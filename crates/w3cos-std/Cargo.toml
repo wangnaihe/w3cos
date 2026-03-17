@@ -1,0 +1,9 @@
+[package]
+name = "w3cos-std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "W3C OS standard library — component types, style definitions, and system API types"
+
+[dependencies]
+serde = { workspace = true }

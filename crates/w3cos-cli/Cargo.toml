@@ -1,0 +1,15 @@
+[package]
+name = "w3cos-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "W3C OS command-line tool — build and run W3C OS applications"
+
+[[bin]]
+name = "w3cos"
+path = "src/main.rs"
+
+[dependencies]
+w3cos-compiler = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

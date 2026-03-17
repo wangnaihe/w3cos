@@ -1,0 +1,10 @@
+[package]
+name = "w3cos-dom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "W3C DOM API implementation for W3C OS — compiled to native code, not interpreted"
+
+[dependencies]
+w3cos-std = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,50 @@
+{
+  "kind": "Column",
+  "style": {
+    "gap": 16,
+    "padding": 32,
+    "align_items": "center",
+    "justify_content": "center",
+    "background": "#1a1a2e"
+  },
+  "children": [
+    {
+      "kind": { "Text": "" },
+      "text": "W3C OS",
+      "style": { "font_size": 36, "color": "#e94560", "font_weight": 700 }
+    },
+    {
+      "kind": { "Text": "" },
+      "text": "TypeScript compiled to native binary. No browser. No V8.",
+      "style": { "font_size": 18, "color": "#c4c4c4" }
+    },
+    {
+      "kind": "Row",
+      "style": { "gap": 12, "padding": 16 },
+      "children": [
+        {
+          "kind": { "Button": "" },
+          "label": "Get Started",
+          "style": {
+            "background": "#e94560",
+            "color": "#ffffff",
+            "border_radius": 8,
+            "font_size": 16
+          }
+        },
+        {
+          "kind": { "Button": "" },
+          "label": "Learn More",
+          "style": {
+            "background": "#16213e",
+            "color": "#e94560",
+            "border_radius": 8,
+            "border_width": 1,
+            "border_color": "#e94560",
+            "font_size": 16
+          }
+        }
+      ]
+    }
+  ]
+}

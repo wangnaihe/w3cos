@@ -1,0 +1,29 @@
+#!/bin/sh
+# W3C OS — system init script
+# This launches the W3C OS Shell as the primary user interface.
+# It replaces the traditional desktop environment (GNOME/KDE/etc.)
+
+case "$1" in
+    start)
+        echo "Starting W3C OS Shell..."
+
+        # Wait for framebuffer
+        while [ ! -e /dev/fb0 ]; do
+            sleep 0.1
+        done
+
+        # Set console font size
+        export TERM=linux
+
+        # Launch W3C OS Shell on tty1 (fullscreen, no desktop)
+        /usr/bin/w3cos-shell &
+        ;;
+    stop)
+        echo "Stopping W3C OS Shell..."
+        killall w3cos-shell 2>/dev/null
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac

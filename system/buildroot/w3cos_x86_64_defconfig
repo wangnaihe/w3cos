@@ -1,0 +1,55 @@
+# W3C OS — Buildroot defconfig for x86_64
+# Produces a minimal bootable ISO with Linux kernel + W3C OS Shell
+#
+# Usage:
+#   cd buildroot-2024.11
+#   make BR2_EXTERNAL=/path/to/w3cos/system/buildroot w3cos_x86_64_defconfig
+#   make
+
+# Target architecture
+BR2_x86_64=y
+BR2_x86_corei7=y
+
+# Toolchain
+BR2_TOOLCHAIN_BUILDROOT_CXX=y
+
+# Kernel
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_USE_DEFCONFIG=y
+BR2_LINUX_KERNEL_DEFCONFIG="x86_64"
+BR2_LINUX_KERNEL_INSTALL_TARGET=y
+
+# Bootloader: syslinux for ISO boot
+BR2_TARGET_SYSLINUX=y
+BR2_TARGET_SYSLINUX_ISOLINUX=y
+
+# Root filesystem
+BR2_TARGET_ROOTFS_ISO9660=y
+BR2_TARGET_ROOTFS_ISO9660_BOOT_MENU="system/buildroot/isolinux.cfg"
+BR2_ROOTFS_OVERLAY="system/rootfs_overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="system/scripts/post-build.sh"
+
+# Init system: busybox init (minimal)
+BR2_INIT_BUSYBOX=y
+BR2_PACKAGE_BUSYBOX=y
+
+# Firmware: include common firmware blobs for hardware support
+BR2_PACKAGE_LINUX_FIRMWARE=y
+BR2_PACKAGE_LINUX_FIRMWARE_IWLWIFI_7260=y
+BR2_PACKAGE_LINUX_FIRMWARE_IWLWIFI_8000C=y
+BR2_PACKAGE_LINUX_FIRMWARE_IWLWIFI_8265=y
+BR2_PACKAGE_LINUX_FIRMWARE_RALINK_RT61=y
+BR2_PACKAGE_LINUX_FIRMWARE_REALTEK_RTL8169=y
+
+# Display: framebuffer support (no X11, no Wayland needed)
+BR2_PACKAGE_MESA3D=y
+BR2_PACKAGE_MESA3D_DRI_DRIVER_I965=y
+BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_NOUVEAU=y
+BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y
+
+# Fonts
+BR2_PACKAGE_DEJAVU=y
+
+# Network: basic networking for SSH access
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_DHCPCD=y

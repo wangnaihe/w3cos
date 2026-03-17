@@ -1,0 +1,17 @@
+[package]
+name = "w3cos-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
+
+[dependencies]
+w3cos-std = { workspace = true }
+w3cos-dom = { workspace = true }
+taffy = { workspace = true }
+parley = { workspace = true }
+fontdue = { workspace = true }
+tiny-skia = { workspace = true }
+winit = { workspace = true }
+softbuffer = { workspace = true }
+anyhow = { workspace = true }
