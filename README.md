@@ -41,8 +41,24 @@ cargo build --release
 
 ## Example
 
+### TSX Syntax (recommended)
+
+```tsx
+// app.tsx — a native application written in TSX
+import { Column, Text, Button } from "@w3cos/std"
+
+export default
+<Column style={{ gap: 20, padding: 48, alignItems: "center", background: "#0f0f1a" }}>
+  <Text style={{ fontSize: 42, color: "#e94560" }}>W3C OS</Text>
+  <Text style={{ fontSize: 20, color: "#a0a0b0" }}>Native binary from TSX.</Text>
+  <Button style={{ background: "#e94560", borderRadius: 8 }}>Get Started</Button>
+</Column>
+```
+
+### Function Syntax
+
 ```typescript
-// app.ts — a native application written in TypeScript
+// app.ts — alternative function-call syntax
 import { Column, Text, Button } from "@w3cos/std"
 
 export default Column({
@@ -56,7 +72,7 @@ export default Column({
 ```
 
 ```bash
-$ w3cos build app.ts -o myapp --release
+$ w3cos build app.tsx -o myapp --release
 ⚡ Transpiling TS → Rust... done
 🔨 Compiling native binary... done
 ✅ Output: ./myapp (2.4 MB)
