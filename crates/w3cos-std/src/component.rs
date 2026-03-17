@@ -1,31 +1,44 @@
 use crate::style::Style;
 use serde::{Deserialize, Serialize};
 
+/// An action triggered by a UI event (click, input, etc.).
+/// Actions modify signals in the reactive state store.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum EventAction {
+    #[default]
+    None,
+    Increment(usize),
+    Decrement(usize),
+    Set(usize, i64),
+    Toggle(usize),
+}
+
+impl EventAction {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// A UI component in the W3C OS component tree.
-/// All UI is built from this unified node type — no legacy DOM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Component {
     pub kind: ComponentKind,
     pub style: Style,
     pub children: Vec<Component>,
+    #[serde(default)]
+    pub on_click: EventAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ComponentKind {
-    /// Root container — the top-level application frame.
     Root,
-    /// Vertical stack (flex-direction: column).
     Column,
-    /// Horizontal stack (flex-direction: row).
     Row,
-    /// Text content.
     Text { content: String },
-    /// Clickable button.
     Button { label: String },
-    /// Generic container with custom styling.
     Box,
-    /// Image (future).
     Image { src: String },
+    TextInput { value: String, placeholder: String },
 }
 
 impl Component {
@@ -34,6 +47,7 @@ impl Component {
             kind: ComponentKind::Root,
             style: Style::default(),
             children,
+            on_click: EventAction::None,
         }
     }
 
@@ -42,6 +56,7 @@ impl Component {
             kind: ComponentKind::Column,
             style,
             children,
+            on_click: EventAction::None,
         }
     }
 
@@ -53,6 +68,7 @@ impl Component {
                 ..style
             },
             children,
+            on_click: EventAction::None,
         }
     }
 
@@ -63,6 +79,7 @@ impl Component {
             },
             style,
             children: vec![],
+            on_click: EventAction::None,
         }
     }
 
@@ -73,6 +90,22 @@ impl Component {
             },
             style,
             children: vec![],
+            on_click: EventAction::None,
+        }
+    }
+
+    pub fn button_with_click(
+        label: impl Into<String>,
+        style: Style,
+        on_click: EventAction,
+    ) -> Self {
+        Self {
+            kind: ComponentKind::Button {
+                label: label.into(),
+            },
+            style,
+            children: vec![],
+            on_click,
         }
     }
 
@@ -81,6 +114,32 @@ impl Component {
             kind: ComponentKind::Box,
             style,
             children,
+            on_click: EventAction::None,
+        }
+    }
+
+    pub fn image(src: impl Into<String>, style: Style) -> Self {
+        Self {
+            kind: ComponentKind::Image { src: src.into() },
+            style,
+            children: vec![],
+            on_click: EventAction::None,
+        }
+    }
+
+    pub fn text_input(
+        value: impl Into<String>,
+        placeholder: impl Into<String>,
+        style: Style,
+    ) -> Self {
+        Self {
+            kind: ComponentKind::TextInput {
+                value: value.into(),
+                placeholder: placeholder.into(),
+            },
+            style,
+            children: vec![],
+            on_click: EventAction::None,
         }
     }
 }

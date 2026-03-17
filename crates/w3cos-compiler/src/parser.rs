@@ -2,8 +2,16 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalDecl {
+    pub name: String,
+    pub initial: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppTree {
     pub root: Node,
+    #[serde(default)]
+    pub signals: Vec<SignalDecl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +25,12 @@ pub struct Node {
     pub text: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub on_click: Option<String>,
+    #[serde(default)]
+    pub src: Option<String>,
+    #[serde(default)]
+    pub placeholder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +42,10 @@ pub enum NodeKind {
     #[serde(alias = "button")]
     Button(#[serde(default)] String),
     Box,
+    #[serde(alias = "image")]
+    Image(#[serde(default)] String),
+    #[serde(alias = "textinput")]
+    TextInput,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,7 +88,10 @@ fn parse_json(source: &str) -> Result<AppTree> {
     let mut root: Node =
         serde_json::from_str(source).map_err(|e| anyhow!("JSON parse error: {e}"))?;
     fixup_json_node(&mut root);
-    Ok(AppTree { root })
+    Ok(AppTree {
+        root,
+        signals: vec![],
+    })
 }
 
 fn fixup_json_node(node: &mut Node) {
@@ -84,6 +105,14 @@ fn fixup_json_node(node: &mut Node) {
     {
         node.kind = NodeKind::Button(label.clone());
     }
+    if let Some(ref src) = node.src
+        && matches!(node.kind, NodeKind::Image(_))
+    {
+        node.kind = NodeKind::Image(src.clone());
+    }
+    if matches!(node.kind, NodeKind::TextInput) && node.placeholder.is_none() {
+        node.placeholder = Some("Enter text".to_string());
+    }
     for child in &mut node.children {
         fixup_json_node(child);
     }
@@ -95,15 +124,16 @@ fn fixup_json_node(node: &mut Node) {
 // ---------------------------------------------------------------------------
 
 fn parse_ts(source: &str) -> Result<AppTree> {
-    let clean = strip_ts_wrapper(source);
+    let (clean, signals) = strip_ts_wrapper(source);
     let clean = clean.trim();
     if clean.is_empty() {
         return Ok(AppTree {
             root: empty_column(),
+            signals,
         });
     }
     parse_ts_expr(clean)
-        .map(|root| AppTree { root })
+        .map(|root| AppTree { root, signals })
         .ok_or_else(|| {
             anyhow!(
                 "Failed to parse. Supported syntax:\n\
@@ -113,13 +143,21 @@ fn parse_ts(source: &str) -> Result<AppTree> {
         })
 }
 
-fn strip_ts_wrapper(source: &str) -> String {
+fn strip_ts_wrapper(source: &str) -> (String, Vec<SignalDecl>) {
     let mut lines: Vec<&str> = source.lines().collect();
+    let mut signals = Vec::new();
 
-    // Remove import lines
+    // Extract and remove signal declarations: const NAME = signal(VALUE)
     lines.retain(|l| {
         let t = l.trim();
-        !t.starts_with("import ")
+        if t.starts_with("import ") {
+            return false;
+        }
+        if let Some(sig) = parse_signal_decl(t) {
+            signals.push(sig);
+            return false;
+        }
+        true
     });
 
     let mut result = lines.join("\n");
@@ -134,7 +172,24 @@ fn strip_ts_wrapper(source: &str) -> String {
         result = result.trim().trim_end_matches(';').to_string();
     }
 
-    result
+    (result, signals)
+}
+
+fn parse_signal_decl(s: &str) -> Option<SignalDecl> {
+    let s = s.trim();
+    let s = s.strip_prefix("const")?.trim();
+    let eq_pos = s.find('=')?;
+    let name = s[..eq_pos].trim().to_string();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = s[eq_pos + 1..].trim();
+    let rest = rest.strip_prefix("signal")?.trim();
+    let rest = rest.strip_prefix('(')?;
+    let paren_end = rest.find(')')?;
+    let value_str = rest[..paren_end].trim();
+    let initial = value_str.parse::<i64>().ok()?;
+    Some(SignalDecl { name, initial })
 }
 
 fn parse_ts_expr(s: &str) -> Option<Node> {
@@ -161,6 +216,14 @@ fn parse_ts_expr(s: &str) -> Option<Node> {
     if let Some(inner) = strip_fn_call(s, "Button") {
         return parse_text_or_button(inner, false);
     }
+    // Image("path.png", { style: {...} })
+    if let Some(inner) = strip_fn_call(s, "Image") {
+        return parse_image_call(inner);
+    }
+    // TextInput("placeholder", { style: {...} })
+    if let Some(inner) = strip_fn_call(s, "TextInput") {
+        return parse_text_input_call(inner);
+    }
 
     None
 }
@@ -184,16 +247,19 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
     let tag_end = after_lt.find(|c: char| c.is_whitespace() || c == '>' || c == '/')?;
     let tag_name = &after_lt[..tag_end];
 
-    if !matches!(tag_name, "Column" | "Row" | "Box" | "Text" | "Button") {
+    if !matches!(
+        tag_name,
+        "Column" | "Row" | "Box" | "Text" | "Button" | "Image" | "TextInput"
+    ) {
         return None;
     }
 
     let after_tag = &after_lt[tag_end..];
-    let (style, after_attrs) = parse_tsx_attrs(after_tag);
+    let (style, on_click, src, placeholder, after_attrs) = parse_tsx_attrs(after_tag);
     let after_attrs = after_attrs.trim();
 
     if let Some(rest) = after_attrs.strip_prefix("/>") {
-        let node = build_tsx_node(tag_name, style, vec![], None);
+        let node = build_tsx_node(tag_name, style, on_click, src, placeholder, vec![], None);
         return Some((node, rest));
     }
 
@@ -204,16 +270,51 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
 
     let (children, text_content, after_children) = parse_tsx_children(after_open, tag_name)?;
 
-    let node = build_tsx_node(tag_name, style, children, text_content);
+    let node = build_tsx_node(
+        tag_name,
+        style,
+        on_click,
+        src,
+        placeholder,
+        children,
+        text_content,
+    );
     Some((node, after_children))
 }
 
-fn parse_tsx_attrs(s: &str) -> (StyleDecl, &str) {
+fn parse_tsx_attrs(
+    s: &str,
+) -> (
+    StyleDecl,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    &str,
+) {
     let mut style = StyleDecl::default();
+    let mut on_click: Option<String> = None;
+    let mut src: Option<String> = None;
+    let mut placeholder: Option<String> = None;
     let mut rest = s.trim();
 
     while !rest.is_empty() && !rest.starts_with('>') && !rest.starts_with("/>") {
         rest = rest.trim();
+        if let Some(after) = rest.strip_prefix("src=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                src = Some(value);
+                rest = r;
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix("placeholder=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                placeholder = Some(value);
+                rest = r;
+                continue;
+            }
+        }
         if let Some(after) = rest.strip_prefix("style=") {
             let after = after.trim();
             if let Some(inner) = after.strip_prefix("{{")
@@ -224,6 +325,14 @@ fn parse_tsx_attrs(s: &str) -> (StyleDecl, &str) {
                     style = parsed;
                 }
                 rest = &inner[end + 2..]; // skip }}
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix("onClick=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                on_click = Some(value);
+                rest = r;
                 continue;
             }
         }
@@ -253,7 +362,7 @@ fn parse_tsx_attrs(s: &str) -> (StyleDecl, &str) {
         }
     }
 
-    (style, rest)
+    (style, on_click, src, placeholder, rest)
 }
 
 fn find_double_brace_end(s: &str) -> Option<usize> {
@@ -329,6 +438,9 @@ fn parse_tsx_children<'a>(
 fn build_tsx_node(
     tag: &str,
     style: StyleDecl,
+    on_click: Option<String>,
+    src: Option<String>,
+    placeholder: Option<String>,
     children: Vec<Node>,
     text_content: Option<String>,
 ) -> Node {
@@ -341,6 +453,9 @@ fn build_tsx_node(
                 children: vec![],
                 text: Some(content),
                 label: None,
+                on_click,
+                src: None,
+                placeholder: None,
             }
         }
         "Button" => {
@@ -351,6 +466,35 @@ fn build_tsx_node(
                 children: vec![],
                 text: None,
                 label: Some(label),
+                on_click,
+                src: None,
+                placeholder: None,
+            }
+        }
+        "Image" => {
+            let src_val = src.unwrap_or_default();
+            Node {
+                kind: NodeKind::Image(src_val.clone()),
+                style,
+                children: vec![],
+                text: None,
+                label: None,
+                on_click,
+                src: Some(src_val),
+                placeholder: None,
+            }
+        }
+        "TextInput" => {
+            let placeholder_val = placeholder.unwrap_or_else(|| "Enter text".to_string());
+            Node {
+                kind: NodeKind::TextInput,
+                style,
+                children: vec![],
+                text: None,
+                label: None,
+                on_click,
+                src: None,
+                placeholder: Some(placeholder_val),
             }
         }
         "Row" => Node {
@@ -359,6 +503,9 @@ fn build_tsx_node(
             children,
             text: None,
             label: None,
+            on_click,
+            src: None,
+            placeholder: None,
         },
         "Box" => Node {
             kind: NodeKind::Box,
@@ -366,6 +513,9 @@ fn build_tsx_node(
             children,
             text: None,
             label: None,
+            on_click,
+            src: None,
+            placeholder: None,
         },
         _ => Node {
             kind: NodeKind::Column,
@@ -373,6 +523,9 @@ fn build_tsx_node(
             children,
             text: None,
             label: None,
+            on_click,
+            src: None,
+            placeholder: None,
         },
     }
 }
@@ -392,7 +545,7 @@ fn strip_fn_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 fn parse_container_call(kind: &str, inner: &str) -> Option<Node> {
     let inner = inner.trim();
 
-    // Expect: { style: {...}, children: [...] }
+    // Expect: { style: {...}, children: [...], onClick: "..." }
     // or: { children: [...] }
     // or: { style: {...} }
     let style = extract_object_field(inner, "style")
@@ -403,6 +556,10 @@ fn parse_container_call(kind: &str, inner: &str) -> Option<Node> {
         .map(parse_children_array)
         .unwrap_or_default();
 
+    let on_click = extract_object_field(inner, "onClick")
+        .map(|s| unquote(s.trim()))
+        .filter(|s| !s.is_empty());
+
     Some(Node {
         kind: match kind {
             "Row" => NodeKind::Row,
@@ -412,16 +569,56 @@ fn parse_container_call(kind: &str, inner: &str) -> Option<Node> {
         children,
         text: None,
         label: None,
+        on_click,
+        src: None,
+        placeholder: None,
     })
 }
 
-fn parse_text_or_button(inner: &str, is_text: bool) -> Option<Node> {
+fn parse_image_call(inner: &str) -> Option<Node> {
     let inner = inner.trim();
 
-    // First arg: string literal
-    let (content, rest) = extract_first_string_arg(inner)?;
+    // First arg: string literal (src path)
+    let (src_path, rest) = extract_first_string_arg(inner)?;
 
-    // Optional second arg: { style: {...} }
+    // Optional second arg: { style: {...}, onClick: "..." }
+    let (style, on_click) = if let Some(rest) = rest.strip_prefix(',') {
+        let rest = rest.trim();
+        if rest.starts_with('{') {
+            let obj = find_matching_brace(rest)?;
+            let s = extract_object_field(obj, "style")
+                .and_then(parse_style_object)
+                .unwrap_or_default();
+            let o = extract_object_field(obj, "onClick")
+                .map(|x| unquote(x.trim()))
+                .filter(|x| !x.is_empty());
+            (s, o)
+        } else {
+            (StyleDecl::default(), None)
+        }
+    } else {
+        (StyleDecl::default(), None)
+    };
+
+    Some(Node {
+        kind: NodeKind::Image(src_path.clone()),
+        style,
+        children: vec![],
+        text: None,
+        label: None,
+        on_click,
+        src: Some(src_path),
+        placeholder: None,
+    })
+}
+
+fn parse_text_input_call(inner: &str) -> Option<Node> {
+    let inner = inner.trim();
+
+    // First arg: string literal (placeholder)
+    let (placeholder_val, rest) = extract_first_string_arg(inner)?;
+
+    // Optional second arg: { style: {...}, onClick: "..." }
     let style = if let Some(rest) = rest.strip_prefix(',') {
         let rest = rest.trim();
         if rest.starts_with('{') {
@@ -437,6 +634,43 @@ fn parse_text_or_button(inner: &str, is_text: bool) -> Option<Node> {
     };
 
     Some(Node {
+        kind: NodeKind::TextInput,
+        style,
+        children: vec![],
+        text: None,
+        label: None,
+        on_click: None,
+        src: None,
+        placeholder: Some(placeholder_val),
+    })
+}
+
+fn parse_text_or_button(inner: &str, is_text: bool) -> Option<Node> {
+    let inner = inner.trim();
+
+    // First arg: string literal
+    let (content, rest) = extract_first_string_arg(inner)?;
+
+    // Optional second arg: { style: {...}, onClick: "..." }
+    let (style, on_click) = if let Some(rest) = rest.strip_prefix(',') {
+        let rest = rest.trim();
+        if rest.starts_with('{') {
+            let obj = find_matching_brace(rest)?;
+            let s = extract_object_field(obj, "style")
+                .and_then(parse_style_object)
+                .unwrap_or_default();
+            let o = extract_object_field(obj, "onClick")
+                .map(|x| unquote(x.trim()))
+                .filter(|x| !x.is_empty());
+            (s, o)
+        } else {
+            (StyleDecl::default(), None)
+        }
+    } else {
+        (StyleDecl::default(), None)
+    };
+
+    Some(Node {
         kind: if is_text {
             NodeKind::Text(content.clone())
         } else {
@@ -446,6 +680,9 @@ fn parse_text_or_button(inner: &str, is_text: bool) -> Option<Node> {
         children: vec![],
         text: if is_text { Some(content.clone()) } else { None },
         label: if !is_text { Some(content) } else { None },
+        on_click,
+        src: None,
+        placeholder: None,
     })
 }
 
@@ -672,6 +909,9 @@ fn empty_column() -> Node {
         children: vec![],
         text: None,
         label: None,
+        on_click: None,
+        src: None,
+        placeholder: None,
     }
 }
 
@@ -929,6 +1169,17 @@ export default <Column>
     }
 
     #[test]
+    fn tsx_text_input() {
+        let source = r#"<TextInput placeholder="Enter text" />"#;
+        let tree = parse(source).unwrap();
+        match &tree.root.kind {
+            NodeKind::TextInput => {}
+            _ => panic!("expected TextInput, got {:?}", tree.root.kind),
+        }
+        assert_eq!(tree.root.placeholder.as_deref(), Some("Enter text"));
+    }
+
+    #[test]
     fn tsx_row_with_box() {
         let source = r##"<Row style={{ padding: 16 }}>
             <Box style={{ flexGrow: 1, background: "#1e1e2e" }}>
@@ -946,5 +1197,28 @@ export default <Column>
             _ => panic!("expected Box"),
         }
         assert_eq!(tree.root.children[0].style.flex_grow, Some(1.0));
+    }
+
+    #[test]
+    fn tsx_image_self_closing() {
+        let source = r#"<Image src="path.png" />"#;
+        let tree = parse(source).unwrap();
+        match &tree.root.kind {
+            NodeKind::Image(src) => assert_eq!(src, "path.png"),
+            _ => panic!("expected Image, got {:?}", tree.root.kind),
+        }
+        assert_eq!(tree.root.src.as_deref(), Some("path.png"));
+    }
+
+    #[test]
+    fn tsx_image_with_style() {
+        let source = r##"<Image src="logo.png" style={{ width: "100px", height: "80px" }} />"##;
+        let tree = parse(source).unwrap();
+        match &tree.root.kind {
+            NodeKind::Image(src) => assert_eq!(src, "logo.png"),
+            _ => panic!("expected Image"),
+        }
+        assert_eq!(tree.root.style.width.as_deref(), Some("100px"));
+        assert_eq!(tree.root.style.height.as_deref(), Some("80px"));
     }
 }

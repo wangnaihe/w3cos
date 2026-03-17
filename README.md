@@ -35,7 +35,7 @@ cd w3cos
 cargo build --release
 
 # Compile a TypeScript app to a native binary
-./target/release/w3cos build examples/showcase/app.ts -o showcase --release
+./target/release/w3cos build examples/showcase/app.tsx -o showcase --release
 ./showcase    # Opens a native window — no browser involved
 ```
 

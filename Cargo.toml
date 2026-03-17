@@ -24,6 +24,7 @@ w3cos-dom = { path = "crates/w3cos-dom" }
 w3cos-a11y = { path = "crates/w3cos-a11y" }
 w3cos-ai-bridge = { path = "crates/w3cos-ai-bridge" }
 png = "0.17"
+image = "0.25"
 
 # Layout: Taffy 0.9 — Flexbox + Grid + Block + position
 taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout", "content_size"] }

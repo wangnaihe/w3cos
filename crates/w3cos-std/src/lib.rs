@@ -3,7 +3,7 @@ pub mod component;
 pub mod style;
 
 pub use color::Color;
-pub use component::{Component, ComponentKind};
+pub use component::{Component, ComponentKind, EventAction};
 pub use style::Style;
 
 #[cfg(test)]
@@ -293,6 +293,17 @@ mod tests {
         let root = Component::root(vec![child.clone()]);
         assert!(matches!(root.kind, ComponentKind::Root));
         assert_eq!(root.children.len(), 1);
+    }
+
+    #[test]
+    fn component_text_input() {
+        let style = Style::default();
+        let input = Component::text_input("", "Enter text", style.clone());
+        assert!(matches!(
+            &input.kind,
+            ComponentKind::TextInput { value, placeholder } if value == "" && placeholder == "Enter text"
+        ));
+        assert_eq!(input.children.len(), 0);
     }
 
     #[test]

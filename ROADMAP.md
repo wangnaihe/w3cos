@@ -50,9 +50,6 @@
 - [ ] PWA manifest support
 - [ ] npm package compatibility (pure-logic packages)
 - [ ] Cross-compilation: Linux x86/ARM, macOS
-- [ ] Android container (Waydroid integration)
-- [ ] Wine integration for Windows apps
-
 ## Phase 4 — Operating System
 - [ ] Bootable ISO (Buildroot) available on GitHub Releases
 - [ ] W3C OS as system shell (replaces desktop environment)

@@ -15,3 +15,4 @@ tiny-skia = { workspace = true }
 winit = { workspace = true }
 softbuffer = { workspace = true }
 anyhow = { workspace = true }
+image = { workspace = true }
