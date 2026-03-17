@@ -1,0 +1,110 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run CI checks
+        id: ci
+        run: |
+          set +e
+          cargo check --workspace 2>&1 | tee /tmp/check.log
+          CHECK_EXIT=$?
+          cargo clippy --workspace -- -D warnings 2>&1 | tee /tmp/clippy.log
+          CLIPPY_EXIT=$?
+          cargo fmt --all -- --check 2>&1 | tee /tmp/fmt.log
+          FMT_EXIT=$?
+          cargo test --workspace 2>&1 | tee /tmp/test.log
+          TEST_EXIT=$?
+
+          echo "check_exit=$CHECK_EXIT" >> $GITHUB_OUTPUT
+          echo "clippy_exit=$CLIPPY_EXIT" >> $GITHUB_OUTPUT
+          echo "fmt_exit=$FMT_EXIT" >> $GITHUB_OUTPUT
+          echo "test_exit=$TEST_EXIT" >> $GITHUB_OUTPUT
+
+          TEST_COUNT=$(grep -c '^test .* ok$' /tmp/test.log || echo 0)
+          echo "test_count=$TEST_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const isAiPr = pr.title.startsWith('[AI]') || (pr.labels || []).some(l => l.name === 'ai-pr');
+            const check = '${{ steps.ci.outputs.check_exit }}' === '0';
+            const clippy = '${{ steps.ci.outputs.clippy_exit }}' === '0';
+            const fmt = '${{ steps.ci.outputs.fmt_exit }}' === '0';
+            const test = '${{ steps.ci.outputs.test_exit }}' === '0';
+            const testCount = '${{ steps.ci.outputs.test_count }}';
+            const allPassed = check && clippy && fmt && test;
+
+            const status = (ok) => ok ? ':white_check_mark:' : ':x:';
+
+            const body = [
+              `## AI Review Summary`,
+              '',
+              `| Check | Status |`,
+              `|-------|--------|`,
+              `| \`cargo check\` | ${status(check)} |`,
+              `| \`cargo clippy\` | ${status(clippy)} |`,
+              `| \`cargo fmt\` | ${status(fmt)} |`,
+              `| \`cargo test\` (${testCount} tests) | ${status(test)} |`,
+              '',
+              allPassed
+                ? '> :white_check_mark: **All checks passed.** Ready for human review.'
+                : '> :x: **Some checks failed.** Please fix the issues above.',
+              '',
+              isAiPr ? '_This PR was authored by an AI agent._' : '',
+              '',
+              '_Review by W3C OS Management AI. See [AI_DEVELOPMENT.md](../blob/main/AI_DEVELOPMENT.md)._',
+            ].join('\n');
+
+            // Find existing bot comment to update
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+            });
+            const existing = comments.data.find(c =>
+              c.user.type === 'Bot' && c.body.includes('AI Review Summary')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body,
+              });
+            }
+
+            // Auto-label AI PRs
+            if (isAiPr) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['ai-pr'],
+              });
+            }

@@ -108,10 +108,18 @@ impl AriaRole {
     }
 
     pub fn is_interactive(&self) -> bool {
-        matches!(self,
-            Self::Button | Self::Link | Self::Textbox | Self::Checkbox |
-            Self::Radio | Self::Switch | Self::Slider | Self::MenuItem |
-            Self::Tab | Self::TreeItem
+        matches!(
+            self,
+            Self::Button
+                | Self::Link
+                | Self::Textbox
+                | Self::Checkbox
+                | Self::Radio
+                | Self::Switch
+                | Self::Slider
+                | Self::MenuItem
+                | Self::Tab
+                | Self::TreeItem
         )
     }
 }

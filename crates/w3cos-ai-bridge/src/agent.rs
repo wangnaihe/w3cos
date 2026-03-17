@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use w3cos_dom::document::Document;
 
 use crate::a11y_api;
@@ -48,7 +48,11 @@ impl AiAgent {
             bail!("Agent '{}' does not have DOM read permission", self.name);
         }
         if !self.permissions.check_selector(selector) {
-            bail!("Agent '{}' is not allowed to access '{}'", self.name, selector);
+            bail!(
+                "Agent '{}' is not allowed to access '{}'",
+                self.name,
+                selector
+            );
         }
         Ok(dom_access::query(doc, selector))
     }
@@ -57,7 +61,11 @@ impl AiAgent {
     pub fn act(&mut self, doc: &mut Document, action: &DomAction) -> Result<DomResult> {
         // Permission checks
         if !self.permissions.check_selector(&action.selector) {
-            bail!("Agent '{}' is not allowed to access '{}'", self.name, action.selector);
+            bail!(
+                "Agent '{}' is not allowed to access '{}'",
+                self.name,
+                action.selector
+            );
         }
 
         match action.action {
@@ -66,12 +74,12 @@ impl AiAgent {
                     bail!("Agent '{}' does not have interaction permission", self.name);
                 }
             }
-            dom_access::ActionType::SetText |
-            dom_access::ActionType::SetAttribute |
-            dom_access::ActionType::RemoveAttribute |
-            dom_access::ActionType::AddClass |
-            dom_access::ActionType::RemoveClass |
-            dom_access::ActionType::SetStyle => {
+            dom_access::ActionType::SetText
+            | dom_access::ActionType::SetAttribute
+            | dom_access::ActionType::RemoveAttribute
+            | dom_access::ActionType::AddClass
+            | dom_access::ActionType::RemoveClass
+            | dom_access::ActionType::SetStyle => {
                 if !self.permissions.can_write_dom {
                     bail!("Agent '{}' does not have DOM write permission", self.name);
                 }
@@ -80,8 +88,12 @@ impl AiAgent {
         }
 
         self.action_count += 1;
-        eprintln!("[AI:{}] {} → {}", self.name, 
-            serde_json::to_string(&action.action).unwrap_or_default().trim_matches('"'),
+        eprintln!(
+            "[AI:{}] {} → {}",
+            self.name,
+            serde_json::to_string(&action.action)
+                .unwrap_or_default()
+                .trim_matches('"'),
             action.selector
         );
 

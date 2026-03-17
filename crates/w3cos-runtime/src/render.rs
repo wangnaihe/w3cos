@@ -52,21 +52,47 @@ fn render_node(
     }
 
     if style.border_width > 0.0 && style.border_color.a > 0 {
-        draw_border(pixmap, rect, apply_opacity(style.border_color, opacity), style.border_width, style.border_radius);
+        draw_border(
+            pixmap,
+            rect,
+            apply_opacity(style.border_color, opacity),
+            style.border_width,
+            style.border_radius,
+        );
     }
 
     let text_color = apply_opacity(style.color, opacity);
 
     match kind {
         ComponentKind::Text { content } => {
-            draw_text(pixmap, rect.x, rect.y, content, style.font_size, text_color, font);
+            draw_text(
+                pixmap,
+                rect.x,
+                rect.y,
+                content,
+                style.font_size,
+                text_color,
+                font,
+            );
         }
         ComponentKind::Button { label } => {
-            let btn_bg = if bg.a == 0 { apply_opacity(Color::rgb(55, 65, 81), opacity) } else { bg };
+            let btn_bg = if bg.a == 0 {
+                apply_opacity(Color::rgb(55, 65, 81), opacity)
+            } else {
+                bg
+            };
             draw_rect(pixmap, rect, btn_bg, style.border_radius.max(6.0));
             let text_x = rect.x + 16.0;
             let text_y = rect.y + 8.0;
-            draw_text(pixmap, text_x, text_y, label, style.font_size, text_color, font);
+            draw_text(
+                pixmap,
+                text_x,
+                text_y,
+                label,
+                style.font_size,
+                text_color,
+                font,
+            );
         }
         _ => {}
     }
@@ -76,7 +102,13 @@ fn apply_opacity(c: Color, opacity: f32) -> Color {
     Color::rgba(c.r, c.g, c.b, (c.a as f32 * opacity) as u8)
 }
 
-fn draw_box_shadow(pixmap: &mut Pixmap, rect: LayoutRect, shadow: &w3cos_std::style::BoxShadow, radius: f32, opacity: f32) {
+fn draw_box_shadow(
+    pixmap: &mut Pixmap,
+    rect: LayoutRect,
+    shadow: &w3cos_std::style::BoxShadow,
+    radius: f32,
+    opacity: f32,
+) {
     let spread = shadow.spread_radius;
     let shadow_rect = LayoutRect {
         x: rect.x + shadow.offset_x - spread,
@@ -92,7 +124,9 @@ fn draw_box_shadow(pixmap: &mut Pixmap, rect: LayoutRect, shadow: &w3cos_std::st
         let t = i as f32 / steps as f32;
         let expand = shadow.blur_radius * t;
         let alpha = ((1.0 - t) * color.a as f32 / steps as f32) as u8;
-        if alpha == 0 { continue; }
+        if alpha == 0 {
+            continue;
+        }
         let c = Color::rgba(color.r, color.g, color.b, alpha);
         let r = LayoutRect {
             x: shadow_rect.x - expand,
@@ -112,7 +146,13 @@ fn draw_rect(pixmap: &mut Pixmap, r: LayoutRect, color: Color, radius: f32) {
     if let Some(sk_rect) = Rect::from_xywh(r.x, r.y, r.width, r.height) {
         if radius > 0.0 {
             if let Some(path) = rounded_rect_path(r.x, r.y, r.width, r.height, radius) {
-                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                pixmap.fill_path(
+                    &path,
+                    &paint,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
             }
         } else {
             pixmap.fill_rect(sk_rect, &paint, Transform::identity(), None);
@@ -157,7 +197,7 @@ fn draw_text(
         let px_w = pixmap.width() as i32;
         let px_h = pixmap.height() as i32;
         let gx = cursor_x as i32;
-        let gy = cursor_y as i32 - metrics.height as i32 - metrics.ymin as i32;
+        let gy = cursor_y as i32 - metrics.height as i32 - metrics.ymin;
 
         let pixels = pixmap.pixels_mut();
         for row in 0..metrics.height {
@@ -185,7 +225,10 @@ fn draw_text(
 
 fn blend_pixel(
     dst: tiny_skia::PremultipliedColorU8,
-    sr: u8, sg: u8, sb: u8, sa: u8,
+    sr: u8,
+    sg: u8,
+    sb: u8,
+    sa: u8,
 ) -> tiny_skia::PremultipliedColorU8 {
     let da = dst.alpha() as u16;
     let dr = dst.red() as u16;

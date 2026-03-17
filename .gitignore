@@ -4,3 +4,5 @@ Cargo.lock
 *.swp
 *.swo
 .DS_Store
+/build
+w3cos.iso

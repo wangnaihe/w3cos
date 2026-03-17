@@ -1,10 +1,9 @@
-use w3cos_a11y::tree::{build_a11y_tree, flatten_for_ai, A11yNode};
+use w3cos_a11y::tree::{A11yNode, build_a11y_tree, flatten_for_ai};
 use w3cos_dom::document::Document;
 
 /// Layer 2: Accessibility tree API.
 /// Returns structured ARIA tree for AI agents that prefer semantic understanding
 /// over raw DOM manipulation.
-
 /// Get the full accessibility tree as a structured JSON object.
 pub fn get_tree(doc: &Document) -> A11yNode {
     build_a11y_tree(doc)
@@ -44,7 +43,9 @@ pub fn get_ui_summary(doc: &Document) -> String {
     let total = flat.len();
 
     let mut summary = String::new();
-    summary.push_str(&format!("UI: {total} elements, {interactive_count} interactive\n"));
+    summary.push_str(&format!(
+        "UI: {total} elements, {interactive_count} interactive\n"
+    ));
     summary.push_str("---\n");
     for line in &flat {
         summary.push_str(line);

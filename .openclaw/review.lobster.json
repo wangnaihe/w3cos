@@ -1,0 +1,44 @@
+{
+  "name": "ai-review",
+  "description": "Management AI reviews a PR: run checks, analyze changes, post review",
+  "trigger": "github.pull_request.opened",
+  "steps": [
+    {
+      "id": "read_pr",
+      "tool": "github",
+      "action": "get_pr",
+      "args": { "pr": "{{trigger.pull_request.number}}" }
+    },
+    {
+      "id": "get_diff",
+      "tool": "github",
+      "action": "get_pr_diff",
+      "args": { "pr": "{{trigger.pull_request.number}}" }
+    },
+    {
+      "id": "run_ci",
+      "tool": "shell",
+      "action": "run",
+      "args": {
+        "command": "cargo check --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace"
+      }
+    },
+    {
+      "id": "analyze",
+      "tool": "llm-task",
+      "args": {
+        "prompt": "You are the W3C OS Management AI reviewing a Pull Request.\n\nPR #{{steps.read_pr.number}}: {{steps.read_pr.title}}\n\n{{steps.read_pr.body}}\n\nDiff:\n{{steps.get_diff.diff}}\n\nCI result: {{steps.run_ci.exit_code == 0 ? 'PASSED' : 'FAILED'}}\n{{steps.run_ci.output}}\n\nReview criteria:\n1. Does the code follow existing patterns?\n2. Are there adequate tests?\n3. Any security concerns?\n4. Is the PR description clear?\n5. Does it match the linked issue's acceptance criteria?\n\nRespond with JSON:\n{\n  \"verdict\": \"approve\" | \"request_changes\" | \"comment\",\n  \"summary\": \"1-2 sentence summary\",\n  \"issues\": [\"issue1\", \"issue2\"],\n  \"suggestions\": [\"suggestion1\"]\n}",
+        "format": "json"
+      }
+    },
+    {
+      "id": "post_review",
+      "tool": "github",
+      "action": "comment",
+      "args": {
+        "issue": "{{trigger.pull_request.number}}",
+        "body": "## AI Review\n\n**Verdict**: `{{steps.analyze.verdict}}`\n\n{{steps.analyze.summary}}\n\n{{#if steps.analyze.issues}}### Issues\n{{#each steps.analyze.issues}}- {{this}}\n{{/each}}{{/if}}\n\n{{#if steps.analyze.suggestions}}### Suggestions\n{{#each steps.analyze.suggestions}}- {{this}}\n{{/each}}{{/if}}\n\n_Review by W3C OS Management AI via OpenClaw._"
+      }
+    }
+  ]
+}

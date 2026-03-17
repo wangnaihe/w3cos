@@ -1,11 +1,10 @@
 use anyhow::Result;
 use taffy::prelude::*;
-use w3cos_std::{Component, ComponentKind};
 use w3cos_std::style::{
-    AlignItems as WAlign, Dimension as WDim, Display as WDisplay,
-    FlexDirection as WDir, FlexWrap as WWrap, JustifyContent as WJustify,
-    Overflow as WOverflow, Position as WPos,
+    AlignItems as WAlign, Dimension as WDim, Display as WDisplay, FlexDirection as WDir,
+    FlexWrap as WWrap, JustifyContent as WJustify, Overflow as WOverflow, Position as WPos,
 };
+use w3cos_std::{Component, ComponentKind};
 
 #[derive(Debug, Clone, Copy)]
 pub struct LayoutRect {
@@ -15,15 +14,22 @@ pub struct LayoutRect {
     pub height: f32,
 }
 
-pub fn compute(root: &Component, viewport_w: f32, viewport_h: f32) -> Result<Vec<(LayoutRect, usize)>> {
+pub fn compute(
+    root: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Result<Vec<(LayoutRect, usize)>> {
     let mut tree: TaffyTree<usize> = TaffyTree::new();
     let mut node_index: usize = 0;
 
     let root_node = build_taffy_tree(&mut tree, root, &mut node_index)?;
-    tree.compute_layout(root_node, Size {
-        width: AvailableSpace::Definite(viewport_w),
-        height: AvailableSpace::Definite(viewport_h),
-    })?;
+    tree.compute_layout(
+        root_node,
+        Size {
+            width: AvailableSpace::Definite(viewport_w),
+            height: AvailableSpace::Definite(viewport_h),
+        },
+    )?;
 
     let mut results = Vec::new();
     collect_layouts(&tree, root_node, 0.0, 0.0, &mut results);
@@ -46,21 +52,32 @@ fn build_taffy_tree(
                 let char_w = comp.style.font_size * 0.6;
                 let w = content.len() as f32 * char_w;
                 let h = comp.style.font_size * 1.4;
-                Size { width: Dimension::length(w), height: Dimension::length(h) }
+                Size {
+                    width: Dimension::length(w),
+                    height: Dimension::length(h),
+                }
             }
             ComponentKind::Button { label } => {
                 let char_w = comp.style.font_size * 0.6;
                 let w = (label.len() as f32 * char_w) + 32.0;
                 let h = comp.style.font_size * 1.4 + 16.0;
-                Size { width: Dimension::length(w), height: Dimension::length(h) }
+                Size {
+                    width: Dimension::length(w),
+                    height: Dimension::length(h),
+                }
             }
-            _ => Size { width: style.size.width, height: style.size.height },
+            _ => Size {
+                width: style.size.width,
+                height: style.size.height,
+            },
         };
 
         let leaf_style = Style { size, ..style };
         tree.new_leaf_with_context(leaf_style, my_idx)
     } else {
-        let child_nodes: Vec<NodeId> = comp.children.iter()
+        let child_nodes: Vec<NodeId> = comp
+            .children
+            .iter()
             .map(|c| build_taffy_tree(tree, c, idx))
             .collect::<Result<_, _>>()?;
         let node = tree.new_with_children(style, &child_nodes)?;
@@ -79,7 +96,12 @@ fn collect_layouts(
     let layout = tree.layout(node).unwrap();
     let x = parent_x + layout.location.x;
     let y = parent_y + layout.location.y;
-    let rect = LayoutRect { x, y, width: layout.size.width, height: layout.size.height };
+    let rect = LayoutRect {
+        x,
+        y,
+        width: layout.size.width,
+        height: layout.size.height,
+    };
 
     if let Some(ctx) = tree.get_node_context(node) {
         out.push((rect, *ctx));

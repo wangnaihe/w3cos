@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use w3cos_dom::document::Document;
 use w3cos_dom::events::Event;
-use serde::{Deserialize, Serialize};
 
 /// Layer 1: Direct DOM access for AI agents.
 /// The most powerful interface — AI reads and writes the DOM directly.
@@ -44,13 +44,25 @@ pub struct DomResult {
 
 impl DomResult {
     pub fn ok(data: serde_json::Value) -> Self {
-        Self { success: true, error: None, data: Some(data) }
+        Self {
+            success: true,
+            error: None,
+            data: Some(data),
+        }
     }
     pub fn ok_empty() -> Self {
-        Self { success: true, error: None, data: None }
+        Self {
+            success: true,
+            error: None,
+            data: None,
+        }
     }
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { success: false, error: Some(msg.into()), data: None }
+        Self {
+            success: false,
+            error: Some(msg.into()),
+            data: None,
+        }
     }
 }
 
@@ -78,15 +90,18 @@ pub fn query(doc: &Document, selector: &str) -> DomResult {
 /// Query all matching elements.
 pub fn query_all(doc: &Document, selector: &str) -> DomResult {
     let elements = doc.query_selector_all(selector);
-    let results: Vec<serde_json::Value> = elements.iter().map(|el| {
-        let node = doc.get_node(el.id);
-        serde_json::json!({
-            "id": el.id.as_u32(),
-            "tag": node.tag,
-            "text": node.text_content,
-            "classes": node.class_list,
+    let results: Vec<serde_json::Value> = elements
+        .iter()
+        .map(|el| {
+            let node = doc.get_node(el.id);
+            serde_json::json!({
+                "id": el.id.as_u32(),
+                "tag": node.tag,
+                "text": node.text_content,
+                "classes": node.class_list,
+            })
         })
-    }).collect();
+        .collect();
     DomResult::ok(serde_json::json!(results))
 }
 
@@ -109,13 +124,14 @@ pub fn execute(doc: &mut Document, action: &DomAction) -> DomResult {
             DomResult::ok_empty()
         }
         ActionType::SetAttribute => {
-            if let Some(ref val) = action.value {
-                if let Some((name, value)) = val.split_once('=') {
-                    el.set_attribute(doc, name.trim(), value.trim());
-                    return DomResult::ok_empty();
-                }
+            if let Some(ref val) = action.value
+                && let Some((name, value)) = val.split_once('=')
+            {
+                el.set_attribute(doc, name.trim(), value.trim());
+                DomResult::ok_empty()
+            } else {
+                DomResult::err("SetAttribute requires value in format 'name=value'")
             }
-            DomResult::err("SetAttribute requires value in format 'name=value'")
         }
         ActionType::RemoveAttribute => {
             if let Some(ref name) = action.value {
@@ -142,16 +158,15 @@ pub fn execute(doc: &mut Document, action: &DomAction) -> DomResult {
             }
         }
         ActionType::SetStyle => {
-            if let Some(ref val) = action.value {
-                if let Some((prop, value)) = val.split_once(':') {
-                    el.style_mut(doc).set_property(prop.trim(), value.trim());
-                    return DomResult::ok_empty();
-                }
+            if let Some(ref val) = action.value
+                && let Some((prop, value)) = val.split_once(':')
+            {
+                el.style_mut(doc).set_property(prop.trim(), value.trim());
+                DomResult::ok_empty()
+            } else {
+                DomResult::err("SetStyle requires value in format 'property: value'")
             }
-            DomResult::err("SetStyle requires value in format 'property: value'")
         }
-        ActionType::Focus | ActionType::ScrollIntoView => {
-            DomResult::ok_empty()
-        }
+        ActionType::Focus | ActionType::ScrollIntoView => DomResult::ok_empty(),
     }
 }

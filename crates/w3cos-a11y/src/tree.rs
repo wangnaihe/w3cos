@@ -46,7 +46,9 @@ fn build_node(doc: &Document, id: NodeId) -> A11yNode {
     let dom_node = doc.get_node(id);
 
     // Determine role: explicit `role` attribute > inferred from tag
-    let role = dom_node.attributes.iter()
+    let role = dom_node
+        .attributes
+        .iter()
         .find(|(k, _)| k == "role")
         .map(|(_, v)| AriaRole::from_attr(v))
         .unwrap_or_else(|| {
@@ -58,17 +60,23 @@ fn build_node(doc: &Document, id: NodeId) -> A11yNode {
         });
 
     // Name: aria-label > aria-labelledby (skip for now) > text content > tag
-    let name = dom_node.attributes.iter()
+    let name = dom_node
+        .attributes
+        .iter()
         .find(|(k, _)| k == "aria-label")
         .map(|(_, v): &(String, String)| v.clone())
         .or_else(|| dom_node.text_content.clone())
         .or_else(|| {
-            dom_node.attributes.iter()
+            dom_node
+                .attributes
+                .iter()
                 .find(|(k, _)| k == "title" || k == "alt" || k == "placeholder")
                 .map(|(_, v): &(String, String)| v.clone())
         });
 
-    let value = dom_node.attributes.iter()
+    let value = dom_node
+        .attributes
+        .iter()
         .find(|(k, _)| k == "value")
         .map(|(_, v): &(String, String)| v.clone());
 
@@ -88,7 +96,9 @@ fn build_node(doc: &Document, id: NodeId) -> A11yNode {
     let visible = style.inner.opacity > 0.0
         && !matches!(style.inner.display, w3cos_std::style::Display::None);
 
-    let children: Vec<A11yNode> = dom_node.children.iter()
+    let children: Vec<A11yNode> = dom_node
+        .children
+        .iter()
         .map(|&child_id| build_node(doc, child_id))
         .filter(|node| node.visible && node.role != AriaRole::None)
         .collect();

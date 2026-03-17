@@ -65,9 +65,10 @@ impl Document {
     }
 
     pub fn get_element_by_id(&self, id: &str) -> Option<Element> {
-        self.nodes.iter().find(|n| {
-            n.attributes.iter().any(|(k, v)| k == "id" && v == id)
-        }).map(|n| Element::new(n.id))
+        self.nodes
+            .iter()
+            .find(|n| n.attributes.iter().any(|(k, v)| k == "id" && v == id))
+            .map(|n| Element::new(n.id))
     }
 
     pub fn query_selector(&self, selector: &str) -> Option<Element> {
@@ -76,19 +77,24 @@ impl Document {
             return self.get_element_by_id(id);
         }
         if let Some(class) = selector.strip_prefix('.') {
-            return self.nodes.iter().find(|n| {
-                n.class_list.contains(&class.to_string())
-            }).map(|n| Element::new(n.id));
+            return self
+                .nodes
+                .iter()
+                .find(|n| n.class_list.contains(&class.to_string()))
+                .map(|n| Element::new(n.id));
         }
         // Tag selector
-        self.nodes.iter().find(|n| {
-            n.tag == selector && n.node_type == NodeType::Element
-        }).map(|n| Element::new(n.id))
+        self.nodes
+            .iter()
+            .find(|n| n.tag == selector && n.node_type == NodeType::Element)
+            .map(|n| Element::new(n.id))
     }
 
     pub fn query_selector_all(&self, selector: &str) -> Vec<Element> {
         if let Some(class) = selector.strip_prefix('.') {
-            return self.nodes.iter()
+            return self
+                .nodes
+                .iter()
                 .filter(|n| n.class_list.contains(&class.to_string()))
                 .map(|n| Element::new(n.id))
                 .collect();
@@ -96,7 +102,8 @@ impl Document {
         if let Some(id) = selector.strip_prefix('#') {
             return self.get_element_by_id(id).into_iter().collect();
         }
-        self.nodes.iter()
+        self.nodes
+            .iter()
             .filter(|n| n.tag == selector && n.node_type == NodeType::Element)
             .map(|n| Element::new(n.id))
             .collect()
@@ -107,7 +114,9 @@ impl Document {
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         // Remove from old parent if any
         if let Some(old_parent) = self.nodes[child.0 as usize].parent {
-            self.nodes[old_parent.0 as usize].children.retain(|&id| id != child);
+            self.nodes[old_parent.0 as usize]
+                .children
+                .retain(|&id| id != child);
         }
         self.nodes[parent.0 as usize].children.push(child);
         self.nodes[child.0 as usize].parent = Some(parent);
@@ -115,14 +124,18 @@ impl Document {
     }
 
     pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
-        self.nodes[parent.0 as usize].children.retain(|&id| id != child);
+        self.nodes[parent.0 as usize]
+            .children
+            .retain(|&id| id != child);
         self.nodes[child.0 as usize].parent = None;
         self.mark_dirty(parent);
     }
 
     pub fn insert_before(&mut self, parent: NodeId, new_child: NodeId, ref_child: NodeId) {
         if let Some(old_parent) = self.nodes[new_child.0 as usize].parent {
-            self.nodes[old_parent.0 as usize].children.retain(|&id| id != new_child);
+            self.nodes[old_parent.0 as usize]
+                .children
+                .retain(|&id| id != new_child);
         }
         let children = &mut self.nodes[parent.0 as usize].children;
         if let Some(pos) = children.iter().position(|&id| id == ref_child) {
@@ -188,22 +201,24 @@ impl Document {
                 w3cos_std::Component::text(text, style)
             }
             NodeType::Element | NodeType::Document => {
-                let children: Vec<w3cos_std::Component> = node.children.iter()
+                let children: Vec<w3cos_std::Component> = node
+                    .children
+                    .iter()
                     .map(|&child_id| self.node_to_component(child_id))
                     .collect();
 
-                if let Some(text) = &node.text_content {
-                    if children.is_empty() {
-                        return match node.tag.as_str() {
-                            "button" | "a" => w3cos_std::Component::button(text, style),
-                            _ => w3cos_std::Component::text(text, style),
-                        };
-                    }
+                if let Some(text) = &node.text_content
+                    && children.is_empty()
+                {
+                    return match node.tag.as_str() {
+                        "button" | "a" => w3cos_std::Component::button(text, style),
+                        _ => w3cos_std::Component::text(text, style),
+                    };
                 }
 
                 match node.tag.as_str() {
-                    "body" | "div" | "section" | "main" | "article" | "nav" | "header" | "footer" =>
-                        w3cos_std::Component::column(style, children),
+                    "body" | "div" | "section" | "main" | "article" | "nav" | "header"
+                    | "footer" => w3cos_std::Component::column(style, children),
                     "span" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                         if let Some(text) = &node.text_content {
                             w3cos_std::Component::text(text, style)

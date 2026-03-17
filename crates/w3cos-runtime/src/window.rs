@@ -1,14 +1,14 @@
-use std::num::NonZeroU32;
 use anyhow::Result;
+use std::num::NonZeroU32;
 use tiny_skia::Pixmap;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::window::{Window, WindowId, WindowAttributes};
+use winit::window::{Window, WindowAttributes, WindowId};
 
-use w3cos_std::{Component, ComponentKind};
 use crate::layout::{self, LayoutRect};
 use crate::render;
+use w3cos_std::{Component, ComponentKind};
 
 static EMBEDDED_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
 
@@ -34,10 +34,8 @@ struct App {
 
 impl App {
     fn new(root: Component) -> Self {
-        let font = fontdue::Font::from_bytes(
-            EMBEDDED_FONT,
-            fontdue::FontSettings::default(),
-        ).expect("failed to load embedded font");
+        let font = fontdue::Font::from_bytes(EMBEDDED_FONT, fontdue::FontSettings::default())
+            .expect("failed to load embedded font");
         Self {
             root,
             window: None,
@@ -63,7 +61,9 @@ impl App {
         };
         let size = window.inner_size();
         let (w, h) = (size.width as f32, size.height as f32);
-        if w == 0.0 || h == 0.0 { return; }
+        if w == 0.0 || h == 0.0 {
+            return;
+        }
 
         // Layout uses physical pixels
         self.layout_cache = layout::compute(&self.root, w, h).unwrap_or_default();
@@ -72,10 +72,12 @@ impl App {
         self.hit_nodes.clear();
         for &(rect, idx) in &self.layout_cache {
             if let Some(&(kind, _)) = flat.get(idx) {
-                let is_interactive = matches!(kind,
-                    ComponentKind::Button { .. }
-                );
-                self.hit_nodes.push(HitNode { rect, index: idx, is_interactive });
+                let is_interactive = matches!(kind, ComponentKind::Button { .. });
+                self.hit_nodes.push(HitNode {
+                    rect,
+                    index: idx,
+                    is_interactive,
+                });
             }
         }
         self.needs_layout = false;
@@ -90,7 +92,9 @@ impl App {
         };
         let size = window.inner_size();
         let (w, h) = (size.width, size.height);
-        if w == 0 || h == 0 { return; }
+        if w == 0 || h == 0 {
+            return;
+        }
 
         let mut pixmap = match Pixmap::new(w, h) {
             Some(p) => p,
@@ -99,23 +103,29 @@ impl App {
 
         let mut render_root = self.root.clone();
         if let Some(hover_idx) = self.hovered_index {
-            apply_hover(&mut render_root, hover_idx, self.pressed_index == Some(hover_idx));
+            apply_hover(
+                &mut render_root,
+                hover_idx,
+                self.pressed_index == Some(hover_idx),
+            );
         }
 
         let flat = flatten_tree(&render_root);
-        let render_nodes: Vec<(LayoutRect, &ComponentKind, &w3cos_std::style::Style)> =
-            self.layout_cache.iter()
-                .filter_map(|&(rect, idx)| {
-                    flat.get(idx).map(|&(kind, style)| (rect, kind, style))
-                })
-                .collect();
+        let render_nodes: Vec<(LayoutRect, &ComponentKind, &w3cos_std::style::Style)> = self
+            .layout_cache
+            .iter()
+            .filter_map(|&(rect, idx)| flat.get(idx).map(|&(kind, style)| (rect, kind, style)))
+            .collect();
 
         render::render_frame(&mut pixmap, &render_nodes, &self.font);
 
-        if let Some(hover_idx) = self.hovered_index {
-            if let Some(hit) = self.hit_nodes.iter().find(|h| h.index == hover_idx && h.is_interactive) {
-                draw_hover_outline(&mut pixmap, hit.rect);
-            }
+        if let Some(hover_idx) = self.hovered_index
+            && let Some(hit) = self
+                .hit_nodes
+                .iter()
+                .find(|h| h.index == hover_idx && h.is_interactive)
+        {
+            draw_hover_outline(&mut pixmap, hit.rect);
         }
 
         present_pixels(window, &pixmap, w, h);
@@ -124,8 +134,10 @@ impl App {
     fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
         for hit in self.hit_nodes.iter().rev() {
             if hit.is_interactive
-                && x >= hit.rect.x && x <= hit.rect.x + hit.rect.width
-                && y >= hit.rect.y && y <= hit.rect.y + hit.rect.height
+                && x >= hit.rect.x
+                && x <= hit.rect.x + hit.rect.width
+                && y >= hit.rect.y
+                && y <= hit.rect.y + hit.rect.height
             {
                 return Some(hit.index);
             }
@@ -145,7 +157,12 @@ fn apply_hover(root: &mut Component, target_idx: usize, is_pressed: bool) {
     apply_hover_recursive(root, target_idx, is_pressed, &mut counter);
 }
 
-fn apply_hover_recursive(comp: &mut Component, target_idx: usize, is_pressed: bool, counter: &mut usize) {
+fn apply_hover_recursive(
+    comp: &mut Component,
+    target_idx: usize,
+    is_pressed: bool,
+    counter: &mut usize,
+) {
     let my_idx = *counter;
     *counter += 1;
 
@@ -179,7 +196,10 @@ fn draw_hover_outline(pixmap: &mut Pixmap, rect: LayoutRect) {
         tiny_skia::Rect::from_xywh(rect.x, rect.y + rect.height - w, rect.width, w),
         tiny_skia::Rect::from_xywh(rect.x, rect.y, w, rect.height),
         tiny_skia::Rect::from_xywh(rect.x + rect.width - w, rect.y, w, rect.height),
-    ].into_iter().flatten() {
+    ]
+    .into_iter()
+    .flatten()
+    {
         pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
     }
 }
@@ -193,7 +213,10 @@ fn present_pixels(window: &Window, pixmap: &Pixmap, w: u32, h: u32) {
         Ok(s) => s,
         Err(_) => return,
     };
-    if surface.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap()).is_err() {
+    if surface
+        .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
+        .is_err()
+    {
         return;
     }
     let mut buffer = match surface.buffer_mut() {
@@ -250,49 +273,55 @@ impl ApplicationHandler for App {
                     self.hovered_index = new_hover;
                     if let Some(ref window) = self.window {
                         if new_hover.is_some() {
-                            window.set_cursor(winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer));
+                            window.set_cursor(winit::window::Cursor::Icon(
+                                winit::window::CursorIcon::Pointer,
+                            ));
                         } else {
-                            window.set_cursor(winit::window::Cursor::Icon(winit::window::CursorIcon::Default));
+                            window.set_cursor(winit::window::Cursor::Icon(
+                                winit::window::CursorIcon::Default,
+                            ));
                         }
                     }
                     self.request_repaint();
                 }
             }
 
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                match state {
-                    ElementState::Pressed => {
-                        self.ensure_layout();
-                        let hit = self.hit_test(self.mouse_x, self.mouse_y);
-                        if hit.is_some() {
-                            self.pressed_index = hit;
-                            self.request_repaint();
-                        }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => {
+                    self.ensure_layout();
+                    let hit = self.hit_test(self.mouse_x, self.mouse_y);
+                    if hit.is_some() {
+                        self.pressed_index = hit;
+                        self.request_repaint();
                     }
-                    ElementState::Released => {
-                        if let Some(pressed_idx) = self.pressed_index.take() {
-                            let current_hover = self.hit_test(self.mouse_x, self.mouse_y);
-                            if current_hover == Some(pressed_idx) {
-                                let flat = flatten_tree(&self.root);
-                                if let Some(&(kind, _)) = flat.get(pressed_idx) {
-                                    match kind {
-                                        ComponentKind::Button { label } => {
-                                            eprintln!("[W3C OS] Click → Button(\"{}\")", label);
-                                        }
-                                        ComponentKind::Text { content } => {
-                                            eprintln!("[W3C OS] Click → Text(\"{}\")", content);
-                                        }
-                                        _ => {
-                                            eprintln!("[W3C OS] Click → node #{}", pressed_idx);
-                                        }
+                }
+                ElementState::Released => {
+                    if let Some(pressed_idx) = self.pressed_index.take() {
+                        let current_hover = self.hit_test(self.mouse_x, self.mouse_y);
+                        if current_hover == Some(pressed_idx) {
+                            let flat = flatten_tree(&self.root);
+                            if let Some(&(kind, _)) = flat.get(pressed_idx) {
+                                match kind {
+                                    ComponentKind::Button { label } => {
+                                        eprintln!("[W3C OS] Click → Button(\"{}\")", label);
+                                    }
+                                    ComponentKind::Text { content } => {
+                                        eprintln!("[W3C OS] Click → Text(\"{}\")", content);
+                                    }
+                                    _ => {
+                                        eprintln!("[W3C OS] Click → node #{}", pressed_idx);
                                     }
                                 }
                             }
-                            self.request_repaint();
                         }
+                        self.request_repaint();
                     }
                 }
-            }
+            },
 
             _ => {}
         }

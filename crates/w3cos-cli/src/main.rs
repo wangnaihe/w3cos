@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use std::process::Command;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Parser)]
 #[command(
@@ -40,14 +40,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build { input, output, release } => {
+        Commands::Build {
+            input,
+            output,
+            release,
+        } => {
             build(&input, &output, release)?;
         }
         Commands::Run { input } => {
             let tmp = std::env::temp_dir().join("w3cos-run");
-            let bin = tmp.join("target")
-                .join("debug")
-                .join("w3cos-app");
+            let bin = tmp.join("target").join("debug").join("w3cos-app");
             build(&input, &bin, false)?;
             println!("▶  Running...");
             let status = Command::new(&bin)

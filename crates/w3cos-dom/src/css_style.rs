@@ -1,7 +1,7 @@
 use w3cos_std::color::Color;
 use w3cos_std::style::{
-    Style, Display, Position, FlexDirection, JustifyContent, AlignItems,
-    FlexWrap, Dimension, Edges, Overflow,
+    AlignItems, Dimension, Display, Edges, FlexDirection, FlexWrap, JustifyContent, Overflow,
+    Position, Style,
 };
 
 /// CSSStyleDeclaration — the `element.style` property.
@@ -13,7 +13,9 @@ pub struct CSSStyleDeclaration {
 
 impl CSSStyleDeclaration {
     pub fn new() -> Self {
-        Self { inner: Style::default() }
+        Self {
+            inner: Style::default(),
+        }
     }
 
     pub fn from_style(style: Style) -> Self {
@@ -25,20 +27,60 @@ impl CSSStyleDeclaration {
             "display" => self.inner.display = parse_display(value),
             "position" => self.inner.position = parse_position(value),
 
-            "flex-direction" | "flexDirection" => self.inner.flex_direction = parse_flex_direction(value),
-            "justify-content" | "justifyContent" => self.inner.justify_content = parse_justify_content(value),
+            "flex-direction" | "flexDirection" => {
+                self.inner.flex_direction = parse_flex_direction(value)
+            }
+            "justify-content" | "justifyContent" => {
+                self.inner.justify_content = parse_justify_content(value)
+            }
             "align-items" | "alignItems" => self.inner.align_items = parse_align_items(value),
             "flex-wrap" | "flexWrap" => self.inner.flex_wrap = parse_flex_wrap(value),
-            "flex-grow" | "flexGrow" => if let Ok(v) = value.parse() { self.inner.flex_grow = v },
-            "flex-shrink" | "flexShrink" => if let Ok(v) = value.parse() { self.inner.flex_shrink = v },
+            "flex-grow" | "flexGrow" => {
+                if let Ok(v) = value.parse() {
+                    self.inner.flex_grow = v
+                }
+            }
+            "flex-shrink" | "flexShrink" => {
+                if let Ok(v) = value.parse() {
+                    self.inner.flex_shrink = v
+                }
+            }
 
-            "gap" => if let Some(v) = parse_px(value) { self.inner.gap = v },
-            "padding" => if let Some(v) = parse_px(value) { self.inner.padding = Edges::all(v) },
-            "padding-top" | "paddingTop" => if let Some(v) = parse_px(value) { self.inner.padding.top = v },
-            "padding-right" | "paddingRight" => if let Some(v) = parse_px(value) { self.inner.padding.right = v },
-            "padding-bottom" | "paddingBottom" => if let Some(v) = parse_px(value) { self.inner.padding.bottom = v },
-            "padding-left" | "paddingLeft" => if let Some(v) = parse_px(value) { self.inner.padding.left = v },
-            "margin" => if let Some(v) = parse_px(value) { self.inner.margin = Edges::all(v) },
+            "gap" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.gap = v
+                }
+            }
+            "padding" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.padding = Edges::all(v)
+                }
+            }
+            "padding-top" | "paddingTop" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.padding.top = v
+                }
+            }
+            "padding-right" | "paddingRight" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.padding.right = v
+                }
+            }
+            "padding-bottom" | "paddingBottom" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.padding.bottom = v
+                }
+            }
+            "padding-left" | "paddingLeft" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.padding.left = v
+                }
+            }
+            "margin" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.margin = Edges::all(v)
+                }
+            }
 
             "width" => self.inner.width = parse_dimension(value),
             "height" => self.inner.height = parse_dimension(value),
@@ -51,18 +93,44 @@ impl CSSStyleDeclaration {
             "right" => self.inner.right = parse_dimension(value),
             "bottom" => self.inner.bottom = parse_dimension(value),
             "left" => self.inner.left = parse_dimension(value),
-            "z-index" | "zIndex" => if let Ok(v) = value.parse() { self.inner.z_index = v },
+            "z-index" | "zIndex" => {
+                if let Ok(v) = value.parse() {
+                    self.inner.z_index = v
+                }
+            }
 
             "overflow" => self.inner.overflow = parse_overflow(value),
 
-            "background" | "background-color" | "backgroundColor" => self.inner.background = Color::from_hex(value),
+            "background" | "background-color" | "backgroundColor" => {
+                self.inner.background = Color::from_hex(value)
+            }
             "color" => self.inner.color = Color::from_hex(value),
-            "font-size" | "fontSize" => if let Some(v) = parse_px(value) { self.inner.font_size = v },
-            "font-weight" | "fontWeight" => if let Ok(v) = value.parse() { self.inner.font_weight = v },
-            "border-radius" | "borderRadius" => if let Some(v) = parse_px(value) { self.inner.border_radius = v },
-            "border-width" | "borderWidth" => if let Some(v) = parse_px(value) { self.inner.border_width = v },
+            "font-size" | "fontSize" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.font_size = v
+                }
+            }
+            "font-weight" | "fontWeight" => {
+                if let Ok(v) = value.parse() {
+                    self.inner.font_weight = v
+                }
+            }
+            "border-radius" | "borderRadius" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.border_radius = v
+                }
+            }
+            "border-width" | "borderWidth" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.border_width = v
+                }
+            }
             "border-color" | "borderColor" => self.inner.border_color = Color::from_hex(value),
-            "opacity" => if let Ok(v) = value.parse() { self.inner.opacity = v },
+            "opacity" => {
+                if let Ok(v) = value.parse() {
+                    self.inner.opacity = v
+                }
+            }
 
             // Box shadow: "offsetX offsetY blur spread color"
             "box-shadow" | "boxShadow" => {
@@ -88,7 +156,10 @@ impl CSSStyleDeclaration {
             "display" => format!("{:?}", self.inner.display).to_lowercase(),
             "position" => format!("{:?}", self.inner.position).to_lowercase(),
             "font-size" | "fontSize" => format!("{}px", self.inner.font_size),
-            "color" => format!("#{:02x}{:02x}{:02x}", self.inner.color.r, self.inner.color.g, self.inner.color.b),
+            "color" => format!(
+                "#{:02x}{:02x}{:02x}",
+                self.inner.color.r, self.inner.color.g, self.inner.color.b
+            ),
             "opacity" => format!("{}", self.inner.opacity),
             _ => String::new(),
         }
@@ -186,20 +257,46 @@ fn parse_overflow(value: &str) -> Overflow {
 
 fn parse_dimension(value: &str) -> Dimension {
     let v = value.trim();
-    if v == "auto" { return Dimension::Auto; }
-    if let Some(n) = v.strip_suffix("rem") { if let Ok(n) = n.trim().parse() { return Dimension::Rem(n); } }
-    if let Some(n) = v.strip_suffix("em") { if let Ok(n) = n.trim().parse() { return Dimension::Em(n); } }
-    if let Some(n) = v.strip_suffix("vw") { if let Ok(n) = n.trim().parse() { return Dimension::Vw(n); } }
-    if let Some(n) = v.strip_suffix("vh") { if let Ok(n) = n.trim().parse() { return Dimension::Vh(n); } }
-    if let Some(n) = v.strip_suffix('%') { if let Ok(n) = n.trim().parse() { return Dimension::Percent(n); } }
-    if let Some(px) = parse_px(v) { return Dimension::Px(px); }
+    if v == "auto" {
+        return Dimension::Auto;
+    }
+    if let Some(n) = v.strip_suffix("rem")
+        && let Ok(n) = n.trim().parse()
+    {
+        return Dimension::Rem(n);
+    }
+    if let Some(n) = v.strip_suffix("em")
+        && let Ok(n) = n.trim().parse()
+    {
+        return Dimension::Em(n);
+    }
+    if let Some(n) = v.strip_suffix("vw")
+        && let Ok(n) = n.trim().parse()
+    {
+        return Dimension::Vw(n);
+    }
+    if let Some(n) = v.strip_suffix("vh")
+        && let Ok(n) = n.trim().parse()
+    {
+        return Dimension::Vh(n);
+    }
+    if let Some(n) = v.strip_suffix('%')
+        && let Ok(n) = n.trim().parse()
+    {
+        return Dimension::Percent(n);
+    }
+    if let Some(px) = parse_px(v) {
+        return Dimension::Px(px);
+    }
     Dimension::Auto
 }
 
 fn parse_box_shadow(value: &str) -> Option<w3cos_std::style::BoxShadow> {
     // Format: "4px 4px 10px 0px rgba(0,0,0,0.5)" or "4 4 10 0 #000000"
     let parts: Vec<&str> = value.trim().splitn(5, ' ').collect();
-    if parts.len() < 4 { return None; }
+    if parts.len() < 4 {
+        return None;
+    }
     let ox = parse_px(parts[0])?;
     let oy = parse_px(parts[1])?;
     let blur = parse_px(parts[2])?;
@@ -209,7 +306,13 @@ fn parse_box_shadow(value: &str) -> Option<w3cos_std::style::BoxShadow> {
     } else {
         Color::rgba(0, 0, 0, 80)
     };
-    Some(w3cos_std::style::BoxShadow::new(ox, oy, blur, spread.unwrap_or(0.0), color))
+    Some(w3cos_std::style::BoxShadow::new(
+        ox,
+        oy,
+        blur,
+        spread.unwrap_or(0.0),
+        color,
+    ))
 }
 
 fn parse_transform(value: &str) -> w3cos_std::style::Transform2D {
@@ -226,28 +329,43 @@ fn parse_transform(value: &str) -> w3cos_std::style::Transform2D {
     // translate(10px, 20px)
     if let Some(inner) = extract_fn(v, "translate") {
         let parts: Vec<&str> = inner.split(',').collect();
-        if let Some(x) = parts.first().and_then(|s| parse_px(s.trim())) { t.translate_x = x; }
-        if let Some(y) = parts.get(1).and_then(|s| parse_px(s.trim())) { t.translate_y = y; }
+        if let Some(x) = parts.first().and_then(|s| parse_px(s.trim())) {
+            t.translate_x = x;
+        }
+        if let Some(y) = parts.get(1).and_then(|s| parse_px(s.trim())) {
+            t.translate_y = y;
+        }
     }
     // scale(1.5) or scale(1.5, 2.0)
     if let Some(inner) = extract_fn(v, "scale") {
         let parts: Vec<&str> = inner.split(',').collect();
         if let Ok(sx) = parts[0].trim().parse::<f32>() {
             t.scale_x = sx;
-            t.scale_y = parts.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(sx);
+            t.scale_y = parts
+                .get(1)
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(sx);
         }
     }
-    if let Some(inner) = extract_fn(v, "scaleX") {
-        if let Ok(s) = inner.trim().parse::<f32>() { t.scale_x = s; }
+    if let Some(inner) = extract_fn(v, "scaleX")
+        && let Ok(s) = inner.trim().parse::<f32>()
+    {
+        t.scale_x = s;
     }
-    if let Some(inner) = extract_fn(v, "scaleY") {
-        if let Ok(s) = inner.trim().parse::<f32>() { t.scale_y = s; }
+    if let Some(inner) = extract_fn(v, "scaleY")
+        && let Ok(s) = inner.trim().parse::<f32>()
+    {
+        t.scale_y = s;
     }
     // rotate(45deg)
     if let Some(inner) = extract_fn(v, "rotate") {
         let deg_str = inner.trim().trim_end_matches("deg").trim_end_matches("rad");
         if let Ok(d) = deg_str.parse::<f32>() {
-            t.rotate_deg = if inner.contains("rad") { d.to_degrees() } else { d };
+            t.rotate_deg = if inner.contains("rad") {
+                d.to_degrees()
+            } else {
+                d
+            };
         }
     }
 
@@ -263,9 +381,11 @@ fn extract_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn parse_transition(value: &str) -> Option<w3cos_std::style::Transition> {
-    use w3cos_std::style::{Transition, TransitionProperty, Easing};
-    let parts: Vec<&str> = value.trim().split_whitespace().collect();
-    if parts.is_empty() { return None; }
+    use w3cos_std::style::{Easing, Transition, TransitionProperty};
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
 
     let property = match parts[0] {
         "all" => TransitionProperty::All,
@@ -276,30 +396,48 @@ fn parse_transition(value: &str) -> Option<w3cos_std::style::Transition> {
         p => TransitionProperty::Custom(p.to_string()),
     };
 
-    let duration_ms = parts.get(1)
+    let duration_ms = parts
+        .get(1)
         .and_then(|s| {
-            if let Some(ms) = s.strip_suffix("ms") { ms.parse().ok() }
-            else if let Some(sec) = s.strip_suffix('s') { sec.parse::<f32>().ok().map(|v| (v * 1000.0) as u32) }
-            else { s.parse().ok() }
+            if let Some(ms) = s.strip_suffix("ms") {
+                ms.parse().ok()
+            } else if let Some(sec) = s.strip_suffix('s') {
+                sec.parse::<f32>().ok().map(|v| (v * 1000.0) as u32)
+            } else {
+                s.parse().ok()
+            }
         })
         .unwrap_or(300);
 
-    let easing = parts.get(2).map(|s| match *s {
-        "linear" => Easing::Linear,
-        "ease" => Easing::Ease,
-        "ease-in" => Easing::EaseIn,
-        "ease-out" => Easing::EaseOut,
-        "ease-in-out" => Easing::EaseInOut,
-        _ => Easing::Ease,
-    }).unwrap_or(Easing::Ease);
+    let easing = parts
+        .get(2)
+        .map(|s| match *s {
+            "linear" => Easing::Linear,
+            "ease" => Easing::Ease,
+            "ease-in" => Easing::EaseIn,
+            "ease-out" => Easing::EaseOut,
+            "ease-in-out" => Easing::EaseInOut,
+            _ => Easing::Ease,
+        })
+        .unwrap_or(Easing::Ease);
 
-    let delay_ms = parts.get(3)
+    let delay_ms = parts
+        .get(3)
         .and_then(|s| {
-            if let Some(ms) = s.strip_suffix("ms") { ms.parse().ok() }
-            else if let Some(sec) = s.strip_suffix('s') { sec.parse::<f32>().ok().map(|v| (v * 1000.0) as u32) }
-            else { None }
+            if let Some(ms) = s.strip_suffix("ms") {
+                ms.parse().ok()
+            } else if let Some(sec) = s.strip_suffix('s') {
+                sec.parse::<f32>().ok().map(|v| (v * 1000.0) as u32)
+            } else {
+                None
+            }
         })
         .unwrap_or(0);
 
-    Some(Transition { property, duration_ms, easing, delay_ms })
+    Some(Transition {
+        property,
+        duration_ms,
+        easing,
+        delay_ms,
+    })
 }

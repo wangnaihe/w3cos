@@ -107,11 +107,18 @@ impl AgentPermissions {
     }
 
     pub fn check_selector(&self, selector: &str) -> bool {
-        if self.blocked_selectors.iter().any(|s| selector.contains(s.as_str())) {
+        if self
+            .blocked_selectors
+            .iter()
+            .any(|s| selector.contains(s.as_str()))
+        {
             return false;
         }
         if !self.allowed_selectors.is_empty() {
-            return self.allowed_selectors.iter().any(|s| selector.contains(s.as_str()));
+            return self
+                .allowed_selectors
+                .iter()
+                .any(|s| selector.contains(s.as_str()));
         }
         true
     }

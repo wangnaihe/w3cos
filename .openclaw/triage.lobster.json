@@ -1,0 +1,46 @@
+{
+  "name": "issue-triage",
+  "description": "Triage a new GitHub issue: classify, label, and assess AI-readiness",
+  "trigger": "github.issues.opened",
+  "steps": [
+    {
+      "id": "read_issue",
+      "tool": "github",
+      "action": "get_issue",
+      "args": { "issue": "{{trigger.issue.number}}" }
+    },
+    {
+      "id": "read_architecture",
+      "tool": "fs",
+      "action": "read",
+      "args": { "path": "ARCHITECTURE.md" }
+    },
+    {
+      "id": "classify",
+      "tool": "llm-task",
+      "args": {
+        "prompt": "You are the W3C OS Management AI. Classify this GitHub issue.\n\nIssue #{{steps.read_issue.number}}: {{steps.read_issue.title}}\n\n{{steps.read_issue.body}}\n\nProject architecture:\n{{steps.read_architecture.content}}\n\nRespond with JSON:\n{\n  \"type\": \"bug\" | \"feature\" | \"task\" | \"question\",\n  \"module\": \"compiler\" | \"runtime\" | \"dom\" | \"ai-bridge\" | \"cli\" | \"system\" | \"std\" | \"other\",\n  \"difficulty\": \"low\" | \"medium\" | \"hard\",\n  \"ai_ready\": true | false,\n  \"ai_ready_reason\": \"why or why not\",\n  \"suggested_labels\": [\"label1\", \"label2\"]\n}",
+        "format": "json"
+      }
+    },
+    {
+      "id": "apply_labels",
+      "tool": "github",
+      "action": "add_labels",
+      "args": {
+        "issue": "{{trigger.issue.number}}",
+        "labels": "{{steps.classify.suggested_labels}}"
+      }
+    },
+    {
+      "id": "comment",
+      "tool": "github",
+      "action": "comment",
+      "approve": true,
+      "args": {
+        "issue": "{{trigger.issue.number}}",
+        "body": "**AI Triage**\n\n- Type: `{{steps.classify.type}}`\n- Module: `{{steps.classify.module}}`\n- Difficulty: `{{steps.classify.difficulty}}`\n- AI-Ready: {{steps.classify.ai_ready}}\n\n{{steps.classify.ai_ready_reason}}\n\n_Triaged by W3C OS Management AI via OpenClaw._"
+      }
+    }
+  ]
+}

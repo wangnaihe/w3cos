@@ -1,0 +1,21 @@
+{
+  "project": "w3cos",
+  "description": "W3C OS — AI-native operating system",
+  "repository": "https://github.com/wangnaihe/w3cos",
+  "ai_model_preferences": {
+    "triage": "claude-sonnet",
+    "code_review": "claude-sonnet",
+    "implementation": "claude-sonnet",
+    "testing": "claude-haiku"
+  },
+  "labels": {
+    "ai_ready": "ai-ready",
+    "ai_assigned": "ai-assigned",
+    "ai_pr": "ai-pr",
+    "needs_human": "needs-human"
+  },
+  "branch_prefix": "ai/",
+  "pr_prefix": "[AI]",
+  "auto_merge": false,
+  "require_human_approval": true
+}

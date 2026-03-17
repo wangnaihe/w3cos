@@ -18,6 +18,7 @@ pub enum EventType {
 }
 
 impl EventType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "click" => Some(Self::Click),
@@ -98,11 +99,19 @@ pub struct EventRegistry {
 
 impl EventRegistry {
     pub fn new() -> Self {
-        Self { listeners: Vec::new() }
+        Self {
+            listeners: Vec::new(),
+        }
     }
 
     pub fn add(&mut self, node: NodeId, event_type: EventType, handler: EventHandler) {
-        self.listeners.push((node, EventListener { event_type, handler }));
+        self.listeners.push((
+            node,
+            EventListener {
+                event_type,
+                handler,
+            },
+        ));
     }
 
     pub fn remove_all(&mut self, node: NodeId) {

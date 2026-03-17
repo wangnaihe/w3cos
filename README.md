@@ -1,5 +1,10 @@
 # W3C OS
 
+[![CI](https://github.com/wangnaihe/w3cos/actions/workflows/ci.yml/badge.svg)](https://github.com/wangnaihe/w3cos/actions/workflows/ci.yml)
+[![Build ISO](https://github.com/wangnaihe/w3cos/actions/workflows/build-iso.yml/badge.svg)](https://github.com/wangnaihe/w3cos/actions/workflows/build-iso.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
+
 **An AI-native operating system built on W3C standards. TypeScript + DOM compiled to native binaries. No browser. No V8.**
 
 ![W3C OS Demo](docs/screenshot.png)
@@ -176,20 +181,45 @@ w3cos/
 │   ├── scripts/           # build-iso.sh, run-qemu.sh
 │   └── INSTALL.md         # Installation guide
 ├── examples/              # 4 example applications
+├── .openclaw/             # OpenClaw + Lobster AI workflow configs
 ├── .devcontainer/         # One-click dev environment
 ├── Dockerfile             # Container build
 ├── ARCHITECTURE.md        # Full architecture document
+├── AI_DEVELOPMENT.md      # AI-driven development model
 ├── ROADMAP.md             # Phased development plan
 └── CONTRIBUTING.md        # How to contribute (AI + humans)
 ```
 
-## Contributing
+## AI-Driven Development
 
-This project is designed for **AI-assisted development**. See [CONTRIBUTING.md](CONTRIBUTING.md).
+W3C OS is built by AI agents, directed by humans.
 
-- **Humans**: File Issues, architecture decisions, security review
-- **AI agents**: Pick up `ai-ready` Issues, submit PRs, write tests
-- No AI compute or API keys provided — bring your own
+```
+Humans file Issues  →  Management AI triages  →  Contributor AI codes  →  Human approves
+```
+
+- **Humans**: File Issues, review PRs, make architecture decisions, sponsor tokens
+- **AI (Management)**: Triage issues, review PRs, run CI, manage releases
+- **AI (Contributor)**: Pick up `ai-ready` issues, implement features, write tests, submit PRs
+
+AI tokens are funded by community sponsors. Every dollar goes to AI compute.
+
+See [AI_DEVELOPMENT.md](AI_DEVELOPMENT.md) for the full model, and [CONTRIBUTING.md](CONTRIBUTING.md) to get involved.
+
+## Sponsor
+
+AI agents need tokens. Your sponsorship keeps development moving.
+
+[![Sponsor](https://img.shields.io/badge/sponsor-w3cos-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/wangnaihe)
+
+| Tier | Amount | Impact |
+|------|--------|--------|
+| Byte | $5/mo | ~1 AI-implemented issue/month |
+| Kilobyte | $25/mo | ~5 AI-implemented issues/month |
+| Megabyte | $100/mo | ~20 AI-implemented issues/month |
+| Gigabyte | $500/mo | Sustained AI development capacity |
+
+100% goes to AI compute. No human salaries. Fully transparent.
 
 ## License
 

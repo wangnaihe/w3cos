@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::color::Color;
+use serde::{Deserialize, Serialize};
 
 /// CSS Modern Subset — Flexbox, Grid, Block, Inline, and positioning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,8 +167,9 @@ pub enum FlexWrap {
     WrapReverse,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub enum Dimension {
+    #[default]
     Auto,
     Px(f32),
     Percent(f32),
@@ -176,12 +177,6 @@ pub enum Dimension {
     Em(f32),
     Vw(f32),
     Vh(f32),
-}
-
-impl Default for Dimension {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -193,14 +188,29 @@ pub struct Edges {
 }
 
 impl Edges {
-    pub const ZERO: Self = Self { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 };
+    pub const ZERO: Self = Self {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: 0.0,
+    };
 
     pub const fn all(v: f32) -> Self {
-        Self { top: v, right: v, bottom: v, left: v }
+        Self {
+            top: v,
+            right: v,
+            bottom: v,
+            left: v,
+        }
     }
 
     pub const fn xy(x: f32, y: f32) -> Self {
-        Self { top: y, right: x, bottom: y, left: x }
+        Self {
+            top: y,
+            right: x,
+            bottom: y,
+            left: x,
+        }
     }
 }
 
@@ -224,7 +234,14 @@ pub struct BoxShadow {
 
 impl BoxShadow {
     pub fn new(ox: f32, oy: f32, blur: f32, spread: f32, color: Color) -> Self {
-        Self { offset_x: ox, offset_y: oy, blur_radius: blur, spread_radius: spread, color, inset: false }
+        Self {
+            offset_x: ox,
+            offset_y: oy,
+            blur_radius: blur,
+            spread_radius: spread,
+            color,
+            inset: false,
+        }
     }
 }
 
@@ -241,20 +258,26 @@ pub struct Transform2D {
 
 impl Transform2D {
     pub const IDENTITY: Self = Self {
-        translate_x: 0.0, translate_y: 0.0,
-        scale_x: 1.0, scale_y: 1.0,
+        translate_x: 0.0,
+        translate_y: 0.0,
+        scale_x: 1.0,
+        scale_y: 1.0,
         rotate_deg: 0.0,
     };
 
     pub fn is_identity(&self) -> bool {
-        self.translate_x == 0.0 && self.translate_y == 0.0
-            && self.scale_x == 1.0 && self.scale_y == 1.0
+        self.translate_x == 0.0
+            && self.translate_y == 0.0
+            && self.scale_x == 1.0
+            && self.scale_y == 1.0
             && self.rotate_deg == 0.0
     }
 }
 
 impl Default for Transform2D {
-    fn default() -> Self { Self::IDENTITY }
+    fn default() -> Self {
+        Self::IDENTITY
+    }
 }
 
 // --- Transition ---
@@ -313,7 +336,14 @@ fn cubic_bezier(_x1: f32, y1: f32, _x2: f32, y2: f32, t: f32) -> f32 {
 // --- Dimension resolution ---
 
 impl Dimension {
-    pub fn resolve(&self, parent_size: f32, root_font_size: f32, local_font_size: f32, viewport_w: f32, viewport_h: f32) -> Option<f32> {
+    pub fn resolve(
+        &self,
+        parent_size: f32,
+        root_font_size: f32,
+        local_font_size: f32,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Option<f32> {
         match self {
             Dimension::Auto => None,
             Dimension::Px(v) => Some(*v),

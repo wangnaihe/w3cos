@@ -19,6 +19,19 @@ impl Color {
 
     pub fn from_hex(hex: &str) -> Self {
         let hex = hex.trim_start_matches('#');
+        let hex = if hex.len() == 3 {
+            format!(
+                "{}{}{}{}{}{}",
+                &hex[0..1],
+                &hex[0..1],
+                &hex[1..2],
+                &hex[1..2],
+                &hex[2..3],
+                &hex[2..3]
+            )
+        } else {
+            hex.to_string()
+        };
         let len = hex.len();
         match len {
             6 => {
@@ -36,6 +49,22 @@ impl Color {
             }
             _ => Self::rgb(0, 0, 0),
         }
+    }
+
+    pub fn from_named(name: &str) -> Option<Self> {
+        Some(match name.to_lowercase().as_str() {
+            "white" => Self::WHITE,
+            "black" => Self::BLACK,
+            "transparent" => Self::TRANSPARENT,
+            "red" => Self::rgb(255, 0, 0),
+            "green" => Self::rgb(0, 128, 0),
+            "blue" => Self::rgb(0, 0, 255),
+            "yellow" => Self::rgb(255, 255, 0),
+            "cyan" => Self::rgb(0, 255, 255),
+            "magenta" => Self::rgb(255, 0, 255),
+            "orange" => Self::rgb(255, 165, 0),
+            _ => return None,
+        })
     }
 
     pub const WHITE: Self = Self::rgb(255, 255, 255);

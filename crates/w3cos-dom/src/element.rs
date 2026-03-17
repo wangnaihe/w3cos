@@ -49,7 +49,9 @@ impl Element {
     }
 
     pub fn children(&self, doc: &Document) -> Vec<Element> {
-        doc.get_node(self.id).children.iter()
+        doc.get_node(self.id)
+            .children
+            .iter()
             .map(|&id| Element::new(id))
             .collect()
     }
@@ -73,13 +75,17 @@ impl Element {
     }
 
     pub fn get_attribute<'a>(&self, doc: &'a Document, name: &str) -> Option<&'a str> {
-        doc.get_node(self.id).attributes.iter()
+        doc.get_node(self.id)
+            .attributes
+            .iter()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     }
 
     pub fn remove_attribute(&self, doc: &mut Document, name: &str) {
-        doc.get_node_mut(self.id).attributes.retain(|(k, _)| k != name);
+        doc.get_node_mut(self.id)
+            .attributes
+            .retain(|(k, _)| k != name);
     }
 
     // --- classList ---
@@ -110,7 +116,9 @@ impl Element {
     }
 
     pub fn class_list_contains(&self, doc: &Document, class: &str) -> bool {
-        doc.get_node(self.id).class_list.contains(&class.to_string())
+        doc.get_node(self.id)
+            .class_list
+            .contains(&class.to_string())
     }
 
     // --- Style ---
@@ -143,7 +151,7 @@ impl Element {
 
 impl Clone for Element {
     fn clone(&self) -> Self {
-        Self { id: self.id }
+        *self
     }
 }
 

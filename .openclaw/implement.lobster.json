@@ -1,0 +1,81 @@
+{
+  "name": "ai-implement",
+  "description": "AI Contributor picks up an ai-ready issue and implements it",
+  "trigger": "manual",
+  "input": {
+    "issue_number": { "type": "number", "description": "GitHub issue number to implement" }
+  },
+  "steps": [
+    {
+      "id": "read_issue",
+      "tool": "github",
+      "action": "get_issue",
+      "args": { "issue": "{{input.issue_number}}" }
+    },
+    {
+      "id": "label_assigned",
+      "tool": "github",
+      "action": "add_labels",
+      "args": {
+        "issue": "{{input.issue_number}}",
+        "labels": ["ai-assigned"]
+      }
+    },
+    {
+      "id": "read_codebase",
+      "tool": "fs",
+      "action": "read_multiple",
+      "args": {
+        "paths": ["ARCHITECTURE.md", "ROADMAP.md", "crates/"]
+      }
+    },
+    {
+      "id": "plan",
+      "tool": "llm-task",
+      "args": {
+        "prompt": "You are a W3C OS Contributor AI. Plan the implementation for:\n\nIssue #{{steps.read_issue.number}}: {{steps.read_issue.title}}\n\n{{steps.read_issue.body}}\n\nCodebase context:\n{{steps.read_codebase.summary}}\n\nRespond with JSON:\n{\n  \"branch_name\": \"ai/{{input.issue_number}}-short-desc\",\n  \"files_to_modify\": [\"path1\", \"path2\"],\n  \"files_to_create\": [\"path1\"],\n  \"test_plan\": \"description of tests to add\",\n  \"implementation_steps\": [\"step1\", \"step2\"]\n}",
+        "format": "json"
+      }
+    },
+    {
+      "id": "review_plan",
+      "tool": "noop",
+      "approve": true,
+      "description": "Human reviews the implementation plan before AI starts coding"
+    },
+    {
+      "id": "create_branch",
+      "tool": "git",
+      "action": "create_branch",
+      "args": { "name": "{{steps.plan.branch_name}}" }
+    },
+    {
+      "id": "implement",
+      "tool": "cursor-agent",
+      "args": {
+        "task": "Implement the following plan for W3C OS issue #{{input.issue_number}}:\n\n{{steps.plan}}\n\nIssue: {{steps.read_issue.title}}\n{{steps.read_issue.body}}\n\nRules:\n- Write Rust code following existing patterns\n- Add tests for all new functionality\n- Run cargo check, clippy, fmt, test before finishing\n- Do not modify ARCHITECTURE.md"
+      }
+    },
+    {
+      "id": "verify",
+      "tool": "shell",
+      "action": "run",
+      "args": {
+        "command": "cargo check --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace"
+      }
+    },
+    {
+      "id": "open_pr",
+      "tool": "github",
+      "action": "create_pr",
+      "approve": true,
+      "args": {
+        "title": "[AI] {{steps.read_issue.title}}",
+        "body": "## Summary\n\nCloses #{{input.issue_number}}\n\n## Changes\n\n{{steps.plan.implementation_steps}}\n\n## Tests\n\n{{steps.plan.test_plan}}\n\n_Implemented by W3C OS Contributor AI via OpenClaw._",
+        "base": "main",
+        "head": "{{steps.plan.branch_name}}",
+        "labels": ["ai-pr"]
+      }
+    }
+  ]
+}
