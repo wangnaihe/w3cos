@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
+use fontdue::Font;
 
 /// Layer 3: Annotated screenshot API.
 /// For compatibility with external AI tools (Claude Computer Use, UI-TARS, etc.)
@@ -41,6 +43,12 @@ pub struct CaptureConfig {
     pub include_map: bool,
 }
 
+/// Font metrics for annotation rendering.
+const CIRCLE_RADIUS: f32 = 12.0;
+const CIRCLE_BG: Color = Color::from_rgba8(220, 50, 47, 230);
+const CIRCLE_STROKE: Color = Color::from_rgba8(255, 255, 255, 255);
+const TEXT_COLOR: Color = Color::from_rgba8(255, 255, 255, 255);
+
 /// Capture an annotated screenshot from a rendered pixmap.
 ///
 /// This takes the raw pixel buffer + layout info and produces:
@@ -51,11 +59,19 @@ pub fn capture(
     width: u32,
     height: u32,
     annotations: Vec<ElementAnnotation>,
-    _config: &CaptureConfig,
+    config: &CaptureConfig,
 ) -> AnnotatedScreenshot {
-    // For Phase 1: return raw pixels as PNG without drawing annotations.
-    // Phase 2 will draw numbered circles on the image.
-    let png_data = encode_png(pixels, width, height);
+    let mut pixmap = Pixmap::new(width, height, pixels).expect("invalid pixmap dimensions");
+
+    if config.annotate_interactive {
+        draw_annotations(&mut pixmap, &annotations);
+    }
+
+    if config.show_outlines {
+        draw_outlines(&mut pixmap, &annotations);
+    }
+
+    let png_data = encode_pixmap(&pixmap);
 
     AnnotatedScreenshot {
         png_data,
@@ -65,14 +81,110 @@ pub fn capture(
     }
 }
 
-fn encode_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+/// Draw numbered circle markers on interactive elements.
+fn draw_annotations(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
+    // Load embedded font (monospace fallback bitmap)
+    let font_data = include_bytes!("../../w3cos-runtime/assets/Inter-Regular.ttf");
+    let font = Font::from_bytes(font_data as &[u8], fontdue::FontSettings::default())
+        .expect("failed to load Inter font");
+
+    for ann in annotations.iter().filter(|a| a.interactive) {
+        let cx = ann.bounds[0] + ann.bounds[2] / 2.0;
+        let cy = ann.bounds[1] + ann.bounds[3] / 2.0;
+        let r = CIRCLE_RADIUS;
+
+        // Draw filled circle (background)
+        let mut paint = Paint::default();
+        paint.set_color(CIRCLE_BG);
+        paint.set_anti_alias(true);
+
+        let mut pb = PathBuilder::new();
+        pb.push_circle(cx, cy, r);
+        let path = pb.finish().unwrap();
+        pixmap.fill_path(&path, &paint, Transform::identity(), None);
+
+        // Draw circle stroke (white border)
+        let mut stroke = Paint::default();
+        stroke.set_color(CIRCLE_STROKE);
+        stroke.set_anti_alias(true);
+        let _ = pixmap.stroke_path(
+            &path,
+            &stroke,
+            &tiny_skia::Stroke::default(),
+            Transform::identity(),
+            None,
+        );
+
+        // Render number text
+        let text = ann.index.to_string();
+        draw_text(pixmap, &font, &text, cx, cy, r);
+    }
+}
+
+/// Draw text centered in a circle using fontdue rasterization.
+fn draw_text(pixmap: &mut Pixmap, font: &Font, text: &str, cx: f32, cy: f32, circle_r: f32) {
+    let font_size = circle_r * 1.2;
+    let (metrics, bitmap) = font.rasterize(text, font_size);
+
+    let text_w = metrics.advance_width;
+    let text_h = metrics.height as f32;
+
+    // Center text in the circle
+    let offset_x = cx - text_w / 2.0 - metrics.xmin as f32;
+    let offset_y = cy - text_h / 2.0 - metrics.ymin as f32;
+
+    for (glyph_x, glyph_y, width, height, coverage) in bitmap.iter() {
+        let px = (offset_x + *glyph_x as f32) as u32;
+        let py = (offset_y + *glyph_y as f32) as u32;
+        if px < pixmap.width() && py < pixmap.height() {
+            let alpha = (*coverage as f32 / 255.0).min(1.0);
+            let pixel = pixmap.pixel(px, py);
+            if let Some(px_data) = pixel {
+                let src = TEXT_COLOR;
+                let dst_a = px_data.a() as f32 / 255.0;
+                let r = ((src.r() as f32 * alpha + px_data.r() as f32 * dst_a * (1.0 - alpha)).min(255.0)) as u8;
+                let g = ((src.g() as f32 * alpha + px_data.g() as f32 * dst_a * (1.0 - alpha)).min(255.0)) as u8;
+                let b = ((src.b() as f32 * alpha + px_data.b() as f32 * dst_a * (1.0 - alpha)).min(255.0)) as u8;
+                let a = ((alpha + dst_a * (1.0 - alpha)).min(1.0) * 255.0) as u8;
+                let blended = tiny_skia::PremultipliedColorU8::from_rgba(r, g, b, a);
+                pixmap.pixels_mut()[(py as usize * pixmap.width() as usize + px as usize) * 4..][..4]
+                    .copy_from_slice(&blended.to_bytes());
+            }
+        }
+    }
+}
+
+/// Draw rectangular outlines around elements.
+fn draw_outlines(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(108, 92, 231, 80));
+    paint.set_anti_alias(true);
+
+    let stroke = tiny_skia::Stroke {
+        width: 1.0,
+        ..Default::default()
+    };
+
+    for ann in annotations {
+        if let Some(rect) = Rect::from_xywh(ann.bounds[0], ann.bounds[1], ann.bounds[2], ann.bounds[3])
+        {
+            let mut pb = PathBuilder::new();
+            pb.push_rect(rect);
+            if let Some(path) = pb.finish() {
+                let _ = pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+        }
+    }
+}
+
+fn encode_pixmap(pixmap: &Pixmap) -> Vec<u8> {
     let mut buf = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        let mut encoder = png::Encoder::new(&mut buf, pixmap.width(), pixmap.height());
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         if let Ok(mut writer) = encoder.write_header() {
-            let _ = writer.write_image_data(pixels);
+            let _ = writer.write_image_data(pixmap.data());
         }
     }
     buf
