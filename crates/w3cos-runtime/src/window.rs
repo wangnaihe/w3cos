@@ -6,6 +6,7 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use crate::animation::AnimationManager;
 use crate::layout::{self, LayoutRect};
 use crate::render;
 use w3cos_std::{Component, ComponentKind};
@@ -30,6 +31,7 @@ struct App {
     hit_nodes: Vec<HitNode>,
     layout_cache: Vec<(LayoutRect, usize)>,
     needs_layout: bool,
+    animation_manager: AnimationManager,
 }
 
 impl App {
@@ -48,6 +50,7 @@ impl App {
             hit_nodes: Vec::new(),
             layout_cache: Vec::new(),
             needs_layout: true,
+            animation_manager: AnimationManager::new(),
         }
     }
 
@@ -108,6 +111,12 @@ impl App {
                 hover_idx,
                 self.pressed_index == Some(hover_idx),
             );
+        }
+
+        // Tick animations and apply interpolated styles to render tree
+        let still_animating = self.animation_manager.tick_and_apply(&mut render_root);
+        if still_animating {
+            self.request_repaint();
         }
 
         let flat = flatten_tree(&render_root);
