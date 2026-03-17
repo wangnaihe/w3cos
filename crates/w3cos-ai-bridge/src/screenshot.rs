@@ -46,7 +46,7 @@ pub struct CaptureConfig {
 /// Circle radius for annotation markers.
 const CIRCLE_RADIUS: f32 = 12.0;
 
-/// Colors for annotation circles.
+/// Returns the background color for annotation circles.
 fn circle_bg() -> Color {
     Color::from_rgba8(220, 50, 47, 230)
 }
@@ -76,10 +76,18 @@ pub fn capture(
         }
     };
 
-    // Copy source pixels into the pixmap
+    // Copy source pixels into the pixmap.
+    // Pixmap stores PremultipliedColorU8 internally, but new pixmap starts zeroed,
+    // so we need to set each pixel from the raw RGBA source data.
     let dst = pixmap.pixels_mut();
-    let copy_len = (width as usize * height as usize * 4).min(pixels.len());
-    dst[..copy_len].copy_from_slice(&pixels[..copy_len]);
+    for i in 0..pixels.len().min(dst.len() / 4) {
+        dst[i] = tiny_skia::PremultipliedColorU8::from_rgba(
+            pixels[i * 4],
+            pixels[i * 4 + 1],
+            pixels[i * 4 + 2],
+            pixels[i * 4 + 3],
+        ).unwrap();
+    }
 
     if config.annotate_interactive {
         draw_annotations(&mut pixmap, &annotations);
@@ -118,7 +126,8 @@ fn draw_annotations(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
         let mut pb = PathBuilder::new();
         pb.push_circle(cx, cy, r);
         let path = pb.finish().unwrap();
-        pixmap.fill_path(&path, &paint, Transform::identity(), FillRule::Winding, None);
+        // fill_path signature: (path, paint, transform, mask, fill_rule)
+        pixmap.fill_path(&path, &paint, Transform::identity(), None, FillRule::Winding);
 
         // Render number text
         let text = ann.index.to_string();
@@ -130,45 +139,51 @@ fn draw_annotations(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
 /// Uses the same pixel blending approach as w3cos-runtime/src/render.rs.
 fn draw_text(pixmap: &mut Pixmap, font: &Font, text: &str, cx: f32, cy: f32, circle_r: f32) {
     let font_size = circle_r * 1.2;
-    let (metrics, bitmap) = font.rasterize(text, font_size);
+    // fontdue rasterize takes each char separately
+    let mut total_width = 0.0f32;
+    let mut glyphs: Vec<(fontdue::GlyphLayout, Vec<u8>)> = Vec::new();
+
+    for ch in text.chars() {
+        let (metrics, bitmap) = font.rasterize(ch, font_size);
+        glyphs.push((metrics, bitmap));
+        total_width += metrics.advance_width;
+    }
 
     let px_w = pixmap.width() as i32;
     let px_h = pixmap.height() as i32;
+    let total_height = glyphs.first().map(|(m, _)| m.height).unwrap_or(0) as f32;
+    let y_min = glyphs.first().map(|(m, _)| m.ymin).unwrap_or(0) as f32;
 
-    let offset_x = cx - metrics.advance_width / 2.0 - metrics.xmin as f32;
-    let offset_y = cy - metrics.height as f32 / 2.0 - metrics.ymin as f32;
+    let start_x = cx - total_width / 2.0;
+    let start_y = cy - total_height / 2.0 - y_min;
 
     // Source color (white text)
     let sr: u8 = 255;
     let sg: u8 = 255;
     let sb: u8 = 255;
 
-    let pixels = pixmap.pixels_mut();
-    for row in 0..metrics.height {
-        for col in 0..metrics.width {
-            let px = (offset_x + col as f32) as i32;
-            let py = (offset_y + row as f32) as i32;
-            if px < 0 || py < 0 || px >= px_w || py >= px_h {
-                continue;
-            }
-            let coverage = bitmap[row * metrics.width + col];
-            if coverage == 0 {
-                continue;
-            }
-            let idx = (py as usize * px_w as usize + px as usize) * 4;
-            let dst = tiny_skia::PremultipliedColorU8::from_rgba(
-                pixels[idx],
-                pixels[idx + 1],
-                pixels[idx + 2],
-                pixels[idx + 3],
-            ).unwrap();
+    let mut cursor_x = start_x;
 
-            let blended = blend_pixel(dst, sr, sg, sb, coverage);
-            pixels[idx] = blended;
-            pixels[idx + 1] = blended;
-            pixels[idx + 2] = blended;
-            pixels[idx + 3] = blended;
+    for (metrics, bitmap) in &glyphs {
+        for row in 0..metrics.height {
+            for col in 0..metrics.width {
+                let px = (cursor_x + col as f32) as i32;
+                let py = (start_y + row as f32) as i32;
+                if px < 0 || py < 0 || px >= px_w || py >= px_h {
+                    continue;
+                }
+                let coverage = bitmap[row * metrics.width + col];
+                if coverage == 0 {
+                    continue;
+                }
+                let idx = (py as usize * px_w as usize + px as usize);
+                let dst = pixmap.pixels_mut()[idx];
+
+                let blended = blend_pixel(dst, sr, sg, sb, coverage);
+                pixmap.pixels_mut()[idx] = blended;
+            }
         }
+        cursor_x += metrics.advance_width;
     }
 }
 
