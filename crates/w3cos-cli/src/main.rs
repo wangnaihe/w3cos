@@ -26,8 +26,15 @@ enum Commands {
         #[arg(short, long, default_value = "./app")]
         output: PathBuf,
         /// Build in release mode (optimized, smaller binary).
+        /// Enables --strip by default for smaller output.
         #[arg(long)]
         release: bool,
+        /// Strip debug symbols from the binary (enabled by default in release mode).
+        #[arg(long)]
+        strip: bool,
+        /// Enable Link-Time Optimization for smaller, faster binaries.
+        #[arg(long)]
+        lto: bool,
     },
     /// Compile and immediately run the application.
     Run {
@@ -44,13 +51,17 @@ fn main() -> Result<()> {
             input,
             output,
             release,
+            strip,
+            lto,
         } => {
-            build(&input, &output, release)?;
+            // Enable strip by default in release mode unless explicitly disabled
+            let strip = if release && !strip { Some(true) } else if strip { Some(true) } else { None };
+            build(&input, &output, release, strip, lto)?;
         }
         Commands::Run { input } => {
             let tmp = std::env::temp_dir().join("w3cos-run");
             let bin = tmp.join("target").join("debug").join("w3cos-app");
-            build(&input, &bin, false)?;
+            build(&input, &bin, false, None, false)?;
             println!("▶  Running...");
             let status = Command::new(&bin)
                 .status()
@@ -62,7 +73,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build(input: &PathBuf, output: &PathBuf, release: bool) -> Result<()> {
+fn build(input: &PathBuf, output: &PathBuf, release: bool, strip: Option<bool>, lto: bool) -> Result<()> {
     let source = std::fs::read_to_string(input)
         .with_context(|| format!("Could not read {}", input.display()))?;
 
@@ -79,6 +90,16 @@ fn build(input: &PathBuf, output: &PathBuf, release: bool) -> Result<()> {
     cmd.arg("build").current_dir(&build_dir);
     if release {
         cmd.arg("--release");
+    }
+    if strip.unwrap_or(false) {
+        cmd.env("CARGO_PROFILE_RELEASE_STRIP", "true");
+        cmd.env("CARGO_PROFILE_DEBUG_STRIP", "true");
+        println!("  📦 Strip: enabled");
+    }
+    if lto {
+        cmd.env("CARGO_PROFILE_RELEASE_LTO", "true");
+        cmd.env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+        println!("  📦 LTO: enabled (codegen-units=1)");
     }
 
     let status = cmd.status().context("cargo build failed")?;
