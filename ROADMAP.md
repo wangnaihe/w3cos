@@ -20,18 +20,18 @@
 - [x] Buildroot config + QEMU scripts + INSTALL.md
 - [x] ARCHITECTURE.md, README.md, CONTRIBUTING.md, ISSUES.md
 
-## Phase 1 — Interactive Apps
-- [ ] Reactive state system (signal/memo/effect)
-- [ ] Event handlers in TS (onClick, onInput compiled to Rust callbacks)
-- [ ] TSX syntax support (via SWC integration)
-- [ ] Text input component
-- [ ] display: inline / inline-block (Parley text reflow integration)
-- [ ] position: fixed / sticky
-- [ ] CSS transitions (animated with frame loop)
-- [ ] @keyframes animation
-- [ ] Scroll support (overflow: scroll with mouse wheel)
-- [ ] Image component (PNG/JPEG decoding)
-- [ ] Focus management + keyboard navigation
+## Phase 1 — Interactive Apps ✅
+- [x] Reactive state system (signal/create_signal/get_signal/set_signal)
+- [x] Event handlers in TSX (onClick compiled to EventAction)
+- [x] TSX syntax support (built-in parser, SWC integration planned #10)
+- [x] Text input component (TextInput with keyboard input)
+- [x] display: inline / inline-block (Taffy flex approximation)
+- [x] position: fixed / sticky
+- [x] CSS transitions (animated with 60fps frame loop)
+- [ ] @keyframes animation (#11)
+- [x] Scroll support (overflow: scroll with mouse wheel)
+- [x] Image component (placeholder rendering, full decode #2)
+- [x] Focus management + keyboard navigation (Tab/Shift+Tab)
 
 ## Phase 2 — Production Quality
 - [ ] GPU rendering (Vello + wgpu — replace tiny-skia)
