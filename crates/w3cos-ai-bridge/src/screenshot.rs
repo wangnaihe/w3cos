@@ -97,6 +97,7 @@ pub fn capture(
         draw_outlines(&mut pixmap, &annotations);
     }
 
+    // Encode pixmap to PNG bytes.
     let png_data = encode_pixmap(&pixmap);
 
     AnnotatedScreenshot {
@@ -235,16 +236,12 @@ fn draw_outlines(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
 }
 
 fn encode_pixmap(pixmap: &Pixmap) -> Vec<u8> {
-    let mut buf = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut buf, pixmap.width(), pixmap.height());
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        if let Ok(mut writer) = encoder.write_header() {
-            let _ = writer.write_image_data(pixmap.data());
-        }
-    }
-    buf
+    // Use Pixmap::save_png via temp file since data() returns premultiplied pixels
+    let tmp_path = format!("/tmp/w3cos-screenshot-{}.png", std::process::id());
+    pixmap.save_png(&tmp_path).ok();
+    let data = std::fs::read(&tmp_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp_path);
+    data
 }
 
 fn encode_raw_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
