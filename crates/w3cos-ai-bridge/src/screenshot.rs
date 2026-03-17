@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
+use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Rect, Transform};
 use fontdue::Font;
 
 /// Layer 3: Annotated screenshot API.
@@ -46,8 +46,6 @@ pub struct CaptureConfig {
 /// Font metrics for annotation rendering.
 const CIRCLE_RADIUS: f32 = 12.0;
 const CIRCLE_BG: Color = Color::from_rgba8(220, 50, 47, 230);
-const CIRCLE_STROKE: Color = Color::from_rgba8(255, 255, 255, 255);
-const TEXT_COLOR: Color = Color::from_rgba8(255, 255, 255, 255);
 
 /// Capture an annotated screenshot from a rendered pixmap.
 ///
@@ -120,18 +118,6 @@ fn draw_annotations(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
         let path = pb.finish().unwrap();
         pixmap.fill_path(&path, &paint, Transform::identity(), None);
 
-        // Draw circle stroke (white border)
-        let mut stroke = Paint::default();
-        stroke.set_color(CIRCLE_STROKE);
-        stroke.anti_alias = true;
-        let _ = pixmap.stroke_path(
-            &path,
-            &stroke,
-            &tiny_skia::Stroke::default(),
-            Transform::identity(),
-            None,
-        );
-
         // Render number text
         let text = ann.index.to_string();
         draw_text(pixmap, &font, &text, cx, cy, r);
@@ -139,35 +125,74 @@ fn draw_annotations(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
 }
 
 /// Draw text centered in a circle using fontdue rasterization.
+/// Uses the same pixel blending approach as w3cos-runtime/src/render.rs.
 fn draw_text(pixmap: &mut Pixmap, font: &Font, text: &str, cx: f32, cy: f32, circle_r: f32) {
     let font_size = circle_r * 1.2;
     let (metrics, bitmap) = font.rasterize(text, font_size);
 
-    let text_w = metrics.advance_width;
-    let text_h = metrics.height as f32;
+    let px_w = pixmap.width() as i32;
+    let px_h = pixmap.height() as i32;
 
-    // Center text in the circle
-    let offset_x = cx - text_w / 2.0 - metrics.xmin as f32;
-    let offset_y = cy - text_h / 2.0 - metrics.ymin as f32;
+    let offset_x = cx - metrics.advance_width / 2.0 - metrics.xmin as f32;
+    let offset_y = cy - metrics.height as f32 / 2.0 - metrics.ymin as f32;
 
-    for (glyph_x, glyph_y, width, height, coverage) in bitmap.iter() {
-        let px = (offset_x + *glyph_x as f32) as u32;
-        let py = (offset_y + *glyph_y as f32) as u32;
-        if px < pixmap.width() && py < pixmap.height() {
-            let alpha = (*coverage as f32 / 255.0).min(1.0);
-            let pixel = pixmap.pixel(px, py);
-            if let Some(px_data) = pixel {
-                let dst_a = px_data.a() as f32 / 255.0;
-                let r = ((TEXT_COLOR.to_rgba8().0 as f32 * alpha + px_data.red() as f32 * dst_a * (1.0 - alpha)).min(255.0)) as u8;
-                let g = ((TEXT_COLOR.to_rgba8().1 as f32 * alpha + px_data.green() as f32 * dst_a * (1.0 - alpha)).min(255.0)) as u8;
-                let b = ((TEXT_COLOR.to_rgba8().2 as f32 * alpha + px_data.blue() as f32 * dst_a * (1.0 - alpha)).min(255.0)) as u8;
-                let a = ((alpha + dst_a * (1.0 - alpha)).min(1.0) * 255.0) as u8;
-                let blended = tiny_skia::PremultipliedColorU8::from_rgba(r, g, b, a);
-                pixmap.pixels_mut()[(py as usize * pixmap.width() as usize + px as usize) * 4..][..4]
-                    .copy_from_slice(&blended.to_bytes());
+    // Source color (white text)
+    let sr: u8 = 255;
+    let sg: u8 = 255;
+    let sb: u8 = 255;
+
+    let pixels = pixmap.pixels_mut();
+    for row in 0..metrics.height {
+        for col in 0..metrics.width {
+            let px = (offset_x + col as f32) as i32;
+            let py = (offset_y + row as f32) as i32;
+            if px < 0 || py < 0 || px >= px_w || py >= px_h {
+                continue;
             }
+            let coverage = bitmap[row * metrics.width + col];
+            if coverage == 0 {
+                continue;
+            }
+            let idx = (py as usize * px_w as usize + px as usize) * 4;
+            let dst = tiny_skia::PremultipliedColorU8::from_rgba(
+                pixels[idx],
+                pixels[idx + 1],
+                pixels[idx + 2],
+                pixels[idx + 3],
+            ).unwrap();
+
+            let blended = blend_pixel(dst, sr, sg, sb, coverage);
+            let out = blended.to_bytes();
+            pixels[idx] = out[0];
+            pixels[idx + 1] = out[1];
+            pixels[idx + 2] = out[2];
+            pixels[idx + 3] = out[3];
         }
     }
+}
+
+/// Blend a source color with alpha coverage over a destination pixel.
+/// Same approach as w3cos-runtime/src/render.rs::blend_pixel.
+fn blend_pixel(
+    dst: tiny_skia::PremultipliedColorU8,
+    sr: u8,
+    sg: u8,
+    sb: u8,
+    sa: u8,
+) -> tiny_skia::PremultipliedColorU8 {
+    let da = dst.alpha() as u16;
+    let dr = dst.red() as u16;
+    let dg = dst.green() as u16;
+    let db = dst.blue() as u16;
+    let sa16 = sa as u16;
+    let inv = 255 - sa16;
+
+    let out_a = (sa16 + da * inv / 255).min(255) as u8;
+    let out_r = (sr as u16 * sa16 / 255 + dr * inv / 255).min(255) as u8;
+    let out_g = (sg as u16 * sa16 / 255 + dg * inv / 255).min(255) as u8;
+    let out_b = (sb as u16 * sa16 / 255 + db * inv / 255).min(255) as u8;
+
+    tiny_skia::PremultipliedColorU8::from_rgba(out_r, out_g, out_b, out_a).unwrap()
 }
 
 /// Draw rectangular outlines around elements.
