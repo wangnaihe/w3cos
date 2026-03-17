@@ -93,6 +93,8 @@ Power On
 | GPU | Framebuffer (any) | Intel/AMD with mesa support |
 | Network | Optional | Ethernet or supported WiFi |
 
+> **Note**: W3C OS currently supports **x86_64 only**. ARM64 cross-compilation and Android container support (via Waydroid) are planned for Phase 3 — see [ROADMAP.md](/ROADMAP.md). Mobile phone flashing is not yet supported.
+
 ## Remote Access (for AI Agents)
 
 The ISO includes an SSH server. After booting:

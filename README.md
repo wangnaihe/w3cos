@@ -91,12 +91,23 @@ Three access levels for AI agents:
 
 W3C OS can boot as a standalone operating system — directly into the W3C OS Shell.
 
+### Build the bootable ISO
+
+```bash
+# Prerequisites (Linux): build-essential, ncurses-dev, wget, python3
+# On macOS, the script will automatically use Docker for cross-compilation.
+
+./system/scripts/build-iso.sh    # Output: w3cos.iso (~50-100 MB)
+```
+
+### Run
+
 ```bash
 # Option 1: QEMU virtual machine
 qemu-system-x86_64 -cdrom w3cos.iso -m 2G -vga virtio
 
 # Option 2: Flash to USB and boot real hardware
-sudo dd if=w3cos.iso of=/dev/sdX bs=4M
+sudo dd if=w3cos.iso of=/dev/sdX bs=4M status=progress
 
 # Option 3: Docker (compile apps, no GUI)
 docker build -t w3cos . && docker run w3cos --help
