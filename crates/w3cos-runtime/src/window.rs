@@ -113,12 +113,6 @@ impl App {
             );
         }
 
-        // Tick animations and apply interpolated styles to render tree
-        let still_animating = self.animation_manager.tick_and_apply(&mut render_root);
-        if still_animating {
-            self.request_repaint();
-        }
-
         let flat = flatten_tree(&render_root);
         let render_nodes: Vec<(LayoutRect, &ComponentKind, &w3cos_std::style::Style)> = self
             .layout_cache
@@ -262,7 +256,12 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                // Process transitions before paint
+                let still_animating = self.animation_manager.tick_and_apply(&mut self.root);
                 self.paint();
+                if still_animating {
+                    self.request_repaint();
+                }
             }
 
             WindowEvent::Resized(_) => {
