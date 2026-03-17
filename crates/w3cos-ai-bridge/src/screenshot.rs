@@ -127,7 +127,7 @@ fn draw_annotations(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
         pb.push_circle(cx, cy, r);
         let path = pb.finish().unwrap();
         // fill_path signature: (path, paint, transform, mask, fill_rule)
-        pixmap.fill_path(&path, &paint, Transform::identity(), None, FillRule::Winding);
+        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 
         // Render number text
         let text = ann.index.to_string();
