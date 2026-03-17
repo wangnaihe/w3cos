@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Rect, Transform};
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
 use fontdue::Font;
 
 /// Layer 3: Annotated screenshot API.
@@ -43,9 +43,13 @@ pub struct CaptureConfig {
     pub include_map: bool,
 }
 
-/// Font metrics for annotation rendering.
+/// Circle radius for annotation markers.
 const CIRCLE_RADIUS: f32 = 12.0;
-const CIRCLE_BG: Color = Color::from_rgba8(220, 50, 47, 230);
+
+/// Colors for annotation circles.
+fn circle_bg() -> Color {
+    Color::from_rgba8(220, 50, 47, 230)
+}
 
 /// Capture an annotated screenshot from a rendered pixmap.
 ///
@@ -62,7 +66,6 @@ pub fn capture(
     let mut pixmap = match Pixmap::new(width, height) {
         Some(p) => p,
         None => {
-            // Fallback: return raw PNG without annotations
             let png_data = encode_raw_png(pixels, width, height);
             return AnnotatedScreenshot {
                 png_data,
@@ -98,7 +101,6 @@ pub fn capture(
 
 /// Draw numbered circle markers on interactive elements.
 fn draw_annotations(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
-    // Load embedded font (monospace fallback bitmap)
     let font_data = include_bytes!("../../w3cos-runtime/assets/Inter-Regular.ttf");
     let font = Font::from_bytes(font_data as &[u8], fontdue::FontSettings::default())
         .expect("failed to load Inter font");
@@ -108,15 +110,15 @@ fn draw_annotations(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
         let cy = ann.bounds[1] + ann.bounds[3] / 2.0;
         let r = CIRCLE_RADIUS;
 
-        // Draw filled circle (background)
+        // Draw filled circle
         let mut paint = Paint::default();
-        paint.set_color(CIRCLE_BG);
+        paint.set_color(circle_bg());
         paint.anti_alias = true;
 
         let mut pb = PathBuilder::new();
         pb.push_circle(cx, cy, r);
         let path = pb.finish().unwrap();
-        pixmap.fill_path(&path, &paint, Transform::identity(), None);
+        pixmap.fill_path(&path, &paint, Transform::identity(), FillRule::Winding, None);
 
         // Render number text
         let text = ann.index.to_string();
@@ -162,11 +164,10 @@ fn draw_text(pixmap: &mut Pixmap, font: &Font, text: &str, cx: f32, cy: f32, cir
             ).unwrap();
 
             let blended = blend_pixel(dst, sr, sg, sb, coverage);
-            let out = blended.to_bytes();
-            pixels[idx] = out[0];
-            pixels[idx + 1] = out[1];
-            pixels[idx + 2] = out[2];
-            pixels[idx + 3] = out[3];
+            pixels[idx] = blended;
+            pixels[idx + 1] = blended;
+            pixels[idx + 2] = blended;
+            pixels[idx + 3] = blended;
         }
     }
 }
