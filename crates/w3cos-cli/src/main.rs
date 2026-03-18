@@ -55,7 +55,7 @@ fn main() -> Result<()> {
             lto,
         } => {
             // Enable strip by default in release mode unless explicitly disabled
-            let strip = if release && !strip { Some(true) } else if strip { Some(true) } else { None };
+            let strip = if release || strip { Some(true) } else { None };
             build(&input, &output, release, strip, lto)?;
         }
         Commands::Run { input } => {
