@@ -16,3 +16,5 @@ winit = { workspace = true }
 softbuffer = { workspace = true }
 anyhow = { workspace = true }
 image = { workspace = true }
+notify-rust = "4"
+arboard = "3.6.1"

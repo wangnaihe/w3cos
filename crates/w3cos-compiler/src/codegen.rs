@@ -188,6 +188,18 @@ fn gen_text_expr(text: &str, signal_names: &[&str]) -> String {
 
 fn gen_event_action(action_str: &str, signal_names: &[&str]) -> String {
     let parts: Vec<&str> = action_str.split(':').collect();
+    if !parts.is_empty() && parts[0].trim() == "notify" {
+        if parts.len() < 3 {
+            return "EventAction::None".to_string();
+        }
+        let title = parts[1].trim();
+        let body = parts[2..].join(":");
+        return format!(
+            "EventAction::Notify({:?}.to_string(), {:?}.to_string())",
+            title, body
+        );
+    }
+
     if parts.len() < 2 {
         return "EventAction::None".to_string();
     }

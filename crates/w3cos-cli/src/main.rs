@@ -73,7 +73,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build(input: &PathBuf, output: &PathBuf, release: bool, strip: Option<bool>, lto: bool) -> Result<()> {
+fn build(
+    input: &PathBuf,
+    output: &PathBuf,
+    release: bool,
+    strip: Option<bool>,
+    lto: bool,
+) -> Result<()> {
     let source = std::fs::read_to_string(input)
         .with_context(|| format!("Could not read {}", input.display()))?;
 

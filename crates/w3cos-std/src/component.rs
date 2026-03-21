@@ -11,6 +11,7 @@ pub enum EventAction {
     Decrement(usize),
     Set(usize, i64),
     Toggle(usize),
+    Notify(String, String),
 }
 
 impl EventAction {

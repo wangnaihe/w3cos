@@ -86,6 +86,9 @@ pub fn execute_action(action: &w3cos_std::EventAction) {
             let val = get_signal(*id);
             set_signal(*id, if val == 0 { 1 } else { 0 });
         }
+        w3cos_std::EventAction::Notify(title, body) => {
+            crate::notification::show(title, body);
+        }
     }
 }
 
