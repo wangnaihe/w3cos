@@ -13,3 +13,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 png = { workspace = true }
+tiny-skia = { workspace = true }
+fontdue = { workspace = true }
