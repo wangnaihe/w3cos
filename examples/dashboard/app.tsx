@@ -6,7 +6,6 @@ export default
     <Text style={{ fontSize: 20, color: "#f8fafc", fontWeight: 700 }}>Dashboard</Text>
     <Text style={{ fontSize: 14, color: "#64748b" }}>v0.1.0</Text>
   </Row>
-
   <Row style={{ gap: 16, padding: 24 }}>
     <Column style={{ padding: 20, background: "#1e293b", borderRadius: 12, flexGrow: 1 }}>
       <Text style={{ fontSize: 14, color: "#94a3b8" }}>Users</Text>
@@ -24,7 +23,6 @@ export default
       <Text style={{ fontSize: 14, color: "#f87171" }}>-2.1%</Text>
     </Column>
   </Row>
-
   <Column style={{ padding: 24, gap: 12 }}>
     <Text style={{ fontSize: 18, color: "#f8fafc", fontWeight: 700 }}>Recent Activity</Text>
     <Row style={{ padding: 12, background: "#1e293b", borderRadius: 8, justifyContent: "spaceBetween" }}>
