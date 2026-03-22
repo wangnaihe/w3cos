@@ -76,17 +76,13 @@ pub fn capture(
         }
     };
 
-    // Copy source pixels into the pixmap.
-    // Pixmap stores PremultipliedColorU8 internally, but new pixmap starts zeroed,
-    // so we need to set each pixel from the raw RGBA source data.
-    let dst = pixmap.pixels_mut();
-    for i in 0..pixels.len().min(dst.len() / 4) {
-        dst[i] = tiny_skia::PremultipliedColorU8::from_rgba(
-            pixels[i * 4],
-            pixels[i * 4 + 1],
-            pixels[i * 4 + 2],
-            pixels[i * 4 + 3],
-        ).unwrap();
+    let expected_len = (width * height * 4) as usize;
+    let dst = pixmap.data_mut();
+    if pixels.len() >= expected_len && dst.len() >= expected_len {
+        dst[..expected_len].copy_from_slice(&pixels[..expected_len]);
+    } else {
+        let n = pixels.len().min(dst.len());
+        dst[..n].copy_from_slice(&pixels[..n]);
     }
 
     if config.annotate_interactive {
@@ -142,7 +138,7 @@ fn draw_text(pixmap: &mut Pixmap, font: &Font, text: &str, cx: f32, cy: f32, cir
     let font_size = circle_r * 1.2;
     // fontdue rasterize takes each char separately
     let mut total_width = 0.0f32;
-    let mut glyphs: Vec<(fontdue::GlyphLayout, Vec<u8>)> = Vec::new();
+    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::new();
 
     for ch in text.chars() {
         let (metrics, bitmap) = font.rasterize(ch, font_size);
@@ -177,7 +173,7 @@ fn draw_text(pixmap: &mut Pixmap, font: &Font, text: &str, cx: f32, cy: f32, cir
                 if coverage == 0 {
                     continue;
                 }
-                let idx = (py as usize * px_w as usize + px as usize);
+                let idx = py as usize * px_w as usize + px as usize;
                 let dst = pixmap.pixels_mut()[idx];
 
                 let blended = blend_pixel(dst, sr, sg, sb, coverage);
@@ -236,12 +232,7 @@ fn draw_outlines(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
 }
 
 fn encode_pixmap(pixmap: &Pixmap) -> Vec<u8> {
-    // Use Pixmap::save_png via temp file since data() returns premultiplied pixels
-    let tmp_path = format!("/tmp/w3cos-screenshot-{}.png", std::process::id());
-    pixmap.save_png(&tmp_path).ok();
-    let data = std::fs::read(&tmp_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&tmp_path);
-    data
+    pixmap.encode_png().unwrap_or_default()
 }
 
 fn encode_raw_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
