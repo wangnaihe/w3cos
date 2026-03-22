@@ -37,7 +37,7 @@ echo "[4/4] Pushing to Hugging Face..."
 cd "${TMPDIR}/space"
 git add -A
 git commit -m "Deploy W3C OS live demo" --allow-empty 2>/dev/null || true
-git push origin main 2>/dev/null || git push origin master || git push --set-upstream origin main
+git push --set-upstream origin main 2>/dev/null || git push origin main
 
 echo ""
 echo "=== Done! ==="

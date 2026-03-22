@@ -22,7 +22,7 @@ openbox --config-file /dev/null &
 sleep 0.5
 
 # Launch w3cos showcase
-WINIT_UNIX_BACKEND=x11 /usr/bin/w3cos-showcase &
+WINIT_UNIX_BACKEND=x11 /usr/bin/w3cos-demo &
 W3COS_PID=$!
 sleep 2
 
@@ -44,8 +44,8 @@ echo ""
 # Stay alive; restart w3cos if it crashes
 while true; do
     if ! kill -0 $W3COS_PID 2>/dev/null; then
-        echo "Restarting w3cos-showcase..."
-        WINIT_UNIX_BACKEND=x11 /usr/bin/w3cos-showcase &
+        echo "Restarting w3cos-demo..."
+        WINIT_UNIX_BACKEND=x11 /usr/bin/w3cos-demo &
         W3COS_PID=$!
         sleep 2
         xdotool search --name "W3C OS" windowsize "${SCREEN_W}" "${SCREEN_H}" windowmove 0 0 2>/dev/null || true

@@ -8,6 +8,7 @@ members = [
     "crates/w3cos-dom",
     "crates/w3cos-a11y",
     "crates/w3cos-ai-bridge",
+    "crates/w3cos-demo",
 ]
 
 [workspace.package]
