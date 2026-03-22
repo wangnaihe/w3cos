@@ -17,6 +17,14 @@ pub enum RustType {
         params: Vec<RustType>,
         ret: Box<RustType>,
     },
+    FnMut {
+        params: Vec<RustType>,
+        ret: Box<RustType>,
+    },
+    Rc(Box<RustType>),
+    RcRefCell(Box<RustType>),
+    BoxType(Box<RustType>),
+    Future(Box<RustType>),
     Void,
     /// Fallback for unresolved / `any` types — a runtime-tagged value.
     Dynamic,
@@ -43,6 +51,14 @@ impl RustType {
                 let ps: Vec<_> = params.iter().map(|t| t.to_rust_str()).collect();
                 format!("Box<dyn Fn({}) -> {}>", ps.join(", "), ret.to_rust_str())
             }
+            RustType::FnMut { params, ret } => {
+                let ps: Vec<_> = params.iter().map(|t| t.to_rust_str()).collect();
+                format!("Box<dyn FnMut({}) -> {}>", ps.join(", "), ret.to_rust_str())
+            }
+            RustType::Rc(inner) => format!("Rc<{}>", inner.to_rust_str()),
+            RustType::RcRefCell(inner) => format!("Rc<RefCell<{}>>", inner.to_rust_str()),
+            RustType::BoxType(inner) => format!("Box<{}>", inner.to_rust_str()),
+            RustType::Future(inner) => format!("impl Future<Output = {}>", inner.to_rust_str()),
             RustType::Void => "()".into(),
             RustType::Dynamic => "Value".into(),
             RustType::Inferred => "_".into(),
@@ -53,6 +69,16 @@ impl RustType {
         match self {
             RustType::HashMap(_, _) => true,
             RustType::Vec(inner) | RustType::Option(inner) => inner.needs_hashmap_import(),
+            _ => false,
+        }
+    }
+
+    pub fn needs_rc_import(&self) -> bool {
+        match self {
+            RustType::Rc(_) | RustType::RcRefCell(_) => true,
+            RustType::Vec(inner) | RustType::Option(inner) | RustType::BoxType(inner) => {
+                inner.needs_rc_import()
+            }
             _ => false,
         }
     }
@@ -157,9 +183,7 @@ fn resolve_type_ref(type_ref: &swc_ecma_ast::TsTypeRef) -> RustType {
             RustType::HashMap(Box::new(k), Box::new(v))
         }
         "Promise" => {
-            let inner = type_params.into_iter().next().unwrap_or(RustType::Void);
-            // For now, Promise<T> → T (we'll add async support later)
-            inner
+            type_params.into_iter().next().unwrap_or(RustType::Void)
         }
         _ => RustType::Struct(name),
     }

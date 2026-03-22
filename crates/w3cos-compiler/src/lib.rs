@@ -1,5 +1,6 @@
 pub mod codegen;
 pub mod parser;
+pub mod scope_analysis;
 pub mod ts_transpiler;
 pub mod ts_types;
 
@@ -19,25 +20,39 @@ pub fn compile_to_rust(ts_source: &str) -> Result<String> {
     }
 }
 
+/// Compile flags that influence Cargo.toml / import generation.
+pub struct CompileFlags {
+    pub needs_hashmap: bool,
+    pub needs_async: bool,
+    pub needs_rc: bool,
+}
+
 /// Compile a TypeScript source file into a standalone Rust project.
 ///
 /// For UI apps: links against w3cos-runtime and produces a native GUI binary.
 /// For general TS: produces a standalone CLI binary.
 pub fn compile(ts_source: &str, output_dir: &std::path::Path) -> Result<()> {
     let is_ui = is_ui_dsl(ts_source);
-    let rust_code = compile_to_rust(ts_source)?;
 
     std::fs::create_dir_all(output_dir.join("src"))?;
 
     if is_ui {
+        let rust_code = compile_to_rust(ts_source)?;
         let cargo_toml = codegen::generate_cargo_toml(output_dir)?;
         std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
+        std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
     } else {
-        let cargo_toml = generate_standalone_cargo_toml()?;
+        let output = ts_transpiler::transpile_with_flags(ts_source)?;
+        let flags = CompileFlags {
+            needs_hashmap: output.needs_hashmap,
+            needs_async: output.needs_async,
+            needs_rc: output.needs_rc,
+        };
+        let cargo_toml = generate_standalone_cargo_toml(&flags);
         std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
+        std::fs::write(output_dir.join("src/main.rs"), output.code)?;
     }
 
-    std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
     Ok(())
 }
 
@@ -103,15 +118,22 @@ fn is_ui_dsl(source: &str) -> bool {
 }
 
 /// Generate a minimal Cargo.toml for standalone (non-UI) Rust programs.
-fn generate_standalone_cargo_toml() -> Result<String> {
-    Ok(r#"[package]
+fn generate_standalone_cargo_toml(flags: &CompileFlags) -> String {
+    let mut toml = String::from(
+        r#"[package]
 name = "w3cos-app"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-"#
-    .to_string())
+"#,
+    );
+
+    if flags.needs_async {
+        toml.push_str("tokio = { version = \"1\", features = [\"full\"] }\n");
+    }
+
+    toml
 }
 
 #[cfg(test)]
@@ -236,6 +258,79 @@ console.log("Done!");
         assert!(rust.contains(".push("), "missing push: {rust}");
         assert!(rust.contains(".len()"), "missing len: {rust}");
         assert!(rust.contains("println!"), "missing println: {rust}");
+    }
+
+    #[test]
+    fn standalone_cargo_toml_no_deps() {
+        let flags = CompileFlags {
+            needs_hashmap: false,
+            needs_async: false,
+            needs_rc: false,
+        };
+        let toml = generate_standalone_cargo_toml(&flags);
+        assert!(!toml.contains("tokio"), "should not include tokio: {toml}");
+    }
+
+    #[test]
+    fn standalone_cargo_toml_with_tokio() {
+        let flags = CompileFlags {
+            needs_hashmap: false,
+            needs_async: true,
+            needs_rc: false,
+        };
+        let toml = generate_standalone_cargo_toml(&flags);
+        assert!(toml.contains("tokio"), "should include tokio: {toml}");
+        assert!(toml.contains("features"), "should have features: {toml}");
+    }
+
+    #[test]
+    fn compile_async_to_dir() {
+        let input = r#"
+            async function fetchData(): Promise<string> {
+                return await fetch("http://example.com");
+            }
+            let data = await fetchData();
+            console.log(data);
+        "#;
+
+        let dir = std::env::temp_dir().join("w3cos_test_async_compile");
+        let _ = std::fs::remove_dir_all(&dir);
+        compile(input, &dir).expect("compile failed");
+
+        let main_rs = std::fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(main_rs.contains("async fn"), "missing async: {main_rs}");
+        assert!(main_rs.contains("#[tokio::main]"), "missing tokio::main: {main_rs}");
+
+        let cargo_toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        assert!(cargo_toml.contains("tokio"), "missing tokio dep: {cargo_toml}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compile_closure_to_dir() {
+        let input = r#"
+            function makeCounter(): () => number {
+                let count = 0;
+                return () => { count += 1; return count; };
+            }
+            let c = makeCounter();
+            console.log(c());
+        "#;
+
+        let dir = std::env::temp_dir().join("w3cos_test_closure_compile");
+        let _ = std::fs::remove_dir_all(&dir);
+        compile(input, &dir).expect("compile failed");
+
+        let main_rs = std::fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(main_rs.contains("use std::rc::Rc;"), "missing Rc import: {main_rs}");
+        assert!(main_rs.contains("use std::cell::RefCell;"), "missing RefCell import: {main_rs}");
+        assert!(main_rs.contains("Rc::new(RefCell::new("), "missing Rc wrapping: {main_rs}");
+
+        let cargo_toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        assert!(!cargo_toml.contains("tokio"), "should not have tokio: {cargo_toml}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
