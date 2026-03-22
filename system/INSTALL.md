@@ -27,7 +27,7 @@ cargo build --release
 
 ```bash
 # Download from GitHub Releases
-wget https://github.com/anthropic-ai/w3cos/releases/download/v0.1/w3cos-0.1-x86_64.iso
+wget https://github.com/wangnaihe/w3cos/releases/download/v0.1/w3cos-0.1-x86_64.iso
 
 # Run in QEMU
 qemu-system-x86_64 -cdrom w3cos-0.1-x86_64.iso -m 2G -vga virtio

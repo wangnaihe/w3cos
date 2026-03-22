@@ -14,7 +14,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/anthropic-ai/w3cos"
+repository = "https://github.com/wangnaihe/w3cos"
 
 [workspace.dependencies]
 w3cos-runtime = { path = "crates/w3cos-runtime" }

@@ -1,13 +1,13 @@
 # W3C OS
 
-[![CI](https://github.com/wangnaihe/w3cos/actions/workflows/ci.yml/badge.svg)](https://github.com/wangnaihe/w3cos/actions/workflows/ci.yml)
-[![Build ISO](https://github.com/wangnaihe/w3cos/actions/workflows/build-iso.yml/badge.svg)](https://github.com/wangnaihe/w3cos/actions/workflows/build-iso.yml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
+[CI](https://github.com/wangnaihe/w3cos/actions/workflows/ci.yml)
+[Build ISO](https://github.com/wangnaihe/w3cos/actions/workflows/build-iso.yml)
+[License](LICENSE)
+[Rust](https://www.rust-lang.org)
 
 **An AI-native operating system built on W3C standards. TypeScript + DOM compiled to native binaries. No browser. No V8.**
 
-![W3C OS Demo](docs/screenshot.png)
+W3C OS Demo
 
 ```
 app.ts  →  w3cos build  →  native binary (2.4 MB)
@@ -16,6 +16,7 @@ app.ts  →  w3cos build  →  native binary (2.4 MB)
 ## What is this?
 
 W3C OS is a Linux-based operating system where:
+
 - Applications use **standard W3C DOM + CSS** (the same APIs as the Web)
 - TypeScript is compiled to **native machine code** via Rust/LLVM (not interpreted)
 - AI agents can **read and operate every UI element** directly through the DOM — no screenshot guessing
@@ -30,7 +31,7 @@ Write Web-standard code. Get native performance. Give AI full visibility.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone https://github.com/anthropic-ai/w3cos.git
+git clone https://github.com/wangnaihe/w3cos.git
 cd w3cos
 cargo build --release
 
@@ -80,17 +81,19 @@ $ w3cos build app.tsx -o myapp --release
 
 ## Why?
 
-| | Electron | React Native | Flutter | **W3C OS** |
-|---|---------|-------------|---------|-----------|
-| Binary Size | 90+ MB | 30+ MB | 15+ MB | **2.4 MB** |
-| RAM Usage | 200+ MB | 100+ MB | 80+ MB | **~15 MB** |
-| Startup | 2-5 sec | 1-3 sec | 0.5-2 sec | **< 100ms** |
-| Language | JS (V8 JIT) | JS (Hermes) | Dart (AOT) | **TS (native AOT)** |
-| Runtime | Chromium | Bridge + Native | Dart VM | **None** |
-| DOM API | ✅ (browser only) | ❌ | ❌ | **✅ (system-wide)** |
-| AI reads UI | Screenshot | Screenshot | Screenshot | **DOM tree (< 1ms)** |
-| Standard | Proprietary | Proprietary | Proprietary | **W3C** |
-| Installable OS | ❌ | ❌ | ❌ | **✅** |
+
+|                | Electron         | React Native    | Flutter     | **W3C OS**           |
+| -------------- | ---------------- | --------------- | ----------- | -------------------- |
+| Binary Size    | 90+ MB           | 30+ MB          | 15+ MB      | **2.4 MB**           |
+| RAM Usage      | 200+ MB          | 100+ MB         | 80+ MB      | **~15 MB**           |
+| Startup        | 2-5 sec          | 1-3 sec         | 0.5-2 sec   | **< 100ms**          |
+| Language       | JS (V8 JIT)      | JS (Hermes)     | Dart (AOT)  | **TS (native AOT)**  |
+| Runtime        | Chromium         | Bridge + Native | Dart VM     | **None**             |
+| DOM API        | ✅ (browser only) | ❌               | ❌           | **✅ (system-wide)**  |
+| AI reads UI    | Screenshot       | Screenshot      | Screenshot  | **DOM tree (< 1ms)** |
+| Standard       | Proprietary      | Proprietary     | Proprietary | **W3C**              |
+| Installable OS | ❌                | ❌               | ❌           | **✅**                |
+
 
 ## AI-Native: Why This Matters
 
@@ -104,6 +107,7 @@ W3C OS:          AI reads DOM  → structured tree → precise action (< 1ms, fr
 ```
 
 Three access levels for AI agents:
+
 - **Layer 1 — DOM Access**: Read/write any element, trigger events. 100% precise. < 1ms.
 - **Layer 2 — Accessibility Tree**: ARIA-compliant summary. Minimal tokens for LLMs.
 - **Layer 3 — Annotated Screenshot**: For Claude Computer Use / UI-TARS compatibility.
@@ -153,31 +157,35 @@ Runs directly on hardware             ← No runtime
 
 ### Technology Stack
 
-| Layer | Technology | What it does |
-|-------|-----------|-------------|
-| CSS Layout | [Taffy](https://github.com/DioxusLabs/taffy) 0.9 | Flexbox, Grid, Block, position |
-| Text Layout | [Parley](https://github.com/linebender/parley) | Line-breaking, shaping, bidi |
-| 2D Rendering | [tiny-skia](https://github.com/nickel-org/tiny-skia) → [Vello](https://github.com/linebender/vello) (Phase 2) | Vector graphics |
-| Windowing | [winit](https://github.com/rust-windowing/winit) | Cross-platform native windows |
-| OS Base | Linux kernel (Debian Minimal / Buildroot) | Drivers, processes, filesystem |
+
+| Layer        | Technology                                                                                                    | What it does                   |
+| ------------ | ------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| CSS Layout   | [Taffy](https://github.com/DioxusLabs/taffy) 0.9                                                              | Flexbox, Grid, Block, position |
+| Text Layout  | [Parley](https://github.com/linebender/parley)                                                                | Line-breaking, shaping, bidi   |
+| 2D Rendering | [tiny-skia](https://github.com/nickel-org/tiny-skia) → [Vello](https://github.com/linebender/vello) (Phase 2) | Vector graphics                |
+| Windowing    | [winit](https://github.com/rust-windowing/winit)                                                              | Cross-platform native windows  |
+| OS Base      | Linux kernel (Debian Minimal / Buildroot)                                                                     | Drivers, processes, filesystem |
+
 
 ## CSS Support
 
-| Feature | Status |
-|---------|--------|
-| Flexbox / Grid | ✅ Full |
-| Block layout | ✅ |
-| `position: relative / absolute` | ✅ |
-| `position: fixed / sticky` | 🔜 |
-| `overflow: hidden / scroll` | ✅ |
-| `z-index` | ✅ |
-| Units: `px, %, rem, em, vw, vh` | ✅ |
-| `border-radius`, `opacity` | ✅ |
-| `box-shadow` | ✅ |
-| `transform: translate / scale / rotate` | ✅ |
-| `transition` (easing functions) | ✅ |
-| `display: inline / inline-block` | 🔜 |
-| Mouse events (hover, click) | ✅ |
+
+| Feature                                 | Status |
+| --------------------------------------- | ------ |
+| Flexbox / Grid                          | ✅ Full |
+| Block layout                            | ✅      |
+| `position: relative / absolute`         | ✅      |
+| `position: fixed / sticky`              | 🔜     |
+| `overflow: hidden / scroll`             | ✅      |
+| `z-index`                               | ✅      |
+| Units: `px, %, rem, em, vw, vh`         | ✅      |
+| `border-radius`, `opacity`              | ✅      |
+| `box-shadow`                            | ✅      |
+| `transform: translate / scale / rotate` | ✅      |
+| `transition` (easing functions)         | ✅      |
+| `display: inline / inline-block`        | 🔜     |
+| Mouse events (hover, click)             | ✅      |
+
 
 ## Project Structure
 
@@ -226,14 +234,16 @@ See [AI_DEVELOPMENT.md](AI_DEVELOPMENT.md) for the full model, and [CONTRIBUTING
 
 AI agents need tokens. Your sponsorship keeps development moving.
 
-[![Sponsor](https://img.shields.io/badge/sponsor-w3cos-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/wangnaihe)
+[Sponsor](https://github.com/sponsors/wangnaihe)
 
-| Tier | Amount | Impact |
-|------|--------|--------|
-| Byte | $5/mo | ~1 AI-implemented issue/month |
-| Kilobyte | $25/mo | ~5 AI-implemented issues/month |
-| Megabyte | $100/mo | ~20 AI-implemented issues/month |
+
+| Tier     | Amount  | Impact                            |
+| -------- | ------- | --------------------------------- |
+| Byte     | $5/mo   | ~1 AI-implemented issue/month     |
+| Kilobyte | $25/mo  | ~5 AI-implemented issues/month    |
+| Megabyte | $100/mo | ~20 AI-implemented issues/month   |
 | Gigabyte | $500/mo | Sustained AI development capacity |
+
 
 100% goes to AI compute. No human salaries. Fully transparent.
 
