@@ -10,3 +10,6 @@ w3cos-std = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+swc_common = "19.0.0"
+swc_ecma_parser = "36.0.0"
+swc_ecma_ast = "21.0.0"
