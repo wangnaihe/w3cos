@@ -1,0 +1,25 @@
+# Fly.io deployment — W3C OS Live Demo
+# Deploy: fly launch --config demo/fly.toml --dockerfile demo/Dockerfile
+#
+# Free tier: 3 shared-cpu-1x machines, 256 MB RAM (enough for this demo)
+
+app = "w3cos-demo"
+primary_region = "hkg"
+
+[build]
+  dockerfile = "demo/Dockerfile"
+
+[env]
+  PORT = "7860"
+
+[http_service]
+  internal_port = 7860
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

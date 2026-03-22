@@ -297,8 +297,11 @@ fn parse_tsx_attrs(
     let mut placeholder: Option<String> = None;
     let mut rest = s.trim();
 
-    while !rest.is_empty() && !rest.starts_with('>') && !rest.starts_with("/>") {
+    loop {
         rest = rest.trim();
+        if rest.is_empty() || rest.starts_with('>') || rest.starts_with("/>") {
+            break;
+        }
         if let Some(after) = rest.strip_prefix("src=") {
             let after = after.trim();
             if let Some((value, r)) = extract_first_string_arg(after) {
@@ -393,7 +396,6 @@ fn parse_tsx_children<'a>(
     let mut children = Vec::new();
     let mut text_buf = String::new();
     let mut rest = s;
-
     loop {
         rest = rest.trim_start();
         if rest.is_empty() {
@@ -410,12 +412,12 @@ fn parse_tsx_children<'a>(
             return None;
         }
 
-        if rest.starts_with('<')
-            && let Some((child, after)) = parse_tsx_element(rest)
-        {
-            children.push(child);
-            rest = after;
-            continue;
+        if rest.starts_with('<') {
+            if let Some((child, after)) = parse_tsx_element(rest) {
+                children.push(child);
+                rest = after;
+                continue;
+            }
         }
 
         // Text content — collect until next '<'
@@ -1220,5 +1222,12 @@ export default <Column>
         }
         assert_eq!(tree.root.style.width.as_deref(), Some("100px"));
         assert_eq!(tree.root.style.height.as_deref(), Some("80px"));
+    }
+
+    #[test]
+    fn tsx_showcase_full_file_debug() {
+        let source = include_str!("../../../examples/showcase/app.tsx");
+        let tree = parse(source);
+        assert!(tree.is_ok(), "showcase parse failed: {:?}", tree.err());
     }
 }
