@@ -7,7 +7,7 @@
 
 **An AI-native operating system built on W3C standards. TypeScript + DOM compiled to native binaries. No browser. No V8.**
 
-W3C OS Demo
+![W3C OS Demo](docs/screenshot.png)
 
 ```
 app.ts  →  w3cos build  →  native binary (2.4 MB)
