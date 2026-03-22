@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::Command;
+use std::fs;
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +42,11 @@ enum Commands {
         /// Path to the TypeScript or JSON source file.
         input: PathBuf,
     },
+    /// Initialize a new W3C OS project with template files.
+    Init {
+        /// Project name (creates a directory with this name).
+        project_name: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -67,6 +73,9 @@ fn main() -> Result<()> {
                 .status()
                 .context("Failed to run compiled binary")?;
             std::process::exit(status.code().unwrap_or(1));
+        }
+        Commands::Init { project_name } => {
+            init(&project_name)?;
         }
     }
 
@@ -130,5 +139,81 @@ fn build(
     };
 
     println!("✅ Output: {} ({})", output.display(), size_str);
+    Ok(())
+}
+
+fn init(project_name: &PathBuf) -> Result<()> {
+    println!("🚀 Initializing W3C OS project: {}", project_name.display());
+
+    // Check if directory already exists
+    if project_name.exists() {
+        anyhow::bail!("Error: Directory '{}' already exists", project_name.display());
+    }
+
+    // Create project directory
+    fs::create_dir_all(project_name)
+        .with_context(|| format!("Could not create directory {}", project_name.display()))?;
+
+    let app_tsx_path = project_name.join("app.tsx");
+    let app_tsx_content = r##"import { Column, Text, Button } from "@w3cos/std"
+
+export default
+<Column style={{ gap: 20, padding: 48, alignItems: "center", background: "#1e1e2e" }}>
+  <Text style={{ fontSize: 32, color: "#f0f0ff", fontWeight: 700 }}>My App</Text>
+  <Text style={{ fontSize: 16, color: "#a0a0b0" }}>Built with W3C OS</Text>
+  <Button style={{ background: "#6c5ce7", color: "#ffffff", borderRadius: 8 }}>Hello World</Button>
+</Column>
+"##;
+    fs::write(&app_tsx_path, app_tsx_content)
+        .with_context(|| format!("Could not create {}", app_tsx_path.display()))?;
+    println!("✅ Created: {}", app_tsx_path.display());
+
+    // Create README.md
+    let readme_path = project_name.join("README.md");
+    let readme_content = format!(r#"# {}
+
+A W3C OS Application.
+
+## Getting Started
+
+### Prerequisites
+
+- Rust (latest stable)
+- w3cos CLI
+
+### Usage
+
+```bash
+# Run the application
+w3cos run app.tsx
+
+# Or build a native binary
+w3cos build app.tsx -o myapp --release
+
+# Run the binary
+./myapp
+```
+
+## Project Structure
+
+```
+{}
+├── app.tsx         # Main application entry point (TSX)
+└── README.md       # This file
+```
+
+## License
+
+Apache-2.0
+"#, project_name.display(), project_name.display());
+    fs::write(&readme_path, readme_content)
+        .with_context(|| format!("Could not create {}", readme_path.display()))?;
+    println!("✅ Created: {}", readme_path.display());
+
+    println!("\n✨ Project initialized successfully!");
+    println!("📁 Next steps:");
+    println!("   cd {}", project_name.display());
+    println!("   w3cos run app.tsx");
+
     Ok(())
 }
