@@ -9,6 +9,8 @@ FROM rust:1.85-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /w3cos
+# Cache-bust: change this value to force re-clone after code updates
+ARG CACHE_BUST=2026032201
 RUN git clone --depth 1 https://github.com/wangnaihe/w3cos.git .
 
 # Build the demo binary as a workspace member — no temp projects, no arch issues
