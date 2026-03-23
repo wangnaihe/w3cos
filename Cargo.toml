@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/w3cos-core",
     "crates/w3cos-runtime",
     "crates/w3cos-compiler",
     "crates/w3cos-cli",
@@ -18,6 +19,7 @@ license = "Apache-2.0"
 repository = "https://github.com/wangnaihe/w3cos"
 
 [workspace.dependencies]
+w3cos-core = { path = "crates/w3cos-core" }
 w3cos-runtime = { path = "crates/w3cos-runtime" }
 w3cos-compiler = { path = "crates/w3cos-compiler" }
 w3cos-std = { path = "crates/w3cos-std" }

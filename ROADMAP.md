@@ -33,6 +33,24 @@
 - [x] Image component (placeholder rendering, full decode #2)
 - [x] Focus management + keyboard navigation (Tab/Shift+Tab)
 
+## Phase 1.5 — TypeScript → Rust Transpiler ✅
+- [x] General TS → Rust transpilation (SWC parser → Rust codegen)
+- [x] Closures with Rc<RefCell<T>> capture + move semantics
+- [x] async/await → async fn + .await + tokio runtime
+- [x] Promise.all/race → tokio::join!/select!
+- [x] GC → Reference Counting (conservative Rc<RefCell<T>> strategy)
+- [x] w3cos-core crate: Value dynamic type system (JS-compatible)
+- [x] w3cos-core: JsObject with HashMap properties + prototype chain
+- [x] w3cos-core: Proxy with all 13 ECMAScript handler traps + ProxyBuilder
+- [x] w3cos-core: Signal<T> / Computed<T> / Effect / watch() / batch()
+- [x] Compiler: new Proxy(target, handler) → ProxyBuilder codegen
+- [x] Compiler: reactive() → Signal expansion (compile-time optimization)
+- [x] Compiler: watch()/computed()/effect() → w3cos-core API calls
+- [x] Compiler: reactive property access/assignment → signal.get()/set()
+- [x] Dynamic dependency generation (needs_core/needs_async/needs_rc flags)
+- [ ] Escape analysis optimization for Rc<RefCell<T>> elision (P5)
+- [ ] typeof operator runtime support via Value::type_of()
+
 ## Phase 2 — Production Quality
 - [ ] GPU rendering (Vello + wgpu — replace tiny-skia)
 - [ ] System bridge: File System Access API → Linux FS
