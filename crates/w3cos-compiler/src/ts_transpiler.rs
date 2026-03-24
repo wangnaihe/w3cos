@@ -18,6 +18,7 @@ pub struct TranspileOutput {
     pub needs_hashmap: bool,
     pub needs_rc: bool,
     pub needs_core: bool,
+    pub needs_fetch: bool,
 }
 
 /// Parse TypeScript source and generate Rust code with dependency metadata.
@@ -30,12 +31,14 @@ pub fn transpile_with_flags(source: &str) -> Result<TranspileOutput> {
     let needs_hashmap = ctx.needs_hashmap;
     let needs_rc = ctx.needs_rc;
     let needs_core = ctx.needs_core;
+    let needs_fetch = ctx.needs_fetch;
     Ok(TranspileOutput {
         code: ctx.finish(),
         needs_async,
         needs_hashmap,
         needs_rc,
         needs_core,
+        needs_fetch,
     })
 }
 
@@ -80,6 +83,7 @@ struct TranspileContext {
     needs_rc: bool,
     needs_async: bool,
     needs_core: bool,
+    needs_fetch: bool,
     /// Stack of variable renames for nested closures.
     /// Each frame maps original name → clone name (e.g., "count" → "count_c").
     closure_rename_stack: Vec<std::collections::HashMap<String, String>>,
@@ -100,6 +104,7 @@ impl TranspileContext {
             needs_rc: false,
             needs_async: false,
             needs_core: false,
+            needs_fetch: false,
             closure_rename_stack: Vec::new(),
             reactive_vars: std::collections::HashSet::new(),
         }
@@ -1109,11 +1114,13 @@ impl TranspileContext {
                 }
 
                 // Reactive API: watch(), computed(), effect()
+                // Fetch API: fetch(url, options?)
                 if let Expr::Ident(ident) = &**callee {
                     match ident.sym.as_ref() {
                         "watch" => return self.transpile_watch_call(&call.args),
                         "computed" => return self.transpile_computed_call(&call.args),
                         "effect" => return self.transpile_effect_call(&call.args),
+                        "fetch" => return self.transpile_fetch_call(&call.args),
                         _ => {}
                     }
                 }
@@ -1328,6 +1335,106 @@ impl TranspileContext {
                 _ => self.transpile_expr(&arg.expr)?,
             }
         }
+        self.push(")");
+        Ok(())
+    }
+
+    /// Transpile `fetch(url)` or `fetch(url, { method, headers, body })` to w3cos_runtime::fetch API.
+    fn transpile_fetch_call(&mut self, args: &[ExprOrSpread]) -> Result<()> {
+        self.needs_fetch = true;
+
+        if args.is_empty() {
+            self.push("w3cos_runtime::fetch::fetch(\"\", Default::default())");
+            return Ok(());
+        }
+
+        self.push("w3cos_runtime::fetch::fetch(");
+        // First arg: URL
+        if let Expr::Lit(Lit::Str(s)) = &*args[0].expr {
+            self.push(&format!("{:?}", &*s.value));
+        } else {
+            self.push("&");
+            self.transpile_expr(&args[0].expr)?;
+        }
+        self.push(", ");
+
+        // Second arg: options object or default
+        if args.len() > 1 {
+            if let Expr::Object(obj) = &*args[1].expr {
+                self.push("w3cos_runtime::fetch::FetchOptions { ");
+                let mut has_method = false;
+                let mut has_body = false;
+                let mut has_headers = false;
+
+                for prop in &obj.props {
+                    if let PropOrSpread::Prop(prop) = prop {
+                        if let Prop::KeyValue(kv) = &**prop {
+                            let key = match &kv.key {
+                                PropName::Ident(id) => id.sym.to_string(),
+                                PropName::Str(s) => format!("{:?}", &*s.value).trim_matches('"').to_string(),
+                                _ => continue,
+                            };
+                            match key.as_str() {
+                                "method" => {
+                                    has_method = true;
+                                    if let Expr::Lit(Lit::Str(s)) = &*kv.value {
+                                        self.push(&format!(
+                                            "method: w3cos_runtime::fetch::parse_method({:?}), ",
+                                            &*s.value
+                                        ));
+                                    }
+                                }
+                                "body" => {
+                                    has_body = true;
+                                    self.push("body: Some(");
+                                    if let Expr::Lit(Lit::Str(s)) = &*kv.value {
+                                        self.push(&format!("{:?}", &*s.value));
+                                    } else {
+                                        self.transpile_expr(&kv.value)?;
+                                        self.push(".to_string()");
+                                    }
+                                    self.push("), ");
+                                }
+                                "headers" => {
+                                    has_headers = true;
+                                    if let Expr::Object(hdr_obj) = &*kv.value {
+                                        self.push("headers: {let mut h = std::collections::HashMap::new(); ");
+                                        for hprop in &hdr_obj.props {
+                                            if let PropOrSpread::Prop(hp) = hprop {
+                                                if let Prop::KeyValue(hkv) = &**hp {
+                                                    let hk = match &hkv.key {
+                                                        PropName::Ident(id) => id.sym.to_string(),
+                                                        PropName::Str(s) => format!("{:?}", &*s.value).trim_matches('"').to_string(),
+                                                        _ => continue,
+                                                    };
+                                                    if let Expr::Lit(Lit::Str(s)) = &*hkv.value {
+                                                        self.push(&format!(
+                                                            "h.insert({:?}.to_string(), {:?}.to_string()); ",
+                                                            hk, &*s.value
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        self.push("h}, ");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if !has_method { self.push("method: Default::default(), "); }
+                if !has_body { self.push("body: None, "); }
+                if !has_headers { self.push("headers: std::collections::HashMap::new(), "); }
+                self.push("timeout_ms: None }");
+            } else {
+                self.push("Default::default()");
+            }
+        } else {
+            self.push("Default::default()");
+        }
+
         self.push(")");
         Ok(())
     }
@@ -2877,6 +2984,7 @@ mod tests {
             needs_async: false,
             needs_rc: false,
             needs_core: true,
+            needs_fetch: false,
         };
         let toml = crate::generate_standalone_cargo_toml(&flags);
         assert!(toml.contains("w3cos-core"), "missing w3cos-core dep: {toml}");

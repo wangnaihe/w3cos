@@ -26,6 +26,7 @@ pub struct CompileFlags {
     pub needs_async: bool,
     pub needs_rc: bool,
     pub needs_core: bool,
+    pub needs_fetch: bool,
 }
 
 /// Compile a TypeScript source file into a standalone Rust project.
@@ -49,6 +50,7 @@ pub fn compile(ts_source: &str, output_dir: &std::path::Path) -> Result<()> {
             needs_async: output.needs_async,
             needs_rc: output.needs_rc,
             needs_core: output.needs_core,
+            needs_fetch: output.needs_fetch,
         };
         let cargo_toml = generate_standalone_cargo_toml(&flags);
         std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
@@ -136,6 +138,9 @@ edition = "2024"
     }
     if flags.needs_async {
         toml.push_str("tokio = { version = \"1\", features = [\"full\"] }\n");
+    }
+    if flags.needs_fetch {
+        toml.push_str("w3cos-runtime = { path = \"../../crates/w3cos-runtime\" }\n");
     }
 
     toml
@@ -272,6 +277,7 @@ console.log("Done!");
             needs_async: false,
             needs_rc: false,
             needs_core: false,
+            needs_fetch: false,
         };
         let toml = generate_standalone_cargo_toml(&flags);
         assert!(!toml.contains("tokio"), "should not include tokio: {toml}");
@@ -284,6 +290,7 @@ console.log("Done!");
             needs_async: true,
             needs_rc: false,
             needs_core: false,
+            needs_fetch: false,
         };
         let toml = generate_standalone_cargo_toml(&flags);
         assert!(toml.contains("tokio"), "should include tokio: {toml}");

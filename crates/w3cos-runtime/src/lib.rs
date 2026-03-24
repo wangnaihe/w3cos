@@ -1,3 +1,4 @@
+pub mod fetch;
 pub mod layout;
 pub mod notification;
 pub mod render;
