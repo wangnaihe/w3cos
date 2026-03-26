@@ -19,6 +19,7 @@ pub struct TranspileOutput {
     pub needs_rc: bool,
     pub needs_core: bool,
     pub needs_fetch: bool,
+    pub needs_history: bool,
 }
 
 /// Parse TypeScript source and generate Rust code with dependency metadata.
@@ -32,6 +33,7 @@ pub fn transpile_with_flags(source: &str) -> Result<TranspileOutput> {
     let needs_rc = ctx.needs_rc;
     let needs_core = ctx.needs_core;
     let needs_fetch = ctx.needs_fetch;
+    let needs_history = ctx.needs_history;
     Ok(TranspileOutput {
         code: ctx.finish(),
         needs_async,
@@ -39,6 +41,7 @@ pub fn transpile_with_flags(source: &str) -> Result<TranspileOutput> {
         needs_rc,
         needs_core,
         needs_fetch,
+        needs_history,
     })
 }
 
@@ -84,6 +87,7 @@ struct TranspileContext {
     needs_async: bool,
     needs_core: bool,
     needs_fetch: bool,
+    needs_history: bool,
     /// Stack of variable renames for nested closures.
     /// Each frame maps original name → clone name (e.g., "count" → "count_c").
     closure_rename_stack: Vec<std::collections::HashMap<String, String>>,
@@ -105,6 +109,7 @@ impl TranspileContext {
             needs_async: false,
             needs_core: false,
             needs_fetch: false,
+            needs_history: false,
             closure_rename_stack: Vec::new(),
             reactive_vars: std::collections::HashSet::new(),
         }
@@ -1132,6 +1137,9 @@ impl TranspileContext {
                     if is_promise_race(member) {
                         return self.transpile_promise_race(&call.args);
                     }
+                    if let Some(result) = self.try_transpile_history_call(member, &call.args)? {
+                        return Ok(result);
+                    }
                     return self.transpile_method_call(member, &call.args);
                 }
 
@@ -1439,6 +1447,110 @@ impl TranspileContext {
         Ok(())
     }
 
+    /// Intercept `history.pushState(...)` etc. and `location.assign(...)`.
+    /// Returns `Ok(Some(()))` if handled, `Ok(None)` if not a history/location call.
+    fn try_transpile_history_call(
+        &mut self,
+        member: &MemberExpr,
+        args: &[ExprOrSpread],
+    ) -> Result<Option<()>> {
+        let (obj_name, method_name) = match (&*member.obj, &member.prop) {
+            (Expr::Ident(obj), MemberProp::Ident(prop)) => {
+                (obj.sym.as_ref(), prop.sym.as_ref())
+            }
+            _ => return Ok(None),
+        };
+
+        match (obj_name, method_name) {
+            ("history", "pushState") => {
+                self.needs_history = true;
+                self.push("w3cos_runtime::history::push_state(");
+                if let Some(state_arg) = args.first() {
+                    self.transpile_history_state_arg(&state_arg.expr)?;
+                } else {
+                    self.push("None");
+                }
+                self.push(", ");
+                if let Some(title_arg) = args.get(1) {
+                    self.transpile_expr(&title_arg.expr)?;
+                } else {
+                    self.push("\"\"");
+                }
+                self.push(", ");
+                if let Some(url_arg) = args.get(2) {
+                    self.transpile_expr(&url_arg.expr)?;
+                } else {
+                    self.push("\"\"");
+                }
+                self.push(")");
+                Ok(Some(()))
+            }
+            ("history", "replaceState") => {
+                self.needs_history = true;
+                self.push("w3cos_runtime::history::replace_state(");
+                if let Some(state_arg) = args.first() {
+                    self.transpile_history_state_arg(&state_arg.expr)?;
+                } else {
+                    self.push("None");
+                }
+                self.push(", ");
+                if let Some(title_arg) = args.get(1) {
+                    self.transpile_expr(&title_arg.expr)?;
+                } else {
+                    self.push("\"\"");
+                }
+                self.push(", ");
+                if let Some(url_arg) = args.get(2) {
+                    self.transpile_expr(&url_arg.expr)?;
+                } else {
+                    self.push("\"\"");
+                }
+                self.push(")");
+                Ok(Some(()))
+            }
+            ("history", "back") => {
+                self.needs_history = true;
+                self.push("w3cos_runtime::history::back()");
+                Ok(Some(()))
+            }
+            ("history", "forward") => {
+                self.needs_history = true;
+                self.push("w3cos_runtime::history::forward()");
+                Ok(Some(()))
+            }
+            ("history", "go") => {
+                self.needs_history = true;
+                self.push("w3cos_runtime::history::go(");
+                if let Some(arg) = args.first() {
+                    self.transpile_expr(&arg.expr)?;
+                    self.push(" as i32");
+                } else {
+                    self.push("0");
+                }
+                self.push(")");
+                Ok(Some(()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Convert a TS state argument: `null` → `None`, string lit → `Some("...")`,
+    /// other expressions → `Some(&expr.to_string())` (simplified).
+    fn transpile_history_state_arg(&mut self, expr: &Expr) -> Result<()> {
+        match expr {
+            Expr::Lit(Lit::Null(_)) => self.push("None"),
+            Expr::Lit(Lit::Str(s)) => {
+                self.push(&format!("Some({:?})", &*s.value));
+            }
+            _ => {
+                self.push("Some(&format!(\"{:?}\", ");
+                self.transpile_expr(expr)?;
+                self.push("))");
+            }
+        }
+        Ok(())
+    }
+
     fn transpile_method_call(
         &mut self,
         member: &MemberExpr,
@@ -1668,24 +1780,67 @@ impl TranspileContext {
     }
 
     fn transpile_member(&mut self, member: &MemberExpr) -> Result<()> {
-        // Special: .length → .len()
         if let MemberProp::Ident(prop) = &member.prop {
+            if let Expr::Ident(obj) = &*member.obj {
+                let obj_name = obj.sym.as_ref();
+                let prop_name = prop.sym.as_ref();
+
+                // history.length / history.state
+                if obj_name == "history" {
+                    match prop_name {
+                        "length" => {
+                            self.needs_history = true;
+                            self.push("w3cos_runtime::history::get_length()");
+                            return Ok(());
+                        }
+                        "state" => {
+                            self.needs_history = true;
+                            self.push("w3cos_runtime::history::get_state()");
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+
+                // location.pathname / .hash / .search / .href / .host / .hostname / .port / .protocol / .origin
+                if obj_name == "location" {
+                    let mapped = match prop_name {
+                        "pathname" => Some("get_pathname"),
+                        "hash" => Some("get_hash"),
+                        "search" => Some("get_search"),
+                        "href" => Some("get_href"),
+                        "host" => Some("get_host"),
+                        "hostname" => Some("get_hostname"),
+                        "port" => Some("get_port"),
+                        "protocol" => Some("get_protocol"),
+                        "origin" => Some("get_origin"),
+                        _ => None,
+                    };
+                    if let Some(fn_name) = mapped {
+                        self.needs_history = true;
+                        self.push(&format!("w3cos_runtime::history::{fn_name}()"));
+                        return Ok(());
+                    }
+                }
+
+                // Math.PI, Math.E, etc.
+                if obj_name == "Math" {
+                    return self.transpile_math_prop(&prop.sym);
+                }
+
+                // Reactive compile-time optimization:
+                // `state.count` → `state_count.get()`
+                if self.reactive_vars.contains(obj_name) {
+                    self.push(&format!("{}_{}.get()", obj.sym, prop.sym));
+                    return Ok(());
+                }
+            }
+
+            // Generic .length → .len()
             if prop.sym.as_ref() == "length" {
                 self.transpile_expr(&member.obj)?;
                 self.push(".len()");
                 return Ok(());
-            }
-            // Math.PI, Math.E, etc.
-            if let Expr::Ident(obj) = &*member.obj {
-                if obj.sym.as_ref() == "Math" {
-                    return self.transpile_math_prop(&prop.sym);
-                }
-                // Reactive compile-time optimization:
-                // `state.count` → `state_count.get()`
-                if self.reactive_vars.contains(obj.sym.as_ref()) {
-                    self.push(&format!("{}_{}.get()", obj.sym, prop.sym));
-                    return Ok(());
-                }
             }
         }
 
@@ -2985,8 +3140,83 @@ mod tests {
             needs_rc: false,
             needs_core: true,
             needs_fetch: false,
+            needs_history: false,
         };
         let toml = crate::generate_standalone_cargo_toml(&flags);
         assert!(toml.contains("w3cos-core"), "missing w3cos-core dep: {toml}");
+    }
+
+    #[test]
+    fn history_push_state() {
+        let rust = transpile_ok(r#"history.pushState(null, "", "/page2");"#);
+        assert!(rust.contains("w3cos_runtime::history::push_state("), "got: {rust}");
+        assert!(rust.contains("None"), "null should map to None: {rust}");
+        assert!(rust.contains("\"/page2\""), "got: {rust}");
+    }
+
+    #[test]
+    fn history_replace_state() {
+        let rust = transpile_ok(r#"history.replaceState("data", "title", "/new");"#);
+        assert!(rust.contains("w3cos_runtime::history::replace_state("), "got: {rust}");
+    }
+
+    #[test]
+    fn history_back_forward_go() {
+        let rust = transpile_ok("history.back();");
+        assert!(rust.contains("w3cos_runtime::history::back()"), "got: {rust}");
+
+        let rust = transpile_ok("history.forward();");
+        assert!(rust.contains("w3cos_runtime::history::forward()"), "got: {rust}");
+
+        let rust = transpile_ok("history.go(-2);");
+        assert!(rust.contains("w3cos_runtime::history::go("), "got: {rust}");
+    }
+
+    #[test]
+    fn history_length_and_state() {
+        let rust = transpile_ok("let len = history.length;");
+        assert!(rust.contains("w3cos_runtime::history::get_length()"), "got: {rust}");
+
+        let rust = transpile_ok("let s = history.state;");
+        assert!(rust.contains("w3cos_runtime::history::get_state()"), "got: {rust}");
+    }
+
+    #[test]
+    fn location_properties() {
+        let rust = transpile_ok("let p = location.pathname;");
+        assert!(rust.contains("w3cos_runtime::history::get_pathname()"), "got: {rust}");
+
+        let rust = transpile_ok("let h = location.hash;");
+        assert!(rust.contains("w3cos_runtime::history::get_hash()"), "got: {rust}");
+
+        let rust = transpile_ok("let s = location.search;");
+        assert!(rust.contains("w3cos_runtime::history::get_search()"), "got: {rust}");
+
+        let rust = transpile_ok("let h = location.href;");
+        assert!(rust.contains("w3cos_runtime::history::get_href()"), "got: {rust}");
+
+        let rust = transpile_ok("let o = location.origin;");
+        assert!(rust.contains("w3cos_runtime::history::get_origin()"), "got: {rust}");
+
+        let rust = transpile_ok("let hn = location.hostname;");
+        assert!(rust.contains("w3cos_runtime::history::get_hostname()"), "got: {rust}");
+
+        let rust = transpile_ok("let pt = location.port;");
+        assert!(rust.contains("w3cos_runtime::history::get_port()"), "got: {rust}");
+
+        let rust = transpile_ok("let pr = location.protocol;");
+        assert!(rust.contains("w3cos_runtime::history::get_protocol()"), "got: {rust}");
+    }
+
+    #[test]
+    fn history_needs_flag() {
+        let output = transpile_with_flags(r#"history.pushState(null, "", "/x");"#).unwrap();
+        assert!(output.needs_history, "needs_history should be true");
+
+        let output = transpile_with_flags("let x = location.pathname;").unwrap();
+        assert!(output.needs_history, "needs_history should be true for location access");
+
+        let output = transpile_with_flags(r#"console.log("no history");"#).unwrap();
+        assert!(!output.needs_history, "needs_history should be false when unused");
     }
 }

@@ -1,8 +1,13 @@
+use crate::history::History;
+use crate::location::Location;
+
 /// W3C Window API — global scope for the application.
 pub struct Window {
     pub inner_width: f32,
     pub inner_height: f32,
     pub device_pixel_ratio: f32,
+    pub history: History,
+    pub location: Location,
     animation_frame_callbacks: Vec<Box<dyn FnOnce(f64)>>,
 }
 
@@ -12,6 +17,8 @@ impl Window {
             inner_width: width,
             inner_height: height,
             device_pixel_ratio: 1.0,
+            history: History::new(),
+            location: Location::new("/"),
             animation_frame_callbacks: Vec::new(),
         }
     }

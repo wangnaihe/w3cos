@@ -2,12 +2,16 @@ pub mod css_style;
 pub mod document;
 pub mod element;
 pub mod events;
+pub mod history;
+pub mod location;
 pub mod node;
 pub mod window;
 
 pub use document::Document;
 pub use element::Element;
 pub use events::{Event, EventHandler, EventType};
+pub use history::History;
+pub use location::Location;
 pub use node::{NodeId, NodeType};
 pub use window::Window;
 

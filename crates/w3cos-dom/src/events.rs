@@ -15,6 +15,8 @@ pub enum EventType {
     Change,
     Scroll,
     Resize,
+    PopState,
+    HashChange,
 }
 
 impl EventType {
@@ -34,6 +36,8 @@ impl EventType {
             "change" => Some(Self::Change),
             "scroll" => Some(Self::Scroll),
             "resize" => Some(Self::Resize),
+            "popstate" => Some(Self::PopState),
+            "hashchange" => Some(Self::HashChange),
             _ => None,
         }
     }

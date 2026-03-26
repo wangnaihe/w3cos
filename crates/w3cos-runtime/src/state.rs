@@ -3,9 +3,9 @@ use std::cell::RefCell;
 /// Thread-local reactive signal store.
 /// Signals hold i64 values that can be read and modified by event handlers.
 /// When any signal changes, the `dirty` flag is set, prompting a UI rebuild.
-struct SignalStore {
+pub(crate) struct SignalStore {
     values: Vec<i64>,
-    dirty: bool,
+    pub(crate) dirty: bool,
 }
 
 impl SignalStore {
@@ -18,7 +18,7 @@ impl SignalStore {
 }
 
 thread_local! {
-    static STORE: RefCell<SignalStore> = RefCell::new(SignalStore::new());
+    pub(crate) static STORE: RefCell<SignalStore> = RefCell::new(SignalStore::new());
 }
 
 /// Create a new signal with the given initial value. Returns the signal ID.
