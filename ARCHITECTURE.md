@@ -40,11 +40,12 @@
 ├──────────────────────────────────────────────────────────┤
 │  w3cos-runtime                                           │
 │  ┌──────────┐ ┌──────────┐ ┌───────────────────┐       │
-│  │  Taffy    │ │ tiny-skia│ │  winit + softbuf  │       │
-│  │ (CSS      │ │ (2D      │ │  (native window   │       │
-│  │  layout)  │ │  render) │ │   + events)       │       │
-│  │ Flex/Grid │ │          │ │                   │       │
-│  │ Block/Pos │ │          │ │                   │       │
+│  │  Taffy    │ │  Vello   │ │  winit + wgpu     │       │
+│  │ (CSS      │ │ (GPU 2D  │ │  (native window   │       │
+│  │  layout)  │ │  render) │ │   + GPU surface)  │       │
+│  │ Flex/Grid │ │ +skrifa  │ │                   │       │
+│  │ Block/Pos │ │ +fontdue │ │  CPU fallback:    │       │
+│  │           │ │          │ │  tiny-skia+softbuf│       │
 │  └──────────┘ └──────────┘ └───────────────────┘       │
 ├──────────────────────────────────────────────────────────┤
 │  rustc / LLVM (compilation to native machine code)       │
@@ -103,7 +104,7 @@ We use the stock Linux kernel for hardware support. The innovation is above the 
 | `w3cos-a11y` | Accessibility tree: DOM → ARIA roles, flatten for AI consumption | ~250 |
 | `w3cos-ai-bridge` | AI agent interface: DOM access + a11y API + screenshot + permissions (observer/interactive/system) | ~400 |
 | `w3cos-compiler` | TS/JSON parser + Rust code generator. Handles TSX components + CSS-in-JS styles | ~500 |
-| `w3cos-runtime` | Layout (Taffy 0.9) + rendering (tiny-skia) + window (winit) + mouse events + hover/click | ~500 |
+| `w3cos-runtime` | Layout (Taffy 0.9) + rendering (Vello GPU / tiny-skia CPU fallback) + window (winit + wgpu) + mouse events + hover/click | ~900 |
 | `w3cos-cli` | CLI tool: `w3cos build app.ts -o binary --release` | ~100 |
 
 ---

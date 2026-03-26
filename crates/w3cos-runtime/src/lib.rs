@@ -1,8 +1,16 @@
 pub mod fetch;
 pub mod layout;
 pub mod notification;
-pub mod render;
 pub mod state;
+
+#[cfg(feature = "gpu")]
+#[path = "render_gpu.rs"]
+pub mod render;
+
+#[cfg(feature = "cpu-render")]
+#[path = "render_cpu.rs"]
+pub mod render;
+
 pub mod window;
 
 use anyhow::Result;

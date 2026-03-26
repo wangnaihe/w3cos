@@ -1,13 +1,28 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::time::Instant;
-use tiny_skia::Pixmap;
+
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
+
+#[cfg(feature = "cpu-render")]
+use std::num::NonZeroU32;
+#[cfg(feature = "cpu-render")]
+use tiny_skia::Pixmap;
+
+#[cfg(feature = "gpu")]
+use vello::peniko::FontData;
+#[cfg(feature = "gpu")]
+use vello::util::{RenderContext, RenderSurface};
+#[cfg(feature = "gpu")]
+use vello::{AaConfig, Renderer, RendererOptions, Scene};
+#[cfg(feature = "gpu")]
+use vello::wgpu;
 
 use crate::layout::{self, LayoutRect, ScrollExtent};
 use crate::render;
@@ -18,7 +33,6 @@ use w3cos_std::{Component, ComponentKind, EventAction};
 
 static EMBEDDED_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
 
-/// Target ~60fps for animation frames.
 const ANIMATION_FRAME_INTERVAL_MS: u64 = 16;
 
 struct HitNode {
@@ -29,7 +43,6 @@ struct HitNode {
     on_click: EventAction,
 }
 
-/// A single active CSS transition animation for a specific property on a node.
 enum ActiveAnimation {
     Opacity {
         node_index: usize,
@@ -87,10 +100,24 @@ impl ActiveAnimation {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPU render state
+// ---------------------------------------------------------------------------
+#[cfg(feature = "gpu")]
+enum GpuState {
+    Active {
+        surface: RenderSurface<'static>,
+        window: Arc<Window>,
+    },
+    Suspended(Option<Arc<Window>>),
+}
+
+// ---------------------------------------------------------------------------
+// App struct — shared fields + backend-specific fields
+// ---------------------------------------------------------------------------
 struct App {
     builder: Option<fn() -> Component>,
     root: Component,
-    window: Option<Window>,
     font: fontdue::Font,
     mouse_x: f32,
     mouse_y: f32,
@@ -109,45 +136,41 @@ struct App {
     animations: Vec<ActiveAnimation>,
     last_frame_time: Option<Instant>,
     modifiers: ModifiersState,
+
+    // GPU-specific
+    #[cfg(feature = "gpu")]
+    render_cx: RenderContext,
+    #[cfg(feature = "gpu")]
+    renderers: Vec<Option<Renderer>>,
+    #[cfg(feature = "gpu")]
+    gpu_state: GpuState,
+    #[cfg(feature = "gpu")]
+    scene: Scene,
+    #[cfg(feature = "gpu")]
+    font_data: FontData,
+
+    // CPU-specific
+    #[cfg(feature = "cpu-render")]
+    window: Option<Window>,
 }
 
 impl App {
     fn new_reactive(builder: fn() -> Component) -> Self {
         let root = builder();
-        let font = fontdue::Font::from_bytes(EMBEDDED_FONT, fontdue::FontSettings::default())
-            .expect("failed to load embedded font");
-        Self {
-            builder: Some(builder),
-            root,
-            window: None,
-            font,
-            mouse_x: 0.0,
-            mouse_y: 0.0,
-            scale_factor: 1.0,
-            hovered_index: None,
-            pressed_index: None,
-            focused_index: None,
-            text_input_values: HashMap::new(),
-            hit_nodes: Vec::new(),
-            focusable_indices: Vec::new(),
-            layout_cache: Vec::new(),
-            scrollable_nodes: Vec::new(),
-            clip_only_nodes: Vec::new(),
-            scroll_offsets: HashMap::new(),
-            needs_layout: true,
-            animations: Vec::new(),
-            last_frame_time: None,
-            modifiers: ModifiersState::default(),
-        }
+        Self::create(Some(builder), root)
     }
 
     fn new_static(root: Component) -> Self {
+        Self::create(None, root)
+    }
+
+    fn create(builder: Option<fn() -> Component>, root: Component) -> Self {
         let font = fontdue::Font::from_bytes(EMBEDDED_FONT, fontdue::FontSettings::default())
             .expect("failed to load embedded font");
+
         Self {
-            builder: None,
+            builder,
             root,
-            window: None,
             font,
             mouse_x: 0.0,
             mouse_y: 0.0,
@@ -166,6 +189,35 @@ impl App {
             animations: Vec::new(),
             last_frame_time: None,
             modifiers: ModifiersState::default(),
+
+            #[cfg(feature = "gpu")]
+            render_cx: RenderContext::new(),
+            #[cfg(feature = "gpu")]
+            renderers: vec![],
+            #[cfg(feature = "gpu")]
+            gpu_state: GpuState::Suspended(None),
+            #[cfg(feature = "gpu")]
+            scene: Scene::new(),
+            #[cfg(feature = "gpu")]
+            font_data: render::make_font_data(EMBEDDED_FONT),
+
+            #[cfg(feature = "cpu-render")]
+            window: None,
+        }
+    }
+
+    fn get_window(&self) -> Option<&Window> {
+        #[cfg(feature = "gpu")]
+        {
+            match &self.gpu_state {
+                GpuState::Active { window, .. } => Some(window.as_ref()),
+                GpuState::Suspended(Some(w)) => Some(w.as_ref()),
+                GpuState::Suspended(None) => None,
+            }
+        }
+        #[cfg(feature = "cpu-render")]
+        {
+            self.window.as_ref()
         }
     }
 
@@ -240,7 +292,7 @@ impl App {
         if !self.needs_layout && !self.layout_cache.is_empty() {
             return;
         }
-        let window = match self.window.as_ref() {
+        let window = match self.get_window() {
             Some(w) => w,
             None => return,
         };
@@ -281,6 +333,150 @@ impl App {
         self.needs_layout = false;
     }
 
+    // -----------------------------------------------------------------------
+    // GPU paint
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "gpu")]
+    fn paint(&mut self) {
+        self.ensure_layout();
+
+        let (surface, dev_id) = match &self.gpu_state {
+            GpuState::Active { surface, .. } => (surface, surface.dev_id),
+            _ => return,
+        };
+        let width = surface.config.width;
+        let height = surface.config.height;
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let mut render_root = self.root.clone();
+        let now = Instant::now();
+        apply_animations(&mut render_root, &self.animations, now);
+        if let Some(hover_idx) = self.hovered_index {
+            apply_hover(
+                &mut render_root,
+                hover_idx,
+                self.pressed_index == Some(hover_idx),
+            );
+        }
+
+        self.animations.retain(|a| !a.is_complete(now));
+        self.last_frame_time = Some(now);
+
+        if !self.animations.is_empty() {
+            self.request_repaint();
+        }
+
+        let flat = flatten_tree(&render_root);
+        let render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> = self
+            .layout_cache
+            .iter()
+            .filter_map(|&(rect, idx)| {
+                flat.get(idx)
+                    .map(|&(kind, style, _)| (idx, rect, kind, style))
+            })
+            .collect();
+
+        let scroll_info = build_scroll_info(
+            &self.root,
+            &self.scrollable_nodes,
+            &self.clip_only_nodes,
+            &self.scroll_offsets,
+        );
+
+        self.scene.reset();
+        render::render_frame(
+            &mut self.scene,
+            width,
+            height,
+            &render_nodes,
+            &self.font_data,
+            &self.font,
+            &scroll_info,
+            &self.text_input_values,
+            self.focused_index,
+        );
+
+        if let Some(hover_idx) = self.hovered_index
+            && let Some(hit) = self
+                .hit_nodes
+                .iter()
+                .find(|h| h.index == hover_idx && h.is_interactive)
+        {
+            render::draw_hover_outline(&mut self.scene, hit.rect);
+        }
+        if let Some(focus_idx) = self.focused_index
+            && (self.hovered_index != Some(focus_idx))
+            && let Some(&(kind, _, _)) = flatten_tree(&self.root).get(focus_idx)
+            && matches!(kind, ComponentKind::Button { .. })
+            && let Some(hit) = self
+                .hit_nodes
+                .iter()
+                .find(|h| h.index == focus_idx && h.is_focusable)
+        {
+            render::draw_focus_ring(&mut self.scene, hit.rect);
+        }
+
+        let GpuState::Active { surface, .. } = &self.gpu_state else {
+            return;
+        };
+
+        let device_handle = &self.render_cx.devices[dev_id];
+        if let Some(renderer) = self.renderers.get_mut(dev_id).and_then(|r| r.as_mut()) {
+            let render_result = renderer.render_to_texture(
+                &device_handle.device,
+                &device_handle.queue,
+                &self.scene,
+                &surface.target_view,
+                &vello::RenderParams {
+                    base_color: vello::peniko::Color::new([
+                        18.0 / 255.0,
+                        18.0 / 255.0,
+                        24.0 / 255.0,
+                        1.0,
+                    ]),
+                    width,
+                    height,
+                    antialiasing_method: AaConfig::Msaa16,
+                },
+            );
+            if let Err(e) = render_result {
+                eprintln!("[W3C OS] GPU render error: {e}");
+                return;
+            }
+
+            let surface_texture = match surface.surface.get_current_texture() {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[W3C OS] Failed to get surface texture: {e}");
+                    return;
+                }
+            };
+            let mut encoder =
+                device_handle
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Surface Blit"),
+                    });
+            surface.blitter.copy(
+                &device_handle.device,
+                &mut encoder,
+                &surface.target_view,
+                &surface_texture
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default()),
+            );
+            device_handle.queue.submit([encoder.finish()]);
+            surface_texture.present();
+            let _ = device_handle.device.poll(wgpu::PollType::Poll);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CPU paint
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "cpu-render")]
     fn paint(&mut self) {
         self.ensure_layout();
 
@@ -348,7 +544,7 @@ impl App {
                 .iter()
                 .find(|h| h.index == hover_idx && h.is_interactive)
         {
-            draw_hover_outline(&mut pixmap, hit.rect);
+            draw_hover_outline_cpu(&mut pixmap, hit.rect);
         }
         if let Some(focus_idx) = self.focused_index
             && (self.hovered_index != Some(focus_idx))
@@ -359,7 +555,7 @@ impl App {
                 .iter()
                 .find(|h| h.index == focus_idx && h.is_focusable)
         {
-            draw_focus_ring(&mut pixmap, hit.rect);
+            draw_focus_ring_cpu(&mut pixmap, hit.rect);
         }
 
         present_pixels(window, &pixmap, w, h);
@@ -379,7 +575,6 @@ impl App {
         None
     }
 
-    /// Find the topmost scrollable node that contains the given point.
     fn hit_test_scroll(&self, x: f32, y: f32) -> Option<usize> {
         for (idx, rect, _) in self.scrollable_nodes.iter().rev() {
             if x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height {
@@ -426,7 +621,7 @@ impl App {
     }
 
     fn request_repaint(&self) {
-        if let Some(ref window) = self.window {
+        if let Some(window) = self.get_window() {
             window.request_redraw();
         }
     }
@@ -461,6 +656,10 @@ impl App {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Animation helpers (shared)
+// ---------------------------------------------------------------------------
 
 fn apply_animations(root: &mut Component, animations: &[ActiveAnimation], now: Instant) {
     for anim in animations {
@@ -542,7 +741,12 @@ fn apply_hover_recursive(
     }
 }
 
-fn draw_hover_outline(pixmap: &mut Pixmap, rect: LayoutRect) {
+// ---------------------------------------------------------------------------
+// CPU-only drawing helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cpu-render")]
+fn draw_hover_outline_cpu(pixmap: &mut Pixmap, rect: LayoutRect) {
     let color = tiny_skia::Color::from_rgba8(108, 92, 231, 100);
     let mut paint = tiny_skia::Paint::default();
     paint.set_color(color);
@@ -562,7 +766,8 @@ fn draw_hover_outline(pixmap: &mut Pixmap, rect: LayoutRect) {
     }
 }
 
-fn draw_focus_ring(pixmap: &mut Pixmap, rect: LayoutRect) {
+#[cfg(feature = "cpu-render")]
+fn draw_focus_ring_cpu(pixmap: &mut Pixmap, rect: LayoutRect) {
     let color = tiny_skia::Color::from_rgba8(108, 92, 231, 180);
     let mut paint = tiny_skia::Paint::default();
     paint.set_color(color);
@@ -582,6 +787,7 @@ fn draw_focus_ring(pixmap: &mut Pixmap, rect: LayoutRect) {
     }
 }
 
+#[cfg(feature = "cpu-render")]
 fn present_pixels(window: &Window, pixmap: &Pixmap, w: u32, h: u32) {
     let context = match softbuffer::Context::new(window) {
         Ok(c) => c,
@@ -607,6 +813,10 @@ fn present_pixels(window: &Window, pixmap: &Pixmap, w: u32, h: u32) {
     let _ = buffer.present();
 }
 
+// ---------------------------------------------------------------------------
+// ApplicationHandler
+// ---------------------------------------------------------------------------
+
 impl ApplicationHandler for App {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         if matches!(cause, StartCause::ResumeTimeReached { .. }) && !self.animations.is_empty() {
@@ -625,14 +835,68 @@ impl ApplicationHandler for App {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() {
-            let attrs = WindowAttributes::default()
-                .with_title("W3C OS")
-                .with_inner_size(winit::dpi::LogicalSize::new(1200, 800));
-            let window = event_loop.create_window(attrs).unwrap();
+        #[cfg(feature = "gpu")]
+        {
+            let window = match &self.gpu_state {
+                GpuState::Suspended(cached) => {
+                    cached.clone().unwrap_or_else(|| {
+                        let attrs = WindowAttributes::default()
+                            .with_title("W3C OS")
+                            .with_inner_size(winit::dpi::LogicalSize::new(1200, 800));
+                        Arc::new(event_loop.create_window(attrs).unwrap())
+                    })
+                }
+                GpuState::Active { .. } => return,
+            };
+
             self.scale_factor = window.scale_factor();
-            self.window = Some(window);
+            let size = window.inner_size();
+
+            let surface = pollster::block_on(self.render_cx.create_surface(
+                window.clone(),
+                size.width.max(1),
+                size.height.max(1),
+                wgpu::PresentMode::AutoVsync,
+            ))
+            .expect("failed to create GPU surface");
+
+            while self.renderers.len() <= surface.dev_id {
+                self.renderers.push(None);
+            }
+            if self.renderers[surface.dev_id].is_none() {
+                let dev = &self.render_cx.devices[surface.dev_id];
+                self.renderers[surface.dev_id] = Some(
+                    Renderer::new(&dev.device, RendererOptions::default())
+                        .expect("failed to create vello renderer"),
+                );
+            }
+
+            self.gpu_state = GpuState::Active { surface, window };
             self.needs_layout = true;
+        }
+
+        #[cfg(feature = "cpu-render")]
+        {
+            if self.window.is_none() {
+                let attrs = WindowAttributes::default()
+                    .with_title("W3C OS")
+                    .with_inner_size(winit::dpi::LogicalSize::new(1200, 800));
+                let window = event_loop.create_window(attrs).unwrap();
+                self.scale_factor = window.scale_factor();
+                self.window = Some(window);
+                self.needs_layout = true;
+            }
+        }
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "gpu")]
+        {
+            if let GpuState::Active { window, .. } =
+                std::mem::replace(&mut self.gpu_state, GpuState::Suspended(None))
+            {
+                self.gpu_state = GpuState::Suspended(Some(window));
+            }
         }
     }
 
@@ -654,7 +918,16 @@ impl ApplicationHandler for App {
                 self.paint();
             }
 
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(_size) => {
+                #[cfg(feature = "gpu")]
+                {
+                    if _size.width > 0 && _size.height > 0 {
+                        if let GpuState::Active { ref mut surface, .. } = self.gpu_state {
+                            self.render_cx
+                                .resize_surface(surface, _size.width, _size.height);
+                        }
+                    }
+                }
                 self.needs_layout = true;
                 self.request_repaint();
             }
@@ -668,7 +941,7 @@ impl ApplicationHandler for App {
 
                 if new_hover != self.hovered_index {
                     self.hovered_index = new_hover;
-                    if let Some(ref window) = self.window {
+                    if let Some(window) = self.get_window() {
                         if new_hover.is_some() {
                             window.set_cursor(winit::window::Cursor::Icon(
                                 winit::window::CursorIcon::Pointer,
@@ -828,7 +1101,10 @@ impl ApplicationHandler for App {
     }
 }
 
-/// For each node index, returns (scroll_x, scroll_y, clip_rect) if the node is inside a scroll or clip container.
+// ---------------------------------------------------------------------------
+// Tree helpers (shared)
+// ---------------------------------------------------------------------------
+
 fn build_scroll_info(
     root: &Component,
     scrollable: &[(usize, LayoutRect, ScrollExtent)],
@@ -926,6 +1202,10 @@ fn flatten_recursive<'a>(
         flatten_recursive(child, out);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
 
 pub fn run_reactive(builder: fn() -> Component) -> Result<()> {
     let event_loop = EventLoop::new()?;

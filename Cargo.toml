@@ -36,7 +36,10 @@ taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout",
 parley = "0.7"
 fontdue = "0.9"
 
-# Rendering: tiny-skia (CPU) — Phase 1; Vello (GPU) planned for Phase 2
+# Rendering: Vello (GPU, default) + tiny-skia (CPU fallback)
+vello = "0.8"
+skrifa = "0.36"
+pollster = "0.4"
 tiny-skia = "0.11"
 
 # Windowing

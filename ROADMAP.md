@@ -10,7 +10,7 @@
 - [x] w3cos-a11y: DOM → ARIA tree, flatten for AI
 - [x] w3cos-ai-bridge: DOM access + a11y API + screenshot + permissions
 - [x] w3cos-compiler: JSON + TS parsing → Rust codegen
-- [x] w3cos-runtime: Taffy 0.9 (Flex/Grid/Block/position) + tiny-skia + winit
+- [x] w3cos-runtime: Taffy 0.9 (Flex/Grid/Block/position) + Vello GPU / tiny-skia CPU + winit
 - [x] w3cos-runtime: Mouse events, hover, click, hit-testing
 - [x] w3cos-cli: `w3cos build` and `w3cos run`
 - [x] CSS: Flexbox, Grid, Block, position relative/absolute, overflow, z-index
@@ -52,7 +52,7 @@
 - [ ] typeof operator runtime support via Value::type_of()
 
 ## Phase 2 — Production Quality
-- [ ] GPU rendering (Vello + wgpu — replace tiny-skia)
+- [x] GPU rendering (Vello + wgpu — replace tiny-skia, CPU fallback via feature flag)
 - [ ] System bridge: File System Access API → Linux FS
 - [ ] System bridge: Fetch API → native HTTP client
 - [ ] System bridge: Clipboard API
