@@ -4,13 +4,13 @@
 # ============================================================
 # Stage 1: Build the demo binary directly from workspace
 # ============================================================
-FROM rust:bookworm AS builder
+FROM rust:1.87-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /w3cos
 # Cache-bust: change this value to force re-clone after code updates
-ARG CACHE_BUST=2026032202
+ARG CACHE_BUST=2026032801
 RUN git clone --depth 1 https://github.com/wangnaihe/w3cos.git .
 
 # Build the demo binary as a workspace member — no temp projects, no arch issues
