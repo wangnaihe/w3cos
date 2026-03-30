@@ -819,18 +819,43 @@ fn present_pixels(window: &Window, pixmap: &Pixmap, w: u32, h: u32) {
 
 impl ApplicationHandler for App {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
-        if matches!(cause, StartCause::ResumeTimeReached { .. }) && !self.animations.is_empty() {
-            self.request_repaint();
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            // Fire due timers
+            let timer_actions = crate::timers::tick();
+            for action in &timer_actions {
+                state::execute_action(action);
+            }
+            if !timer_actions.is_empty() {
+                self.rebuild_if_dirty();
+            }
+
+            if !self.animations.is_empty() || !timer_actions.is_empty() {
+                self.request_repaint();
+            }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.animations.is_empty() {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + std::time::Duration::from_millis(ANIMATION_FRAME_INTERVAL_MS),
-            ));
+        let has_animations = !self.animations.is_empty();
+        let timer_deadline = crate::timers::next_deadline();
+
+        match (has_animations, timer_deadline) {
+            (false, None) => {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            (true, None) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + std::time::Duration::from_millis(ANIMATION_FRAME_INTERVAL_MS),
+                ));
+            }
+            (false, Some(deadline)) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            }
+            (true, Some(deadline)) => {
+                let anim_deadline =
+                    Instant::now() + std::time::Duration::from_millis(ANIMATION_FRAME_INTERVAL_MS);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline.min(anim_deadline)));
+            }
         }
     }
 
