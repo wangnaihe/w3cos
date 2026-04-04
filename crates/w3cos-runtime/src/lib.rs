@@ -3,6 +3,8 @@ pub mod fetch;
 pub mod fs;
 pub mod history;
 pub mod layout;
+pub mod manifest;
+pub mod multi_window;
 pub mod notification;
 pub mod process;
 #[cfg(unix)]

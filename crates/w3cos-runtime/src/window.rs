@@ -24,7 +24,7 @@ use vello::{AaConfig, Renderer, RendererOptions, Scene};
 #[cfg(feature = "gpu")]
 use vello::wgpu;
 
-use crate::layout::{self, LayoutRect, ScrollExtent};
+use crate::layout::{self, LayoutEngine, LayoutRect, ScrollExtent};
 use crate::render;
 use crate::state;
 use w3cos_std::color::Color;
@@ -35,6 +35,10 @@ static EMBEDDED_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
 
 const ANIMATION_FRAME_INTERVAL_MS: u64 = 16;
 
+// ---------------------------------------------------------------------------
+// HitNode — interactive region for click/focus
+// ---------------------------------------------------------------------------
+
 struct HitNode {
     rect: LayoutRect,
     index: usize,
@@ -42,6 +46,91 @@ struct HitNode {
     is_focusable: bool,
     on_click: EventAction,
 }
+
+// ---------------------------------------------------------------------------
+// SpatialGrid — O(1) hit testing via grid-based spatial hash
+// ---------------------------------------------------------------------------
+
+struct SpatialGrid {
+    cell_size: f32,
+    cols: usize,
+    cells: Vec<Vec<usize>>,
+}
+
+impl SpatialGrid {
+    fn empty() -> Self {
+        Self {
+            cell_size: 64.0,
+            cols: 1,
+            cells: Vec::new(),
+        }
+    }
+
+    fn build(hit_nodes: &[HitNode], viewport_w: f32, viewport_h: f32) -> Self {
+        let cell_size = 64.0f32;
+        let cols = ((viewport_w / cell_size).ceil() as usize).max(1);
+        let rows = ((viewport_h / cell_size).ceil() as usize).max(1);
+        let mut cells = vec![Vec::new(); cols * rows];
+
+        for (i, hit) in hit_nodes.iter().enumerate() {
+            if !hit.is_interactive {
+                continue;
+            }
+            let x0 = (hit.rect.x / cell_size).floor().max(0.0) as usize;
+            let y0 = (hit.rect.y / cell_size).floor().max(0.0) as usize;
+            let x1 = ((hit.rect.x + hit.rect.width) / cell_size)
+                .ceil()
+                .min(cols as f32) as usize;
+            let y1 = ((hit.rect.y + hit.rect.height) / cell_size)
+                .ceil()
+                .min(rows as f32) as usize;
+
+            for cy in y0..y1 {
+                for cx in x0..x1 {
+                    if cy < rows && cx < cols {
+                        cells[cy * cols + cx].push(i);
+                    }
+                }
+            }
+        }
+
+        Self {
+            cell_size,
+            cols,
+            cells,
+        }
+    }
+
+    fn query(&self, x: f32, y: f32, hit_nodes: &[HitNode]) -> Option<usize> {
+        if self.cells.is_empty() {
+            return None;
+        }
+        let cx = (x / self.cell_size).floor() as usize;
+        let cy = (y / self.cell_size).floor() as usize;
+        let cell_idx = cy * self.cols + cx;
+
+        if cell_idx >= self.cells.len() {
+            return None;
+        }
+
+        for &hit_idx in self.cells[cell_idx].iter().rev() {
+            let hit = &hit_nodes[hit_idx];
+            if hit.is_interactive
+                && x >= hit.rect.x
+                && x <= hit.rect.x + hit.rect.width
+                && y >= hit.rect.y
+                && y <= hit.rect.y + hit.rect.height
+            {
+                return Some(hit.index);
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ActiveAnimation
+// ---------------------------------------------------------------------------
 
 enum ActiveAnimation {
     Opacity {
@@ -113,7 +202,7 @@ enum GpuState {
 }
 
 // ---------------------------------------------------------------------------
-// App struct — shared fields + backend-specific fields
+// App struct
 // ---------------------------------------------------------------------------
 struct App {
     builder: Option<fn() -> Component>,
@@ -135,9 +224,20 @@ struct App {
     clip_only_nodes: Vec<(usize, LayoutRect)>,
     scroll_offsets: HashMap<usize, (f32, f32)>,
     needs_layout: bool,
+    needs_tree_rebuild: bool,
     animations: Vec<ActiveAnimation>,
     last_frame_time: Option<Instant>,
     modifiers: ModifiersState,
+
+    // Performance: persistent layout engine (avoids TaffyTree rebuild on resize)
+    layout_engine: LayoutEngine,
+    // Performance: scroll ancestor map (avoids O(n*depth) parent walk)
+    scroll_ancestor: Vec<Option<usize>>,
+    // Performance: spatial grid for O(1) hit testing
+    spatial_grid: SpatialGrid,
+    // Performance: dirty frame detection
+    paint_generation: u64,
+    layout_generation: u64,
 
     // GPU-specific
     #[cfg(feature = "gpu")]
@@ -150,6 +250,8 @@ struct App {
     scene: Scene,
     #[cfg(feature = "gpu")]
     font_data: FontData,
+    #[cfg(feature = "gpu")]
+    glyph_cache: render::GlyphCache,
 
     // CPU-specific
     #[cfg(feature = "cpu-render")]
@@ -203,9 +305,16 @@ impl App {
             clip_only_nodes: Vec::new(),
             scroll_offsets: HashMap::new(),
             needs_layout: true,
+            needs_tree_rebuild: true,
             animations: Vec::new(),
             last_frame_time: None,
             modifiers: ModifiersState::default(),
+
+            layout_engine: LayoutEngine::new(),
+            scroll_ancestor: Vec::new(),
+            spatial_grid: SpatialGrid::empty(),
+            paint_generation: 0,
+            layout_generation: 0,
 
             #[cfg(feature = "gpu")]
             render_cx: RenderContext::new(),
@@ -217,6 +326,8 @@ impl App {
             scene: Scene::new(),
             #[cfg(feature = "gpu")]
             font_data: render::make_font_data(EMBEDDED_FONT),
+            #[cfg(feature = "gpu")]
+            glyph_cache: render::GlyphCache::new(),
 
             #[cfg(feature = "cpu-render")]
             window: None,
@@ -258,12 +369,14 @@ impl App {
         if self.dom_mode {
             self.root = crate::dom::to_component_tree();
             self.needs_layout = true;
+            self.needs_tree_rebuild = true;
             self.hovered_index = None;
             self.pressed_index = None;
             self.collect_transition_animations(&old_root);
         } else if let Some(builder) = self.builder {
             self.root = builder();
             self.needs_layout = true;
+            self.needs_tree_rebuild = true;
             self.hovered_index = None;
             self.pressed_index = None;
             self.collect_transition_animations(&old_root);
@@ -271,12 +384,12 @@ impl App {
     }
 
     fn collect_transition_animations(&mut self, old_root: &Component) {
-        let old_flat = flatten_styles(old_root);
-        let new_flat = flatten_styles(&self.root);
+        let old_flat = layout::pre_flatten(old_root);
+        let new_flat = layout::pre_flatten(&self.root);
         let now = Instant::now();
 
-        for (idx, (old_style, new_style)) in old_flat.iter().zip(new_flat.iter()).enumerate() {
-            let Some(transition) = &new_style.transition else {
+        for (idx, (old_node, new_node)) in old_flat.iter().zip(new_flat.iter()).enumerate() {
+            let Some(transition) = &new_node.style.transition else {
                 continue;
             };
             let duration_ms = transition.duration_ms as f64;
@@ -292,11 +405,11 @@ impl App {
                 TransitionProperty::All | TransitionProperty::Background
             );
 
-            if animates_opacity && old_style.opacity != new_style.opacity {
+            if animates_opacity && old_node.style.opacity != new_node.style.opacity {
                 self.animations.push(ActiveAnimation::Opacity {
                     node_index: idx,
-                    from: old_style.opacity,
-                    to: new_style.opacity,
+                    from: old_node.style.opacity,
+                    to: new_node.style.opacity,
                     start: now,
                     duration_ms,
                     delay_ms,
@@ -304,15 +417,15 @@ impl App {
                 });
             }
             if animates_background
-                && (old_style.background.r != new_style.background.r
-                    || old_style.background.g != new_style.background.g
-                    || old_style.background.b != new_style.background.b
-                    || old_style.background.a != new_style.background.a)
+                && (old_node.style.background.r != new_node.style.background.r
+                    || old_node.style.background.g != new_node.style.background.g
+                    || old_node.style.background.b != new_node.style.background.b
+                    || old_node.style.background.a != new_node.style.background.a)
             {
                 self.animations.push(ActiveAnimation::Background {
                     node_index: idx,
-                    from: old_style.background,
-                    to: new_style.background,
+                    from: old_node.style.background,
+                    to: new_node.style.background,
                     start: now,
                     duration_ms,
                     delay_ms,
@@ -336,22 +449,32 @@ impl App {
             return;
         }
 
-        let (cache, scrollable, clip_only) = layout::compute_with_scroll(&self.root, w, h)
-            .unwrap_or_else(|_| (Vec::new(), Vec::new(), Vec::new()));
-        self.layout_cache = cache;
-        self.scrollable_nodes = scrollable;
-        self.clip_only_nodes = clip_only;
+        let flat = layout::pre_flatten(&self.root);
 
-        let flat = flatten_tree(&self.root);
+        if self.needs_tree_rebuild {
+            self.layout_engine.invalidate();
+            self.needs_tree_rebuild = false;
+        }
+
+        let results = self
+            .layout_engine
+            .compute(&self.root, &flat, w, h)
+            .unwrap_or_else(|_| layout::LayoutResults::empty());
+
+        self.layout_cache = results.layout_cache;
+        self.scrollable_nodes = results.scrollable_nodes;
+        self.clip_only_nodes = results.clip_only_nodes;
+        self.scroll_ancestor = results.scroll_ancestor;
+
         self.hit_nodes.clear();
         self.focusable_indices.clear();
         for &(rect, idx) in &self.layout_cache {
-            if let Some(&(kind, _, on_click)) = flat.get(idx) {
-                let is_interactive = matches!(kind, ComponentKind::Button { .. })
-                    || matches!(kind, ComponentKind::TextInput { .. })
-                    || !on_click.is_none();
-                let is_focusable = matches!(kind, ComponentKind::Button { .. })
-                    || matches!(kind, ComponentKind::TextInput { .. });
+            if let Some(node) = flat.get(idx) {
+                let is_interactive = matches!(node.kind, ComponentKind::Button { .. })
+                    || matches!(node.kind, ComponentKind::TextInput { .. })
+                    || !node.on_click.is_none();
+                let is_focusable = matches!(node.kind, ComponentKind::Button { .. })
+                    || matches!(node.kind, ComponentKind::TextInput { .. });
                 if is_focusable {
                     self.focusable_indices.push(idx);
                 }
@@ -360,65 +483,104 @@ impl App {
                     index: idx,
                     is_interactive,
                     is_focusable,
-                    on_click: on_click.clone(),
+                    on_click: node.on_click.clone(),
                 });
             }
         }
+
+        self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, h);
         self.needs_layout = false;
+        self.layout_generation += 1;
     }
 
     // -----------------------------------------------------------------------
-    // GPU paint
+    // GPU paint — zero-copy via style overrides (no root.clone())
     // -----------------------------------------------------------------------
     #[cfg(feature = "gpu")]
     fn paint(&mut self) {
         self.ensure_layout();
 
-        let (surface, dev_id) = match &self.gpu_state {
-            GpuState::Active { surface, .. } => (surface, surface.dev_id),
+        let (dev_id, width, height) = match &self.gpu_state {
+            GpuState::Active { surface, .. } => {
+                (surface.dev_id, surface.config.width, surface.config.height)
+            }
             _ => return,
         };
-        let width = surface.config.width;
-        let height = surface.config.height;
         if width == 0 || height == 0 {
             return;
         }
 
-        let mut render_root = self.root.clone();
         let now = Instant::now();
-        apply_animations(&mut render_root, &self.animations, now);
+
+        // Pre-flatten once for this frame (borrows self.root)
+        let flat = layout::pre_flatten(&self.root);
+
+        // Compute style overrides for animated/hovered nodes (only clones 0-2 styles)
+        let mut style_overrides: HashMap<usize, w3cos_std::style::Style> = HashMap::new();
+
+        for anim in &self.animations {
+            let idx = anim.node_index();
+            if idx >= flat.len() {
+                continue;
+            }
+            let t = anim.progress(now);
+            let eased = match anim {
+                ActiveAnimation::Opacity { easing, .. } => easing.interpolate(t),
+                ActiveAnimation::Background { easing, .. } => easing.interpolate(t),
+            };
+            let entry = style_overrides
+                .entry(idx)
+                .or_insert_with(|| flat[idx].style.clone());
+            match anim {
+                ActiveAnimation::Opacity { from, to, .. } => {
+                    entry.opacity = *from + eased * (to - from);
+                }
+                ActiveAnimation::Background { from, to, .. } => {
+                    entry.background = Color::rgba(
+                        lerp_u8(from.r, to.r, eased),
+                        lerp_u8(from.g, to.g, eased),
+                        lerp_u8(from.b, to.b, eased),
+                        lerp_u8(from.a, to.a, eased),
+                    );
+                }
+            }
+        }
+
         if let Some(hover_idx) = self.hovered_index {
-            apply_hover(
-                &mut render_root,
-                hover_idx,
-                self.pressed_index == Some(hover_idx),
-            );
+            if hover_idx < flat.len() {
+                let entry = style_overrides
+                    .entry(hover_idx)
+                    .or_insert_with(|| flat[hover_idx].style.clone());
+                if self.pressed_index == Some(hover_idx) {
+                    entry.opacity = 0.6;
+                } else if entry.background.a > 0 {
+                    entry.background.r = entry.background.r.saturating_add(25);
+                    entry.background.g = entry.background.g.saturating_add(25);
+                    entry.background.b = entry.background.b.saturating_add(25);
+                }
+            }
         }
 
-        self.animations.retain(|a| !a.is_complete(now));
-        self.last_frame_time = Some(now);
-
-        if !self.animations.is_empty() {
-            self.request_repaint();
-        }
-
-        let flat = flatten_tree(&render_root);
+        // Build render nodes using flat array + overrides (no flatten_tree needed)
         let render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> = self
             .layout_cache
             .iter()
             .filter_map(|&(rect, idx)| {
-                flat.get(idx)
-                    .map(|&(kind, style, _)| (idx, rect, kind, style))
+                let node = flat.get(idx)?;
+                let style = style_overrides.get(&idx).unwrap_or(node.style);
+                Some((idx, rect, node.kind, style))
             })
             .collect();
 
-        let scroll_info = build_scroll_info(
-            &self.root,
+        // Build scroll info using pre-computed scroll_ancestor (O(n) instead of O(n*depth))
+        let scroll_info = build_scroll_info_fast(
+            &self.scroll_ancestor,
             &self.scrollable_nodes,
             &self.clip_only_nodes,
             &self.scroll_offsets,
         );
 
+        // Render (split borrows: scene is separate from root/layout_cache/etc.)
         self.scene.reset();
         render::render_frame(
             &mut self.scene,
@@ -430,28 +592,52 @@ impl App {
             &scroll_info,
             &self.text_input_values,
             self.focused_index,
+            &mut self.glyph_cache,
         );
 
-        if let Some(hover_idx) = self.hovered_index
-            && let Some(hit) = self
+        // Draw hover outline
+        if let Some(hover_idx) = self.hovered_index {
+            if let Some(hit) = self
                 .hit_nodes
                 .iter()
                 .find(|h| h.index == hover_idx && h.is_interactive)
-        {
-            render::draw_hover_outline(&mut self.scene, hit.rect);
-        }
-        if let Some(focus_idx) = self.focused_index
-            && (self.hovered_index != Some(focus_idx))
-            && let Some(&(kind, _, _)) = flatten_tree(&self.root).get(focus_idx)
-            && matches!(kind, ComponentKind::Button { .. })
-            && let Some(hit) = self
-                .hit_nodes
-                .iter()
-                .find(|h| h.index == focus_idx && h.is_focusable)
-        {
-            render::draw_focus_ring(&mut self.scene, hit.rect);
+            {
+                render::draw_hover_outline(&mut self.scene, hit.rect);
+            }
         }
 
+        // Draw focus ring for focused buttons
+        if let Some(focus_idx) = self.focused_index {
+            if self.hovered_index != Some(focus_idx) {
+                if let Some(node) = flat.get(focus_idx) {
+                    if matches!(node.kind, ComponentKind::Button { .. }) {
+                        if let Some(hit) = self
+                            .hit_nodes
+                            .iter()
+                            .find(|h| h.index == focus_idx && h.is_focusable)
+                        {
+                            render::draw_focus_ring(&mut self.scene, hit.rect);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drop borrows on self.root (via flat/render_nodes/style_overrides)
+        drop(render_nodes);
+        drop(style_overrides);
+        drop(flat);
+
+        // Cleanup animations
+        self.animations.retain(|a| !a.is_complete(now));
+        self.last_frame_time = Some(now);
+        self.paint_generation += 1;
+
+        if !self.animations.is_empty() {
+            self.request_repaint();
+        }
+
+        // GPU submit
         let GpuState::Active { surface, .. } = &self.gpu_state else {
             return;
         };
@@ -508,7 +694,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // CPU paint
+    // CPU paint — same zero-copy pattern
     // -----------------------------------------------------------------------
     #[cfg(feature = "cpu-render")]
     fn paint(&mut self) {
@@ -529,36 +715,65 @@ impl App {
             None => return,
         };
 
-        let mut render_root = self.root.clone();
         let now = Instant::now();
-        apply_animations(&mut render_root, &self.animations, now);
+        let flat = layout::pre_flatten(&self.root);
+
+        // Compute style overrides
+        let mut style_overrides: HashMap<usize, w3cos_std::style::Style> = HashMap::new();
+        for anim in &self.animations {
+            let idx = anim.node_index();
+            if idx >= flat.len() {
+                continue;
+            }
+            let t = anim.progress(now);
+            let eased = match anim {
+                ActiveAnimation::Opacity { easing, .. } => easing.interpolate(t),
+                ActiveAnimation::Background { easing, .. } => easing.interpolate(t),
+            };
+            let entry = style_overrides
+                .entry(idx)
+                .or_insert_with(|| flat[idx].style.clone());
+            match anim {
+                ActiveAnimation::Opacity { from, to, .. } => {
+                    entry.opacity = *from + eased * (to - from);
+                }
+                ActiveAnimation::Background { from, to, .. } => {
+                    entry.background = Color::rgba(
+                        lerp_u8(from.r, to.r, eased),
+                        lerp_u8(from.g, to.g, eased),
+                        lerp_u8(from.b, to.b, eased),
+                        lerp_u8(from.a, to.a, eased),
+                    );
+                }
+            }
+        }
         if let Some(hover_idx) = self.hovered_index {
-            apply_hover(
-                &mut render_root,
-                hover_idx,
-                self.pressed_index == Some(hover_idx),
-            );
+            if hover_idx < flat.len() {
+                let entry = style_overrides
+                    .entry(hover_idx)
+                    .or_insert_with(|| flat[hover_idx].style.clone());
+                if self.pressed_index == Some(hover_idx) {
+                    entry.opacity = 0.6;
+                } else if entry.background.a > 0 {
+                    entry.background.r = entry.background.r.saturating_add(25);
+                    entry.background.g = entry.background.g.saturating_add(25);
+                    entry.background.b = entry.background.b.saturating_add(25);
+                }
+            }
         }
 
-        self.animations.retain(|a| !a.is_complete(now));
-        self.last_frame_time = Some(now);
-
-        if !self.animations.is_empty() {
-            self.request_repaint();
-        }
-
-        let flat = flatten_tree(&render_root);
         let render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> = self
             .layout_cache
             .iter()
             .filter_map(|&(rect, idx)| {
-                flat.get(idx)
-                    .map(|&(kind, style, _)| (idx, rect, kind, style))
+                let node = flat.get(idx)?;
+                let style = style_overrides.get(&idx).unwrap_or(node.style);
+                Some((idx, rect, node.kind, style))
             })
             .collect();
 
-        let scroll_info = build_scroll_info(
-            &self.root,
+        let scroll_info = build_scroll_info_fast(
+            &self.scroll_ancestor,
             &self.scrollable_nodes,
             &self.clip_only_nodes,
             &self.scroll_offsets,
@@ -572,46 +787,54 @@ impl App {
             self.focused_index,
         );
 
-        if let Some(hover_idx) = self.hovered_index
-            && let Some(hit) = self
+        if let Some(hover_idx) = self.hovered_index {
+            if let Some(hit) = self
                 .hit_nodes
                 .iter()
                 .find(|h| h.index == hover_idx && h.is_interactive)
-        {
-            draw_hover_outline_cpu(&mut pixmap, hit.rect);
+            {
+                draw_hover_outline_cpu(&mut pixmap, hit.rect);
+            }
         }
-        if let Some(focus_idx) = self.focused_index
-            && (self.hovered_index != Some(focus_idx))
-            && let Some(&(kind, _, _)) = flatten_tree(&self.root).get(focus_idx)
-            && matches!(kind, ComponentKind::Button { .. })
-            && let Some(hit) = self
-                .hit_nodes
-                .iter()
-                .find(|h| h.index == focus_idx && h.is_focusable)
-        {
-            draw_focus_ring_cpu(&mut pixmap, hit.rect);
+        if let Some(focus_idx) = self.focused_index {
+            if self.hovered_index != Some(focus_idx) {
+                if let Some(node) = flat.get(focus_idx) {
+                    if matches!(node.kind, ComponentKind::Button { .. }) {
+                        if let Some(hit) = self
+                            .hit_nodes
+                            .iter()
+                            .find(|h| h.index == focus_idx && h.is_focusable)
+                        {
+                            draw_focus_ring_cpu(&mut pixmap, hit.rect);
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(render_nodes);
+        drop(style_overrides);
+        drop(flat);
+
+        self.animations.retain(|a| !a.is_complete(now));
+        self.last_frame_time = Some(now);
+        self.paint_generation += 1;
+
+        if !self.animations.is_empty() {
+            self.request_repaint();
         }
 
         present_pixels(window, &pixmap, w, h);
     }
 
     fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
-        for hit in self.hit_nodes.iter().rev() {
-            if hit.is_interactive
-                && x >= hit.rect.x
-                && x <= hit.rect.x + hit.rect.width
-                && y >= hit.rect.y
-                && y <= hit.rect.y + hit.rect.height
-            {
-                return Some(hit.index);
-            }
-        }
-        None
+        self.spatial_grid.query(x, y, &self.hit_nodes)
     }
 
     fn hit_test_scroll(&self, x: f32, y: f32) -> Option<usize> {
         for (idx, rect, _) in self.scrollable_nodes.iter().rev() {
-            if x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height {
+            if x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
+            {
                 return Some(*idx);
             }
         }
@@ -619,39 +842,44 @@ impl App {
     }
 
     fn handle_click(&mut self, idx: usize) {
-        let flat = flatten_tree(&self.root);
-        if let Some(&(kind, _, _)) = flat.get(idx) {
-            match kind {
-                ComponentKind::TextInput { .. } => {
-                    self.focused_index = Some(idx);
-                    self.request_repaint();
-                    return;
-                }
-                ComponentKind::Button { .. } => {
-                    if let Some(hit) = self.hit_nodes.iter().find(|h| h.index == idx)
-                        && !hit.on_click.is_none()
-                    {
-                        state::execute_action(&hit.on_click);
-                        self.rebuild_if_dirty();
-                    } else {
-                        eprintln!("[W3C OS] Click → Button (no action)");
-                    }
-                    self.request_repaint();
-                    return;
-                }
-                _ => {}
+        if let Some(hit) = self.hit_nodes.iter().find(|h| h.index == idx) {
+            let kind_is_text_input = matches!(
+                self.get_kind_at(idx),
+                Some(ComponentKind::TextInput { .. })
+            );
+            let kind_is_button = matches!(
+                self.get_kind_at(idx),
+                Some(ComponentKind::Button { .. })
+            );
+
+            if kind_is_text_input {
+                self.focused_index = Some(idx);
+                self.request_repaint();
+                return;
             }
-        }
-        if let Some(hit) = self.hit_nodes.iter().find(|h| h.index == idx)
-            && !hit.on_click.is_none()
-        {
-            state::execute_action(&hit.on_click);
-            self.rebuild_if_dirty();
-            self.request_repaint();
-            return;
+            if kind_is_button {
+                if !hit.on_click.is_none() {
+                    state::execute_action(&hit.on_click);
+                    self.rebuild_if_dirty();
+                } else {
+                    eprintln!("[W3C OS] Click → Button (no action)");
+                }
+                self.request_repaint();
+                return;
+            }
+            if !hit.on_click.is_none() {
+                state::execute_action(&hit.on_click);
+                self.rebuild_if_dirty();
+                self.request_repaint();
+                return;
+            }
         }
         self.focused_index = None;
         self.request_repaint();
+    }
+
+    fn get_kind_at(&self, idx: usize) -> Option<&ComponentKind> {
+        get_kind_recursive(&self.root, idx, &mut 0)
     }
 
     fn request_repaint(&self) {
@@ -692,87 +920,65 @@ impl App {
 }
 
 // ---------------------------------------------------------------------------
-// Animation helpers (shared)
+// Helpers
 // ---------------------------------------------------------------------------
-
-fn apply_animations(root: &mut Component, animations: &[ActiveAnimation], now: Instant) {
-    for anim in animations {
-        let t = anim.progress(now);
-        let node_index = anim.node_index();
-        apply_animation_to_node(root, node_index, anim, t, &mut 0);
-    }
-}
-
-fn apply_animation_to_node(
-    comp: &mut Component,
-    target_idx: usize,
-    anim: &ActiveAnimation,
-    t: f32,
-    counter: &mut usize,
-) {
-    let my_idx = *counter;
-    *counter += 1;
-
-    if my_idx == target_idx {
-        let eased = match anim {
-            ActiveAnimation::Opacity { easing, .. } => easing.interpolate(t),
-            ActiveAnimation::Background { easing, .. } => easing.interpolate(t),
-        };
-        match anim {
-            ActiveAnimation::Opacity { from, to, .. } => {
-                comp.style.opacity = *from + eased * (to - from);
-            }
-            ActiveAnimation::Background { from, to, .. } => {
-                comp.style.background = Color::rgba(
-                    lerp_u8(from.r, to.r, eased),
-                    lerp_u8(from.g, to.g, eased),
-                    lerp_u8(from.b, to.b, eased),
-                    lerp_u8(from.a, to.a, eased),
-                );
-            }
-        }
-    }
-
-    for child in &mut comp.children {
-        apply_animation_to_node(child, target_idx, anim, t, counter);
-    }
-}
 
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let t = t.clamp(0.0, 1.0);
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
-fn apply_hover(root: &mut Component, target_idx: usize, is_pressed: bool) {
-    let mut counter = 0usize;
-    apply_hover_recursive(root, target_idx, is_pressed, &mut counter);
-}
-
-fn apply_hover_recursive(
-    comp: &mut Component,
-    target_idx: usize,
-    is_pressed: bool,
+fn get_kind_recursive<'a>(
+    comp: &'a Component,
+    target: usize,
     counter: &mut usize,
-) {
+) -> Option<&'a ComponentKind> {
     let my_idx = *counter;
     *counter += 1;
-
-    if my_idx == target_idx {
-        if is_pressed {
-            comp.style.opacity = 0.6;
-        } else {
-            let bg = &mut comp.style.background;
-            if bg.a > 0 {
-                bg.r = bg.r.saturating_add(25);
-                bg.g = bg.g.saturating_add(25);
-                bg.b = bg.b.saturating_add(25);
-            }
+    if my_idx == target {
+        return Some(&comp.kind);
+    }
+    for child in &comp.children {
+        if let Some(k) = get_kind_recursive(child, target, counter) {
+            return Some(k);
         }
     }
+    None
+}
 
-    for child in &mut comp.children {
-        apply_hover_recursive(child, target_idx, is_pressed, counter);
+/// Build scroll info using pre-computed scroll_ancestor map.
+/// O(n) instead of O(n * tree_depth).
+fn build_scroll_info_fast(
+    scroll_ancestor: &[Option<usize>],
+    scrollable: &[(usize, LayoutRect, ScrollExtent)],
+    clip_only: &[(usize, LayoutRect)],
+    offsets: &HashMap<usize, (f32, f32)>,
+) -> Vec<Option<(f32, f32, LayoutRect)>> {
+    if scroll_ancestor.is_empty() {
+        return Vec::new();
     }
+
+    let scrollable_rect: HashMap<usize, LayoutRect> =
+        scrollable.iter().map(|(i, r, _)| (*i, *r)).collect();
+    let clip_only_rect: HashMap<usize, LayoutRect> =
+        clip_only.iter().map(|(i, r)| (*i, *r)).collect();
+
+    scroll_ancestor
+        .iter()
+        .map(|ancestor| match ancestor {
+            Some(anc_idx) => {
+                if let Some(&clip) = scrollable_rect.get(anc_idx) {
+                    let (sx, sy) = offsets.get(anc_idx).copied().unwrap_or((0.0, 0.0));
+                    Some((sx, sy, clip))
+                } else if let Some(&clip) = clip_only_rect.get(anc_idx) {
+                    Some((0.0, 0.0, clip))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -854,7 +1060,6 @@ fn present_pixels(window: &Window, pixmap: &Pixmap, w: u32, h: u32) {
 impl ApplicationHandler for App {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            // Fire due timers
             let timer_actions = crate::timers::tick();
             for action in &timer_actions {
                 state::execute_action(action);
@@ -897,14 +1102,12 @@ impl ApplicationHandler for App {
         #[cfg(feature = "gpu")]
         {
             let window = match &self.gpu_state {
-                GpuState::Suspended(cached) => {
-                    cached.clone().unwrap_or_else(|| {
-                        let attrs = WindowAttributes::default()
-                            .with_title("W3C OS")
-                            .with_inner_size(winit::dpi::LogicalSize::new(1200, 800));
-                        Arc::new(event_loop.create_window(attrs).unwrap())
-                    })
-                }
+                GpuState::Suspended(cached) => cached.clone().unwrap_or_else(|| {
+                    let attrs = WindowAttributes::default()
+                        .with_title("W3C OS")
+                        .with_inner_size(winit::dpi::LogicalSize::new(1200, 800));
+                    Arc::new(event_loop.create_window(attrs).unwrap())
+                }),
                 GpuState::Active { .. } => return,
             };
 
@@ -981,7 +1184,10 @@ impl ApplicationHandler for App {
                 #[cfg(feature = "gpu")]
                 {
                     if _size.width > 0 && _size.height > 0 {
-                        if let GpuState::Active { ref mut surface, .. } = self.gpu_state {
+                        if let GpuState::Active {
+                            ref mut surface, ..
+                        } = self.gpu_state
+                        {
                             self.render_cx
                                 .resize_surface(surface, _size.width, _size.height);
                         }
@@ -1051,10 +1257,10 @@ impl ApplicationHandler for App {
                     return;
                 }
                 if let Some(focus_idx) = self.focused_index {
-                    let flat = flatten_tree(&self.root);
-                    if let Some(&(kind, _, _)) = flat.get(focus_idx) {
+                    if let Some(kind) = self.get_kind_at(focus_idx) {
                         match kind {
                             ComponentKind::TextInput { value, .. } => {
+                                let value = value.clone();
                                 if let Key::Named(NamedKey::Backspace) = event.logical_key {
                                     let current = self
                                         .text_input_values
@@ -1073,17 +1279,18 @@ impl ApplicationHandler for App {
                                     self.request_repaint();
                                     return;
                                 }
-                                if let Some(ref text) = event.text
-                                    && !text.is_empty()
-                                    && !text.chars().all(|c| c.is_control())
-                                {
-                                    let current = self
-                                        .text_input_values
-                                        .entry(focus_idx)
-                                        .or_insert_with(|| value.clone());
-                                    current.push_str(text);
-                                    self.request_repaint();
-                                    return;
+                                if let Some(ref text) = event.text {
+                                    if !text.is_empty()
+                                        && !text.chars().all(|c| c.is_control())
+                                    {
+                                        let current = self
+                                            .text_input_values
+                                            .entry(focus_idx)
+                                            .or_insert_with(|| value.clone());
+                                        current.push_str(text);
+                                        self.request_repaint();
+                                        return;
+                                    }
                                 }
                             }
                             ComponentKind::Button { .. } => {
@@ -1092,10 +1299,11 @@ impl ApplicationHandler for App {
                                 {
                                     if let Some(hit) =
                                         self.hit_nodes.iter().find(|h| h.index == focus_idx)
-                                        && !hit.on_click.is_none()
                                     {
-                                        state::execute_action(&hit.on_click);
-                                        self.rebuild_if_dirty();
+                                        if !hit.on_click.is_none() {
+                                            state::execute_action(&hit.on_click);
+                                            self.rebuild_if_dirty();
+                                        }
                                     }
                                     self.request_repaint();
                                     return;
@@ -1117,39 +1325,44 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Ime(ime) => {
-                if let Some(focus_idx) = self.focused_index
-                    && let Some(&(kind, _, _)) = flatten_tree(&self.root).get(focus_idx)
-                    && let ComponentKind::TextInput { value, .. } = kind
-                    && let winit::event::Ime::Commit(commit) = ime
-                {
-                    let current = self
-                        .text_input_values
-                        .entry(focus_idx)
-                        .or_insert_with(|| value.clone());
-                    current.push_str(&commit);
-                    self.request_repaint();
+                if let Some(focus_idx) = self.focused_index {
+                    if let Some(kind) = self.get_kind_at(focus_idx) {
+                        if let ComponentKind::TextInput { value, .. } = kind {
+                            let value = value.clone();
+                            if let winit::event::Ime::Commit(commit) = ime {
+                                let current = self
+                                    .text_input_values
+                                    .entry(focus_idx)
+                                    .or_insert_with(|| value);
+                                current.push_str(&commit);
+                                self.request_repaint();
+                            }
+                        }
+                    }
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
                 self.ensure_layout();
-                if let Some(idx) = self.hit_test_scroll(self.mouse_x, self.mouse_y)
-                    && let Some((_rect, extent)) = self
+                if let Some(idx) = self.hit_test_scroll(self.mouse_x, self.mouse_y) {
+                    if let Some((_rect, extent)) = self
                         .scrollable_nodes
                         .iter()
                         .find(|(i, _, _)| *i == idx)
                         .map(|(_, r, e)| (r, e))
-                {
-                    let dy = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
-                        MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
-                    };
-                    if dy != 0.0 {
-                        let (ox, oy) = self.scroll_offsets.get(&idx).copied().unwrap_or((0.0, 0.0));
-                        let new_oy = (oy + dy).clamp(0.0, extent.max_y);
-                        if (new_oy - oy).abs() > 0.001 {
-                            self.scroll_offsets.insert(idx, (ox, new_oy));
-                            self.request_repaint();
+                    {
+                        let dy = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
+                            MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
+                        };
+                        if dy != 0.0 {
+                            let (ox, oy) =
+                                self.scroll_offsets.get(&idx).copied().unwrap_or((0.0, 0.0));
+                            let new_oy = (oy + dy).clamp(0.0, extent.max_y);
+                            if (new_oy - oy).abs() > 0.001 {
+                                self.scroll_offsets.insert(idx, (ox, new_oy));
+                                self.request_repaint();
+                            }
                         }
                     }
                 }
@@ -1157,108 +1370,6 @@ impl ApplicationHandler for App {
 
             _ => {}
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tree helpers (shared)
-// ---------------------------------------------------------------------------
-
-fn build_scroll_info(
-    root: &Component,
-    scrollable: &[(usize, LayoutRect, ScrollExtent)],
-    clip_only: &[(usize, LayoutRect)],
-    offsets: &HashMap<usize, (f32, f32)>,
-) -> Vec<Option<(f32, f32, LayoutRect)>> {
-    let parent_map = build_parent_map(root);
-    let scrollable_set: std::collections::HashSet<usize> =
-        scrollable.iter().map(|(i, _, _)| *i).collect();
-    let scrollable_rect: HashMap<usize, LayoutRect> =
-        scrollable.iter().map(|(i, r, _)| (*i, *r)).collect();
-    let clip_only_set: std::collections::HashSet<usize> =
-        clip_only.iter().map(|(i, _)| *i).collect();
-    let clip_only_rect: HashMap<usize, LayoutRect> =
-        clip_only.iter().map(|(i, r)| (*i, *r)).collect();
-    let n = parent_map.len();
-    let mut out = vec![None; n];
-    #[allow(clippy::needless_range_loop)]
-    for idx in 0..n {
-        let mut cur = Some(idx);
-        let mut scroll_container = None;
-        let mut clip_container = None;
-        while let Some(i) = cur {
-            if scrollable_set.contains(&i) {
-                scroll_container = Some(i);
-                break;
-            }
-            if clip_only_set.contains(&i) {
-                clip_container = Some(i);
-                break;
-            }
-            cur = parent_map.get(i).copied().flatten();
-        }
-        if let Some(sc_id) = scroll_container {
-            let (sx, sy) = offsets.get(&sc_id).copied().unwrap_or((0.0, 0.0));
-            if let Some(&clip) = scrollable_rect.get(&sc_id) {
-                out[idx] = Some((sx, sy, clip));
-            }
-        } else if let Some(cl_id) = clip_container
-            && let Some(&clip) = clip_only_rect.get(&cl_id)
-        {
-            out[idx] = Some((0.0, 0.0, clip));
-        }
-    }
-    out
-}
-
-fn build_parent_map(root: &Component) -> Vec<Option<usize>> {
-    let mut out = Vec::new();
-    build_parent_map_recursive(root, None, &mut out);
-    out
-}
-
-fn build_parent_map_recursive(
-    comp: &Component,
-    parent: Option<usize>,
-    out: &mut Vec<Option<usize>>,
-) {
-    let my_idx = out.len();
-    out.push(parent);
-    for child in &comp.children {
-        build_parent_map_recursive(child, Some(my_idx), out);
-    }
-}
-
-fn flatten_styles(comp: &Component) -> Vec<w3cos_std::style::Style> {
-    let mut out = Vec::new();
-    flatten_styles_recursive(comp, &mut out);
-    out
-}
-
-fn flatten_styles_recursive(comp: &Component, out: &mut Vec<w3cos_std::style::Style>) {
-    out.push(comp.style.clone());
-    for child in &comp.children {
-        flatten_styles_recursive(child, out);
-    }
-}
-
-fn flatten_tree(comp: &Component) -> Vec<(&ComponentKind, &w3cos_std::style::Style, &EventAction)> {
-    let mut out = Vec::new();
-    flatten_recursive(comp, &mut out);
-    out
-}
-
-fn flatten_recursive<'a>(
-    comp: &'a Component,
-    out: &mut Vec<(
-        &'a ComponentKind,
-        &'a w3cos_std::style::Style,
-        &'a EventAction,
-    )>,
-) {
-    out.push((&comp.kind, &comp.style, &comp.on_click));
-    for child in &comp.children {
-        flatten_recursive(child, out);
     }
 }
 
