@@ -1,46 +1,29 @@
 # W3C OS — Hugging Face Spaces Live Demo
-# Self-contained: clones from GitHub and builds everything.
+# Builds w3cos-shell (desktop environment) and serves via noVNC.
 
-# ============================================================
-# Stage 1: Build the demo binary directly from workspace
-# ============================================================
-FROM rust:1.87-bookworm AS builder
+FROM rust:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /w3cos
-# Cache-bust: change this value to force re-clone after code updates
-ARG CACHE_BUST=2026032801
+ARG CACHE_BUST=2026040401
 RUN git clone --depth 1 https://github.com/wangnaihe/w3cos.git .
 
-# Build the demo binary as a workspace member — no temp projects, no arch issues
-RUN cargo build --release -p w3cos-demo 2>&1 | tail -5
+RUN cargo build --release -p w3cos-shell 2>&1 | tail -10
 
-RUN strip target/release/w3cos-demo && ls -lh target/release/w3cos-demo
+RUN strip target/release/w3cos-shell && ls -lh target/release/w3cos-shell
 
-# ============================================================
-# Stage 2: Runtime with virtual display + noVNC
-# ============================================================
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    xvfb \
-    x11vnc \
-    novnc \
-    websockify \
-    libfontconfig1 \
-    fonts-dejavu-core \
-    fonts-noto-cjk \
-    dbus-x11 \
-    xdotool \
-    openbox \
-    && rm -rf /var/lib/apt/lists/*
+    xvfb x11vnc novnc websockify libfontconfig1 fonts-dejavu-core \
+    fonts-noto-cjk dbus-x11 xdotool openbox && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash demo
 
-COPY --from=builder /w3cos/target/release/w3cos-demo /usr/bin/w3cos-demo
+COPY --from=builder /w3cos/target/release/w3cos-shell /usr/bin/w3cos-shell
 COPY start.sh /start.sh
-RUN chmod +x /start.sh /usr/bin/w3cos-demo
+RUN chmod +x /start.sh /usr/bin/w3cos-shell
 
 ENV PORT=7860
 EXPOSE 7860
