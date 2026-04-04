@@ -1,6 +1,9 @@
 
   W3C OS v0.1.0
-  TypeScript compiled to native. No browser. No V8.
+  An AI-native operating system built on W3C standards.
+  TypeScript + DOM/CSS compiled to native binaries.
+  No browser. No V8. No Electron.
 
   Login: root (no password)
+  SSH:   ssh root@localhost -p 2222
 

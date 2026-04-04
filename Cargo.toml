@@ -10,6 +10,7 @@ members = [
     "crates/w3cos-a11y",
     "crates/w3cos-ai-bridge",
     "crates/w3cos-demo",
+    "crates/w3cos-shell",
 ]
 
 [workspace.package]
@@ -48,6 +49,9 @@ softbuffer = "0.4"
 
 # HTTP client for Fetch API
 ureq = { version = "3", features = ["json"] }
+
+# DevTools (Chrome DevTools Protocol over WebSocket)
+tungstenite = "0.24"
 
 # Core
 anyhow = "1"

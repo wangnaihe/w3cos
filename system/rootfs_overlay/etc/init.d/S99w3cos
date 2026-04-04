@@ -1,29 +1,67 @@
 #!/bin/sh
 # W3C OS — system init script
-# This launches the W3C OS Shell as the primary user interface.
-# It replaces the traditional desktop environment (GNOME/KDE/etc.)
+# Launches the W3C OS Desktop Shell as the primary user interface.
+# Replaces traditional desktop environments (GNOME/KDE/etc.)
+#
+# Boot sequence: Linux kernel → busybox init → S99w3cos → w3cos-shell
 
 case "$1" in
     start)
-        echo "Starting W3C OS Shell..."
+        echo ""
+        echo "  ╔═══════════════════════════════════════╗"
+        echo "  ║     W3C OS v0.1.0                     ║"
+        echo "  ║     Starting Desktop Shell...          ║"
+        echo "  ╚═══════════════════════════════════════╝"
+        echo ""
 
-        # Wait for framebuffer
-        while [ ! -e /dev/fb0 ]; do
+        # Wait for framebuffer device
+        TIMEOUT=50
+        while [ ! -e /dev/fb0 ] && [ "$TIMEOUT" -gt 0 ]; do
             sleep 0.1
+            TIMEOUT=$((TIMEOUT - 1))
         done
 
-        # Set console font size
-        export TERM=linux
+        if [ ! -e /dev/fb0 ]; then
+            echo "  WARNING: No framebuffer (/dev/fb0) found."
+            echo "  Shell requires a display. Falling back to console."
+            exit 0
+        fi
 
-        # Launch W3C OS Shell on tty1 (fullscreen, no desktop)
-        /usr/bin/w3cos-shell &
+        # Set environment
+        export TERM=linux
+        export HOME=/root
+        export WINIT_UNIX_BACKEND=x11
+        export W3COS_SHELL=1
+
+        # Start networking in background
+        dhcpcd -b 2>/dev/null &
+
+        # Start SSH server for AI agent remote access
+        if [ -x /usr/sbin/dropbear ]; then
+            /usr/sbin/dropbear -R 2>/dev/null &
+            echo "  SSH: listening on port 22"
+        fi
+
+        # Launch W3C OS Desktop Shell (fullscreen, replaces desktop)
+        if [ -x /usr/bin/w3cos-shell ]; then
+            echo "  Shell: starting w3cos-shell"
+            /usr/bin/w3cos-shell 2>/var/log/w3cos-shell.log &
+        else
+            echo "  ERROR: /usr/bin/w3cos-shell not found"
+            echo "  Dropping to console."
+        fi
         ;;
     stop)
         echo "Stopping W3C OS Shell..."
         killall w3cos-shell 2>/dev/null
         ;;
+    restart)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
     *)
-        echo "Usage: $0 {start|stop}"
+        echo "Usage: $0 {start|stop|restart}"
         exit 1
         ;;
 esac

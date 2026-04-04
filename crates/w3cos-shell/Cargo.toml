@@ -1,0 +1,14 @@
+[package]
+name = "w3cos-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "W3C OS Desktop Shell — the system-level GUI that replaces traditional desktop environments"
+
+[[bin]]
+name = "w3cos-shell"
+path = "src/main.rs"
+
+[dependencies]
+w3cos-runtime = { workspace = true }
+w3cos-std = { workspace = true }
