@@ -21,6 +21,7 @@ anyhow = { workspace = true }
 image = { workspace = true }
 ureq = { workspace = true }
 serde_json = { workspace = true }
+libc = "0.2"
 notify-rust = "4"
 arboard = "3.6.1"
 

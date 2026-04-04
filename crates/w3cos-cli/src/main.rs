@@ -42,6 +42,11 @@ enum Commands {
         /// Path to the TypeScript or JSON source file.
         input: PathBuf,
     },
+    /// Start a dev server with hot reload (recompile + restart on file changes).
+    Dev {
+        /// Path to the TypeScript or JSON source file.
+        input: PathBuf,
+    },
     /// Initialize a new W3C OS project with template files.
     Init {
         /// Project name (creates a directory with this name).
@@ -73,6 +78,9 @@ fn main() -> Result<()> {
                 .status()
                 .context("Failed to run compiled binary")?;
             std::process::exit(status.code().unwrap_or(1));
+        }
+        Commands::Dev { input } => {
+            dev_watch(&input)?;
         }
         Commands::Init { project_name } => {
             init(&project_name)?;
@@ -217,3 +225,78 @@ Apache-2.0
 
     Ok(())
 }
+
+fn dev_watch(input: &PathBuf) -> Result<()> {
+    use std::time::{Duration, SystemTime};
+
+    let input = std::fs::canonicalize(input)
+        .with_context(|| format!("Could not find {}", input.display()))?;
+
+    println!("🔄 W3C OS Dev Mode — watching {}", input.display());
+    println!("   Press Ctrl+C to stop\n");
+
+    let mut last_modified = file_mtime(&input);
+    let tmp = std::env::temp_dir().join("w3cos-dev");
+    let bin = tmp.join("target").join("debug").join("w3cos-app");
+
+    loop {
+        // Build
+        println!("⚡ Building...");
+        if let Err(e) = build(&input, &bin, false, None, false) {
+            eprintln!("❌ Build failed: {e}");
+            wait_for_change(&input, &mut last_modified);
+            continue;
+        }
+        println!("✅ Built successfully");
+
+        // Run
+        println!("▶  Running...\n");
+        let mut child = Command::new(&bin)
+            .spawn()
+            .context("Failed to run compiled binary")?;
+
+        // Watch for file changes while the app is running
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+
+            let current_mtime = file_mtime(&input);
+            if current_mtime != last_modified {
+                last_modified = current_mtime;
+                println!("\n🔄 File changed — rebuilding...");
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    println!("\n⏹  App exited (code: {})", status.code().unwrap_or(-1));
+                    wait_for_change(&input, &mut last_modified);
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+fn wait_for_change(path: &std::path::Path, last_modified: &mut Option<SystemTime>) {
+    println!("👀 Waiting for file changes...");
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let current = file_mtime(path);
+        if current != *last_modified {
+            *last_modified = current;
+            return;
+        }
+    }
+}
+
+use std::time::SystemTime;

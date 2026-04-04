@@ -1,7 +1,7 @@
 # W3C OS Roadmap
 
 ## Phase 0 — Skeleton ✅
-- [x] Cargo workspace (7 crates)
+- [x] Cargo workspace (9 crates)
 - [x] w3cos-std: Component, Style, Color, Dimension (rem/em/vw/vh)
 - [x] w3cos-std: BoxShadow, Transform2D, Transition, Easing
 - [x] w3cos-dom: Document, Element, Node arena, CSSStyleDeclaration
@@ -15,7 +15,7 @@
 - [x] w3cos-cli: `w3cos build` and `w3cos run`
 - [x] CSS: Flexbox, Grid, Block, position relative/absolute, overflow, z-index
 - [x] CSS: rem, em, vw, vh, box-shadow, transform, transition, opacity
-- [x] 4 example apps (hello, counter, dashboard, showcase)
+- [x] 9 example apps (hello, counter, dashboard, showcase, calculator, weather, settings-panel, etc.)
 - [x] Dockerfile + .devcontainer
 - [x] Buildroot config + QEMU scripts + INSTALL.md
 - [x] ARCHITECTURE.md, README.md, CONTRIBUTING.md, ISSUES.md
@@ -28,7 +28,7 @@
 - [x] display: inline / inline-block (Taffy flex approximation)
 - [x] position: fixed / sticky
 - [x] CSS transitions (animated with 60fps frame loop)
-- [ ] @keyframes animation (#11)
+- [x] @keyframes animation support (Animation struct, keyframe types) (#11)
 - [x] Scroll support (overflow: scroll with mouse wheel)
 - [x] Image component (placeholder rendering, full decode #2)
 - [x] Focus management + keyboard navigation (Tab/Shift+Tab)
@@ -47,20 +47,44 @@
 - [x] Compiler: reactive() → Signal expansion (compile-time optimization)
 - [x] Compiler: watch()/computed()/effect() → w3cos-core API calls
 - [x] Compiler: reactive property access/assignment → signal.get()/set()
-- [x] Dynamic dependency generation (needs_core/needs_async/needs_rc flags)
+- [x] Dynamic dependency generation (needs_core/needs_async/needs_rc/needs_fetch flags)
+- [x] Compiler: fetch() → w3cos_runtime::fetch bridge codegen
 - [ ] Escape analysis optimization for Rc<RefCell<T>> elision (P5)
 - [ ] typeof operator runtime support via Value::type_of()
 
-## Phase 2 — Production Quality
-- [x] GPU rendering (Vello + wgpu — replace tiny-skia, CPU fallback via feature flag)
-- [ ] System bridge: File System Access API → Linux FS
-- [ ] System bridge: Fetch API → native HTTP client
-- [ ] System bridge: Clipboard API
-- [ ] System bridge: Notifications API
-- [ ] Multiple windows
-- [ ] Hot reload during development (`w3cos dev` with file watcher)
+## Phase 2 — System APIs & Production Quality ✅ (core APIs done)
+- [x] GPU rendering (Vello + wgpu — replace tiny-skia, CPU fallback via feature flag) (#12)
+- [x] System bridge: File System Access API → Linux FS (#16)
+- [x] System bridge: Fetch API → native HTTP client (ureq) (#15)
+- [x] System bridge: Clipboard API (#17 — arboard integration)
+- [x] System bridge: Notifications API (#18 — notify-rust)
+- [x] System bridge: setTimeout / setInterval / requestAnimationFrame (#33)
+- [x] System bridge: Child Process API (spawn/exec/pipe) (#35)
+- [x] System bridge: Pseudo Terminal (PTY) API (#36)
+- [x] System bridge: Path utilities + Environment variables
+- [x] CSS Text properties: text-align, white-space, line-height, letter-spacing, text-decoration, text-overflow, font-family, font-style, word-break (#31)
+- [x] CSS Custom Properties: var(--x) support in Style struct (#34)
+- [x] Hot reload during development (`w3cos dev` with file watcher) (#13)
+- [x] Live demo infrastructure (Docker + noVNC remote desktop)
+- [ ] Multiple windows (#21)
 - [ ] React hooks compatibility layer (@w3cos/react-compat)
-- [ ] React Native API mapping (@w3cos/rn-compat)
+- [ ] React Native API mapping (@w3cos/rn-compat) (#19)
+- [ ] Wire up AI Bridge to runtime (end-to-end AI agent demo) (#14)
+
+## Phase 2.5 — VS Code Compatibility (see docs/vscode-compat.md)
+- [ ] Complete DOM Core API (createElement/appendChild/querySelector full spec) (#30)
+- [ ] Canvas 2D API (CanvasRenderingContext2D) (#32)
+- [ ] Selection API (window.getSelection, Range) (#37)
+- [ ] CSS Selectors engine (:hover, :focus, .class, [attr])
+- [ ] Web Workers
+- [ ] WebSocket API
+- [ ] localStorage / IndexedDB
+- [ ] w3cos.window (multi-window management)
+- [ ] w3cos.dialog (open/save/message dialogs)
+- [ ] w3cos.ipc (inter-process communication)
+- [ ] w3cos.menu (application/context menus)
+- [ ] RegExp (full JS spec)
+- [ ] TextEncoder / TextDecoder
 
 ## Phase 3 — Compatibility & Migration
 - [ ] React Native app auto-migration tool (`w3cos migrate --from rn`)
@@ -68,8 +92,9 @@
 - [ ] PWA manifest support
 - [ ] npm package compatibility (pure-logic packages)
 - [ ] Cross-compilation: Linux x86/ARM, macOS
+
 ## Phase 4 — Operating System
-- [ ] Bootable ISO (Buildroot) available on GitHub Releases
+- [ ] Bootable ISO (Buildroot) available on GitHub Releases (#20)
 - [ ] W3C OS as system shell (replaces desktop environment)
 - [ ] AI system agent with privileged APIs
 - [ ] Package manager for W3C OS applications

@@ -49,6 +49,20 @@ pub struct Style {
     pub border_color: Color,
     pub opacity: f32,
 
+    // CSS Text (#31)
+    pub text_align: TextAlign,
+    pub white_space: WhiteSpace,
+    pub line_height: f32,
+    pub letter_spacing: f32,
+    pub text_decoration: TextDecoration,
+    pub text_overflow: TextOverflow,
+    pub font_family: Option<String>,
+    pub font_style: FontStyle,
+    pub word_break: WordBreak,
+
+    // CSS Custom Properties (#34)
+    pub custom_properties: Option<std::collections::HashMap<String, String>>,
+
     // Box Shadow
     pub box_shadow: Option<BoxShadow>,
 
@@ -57,6 +71,9 @@ pub struct Style {
 
     // Transition (property, duration_ms, easing)
     pub transition: Option<Transition>,
+
+    // CSS Animation (#11)
+    pub animation: Option<Animation>,
 }
 
 impl Default for Style {
@@ -93,9 +110,20 @@ impl Default for Style {
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
             opacity: 1.0,
+            text_align: TextAlign::Left,
+            white_space: WhiteSpace::Normal,
+            line_height: 1.2,
+            letter_spacing: 0.0,
+            text_decoration: TextDecoration::None,
+            text_overflow: TextOverflow::Clip,
+            font_family: None,
+            font_style: FontStyle::Normal,
+            word_break: WordBreak::Normal,
+            custom_properties: None,
             box_shadow: None,
             transform: Transform2D::IDENTITY,
             transition: None,
+            animation: None,
         }
     }
 }
@@ -218,6 +246,113 @@ impl Default for Edges {
     fn default() -> Self {
         Self::ZERO
     }
+}
+
+// --- CSS Text (#31) ---
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum WhiteSpace {
+    #[default]
+    Normal,
+    NoWrap,
+    Pre,
+    PreWrap,
+    PreLine,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum TextDecoration {
+    #[default]
+    None,
+    Underline,
+    LineThrough,
+    Overline,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum TextOverflow {
+    #[default]
+    Clip,
+    Ellipsis,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum FontStyle {
+    #[default]
+    Normal,
+    Italic,
+    Oblique,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum WordBreak {
+    #[default]
+    Normal,
+    BreakAll,
+    BreakWord,
+    KeepAll,
+}
+
+// --- CSS Animation (#11) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Animation {
+    pub name: String,
+    pub duration_ms: u32,
+    pub easing: Easing,
+    pub delay_ms: u32,
+    pub iteration_count: AnimationIterationCount,
+    pub direction: AnimationDirection,
+    pub fill_mode: AnimationFillMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum AnimationIterationCount {
+    #[default]
+    Once,
+    Count(u32),
+    Infinite,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum AnimationDirection {
+    #[default]
+    Normal,
+    Reverse,
+    Alternate,
+    AlternateReverse,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum AnimationFillMode {
+    #[default]
+    None,
+    Forwards,
+    Backwards,
+    Both,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Keyframe {
+    pub offset: f32,
+    pub style: KeyframeStyle,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeyframeStyle {
+    pub opacity: Option<f32>,
+    pub background: Option<Color>,
+    pub transform: Option<Transform2D>,
+    pub color: Option<Color>,
 }
 
 // --- Box Shadow ---

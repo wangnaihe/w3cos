@@ -3,6 +3,9 @@ pub mod fs;
 pub mod history;
 pub mod layout;
 pub mod notification;
+pub mod process;
+#[cfg(unix)]
+pub mod pty;
 pub mod state;
 pub mod timers;
 
