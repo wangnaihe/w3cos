@@ -167,37 +167,48 @@ fn render_node(
             );
         }
         ComponentKind::Image { src } => {
-            // Placeholder: draw border and label until PNG/JPEG decoding is implemented
-            let placeholder_bg = if bg.a == 0 {
-                apply_opacity(Color::rgb(40, 40, 50), opacity)
+            if let Some(decoded) = crate::image_loader::get_or_load(src) {
+                draw_image_pixels(
+                    pixmap,
+                    rect,
+                    decoded.width,
+                    decoded.height,
+                    &decoded.data,
+                    opacity,
+                    clip_mask,
+                );
             } else {
-                bg
-            };
-            draw_rect(pixmap, rect, placeholder_bg, style.border_radius, clip_mask);
-            let border_color = if style.border_width > 0.0 && style.border_color.a > 0 {
-                apply_opacity(style.border_color, opacity)
-            } else {
-                apply_opacity(Color::rgb(100, 100, 120), opacity)
-            };
-            draw_border(
-                pixmap,
-                rect,
-                border_color,
-                style.border_width.max(1.0),
-                style.border_radius,
-                clip_mask,
-            );
-            let label = format!("[Image: {}]", src);
-            draw_text(
-                pixmap,
-                rect.x + 8.0,
-                rect.y + 8.0,
-                &label,
-                style.font_size,
-                text_color,
-                font,
-                clip_mask,
-            );
+                let placeholder_bg = if bg.a == 0 {
+                    apply_opacity(Color::rgb(40, 40, 50), opacity)
+                } else {
+                    bg
+                };
+                draw_rect(pixmap, rect, placeholder_bg, style.border_radius, clip_mask);
+                let border_color = if style.border_width > 0.0 && style.border_color.a > 0 {
+                    apply_opacity(style.border_color, opacity)
+                } else {
+                    apply_opacity(Color::rgb(100, 100, 120), opacity)
+                };
+                draw_border(
+                    pixmap,
+                    rect,
+                    border_color,
+                    style.border_width.max(1.0),
+                    style.border_radius,
+                    clip_mask,
+                );
+                let label = format!("[Image: {}]", src);
+                draw_text(
+                    pixmap,
+                    rect.x + 8.0,
+                    rect.y + 8.0,
+                    &label,
+                    style.font_size,
+                    text_color,
+                    font,
+                    clip_mask,
+                );
+            }
         }
         ComponentKind::TextInput { value, placeholder } => {
             let display_value = text_input_value.unwrap_or(value.as_str());
@@ -483,6 +494,62 @@ fn draw_blinking_cursor(
             let dst = pixels[idx];
             let blended = blend_pixel(dst, color.r, color.g, color.b, 255);
             pixels[idx] = blended;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_image_pixels(
+    pixmap: &mut Pixmap,
+    rect: LayoutRect,
+    img_w: u32,
+    img_h: u32,
+    rgba: &[u8],
+    opacity: f32,
+    clip_mask: Option<&Mask>,
+) {
+    let dest_w = rect.width.ceil() as u32;
+    let dest_h = rect.height.ceil() as u32;
+    if dest_w == 0 || dest_h == 0 || img_w == 0 || img_h == 0 {
+        return;
+    }
+    let px_w = pixmap.width() as i32;
+    let px_h = pixmap.height() as i32;
+    let pixels = pixmap.pixels_mut();
+
+    for dy in 0..dest_h {
+        for dx in 0..dest_w {
+            let px = rect.x as i32 + dx as i32;
+            let py = rect.y as i32 + dy as i32;
+            if px < 0 || py < 0 || px >= px_w || py >= px_h {
+                continue;
+            }
+            if let Some(mask) = clip_mask {
+                if px >= mask.width() as i32 || py >= mask.height() as i32 {
+                    continue;
+                }
+                let mask_idx = (py * mask.width() as i32 + px) as usize;
+                if mask.data().get(mask_idx).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+            }
+            let src_x = ((dx as f32 / dest_w as f32) * img_w as f32) as u32;
+            let src_y = ((dy as f32 / dest_h as f32) * img_h as f32) as u32;
+            let src_x = src_x.min(img_w - 1);
+            let src_y = src_y.min(img_h - 1);
+            let src_idx = ((src_y * img_w + src_x) * 4) as usize;
+
+            let r = rgba[src_idx];
+            let g = rgba[src_idx + 1];
+            let b = rgba[src_idx + 2];
+            let a = (rgba[src_idx + 3] as f32 * opacity) as u8;
+            if a == 0 {
+                continue;
+            }
+
+            let dst_idx = (py * px_w + px) as usize;
+            let dst = pixels[dst_idx];
+            pixels[dst_idx] = blend_pixel(dst, r, g, b, a);
         }
     }
 }

@@ -4,13 +4,74 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use skrifa::MetadataProvider;
 use vello::kurbo::{Affine, Rect, RoundedRect, Stroke};
-use vello::peniko::{Blob, Color, Fill, FontData};
+use vello::peniko::{
+    Blob, Color, Fill, FontData, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
+};
 use vello::{Glyph, Scene};
 use w3cos_std::color::Color as AppColor;
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::Style;
 
 use crate::layout::LayoutRect;
+
+// ---------------------------------------------------------------------------
+// GlyphCache — avoid repeated font parsing, charmap lookup, and rasterization
+// ---------------------------------------------------------------------------
+
+pub struct GlyphCache {
+    entries: HashMap<(char, u32), GlyphEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct GlyphEntry {
+    glyph_id: Option<u32>,
+    advance: f32,
+}
+
+impl GlyphCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(256),
+        }
+    }
+
+    fn quantize(font_size: f32) -> u32 {
+        (font_size * 4.0).round() as u32
+    }
+
+    fn lookup_or_insert(
+        &mut self,
+        ch: char,
+        font_size: f32,
+        charmap: &skrifa::charmap::Charmap,
+        glyph_metrics: &skrifa::metrics::GlyphMetrics,
+        fontdue_font: &fontdue::Font,
+    ) -> GlyphEntry {
+        let key = (ch, Self::quantize(font_size));
+        *self.entries.entry(key).or_insert_with(|| {
+            if let Some(glyph_id) = charmap.map(ch) {
+                let advance = glyph_metrics.advance_width(glyph_id).unwrap_or_else(|| {
+                    let (metrics, _) = fontdue_font.rasterize(ch, font_size);
+                    metrics.advance_width
+                });
+                GlyphEntry {
+                    glyph_id: Some(glyph_id.to_u32()),
+                    advance,
+                }
+            } else {
+                let (metrics, _) = fontdue_font.rasterize(ch, font_size);
+                GlyphEntry {
+                    glyph_id: None,
+                    advance: metrics.advance_width,
+                }
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
 
 fn color_to_vello(c: AppColor) -> Color {
     Color::new([
@@ -26,6 +87,7 @@ pub fn make_font_data(font_bytes: &'static [u8]) -> FontData {
     FontData::new(blob, 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_frame(
     scene: &mut Scene,
     width: u32,
@@ -36,7 +98,11 @@ pub fn render_frame(
     scroll_info: &[Option<(f32, f32, LayoutRect)>],
     text_input_values: &HashMap<usize, String>,
     focused_index: Option<usize>,
+    glyph_cache: &mut GlyphCache,
 ) {
+    let vw = width as f32;
+    let vh = height as f32;
+
     for &(idx, rect, kind, style) in nodes {
         let (offset_rect, clip) = match scroll_info.get(idx) {
             Some(Some((sx, sy, clip_rect))) => {
@@ -50,6 +116,16 @@ pub fn render_frame(
             }
             _ => (rect, None),
         };
+
+        // Viewport culling: skip nodes entirely outside the visible area
+        if offset_rect.x + offset_rect.width < 0.0
+            || offset_rect.y + offset_rect.height < 0.0
+            || offset_rect.x > vw
+            || offset_rect.y > vh
+        {
+            continue;
+        }
+
         let text_value = match kind {
             ComponentKind::TextInput { value, .. } => Some(
                 text_input_values
@@ -62,8 +138,6 @@ pub fn render_frame(
         let is_focused = focused_index == Some(idx);
         render_node(
             scene,
-            width,
-            height,
             offset_rect,
             kind,
             style,
@@ -72,6 +146,7 @@ pub fn render_frame(
             clip,
             text_value,
             is_focused,
+            glyph_cache,
         );
     }
 }
@@ -79,8 +154,6 @@ pub fn render_frame(
 #[allow(clippy::too_many_arguments)]
 fn render_node(
     scene: &mut Scene,
-    _width: u32,
-    _height: u32,
     rect: LayoutRect,
     kind: &ComponentKind,
     style: &Style,
@@ -89,6 +162,7 @@ fn render_node(
     clip_rect: Option<LayoutRect>,
     text_input_value: Option<&str>,
     is_focused: bool,
+    glyph_cache: &mut GlyphCache,
 ) {
     if style.opacity <= 0.0 {
         return;
@@ -166,6 +240,7 @@ fn render_node(
                 text_color,
                 font_data,
                 font,
+                glyph_cache,
             );
         }
         ComponentKind::Button { label } => {
@@ -186,38 +261,59 @@ fn render_node(
                 text_color,
                 font_data,
                 font,
+                glyph_cache,
             );
         }
         ComponentKind::Image { src } => {
-            let placeholder_bg = if bg.a == 0 {
-                AppColor::rgb(40, 40, 50)
+            if let Some(decoded) = crate::image_loader::get_or_load(src) {
+                let blob = Blob::new(
+                    decoded.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>,
+                );
+                let image_data = ImageData {
+                    data: blob,
+                    format: ImageFormat::Rgba8,
+                    alpha_type: ImageAlphaType::Alpha,
+                    width: decoded.width,
+                    height: decoded.height,
+                };
+                let image_brush = ImageBrush::new(image_data);
+                let scale_x = rect.width as f64 / decoded.width as f64;
+                let scale_y = rect.height as f64 / decoded.height as f64;
+                let transform = Affine::translate((rect.x as f64, rect.y as f64))
+                    * Affine::scale_non_uniform(scale_x, scale_y);
+                scene.draw_image(image_brush.as_ref(), transform);
             } else {
-                bg
-            };
-            draw_rect(scene, rect, placeholder_bg, style.border_radius);
-            let border_color = if style.border_width > 0.0 && style.border_color.a > 0 {
-                style.border_color
-            } else {
-                AppColor::rgb(100, 100, 120)
-            };
-            draw_border(
-                scene,
-                rect,
-                border_color,
-                style.border_width.max(1.0),
-                style.border_radius,
-            );
-            let label = format!("[Image: {}]", src);
-            draw_text(
-                scene,
-                rect.x + 8.0,
-                rect.y + 8.0,
-                &label,
-                style.font_size,
-                text_color,
-                font_data,
-                font,
-            );
+                let placeholder_bg = if bg.a == 0 {
+                    AppColor::rgb(40, 40, 50)
+                } else {
+                    bg
+                };
+                draw_rect(scene, rect, placeholder_bg, style.border_radius);
+                let border_color = if style.border_width > 0.0 && style.border_color.a > 0 {
+                    style.border_color
+                } else {
+                    AppColor::rgb(100, 100, 120)
+                };
+                draw_border(
+                    scene,
+                    rect,
+                    border_color,
+                    style.border_width.max(1.0),
+                    style.border_radius,
+                );
+                let label = format!("[Image: {}]", src);
+                draw_text(
+                    scene,
+                    rect.x + 8.0,
+                    rect.y + 8.0,
+                    &label,
+                    style.font_size,
+                    text_color,
+                    font_data,
+                    font,
+                    glyph_cache,
+                );
+            }
         }
         ComponentKind::TextInput { value, placeholder } => {
             let display_value = text_input_value.unwrap_or(value.as_str());
@@ -262,9 +358,19 @@ fn render_node(
                 text_color_final,
                 font_data,
                 font,
+                glyph_cache,
             );
             if is_focused {
-                draw_blinking_cursor(scene, rect, display_value, style.font_size, text_color, font);
+                draw_blinking_cursor(
+                    scene,
+                    rect,
+                    display_value,
+                    style.font_size,
+                    text_color,
+                    font_data,
+                    font,
+                    glyph_cache,
+                );
             }
         }
         _ => {}
@@ -320,13 +426,7 @@ fn draw_rect(scene: &mut Scene, r: LayoutRect, color: AppColor, radius: f32) {
     }
 }
 
-fn draw_border(
-    scene: &mut Scene,
-    r: LayoutRect,
-    color: AppColor,
-    width: f32,
-    radius: f32,
-) {
+fn draw_border(scene: &mut Scene, r: LayoutRect, color: AppColor, width: f32, radius: f32) {
     let vc = color_to_vello(color);
     let stroke = Stroke::new(width as f64);
     let half = width as f64 / 2.0;
@@ -360,6 +460,7 @@ fn draw_text(
     color: AppColor,
     font_data: &FontData,
     fontdue_font: &fontdue::Font,
+    glyph_cache: &mut GlyphCache,
 ) {
     if text.is_empty() {
         return;
@@ -372,29 +473,26 @@ fn draw_text(
         Err(_) => return,
     };
     let charmap = font_ref.charmap();
-    let glyph_metrics =
-        font_ref.glyph_metrics(skrifa::instance::Size::new(font_size), skrifa::instance::LocationRef::default());
+    let glyph_metrics = font_ref.glyph_metrics(
+        skrifa::instance::Size::new(font_size),
+        skrifa::instance::LocationRef::default(),
+    );
 
     let baseline_y = y + font_size;
     let mut cursor_x = x;
     let mut glyphs = Vec::new();
 
     for ch in text.chars() {
-        if let Some(glyph_id) = charmap.map(ch) {
-            let advance = glyph_metrics.advance_width(glyph_id).unwrap_or_else(|| {
-                let (metrics, _) = fontdue_font.rasterize(ch, font_size);
-                metrics.advance_width
-            });
+        let entry =
+            glyph_cache.lookup_or_insert(ch, font_size, &charmap, &glyph_metrics, fontdue_font);
+        if let Some(gid) = entry.glyph_id {
             glyphs.push(Glyph {
-                id: glyph_id.to_u32(),
+                id: gid,
                 x: cursor_x,
                 y: baseline_y,
             });
-            cursor_x += advance;
-        } else {
-            let (metrics, _) = fontdue_font.rasterize(ch, font_size);
-            cursor_x += metrics.advance_width;
         }
+        cursor_x += entry.advance;
     }
 
     if !glyphs.is_empty() {
@@ -406,13 +504,16 @@ fn draw_text(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_blinking_cursor(
     scene: &mut Scene,
     rect: LayoutRect,
     text: &str,
     font_size: f32,
     color: AppColor,
+    font_data: &FontData,
     fontdue_font: &fontdue::Font,
+    glyph_cache: &mut GlyphCache,
 ) {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -422,10 +523,22 @@ fn draw_blinking_cursor(
         return;
     }
 
+    let font_ref = skrifa::FontRef::from_index(font_data.data.as_ref().as_ref(), 0);
+    let font_ref = match font_ref {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let charmap = font_ref.charmap();
+    let glyph_metrics = font_ref.glyph_metrics(
+        skrifa::instance::Size::new(font_size),
+        skrifa::instance::LocationRef::default(),
+    );
+
     let mut cursor_x = rect.x + 12.0;
     for ch in text.chars() {
-        let (metrics, _) = fontdue_font.rasterize(ch, font_size);
-        cursor_x += metrics.advance_width;
+        let entry =
+            glyph_cache.lookup_or_insert(ch, font_size, &charmap, &glyph_metrics, fontdue_font);
+        cursor_x += entry.advance;
     }
 
     let cursor_w = 2.0f32.max(font_size * 0.1);
