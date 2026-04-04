@@ -158,9 +158,14 @@
 - [ ] npm package compatibility (pure-logic packages)
 - [ ] Cross-compilation: Linux x86/ARM, macOS
 
-## Phase 4 — Operating System
-- [ ] Bootable ISO (Buildroot) available on GitHub Releases (#20)
-- [ ] W3C OS as system shell (replaces desktop environment)
+## Phase 4 — Operating System ✅ (core done)
+- [x] w3cos-shell crate: native desktop shell binary (taskbar, icons, system tray)
+- [x] Boot pipeline: S99w3cos init → framebuffer detect → w3cos-shell fullscreen
+- [x] GitHub Actions build-iso.yml: auto-build ISO on version tag push
+- [x] Buildroot post-build: installs w3cos-shell + CLI + example apps
+- [x] QEMU script: --download flag, KVM detect, SSH forwarding
+- [x] Bootable ISO (Buildroot) available on GitHub Releases (#20)
+- [x] W3C OS as system shell (replaces desktop environment)
 - [ ] AI system agent with privileged APIs
 - [ ] Package manager for W3C OS applications
 - [ ] Multi-device sync protocol
