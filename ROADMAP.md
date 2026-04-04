@@ -91,6 +91,17 @@
 - [x] Event bubbling: dispatch_event_bubbling walks parent chain
 - [x] Backward compatible: existing Component-mode apps unchanged
 
+### CSS Ecosystem ✅
+- [x] External CSS file parsing: selector + property → `Stylesheet` / `CssRule` / `Selector`
+- [x] CSS selectors: universal (`*`), element (DOM tags: `div`, `span`, `h1`–`h6`, etc.), class (`.name`), compound (`div.name`)
+- [x] DOM selector mapping: W3COS component names → standard HTML tag aliases (Column → div, Text → span, etc.)
+- [x] `className` attribute in TSX parser + codegen
+- [x] `import "./styles.css"` / `import "./theme.scss"` in TSX
+- [x] Style matching: `resolve_style()` merges CSS rules with inline styles (inline wins)
+- [x] CSS Cascade Layers (`@layer`): explicit ordering, named/anonymous/nested layers, layer precedence in cascade
+- [x] SCSS preprocessor: `grass` crate integration (feature-gated `scss`)
+- [x] Compiler integration: `compile_from_file()` resolves CSS/SCSS imports, parses stylesheets, feeds to codegen
+
 ### DOM Performance (Chrome/Blink Algorithms) ✅
 - [x] Interned Atoms: O(1) string comparison, 45 pre-interned common tags/attrs
 - [x] LCRS Tree: first_child/last_child/next_sibling/prev_sibling — O(1) tree mutations
@@ -100,16 +111,37 @@
 - [x] Scoped dirty propagation: mark_dirty walks to nearest `contain` boundary
 - [x] CSS `contain` property: layout isolation for incremental re-layout
 
+### Rendering Pipeline Optimizations ✅
+- [x] Pre-flatten architecture: `FlatNodeInfo` array replaces all `flatten_tree` / `get_*_at_index` calls — O(n²) → O(n)
+- [x] Viewport culling: `render_frame` skips nodes entirely outside visible area — 80%+ draw call reduction in scroll
+- [x] Glyph cache: `GlyphCache` HashMap keyed by `(char, quantized_font_size)` — eliminates repeated charmap lookup + fontdue rasterize
+- [x] Zero-copy animation/hover: `HashMap<usize, Style>` override table replaces `root.clone()` deep copy — only 0–2 styles cloned per frame
+- [x] Scroll info precomputation: top-down `scroll_ancestor` propagation in `collect_layouts` — O(n × depth) → O(n)
+- [x] Incremental layout: persistent `LayoutEngine` with cached `TaffyTree` — resize skips tree rebuild, Taffy internal caching applies
+- [x] Spatial index: `SpatialGrid` (64px grid hash) for hit testing — O(n) → O(k) per `CursorMoved` (k ≈ 1–5)
+- [x] Buffer reuse: `LayoutEngine`, `GlyphCache`, `SpatialGrid` persist in `App` — eliminates per-frame heap allocations
+- [x] Dirty generation tracking: `paint_generation` / `layout_generation` + `needs_tree_rebuild` flag — distinguishes tree change from resize-only
+
+### Multi-Device Adaptive Layout ✅
+- [x] @media query engine: min-width, max-width, orientation, resolution, prefers-color-scheme
+- [x] Compound media queries: And, Or, Not conditions
+- [x] Media query string parser: "(min-width: 600px) and (max-width: 1024px)"
+- [x] CSS Container Queries: component-level responsive (min-width, max-width, And)
+- [x] Viewport helpers: orientation(), size_class() (Compact/Medium/Expanded)
+- [x] Adaptive layout example: flex-wrap + minWidth for phone/tablet/desktop
+
 ### System GUI Examples ✅
 - [x] Desktop Shell: taskbar + app launcher + system tray + desktop icons
 - [x] File Manager: split-pane with directory tree + file list + toolbar
 - [x] Terminal: multi-tab + colored output + input + status bar
 - [x] AI Agent Hub: agent list + permissions + DOM API conversation view
+- [x] Adaptive Layout: responsive dashboard that works on any screen size
 
 ## Phase 2.75 — VS Code Compatibility (see docs/vscode-compat.md)
 - [ ] Canvas 2D API (CanvasRenderingContext2D) (#32)
 - [ ] Selection API (window.getSelection, Range) (#37)
-- [ ] CSS Selectors engine (:hover, :focus, .class, [attr])
+- [ ] CSS pseudo-class selectors (:hover, :focus, :active, :first-child, :nth-child)
+- [ ] CSS attribute selectors ([attr], [attr=value])
 - [ ] Web Workers
 - [ ] WebSocket API
 - [ ] localStorage / IndexedDB
