@@ -1,3 +1,4 @@
+pub mod atom;
 pub mod css_style;
 pub mod document;
 pub mod element;
@@ -37,7 +38,7 @@ mod tests {
         let mut doc = Document::new();
         let text = doc.create_text_node("Hello World");
         assert_eq!(text.text_content(&doc), Some("Hello World"));
-        assert_eq!(doc.get_node(text.id).tag, "#text");
+        assert_eq!(doc.get_node(text.id).tag_str(), "#text");
     }
 
     #[test]

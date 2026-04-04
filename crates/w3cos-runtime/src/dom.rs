@@ -177,8 +177,7 @@ pub fn get_element_by_id(id: &str) -> Option<u32> {
 
 pub fn children(node: u32) -> Vec<u32> {
     with_document(|doc| {
-        doc.get_node(NodeId::from_u32(node))
-            .children
+        doc.children_ids(NodeId::from_u32(node))
             .iter()
             .map(|id| id.as_u32())
             .collect()
@@ -194,7 +193,7 @@ pub fn parent_node(node: u32) -> Option<u32> {
 }
 
 pub fn tag_name(node: u32) -> String {
-    with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.clone())
+    with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_str())
 }
 
 pub fn node_count() -> usize {

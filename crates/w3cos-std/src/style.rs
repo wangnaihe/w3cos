@@ -63,6 +63,9 @@ pub struct Style {
     // CSS Custom Properties (#34)
     pub custom_properties: Option<std::collections::HashMap<String, String>>,
 
+    // CSS Containment — layout isolation boundaries (Chrome-inspired)
+    pub contain: Contain,
+
     // Box Shadow
     pub box_shadow: Option<BoxShadow>,
 
@@ -120,6 +123,7 @@ impl Default for Style {
             font_style: FontStyle::Normal,
             word_break: WordBreak::Normal,
             custom_properties: None,
+            contain: Contain::None,
             box_shadow: None,
             transform: Transform2D::IDENTITY,
             transition: None,
@@ -246,6 +250,25 @@ impl Default for Edges {
     fn default() -> Self {
         Self::ZERO
     }
+}
+
+// --- CSS Containment ---
+
+/// CSS `contain` property — creates layout isolation boundaries.
+/// Enables incremental layout: changes inside a contained subtree
+/// cannot affect layout outside it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum Contain {
+    #[default]
+    None,
+    /// Layout isolation: child layout cannot affect parent.
+    Layout,
+    /// Size isolation: element has intrinsic size, children don't affect it.
+    Size,
+    /// Both layout and paint containment.
+    Content,
+    /// Layout + size + paint + style containment (strongest).
+    Strict,
 }
 
 // --- CSS Text (#31) ---

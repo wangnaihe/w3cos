@@ -1,3 +1,4 @@
+use crate::atom::Atom;
 use crate::css_style::CSSStyleDeclaration;
 use crate::document::Document;
 use crate::events::{Event, EventHandler, EventType};
@@ -5,15 +6,7 @@ use crate::node::NodeId;
 
 /// W3C Element API — the primary interface for DOM manipulation.
 ///
-/// This is NOT a browser DOM. All operations compile to direct struct mutations
-/// and signal updates. No GC, no reference counting, no runtime overhead.
-///
-/// Usage mirrors the W3C spec:
-///   let el = document.create_element("div");
-///   el.set_attribute(&mut doc, "id", "main");
-///   el.style(&mut doc).set_property("display", "flex");
-///   el.set_text_content(&mut doc, "Hello");
-///   document.body().append_child(&mut doc, el);
+/// Performance: all operations are O(1) through arena access + interned atoms.
 pub struct Element {
     pub id: NodeId,
 }
@@ -23,10 +16,8 @@ impl Element {
         Self { id }
     }
 
-    // --- W3C Properties ---
-
-    pub fn tag_name<'a>(&self, doc: &'a Document) -> &'a str {
-        &doc.get_node(self.id).tag
+    pub fn tag_name(&self, doc: &Document) -> String {
+        doc.get_node(self.id).tag.as_str()
     }
 
     pub fn text_content<'a>(&self, doc: &'a Document) -> Option<&'a str> {
@@ -38,8 +29,6 @@ impl Element {
         doc.mark_dirty(self.id);
     }
 
-    // --- Children ---
-
     pub fn append_child(&self, doc: &mut Document, child: Element) {
         doc.append_child(self.id, child.id);
     }
@@ -49,8 +38,7 @@ impl Element {
     }
 
     pub fn children(&self, doc: &Document) -> Vec<Element> {
-        doc.get_node(self.id)
-            .children
+        doc.children_ids(self.id)
             .iter()
             .map(|&id| Element::new(id))
             .collect()
@@ -60,53 +48,64 @@ impl Element {
         doc.get_node(self.id).parent.map(Element::new)
     }
 
-    // --- Attributes ---
-
     pub fn set_attribute(&self, doc: &mut Document, name: &str, value: &str) {
+        let atom_name = Atom::intern(name);
         let node = doc.get_node_mut(self.id);
-        if let Some(attr) = node.attributes.iter_mut().find(|(k, _)| k == name) {
-            attr.1 = value.to_string();
+        if let Some(attr) = node.attributes.iter_mut().find(|(k, _)| *k == atom_name) {
+            if name == "id" {
+                let old_val = attr.1.clone();
+                attr.1 = value.to_string();
+                doc.update_id_index(self.id, Some(&old_val), value);
+            } else {
+                attr.1 = value.to_string();
+            }
         } else {
-            node.attributes.push((name.to_string(), value.to_string()));
+            let node = doc.get_node_mut(self.id);
+            node.attributes.push((atom_name, value.to_string()));
+            if name == "id" {
+                doc.update_id_index(self.id, None, value);
+            }
         }
-        if name == "id" || name == "class" {
-            doc.mark_dirty(self.id);
-        }
+        doc.mark_dirty(self.id);
     }
 
     pub fn get_attribute<'a>(&self, doc: &'a Document, name: &str) -> Option<&'a str> {
+        let atom_name = Atom::intern(name);
         doc.get_node(self.id)
             .attributes
             .iter()
-            .find(|(k, _)| k == name)
+            .find(|(k, _)| *k == atom_name)
             .map(|(_, v)| v.as_str())
     }
 
     pub fn remove_attribute(&self, doc: &mut Document, name: &str) {
+        let atom_name = Atom::intern(name);
         doc.get_node_mut(self.id)
             .attributes
-            .retain(|(k, _)| k != name);
+            .retain(|(k, _)| *k != atom_name);
     }
 
-    // --- classList ---
-
     pub fn class_list_add(&self, doc: &mut Document, class: &str) {
+        let atom = Atom::intern(class);
         let node = doc.get_node_mut(self.id);
-        if !node.class_list.contains(&class.to_string()) {
-            node.class_list.push(class.to_string());
+        if !node.class_list.contains(&atom) {
+            node.class_list.push(atom);
+            doc.add_to_class_index(self.id, &atom);
             doc.mark_dirty(self.id);
         }
     }
 
     pub fn class_list_remove(&self, doc: &mut Document, class: &str) {
-        let node = doc.get_node_mut(self.id);
-        node.class_list.retain(|c| c != class);
+        let atom = Atom::intern(class);
+        doc.get_node_mut(self.id).class_list.retain(|c| *c != atom);
+        doc.remove_from_class_index(self.id, &atom);
         doc.mark_dirty(self.id);
     }
 
     pub fn class_list_toggle(&self, doc: &mut Document, class: &str) -> bool {
-        let node = doc.get_node(self.id);
-        if node.class_list.contains(&class.to_string()) {
+        let atom = Atom::intern(class);
+        let contains = doc.get_node(self.id).class_list.contains(&atom);
+        if contains {
             self.class_list_remove(doc, class);
             false
         } else {
@@ -116,12 +115,9 @@ impl Element {
     }
 
     pub fn class_list_contains(&self, doc: &Document, class: &str) -> bool {
-        doc.get_node(self.id)
-            .class_list
-            .contains(&class.to_string())
+        let atom = Atom::intern(class);
+        doc.get_node(self.id).class_list.contains(&atom)
     }
-
-    // --- Style ---
 
     pub fn style<'a>(&self, doc: &'a Document) -> &'a CSSStyleDeclaration {
         doc.get_style(self.id)
@@ -131,8 +127,6 @@ impl Element {
         doc.mark_dirty(self.id);
         doc.get_style_mut(self.id)
     }
-
-    // --- Events ---
 
     pub fn add_event_listener(&self, doc: &mut Document, event: &str, handler: EventHandler) {
         if let Some(event_type) = EventType::from_str(event) {

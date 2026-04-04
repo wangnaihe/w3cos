@@ -7,4 +7,5 @@ description = "W3C DOM API implementation for W3C OS — compiled to native code
 
 [dependencies]
 w3cos-std = { workspace = true }
+serde = { workspace = true }
 anyhow = { workspace = true }

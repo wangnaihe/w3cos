@@ -79,7 +79,7 @@ pub fn query(doc: &Document, selector: &str) -> DomResult {
                 "attributes": node.attributes.iter()
                     .map(|(k, v)| serde_json::json!({ "name": k, "value": v }))
                     .collect::<Vec<_>>(),
-                "childCount": node.children.len(),
+                "childCount": doc.children_ids(el.id).len(),
             });
             DomResult::ok(info)
         }

@@ -90,7 +90,6 @@ impl Event {
 
 pub type EventHandler = Box<dyn FnMut(&mut Event)>;
 
-/// Per-node event listener storage.
 pub struct EventListener {
     pub event_type: EventType,
     pub handler: EventHandler,
@@ -122,6 +121,7 @@ impl EventRegistry {
         self.listeners.retain(|(id, _)| *id != node);
     }
 
+    /// Dispatch event to listeners on the target node only (no bubbling).
     pub fn dispatch(&mut self, event: &mut Event) {
         let target = event.target;
         for (node_id, listener) in self.listeners.iter_mut() {
@@ -134,24 +134,15 @@ impl EventRegistry {
         }
     }
 
-    /// Dispatch an event with W3C-standard bubbling up the DOM tree.
-    /// Fires listeners on the target first, then walks up via parent pointers.
-    pub fn dispatch_with_bubbling(
-        &mut self,
-        parents: &std::collections::HashMap<NodeId, Option<NodeId>>,
-        event: &mut Event,
-    ) {
-        let mut current = Some(event.target);
-        while let Some(node_id) = current {
-            for (listener_node, listener) in self.listeners.iter_mut() {
-                if *listener_node == node_id && listener.event_type == event.event_type {
-                    (listener.handler)(event);
-                    if event.stop_propagation {
-                        return;
-                    }
+    /// Dispatch event to listeners on a specific node (used by bubbling in Document).
+    pub fn dispatch_at_node(&mut self, node_id: NodeId, event: &mut Event) {
+        for (listener_node, listener) in self.listeners.iter_mut() {
+            if *listener_node == node_id && listener.event_type == event.event_type {
+                (listener.handler)(event);
+                if event.stop_propagation {
+                    return;
                 }
             }
-            current = parents.get(&node_id).copied().flatten();
         }
     }
 }
