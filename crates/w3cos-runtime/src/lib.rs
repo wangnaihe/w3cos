@@ -1,9 +1,13 @@
 pub mod dom;
+#[cfg(feature = "devtools")]
+pub mod devtools;
 pub mod fetch;
 pub mod fs;
 pub mod history;
+pub mod image_loader;
 pub mod layout;
 pub mod manifest;
+pub mod media;
 pub mod multi_window;
 pub mod notification;
 pub mod process;
