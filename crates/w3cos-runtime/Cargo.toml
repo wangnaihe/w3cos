@@ -9,6 +9,7 @@ description = "W3C OS native runtime — layout engine, renderer, window manager
 default = ["gpu"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
+devtools = ["dep:tungstenite"]
 
 [dependencies]
 w3cos-std = { workspace = true }
@@ -20,10 +21,14 @@ winit = { workspace = true }
 anyhow = { workspace = true }
 image = { workspace = true }
 ureq = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"
 notify-rust = "4"
 arboard = "3.6.1"
+
+# DevTools
+tungstenite = { workspace = true, optional = true }
 
 # GPU rendering (default)
 vello = { workspace = true, optional = true }

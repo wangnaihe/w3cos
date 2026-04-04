@@ -211,7 +211,7 @@ pub enum Dimension {
     Vh(f32),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Edges {
     pub top: f32,
     pub right: f32,

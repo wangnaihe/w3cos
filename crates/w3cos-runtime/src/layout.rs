@@ -1,12 +1,12 @@
 use anyhow::Result;
 use taffy::prelude::*;
+use w3cos_std::component::EventAction;
 use w3cos_std::style::{
     AlignItems as WAlign, Dimension as WDim, Display as WDisplay, FlexDirection as WDir,
     FlexWrap as WWrap, JustifyContent as WJustify, Overflow as WOverflow, Position as WPos,
 };
 use w3cos_std::{Component, ComponentKind};
 
-/// Default root font size for resolving dimension values.
 const ROOT_FONT_SIZE: f32 = 16.0;
 
 #[derive(Debug, Clone, Copy)]
@@ -17,12 +17,151 @@ pub struct LayoutRect {
     pub height: f32,
 }
 
-/// Scroll extent for a scrollable node (max scroll offset in x and y).
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollExtent {
     pub max_x: f32,
     pub max_y: f32,
 }
+
+// ---------------------------------------------------------------------------
+// FlatNodeInfo — O(1) indexed access to tree data (replaces O(n) recursive lookups)
+// ---------------------------------------------------------------------------
+
+pub struct FlatNodeInfo<'a> {
+    pub kind: &'a ComponentKind,
+    pub style: &'a w3cos_std::style::Style,
+    pub on_click: &'a EventAction,
+    pub parent: Option<usize>,
+}
+
+pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
+    let n = count_nodes(root);
+    let mut out = Vec::with_capacity(n);
+    pre_flatten_recursive(root, None, &mut out);
+    out
+}
+
+fn count_nodes(comp: &Component) -> usize {
+    1 + comp.children.iter().map(count_nodes).sum::<usize>()
+}
+
+fn pre_flatten_recursive<'a>(
+    comp: &'a Component,
+    parent: Option<usize>,
+    out: &mut Vec<FlatNodeInfo<'a>>,
+) {
+    let my_idx = out.len();
+    out.push(FlatNodeInfo {
+        kind: &comp.kind,
+        style: &comp.style,
+        on_click: &comp.on_click,
+        parent,
+    });
+    for child in &comp.children {
+        pre_flatten_recursive(child, Some(my_idx), out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LayoutEngine — persistent TaffyTree for incremental layout
+// ---------------------------------------------------------------------------
+
+pub struct LayoutEngine {
+    tree: TaffyTree<usize>,
+    root_node: Option<taffy::NodeId>,
+    tree_valid: bool,
+}
+
+pub struct LayoutResults {
+    pub layout_cache: Vec<(LayoutRect, usize)>,
+    pub scrollable_nodes: Vec<(usize, LayoutRect, ScrollExtent)>,
+    pub clip_only_nodes: Vec<(usize, LayoutRect)>,
+    pub scroll_ancestor: Vec<Option<usize>>,
+}
+
+impl LayoutResults {
+    pub fn empty() -> Self {
+        Self {
+            layout_cache: Vec::new(),
+            scrollable_nodes: Vec::new(),
+            clip_only_nodes: Vec::new(),
+            scroll_ancestor: Vec::new(),
+        }
+    }
+}
+
+impl LayoutEngine {
+    pub fn new() -> Self {
+        Self {
+            tree: TaffyTree::new(),
+            root_node: None,
+            tree_valid: false,
+        }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.tree_valid = false;
+    }
+
+    pub fn compute(
+        &mut self,
+        root: &Component,
+        flat: &[FlatNodeInfo],
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Result<LayoutResults> {
+        if !self.tree_valid {
+            self.tree.clear();
+            let mut idx = 0;
+            self.root_node = Some(build_taffy_tree(&mut self.tree, root, &mut idx)?);
+            self.tree_valid = true;
+        }
+
+        let root_node = self.root_node.unwrap();
+        self.tree.compute_layout(
+            root_node,
+            Size {
+                width: AvailableSpace::Definite(viewport_w),
+                height: AvailableSpace::Definite(viewport_h),
+            },
+        )?;
+
+        let mut results = Vec::new();
+        let mut fixed_results = Vec::new();
+        let mut scrollable = Vec::new();
+        let mut clip_only = Vec::new();
+        let mut scroll_ancestor = vec![None; flat.len()];
+
+        collect_layouts_fast(
+            flat,
+            &self.tree,
+            root_node,
+            0.0,
+            0.0,
+            viewport_w,
+            viewport_h,
+            None,
+            &mut results,
+            &mut fixed_results,
+            &mut scrollable,
+            &mut clip_only,
+            &mut scroll_ancestor,
+        );
+
+        results.extend(fixed_results);
+
+        Ok(LayoutResults {
+            layout_cache: results,
+            scrollable_nodes: scrollable,
+            clip_only_nodes: clip_only,
+            scroll_ancestor,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API (backward compatible — used by tests and simple callers)
+// ---------------------------------------------------------------------------
 
 pub fn compute(
     root: &Component,
@@ -33,7 +172,6 @@ pub fn compute(
     Ok(results)
 }
 
-/// Compute layout and return both layout results and scrollable node info.
 #[allow(clippy::type_complexity)]
 pub fn compute_with_scroll(
     root: &Component,
@@ -44,6 +182,7 @@ pub fn compute_with_scroll(
     Vec<(usize, LayoutRect, ScrollExtent)>,
     Vec<(usize, LayoutRect)>,
 )> {
+    let flat = pre_flatten(root);
     let mut tree: TaffyTree<usize> = TaffyTree::new();
     let mut node_index: usize = 0;
 
@@ -60,23 +199,31 @@ pub fn compute_with_scroll(
     let mut fixed_results = Vec::new();
     let mut scrollable = Vec::new();
     let mut clip_only = Vec::new();
-    collect_layouts(
-        root,
+    let mut scroll_ancestor = vec![None; flat.len()];
+
+    collect_layouts_fast(
+        &flat,
         &tree,
         root_node,
         0.0,
         0.0,
         viewport_w,
         viewport_h,
+        None,
         &mut results,
         &mut fixed_results,
         &mut scrollable,
         &mut clip_only,
+        &mut scroll_ancestor,
     );
-    // Fixed nodes render last (on top of everything else)
+
     results.extend(fixed_results);
     Ok((results, scrollable, clip_only))
 }
+
+// ---------------------------------------------------------------------------
+// Internal: Taffy tree construction
+// ---------------------------------------------------------------------------
 
 fn build_taffy_tree(
     tree: &mut TaffyTree<usize>,
@@ -109,7 +256,6 @@ fn build_taffy_tree(
                 }
             }
             ComponentKind::Image { .. } => {
-                // Default 200x200 if width/height are Auto; otherwise use style dimensions
                 let w = if matches!(comp.style.width, WDim::Auto) {
                     Dimension::length(200.0)
                 } else {
@@ -161,19 +307,26 @@ fn build_taffy_tree(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fast layout collection using pre-flattened array (O(1) lookups)
+// Also propagates scroll container top-down (eliminates O(n*depth) parent walk)
+// ---------------------------------------------------------------------------
+
 #[allow(clippy::too_many_arguments)]
-fn collect_layouts(
-    root: &Component,
+fn collect_layouts_fast(
+    flat: &[FlatNodeInfo],
     tree: &TaffyTree<usize>,
     node: NodeId,
     parent_x: f32,
     parent_y: f32,
     viewport_w: f32,
     viewport_h: f32,
+    current_scroll_container: Option<usize>,
     out: &mut Vec<(LayoutRect, usize)>,
     fixed_out: &mut Vec<(LayoutRect, usize)>,
     scrollable: &mut Vec<(usize, LayoutRect, ScrollExtent)>,
     clip_only: &mut Vec<(usize, LayoutRect)>,
+    scroll_ancestor: &mut [Option<usize>],
 ) {
     let layout = tree.layout(node).unwrap();
     let x = parent_x + layout.location.x;
@@ -185,88 +338,66 @@ fn collect_layouts(
         height: layout.size.height,
     };
 
-    if let Some(ctx) = tree.get_node_context(node) {
-        let position = get_position_at_index(root, *ctx);
-        if matches!(position, WPos::Fixed) {
-            rect = compute_fixed_rect(
-                get_style_at_index(root, *ctx),
-                viewport_w,
-                viewport_h,
-                rect.width,
-                rect.height,
-            );
-            fixed_out.push((rect, *ctx));
-        } else {
-            out.push((rect, *ctx));
-        }
-        let overflow = get_overflow_at_index(root, *ctx);
-        match overflow {
-            WOverflow::Scroll | WOverflow::Auto => {
-                let max_x = layout.scroll_width().max(0.0);
-                let max_y = layout.scroll_height().max(0.0);
-                if max_x > 0.0 || max_y > 0.0 {
-                    scrollable.push((*ctx, rect, ScrollExtent { max_x, max_y }));
-                } else {
-                    clip_only.push((*ctx, rect));
-                }
+    let mut new_scroll_container = current_scroll_container;
+
+    if let Some(&ctx) = tree.get_node_context(node) {
+        if ctx < flat.len() {
+            let info = &flat[ctx];
+
+            scroll_ancestor[ctx] = current_scroll_container;
+
+            if matches!(info.style.position, WPos::Fixed) {
+                rect = compute_fixed_rect(
+                    info.style,
+                    viewport_w,
+                    viewport_h,
+                    rect.width,
+                    rect.height,
+                );
+                fixed_out.push((rect, ctx));
+            } else {
+                out.push((rect, ctx));
             }
-            WOverflow::Hidden => clip_only.push((*ctx, rect)),
-            WOverflow::Visible => {}
+
+            match info.style.overflow {
+                WOverflow::Scroll | WOverflow::Auto => {
+                    let max_x = layout.scroll_width().max(0.0);
+                    let max_y = layout.scroll_height().max(0.0);
+                    if max_x > 0.0 || max_y > 0.0 {
+                        scrollable.push((ctx, rect, ScrollExtent { max_x, max_y }));
+                    } else {
+                        clip_only.push((ctx, rect));
+                    }
+                    new_scroll_container = Some(ctx);
+                }
+                WOverflow::Hidden => {
+                    clip_only.push((ctx, rect));
+                    new_scroll_container = Some(ctx);
+                }
+                WOverflow::Visible => {}
+            }
         }
     }
 
     for &child in tree.children(node).unwrap().iter() {
-        collect_layouts(
-            root, tree, child, x, y, viewport_w, viewport_h, out, fixed_out, scrollable, clip_only,
+        collect_layouts_fast(
+            flat,
+            tree,
+            child,
+            x,
+            y,
+            viewport_w,
+            viewport_h,
+            new_scroll_container,
+            out,
+            fixed_out,
+            scrollable,
+            clip_only,
+            scroll_ancestor,
         );
     }
 }
 
-fn get_overflow_at_index(root: &Component, index: usize) -> WOverflow {
-    get_overflow_recursive(root, index, &mut 0).unwrap_or(WOverflow::Visible)
-}
-
-fn get_position_at_index(root: &Component, index: usize) -> WPos {
-    get_position_recursive(root, index, &mut 0).unwrap_or(WPos::Relative)
-}
-
-fn get_position_recursive(comp: &Component, target: usize, counter: &mut usize) -> Option<WPos> {
-    let my_idx = *counter;
-    *counter += 1;
-    if my_idx == target {
-        return Some(comp.style.position);
-    }
-    for child in &comp.children {
-        if let Some(pos) = get_position_recursive(child, target, counter) {
-            return Some(pos);
-        }
-    }
-    None
-}
-
-fn get_style_at_index(root: &Component, index: usize) -> &w3cos_std::style::Style {
-    get_style_recursive(root, index, &mut 0).unwrap_or(&root.style)
-}
-
-fn get_style_recursive<'a>(
-    comp: &'a Component,
-    target: usize,
-    counter: &mut usize,
-) -> Option<&'a w3cos_std::style::Style> {
-    let my_idx = *counter;
-    *counter += 1;
-    if my_idx == target {
-        return Some(&comp.style);
-    }
-    for child in &comp.children {
-        if let Some(s) = get_style_recursive(child, target, counter) {
-            return Some(s);
-        }
-    }
-    None
-}
-
-/// Compute viewport-relative rect for position: fixed using top/right/bottom/left.
 fn compute_fixed_rect(
     style: &w3cos_std::style::Style,
     viewport_w: f32,
@@ -317,28 +448,11 @@ fn compute_fixed_rect(
     }
 }
 
-fn get_overflow_recursive(
-    comp: &Component,
-    target: usize,
-    counter: &mut usize,
-) -> Option<WOverflow> {
-    let my_idx = *counter;
-    *counter += 1;
-    if my_idx == target {
-        return Some(comp.style.overflow);
-    }
-    for child in &comp.children {
-        if let Some(ov) = get_overflow_recursive(child, target, counter) {
-            return Some(ov);
-        }
-    }
-    None
-}
+// ---------------------------------------------------------------------------
+// Style conversion helpers
+// ---------------------------------------------------------------------------
 
 fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
-    // Inline/InlineBlock: Taffy 0.9 has no native inline support; approximate via Flex.
-    // Inline: fit content (auto size), flex_grow=0, flex_shrink=1.
-    // InlineBlock: respect explicit width/height, flex_grow=0, flex_shrink=0.
     let (display, flex_grow, flex_shrink, size) = match s.display {
         WDisplay::Flex => (
             taffy::Display::Flex,
@@ -501,6 +615,7 @@ fn to_taffy_overflow(o: WOverflow) -> taffy::Overflow {
         WOverflow::Auto => taffy::Overflow::Scroll,
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,5 +929,34 @@ mod tests {
     fn large_viewport() {
         let l = compute(&Component::text("Big", s()), 4000.0, 3000.0).unwrap();
         assert!(l[0].0.width > 0.0);
+    }
+
+    #[test]
+    fn pre_flatten_node_count() {
+        let tree = Component::column(
+            col(),
+            vec![
+                Component::text("A", s()),
+                Component::row(row(), vec![Component::text("B", s())]),
+            ],
+        );
+        let flat = pre_flatten(&tree);
+        assert_eq!(flat.len(), 4);
+        assert!(flat[0].parent.is_none());
+        assert_eq!(flat[1].parent, Some(0));
+        assert_eq!(flat[2].parent, Some(0));
+        assert_eq!(flat[3].parent, Some(2));
+    }
+
+    #[test]
+    fn layout_engine_recompute_without_rebuild() {
+        let tree = Component::column(col(), vec![Component::text("X", s())]);
+        let flat = pre_flatten(&tree);
+        let mut engine = LayoutEngine::new();
+        let r1 = engine.compute(&tree, &flat, 800.0, 600.0).unwrap();
+        assert_eq!(r1.layout_cache.len(), 2);
+
+        let r2 = engine.compute(&tree, &flat, 1200.0, 800.0).unwrap();
+        assert_eq!(r2.layout_cache.len(), 2);
     }
 }

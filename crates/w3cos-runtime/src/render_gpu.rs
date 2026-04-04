@@ -99,9 +99,12 @@ pub fn render_frame(
     text_input_values: &HashMap<usize, String>,
     focused_index: Option<usize>,
     glyph_cache: &mut GlyphCache,
+    scale_factor: f32,
 ) {
-    let vw = width as f32;
-    let vh = height as f32;
+    let vw = width as f32 / scale_factor;
+    let vh = height as f32 / scale_factor;
+
+    let dpi = Affine::scale(scale_factor as f64);
 
     for &(idx, rect, kind, style) in nodes {
         let (offset_rect, clip) = match scroll_info.get(idx) {
@@ -147,6 +150,7 @@ pub fn render_frame(
             text_value,
             is_focused,
             glyph_cache,
+            dpi,
         );
     }
 }
@@ -163,6 +167,7 @@ fn render_node(
     text_input_value: Option<&str>,
     is_focused: bool,
     glyph_cache: &mut GlyphCache,
+    dpi: Affine,
 ) {
     if style.opacity <= 0.0 {
         return;
@@ -176,7 +181,7 @@ fn render_node(
             (cr.x + cr.width) as f64,
             (cr.y + cr.height) as f64,
         );
-        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip_shape);
+        scene.push_clip_layer(Fill::NonZero, dpi, &clip_shape);
     }
 
     let tx = style.transform.translate_x;
@@ -202,29 +207,23 @@ fn render_node(
             Fill::NonZero,
             vello::peniko::Mix::Normal,
             opacity,
-            Affine::IDENTITY,
+            dpi,
             &bounds,
         );
     }
 
     if let Some(ref shadow) = style.box_shadow {
-        draw_box_shadow(scene, rect, shadow, style.border_radius);
+        draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
     }
 
     let bg = style.background;
 
     if bg.a > 0 {
-        draw_rect(scene, rect, bg, style.border_radius);
+        draw_rect(scene, rect, bg, style.border_radius, dpi);
     }
 
     if style.border_width > 0.0 && style.border_color.a > 0 {
-        draw_border(
-            scene,
-            rect,
-            style.border_color,
-            style.border_width,
-            style.border_radius,
-        );
+        draw_border(scene, rect, style.border_color, style.border_width, style.border_radius, dpi);
     }
 
     let text_color = style.color;
@@ -240,7 +239,7 @@ fn render_node(
                 text_color,
                 font_data,
                 font,
-                glyph_cache,
+                glyph_cache, dpi,
             );
         }
         ComponentKind::Button { label } => {
@@ -249,7 +248,7 @@ fn render_node(
             } else {
                 bg
             };
-            draw_rect(scene, rect, btn_bg, style.border_radius.max(6.0));
+            draw_rect(scene, rect, btn_bg, style.border_radius.max(6.0), dpi);
             let text_x = rect.x + 16.0;
             let text_y = rect.y + 8.0;
             draw_text(
@@ -261,7 +260,7 @@ fn render_node(
                 text_color,
                 font_data,
                 font,
-                glyph_cache,
+                glyph_cache, dpi,
             );
         }
         ComponentKind::Image { src } => {
@@ -288,19 +287,13 @@ fn render_node(
                 } else {
                     bg
                 };
-                draw_rect(scene, rect, placeholder_bg, style.border_radius);
+                draw_rect(scene, rect, placeholder_bg, style.border_radius, dpi);
                 let border_color = if style.border_width > 0.0 && style.border_color.a > 0 {
                     style.border_color
                 } else {
                     AppColor::rgb(100, 100, 120)
                 };
-                draw_border(
-                    scene,
-                    rect,
-                    border_color,
-                    style.border_width.max(1.0),
-                    style.border_radius,
-                );
+                draw_border(scene, rect, border_color, style.border_width.max(1.0), style.border_radius, dpi);
                 let label = format!("[Image: {}]", src);
                 draw_text(
                     scene,
@@ -311,7 +304,7 @@ fn render_node(
                     text_color,
                     font_data,
                     font,
-                    glyph_cache,
+                    glyph_cache, dpi,
                 );
             }
         }
@@ -327,7 +320,7 @@ fn render_node(
             } else {
                 bg
             };
-            draw_rect(scene, rect, input_bg, style.border_radius.max(4.0));
+            draw_rect(scene, rect, input_bg, style.border_radius.max(4.0), dpi);
             let border_color = if is_focused {
                 AppColor::rgb(108, 92, 231)
             } else if style.border_color.a > 0 {
@@ -340,13 +333,7 @@ fn render_node(
             } else {
                 style.border_width.max(1.0)
             };
-            draw_border(
-                scene,
-                rect,
-                border_color,
-                border_w,
-                style.border_radius.max(4.0),
-            );
+            draw_border(scene, rect, border_color, border_w, style.border_radius.max(4.0), dpi);
             let text_x = rect.x + 12.0;
             let text_y = rect.y + (rect.height - style.font_size) / 2.0 + style.font_size;
             draw_text(
@@ -358,7 +345,7 @@ fn render_node(
                 text_color_final,
                 font_data,
                 font,
-                glyph_cache,
+                glyph_cache, dpi,
             );
             if is_focused {
                 draw_blinking_cursor(
@@ -370,6 +357,7 @@ fn render_node(
                     font_data,
                     font,
                     glyph_cache,
+                    dpi,
                 );
             }
         }
@@ -390,6 +378,7 @@ fn draw_box_shadow(
     rect: LayoutRect,
     shadow: &w3cos_std::style::BoxShadow,
     radius: f32,
+    dpi: Affine,
 ) {
     let spread = shadow.spread_radius;
     let shadow_rect = Rect::new(
@@ -401,10 +390,10 @@ fn draw_box_shadow(
     let color = color_to_vello(shadow.color);
     let r = (radius + spread) as f64;
     let std_dev = (shadow.blur_radius / 2.0) as f64;
-    scene.draw_blurred_rounded_rect(Affine::IDENTITY, shadow_rect, color, r, std_dev);
+    scene.draw_blurred_rounded_rect(dpi, shadow_rect, color, r, std_dev);
 }
 
-fn draw_rect(scene: &mut Scene, r: LayoutRect, color: AppColor, radius: f32) {
+fn draw_rect(scene: &mut Scene, r: LayoutRect, color: AppColor, radius: f32, dpi: Affine) {
     let vc = color_to_vello(color);
     if radius > 0.0 {
         let rr = RoundedRect::new(
@@ -414,7 +403,7 @@ fn draw_rect(scene: &mut Scene, r: LayoutRect, color: AppColor, radius: f32) {
             (r.y + r.height) as f64,
             radius as f64,
         );
-        scene.fill(Fill::NonZero, Affine::IDENTITY, vc, None, &rr);
+        scene.fill(Fill::NonZero, dpi, vc, None, &rr);
     } else {
         let rect = Rect::new(
             r.x as f64,
@@ -422,11 +411,11 @@ fn draw_rect(scene: &mut Scene, r: LayoutRect, color: AppColor, radius: f32) {
             (r.x + r.width) as f64,
             (r.y + r.height) as f64,
         );
-        scene.fill(Fill::NonZero, Affine::IDENTITY, vc, None, &rect);
+        scene.fill(Fill::NonZero, dpi, vc, None, &rect);
     }
 }
 
-fn draw_border(scene: &mut Scene, r: LayoutRect, color: AppColor, width: f32, radius: f32) {
+fn draw_border(scene: &mut Scene, r: LayoutRect, color: AppColor, width: f32, radius: f32, dpi: Affine) {
     let vc = color_to_vello(color);
     let stroke = Stroke::new(width as f64);
     let half = width as f64 / 2.0;
@@ -438,7 +427,7 @@ fn draw_border(scene: &mut Scene, r: LayoutRect, color: AppColor, width: f32, ra
             (r.y + r.height) as f64 - half,
             radius as f64,
         );
-        scene.stroke(&stroke, Affine::IDENTITY, vc, None, &rr);
+        scene.stroke(&stroke, dpi, vc, None, &rr);
     } else {
         let rect = Rect::new(
             r.x as f64 + half,
@@ -446,7 +435,7 @@ fn draw_border(scene: &mut Scene, r: LayoutRect, color: AppColor, width: f32, ra
             (r.x + r.width) as f64 - half,
             (r.y + r.height) as f64 - half,
         );
-        scene.stroke(&stroke, Affine::IDENTITY, vc, None, &rect);
+        scene.stroke(&stroke, dpi, vc, None, &rect);
     }
 }
 
@@ -461,6 +450,7 @@ fn draw_text(
     font_data: &FontData,
     fontdue_font: &fontdue::Font,
     glyph_cache: &mut GlyphCache,
+    dpi: Affine,
 ) {
     if text.is_empty() {
         return;
@@ -499,6 +489,7 @@ fn draw_text(
         scene
             .draw_glyphs(font_data)
             .font_size(font_size)
+            .transform(dpi)
             .brush(vc)
             .draw(Fill::NonZero, glyphs.into_iter());
     }
@@ -514,6 +505,7 @@ fn draw_blinking_cursor(
     font_data: &FontData,
     fontdue_font: &fontdue::Font,
     glyph_cache: &mut GlyphCache,
+    dpi: Affine,
 ) {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -550,10 +542,11 @@ fn draw_blinking_cursor(
         (cursor_y + font_size) as f64,
     );
     let vc = color_to_vello(color);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, vc, None, &cursor_rect);
+    scene.fill(Fill::NonZero, dpi, vc, None, &cursor_rect);
 }
 
-pub fn draw_hover_outline(scene: &mut Scene, rect: LayoutRect) {
+pub fn draw_hover_outline(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
+    let dpi = Affine::scale(scale_factor as f64);
     let color = Color::new([108.0 / 255.0, 92.0 / 255.0, 231.0 / 255.0, 100.0 / 255.0]);
     let stroke = Stroke::new(2.0);
     let r = Rect::new(
@@ -562,10 +555,11 @@ pub fn draw_hover_outline(scene: &mut Scene, rect: LayoutRect) {
         (rect.x + rect.width) as f64,
         (rect.y + rect.height) as f64,
     );
-    scene.stroke(&stroke, Affine::IDENTITY, color, None, &r);
+    scene.stroke(&stroke, dpi, color, None, &r);
 }
 
-pub fn draw_focus_ring(scene: &mut Scene, rect: LayoutRect) {
+pub fn draw_focus_ring(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
+    let dpi = Affine::scale(scale_factor as f64);
     let color = Color::new([108.0 / 255.0, 92.0 / 255.0, 231.0 / 255.0, 180.0 / 255.0]);
     let stroke = Stroke::new(3.0);
     let r = Rect::new(
@@ -574,5 +568,5 @@ pub fn draw_focus_ring(scene: &mut Scene, rect: LayoutRect) {
         (rect.x + rect.width) as f64,
         (rect.y + rect.height) as f64,
     );
-    scene.stroke(&stroke, Affine::IDENTITY, color, None, &r);
+    scene.stroke(&stroke, dpi, color, None, &r);
 }

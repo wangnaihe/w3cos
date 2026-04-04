@@ -239,6 +239,12 @@ struct App {
     paint_generation: u64,
     layout_generation: u64,
 
+    // DevTools integration (Chrome DevTools Protocol)
+    #[cfg(feature = "devtools")]
+    devtools_handle: Option<crate::devtools::DevToolsHandle>,
+    #[cfg(feature = "devtools")]
+    devtools_highlight: Option<i64>,
+
     // GPU-specific
     #[cfg(feature = "gpu")]
     render_cx: RenderContext,
@@ -315,6 +321,11 @@ impl App {
             spatial_grid: SpatialGrid::empty(),
             paint_generation: 0,
             layout_generation: 0,
+
+            #[cfg(feature = "devtools")]
+            devtools_handle: None,
+            #[cfg(feature = "devtools")]
+            devtools_highlight: None,
 
             #[cfg(feature = "gpu")]
             render_cx: RenderContext::new(),
@@ -444,7 +455,8 @@ impl App {
             None => return,
         };
         let size = window.inner_size();
-        let (w, h) = (size.width as f32, size.height as f32);
+        let scale = self.scale_factor as f32;
+        let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
         if w == 0.0 || h == 0.0 {
             return;
         }
@@ -561,7 +573,8 @@ impl App {
             }
         }
 
-        // Build render nodes using flat array + overrides (no flatten_tree needed)
+        // Build render nodes — all in logical (CSS) pixels.
+        // DPI scaling is handled by Vello's Affine::scale inside render_frame.
         let render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> = self
             .layout_cache
             .iter()
@@ -572,7 +585,6 @@ impl App {
             })
             .collect();
 
-        // Build scroll info using pre-computed scroll_ancestor (O(n) instead of O(n*depth))
         let scroll_info = build_scroll_info_fast(
             &self.scroll_ancestor,
             &self.scrollable_nodes,
@@ -580,7 +592,8 @@ impl App {
             &self.scroll_offsets,
         );
 
-        // Render (split borrows: scene is separate from root/layout_cache/etc.)
+        let scale = self.scale_factor as f32;
+
         self.scene.reset();
         render::render_frame(
             &mut self.scene,
@@ -593,16 +606,17 @@ impl App {
             &self.text_input_values,
             self.focused_index,
             &mut self.glyph_cache,
+            scale,
         );
 
-        // Draw hover outline
+        // Draw hover outline (logical pixels — render function handles DPI)
         if let Some(hover_idx) = self.hovered_index {
             if let Some(hit) = self
                 .hit_nodes
                 .iter()
                 .find(|h| h.index == hover_idx && h.is_interactive)
             {
-                render::draw_hover_outline(&mut self.scene, hit.rect);
+                render::draw_hover_outline(&mut self.scene, hit.rect, scale);
             }
         }
 
@@ -616,7 +630,7 @@ impl App {
                             .iter()
                             .find(|h| h.index == focus_idx && h.is_focusable)
                         {
-                            render::draw_focus_ring(&mut self.scene, hit.rect);
+                            render::draw_focus_ring(&mut self.scene, hit.rect, scale);
                         }
                     }
                 }
@@ -706,6 +720,7 @@ impl App {
         };
         let size = window.inner_size();
         let (w, h) = (size.width, size.height);
+        let scale = self.scale_factor as f32;
         if w == 0 || h == 0 {
             return;
         }
@@ -762,22 +777,56 @@ impl App {
             }
         }
 
-        let render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> = self
+        // Scale layout rects (logical) → physical pixels for the Pixmap.
+        // Also scale font_size so text renders at correct physical resolution.
+        let scaled_styles: Vec<w3cos_std::style::Style> = self
             .layout_cache
             .iter()
-            .filter_map(|&(rect, idx)| {
+            .filter_map(|&(_, idx)| {
                 let node = flat.get(idx)?;
-                let style = style_overrides.get(&idx).unwrap_or(node.style);
-                Some((idx, rect, node.kind, style))
+                let base = style_overrides.get(&idx).unwrap_or(node.style);
+                let mut s = base.clone();
+                s.font_size *= scale;
+                s.border_radius *= scale;
+                s.border_width *= scale;
+                Some(s)
             })
             .collect();
 
-        let scroll_info = build_scroll_info_fast(
+        let render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> = self
+            .layout_cache
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &(rect, idx))| {
+                let node = flat.get(idx)?;
+                let scaled_rect = LayoutRect {
+                    x: rect.x * scale,
+                    y: rect.y * scale,
+                    width: rect.width * scale,
+                    height: rect.height * scale,
+                };
+                Some((idx, scaled_rect, node.kind, scaled_styles.get(i)?))
+            })
+            .collect();
+
+        let scroll_info_raw = build_scroll_info_fast(
             &self.scroll_ancestor,
             &self.scrollable_nodes,
             &self.clip_only_nodes,
             &self.scroll_offsets,
         );
+        let scroll_info: Vec<Option<(f32, f32, LayoutRect)>> = scroll_info_raw
+            .iter()
+            .map(|si| {
+                si.map(|(sx, sy, clip)| {
+                    (sx * scale, sy * scale, LayoutRect {
+                        x: clip.x * scale, y: clip.y * scale,
+                        width: clip.width * scale, height: clip.height * scale,
+                    })
+                })
+            })
+            .collect();
+
         render::render_frame(
             &mut pixmap,
             &render_nodes,
@@ -916,6 +965,126 @@ impl App {
         if let Some(pos) = next_pos {
             self.focused_index = Some(self.focusable_indices[pos]);
         }
+    }
+
+    #[cfg(feature = "devtools")]
+    fn poll_devtools(&mut self) {
+        use crate::devtools::server::{DevToolsToMain, DomSnapshot, SerializedDocument};
+
+        let handle = match &self.devtools_handle {
+            Some(h) => h,
+            None => return,
+        };
+
+        for msg in handle.poll_messages() {
+            match msg {
+                DevToolsToMain::RequestSnapshot => {
+                    let serialized_doc = if self.dom_mode {
+                        crate::dom::with_document(|doc| {
+                            SerializedDocument::from_document(doc)
+                        })
+                    } else {
+                        let mut nodes = Vec::new();
+                        Self::serialize_component_tree(&self.root, None, &mut nodes);
+                        SerializedDocument { nodes }
+                    };
+                    let snapshot = DomSnapshot {
+                        serialized_doc,
+                        layout_rects: self.layout_cache.clone(),
+                    };
+                    handle.send_snapshot(snapshot);
+                }
+                DevToolsToMain::HighlightNode(node_id) => {
+                    self.devtools_highlight = node_id;
+                    self.request_repaint();
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "devtools")]
+    fn serialize_component_tree(
+        comp: &Component,
+        parent_id: Option<u32>,
+        nodes: &mut Vec<crate::devtools::server::SerializedNode>,
+    ) {
+        use crate::devtools::server::SerializedNode;
+
+        let my_id = nodes.len() as u32;
+
+        let (tag, text, attrs) = match &comp.kind {
+            ComponentKind::Root | ComponentKind::Column => ("div", None, vec![]),
+            ComponentKind::Row => ("div", None, vec![]),
+            ComponentKind::Box => ("div", None, vec![]),
+            ComponentKind::Text { content } => ("#text", Some(content.clone()), vec![]),
+            ComponentKind::Button { label } => ("button", Some(label.clone()), vec![]),
+            ComponentKind::Image { src } => {
+                ("img", None, vec![("src".to_string(), src.clone())])
+            }
+            ComponentKind::TextInput { value, placeholder } => (
+                "input",
+                Some(value.clone()),
+                vec![("placeholder".to_string(), placeholder.clone())],
+            ),
+        };
+
+        let node_type = if tag == "#text" { 3u8 } else { 1u8 };
+        if my_id == 0 {
+            // Root node is the document node
+            nodes.push(SerializedNode {
+                id: 0,
+                node_type: 9,
+                tag: "#document".to_string(),
+                text_content: None,
+                parent: None,
+                children: vec![1],
+                attributes: vec![],
+                class_list: vec![],
+                style: w3cos_std::style::Style::default(),
+            });
+
+            nodes.push(SerializedNode {
+                id: 1,
+                node_type: 1,
+                tag: "body".to_string(),
+                text_content: None,
+                parent: Some(0),
+                children: vec![],
+                attributes: vec![],
+                class_list: vec![],
+                style: comp.style.clone(),
+            });
+
+            let body_idx = 1u32;
+            let mut child_ids = Vec::new();
+            for child in &comp.children {
+                let child_id = nodes.len() as u32;
+                child_ids.push(child_id);
+                Self::serialize_component_tree(child, Some(body_idx), nodes);
+            }
+            nodes[1].children = child_ids;
+            return;
+        }
+
+        nodes.push(SerializedNode {
+            id: my_id,
+            node_type,
+            tag: tag.to_string(),
+            text_content: text,
+            parent: parent_id,
+            children: vec![],
+            attributes: attrs,
+            class_list: vec![],
+            style: comp.style.clone(),
+        });
+
+        let mut child_ids = Vec::new();
+        for child in &comp.children {
+            let child_id = nodes.len() as u32;
+            child_ids.push(child_id);
+            Self::serialize_component_tree(child, Some(my_id), nodes);
+        }
+        nodes[my_id as usize].children = child_ids;
     }
 }
 
@@ -1072,15 +1241,29 @@ impl ApplicationHandler for App {
                 self.request_repaint();
             }
         }
+
+        #[cfg(feature = "devtools")]
+        self.poll_devtools();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let has_animations = !self.animations.is_empty();
         let timer_deadline = crate::timers::next_deadline();
 
+        #[cfg(feature = "devtools")]
+        let has_devtools = self.devtools_handle.is_some();
+        #[cfg(not(feature = "devtools"))]
+        let has_devtools = false;
+
         match (has_animations, timer_deadline) {
             (false, None) => {
-                event_loop.set_control_flow(ControlFlow::Wait);
+                if has_devtools {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        Instant::now() + std::time::Duration::from_millis(100),
+                    ));
+                } else {
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
             }
             (true, None) => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -1088,7 +1271,14 @@ impl ApplicationHandler for App {
                 ));
             }
             (false, Some(deadline)) => {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                if has_devtools {
+                    let devtools_deadline =
+                        Instant::now() + std::time::Duration::from_millis(100);
+                    event_loop
+                        .set_control_flow(ControlFlow::WaitUntil(deadline.min(devtools_deadline)));
+                } else {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
             }
             (true, Some(deadline)) => {
                 let anim_deadline =
@@ -1149,6 +1339,18 @@ impl ApplicationHandler for App {
                 self.needs_layout = true;
             }
         }
+
+        #[cfg(feature = "devtools")]
+        {
+            if self.devtools_handle.is_none() {
+                let port = std::env::var("W3COS_DEVTOOLS_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(9229u16);
+                self.devtools_handle =
+                    Some(crate::devtools::DevToolsServer::start(port));
+            }
+        }
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1198,8 +1400,10 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_x = position.x as f32;
-                self.mouse_y = position.y as f32;
+                // winit gives physical pixels on macOS; convert to logical for hit testing
+                let scale = self.scale_factor as f32;
+                self.mouse_x = position.x as f32 / scale;
+                self.mouse_y = position.y as f32 / scale;
 
                 self.ensure_layout();
                 let new_hover = self.hit_test(self.mouse_x, self.mouse_y);
