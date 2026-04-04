@@ -9,13 +9,13 @@
 - [x] w3cos-dom: querySelector, classList, setAttribute
 - [x] w3cos-a11y: DOM → ARIA tree, flatten for AI
 - [x] w3cos-ai-bridge: DOM access + a11y API + screenshot + permissions
-- [x] w3cos-compiler: JSON + TS parsing → Rust codegen
+- [x] w3cos-compiler: JSON + TS parsing → Rust codegen (Component + DOM backends)
 - [x] w3cos-runtime: Taffy 0.9 (Flex/Grid/Block/position) + Vello GPU / tiny-skia CPU + winit
 - [x] w3cos-runtime: Mouse events, hover, click, hit-testing
 - [x] w3cos-cli: `w3cos build`, `w3cos run`, `w3cos dev`, `w3cos init`
 - [x] CSS: Flexbox, Grid, Block, position relative/absolute/fixed/sticky, overflow, z-index
 - [x] CSS: rem, em, vw, vh, box-shadow, transform, transition, opacity
-- [x] 9 example apps (hello, counter, dashboard, showcase, calculator, weather, settings-panel, etc.)
+- [x] 13 example apps (hello, counter, dashboard, showcase, calculator, weather, settings-panel, chat-ui, css-demo, scss-demo, desktop-shell, file-manager, terminal, ai-agent)
 - [x] Dockerfile + .devcontainer
 - [x] Buildroot config + QEMU scripts + INSTALL.md
 - [x] ARCHITECTURE.md, README.md, CONTRIBUTING.md, ISSUES.md
@@ -52,7 +52,7 @@
 - [ ] Escape analysis optimization for Rc<RefCell<T>> elision (P5)
 - [ ] typeof operator runtime support via Value::type_of()
 
-## Phase 2 — System APIs & Production Quality ✅ (core APIs done)
+## Phase 2 — System APIs & Production Quality ✅
 - [x] GPU rendering (Vello + wgpu — replace tiny-skia, CPU fallback via feature flag) (#12)
 - [x] System bridge: File System Access API → Linux FS (#16)
 - [x] System bridge: Fetch API → native HTTP client (ureq) (#15)
@@ -67,12 +67,15 @@
 - [x] CSS Containment: `contain` property (None/Layout/Size/Content/Strict) for layout isolation
 - [x] Hot reload during development (`w3cos dev` with file watcher) (#13)
 - [x] Live demo infrastructure (Docker + noVNC remote desktop)
-- [ ] Multiple windows (#21)
+- [x] Multiple windows: W3C-standard window.open/close/focus/moveTo/resizeTo (#21)
+- [x] Multi-window: w3cos:// URL scheme with app manifest + registry
+- [x] Multi-window: postMessage cross-window communication
+- [x] Multi-window: WindowManager with focus stack (z-order)
 - [ ] React hooks compatibility layer (@w3cos/react-compat)
 - [ ] React Native API mapping (@w3cos/rn-compat) (#19)
 - [ ] Wire up AI Bridge to runtime (end-to-end AI agent demo) (#14)
 
-## Phase 2.5 — Dynamic DOM & Performance ✅ (core done)
+## Phase 2.5 — Dynamic DOM & Performance ✅
 
 ### Dynamic DOM (#30) ✅
 - [x] Thread-local Document in runtime (`w3cos_runtime::dom`)
@@ -97,6 +100,12 @@
 - [x] Scoped dirty propagation: mark_dirty walks to nearest `contain` boundary
 - [x] CSS `contain` property: layout isolation for incremental re-layout
 
+### System GUI Examples ✅
+- [x] Desktop Shell: taskbar + app launcher + system tray + desktop icons
+- [x] File Manager: split-pane with directory tree + file list + toolbar
+- [x] Terminal: multi-tab + colored output + input + status bar
+- [x] AI Agent Hub: agent list + permissions + DOM API conversation view
+
 ## Phase 2.75 — VS Code Compatibility (see docs/vscode-compat.md)
 - [ ] Canvas 2D API (CanvasRenderingContext2D) (#32)
 - [ ] Selection API (window.getSelection, Range) (#37)
@@ -104,7 +113,6 @@
 - [ ] Web Workers
 - [ ] WebSocket API
 - [ ] localStorage / IndexedDB
-- [ ] w3cos.window (multi-window management) (#21)
 - [ ] w3cos.dialog (open/save/message dialogs)
 - [ ] w3cos.ipc (inter-process communication)
 - [ ] w3cos.menu (application/context menus)
