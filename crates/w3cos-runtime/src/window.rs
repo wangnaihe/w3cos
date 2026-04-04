@@ -117,6 +117,8 @@ enum GpuState {
 // ---------------------------------------------------------------------------
 struct App {
     builder: Option<fn() -> Component>,
+    dom_setup: Option<fn()>,
+    dom_mode: bool,
     root: Component,
     font: fontdue::Font,
     mouse_x: f32,
@@ -157,19 +159,34 @@ struct App {
 impl App {
     fn new_reactive(builder: fn() -> Component) -> Self {
         let root = builder();
-        Self::create(Some(builder), root)
+        Self::create(Some(builder), None, false, root)
     }
 
     fn new_static(root: Component) -> Self {
-        Self::create(None, root)
+        Self::create(None, None, false, root)
     }
 
-    fn create(builder: Option<fn() -> Component>, root: Component) -> Self {
+    fn new_dom(setup: fn()) -> Self {
+        crate::dom::reset_document();
+        setup();
+        let root = crate::dom::to_component_tree();
+        crate::dom::clear_document_dirty();
+        Self::create(None, Some(setup), true, root)
+    }
+
+    fn create(
+        builder: Option<fn() -> Component>,
+        dom_setup: Option<fn()>,
+        dom_mode: bool,
+        root: Component,
+    ) -> Self {
         let font = fontdue::Font::from_bytes(EMBEDDED_FONT, fontdue::FontSettings::default())
             .expect("failed to load embedded font");
 
         Self {
             builder,
+            dom_setup,
+            dom_mode,
             root,
             font,
             mouse_x: 0.0,
@@ -222,12 +239,29 @@ impl App {
     }
 
     fn rebuild_if_dirty(&mut self) {
-        if !state::is_dirty() {
+        let signal_dirty = state::is_dirty();
+        let dom_dirty = self.dom_mode && crate::dom::is_document_dirty();
+
+        if !signal_dirty && !dom_dirty {
             return;
         }
+
         let old_root = self.root.clone();
-        state::clear_dirty();
-        if let Some(builder) = self.builder {
+
+        if signal_dirty {
+            state::clear_dirty();
+        }
+        if dom_dirty {
+            crate::dom::clear_document_dirty();
+        }
+
+        if self.dom_mode {
+            self.root = crate::dom::to_component_tree();
+            self.needs_layout = true;
+            self.hovered_index = None;
+            self.pressed_index = None;
+            self.collect_transition_animations(&old_root);
+        } else if let Some(builder) = self.builder {
             self.root = builder();
             self.needs_layout = true;
             self.hovered_index = None;
@@ -1242,6 +1276,13 @@ pub fn run_reactive(builder: fn() -> Component) -> Result<()> {
 pub fn run_static(root: Component) -> Result<()> {
     let event_loop = EventLoop::new()?;
     let mut app = App::new_static(root);
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+pub fn run_dom(setup: fn()) -> Result<()> {
+    let event_loop = EventLoop::new()?;
+    let mut app = App::new_dom(setup);
     event_loop.run_app(&mut app)?;
     Ok(())
 }

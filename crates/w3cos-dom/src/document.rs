@@ -216,12 +216,60 @@ impl Document {
                     };
                 }
 
+                let is_row = matches!(
+                    style.flex_direction,
+                    w3cos_std::style::FlexDirection::Row
+                        | w3cos_std::style::FlexDirection::RowReverse
+                );
+
                 match node.tag.as_str() {
                     "body" | "div" | "section" | "main" | "article" | "nav" | "header"
-                    | "footer" => w3cos_std::Component::column(style, children),
-                    "span" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                        if let Some(text) = &node.text_content {
+                    | "footer" | "aside" | "form" | "fieldset" | "ul" | "ol" | "dl" => {
+                        if is_row {
+                            w3cos_std::Component::row(style, children)
+                        } else {
+                            w3cos_std::Component::column(style, children)
+                        }
+                    }
+                    "span" | "label" | "em" | "strong" | "code" | "small" | "li" | "dd"
+                    | "dt" => {
+                        if let Some(text) = &node.text_content
+                            && children.is_empty()
+                        {
                             w3cos_std::Component::text(text, style)
+                        } else if is_row {
+                            w3cos_std::Component::row(style, children)
+                        } else {
+                            w3cos_std::Component::column(style, children)
+                        }
+                    }
+                    "p" => {
+                        if let Some(text) = &node.text_content
+                            && children.is_empty()
+                        {
+                            w3cos_std::Component::text(text, style)
+                        } else {
+                            w3cos_std::Component::column(style, children)
+                        }
+                    }
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                        if let Some(text) = &node.text_content {
+                            let mut heading_style = style;
+                            let default_size = match node.tag.as_str() {
+                                "h1" => 32.0,
+                                "h2" => 24.0,
+                                "h3" => 20.0,
+                                "h4" => 18.0,
+                                "h5" => 16.0,
+                                _ => 14.0,
+                            };
+                            if heading_style.font_size == 16.0 {
+                                heading_style.font_size = default_size;
+                            }
+                            if heading_style.font_weight == 400 {
+                                heading_style.font_weight = 700;
+                            }
+                            w3cos_std::Component::text(text, heading_style)
                         } else {
                             w3cos_std::Component::column(style, children)
                         }
@@ -230,7 +278,32 @@ impl Document {
                         let label = node.text_content.as_deref().unwrap_or("Button");
                         w3cos_std::Component::button(label, style)
                     }
-                    _ => w3cos_std::Component::column(style, children),
+                    "img" => {
+                        let src = node
+                            .attributes
+                            .iter()
+                            .find(|(k, _)| k == "src")
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or("");
+                        w3cos_std::Component::image(src, style)
+                    }
+                    "input" => {
+                        let placeholder = node
+                            .attributes
+                            .iter()
+                            .find(|(k, _)| k == "placeholder")
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or("");
+                        let value = node.text_content.as_deref().unwrap_or("");
+                        w3cos_std::Component::text_input(value, placeholder, style)
+                    }
+                    _ => {
+                        if is_row {
+                            w3cos_std::Component::row(style, children)
+                        } else {
+                            w3cos_std::Component::column(style, children)
+                        }
+                    }
                 }
             }
         }
@@ -238,6 +311,16 @@ impl Document {
 
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Dispatch an event with bubbling through the DOM tree.
+    pub fn dispatch_event_bubbling(&mut self, event: &mut crate::events::Event) {
+        let parents: std::collections::HashMap<NodeId, Option<NodeId>> = self
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.parent))
+            .collect();
+        self.events.dispatch_with_bubbling(&parents, event);
     }
 }
 

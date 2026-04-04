@@ -133,6 +133,27 @@ impl EventRegistry {
             }
         }
     }
+
+    /// Dispatch an event with W3C-standard bubbling up the DOM tree.
+    /// Fires listeners on the target first, then walks up via parent pointers.
+    pub fn dispatch_with_bubbling(
+        &mut self,
+        parents: &std::collections::HashMap<NodeId, Option<NodeId>>,
+        event: &mut Event,
+    ) {
+        let mut current = Some(event.target);
+        while let Some(node_id) = current {
+            for (listener_node, listener) in self.listeners.iter_mut() {
+                if *listener_node == node_id && listener.event_type == event.event_type {
+                    (listener.handler)(event);
+                    if event.stop_propagation {
+                        return;
+                    }
+                }
+            }
+            current = parents.get(&node_id).copied().flatten();
+        }
+    }
 }
 
 impl Default for EventRegistry {
