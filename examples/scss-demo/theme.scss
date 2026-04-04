@@ -1,0 +1,71 @@
+// W3C OS SCSS Demo — variables, nesting, mixins
+
+$bg-dark: #0f0f1a;
+$bg-card: #1a1a2e;
+$accent: #6c5ce7;
+$accent-hover: #a29bfe;
+$text-primary: #ffffff;
+$text-secondary: #a0a0b0;
+$text-muted: #606070;
+$border-color: #2a2a3e;
+$radius-sm: 8;
+$radius-md: 12;
+$radius-lg: 16;
+
+@mixin card-base {
+    padding: 20;
+    background: $bg-card;
+    border-radius: $radius-md;
+    gap: 10;
+}
+
+.container {
+    gap: 20;
+    padding: 32;
+    background: $bg-dark;
+    width: 400;
+    border-radius: $radius-lg;
+}
+
+.title {
+    font-size: 26;
+    color: $text-primary;
+    font-weight: 700;
+}
+
+.card {
+    @include card-base;
+}
+
+.card-heading {
+    font-size: 16;
+    color: $accent-hover;
+    font-weight: 600;
+}
+
+.card-text {
+    font-size: 14;
+    color: $text-secondary;
+}
+
+.btn-accent {
+    padding: 14;
+    background: $accent;
+    border-radius: $radius-sm;
+    color: $text-primary;
+    font-size: 16;
+    font-weight: 600;
+}
+
+.badge {
+    padding: 6;
+    background: $accent;
+    border-radius: 20;
+    font-size: 12;
+    color: $text-primary;
+}
+
+.muted {
+    font-size: 12;
+    color: $text-muted;
+}

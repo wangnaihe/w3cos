@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "W3C OS compiler — transpiles TypeScript (W3C Modern Subset) to native Rust code"
 
+[features]
+default = ["scss"]
+scss = ["grass"]
+
 [dependencies]
 w3cos-std = { workspace = true }
 anyhow = { workspace = true }
@@ -13,3 +17,4 @@ serde_json = { workspace = true }
 swc_common = "19.0.0"
 swc_ecma_parser = "36.0.0"
 swc_ecma_ast = "21.0.0"
+grass = { version = "0.13", optional = true }

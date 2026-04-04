@@ -1,0 +1,80 @@
+/* W3C OS CSS Demo — standard DOM selectors */
+
+/* Element selectors use DOM tag names: div, span, button, img, input */
+
+div {
+    gap: 12;
+}
+
+span {
+    font-size: 14;
+    color: #a0a0b0;
+}
+
+button {
+    padding: 12;
+    border-radius: 8;
+    font-size: 16;
+    font-weight: 600;
+}
+
+/* Class selectors */
+
+.container {
+    gap: 24;
+    padding: 32;
+    background: #0f0f1a;
+    width: 420;
+    border-radius: 16;
+}
+
+.header {
+    font-size: 28;
+    color: #ffffff;
+    font-weight: 700;
+}
+
+.subtitle {
+    font-size: 14;
+    color: #888899;
+}
+
+.card {
+    padding: 20;
+    background: #1a1a2e;
+    border-radius: 12;
+    gap: 12;
+}
+
+.card-title {
+    font-size: 18;
+    color: #e0e0f0;
+    font-weight: 600;
+}
+
+.card-body {
+    font-size: 14;
+    color: #a0a0b0;
+}
+
+/* Compound selectors: DOM tag + class */
+
+button.btn-primary {
+    background: #e94560;
+    color: #ffffff;
+}
+
+button.btn-secondary {
+    background: #2a2a3e;
+    color: #a0a0b0;
+}
+
+.divider {
+    height: 1;
+    background: #2a2a3e;
+}
+
+.footer {
+    font-size: 12;
+    color: #606070;
+}

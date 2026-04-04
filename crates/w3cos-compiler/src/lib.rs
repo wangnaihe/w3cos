@@ -1,10 +1,12 @@
 pub mod codegen;
+pub mod css_parser;
 pub mod parser;
 pub mod scope_analysis;
+pub mod style_matcher;
 pub mod ts_transpiler;
 pub mod ts_types;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Compile TypeScript/JSON source to Rust code string (no file I/O).
 ///
@@ -14,7 +16,7 @@ use anyhow::Result;
 pub fn compile_to_rust(ts_source: &str) -> Result<String> {
     if is_ui_dsl(ts_source) {
         let tree = parser::parse(ts_source)?;
-        codegen::generate(&tree)
+        codegen::generate(&tree, &css_parser::Stylesheet::empty())
     } else {
         ts_transpiler::transpile(ts_source)
     }
@@ -35,12 +37,33 @@ pub struct CompileFlags {
 /// For UI apps: links against w3cos-runtime and produces a native GUI binary.
 /// For general TS: produces a standalone CLI binary.
 pub fn compile(ts_source: &str, output_dir: &std::path::Path) -> Result<()> {
+    compile_with_source_dir(ts_source, output_dir, None)
+}
+
+/// Compile from a source file path, enabling CSS/SCSS import resolution.
+pub fn compile_from_file(
+    source_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<()> {
+    let ts_source = std::fs::read_to_string(source_path)
+        .with_context(|| format!("Could not read {}", source_path.display()))?;
+    let source_dir = source_path.parent().map(|p| p.to_path_buf());
+    compile_with_source_dir(&ts_source, output_dir, source_dir.as_deref())
+}
+
+fn compile_with_source_dir(
+    ts_source: &str,
+    output_dir: &std::path::Path,
+    source_dir: Option<&std::path::Path>,
+) -> Result<()> {
     let is_ui = is_ui_dsl(ts_source);
 
     std::fs::create_dir_all(output_dir.join("src"))?;
 
     if is_ui {
-        let rust_code = compile_to_rust(ts_source)?;
+        let tree = parser::parse(ts_source)?;
+        let stylesheet = resolve_css_imports(&tree.css_imports, source_dir)?;
+        let rust_code = codegen::generate(&tree, &stylesheet)?;
         let cargo_toml = codegen::generate_cargo_toml(output_dir)?;
         std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
         std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
@@ -60,6 +83,62 @@ pub fn compile(ts_source: &str, output_dir: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_css_imports(
+    imports: &[String],
+    source_dir: Option<&std::path::Path>,
+) -> Result<css_parser::Stylesheet> {
+    let mut stylesheet = css_parser::Stylesheet::empty();
+
+    if imports.is_empty() {
+        return Ok(stylesheet);
+    }
+
+    let source_dir = source_dir.ok_or_else(|| {
+        anyhow::anyhow!(
+            "CSS imports found but source directory is unknown. \
+             Use compile_from_file() instead of compile()."
+        )
+    })?;
+
+    for import_path in imports {
+        let full_path = source_dir.join(import_path);
+        let css_source = if full_path
+            .extension()
+            .map_or(false, |e| e == "scss" || e == "sass")
+        {
+            compile_scss(&full_path)?
+        } else if full_path.extension().map_or(false, |e| e == "less") {
+            anyhow::bail!(
+                "Less is not yet supported. Use CSS or SCSS instead: {}",
+                full_path.display()
+            );
+        } else {
+            std::fs::read_to_string(&full_path)
+                .with_context(|| format!("Could not read CSS file: {}", full_path.display()))?
+        };
+        stylesheet.merge(css_parser::parse_css(&css_source));
+    }
+
+    Ok(stylesheet)
+}
+
+#[cfg(feature = "scss")]
+fn compile_scss(path: &std::path::Path) -> Result<String> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("Could not read SCSS file: {}", path.display()))?;
+    grass::from_string(source, &grass::Options::default())
+        .map_err(|e| anyhow::anyhow!("SCSS compilation failed for {}: {e}", path.display()))
+}
+
+#[cfg(not(feature = "scss"))]
+fn compile_scss(path: &std::path::Path) -> Result<String> {
+    anyhow::bail!(
+        "SCSS support is not enabled. Rebuild w3cos with the 'scss' feature to use {}: \
+         cargo build --features scss",
+        path.display()
+    )
 }
 
 /// Detect whether TS source is a UI DSL (component tree) or general TypeScript.
@@ -362,5 +441,89 @@ console.log("Done!");
             r#"function main() { console.log("hello"); }"#
         ));
         assert!(!is_ui_dsl(r#"let x = 42; console.log(x);"#));
+    }
+
+    #[test]
+    fn compile_from_file_with_css() {
+        let dir = std::env::temp_dir().join("w3cos_test_css_compile");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a CSS file
+        std::fs::write(
+            dir.join("styles.css"),
+            ".title { font-size: 32; color: #e94560; font-weight: bold; }\n\
+             .container { padding: 20; background: #1a1a2e; gap: 16; }",
+        )
+        .unwrap();
+
+        // Write the TSX source
+        let tsx = r#"import { Column, Text } from "@w3cos/std"
+import "./styles.css"
+
+export default
+<Column className="container">
+  <Text className="title">Hello CSS</Text>
+</Column>
+"#;
+        let tsx_path = dir.join("app.tsx");
+        std::fs::write(&tsx_path, tsx).unwrap();
+
+        let build_dir = dir.join("build");
+        compile_from_file(&tsx_path, &build_dir).expect("compile_from_file failed");
+
+        let main_rs = std::fs::read_to_string(build_dir.join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains("font_size: 32_f32"),
+            "CSS font-size not applied: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("Color::from_hex(\"#e94560\")"),
+            "CSS color not applied: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("padding: Edges::all(20_f32)"),
+            "CSS padding not applied: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("gap: 16_f32"),
+            "CSS gap not applied: {main_rs}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compile_css_inline_override() {
+        let dir = std::env::temp_dir().join("w3cos_test_css_override");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("s.css"), ".t { color: red; font-size: 20; }").unwrap();
+
+        let tsx = r##"import { Text } from "@w3cos/std"
+import "./s.css"
+
+export default <Text className="t" style={{ color: "#fff" }}>Hi</Text>
+"##;
+        let tsx_path = dir.join("app.tsx");
+        std::fs::write(&tsx_path, tsx).unwrap();
+
+        let build_dir = dir.join("build");
+        compile_from_file(&tsx_path, &build_dir).expect("compile failed");
+
+        let main_rs = std::fs::read_to_string(build_dir.join("src/main.rs")).unwrap();
+        // Inline #fff should override CSS red
+        assert!(
+            main_rs.contains("Color::from_hex(\"#fff\")"),
+            "inline override failed: {main_rs}"
+        );
+        // CSS font-size should still apply
+        assert!(
+            main_rs.contains("font_size: 20_f32"),
+            "CSS font-size missing: {main_rs}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

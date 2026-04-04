@@ -1,13 +1,15 @@
+use crate::css_parser::Stylesheet;
 use crate::parser::{AppTree, Node, NodeKind, SignalDecl, StyleDecl};
+use crate::style_matcher;
 #[allow(unused_imports)]
 use anyhow::Context;
 use anyhow::Result;
 
 /// Generate a complete Rust main.rs that builds and runs a W3C OS application.
-pub fn generate(tree: &AppTree) -> Result<String> {
+pub fn generate(tree: &AppTree, stylesheet: &Stylesheet) -> Result<String> {
     let is_reactive = !tree.signals.is_empty();
     let signal_names: Vec<&str> = tree.signals.iter().map(|s| s.name.as_str()).collect();
-    let component_code = gen_node(&tree.root, 0, &signal_names);
+    let component_code = gen_node(&tree.root, 0, &signal_names, stylesheet);
 
     if is_reactive {
         let signal_inits = gen_signal_inits(&tree.signals);
@@ -118,9 +120,10 @@ fn find_workspace_root() -> Result<std::path::PathBuf> {
     )
 }
 
-fn gen_node(node: &Node, depth: usize, signal_names: &[&str]) -> String {
+fn gen_node(node: &Node, depth: usize, signal_names: &[&str], stylesheet: &Stylesheet) -> String {
     let indent = "    ".repeat(depth + 1);
-    let style_code = gen_style(&node.style, depth + 1);
+    let resolved = style_matcher::resolve_style(node, stylesheet);
+    let style_code = gen_style(&resolved, depth + 1);
 
     match &node.kind {
         NodeKind::Text(content) => {
@@ -158,7 +161,7 @@ fn gen_node(node: &Node, depth: usize, signal_names: &[&str]) -> String {
                 let items: Vec<String> = node
                     .children
                     .iter()
-                    .map(|c| gen_node(c, depth + 2, signal_names))
+                    .map(|c| gen_node(c, depth + 2, signal_names, stylesheet))
                     .collect();
                 format!("vec![\n{},\n{indent}]", items.join(",\n"))
             };
@@ -571,26 +574,42 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
 
 #[cfg(test)]
 mod tests {
+    use crate::css_parser;
     use crate::parser::{AppTree, Node, NodeKind, StyleDecl};
 
     use super::*;
 
+    fn empty_sheet() -> Stylesheet {
+        css_parser::Stylesheet::empty()
+    }
+
+    fn test_node(kind: NodeKind, style: StyleDecl) -> Node {
+        Node {
+            kind,
+            style,
+            children: vec![],
+            text: None,
+            label: None,
+            on_click: None,
+            src: None,
+            placeholder: None,
+            class_name: None,
+        }
+    }
+
+    fn test_tree(root: Node) -> AppTree {
+        AppTree {
+            root,
+            signals: vec![],
+            css_imports: vec![],
+        }
+    }
+
     #[test]
     fn codegen_text_produces_component_text() {
-        let tree = AppTree {
-            root: Node {
-                kind: NodeKind::Text("hello".to_string()),
-                style: StyleDecl::default(),
-                children: vec![],
-                text: Some("hello".to_string()),
-                label: None,
-                on_click: None,
-                src: None,
-                placeholder: None,
-            },
-            signals: vec![],
-        };
-        let rust = generate(&tree).unwrap();
+        let mut node = test_node(NodeKind::Text("hello".into()), StyleDecl::default());
+        node.text = Some("hello".into());
+        let rust = generate(&test_tree(node), &empty_sheet()).unwrap();
         assert!(rust.contains("Component::text(\"hello\""));
         assert!(rust.contains("fn build_ui()"));
         assert!(rust.contains("w3cos_runtime::run_app"));
@@ -598,60 +617,21 @@ mod tests {
 
     #[test]
     fn codegen_button_produces_component_button() {
-        let tree = AppTree {
-            root: Node {
-                kind: NodeKind::Button("click me".to_string()),
-                style: StyleDecl::default(),
-                children: vec![],
-                text: None,
-                label: Some("click me".to_string()),
-                on_click: None,
-                src: None,
-                placeholder: None,
-            },
-            signals: vec![],
-        };
-        let rust = generate(&tree).unwrap();
+        let mut node = test_node(NodeKind::Button("click me".into()), StyleDecl::default());
+        node.label = Some("click me".into());
+        let rust = generate(&test_tree(node), &empty_sheet()).unwrap();
         assert!(rust.contains("Component::button(\"click me\""));
     }
 
     #[test]
     fn codegen_column_with_children() {
-        let tree = AppTree {
-            root: Node {
-                kind: NodeKind::Column,
-                style: StyleDecl::default(),
-                children: vec![
-                    Node {
-                        kind: NodeKind::Text("a".to_string()),
-                        style: StyleDecl::default(),
-                        children: vec![],
-                        text: Some("a".to_string()),
-                        label: None,
-                        on_click: None,
-                        src: None,
-                        placeholder: None,
-                    },
-                    Node {
-                        kind: NodeKind::Text("b".to_string()),
-                        style: StyleDecl::default(),
-                        children: vec![],
-                        text: Some("b".to_string()),
-                        label: None,
-                        on_click: None,
-                        src: None,
-                        placeholder: None,
-                    },
-                ],
-                text: None,
-                label: None,
-                on_click: None,
-                src: None,
-                placeholder: None,
-            },
-            signals: vec![],
-        };
-        let rust = generate(&tree).unwrap();
+        let mut root = test_node(NodeKind::Column, StyleDecl::default());
+        let mut a = test_node(NodeKind::Text("a".into()), StyleDecl::default());
+        a.text = Some("a".into());
+        let mut b = test_node(NodeKind::Text("b".into()), StyleDecl::default());
+        b.text = Some("b".into());
+        root.children = vec![a, b];
+        let rust = generate(&test_tree(root), &empty_sheet()).unwrap();
         assert!(rust.contains("Component::column"));
         assert!(rust.contains("Component::text(\"a\""));
         assert!(rust.contains("Component::text(\"b\""));
@@ -660,20 +640,9 @@ mod tests {
 
     #[test]
     fn codegen_text_input_produces_component_text_input() {
-        let tree = AppTree {
-            root: Node {
-                kind: NodeKind::TextInput,
-                style: StyleDecl::default(),
-                children: vec![],
-                text: None,
-                label: None,
-                on_click: None,
-                src: None,
-                placeholder: Some("Enter name".to_string()),
-            },
-            signals: vec![],
-        };
-        let rust = generate(&tree).unwrap();
+        let mut node = test_node(NodeKind::TextInput, StyleDecl::default());
+        node.placeholder = Some("Enter name".into());
+        let rust = generate(&test_tree(node), &empty_sheet()).unwrap();
         assert!(rust.contains("Component::text_input"));
         assert!(rust.contains("\"Enter name\""));
     }
@@ -682,20 +651,7 @@ mod tests {
     fn codegen_row_with_style() {
         let mut style = StyleDecl::default();
         style.gap = Some(10.0);
-        let tree = AppTree {
-            root: Node {
-                kind: NodeKind::Row,
-                style,
-                children: vec![],
-                text: None,
-                label: None,
-                on_click: None,
-                src: None,
-                placeholder: None,
-            },
-            signals: vec![],
-        };
-        let rust = generate(&tree).unwrap();
+        let rust = generate(&test_tree(test_node(NodeKind::Row, style)), &empty_sheet()).unwrap();
         assert!(rust.contains("Component::row"));
         assert!(rust.contains("gap: 10_f32"));
     }
@@ -703,42 +659,46 @@ mod tests {
     #[test]
     fn codegen_style_color_and_background() {
         let mut style = StyleDecl::default();
-        style.color = Some("#fff".to_string());
-        style.background = Some("#e94560".to_string());
-        let tree = AppTree {
-            root: Node {
-                kind: NodeKind::Text("styled".to_string()),
-                style,
-                children: vec![],
-                text: Some("styled".to_string()),
-                label: None,
-                on_click: None,
-                src: None,
-                placeholder: None,
-            },
-            signals: vec![],
-        };
-        let rust = generate(&tree).unwrap();
+        style.color = Some("#fff".into());
+        style.background = Some("#e94560".into());
+        let mut node = test_node(NodeKind::Text("styled".into()), style);
+        node.text = Some("styled".into());
+        let rust = generate(&test_tree(node), &empty_sheet()).unwrap();
         assert!(rust.contains("Color::from_hex(\"#fff\")"));
         assert!(rust.contains("Color::from_hex(\"#e94560\")"));
     }
 
     #[test]
     fn codegen_image_produces_component_image() {
-        let tree = AppTree {
-            root: Node {
-                kind: NodeKind::Image("path.png".to_string()),
-                style: StyleDecl::default(),
-                children: vec![],
-                text: None,
-                label: None,
-                on_click: None,
-                src: Some("path.png".to_string()),
-                placeholder: None,
-            },
-            signals: vec![],
-        };
-        let rust = generate(&tree).unwrap();
+        let mut node = test_node(NodeKind::Image("path.png".into()), StyleDecl::default());
+        node.src = Some("path.png".into());
+        let rust = generate(&test_tree(node), &empty_sheet()).unwrap();
         assert!(rust.contains("Component::image(\"path.png\""));
+    }
+
+    #[test]
+    fn codegen_with_css_stylesheet() {
+        let css = ".title { font-size: 24; color: #e94560; }";
+        let sheet = css_parser::parse_css(css);
+        let mut node = test_node(NodeKind::Text("Hello".into()), StyleDecl::default());
+        node.text = Some("Hello".into());
+        node.class_name = Some("title".into());
+        let rust = generate(&test_tree(node), &sheet).unwrap();
+        assert!(rust.contains("font_size: 24_f32"));
+        assert!(rust.contains("Color::from_hex(\"#e94560\")"));
+    }
+
+    #[test]
+    fn codegen_css_overridden_by_inline() {
+        let css = ".title { color: red; font-size: 24; }";
+        let sheet = css_parser::parse_css(css);
+        let mut style = StyleDecl::default();
+        style.color = Some("#fff".into());
+        let mut node = test_node(NodeKind::Text("Hello".into()), style);
+        node.text = Some("Hello".into());
+        node.class_name = Some("title".into());
+        let rust = generate(&test_tree(node), &sheet).unwrap();
+        assert!(rust.contains("Color::from_hex(\"#fff\")"));
+        assert!(rust.contains("font_size: 24_f32"));
     }
 }

@@ -97,8 +97,8 @@ fn build(
     strip: Option<bool>,
     lto: bool,
 ) -> Result<()> {
-    let source = std::fs::read_to_string(input)
-        .with_context(|| format!("Could not read {}", input.display()))?;
+    let input_abs = std::fs::canonicalize(input)
+        .with_context(|| format!("Could not find {}", input.display()))?;
 
     let build_dir = std::env::temp_dir().join("w3cos-build");
     if build_dir.exists() {
@@ -106,7 +106,7 @@ fn build(
     }
 
     println!("⚡ Transpiling {} → Rust...", input.display());
-    w3cos_compiler::compile(&source, &build_dir)?;
+    w3cos_compiler::compile_from_file(&input_abs, &build_dir)?;
 
     println!("🔨 Compiling native binary...");
     let mut cmd = Command::new("cargo");

@@ -12,6 +12,8 @@ pub struct AppTree {
     pub root: Node,
     #[serde(default)]
     pub signals: Vec<SignalDecl>,
+    #[serde(default)]
+    pub css_imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,8 @@ pub struct Node {
     pub src: Option<String>,
     #[serde(default)]
     pub placeholder: Option<String>,
+    #[serde(default)]
+    pub class_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +95,7 @@ fn parse_json(source: &str) -> Result<AppTree> {
     Ok(AppTree {
         root,
         signals: vec![],
+        css_imports: vec![],
     })
 }
 
@@ -124,16 +129,21 @@ fn fixup_json_node(node: &mut Node) {
 // ---------------------------------------------------------------------------
 
 fn parse_ts(source: &str) -> Result<AppTree> {
-    let (clean, signals) = strip_ts_wrapper(source);
+    let (clean, signals, css_imports) = strip_ts_wrapper(source);
     let clean = clean.trim();
     if clean.is_empty() {
         return Ok(AppTree {
             root: empty_column(),
             signals,
+            css_imports,
         });
     }
     parse_ts_expr(clean)
-        .map(|root| AppTree { root, signals })
+        .map(|root| AppTree {
+            root,
+            signals,
+            css_imports,
+        })
         .ok_or_else(|| {
             anyhow!(
                 "Failed to parse. Supported syntax:\n\
@@ -143,14 +153,17 @@ fn parse_ts(source: &str) -> Result<AppTree> {
         })
 }
 
-fn strip_ts_wrapper(source: &str) -> (String, Vec<SignalDecl>) {
+fn strip_ts_wrapper(source: &str) -> (String, Vec<SignalDecl>, Vec<String>) {
     let mut lines: Vec<&str> = source.lines().collect();
     let mut signals = Vec::new();
+    let mut css_imports = Vec::new();
 
-    // Extract and remove signal declarations: const NAME = signal(VALUE)
     lines.retain(|l| {
         let t = l.trim();
         if t.starts_with("import ") {
+            if let Some(path) = extract_css_import(t) {
+                css_imports.push(path);
+            }
             return false;
         }
         if let Some(sig) = parse_signal_decl(t) {
@@ -162,17 +175,32 @@ fn strip_ts_wrapper(source: &str) -> (String, Vec<SignalDecl>) {
 
     let mut result = lines.join("\n");
 
-    // Remove `export default` prefix
     if let Some(rest) = result.trim().strip_prefix("export default") {
         result = rest.trim().to_string();
     }
 
-    // Remove trailing semicolons
     if result.trim().ends_with(';') {
         result = result.trim().trim_end_matches(';').to_string();
     }
 
-    (result, signals)
+    (result, signals, css_imports)
+}
+
+fn extract_css_import(line: &str) -> Option<String> {
+    let line = line.trim().strip_prefix("import")?.trim();
+    let line = line.trim_end_matches(';');
+    let path = if (line.starts_with('"') && line.ends_with('"'))
+        || (line.starts_with('\'') && line.ends_with('\''))
+    {
+        &line[1..line.len() - 1]
+    } else {
+        return None;
+    };
+    if path.ends_with(".css") || path.ends_with(".scss") || path.ends_with(".less") {
+        Some(path.to_string())
+    } else {
+        None
+    }
 }
 
 fn parse_signal_decl(s: &str) -> Option<SignalDecl> {
@@ -255,11 +283,20 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
     }
 
     let after_tag = &after_lt[tag_end..];
-    let (style, on_click, src, placeholder, after_attrs) = parse_tsx_attrs(after_tag);
+    let (style, class_name, on_click, src, placeholder, after_attrs) = parse_tsx_attrs(after_tag);
     let after_attrs = after_attrs.trim();
 
     if let Some(rest) = after_attrs.strip_prefix("/>") {
-        let node = build_tsx_node(tag_name, style, on_click, src, placeholder, vec![], None);
+        let node = build_tsx_node(
+            tag_name,
+            style,
+            class_name,
+            on_click,
+            src,
+            placeholder,
+            vec![],
+            None,
+        );
         return Some((node, rest));
     }
 
@@ -273,6 +310,7 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
     let node = build_tsx_node(
         tag_name,
         style,
+        class_name,
         on_click,
         src,
         placeholder,
@@ -289,9 +327,11 @@ fn parse_tsx_attrs(
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
     &str,
 ) {
     let mut style = StyleDecl::default();
+    let mut class_name: Option<String> = None;
     let mut on_click: Option<String> = None;
     let mut src: Option<String> = None;
     let mut placeholder: Option<String> = None;
@@ -301,6 +341,14 @@ fn parse_tsx_attrs(
         rest = rest.trim();
         if rest.is_empty() || rest.starts_with('>') || rest.starts_with("/>") {
             break;
+        }
+        if let Some(after) = rest.strip_prefix("className=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                class_name = Some(value);
+                rest = r;
+                continue;
+            }
         }
         if let Some(after) = rest.strip_prefix("src=") {
             let after = after.trim();
@@ -365,7 +413,7 @@ fn parse_tsx_attrs(
         }
     }
 
-    (style, on_click, src, placeholder, rest)
+    (style, class_name, on_click, src, placeholder, rest)
 }
 
 fn find_double_brace_end(s: &str) -> Option<usize> {
@@ -440,6 +488,7 @@ fn parse_tsx_children<'a>(
 fn build_tsx_node(
     tag: &str,
     style: StyleDecl,
+    class_name: Option<String>,
     on_click: Option<String>,
     src: Option<String>,
     placeholder: Option<String>,
@@ -458,6 +507,7 @@ fn build_tsx_node(
                 on_click,
                 src: None,
                 placeholder: None,
+                class_name,
             }
         }
         "Button" => {
@@ -471,6 +521,7 @@ fn build_tsx_node(
                 on_click,
                 src: None,
                 placeholder: None,
+                class_name,
             }
         }
         "Image" => {
@@ -484,6 +535,7 @@ fn build_tsx_node(
                 on_click,
                 src: Some(src_val),
                 placeholder: None,
+                class_name,
             }
         }
         "TextInput" => {
@@ -497,6 +549,7 @@ fn build_tsx_node(
                 on_click,
                 src: None,
                 placeholder: Some(placeholder_val),
+                class_name,
             }
         }
         "Row" => Node {
@@ -508,6 +561,7 @@ fn build_tsx_node(
             on_click,
             src: None,
             placeholder: None,
+            class_name,
         },
         "Box" => Node {
             kind: NodeKind::Box,
@@ -518,6 +572,7 @@ fn build_tsx_node(
             on_click,
             src: None,
             placeholder: None,
+            class_name,
         },
         _ => Node {
             kind: NodeKind::Column,
@@ -528,6 +583,7 @@ fn build_tsx_node(
             on_click,
             src: None,
             placeholder: None,
+            class_name,
         },
     }
 }
@@ -547,9 +603,6 @@ fn strip_fn_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 fn parse_container_call(kind: &str, inner: &str) -> Option<Node> {
     let inner = inner.trim();
 
-    // Expect: { style: {...}, children: [...], onClick: "..." }
-    // or: { children: [...] }
-    // or: { style: {...} }
     let style = extract_object_field(inner, "style")
         .and_then(parse_style_object)
         .unwrap_or_default();
@@ -559,6 +612,10 @@ fn parse_container_call(kind: &str, inner: &str) -> Option<Node> {
         .unwrap_or_default();
 
     let on_click = extract_object_field(inner, "onClick")
+        .map(|s| unquote(s.trim()))
+        .filter(|s| !s.is_empty());
+
+    let class_name = extract_object_field(inner, "className")
         .map(|s| unquote(s.trim()))
         .filter(|s| !s.is_empty());
 
@@ -574,17 +631,16 @@ fn parse_container_call(kind: &str, inner: &str) -> Option<Node> {
         on_click,
         src: None,
         placeholder: None,
+        class_name,
     })
 }
 
 fn parse_image_call(inner: &str) -> Option<Node> {
     let inner = inner.trim();
 
-    // First arg: string literal (src path)
     let (src_path, rest) = extract_first_string_arg(inner)?;
 
-    // Optional second arg: { style: {...}, onClick: "..." }
-    let (style, on_click) = if let Some(rest) = rest.strip_prefix(',') {
+    let (style, on_click, class_name) = if let Some(rest) = rest.strip_prefix(',') {
         let rest = rest.trim();
         if rest.starts_with('{') {
             let obj = find_matching_brace(rest)?;
@@ -594,12 +650,15 @@ fn parse_image_call(inner: &str) -> Option<Node> {
             let o = extract_object_field(obj, "onClick")
                 .map(|x| unquote(x.trim()))
                 .filter(|x| !x.is_empty());
-            (s, o)
+            let cn = extract_object_field(obj, "className")
+                .map(|x| unquote(x.trim()))
+                .filter(|x| !x.is_empty());
+            (s, o, cn)
         } else {
-            (StyleDecl::default(), None)
+            (StyleDecl::default(), None, None)
         }
     } else {
-        (StyleDecl::default(), None)
+        (StyleDecl::default(), None, None)
     };
 
     Some(Node {
@@ -611,28 +670,31 @@ fn parse_image_call(inner: &str) -> Option<Node> {
         on_click,
         src: Some(src_path),
         placeholder: None,
+        class_name,
     })
 }
 
 fn parse_text_input_call(inner: &str) -> Option<Node> {
     let inner = inner.trim();
 
-    // First arg: string literal (placeholder)
     let (placeholder_val, rest) = extract_first_string_arg(inner)?;
 
-    // Optional second arg: { style: {...}, onClick: "..." }
-    let style = if let Some(rest) = rest.strip_prefix(',') {
+    let (style, class_name) = if let Some(rest) = rest.strip_prefix(',') {
         let rest = rest.trim();
         if rest.starts_with('{') {
             let obj = find_matching_brace(rest)?;
-            extract_object_field(obj, "style")
+            let s = extract_object_field(obj, "style")
                 .and_then(parse_style_object)
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let cn = extract_object_field(obj, "className")
+                .map(|x| unquote(x.trim()))
+                .filter(|x| !x.is_empty());
+            (s, cn)
         } else {
-            StyleDecl::default()
+            (StyleDecl::default(), None)
         }
     } else {
-        StyleDecl::default()
+        (StyleDecl::default(), None)
     };
 
     Some(Node {
@@ -644,17 +706,16 @@ fn parse_text_input_call(inner: &str) -> Option<Node> {
         on_click: None,
         src: None,
         placeholder: Some(placeholder_val),
+        class_name,
     })
 }
 
 fn parse_text_or_button(inner: &str, is_text: bool) -> Option<Node> {
     let inner = inner.trim();
 
-    // First arg: string literal
     let (content, rest) = extract_first_string_arg(inner)?;
 
-    // Optional second arg: { style: {...}, onClick: "..." }
-    let (style, on_click) = if let Some(rest) = rest.strip_prefix(',') {
+    let (style, on_click, class_name) = if let Some(rest) = rest.strip_prefix(',') {
         let rest = rest.trim();
         if rest.starts_with('{') {
             let obj = find_matching_brace(rest)?;
@@ -664,12 +725,15 @@ fn parse_text_or_button(inner: &str, is_text: bool) -> Option<Node> {
             let o = extract_object_field(obj, "onClick")
                 .map(|x| unquote(x.trim()))
                 .filter(|x| !x.is_empty());
-            (s, o)
+            let cn = extract_object_field(obj, "className")
+                .map(|x| unquote(x.trim()))
+                .filter(|x| !x.is_empty());
+            (s, o, cn)
         } else {
-            (StyleDecl::default(), None)
+            (StyleDecl::default(), None, None)
         }
     } else {
-        (StyleDecl::default(), None)
+        (StyleDecl::default(), None, None)
     };
 
     Some(Node {
@@ -685,6 +749,7 @@ fn parse_text_or_button(inner: &str, is_text: bool) -> Option<Node> {
         on_click,
         src: None,
         placeholder: None,
+        class_name,
     })
 }
 
@@ -914,6 +979,7 @@ fn empty_column() -> Node {
         on_click: None,
         src: None,
         placeholder: None,
+        class_name: None,
     }
 }
 
@@ -1229,5 +1295,71 @@ export default <Column>
         let source = include_str!("../../../examples/showcase/app.tsx");
         let tree = parse(source);
         assert!(tree.is_ok(), "showcase parse failed: {:?}", tree.err());
+    }
+
+    #[test]
+    fn tsx_classname_parsed() {
+        let source = r##"<Text className="title" style={{ fontSize: 20 }}>Hello</Text>"##;
+        let tree = parse(source).unwrap();
+        assert_eq!(tree.root.class_name.as_deref(), Some("title"));
+        assert_eq!(tree.root.style.font_size, Some(20.0));
+        match &tree.root.kind {
+            NodeKind::Text(t) => assert_eq!(t, "Hello"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn tsx_classname_without_style() {
+        let source = r#"<Column className="container"><Text>Hi</Text></Column>"#;
+        let tree = parse(source).unwrap();
+        assert_eq!(tree.root.class_name.as_deref(), Some("container"));
+        assert_eq!(tree.root.children.len(), 1);
+    }
+
+    #[test]
+    fn css_imports_extracted() {
+        let source = r#"
+import { Column, Text } from "@w3cos/std"
+import "./styles.css"
+import "./theme.scss"
+
+export default <Column><Text>Hi</Text></Column>
+"#;
+        let tree = parse(source).unwrap();
+        assert_eq!(tree.css_imports, vec!["./styles.css", "./theme.scss"]);
+    }
+
+    #[test]
+    fn css_imports_single_quotes() {
+        let source = r#"
+import { Column } from "@w3cos/std"
+import './app.css';
+
+export default <Column />
+"#;
+        let tree = parse(source).unwrap();
+        assert_eq!(tree.css_imports, vec!["./app.css"]);
+    }
+
+    #[test]
+    fn non_css_imports_not_captured() {
+        let source = r#"
+import { Column } from "@w3cos/std"
+
+export default <Column />
+"#;
+        let tree = parse(source).unwrap();
+        assert!(tree.css_imports.is_empty());
+    }
+
+    #[test]
+    fn tsx_css_demo_parses() {
+        let source = include_str!("../../../examples/css-demo/app.tsx");
+        let tree = parse(source);
+        assert!(tree.is_ok(), "css-demo parse failed: {:?}", tree.err());
+        let tree = tree.unwrap();
+        assert_eq!(tree.css_imports, vec!["./styles.css"]);
+        assert_eq!(tree.root.class_name.as_deref(), Some("container"));
     }
 }
