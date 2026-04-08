@@ -10,6 +10,19 @@ use w3cos_std::{Component, EventAction, Style};
 
 fn main() {
     eprintln!("W3C OS Desktop Shell v0.1.0 — starting...");
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--ai-port" {
+            if let Some(port_str) = args.next() {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    w3cos_runtime::enable_ai_bridge(port);
+                    eprintln!("[AI Bridge] Will start on port {port}");
+                }
+            }
+        }
+    }
+
     w3cos_runtime::run_app(build_shell).expect("W3C OS Shell crashed");
 }
 

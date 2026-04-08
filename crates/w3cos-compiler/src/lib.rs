@@ -157,16 +157,22 @@ fn is_ui_dsl(source: &str) -> bool {
         return true;
     }
 
-    // Quick scan for W3C OS UI patterns
-    let has_ui_import = trimmed.contains("@w3cos/std");
-    let has_component_call = ["Column(", "Row(", "Text(", "Button("]
+    // Quick scan for W3C OS UI patterns (including React Native compat)
+    let has_ui_import = trimmed.contains("@w3cos/std") || trimmed.contains("react-native");
+    let has_component_call = [
+        "Column(", "Row(", "Text(", "Button(",
+        "View(", "ScrollView(", "TouchableOpacity(", "FlatList(",
+    ]
         .iter()
         .any(|pat| trimmed.contains(pat));
-    let has_tsx_component = ["<Column", "<Row", "<Text", "<Button"]
+    let has_tsx_component = [
+        "<Column", "<Row", "<Text", "<Button",
+        "<View", "<ScrollView", "<TouchableOpacity", "<FlatList",
+    ]
         .iter()
         .any(|pat| trimmed.contains(pat));
 
-    // If it imports @w3cos/std or directly uses component constructors at top level
+    // If it imports @w3cos/std or react-native or directly uses component constructors
     if has_ui_import && (has_component_call || has_tsx_component) {
         return true;
     }
@@ -187,6 +193,8 @@ fn is_ui_dsl(source: &str) -> bool {
     let component_starts = [
         "Column(", "Row(", "Text(", "Button(", "Image(", "TextInput(", "Box(",
         "<Column", "<Row", "<Text", "<Button", "<Image", "<TextInput", "<Box",
+        "View(", "ScrollView(", "TouchableOpacity(", "FlatList(",
+        "<View", "<ScrollView", "<TouchableOpacity", "<FlatList",
     ];
     let starts_with_component = component_starts.iter().any(|pat| body.starts_with(pat));
 

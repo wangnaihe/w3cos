@@ -1,0 +1,10 @@
+[package]
+name = "w3cos-rn-compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "React Native compatibility layer — maps RN components to W3C OS equivalents"
+
+[dependencies]
+w3cos-std = { workspace = true }
+w3cos-runtime = { workspace = true }

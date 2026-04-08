@@ -40,6 +40,7 @@ pub enum ComponentKind {
     Box,
     Image { src: String },
     TextInput { value: String, placeholder: String },
+    Canvas { width: u32, height: u32 },
 }
 
 impl Component {
@@ -138,6 +139,15 @@ impl Component {
                 value: value.into(),
                 placeholder: placeholder.into(),
             },
+            style,
+            children: vec![],
+            on_click: EventAction::None,
+        }
+    }
+
+    pub fn canvas(width: u32, height: u32, style: Style) -> Self {
+        Self {
+            kind: ComponentKind::Canvas { width, height },
             style,
             children: vec![],
             on_click: EventAction::None,

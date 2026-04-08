@@ -245,6 +245,10 @@ struct App {
     #[cfg(feature = "devtools")]
     devtools_highlight: Option<i64>,
 
+    // AI Bridge HTTP server
+    #[cfg(feature = "ai-bridge")]
+    ai_bridge_handle: Option<w3cos_ai_bridge::AiBridgeHandle>,
+
     // GPU-specific
     #[cfg(feature = "gpu")]
     render_cx: RenderContext,
@@ -326,6 +330,9 @@ impl App {
             devtools_handle: None,
             #[cfg(feature = "devtools")]
             devtools_highlight: None,
+
+            #[cfg(feature = "ai-bridge")]
+            ai_bridge_handle: None,
 
             #[cfg(feature = "gpu")]
             render_cx: RenderContext::new(),
@@ -967,6 +974,20 @@ impl App {
         }
     }
 
+    #[cfg(feature = "ai-bridge")]
+    fn poll_ai_bridge(&mut self) {
+        let handle = match &self.ai_bridge_handle {
+            Some(h) => h,
+            None => return,
+        };
+
+        if self.dom_mode {
+            crate::dom::with_document_mut(|doc| {
+                handle.poll_and_respond(doc);
+            });
+        }
+    }
+
     #[cfg(feature = "devtools")]
     fn poll_devtools(&mut self) {
         use crate::devtools::server::{DevToolsToMain, DomSnapshot, SerializedDocument};
@@ -1025,6 +1046,14 @@ impl App {
                 "input",
                 Some(value.clone()),
                 vec![("placeholder".to_string(), placeholder.clone())],
+            ),
+            ComponentKind::Canvas { width, height } => (
+                "canvas",
+                None,
+                vec![
+                    ("width".to_string(), width.to_string()),
+                    ("height".to_string(), height.to_string()),
+                ],
             ),
         };
 
@@ -1244,6 +1273,9 @@ impl ApplicationHandler for App {
 
         #[cfg(feature = "devtools")]
         self.poll_devtools();
+
+        #[cfg(feature = "ai-bridge")]
+        self.poll_ai_bridge();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1254,6 +1286,9 @@ impl ApplicationHandler for App {
         let has_devtools = self.devtools_handle.is_some();
         #[cfg(not(feature = "devtools"))]
         let has_devtools = false;
+
+        #[cfg(feature = "ai-bridge")]
+        let has_devtools = has_devtools || self.ai_bridge_handle.is_some();
 
         match (has_animations, timer_deadline) {
             (false, None) => {
@@ -1349,6 +1384,17 @@ impl ApplicationHandler for App {
                     .unwrap_or(9229u16);
                 self.devtools_handle =
                     Some(crate::devtools::DevToolsServer::start(port));
+            }
+        }
+
+        #[cfg(feature = "ai-bridge")]
+        {
+            if self.ai_bridge_handle.is_none() {
+                if let Ok(port_str) = std::env::var("W3COS_AI_PORT") {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        self.ai_bridge_handle = Some(w3cos_ai_bridge::start_server(port));
+                    }
+                }
             }
         }
     }
