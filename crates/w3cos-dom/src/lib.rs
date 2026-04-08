@@ -1,4 +1,5 @@
 pub mod atom;
+pub mod canvas;
 pub mod css_style;
 pub mod document;
 pub mod element;
@@ -6,6 +7,7 @@ pub mod events;
 pub mod history;
 pub mod location;
 pub mod node;
+pub mod selection;
 pub mod window;
 
 pub use document::Document;

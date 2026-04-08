@@ -5,6 +5,7 @@ use crate::css_style::CSSStyleDeclaration;
 use crate::element::Element;
 use crate::events::EventRegistry;
 use crate::node::{DomNode, NodeId, NodeType};
+use crate::selection::{Range, Selection};
 
 /// W3C Document — the root of the DOM tree.
 ///
@@ -25,6 +26,8 @@ pub struct Document {
     id_index: HashMap<Atom, NodeId>,
     class_index: HashMap<Atom, Vec<NodeId>>,
     tag_index: HashMap<Atom, Vec<NodeId>>,
+    // Selection state
+    selection: Selection,
 }
 
 impl Document {
@@ -39,6 +42,7 @@ impl Document {
             id_index: HashMap::new(),
             class_index: HashMap::new(),
             tag_index: HashMap::new(),
+            selection: Selection::new(),
         };
 
         let root_id = doc.alloc_node(DomNode {
@@ -123,6 +127,21 @@ impl Document {
             .get(&atom)
             .map(|ids| ids.iter().map(|&id| Element::new(id)).collect())
             .unwrap_or_default()
+    }
+
+    /// W3C `document.createRange()` — creates a new Range object.
+    pub fn create_range(&self) -> Range {
+        Range::new()
+    }
+
+    /// W3C `window.getSelection()` — returns the current selection.
+    pub fn get_selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    /// W3C `window.getSelection()` — returns the current selection (mutable).
+    pub fn get_selection_mut(&mut self) -> &mut Selection {
+        &mut self.selection
     }
 
     // -----------------------------------------------------------------------
@@ -465,6 +484,21 @@ impl Document {
                             .unwrap_or("");
                         let value = node.text_content.as_deref().unwrap_or("");
                         w3cos_std::Component::text_input(value, placeholder, style)
+                    }
+                    "canvas" => {
+                        let width = node
+                            .attributes
+                            .iter()
+                            .find(|(k, _)| k.as_str() == "width")
+                            .and_then(|(_, v)| v.parse::<u32>().ok())
+                            .unwrap_or(300);
+                        let height = node
+                            .attributes
+                            .iter()
+                            .find(|(k, _)| k.as_str() == "height")
+                            .and_then(|(_, v)| v.parse::<u32>().ok())
+                            .unwrap_or(150);
+                        w3cos_std::Component::canvas(width, height, style)
                     }
                     _ => {
                         if is_row {

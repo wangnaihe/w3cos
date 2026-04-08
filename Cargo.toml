@@ -11,6 +11,7 @@ members = [
     "crates/w3cos-ai-bridge",
     "crates/w3cos-demo",
     "crates/w3cos-shell",
+    "crates/w3cos-rn-compat",
 ]
 
 [workspace.package]
@@ -21,12 +22,13 @@ repository = "https://github.com/wangnaihe/w3cos"
 
 [workspace.dependencies]
 w3cos-core = { path = "crates/w3cos-core" }
-w3cos-runtime = { path = "crates/w3cos-runtime" }
+w3cos-runtime = { path = "crates/w3cos-runtime", default-features = false }
 w3cos-compiler = { path = "crates/w3cos-compiler" }
 w3cos-std = { path = "crates/w3cos-std" }
 w3cos-dom = { path = "crates/w3cos-dom" }
 w3cos-a11y = { path = "crates/w3cos-a11y" }
 w3cos-ai-bridge = { path = "crates/w3cos-ai-bridge" }
+w3cos-rn-compat = { path = "crates/w3cos-rn-compat" }
 png = "0.17"
 image = "0.25"
 

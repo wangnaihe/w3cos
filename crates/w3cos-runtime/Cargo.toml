@@ -10,10 +10,12 @@ default = ["gpu"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 devtools = ["dep:tungstenite"]
+ai-bridge = ["dep:w3cos-ai-bridge"]
 
 [dependencies]
 w3cos-std = { workspace = true }
 w3cos-dom = { workspace = true }
+w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
 parley = { workspace = true }
 fontdue = { workspace = true }

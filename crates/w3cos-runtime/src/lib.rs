@@ -29,6 +29,14 @@ pub mod window;
 use anyhow::Result;
 use w3cos_std::Component;
 
+/// Enable the AI Bridge HTTP server by setting the W3COS_AI_PORT environment variable.
+/// The server will start when the application window is created.
+///
+/// Example: `enable_ai_bridge(9222)` starts the server on `http://127.0.0.1:9222`
+pub fn enable_ai_bridge(port: u16) {
+    unsafe { std::env::set_var("W3COS_AI_PORT", port.to_string()) };
+}
+
 /// Run a W3C OS application with a reactive builder function.
 /// The builder is re-called whenever signals change, producing a new component tree.
 pub fn run_app(builder: fn() -> Component) -> Result<()> {
