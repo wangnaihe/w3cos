@@ -6,10 +6,11 @@ FROM rust:bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /w3cos
-ARG CACHE_BUST=2026040401
+ARG CACHE_BUST=2026040402
 RUN git clone --depth 1 https://github.com/wangnaihe/w3cos.git .
 
-RUN cargo build --release -p w3cos-shell 2>&1 | tail -10
+# Build with CPU rendering (no GPU needed for HF Spaces)
+RUN cargo build --release -p w3cos-shell --no-default-features --features cpu-render 2>&1 | tail -10
 
 RUN strip target/release/w3cos-shell && ls -lh target/release/w3cos-shell
 

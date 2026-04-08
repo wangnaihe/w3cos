@@ -9,6 +9,12 @@ description = "W3C OS Desktop Shell — the system-level GUI that replaces tradi
 name = "w3cos-shell"
 path = "src/main.rs"
 
+[features]
+default = ["gpu"]
+gpu = ["w3cos-runtime/gpu"]
+cpu-render = ["w3cos-runtime/cpu-render"]
+ai-bridge = ["w3cos-runtime/ai-bridge"]
+
 [dependencies]
-w3cos-runtime = { workspace = true }
+w3cos-runtime = { workspace = true, default-features = false }
 w3cos-std = { workspace = true }
