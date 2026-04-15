@@ -81,6 +81,16 @@ impl Document {
         Element::new(id)
     }
 
+    pub fn create_document_fragment(&mut self) -> Element {
+        let id = self.alloc_node(DomNode::new_document_fragment(NodeId(0)));
+        Element::new(id)
+    }
+
+    pub fn create_comment(&mut self, content: &str) -> Element {
+        let id = self.alloc_node(DomNode::new_comment(NodeId(0), content));
+        Element::new(id)
+    }
+
     pub fn body(&self) -> Element {
         Element::new(self.body_id)
     }
@@ -172,6 +182,66 @@ impl Document {
         self.unlink_from_parent(child);
         self.get_node_mut(child).parent = None;
         self.mark_dirty(parent);
+    }
+
+    pub fn replace_child(&mut self, parent: NodeId, new_child: NodeId, old_child: NodeId) {
+        self.insert_before(parent, new_child, old_child);
+        self.remove_child(parent, old_child);
+    }
+
+    /// Deep-clone a node and its subtree. Returns the new root NodeId.
+    pub fn clone_node(&mut self, source: NodeId, deep: bool) -> NodeId {
+        let node = self.get_node(source);
+        let mut new_node = match node.node_type {
+            NodeType::Element => {
+                let mut n = DomNode::new_element(NodeId(0), &node.tag.as_str());
+                n.attributes = node.attributes.clone();
+                n.class_list = node.class_list.clone();
+                n.text_content = node.text_content.clone();
+                n
+            }
+            NodeType::Text => DomNode::new_text(NodeId(0), node.text_content.as_deref().unwrap_or("")),
+            NodeType::Comment => DomNode::new_comment(NodeId(0), node.text_content.as_deref().unwrap_or("")),
+            NodeType::DocumentFragment => DomNode::new_document_fragment(NodeId(0)),
+            NodeType::Document => DomNode::new_element(NodeId(0), "div"),
+        };
+        new_node.parent = None;
+        new_node.first_child = None;
+        new_node.last_child = None;
+        new_node.next_sibling = None;
+        new_node.prev_sibling = None;
+
+        let source_style = self.get_style(source).clone();
+        let new_id = self.alloc_node(new_node);
+        self.styles[new_id.0 as usize] = source_style;
+
+        if deep {
+            let child_ids = self.children_ids(source);
+            for child_id in child_ids {
+                let cloned_child = self.clone_node(child_id, true);
+                self.append_child(new_id, cloned_child);
+            }
+        }
+
+        new_id
+    }
+
+    // ── Query helpers ──
+
+    pub fn get_elements_by_tag_name(&self, tag: &str) -> Vec<Element> {
+        let atom = Atom::intern(tag);
+        self.tag_index
+            .get(&atom)
+            .map(|ids| ids.iter().map(|&id| Element::new(id)).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn get_elements_by_class_name(&self, class: &str) -> Vec<Element> {
+        let atom = Atom::intern(class);
+        self.class_index
+            .get(&atom)
+            .map(|ids| ids.iter().map(|&id| Element::new(id)).collect())
+            .unwrap_or_default()
     }
 
     pub fn insert_before(&mut self, parent: NodeId, new_child: NodeId, ref_child: NodeId) {
@@ -388,7 +458,10 @@ impl Document {
                 let text = node.text_content.as_deref().unwrap_or("");
                 w3cos_std::Component::text(text, style)
             }
-            NodeType::Element | NodeType::Document => {
+            NodeType::Comment => {
+                return w3cos_std::Component::column(style, vec![]);
+            }
+            NodeType::Element | NodeType::Document | NodeType::DocumentFragment => {
                 let children: Vec<w3cos_std::Component> = self
                     .children_ids(id)
                     .iter()
@@ -516,20 +589,47 @@ impl Document {
         self.nodes.iter().filter(|n| n.is_some()).count()
     }
 
-    /// Event dispatch with bubbling — walks parent pointers directly (O(depth), no HashMap).
+    /// Full W3C event dispatch with capturing and bubbling phases.
     pub fn dispatch_event_bubbling(&mut self, event: &mut crate::events::Event) {
+        // Build ancestor chain: [target, parent, ..., root]
         let mut chain = Vec::new();
         let mut current = Some(event.target);
         while let Some(id) = current {
             chain.push(id);
             current = self.get_node(id).parent;
         }
-        for node_id in chain {
+
+        // Phase 1: Capturing — root to target (exclusive)
+        event.event_phase = crate::events::EventPhase::Capturing;
+        for &node_id in chain.iter().rev().skip(0) {
+            if node_id == event.target {
+                break;
+            }
             self.events.dispatch_at_node(node_id, event);
             if event.stop_propagation {
                 return;
             }
         }
+
+        // Phase 2: At target
+        event.event_phase = crate::events::EventPhase::AtTarget;
+        self.events.dispatch_at_node(event.target, event);
+        if event.stop_propagation {
+            return;
+        }
+
+        // Phase 3: Bubbling — target parent to root
+        if event.bubbles {
+            event.event_phase = crate::events::EventPhase::Bubbling;
+            for &node_id in chain.iter().skip(1) {
+                self.events.dispatch_at_node(node_id, event);
+                if event.stop_propagation {
+                    return;
+                }
+            }
+        }
+
+        event.event_phase = crate::events::EventPhase::None;
     }
 
     fn link_child(&mut self, parent: NodeId, child: NodeId) {

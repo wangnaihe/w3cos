@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod media;
 pub mod multi_window;
 pub mod notification;
+pub mod observers;
 pub mod process;
 #[cfg(unix)]
 pub mod pty;

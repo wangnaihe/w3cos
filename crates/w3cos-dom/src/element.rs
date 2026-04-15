@@ -2,7 +2,7 @@ use crate::atom::Atom;
 use crate::css_style::CSSStyleDeclaration;
 use crate::document::Document;
 use crate::events::{Event, EventHandler, EventType};
-use crate::node::NodeId;
+use crate::node::{NodeId, NodeType};
 
 /// W3C Element API — the primary interface for DOM manipulation.
 ///
@@ -140,6 +140,216 @@ impl Element {
 
     pub fn dispatch_event(&self, doc: &mut Document, event: &mut Event) {
         doc.events.dispatch(event);
+    }
+
+    // ── W3C Node tree traversal ────────────────────────────────────────
+
+    pub fn next_sibling(&self, doc: &Document) -> Option<Element> {
+        doc.get_node(self.id).next_sibling.map(Element::new)
+    }
+
+    pub fn previous_sibling(&self, doc: &Document) -> Option<Element> {
+        doc.get_node(self.id).prev_sibling.map(Element::new)
+    }
+
+    pub fn first_child(&self, doc: &Document) -> Option<Element> {
+        doc.get_node(self.id).first_child.map(Element::new)
+    }
+
+    pub fn last_child(&self, doc: &Document) -> Option<Element> {
+        doc.get_node(self.id).last_child.map(Element::new)
+    }
+
+    pub fn child_element_count(&self, doc: &Document) -> usize {
+        doc.children_ids(self.id)
+            .iter()
+            .filter(|&&id| doc.get_node(id).node_type == NodeType::Element)
+            .count()
+    }
+
+    /// W3C `Node.nodeType` — returns numeric constant.
+    pub fn node_type(&self, doc: &Document) -> u16 {
+        doc.get_node(self.id).node_type.as_u16()
+    }
+
+    /// W3C `Node.nodeName` — tag name (uppercase for elements).
+    pub fn node_name(&self, doc: &Document) -> String {
+        doc.get_node(self.id).node_name()
+    }
+
+    /// Check if this element is connected to the document tree.
+    pub fn is_connected(&self, doc: &Document) -> bool {
+        let mut current = self.id;
+        loop {
+            let node = doc.get_node(current);
+            if node.node_type == NodeType::Document {
+                return true;
+            }
+            match node.parent {
+                Some(parent_id) => current = parent_id,
+                None => return false,
+            }
+        }
+    }
+
+    // ── W3C Node tree mutation ─────────────────────────────────────────
+
+    pub fn replace_child(&self, doc: &mut Document, new_child: Element, old_child: Element) {
+        doc.replace_child(self.id, new_child.id, old_child.id);
+    }
+
+    pub fn insert_before(&self, doc: &mut Document, new_child: Element, ref_child: Element) {
+        doc.insert_before(self.id, new_child.id, ref_child.id);
+    }
+
+    // ── Attribute convenience ──────────────────────────────────────────
+
+    pub fn id(&self, doc: &Document) -> Option<String> {
+        self.get_attribute(doc, "id").map(|s| s.to_string())
+    }
+
+    pub fn set_id(&self, doc: &mut Document, id: &str) {
+        self.set_attribute(doc, "id", id);
+    }
+
+    pub fn class_name(&self, doc: &Document) -> String {
+        let node = doc.get_node(self.id);
+        node.class_list
+            .iter()
+            .map(|a| a.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn set_class_name(&self, doc: &mut Document, name: &str) {
+        let node = doc.get_node_mut(self.id);
+        let old_classes: Vec<Atom> = std::mem::take(&mut node.class_list);
+        for class in old_classes {
+            doc.remove_from_class_index(self.id, &class);
+        }
+        for class in name.split_whitespace() {
+            self.class_list_add(doc, class);
+        }
+    }
+
+    /// `element.dataset` — returns all `data-*` attributes as key/value pairs.
+    pub fn dataset(&self, doc: &Document) -> std::collections::HashMap<String, String> {
+        doc.get_node(self.id)
+            .attributes
+            .iter()
+            .filter_map(|(k, v)| {
+                let name = k.as_str();
+                name.strip_prefix("data-").map(|key| {
+                    let camel = key
+                        .split('-')
+                        .enumerate()
+                        .map(|(i, part)| {
+                            if i == 0 {
+                                part.to_string()
+                            } else {
+                                let mut c = part.chars();
+                                match c.next() {
+                                    None => String::new(),
+                                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                                }
+                            }
+                        })
+                        .collect::<String>();
+                    (camel, v.clone())
+                })
+            })
+            .collect()
+    }
+
+    /// Recursively collect text content from all descendant text nodes.
+    pub fn inner_text(&self, doc: &Document) -> String {
+        let mut result = String::new();
+        Self::collect_text(doc, self.id, &mut result);
+        result
+    }
+
+    fn collect_text(doc: &Document, id: NodeId, out: &mut String) {
+        let node = doc.get_node(id);
+        if node.node_type == NodeType::Text {
+            if let Some(ref text) = node.text_content {
+                out.push_str(text);
+            }
+            return;
+        }
+        if let Some(ref text) = node.text_content {
+            out.push_str(text);
+        }
+        let mut child = node.first_child;
+        while let Some(child_id) = child {
+            Self::collect_text(doc, child_id, out);
+            child = doc.get_node(child_id).next_sibling;
+        }
+    }
+
+    /// Serialize this element as an HTML string (read-only).
+    pub fn outer_html(&self, doc: &Document) -> String {
+        let mut result = String::new();
+        Self::serialize_node(doc, self.id, &mut result);
+        result
+    }
+
+    fn serialize_node(doc: &Document, id: NodeId, out: &mut String) {
+        let node = doc.get_node(id);
+        match node.node_type {
+            NodeType::Text => {
+                if let Some(ref t) = node.text_content {
+                    out.push_str(t);
+                }
+            }
+            NodeType::Comment => {
+                out.push_str("<!--");
+                if let Some(ref t) = node.text_content {
+                    out.push_str(t);
+                }
+                out.push_str("-->");
+            }
+            NodeType::Element => {
+                let tag = node.tag.as_str();
+                out.push('<');
+                out.push_str(&tag);
+                for (k, v) in &node.attributes {
+                    out.push(' ');
+                    out.push_str(&k.as_str());
+                    out.push_str("=\"");
+                    out.push_str(v);
+                    out.push('"');
+                }
+                if !node.class_list.is_empty() {
+                    out.push_str(" class=\"");
+                    for (i, c) in node.class_list.iter().enumerate() {
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        out.push_str(&c.as_str());
+                    }
+                    out.push('"');
+                }
+                out.push('>');
+                if let Some(ref t) = node.text_content {
+                    out.push_str(t);
+                }
+                let mut child = node.first_child;
+                while let Some(child_id) = child {
+                    Self::serialize_node(doc, child_id, out);
+                    child = doc.get_node(child_id).next_sibling;
+                }
+                out.push_str("</");
+                out.push_str(&tag);
+                out.push('>');
+            }
+            _ => {
+                let mut child = node.first_child;
+                while let Some(child_id) = child {
+                    Self::serialize_node(doc, child_id, out);
+                    child = doc.get_node(child_id).next_sibling;
+                }
+            }
+        }
     }
 }
 

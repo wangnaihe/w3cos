@@ -1,9 +1,33 @@
+use std::collections::HashMap;
+
 use crate::parser::StyleDecl;
+
+#[derive(Debug, Clone)]
+pub struct KeyframeStop {
+    pub offset: f32,
+    pub style: StyleDecl,
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyframeAnimation {
+    pub name: String,
+    pub stops: Vec<KeyframeStop>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FontFace {
+    pub family: String,
+    pub src: String,
+    pub weight: Option<String>,
+    pub style: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
     pub layer_order: Vec<String>,
     pub rules: Vec<CssRule>,
+    pub keyframes: Vec<KeyframeAnimation>,
+    pub font_faces: Vec<FontFace>,
 }
 
 impl Stylesheet {
@@ -11,6 +35,8 @@ impl Stylesheet {
         Self {
             layer_order: Vec::new(),
             rules: Vec::new(),
+            keyframes: Vec::new(),
+            font_faces: Vec::new(),
         }
     }
 
@@ -21,6 +47,8 @@ impl Stylesheet {
             }
         }
         self.rules.extend(other.rules);
+        self.keyframes.extend(other.keyframes);
+        self.font_faces.extend(other.font_faces);
     }
 }
 
@@ -219,8 +247,17 @@ pub fn parse_css(source: &str) -> Stylesheet {
     let source = strip_comments(source);
     let mut layer_order: Vec<String> = Vec::new();
     let mut anon_counter: u32 = 0;
-    let rules = parse_block(&source, &mut layer_order, &mut anon_counter, None);
-    Stylesheet { layer_order, rules }
+    let mut keyframes: Vec<KeyframeAnimation> = Vec::new();
+    let mut font_faces: Vec<FontFace> = Vec::new();
+    let rules = parse_block(
+        &source,
+        &mut layer_order,
+        &mut anon_counter,
+        None,
+        &mut keyframes,
+        &mut font_faces,
+    );
+    Stylesheet { layer_order, rules, keyframes, font_faces }
 }
 
 /// Parse a block of CSS, which can be the top level or the inside of an @layer.
@@ -229,6 +266,8 @@ fn parse_block(
     layer_order: &mut Vec<String>,
     anon_counter: &mut u32,
     current_layer: Option<&str>,
+    keyframes: &mut Vec<KeyframeAnimation>,
+    font_faces: &mut Vec<FontFace>,
 ) -> Vec<CssRule> {
     let mut rules = Vec::new();
     let bytes = source.as_bytes();
@@ -250,6 +289,8 @@ fn parse_block(
                 layer_order,
                 anon_counter,
                 current_layer,
+                keyframes,
+                font_faces,
             );
             continue;
         }
@@ -291,12 +332,14 @@ fn parse_at_rule(
     layer_order: &mut Vec<String>,
     anon_counter: &mut u32,
     current_layer: Option<&str>,
+    keyframes: &mut Vec<KeyframeAnimation>,
+    font_faces: &mut Vec<FontFace>,
 ) -> usize {
     let bytes = source.as_bytes();
     let mut pos = start + 1; // skip @
 
     let kw_start = pos;
-    while pos < bytes.len() && bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'-' {
+    while pos < bytes.len() && (bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'-') {
         pos += 1;
     }
     let keyword = &source[kw_start..pos];
@@ -310,7 +353,6 @@ fn parse_at_rule(
         }
 
         if bytes[pos] == b'{' {
-            // Anonymous layer: @layer { ... }
             let anon_name = format!("__anon_{anon_counter}");
             *anon_counter += 1;
             let full_name = qualify_layer_name(current_layer, &anon_name);
@@ -318,13 +360,11 @@ fn parse_at_rule(
             pos += 1;
             let (block_str, advance) = extract_brace_content(&source[pos..]);
             pos += advance;
-            let inner = parse_block(block_str, layer_order, anon_counter, Some(&full_name));
+            let inner = parse_block(block_str, layer_order, anon_counter, Some(&full_name), keyframes, font_faces);
             rules.extend(inner);
         } else if bytes[pos] == b';' {
-            // Bare @layer; — do nothing
             pos += 1;
         } else {
-            // Find ; or { to distinguish declaration vs block
             let scan_start = pos;
             let mut scan = pos;
             while scan < bytes.len() && bytes[scan] != b';' && bytes[scan] != b'{' {
@@ -337,7 +377,6 @@ fn parse_at_rule(
             let name_part = source[scan_start..scan].trim();
 
             if bytes[scan] == b';' {
-                // @layer name1, name2, name3;
                 for name in name_part.split(',') {
                     let name = name.trim();
                     if !name.is_empty() {
@@ -347,7 +386,6 @@ fn parse_at_rule(
                 }
                 pos = scan + 1;
             } else {
-                // @layer name { ... }
                 let full_name = if name_part.is_empty() {
                     let anon = format!("__anon_{anon_counter}");
                     *anon_counter += 1;
@@ -359,13 +397,58 @@ fn parse_at_rule(
                 pos = scan + 1;
                 let (block_str, advance) = extract_brace_content(&source[pos..]);
                 pos += advance;
-                let inner =
-                    parse_block(block_str, layer_order, anon_counter, Some(&full_name));
+                let inner = parse_block(block_str, layer_order, anon_counter, Some(&full_name), keyframes, font_faces);
                 rules.extend(inner);
             }
         }
+    } else if keyword == "keyframes" {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let name_start = pos;
+        while pos < bytes.len() && bytes[pos] != b'{' && !bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let anim_name = source[name_start..pos].trim().to_string();
+        while pos < bytes.len() && bytes[pos] != b'{' {
+            pos += 1;
+        }
+        if pos < bytes.len() {
+            pos += 1;
+            let (block_str, advance) = extract_brace_content(&source[pos..]);
+            pos += advance;
+            let stops = parse_keyframe_block(block_str);
+            keyframes.push(KeyframeAnimation { name: anim_name, stops });
+        }
+    } else if keyword == "media" {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let condition_start = pos;
+        while pos < bytes.len() && bytes[pos] != b'{' {
+            pos += 1;
+        }
+        let _condition = source[condition_start..pos].trim();
+        if pos < bytes.len() {
+            pos += 1;
+            let (block_str, advance) = extract_brace_content(&source[pos..]);
+            pos += advance;
+            let inner = parse_block(block_str, layer_order, anon_counter, current_layer, keyframes, font_faces);
+            rules.extend(inner);
+        }
+    } else if keyword == "font-face" {
+        while pos < bytes.len() && bytes[pos] != b'{' {
+            pos += 1;
+        }
+        if pos < bytes.len() {
+            pos += 1;
+            let (block_str, advance) = extract_brace_content(&source[pos..]);
+            pos += advance;
+            let ff = parse_font_face_block(block_str);
+            font_faces.push(ff);
+        }
     } else {
-        // Other @-rules (@media, @keyframes, etc.) — skip entirely
+        // Other @-rules — skip
         let mut depth = 0i32;
         let mut found_brace = false;
         while pos < bytes.len() {
@@ -387,6 +470,80 @@ fn parse_at_rule(
     }
 
     pos
+}
+
+fn parse_keyframe_block(source: &str) -> Vec<KeyframeStop> {
+    let mut stops = Vec::new();
+    let bytes = source.as_bytes();
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+
+        let sel_start = pos;
+        while pos < bytes.len() && bytes[pos] != b'{' {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+        let selector = source[sel_start..pos].trim();
+        pos += 1;
+
+        let (block_str, advance) = extract_brace_content(&source[pos..]);
+        pos += advance;
+
+        let offsets = parse_keyframe_selectors(selector);
+        let style = parse_declarations(block_str);
+
+        for offset in offsets {
+            stops.push(KeyframeStop { offset, style: style.clone() });
+        }
+    }
+
+    stops
+}
+
+fn parse_keyframe_selectors(s: &str) -> Vec<f32> {
+    s.split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            match part {
+                "from" => Some(0.0),
+                "to" => Some(1.0),
+                _ => part.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok().map(|v| v / 100.0)),
+            }
+        })
+        .collect()
+}
+
+fn parse_font_face_block(source: &str) -> FontFace {
+    let mut family = String::new();
+    let mut src = String::new();
+    let mut weight = None;
+    let mut style = None;
+
+    for decl in source.split(';') {
+        let decl = decl.trim();
+        if let Some(colon) = decl.find(':') {
+            let prop = decl[..colon].trim();
+            let val = decl[colon + 1..].trim();
+            match prop {
+                "font-family" => family = val.trim_matches('"').trim_matches('\'').to_string(),
+                "src" => src = val.to_string(),
+                "font-weight" => weight = Some(val.to_string()),
+                "font-style" => style = Some(val.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    FontFace { family, src, weight, style }
 }
 
 fn qualify_layer_name(parent: Option<&str>, child: &str) -> String {
@@ -728,6 +885,24 @@ fn unquote(s: &str) -> String {
 fn parse_declarations(block: &str) -> StyleDecl {
     let mut style = StyleDecl::default();
 
+    // First pass: collect custom properties for var() resolution
+    let mut custom_props: HashMap<String, String> = HashMap::new();
+    for decl in block.split(';') {
+        let decl = decl.trim();
+        if decl.is_empty() {
+            continue;
+        }
+        if let Some(colon_pos) = decl.find(':') {
+            let property = decl[..colon_pos].trim();
+            if property.starts_with("--") {
+                let value = decl[colon_pos + 1..].trim();
+                let value = value.trim_end_matches("!important").trim();
+                custom_props.insert(property.to_string(), value.to_string());
+            }
+        }
+    }
+
+    // Second pass: apply all properties with var() resolution
     for decl in block.split(';') {
         let decl = decl.trim();
         if decl.is_empty() {
@@ -738,7 +913,8 @@ fn parse_declarations(block: &str) -> StyleDecl {
             let property = decl[..colon_pos].trim();
             let value = decl[colon_pos + 1..].trim();
             let value = value.trim_end_matches("!important").trim();
-            apply_css_property(&mut style, property, value);
+            let resolved = resolve_var(value, &custom_props);
+            apply_css_property(&mut style, property, &resolved);
         }
     }
 
@@ -746,26 +922,47 @@ fn parse_declarations(block: &str) -> StyleDecl {
 }
 
 fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
+    if property.starts_with("--") {
+        let props = style.custom_properties.get_or_insert_with(HashMap::new);
+        props.insert(property.to_string(), value.to_string());
+        return;
+    }
     match property {
         "gap" => style.gap = css_parse_px(value),
         "padding" => style.padding = css_parse_px(value),
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
+            style.padding = css_parse_px(value);
+        }
+        "margin" => style.margin = css_parse_px(value),
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
+            style.margin = css_parse_px(value);
+        }
         "font-size" => style.font_size = css_parse_px(value),
         "font-weight" => style.font_weight = parse_font_weight(value),
+        "font-family" => style.font_family = Some(value.trim_matches('"').trim_matches('\'').to_string()),
+        "font-style" => style.font_style = Some(value.to_string()),
         "color" => style.color = Some(value.to_string()),
         "background" | "background-color" => style.background = Some(value.to_string()),
         "border-radius" => style.border_radius = css_parse_px(value),
         "border-width" => style.border_width = css_parse_px(value),
         "border-color" => style.border_color = Some(value.to_string()),
         "align-items" => style.align_items = Some(value.to_string()),
+        "align-self" => style.align_self = Some(value.to_string()),
+        "align-content" => style.align_content = Some(value.to_string()),
         "justify-content" => style.justify_content = Some(value.to_string()),
         "width" => style.width = Some(value.to_string()),
         "height" => style.height = Some(value.to_string()),
+        "min-width" => style.min_width = Some(value.to_string()),
+        "min-height" => style.min_height = Some(value.to_string()),
+        "max-width" => style.max_width = Some(value.to_string()),
+        "max-height" => style.max_height = Some(value.to_string()),
         "flex-grow" => style.flex_grow = value.parse().ok(),
-        "flex" => {
-            if let Ok(v) = value.parse::<f32>() {
-                style.flex_grow = Some(v);
-            }
-        }
+        "flex-shrink" => style.flex_shrink = value.parse().ok(),
+        "flex-basis" => style.flex_basis = Some(value.to_string()),
+        "flex-direction" => style.flex_direction = Some(value.to_string()),
+        "flex-wrap" => style.flex_wrap = Some(value.to_string()),
+        "flex" => parse_flex_shorthand(style, value),
+        "order" => style.order = value.parse().ok(),
         "position" => style.position = Some(value.to_string()),
         "top" => style.top = Some(value.to_string()),
         "right" => style.right = Some(value.to_string()),
@@ -774,13 +971,113 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "z-index" => style.z_index = value.parse().ok(),
         "overflow" => style.overflow = Some(value.to_string()),
         "display" => style.display = Some(value.to_string()),
+        "opacity" => style.opacity = value.parse().ok(),
+        "visibility" => style.visibility = Some(value.to_string()),
+        "cursor" => style.cursor = Some(value.to_string()),
+        "pointer-events" => style.pointer_events = Some(value.to_string()),
+        "user-select" => style.user_select = Some(value.to_string()),
+        "text-align" => style.text_align = Some(value.to_string()),
+        "white-space" => style.white_space = Some(value.to_string()),
+        "line-height" => style.line_height = css_parse_px(value).or_else(|| value.parse().ok()),
+        "letter-spacing" => style.letter_spacing = css_parse_px(value),
+        "text-decoration" => style.text_decoration = Some(value.to_string()),
+        "text-overflow" => style.text_overflow = Some(value.to_string()),
+        "word-break" => style.word_break = Some(value.to_string()),
+        "outline-width" => style.outline_width = css_parse_px(value),
+        "outline-color" => style.outline_color = Some(value.to_string()),
+        "outline-style" => style.outline_style = Some(value.to_string()),
+        "outline" => parse_outline_shorthand(style, value),
+        "transform" => style.transform = Some(value.to_string()),
+        "transition" => style.transition = Some(value.to_string()),
+        "box-shadow" => style.box_shadow = Some(value.to_string()),
         "border" => parse_border_shorthand(style, value),
         _ => {}
     }
 }
 
+fn parse_flex_shorthand(style: &mut StyleDecl, value: &str) {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    match parts.len() {
+        1 => {
+            if let Ok(v) = parts[0].parse::<f32>() {
+                style.flex_grow = Some(v);
+            }
+        }
+        2 => {
+            style.flex_grow = parts[0].parse().ok();
+            style.flex_shrink = parts[1].parse().ok();
+        }
+        3 => {
+            style.flex_grow = parts[0].parse().ok();
+            style.flex_shrink = parts[1].parse().ok();
+            style.flex_basis = Some(parts[2].to_string());
+        }
+        _ => {}
+    }
+}
+
+fn parse_outline_shorthand(style: &mut StyleDecl, value: &str) {
+    for part in value.split_whitespace() {
+        if let Some(px) = css_parse_px(part) {
+            style.outline_width = Some(px);
+        } else if part.starts_with('#') || part.starts_with("rgb") {
+            style.outline_color = Some(part.to_string());
+        } else {
+            style.outline_style = Some(part.to_string());
+        }
+    }
+}
+
+fn resolve_var(value: &str, custom_props: &HashMap<String, String>) -> String {
+    if !value.contains("var(") {
+        return value.to_string();
+    }
+    let mut result = value.to_string();
+    // Iteratively resolve var() references (handles nested var())
+    for _ in 0..10 {
+        let Some(start) = result.find("var(") else {
+            break;
+        };
+        let after = &result[start + 4..];
+        let mut depth = 1i32;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            break;
+        }
+        let inner = after[..end].trim();
+        let (var_name, fallback) = match inner.find(',') {
+            Some(comma) => (inner[..comma].trim(), Some(inner[comma + 1..].trim())),
+            None => (inner, None),
+        };
+        let replacement = custom_props
+            .get(var_name)
+            .map(|s| s.as_str())
+            .or(fallback)
+            .unwrap_or("");
+        result = format!("{}{}{}", &result[..start], replacement, &after[end + 1..]);
+    }
+    result
+}
+
 fn css_parse_px(value: &str) -> Option<f32> {
-    let v = value.trim().trim_end_matches("px");
+    let trimmed = value.trim();
+    if trimmed.starts_with("calc(") {
+        return None;
+    }
+    let v = trimmed.trim_end_matches("px");
     v.parse().ok()
 }
 
@@ -907,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn skip_at_rules() {
+    fn media_rules_parsed() {
         let css = r#"
             @media (max-width: 600px) {
                 .title { font-size: 18px; }
@@ -915,8 +1212,8 @@ mod tests {
             .body { gap: 8; }
         "#;
         let sheet = parse_css(css);
-        assert_eq!(sheet.rules.len(), 1);
-        assert_eq!(sheet.rules[0].style.gap, Some(8.0));
+        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules[1].style.gap, Some(8.0));
     }
 
     #[test]
@@ -1075,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_with_media_skipped() {
+    fn layer_with_media_parsed() {
         let css = r#"
             @layer base {
                 .title { font-size: 24; }
@@ -1089,7 +1386,7 @@ mod tests {
         "#;
         let sheet = parse_css(css);
         assert_eq!(sheet.layer_order, vec!["base", "theme"]);
-        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules.len(), 3);
     }
 
     #[test]

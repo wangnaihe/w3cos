@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +78,40 @@ pub struct StyleDecl {
     pub z_index: Option<i32>,
     pub overflow: Option<String>,
     pub display: Option<String>,
+    // Phase 3 additions
+    pub margin: Option<f32>,
+    pub flex_direction: Option<String>,
+    pub flex_wrap: Option<String>,
+    pub flex_shrink: Option<f32>,
+    pub flex_basis: Option<String>,
+    pub align_self: Option<String>,
+    pub align_content: Option<String>,
+    pub order: Option<i32>,
+    pub opacity: Option<f32>,
+    pub text_align: Option<String>,
+    pub white_space: Option<String>,
+    pub line_height: Option<f32>,
+    pub letter_spacing: Option<f32>,
+    pub text_decoration: Option<String>,
+    pub text_overflow: Option<String>,
+    pub font_family: Option<String>,
+    pub font_style: Option<String>,
+    pub word_break: Option<String>,
+    pub cursor: Option<String>,
+    pub visibility: Option<String>,
+    pub pointer_events: Option<String>,
+    pub user_select: Option<String>,
+    pub outline_width: Option<f32>,
+    pub outline_color: Option<String>,
+    pub outline_style: Option<String>,
+    pub min_width: Option<String>,
+    pub min_height: Option<String>,
+    pub max_width: Option<String>,
+    pub max_height: Option<String>,
+    pub transform: Option<String>,
+    pub transition: Option<String>,
+    pub box_shadow: Option<String>,
+    pub custom_properties: Option<HashMap<String, String>>,
 }
 
 pub fn parse(source: &str) -> Result<AppTree> {

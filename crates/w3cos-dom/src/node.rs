@@ -21,6 +21,21 @@ pub enum NodeType {
     Element,
     Text,
     Document,
+    DocumentFragment,
+    Comment,
+}
+
+impl NodeType {
+    /// W3C `Node.nodeType` numeric constant.
+    pub fn as_u16(self) -> u16 {
+        match self {
+            NodeType::Element => 1,
+            NodeType::Text => 3,
+            NodeType::Comment => 8,
+            NodeType::Document => 9,
+            NodeType::DocumentFragment => 11,
+        }
+    }
 }
 
 /// Internal node storage for the DOM tree.
@@ -82,13 +97,53 @@ impl DomNode {
         }
     }
 
-    /// Convenience: get the tag as a &str (via atom lookup).
+    pub fn new_document_fragment(id: NodeId) -> Self {
+        Self {
+            id,
+            node_type: NodeType::DocumentFragment,
+            tag: Atom::intern("#document-fragment"),
+            text_content: None,
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            attributes: Vec::new(),
+            class_list: Vec::new(),
+        }
+    }
+
+    pub fn new_comment(id: NodeId, content: impl Into<String>) -> Self {
+        Self {
+            id,
+            node_type: NodeType::Comment,
+            tag: Atom::intern("#comment"),
+            text_content: Some(content.into()),
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            attributes: Vec::new(),
+            class_list: Vec::new(),
+        }
+    }
+
     pub fn tag_str(&self) -> String {
         self.tag.as_str()
     }
 
-    /// Iterate over child NodeIds (follows first_child -> next_sibling chain).
-    /// Requires access to the node arena to follow pointers.
+    /// W3C `Node.nodeName`.
+    pub fn node_name(&self) -> String {
+        match self.node_type {
+            NodeType::Element => self.tag.as_str().to_ascii_uppercase(),
+            NodeType::Text => "#text".to_string(),
+            NodeType::Comment => "#comment".to_string(),
+            NodeType::Document => "#document".to_string(),
+            NodeType::DocumentFragment => "#document-fragment".to_string(),
+        }
+    }
+
     pub fn child_count_hint(&self) -> bool {
         self.first_child.is_some()
     }

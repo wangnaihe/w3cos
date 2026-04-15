@@ -147,6 +147,48 @@ impl CSSStyleDeclaration {
                 self.inner.transition = parse_transition(value);
             }
 
+            // Text properties
+            "text-align" | "textAlign" => self.inner.text_align = parse_text_align(value),
+            "white-space" | "whiteSpace" => self.inner.white_space = parse_white_space(value),
+            "line-height" | "lineHeight" => {
+                if let Ok(v) = value.trim().trim_end_matches("px").parse() {
+                    self.inner.line_height = v;
+                }
+            }
+            "letter-spacing" | "letterSpacing" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.letter_spacing = v;
+                }
+            }
+            "text-decoration" | "textDecoration" => self.inner.text_decoration = parse_text_decoration(value),
+            "text-overflow" | "textOverflow" => self.inner.text_overflow = parse_text_overflow(value),
+            "font-family" | "fontFamily" => {
+                self.inner.font_family = Some(value.trim_matches('"').trim_matches('\'').to_string());
+            }
+            "font-style" | "fontStyle" => self.inner.font_style = parse_font_style(value),
+            "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
+
+            // Interaction
+            "cursor" => self.inner.cursor = parse_cursor(value),
+            "pointer-events" | "pointerEvents" => self.inner.pointer_events = parse_pointer_events(value),
+            "user-select" | "userSelect" => self.inner.user_select = parse_user_select(value),
+
+            // Visibility
+            "visibility" => self.inner.visibility = parse_visibility(value),
+
+            // Flex extras
+            "flex-basis" | "flexBasis" => self.inner.flex_basis = parse_dimension(value),
+            "order" => { if let Ok(v) = value.parse() { self.inner.order = v } }
+            "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
+            "align-content" | "alignContent" => self.inner.align_content = parse_align_content(value),
+
+            // Outline
+            "outline-width" | "outlineWidth" => {
+                if let Some(v) = parse_px(value) { self.inner.outline_width = v }
+            }
+            "outline-color" | "outlineColor" => self.inner.outline_color = Color::from_hex(value),
+            "outline-style" | "outlineStyle" => self.inner.outline_style = parse_outline_style(value),
+
             _ => {}
         }
     }
@@ -378,6 +420,160 @@ fn extract_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     let open = rest.find('(')?;
     let close = rest.find(')')?;
     Some(&rest[open + 1..close])
+}
+
+fn parse_text_align(value: &str) -> w3cos_std::style::TextAlign {
+    use w3cos_std::style::TextAlign;
+    match value.trim() {
+        "left" => TextAlign::Left,
+        "right" => TextAlign::Right,
+        "center" => TextAlign::Center,
+        "justify" => TextAlign::Justify,
+        _ => TextAlign::Left,
+    }
+}
+
+fn parse_white_space(value: &str) -> w3cos_std::style::WhiteSpace {
+    use w3cos_std::style::WhiteSpace;
+    match value.trim() {
+        "normal" => WhiteSpace::Normal,
+        "nowrap" => WhiteSpace::NoWrap,
+        "pre" => WhiteSpace::Pre,
+        "pre-wrap" => WhiteSpace::PreWrap,
+        "pre-line" => WhiteSpace::PreLine,
+        _ => WhiteSpace::Normal,
+    }
+}
+
+fn parse_text_decoration(value: &str) -> w3cos_std::style::TextDecoration {
+    use w3cos_std::style::TextDecoration;
+    match value.trim() {
+        "none" => TextDecoration::None,
+        "underline" => TextDecoration::Underline,
+        "overline" => TextDecoration::Overline,
+        "line-through" => TextDecoration::LineThrough,
+        _ => TextDecoration::None,
+    }
+}
+
+fn parse_text_overflow(value: &str) -> w3cos_std::style::TextOverflow {
+    use w3cos_std::style::TextOverflow;
+    match value.trim() {
+        "clip" => TextOverflow::Clip,
+        "ellipsis" => TextOverflow::Ellipsis,
+        _ => TextOverflow::Clip,
+    }
+}
+
+fn parse_font_style(value: &str) -> w3cos_std::style::FontStyle {
+    use w3cos_std::style::FontStyle;
+    match value.trim() {
+        "normal" => FontStyle::Normal,
+        "italic" => FontStyle::Italic,
+        "oblique" => FontStyle::Oblique,
+        _ => FontStyle::Normal,
+    }
+}
+
+fn parse_word_break(value: &str) -> w3cos_std::style::WordBreak {
+    use w3cos_std::style::WordBreak;
+    match value.trim() {
+        "normal" => WordBreak::Normal,
+        "break-all" => WordBreak::BreakAll,
+        "keep-all" => WordBreak::KeepAll,
+        "break-word" => WordBreak::BreakWord,
+        _ => WordBreak::Normal,
+    }
+}
+
+fn parse_cursor(value: &str) -> w3cos_std::style::Cursor {
+    use w3cos_std::style::Cursor;
+    match value.trim() {
+        "default" => Cursor::Default,
+        "pointer" => Cursor::Pointer,
+        "text" => Cursor::Text,
+        "move" => Cursor::Move,
+        "grab" => Cursor::Grab,
+        "grabbing" => Cursor::Grabbing,
+        "not-allowed" => Cursor::NotAllowed,
+        "crosshair" => Cursor::Crosshair,
+        "help" => Cursor::Help,
+        "wait" => Cursor::Wait,
+        "progress" => Cursor::Progress,
+        "col-resize" => Cursor::ColResize,
+        "row-resize" => Cursor::RowResize,
+        "none" => Cursor::None,
+        _ => Cursor::Default,
+    }
+}
+
+fn parse_pointer_events(value: &str) -> w3cos_std::style::PointerEvents {
+    use w3cos_std::style::PointerEvents;
+    match value.trim() {
+        "auto" => PointerEvents::Auto,
+        "none" => PointerEvents::None,
+        _ => PointerEvents::Auto,
+    }
+}
+
+fn parse_user_select(value: &str) -> w3cos_std::style::UserSelect {
+    use w3cos_std::style::UserSelect;
+    match value.trim() {
+        "auto" => UserSelect::Auto,
+        "none" => UserSelect::None,
+        "text" => UserSelect::Text,
+        "all" => UserSelect::All,
+        _ => UserSelect::Auto,
+    }
+}
+
+fn parse_visibility(value: &str) -> w3cos_std::style::Visibility {
+    use w3cos_std::style::Visibility;
+    match value.trim() {
+        "visible" => Visibility::Visible,
+        "hidden" => Visibility::Hidden,
+        "collapse" => Visibility::Collapse,
+        _ => Visibility::Visible,
+    }
+}
+
+fn parse_align_self(value: &str) -> w3cos_std::style::AlignSelf {
+    use w3cos_std::style::AlignSelf;
+    match value.trim() {
+        "auto" => AlignSelf::Auto,
+        "flex-start" | "start" => AlignSelf::FlexStart,
+        "flex-end" | "end" => AlignSelf::FlexEnd,
+        "center" => AlignSelf::Center,
+        "baseline" => AlignSelf::Baseline,
+        "stretch" => AlignSelf::Stretch,
+        _ => AlignSelf::Auto,
+    }
+}
+
+fn parse_align_content(value: &str) -> w3cos_std::style::AlignContent {
+    use w3cos_std::style::AlignContent;
+    match value.trim() {
+        "flex-start" | "start" => AlignContent::FlexStart,
+        "flex-end" | "end" => AlignContent::FlexEnd,
+        "center" => AlignContent::Center,
+        "space-between" => AlignContent::SpaceBetween,
+        "space-around" => AlignContent::SpaceAround,
+        "space-evenly" => AlignContent::SpaceEvenly,
+        "stretch" => AlignContent::Stretch,
+        _ => AlignContent::Stretch,
+    }
+}
+
+fn parse_outline_style(value: &str) -> w3cos_std::style::OutlineStyle {
+    use w3cos_std::style::OutlineStyle;
+    match value.trim() {
+        "none" => OutlineStyle::None,
+        "solid" => OutlineStyle::Solid,
+        "dashed" => OutlineStyle::Dashed,
+        "dotted" => OutlineStyle::Dotted,
+        "double" => OutlineStyle::Double,
+        _ => OutlineStyle::None,
+    }
 }
 
 fn parse_transition(value: &str) -> Option<w3cos_std::style::Transition> {

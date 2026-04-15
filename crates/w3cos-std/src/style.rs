@@ -77,6 +77,25 @@ pub struct Style {
 
     // CSS Animation (#11)
     pub animation: Option<Animation>,
+
+    // Additional layout properties
+    pub flex_basis: Dimension,
+    pub order: i32,
+    pub align_self: AlignSelf,
+    pub align_content: AlignContent,
+
+    // Interaction
+    pub cursor: Cursor,
+    pub pointer_events: PointerEvents,
+    pub user_select: UserSelect,
+
+    // Visibility
+    pub visibility: Visibility,
+
+    // Outline
+    pub outline_width: f32,
+    pub outline_color: Color,
+    pub outline_style: OutlineStyle,
 }
 
 impl Default for Style {
@@ -128,6 +147,17 @@ impl Default for Style {
             transform: Transform2D::IDENTITY,
             transition: None,
             animation: None,
+            flex_basis: Dimension::Auto,
+            order: 0,
+            align_self: AlignSelf::Auto,
+            align_content: AlignContent::Stretch,
+            cursor: Cursor::Default,
+            pointer_events: PointerEvents::Auto,
+            user_select: UserSelect::Auto,
+            visibility: Visibility::Visible,
+            outline_width: 0.0,
+            outline_color: Color::TRANSPARENT,
+            outline_style: OutlineStyle::None,
         }
     }
 }
@@ -489,6 +519,92 @@ fn cubic_bezier(_x1: f32, y1: f32, _x2: f32, y2: f32, t: f32) -> f32 {
     let ct2 = ct * ct;
     let t2 = t * t;
     3.0 * ct2 * t * y1 + 3.0 * ct * t2 * y2 + t2 * t
+}
+
+// --- New enums for Phase 3 ---
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum AlignSelf {
+    #[default]
+    Auto,
+    FlexStart,
+    FlexEnd,
+    Center,
+    Baseline,
+    Stretch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum AlignContent {
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+    #[default]
+    Stretch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum Cursor {
+    #[default]
+    Default,
+    Pointer,
+    Text,
+    Move,
+    Grab,
+    Grabbing,
+    NotAllowed,
+    Crosshair,
+    Help,
+    Wait,
+    Progress,
+    ColResize,
+    RowResize,
+    NResize,
+    EResize,
+    SResize,
+    WResize,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum PointerEvents {
+    #[default]
+    Auto,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum UserSelect {
+    #[default]
+    Auto,
+    None,
+    Text,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum Visibility {
+    #[default]
+    Visible,
+    Hidden,
+    Collapse,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum OutlineStyle {
+    #[default]
+    None,
+    Solid,
+    Dashed,
+    Dotted,
+    Double,
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
 }
 
 // --- Dimension resolution ---

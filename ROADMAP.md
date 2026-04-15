@@ -138,10 +138,54 @@
 - [x] Adaptive Layout: responsive dashboard that works on any screen size
 
 ## Phase 2.75 — VS Code Compatibility (see docs/vscode-compat.md)
-- [ ] Canvas 2D API (CanvasRenderingContext2D) (#32)
-- [ ] Selection API (window.getSelection, Range) (#37)
+
+### DOM Core ✅
+- [x] replaceChild, cloneNode(deep), DocumentFragment, Comment node types
+- [x] nextSibling/previousSibling/firstChild/lastChild accessors on Element
+- [x] is_connected, node_type, node_name, child_element_count
+- [x] getElementsByTagName, getElementsByClassName
+- [x] dataset (DOMStringMap), inner_text, outer_html (read-only)
+- [x] Runtime DOM bridge: all new APIs exposed via w3cos_runtime::dom
+
+### DOM Events ✅
+- [x] Full event sub-types: MouseEventData, KeyboardEventData, PointerEventData, WheelEventData
+- [x] 40+ EventType variants (pointer, touch, composition, custom, etc.)
+- [x] Event phases: Capturing → AtTarget → Bubbling (W3C 3-phase propagation)
+- [x] Listener options: capture, once, passive
+- [x] Single listener removal by ID
+- [x] stop_immediate_propagation support
+- [x] CustomEvent with detail
+
+### CSS Engine ✅
+- [x] 30+ new CSS properties in StyleDecl/apply_css_property (cursor, visibility, pointer-events, user-select, outline-*, text-*, flex-basis, order, align-self, align-content, etc.)
+- [x] CSS shorthand parsing: flex, outline, border, margin/padding multi-value
+- [x] CSSStyleDeclaration: text-align, white-space, line-height, letter-spacing, text-decoration, text-overflow, font-family/style, word-break, cursor, visibility, pointer-events, user-select, outline-*, align-self/content
+- [x] Style struct: cursor, visibility, pointer_events, user_select, outline, flex_basis, order, align_self, align_content
+- [x] CSS Custom Properties: var(--name, fallback) resolution with inheritance
+- [x] @keyframes parsing: keyframe stops with percentage/from/to
+- [x] @media parsing: rules inside @media blocks now parsed (not skipped)
+- [x] @font-face parsing: font-family, src, weight, style extraction
 - [x] CSS pseudo-class selectors (:hover, :focus, :active, :first-child, :last-child, :nth-child, :only-child, :empty, :not(), :disabled, :enabled, :checked)
 - [x] CSS attribute selectors ([attr], [attr=value], [attr^=value], [attr$=value], [attr*=value], [attr~=value], [attr|=value])
+
+### Canvas 2D ✅
+- [x] Path: quadraticCurveTo, bezierCurveTo, ellipse, rect, clip
+- [x] Image: drawImage, putImageData
+- [x] Line styles: setLineCap, setLineJoin, setMiterLimit, setLineDash/getLineDash
+- [x] Transform: setTransform, resetTransform
+- [x] TextMetrics: width + boundingBox ascent/descent
+
+### Selection API ✅
+- [x] Range: collapse, selectNode, selectNodeContents, cloneRange, setStartBefore/After, setEndBefore/After
+- [x] Selection: removeRange, containsNode, selectionType
+
+### Observer APIs ✅
+- [x] ResizeObserver (observe/unobserve/disconnect/checkForChanges)
+- [x] MutationObserver (MutationType/MutationRecord)
+- [x] IntersectionObserver (observe/unobserve/disconnect/checkForIntersections)
+- [x] Window.matchMedia (min-width, max-width, prefers-color-scheme)
+
+### Remaining
 - [ ] Web Workers
 - [ ] WebSocket API
 - [x] localStorage (Web Storage API with JSON file persistence)

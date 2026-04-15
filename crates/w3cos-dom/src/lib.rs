@@ -12,7 +12,10 @@ pub mod window;
 
 pub use document::Document;
 pub use element::Element;
-pub use events::{Event, EventHandler, EventType};
+pub use events::{
+    Event, EventData, EventHandler, EventPhase, EventType, KeyboardEventData, ListenerOptions,
+    MouseEventData, PointerEventData, WheelEventData,
+};
 pub use history::History;
 pub use location::Location;
 pub use node::{NodeId, NodeType};
@@ -244,10 +247,12 @@ mod tests {
     }
 
     #[test]
-    fn test_event_type_from_str_invalid() {
-        assert_eq!(EventType::from_str("invalid"), None);
-        assert_eq!(EventType::from_str(""), None);
-        assert_eq!(EventType::from_str("CLICK"), None); // case sensitive
+    fn test_event_type_from_str_custom() {
+        // Unknown event names now produce Custom variants
+        let ev = EventType::from_str("myCustomEvent");
+        assert!(matches!(ev, Some(EventType::Custom(_))));
+        // Known names remain correct
+        assert_eq!(EventType::from_str("click"), Some(EventType::Click));
     }
 
     #[test]

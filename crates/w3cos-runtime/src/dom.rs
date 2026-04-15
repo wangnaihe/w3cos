@@ -200,6 +200,99 @@ pub fn node_count() -> usize {
     with_document(|doc| doc.node_count())
 }
 
+// ── Phase 1 additions ──
+
+pub fn replace_child(parent: u32, new_child: u32, old_child: u32) {
+    with_document_mut(|doc| {
+        doc.replace_child(
+            NodeId::from_u32(parent),
+            NodeId::from_u32(new_child),
+            NodeId::from_u32(old_child),
+        );
+    });
+    mark_dom_dirty();
+}
+
+pub fn clone_node(node: u32, deep: bool) -> u32 {
+    with_document_mut(|doc| doc.clone_node(NodeId::from_u32(node), deep).as_u32())
+}
+
+pub fn create_document_fragment() -> u32 {
+    with_document_mut(|doc| doc.create_document_fragment().id.as_u32())
+}
+
+pub fn create_comment(text: &str) -> u32 {
+    with_document_mut(|doc| doc.create_comment(text).id.as_u32())
+}
+
+pub fn get_elements_by_tag_name(tag: &str) -> Vec<u32> {
+    with_document(|doc| {
+        doc.get_elements_by_tag_name(tag)
+            .iter()
+            .map(|el| el.id.as_u32())
+            .collect()
+    })
+}
+
+pub fn get_elements_by_class_name(class: &str) -> Vec<u32> {
+    with_document(|doc| {
+        doc.get_elements_by_class_name(class)
+            .iter()
+            .map(|el| el.id.as_u32())
+            .collect()
+    })
+}
+
+pub fn next_sibling(node: u32) -> Option<u32> {
+    with_document(|doc| {
+        doc.get_node(NodeId::from_u32(node))
+            .next_sibling
+            .map(|id| id.as_u32())
+    })
+}
+
+pub fn previous_sibling(node: u32) -> Option<u32> {
+    with_document(|doc| {
+        doc.get_node(NodeId::from_u32(node))
+            .prev_sibling
+            .map(|id| id.as_u32())
+    })
+}
+
+pub fn first_child(node: u32) -> Option<u32> {
+    with_document(|doc| {
+        doc.get_node(NodeId::from_u32(node))
+            .first_child
+            .map(|id| id.as_u32())
+    })
+}
+
+pub fn last_child(node: u32) -> Option<u32> {
+    with_document(|doc| {
+        doc.get_node(NodeId::from_u32(node))
+            .last_child
+            .map(|id| id.as_u32())
+    })
+}
+
+pub fn node_type(node: u32) -> u16 {
+    with_document(|doc| doc.get_node(NodeId::from_u32(node)).node_type.as_u16())
+}
+
+pub fn inner_text(node: u32) -> String {
+    with_document(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.inner_text(doc)
+    })
+}
+
+pub fn outer_html(node: u32) -> String {
+    with_document(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.outer_html(doc)
+    })
+}
+
 /// Build Component tree from the current DOM state (for rendering).
 pub fn to_component_tree() -> w3cos_std::Component {
     with_document(|doc| doc.to_component_tree())

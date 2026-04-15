@@ -123,6 +123,56 @@ impl Range {
         self.delete_contents(doc);
         text
     }
+
+    pub fn collapse(&mut self, to_start: bool) {
+        if to_start {
+            self.end_container = self.start_container;
+            self.end_offset = self.start_offset;
+        } else {
+            self.start_container = self.end_container;
+            self.start_offset = self.end_offset;
+        }
+    }
+
+    pub fn select_node(&mut self, node_id: u32) {
+        let nid = NodeId::from_u32(node_id);
+        self.start_container = nid;
+        self.start_offset = 0;
+        self.end_container = nid;
+        self.end_offset = 0;
+    }
+
+    pub fn select_node_contents(&mut self, node_id: u32, length: u32) {
+        let nid = NodeId::from_u32(node_id);
+        self.start_container = nid;
+        self.start_offset = 0;
+        self.end_container = nid;
+        self.end_offset = length;
+    }
+
+    pub fn clone_range(&self) -> Range {
+        self.clone()
+    }
+
+    pub fn set_start_before(&mut self, node_id: u32) {
+        self.start_container = NodeId::from_u32(node_id);
+        self.start_offset = 0;
+    }
+
+    pub fn set_start_after(&mut self, node_id: u32, length: u32) {
+        self.start_container = NodeId::from_u32(node_id);
+        self.start_offset = length;
+    }
+
+    pub fn set_end_before(&mut self, node_id: u32) {
+        self.end_container = NodeId::from_u32(node_id);
+        self.end_offset = 0;
+    }
+
+    pub fn set_end_after(&mut self, node_id: u32, length: u32) {
+        self.end_container = NodeId::from_u32(node_id);
+        self.end_offset = length;
+    }
 }
 
 impl Default for Range {
@@ -259,6 +309,35 @@ impl Selection {
             range.set_start(anchor, self.anchor_offset);
             range.set_end(node, offset);
             self.ranges.push(range);
+        }
+    }
+
+    pub fn remove_range(&mut self, index: usize) {
+        if index < self.ranges.len() {
+            self.ranges.remove(index);
+            if self.ranges.is_empty() {
+                self.anchor_node = None;
+                self.anchor_offset = 0;
+                self.focus_node = None;
+                self.focus_offset = 0;
+            }
+        }
+    }
+
+    pub fn contains_node(&self, node_id: u32) -> bool {
+        let nid = NodeId::from_u32(node_id);
+        self.ranges
+            .iter()
+            .any(|r| r.start_container == nid || r.end_container == nid)
+    }
+
+    pub fn selection_type(&self) -> &str {
+        if self.ranges.is_empty() {
+            "None"
+        } else if self.ranges.iter().all(|r| r.collapsed()) {
+            "Caret"
+        } else {
+            "Range"
         }
     }
 }

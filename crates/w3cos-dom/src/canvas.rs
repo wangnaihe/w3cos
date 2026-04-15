@@ -23,6 +23,8 @@ pub(crate) struct CanvasState {
     pub line_width: f32,
     pub line_cap: LineCap,
     pub line_join: LineJoin,
+    pub miter_limit: f32,
+    pub line_dash: Vec<f32>,
     pub font: String,
     pub font_size: f32,
     pub text_align: TextAlign,
@@ -40,6 +42,8 @@ impl Default for CanvasState {
             line_width: 1.0,
             line_cap: LineCap::Butt,
             line_join: LineJoin::Miter,
+            miter_limit: 10.0,
+            line_dash: Vec::new(),
             font: "16px sans-serif".to_string(),
             font_size: 16.0,
             text_align: TextAlign::Start,
@@ -128,8 +132,10 @@ pub enum CanvasCommand {
     StrokePath { segments: Vec<PathSegment>, color: CanvasColor, line_width: f32, alpha: f32 },
     FillText { text: String, x: f32, y: f32, color: CanvasColor, font_size: f32, alpha: f32 },
     StrokeText { text: String, x: f32, y: f32, color: CanvasColor, font_size: f32, line_width: f32, alpha: f32 },
-    DrawImage { image_data: Vec<u8>, dx: f32, dy: f32, dw: Option<f32>, dh: Option<f32> },
+    DrawImage { image_data: Vec<u8>, width: u32, height: u32, dx: f32, dy: f32, dw: Option<f32>, dh: Option<f32> },
+    PutImageData { data: Vec<u8>, width: u32, height: u32, dx: f32, dy: f32 },
     SetTransform { a: f32, b: f32, c: f32, d: f32, e: f32, f: f32 },
+    Clip { segments: Vec<PathSegment> },
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +143,9 @@ pub enum PathSegment {
     MoveTo(f32, f32),
     LineTo(f32, f32),
     Arc { cx: f32, cy: f32, r: f32, start_angle: f32, end_angle: f32, counter_clockwise: bool },
+    QuadraticCurveTo { cpx: f32, cpy: f32, x: f32, y: f32 },
+    BezierCurveTo { cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32 },
+    Ellipse { x: f32, y: f32, rx: f32, ry: f32, rotation: f32, start_angle: f32, end_angle: f32, counter_clockwise: bool },
     ClosePath,
 }
 
@@ -199,6 +208,34 @@ impl CanvasRenderingContext2D {
         self.current_path.push(PathSegment::ClosePath);
     }
 
+    pub fn quadratic_curve_to(&mut self, cpx: f32, cpy: f32, x: f32, y: f32) {
+        self.current_path.push(PathSegment::QuadraticCurveTo { cpx, cpy, x, y });
+    }
+
+    pub fn bezier_curve_to(&mut self, cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32) {
+        self.current_path.push(PathSegment::BezierCurveTo { cp1x, cp1y, cp2x, cp2y, x, y });
+    }
+
+    pub fn ellipse(&mut self, x: f32, y: f32, rx: f32, ry: f32, rotation: f32, start: f32, end_angle: f32, ccw: bool) {
+        self.current_path.push(PathSegment::Ellipse {
+            x, y, rx, ry, rotation,
+            start_angle: start, end_angle, counter_clockwise: ccw,
+        });
+    }
+
+    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.current_path.push(PathSegment::MoveTo(x, y));
+        self.current_path.push(PathSegment::LineTo(x + w, y));
+        self.current_path.push(PathSegment::LineTo(x + w, y + h));
+        self.current_path.push(PathSegment::LineTo(x, y + h));
+        self.current_path.push(PathSegment::ClosePath);
+    }
+
+    pub fn clip(&mut self) {
+        let segments = self.current_path.clone();
+        self.commands.push(CanvasCommand::Clip { segments });
+    }
+
     pub fn fill(&mut self) {
         let segments = std::mem::take(&mut self.current_path);
         self.commands.push(CanvasCommand::FillPath {
@@ -243,7 +280,11 @@ impl CanvasRenderingContext2D {
 
     pub fn measure_text(&self, text: &str) -> TextMetrics {
         let approx_width = text.len() as f32 * self.state.font_size * 0.6;
-        TextMetrics { width: approx_width }
+        TextMetrics {
+            width: approx_width,
+            actual_bounding_box_ascent: self.state.font_size * 0.8,
+            actual_bounding_box_descent: self.state.font_size * 0.2,
+        }
     }
 
     // --- Style setters ---
@@ -258,6 +299,34 @@ impl CanvasRenderingContext2D {
 
     pub fn set_line_width(&mut self, width: f32) {
         self.state.line_width = width;
+    }
+
+    pub fn set_line_cap(&mut self, cap: &str) {
+        self.state.line_cap = match cap {
+            "round" => LineCap::Round,
+            "square" => LineCap::Square,
+            _ => LineCap::Butt,
+        };
+    }
+
+    pub fn set_line_join(&mut self, join: &str) {
+        self.state.line_join = match join {
+            "round" => LineJoin::Round,
+            "bevel" => LineJoin::Bevel,
+            _ => LineJoin::Miter,
+        };
+    }
+
+    pub fn set_miter_limit(&mut self, limit: f32) {
+        self.state.miter_limit = limit;
+    }
+
+    pub fn set_line_dash(&mut self, segments: Vec<f32>) {
+        self.state.line_dash = segments;
+    }
+
+    pub fn get_line_dash(&self) -> Vec<f32> {
+        self.state.line_dash.clone()
     }
 
     pub fn set_font(&mut self, font: &str) {
@@ -338,6 +407,15 @@ impl CanvasRenderingContext2D {
         });
     }
 
+    pub fn set_transform(&mut self, a: f32, b: f32, c: f32, d: f32, e: f32, f_val: f32) {
+        self.state.transform = [a, b, c, d, e, f_val];
+        self.commands.push(CanvasCommand::SetTransform { a, b, c, d, e, f: f_val });
+    }
+
+    pub fn reset_transform(&mut self) {
+        self.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+    }
+
     // --- Image data ---
 
     pub fn get_image_data(&self) -> ImageData {
@@ -356,6 +434,22 @@ impl CanvasRenderingContext2D {
         }
     }
 
+    pub fn draw_image(&mut self, image_data: &[u8], width: u32, height: u32, dx: f32, dy: f32) {
+        self.commands.push(CanvasCommand::DrawImage {
+            image_data: image_data.to_vec(),
+            width,
+            height,
+            dx,
+            dy,
+            dw: None,
+            dh: None,
+        });
+    }
+
+    pub fn put_image_data(&mut self, data: Vec<u8>, width: u32, height: u32, dx: f32, dy: f32) {
+        self.commands.push(CanvasCommand::PutImageData { data, width, height, dx, dy });
+    }
+
     /// Take and reset the command buffer. Called by the renderer after processing.
     pub fn drain_commands(&mut self) -> Vec<CanvasCommand> {
         std::mem::take(&mut self.commands)
@@ -366,6 +460,8 @@ impl CanvasRenderingContext2D {
 #[derive(Debug, Clone)]
 pub struct TextMetrics {
     pub width: f32,
+    pub actual_bounding_box_ascent: f32,
+    pub actual_bounding_box_descent: f32,
 }
 
 #[derive(Debug, Clone)]
