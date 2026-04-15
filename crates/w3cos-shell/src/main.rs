@@ -38,6 +38,8 @@ fn build_shell() -> Component {
         2 => build_terminal_app(),
         3 => build_settings_app(),
         4 => build_ai_agent_app(),
+        5 => build_browser_app(),
+        6 => build_editor_app(),
         _ => build_desktop(),
     };
 
@@ -339,6 +341,235 @@ fn chat_msg(sender: &str, text: &str, bg: &str, sender_color: &str) -> Component
         Component::text(sender, Style { font_size: 11.0, color: Color::from_hex(sender_color), font_weight: 600, ..Style::default() }),
         Component::text(text, Style { font_size: 13.0, color: Color::from_hex("#d0d0e0"), ..Style::default() }),
     ])
+}
+
+// ==========================================================================
+// Browser App
+// ==========================================================================
+
+fn build_browser_app() -> Component {
+    Component::column(Style { flex_grow: 1.0, background: Color::from_hex("#0e0e18"), gap: 0.0, ..Style::default() }, vec![
+        app_titlebar("Browser", "#f39c12"),
+        // URL bar
+        Component::row(Style {
+            height: Dimension::Px(44.0), background: Color::from_hex("#14142a"),
+            padding: Edges::xy(12.0, 6.0), gap: 8.0, align_items: AlignItems::Center,
+            ..Style::default()
+        }, vec![
+            Component::button("<", Style { font_size: 14.0, color: Color::from_hex("#808090"), background: Color::from_hex("#1e1e38"), border_radius: 6.0, padding: Edges::xy(10.0, 6.0), ..Style::default() }),
+            Component::button(">", Style { font_size: 14.0, color: Color::from_hex("#808090"), background: Color::from_hex("#1e1e38"), border_radius: 6.0, padding: Edges::xy(10.0, 6.0), ..Style::default() }),
+            Component::button("R", Style { font_size: 14.0, color: Color::from_hex("#808090"), background: Color::from_hex("#1e1e38"), border_radius: 6.0, padding: Edges::xy(10.0, 6.0), ..Style::default() }),
+            Component::row(Style {
+                flex_grow: 1.0, background: Color::from_hex("#1e1e38"), border_radius: 8.0,
+                padding: Edges::xy(12.0, 8.0), align_items: AlignItems::Center, gap: 8.0,
+                ..Style::default()
+            }, vec![
+                Component::text("https://w3cos.dev", Style { font_size: 13.0, color: Color::from_hex("#a0a0c0"), ..Style::default() }),
+            ]),
+            Component::button("+", Style { font_size: 14.0, color: Color::from_hex("#808090"), background: Color::from_hex("#1e1e38"), border_radius: 6.0, padding: Edges::xy(10.0, 6.0), ..Style::default() }),
+        ]),
+        // Tab bar
+        Component::row(Style {
+            height: Dimension::Px(36.0), background: Color::from_hex("#12121f"),
+            padding: Edges::xy(8.0, 4.0), gap: 4.0, align_items: AlignItems::Center,
+            ..Style::default()
+        }, vec![
+            browser_tab("W3C OS", true),
+            browser_tab("Docs", false),
+            browser_tab("GitHub", false),
+        ]),
+        // Page content
+        Component::column(Style {
+            flex_grow: 1.0, padding: Edges::all(32.0), gap: 24.0,
+            align_items: AlignItems::Center, justify_content: JustifyContent::Center,
+            background: Color::from_hex("#0a0a14"),
+            ..Style::default()
+        }, vec![
+            Component::text("W3C OS", Style { font_size: 48.0, color: Color::from_hex("#6c5ce7"), font_weight: 700, ..Style::default() }),
+            Component::text("The AI-Native Operating System", Style { font_size: 18.0, color: Color::from_hex("#a0a0c0"), ..Style::default() }),
+            Component::column(Style {
+                padding: Edges::all(24.0), background: Color::from_hex("#16162a"),
+                border_radius: 12.0, gap: 16.0, max_width: Dimension::Px(600.0),
+                ..Style::default()
+            }, vec![
+                Component::text("Welcome to the W3C OS Browser", Style { font_size: 16.0, color: Color::from_hex("#f0f0ff"), font_weight: 600, ..Style::default() }),
+                Component::text("Applications are rendered natively using the W3C DOM model — no Chromium, no V8. TypeScript is compiled to native Rust binaries.", Style { font_size: 13.0, color: Color::from_hex("#808090"), ..Style::default() }),
+                Component::row(Style { gap: 12.0, ..Style::default() }, vec![
+                    Component::button("Get Started", Style { background: Color::from_hex("#6c5ce7"), border_radius: 8.0, font_size: 14.0, color: Color::WHITE, padding: Edges::xy(16.0, 10.0), ..Style::default() }),
+                    Component::button("Documentation", Style { background: Color::from_hex("#1e1e38"), border_radius: 8.0, font_size: 14.0, color: Color::from_hex("#a0a0c0"), padding: Edges::xy(16.0, 10.0), ..Style::default() }),
+                ]),
+            ]),
+        ]),
+    ])
+}
+
+fn browser_tab(title: &str, active: bool) -> Component {
+    let bg = if active { "#1e1e38" } else { "#12121f" };
+    let color = if active { "#e0e0f0" } else { "#606080" };
+    Component::row(Style {
+        padding: Edges::xy(12.0, 6.0), background: Color::from_hex(bg),
+        border_radius: 6.0, gap: 8.0, align_items: AlignItems::Center,
+        ..Style::default()
+    }, vec![
+        Component::text(title, Style { font_size: 12.0, color: Color::from_hex(color), ..Style::default() }),
+        Component::text("x", Style { font_size: 10.0, color: Color::from_hex("#505070"), ..Style::default() }),
+    ])
+}
+
+// ==========================================================================
+// Editor App
+// ==========================================================================
+
+fn build_editor_app() -> Component {
+    Component::column(Style { flex_grow: 1.0, background: Color::from_hex("#1e1e2e"), gap: 0.0, ..Style::default() }, vec![
+        app_titlebar("Editor", "#1abc9c"),
+        // Editor toolbar
+        Component::row(Style {
+            height: Dimension::Px(36.0), background: Color::from_hex("#181828"),
+            padding: Edges::xy(8.0, 4.0), gap: 16.0, align_items: AlignItems::Center,
+            ..Style::default()
+        }, vec![
+            Component::text("File", Style { font_size: 13.0, color: Color::from_hex("#a0a0c0"), ..Style::default() }),
+            Component::text("Edit", Style { font_size: 13.0, color: Color::from_hex("#a0a0c0"), ..Style::default() }),
+            Component::text("View", Style { font_size: 13.0, color: Color::from_hex("#a0a0c0"), ..Style::default() }),
+            Component::text("Terminal", Style { font_size: 13.0, color: Color::from_hex("#a0a0c0"), ..Style::default() }),
+            Component::text("Help", Style { font_size: 13.0, color: Color::from_hex("#a0a0c0"), ..Style::default() }),
+        ]),
+        // Tab bar
+        Component::row(Style {
+            height: Dimension::Px(34.0), background: Color::from_hex("#14142a"),
+            padding: Edges::xy(4.0, 0.0), gap: 0.0, align_items: AlignItems::FlexEnd,
+            ..Style::default()
+        }, vec![
+            editor_tab("app.tsx", true),
+            editor_tab("styles.css", false),
+            editor_tab("Cargo.toml", false),
+        ]),
+        Component::row(Style { flex_grow: 1.0, gap: 0.0, ..Style::default() }, vec![
+            // Explorer sidebar
+            Component::column(Style {
+                width: Dimension::Px(220.0), background: Color::from_hex("#16162a"),
+                padding: Edges::all(8.0), gap: 2.0,
+                ..Style::default()
+            }, vec![
+                Component::text("EXPLORER", Style { font_size: 11.0, color: Color::from_hex("#505070"), font_weight: 700, padding: Edges::xy(8.0, 6.0), ..Style::default() }),
+                explorer_item("src", 0, true),
+                explorer_item("app.tsx", 1, false),
+                explorer_item("main.rs", 1, false),
+                explorer_item("styles", 0, true),
+                explorer_item("theme.css", 1, false),
+                explorer_item("Cargo.toml", 0, false),
+                explorer_item("README.md", 0, false),
+            ]),
+            // Line numbers + code
+            Component::row(Style { flex_grow: 1.0, gap: 0.0, ..Style::default() }, vec![
+                // Gutter
+                Component::column(Style {
+                    width: Dimension::Px(48.0), background: Color::from_hex("#1a1a2e"),
+                    padding: Edges { top: 8.0, right: 8.0, bottom: 8.0, left: 0.0 },
+                    align_items: AlignItems::FlexEnd, gap: 0.0,
+                    ..Style::default()
+                }, vec![
+                    gutter_line(1), gutter_line(2), gutter_line(3), gutter_line(4),
+                    gutter_line(5), gutter_line(6), gutter_line(7), gutter_line(8),
+                    gutter_line(9), gutter_line(10), gutter_line(11), gutter_line(12),
+                    gutter_line(13), gutter_line(14), gutter_line(15),
+                ]),
+                // Code area
+                Component::column(Style {
+                    flex_grow: 1.0, padding: Edges::all(8.0), gap: 0.0,
+                    overflow: Overflow::Scroll,
+                    ..Style::default()
+                }, vec![
+                    code_line("import", " { useState } ", "from", " 'react';", &["#c678dd", "#d0d0e0", "#c678dd", "#98c379"]),
+                    code_line("import", " './styles.css';", "", "", &["#c678dd", "#98c379", "", ""]),
+                    code_line("", "", "", "", &[]),
+                    code_line("export default function ", "App", "() {", "", &["#c678dd", "#61afef", "#d0d0e0", ""]),
+                    code_line("  const ", "[count, setCount]", " = ", "useState(0);", &["#c678dd", "#e06c75", "#d0d0e0", "#61afef"]),
+                    code_line("", "", "", "", &[]),
+                    code_line("  return ", "(", "", "", &["#c678dd", "#d0d0e0", "", ""]),
+                    code_line("    <", "div", " className=\"container\">", "", &["#d0d0e0", "#e06c75", "#d0d0e0", ""]),
+                    code_line("      <", "h1", ">W3C OS App</", "h1>", &["#d0d0e0", "#e06c75", "#d0d0e0", "#e06c75"]),
+                    code_line("      <", "p", ">Count: {count}</", "p>", &["#d0d0e0", "#e06c75", "#d0d0e0", "#e06c75"]),
+                    code_line("      <", "button", " onClick={() => setCount(c => c + 1)}>", "", &["#d0d0e0", "#e06c75", "#d0d0e0", ""]),
+                    code_line("        Increment", "", "", "", &["#d0d0e0", "", "", ""]),
+                    code_line("      </", "button", ">", "", &["#d0d0e0", "#e06c75", "#d0d0e0", ""]),
+                    code_line("    </", "div", ">", "", &["#d0d0e0", "#e06c75", "#d0d0e0", ""]),
+                    code_line("  );", "", "", "", &["#d0d0e0", "", "", ""]),
+                ]),
+            ]),
+        ]),
+        // Status bar
+        Component::row(Style {
+            height: Dimension::Px(24.0), background: Color::from_hex("#6c5ce7"),
+            padding: Edges::xy(12.0, 4.0), gap: 16.0,
+            align_items: AlignItems::Center, justify_content: JustifyContent::SpaceBetween,
+            ..Style::default()
+        }, vec![
+            Component::text("TypeScript React", Style { font_size: 11.0, color: Color::WHITE, ..Style::default() }),
+            Component::row(Style { gap: 16.0, ..Style::default() }, vec![
+                Component::text("Ln 4, Col 12", Style { font_size: 11.0, color: Color::WHITE, ..Style::default() }),
+                Component::text("UTF-8", Style { font_size: 11.0, color: Color::WHITE, ..Style::default() }),
+                Component::text("Spaces: 2", Style { font_size: 11.0, color: Color::WHITE, ..Style::default() }),
+            ]),
+        ]),
+    ])
+}
+
+fn editor_tab(name: &str, active: bool) -> Component {
+    let bg = if active { "#1e1e2e" } else { "#14142a" };
+    let color = if active { "#e0e0f0" } else { "#606080" };
+    let border_color = if active { "#6c5ce7" } else { "#14142a" };
+    Component::column(Style {
+        padding: Edges::xy(14.0, 8.0), background: Color::from_hex(bg),
+        border_width: 2.0, border_color: Color::from_hex(border_color),
+        ..Style::default()
+    }, vec![
+        Component::text(name, Style { font_size: 12.0, color: Color::from_hex(color), ..Style::default() }),
+    ])
+}
+
+fn explorer_item(name: &str, indent: u8, is_dir: bool) -> Component {
+    let icon = if is_dir { "▸ " } else { "  " };
+    let color = if is_dir { "#e0e0f0" } else { "#a0a0c0" };
+    let pad_left = 8.0 + (indent as f32 * 12.0);
+    Component::row(Style {
+        padding: Edges { top: 3.0, right: 8.0, bottom: 3.0, left: pad_left },
+        gap: 4.0, align_items: AlignItems::Center, border_radius: 4.0,
+        ..Style::default()
+    }, vec![
+        Component::text(icon, Style { font_size: 12.0, color: Color::from_hex("#6c5ce7"), ..Style::default() }),
+        Component::text(name, Style { font_size: 12.0, color: Color::from_hex(color), ..Style::default() }),
+    ])
+}
+
+fn gutter_line(n: u32) -> Component {
+    Component::text(&format!("{n}"), Style {
+        font_size: 13.0, color: Color::from_hex("#505070"),
+        height: Dimension::Px(20.0),
+        ..Style::default()
+    })
+}
+
+fn code_line(a: &str, b: &str, c: &str, d: &str, colors: &[&str]) -> Component {
+    let mut parts = Vec::new();
+    let segments = [(a, 0), (b, 1), (c, 2), (d, 3)];
+    for (text, idx) in &segments {
+        if !text.is_empty() {
+            let color = colors.get(*idx).copied().unwrap_or("#d0d0e0");
+            if !color.is_empty() {
+                parts.push(Component::text(*text, Style {
+                    font_size: 13.0, color: Color::from_hex(color),
+                    ..Style::default()
+                }));
+            }
+        }
+    }
+    if parts.is_empty() {
+        Component::text(" ", Style { font_size: 13.0, height: Dimension::Px(20.0), ..Style::default() })
+    } else {
+        Component::row(Style { gap: 0.0, height: Dimension::Px(20.0), ..Style::default() }, parts)
+    }
 }
 
 // ==========================================================================

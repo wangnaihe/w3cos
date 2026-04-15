@@ -50,7 +50,7 @@
 - [x] Dynamic dependency generation (needs_core/needs_async/needs_rc/needs_fetch flags)
 - [x] Compiler: fetch() → w3cos_runtime::fetch bridge codegen
 - [ ] Escape analysis optimization for Rc<RefCell<T>> elision (P5)
-- [ ] typeof operator runtime support via Value::type_of()
+- [x] typeof operator runtime support via Value::type_of() + standalone type_of() function
 
 ## Phase 2 — System APIs & Production Quality ✅
 - [x] GPU rendering (Vello + wgpu — replace tiny-skia, CPU fallback via feature flag) (#12)
@@ -140,16 +140,17 @@
 ## Phase 2.75 — VS Code Compatibility (see docs/vscode-compat.md)
 - [ ] Canvas 2D API (CanvasRenderingContext2D) (#32)
 - [ ] Selection API (window.getSelection, Range) (#37)
-- [ ] CSS pseudo-class selectors (:hover, :focus, :active, :first-child, :nth-child)
-- [ ] CSS attribute selectors ([attr], [attr=value])
+- [x] CSS pseudo-class selectors (:hover, :focus, :active, :first-child, :last-child, :nth-child, :only-child, :empty, :not(), :disabled, :enabled, :checked)
+- [x] CSS attribute selectors ([attr], [attr=value], [attr^=value], [attr$=value], [attr*=value], [attr~=value], [attr|=value])
 - [ ] Web Workers
 - [ ] WebSocket API
-- [ ] localStorage / IndexedDB
+- [x] localStorage (Web Storage API with JSON file persistence)
+- [ ] IndexedDB
 - [ ] w3cos.dialog (open/save/message dialogs)
 - [ ] w3cos.ipc (inter-process communication)
 - [ ] w3cos.menu (application/context menus)
 - [ ] RegExp (full JS spec)
-- [ ] TextEncoder / TextDecoder
+- [x] TextEncoder / TextDecoder (UTF-8, UTF-16LE/BE, ASCII, BOM handling)
 
 ## Phase 3 — Compatibility & Migration
 - [ ] React Native app auto-migration tool (`w3cos migrate --from rn`)

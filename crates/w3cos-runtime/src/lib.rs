@@ -14,6 +14,8 @@ pub mod process;
 #[cfg(unix)]
 pub mod pty;
 pub mod state;
+pub mod storage;
+pub mod text_encoding;
 pub mod timers;
 
 #[cfg(feature = "gpu")]

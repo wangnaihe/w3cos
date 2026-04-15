@@ -120,6 +120,80 @@ impl Value {
     pub fn is_object(&self) -> bool { matches!(self, Value::Object(_)) }
     pub fn is_array(&self) -> bool { matches!(self, Value::Array(_)) }
     pub fn is_function(&self) -> bool { matches!(self, Value::Function(_)) }
+
+    /// ECMAScript `ToInt32`.
+    pub fn to_i32(&self) -> i32 {
+        let n = self.to_number();
+        if n.is_nan() || n.is_infinite() || n == 0.0 {
+            return 0;
+        }
+        let i = n.trunc() as i64;
+        (i % (1i64 << 32)) as i32
+    }
+
+    /// ECMAScript `ToUint32`.
+    pub fn to_u32(&self) -> u32 {
+        self.to_i32() as u32
+    }
+
+    /// ECMAScript `in` operator: `key in obj`.
+    pub fn js_in(&self, obj: &Value) -> Value {
+        let key = self.to_js_string();
+        match obj {
+            Value::Object(o) => Value::Bool(o.borrow().has(&key)),
+            Value::Array(arr) => {
+                if let Ok(idx) = key.parse::<usize>() {
+                    Value::Bool(idx < arr.borrow().len())
+                } else {
+                    Value::Bool(false)
+                }
+            }
+            _ => Value::Bool(false),
+        }
+    }
+
+    /// Property access: `obj[key]` or `obj.key`.
+    pub fn get_property(&self, key: &str) -> Value {
+        match self {
+            Value::Object(o) => o.borrow().get(key, self).clone(),
+            Value::Array(arr) => {
+                if let Ok(idx) = key.parse::<usize>() {
+                    arr.borrow().get(idx).cloned().unwrap_or(Value::Undefined)
+                } else if key == "length" {
+                    Value::Number(arr.borrow().len() as f64)
+                } else {
+                    Value::Undefined
+                }
+            }
+            Value::String(s) => {
+                if let Ok(idx) = key.parse::<usize>() {
+                    s.chars().nth(idx).map(|c| Value::String(c.to_string())).unwrap_or(Value::Undefined)
+                } else if key == "length" {
+                    Value::Number(s.len() as f64)
+                } else {
+                    Value::Undefined
+                }
+            }
+            _ => Value::Undefined,
+        }
+    }
+
+    /// Property assignment: `obj[key] = value`.
+    pub fn set_property(&self, key: &str, value: Value) {
+        match self {
+            Value::Object(o) => { o.borrow_mut().set(key, value, &Value::Undefined); }
+            Value::Array(arr) => {
+                if let Ok(idx) = key.parse::<usize>() {
+                    let mut a = arr.borrow_mut();
+                    if idx >= a.len() {
+                        a.resize(idx + 1, Value::Undefined);
+                    }
+                    a[idx] = value;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // ── Constructors ───────────────────────────────────────────────────────
@@ -172,6 +246,43 @@ impl Value {
 
     pub fn js_neg(&self) -> Value {
         Value::Number(-self.to_number())
+    }
+
+    pub fn js_pow(&self, other: &Value) -> Value {
+        Value::Number(self.to_number().powf(other.to_number()))
+    }
+
+    // ── Bitwise operators ──
+
+    pub fn js_bitor(&self, other: &Value) -> Value {
+        Value::Number((self.to_i32() | other.to_i32()) as f64)
+    }
+
+    pub fn js_bitand(&self, other: &Value) -> Value {
+        Value::Number((self.to_i32() & other.to_i32()) as f64)
+    }
+
+    pub fn js_bitxor(&self, other: &Value) -> Value {
+        Value::Number((self.to_i32() ^ other.to_i32()) as f64)
+    }
+
+    pub fn js_bitnot(&self) -> Value {
+        Value::Number((!self.to_i32()) as f64)
+    }
+
+    pub fn js_shl(&self, other: &Value) -> Value {
+        let shift = (other.to_i32() as u32) & 0x1f;
+        Value::Number((self.to_i32() << shift) as f64)
+    }
+
+    pub fn js_shr(&self, other: &Value) -> Value {
+        let shift = (other.to_i32() as u32) & 0x1f;
+        Value::Number((self.to_i32() >> shift) as f64)
+    }
+
+    pub fn js_ushr(&self, other: &Value) -> Value {
+        let shift = (other.to_i32() as u32) & 0x1f;
+        Value::Number(((self.to_i32() as u32) >> shift) as f64)
     }
 
     /// ECMAScript `===` (strict equality).
@@ -318,5 +429,68 @@ mod tests {
         assert_eq!(Value::Number(42.0).to_js_string(), "42");
         assert_eq!(Value::Number(3.14).to_js_string(), "3.14");
         assert_eq!(Value::Bool(true).to_js_string(), "true");
+    }
+
+    #[test]
+    fn bitwise_operations() {
+        let a = Value::Number(5.0);
+        let b = Value::Number(3.0);
+        assert_eq!(a.js_bitor(&b).to_number(), 7.0);
+        assert_eq!(a.js_bitand(&b).to_number(), 1.0);
+        assert_eq!(a.js_bitxor(&b).to_number(), 6.0);
+        assert_eq!(a.js_shl(&Value::Number(1.0)).to_number(), 10.0);
+        assert_eq!(a.js_shr(&Value::Number(1.0)).to_number(), 2.0);
+    }
+
+    #[test]
+    fn power_operator() {
+        assert_eq!(Value::Number(2.0).js_pow(&Value::Number(10.0)).to_number(), 1024.0);
+        assert_eq!(Value::Number(9.0).js_pow(&Value::Number(0.5)).to_number(), 3.0);
+    }
+
+    #[test]
+    fn to_i32_conversion() {
+        assert_eq!(Value::Number(42.7).to_i32(), 42);
+        assert_eq!(Value::Number(-3.9).to_i32(), -3);
+        assert_eq!(Value::Number(f64::NAN).to_i32(), 0);
+        assert_eq!(Value::Number(f64::INFINITY).to_i32(), 0);
+    }
+
+    #[test]
+    fn in_operator() {
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), Value::String("test".into()));
+        let obj = Value::object(props);
+        assert!(Value::String("name".into()).js_in(&obj).to_bool());
+        assert!(!Value::String("age".into()).js_in(&obj).to_bool());
+
+        let arr = Value::array(vec![Value::Number(10.0), Value::Number(20.0)]);
+        assert!(Value::Number(0.0).js_in(&arr).to_bool());
+        assert!(Value::Number(1.0).js_in(&arr).to_bool());
+        assert!(!Value::Number(2.0).js_in(&arr).to_bool());
+    }
+
+    #[test]
+    fn property_access() {
+        let mut props = HashMap::new();
+        props.insert("x".to_string(), Value::Number(42.0));
+        let obj = Value::object(props);
+        assert_eq!(obj.get_property("x").to_number(), 42.0);
+        assert!(obj.get_property("y").is_undefined());
+
+        let arr = Value::array(vec![Value::String("a".into()), Value::String("b".into())]);
+        assert_eq!(arr.get_property("0").to_js_string(), "a");
+        assert_eq!(arr.get_property("length").to_number(), 2.0);
+
+        let s = Value::String("hello".into());
+        assert_eq!(s.get_property("length").to_number(), 5.0);
+        assert_eq!(s.get_property("0").to_js_string(), "h");
+    }
+
+    #[test]
+    fn property_set() {
+        let obj = Value::object(HashMap::new());
+        obj.set_property("key", Value::Number(99.0));
+        assert_eq!(obj.get_property("key").to_number(), 99.0);
     }
 }

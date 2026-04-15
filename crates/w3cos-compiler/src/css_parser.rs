@@ -31,7 +31,81 @@ pub struct CssRule {
     pub layer: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+/// CSS pseudo-class attached to a selector.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PseudoClass {
+    Hover,
+    Focus,
+    Active,
+    Visited,
+    Disabled,
+    Enabled,
+    Checked,
+    FirstChild,
+    LastChild,
+    NthChild(NthExpr),
+    NthLastChild(NthExpr),
+    OnlyChild,
+    Empty,
+    Not(Box<Selector>),
+}
+
+/// `An+B` expression for `:nth-child()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NthExpr {
+    pub a: i32,
+    pub b: i32,
+}
+
+impl NthExpr {
+    pub fn matches(&self, index_1based: usize) -> bool {
+        let n = index_1based as i32;
+        if self.a == 0 {
+            return n == self.b;
+        }
+        let diff = n - self.b;
+        diff % self.a == 0 && diff / self.a >= 0
+    }
+}
+
+/// CSS attribute selector operator.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttrOp {
+    Exists,
+    Exact(String),
+    Contains(String),
+    StartsWith(String),
+    EndsWith(String),
+    DashMatch(String),
+    Includes(String),
+}
+
+/// A single CSS attribute selector: `[attr]`, `[attr=value]`, etc.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttrSelector {
+    pub name: String,
+    pub op: AttrOp,
+}
+
+impl AttrSelector {
+    pub fn matches_value(&self, value: Option<&str>) -> bool {
+        match &self.op {
+            AttrOp::Exists => value.is_some(),
+            AttrOp::Exact(expected) => value == Some(expected.as_str()),
+            AttrOp::Contains(sub) => value.is_some_and(|v| v.contains(sub.as_str())),
+            AttrOp::StartsWith(prefix) => value.is_some_and(|v| v.starts_with(prefix.as_str())),
+            AttrOp::EndsWith(suffix) => value.is_some_and(|v| v.ends_with(suffix.as_str())),
+            AttrOp::DashMatch(val) => value.is_some_and(|v| {
+                v == val || v.starts_with(&format!("{val}-"))
+            }),
+            AttrOp::Includes(word) => value.is_some_and(|v| {
+                v.split_whitespace().any(|w| w == word)
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Selector {
     Universal,
     Element(String),
@@ -39,7 +113,30 @@ pub enum Selector {
     Compound {
         element: Option<String>,
         classes: Vec<String>,
+        pseudo_classes: Vec<PseudoClass>,
+        attrs: Vec<AttrSelector>,
     },
+}
+
+/// Context information for structural pseudo-class matching.
+pub struct MatchContext<'a> {
+    pub element_kind: &'a str,
+    pub class_names: &'a [&'a str],
+    pub attributes: &'a [(&'a str, &'a str)],
+    pub child_index: usize,
+    pub sibling_count: usize,
+    pub child_count: usize,
+    pub pseudo_state: PseudoState,
+}
+
+/// Runtime pseudo-class state (hover, focus, active).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PseudoState {
+    pub hovered: bool,
+    pub focused: bool,
+    pub active: bool,
+    pub checked: bool,
+    pub disabled: bool,
 }
 
 impl Selector {
@@ -48,15 +145,73 @@ impl Selector {
             Selector::Universal => true,
             Selector::Element(e) => e == element_kind,
             Selector::Class(c) => class_names.contains(&c.as_str()),
-            Selector::Compound { element, classes } => {
-                if let Some(e) = element {
-                    if e != element_kind {
+            Selector::Compound { element, classes, pseudo_classes, attrs } => {
+                if let Some(e) = element
+                    && e != element_kind
+                {
+                    return false;
+                }
+                if !classes.iter().all(|c| class_names.contains(&c.as_str())) {
+                    return false;
+                }
+                pseudo_classes.is_empty() && attrs.is_empty()
+            }
+        }
+    }
+
+    /// Full match with structural/state context.
+    pub fn matches_with_context(&self, ctx: &MatchContext<'_>) -> bool {
+        match self {
+            Selector::Universal => true,
+            Selector::Element(e) => e == ctx.element_kind,
+            Selector::Class(c) => ctx.class_names.contains(&c.as_str()),
+            Selector::Compound { element, classes, pseudo_classes, attrs } => {
+                if let Some(e) = element
+                    && e != ctx.element_kind
+                {
+                    return false;
+                }
+                if !classes.iter().all(|c| ctx.class_names.contains(&c.as_str())) {
+                    return false;
+                }
+                for pc in pseudo_classes {
+                    if !match_pseudo_class(pc, ctx) {
                         return false;
                     }
                 }
-                classes.iter().all(|c| class_names.contains(&c.as_str()))
+                for attr_sel in attrs {
+                    let val = ctx.attributes.iter()
+                        .find(|(k, _)| *k == attr_sel.name)
+                        .map(|(_, v)| *v);
+                    if !attr_sel.matches_value(val) {
+                        return false;
+                    }
+                }
+                true
             }
         }
+    }
+}
+
+fn match_pseudo_class(pc: &PseudoClass, ctx: &MatchContext<'_>) -> bool {
+    match pc {
+        PseudoClass::Hover => ctx.pseudo_state.hovered,
+        PseudoClass::Focus => ctx.pseudo_state.focused,
+        PseudoClass::Active => ctx.pseudo_state.active,
+        PseudoClass::Visited => false,
+        PseudoClass::Disabled => ctx.pseudo_state.disabled,
+        PseudoClass::Enabled => !ctx.pseudo_state.disabled,
+        PseudoClass::Checked => ctx.pseudo_state.checked,
+        PseudoClass::FirstChild => ctx.child_index == 1,
+        PseudoClass::LastChild => ctx.child_index == ctx.sibling_count,
+        PseudoClass::NthChild(expr) => expr.matches(ctx.child_index),
+        PseudoClass::NthLastChild(expr) => {
+            let from_end = ctx.sibling_count + 1 - ctx.child_index;
+            expr.matches(from_end)
+        }
+        PseudoClass::OnlyChild => ctx.sibling_count == 1,
+        PseudoClass::Empty => ctx.child_count == 0,
+        PseudoClass::Not(inner) => !inner.matches_with_context(ctx),
     }
 }
 
@@ -310,21 +465,48 @@ fn parse_single_selector(s: &str) -> Option<Selector> {
         return Some(Selector::Universal);
     }
 
-    let s = s
-        .rsplit_once(|c: char| c.is_whitespace() || c == '>' || c == '+' || c == '~')
-        .map(|(_, last)| last.trim())
-        .unwrap_or(s);
+    // Take only the last simple selector in a combinator chain.
+    // Must skip characters inside parentheses (e.g. `:nth-child(2n+1)`).
+    let s = rsplit_combinator(s);
 
     if s.is_empty() {
         return None;
     }
 
-    let s = s.split(':').next().unwrap_or(s);
-    if s.is_empty() {
+    // Extract attribute selectors `[...]`
+    let mut attrs = Vec::new();
+    let mut base = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch == '[' {
+            chars.next();
+            let mut attr_str = String::new();
+            let mut depth = 1;
+            for c in chars.by_ref() {
+                if c == ']' {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                } else if c == '[' {
+                    depth += 1;
+                }
+                attr_str.push(c);
+            }
+            if let Some(attr) = parse_attr_selector(&attr_str) {
+                attrs.push(attr);
+            }
+        } else {
+            base.push(ch);
+            chars.next();
+        }
+    }
+
+    // Split pseudo-classes from the base: "div.cls:hover:focus"
+    let (main_part, pseudo_classes) = parse_pseudo_classes(&base);
+    if main_part.is_empty() && pseudo_classes.is_empty() && attrs.is_empty() {
         return None;
     }
 
-    let parts: Vec<&str> = s.split('.').collect();
+    let parts: Vec<&str> = main_part.split('.').collect();
 
     let element = if parts[0].is_empty() {
         None
@@ -338,12 +520,208 @@ fn parse_single_selector(s: &str) -> Option<Selector> {
         .map(|p| p.to_string())
         .collect();
 
-    if classes.is_empty() {
+    if classes.is_empty() && pseudo_classes.is_empty() && attrs.is_empty() {
         element.map(Selector::Element)
-    } else if element.is_none() && classes.len() == 1 {
+    } else if element.is_none() && classes.len() == 1 && pseudo_classes.is_empty() && attrs.is_empty() {
         Some(Selector::Class(classes.into_iter().next().unwrap()))
     } else {
-        Some(Selector::Compound { element, classes })
+        Some(Selector::Compound { element, classes, pseudo_classes, attrs })
+    }
+}
+
+fn rsplit_combinator(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut paren_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut last_split = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => paren_depth += 1,
+            b')' => paren_depth -= 1,
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth -= 1,
+            b' ' | b'\t' | b'>' | b'+' | b'~' if paren_depth == 0 && bracket_depth == 0 => {
+                last_split = Some(i);
+            }
+            _ => {}
+        }
+    }
+    match last_split {
+        Some(pos) => s[pos + 1..].trim(),
+        None => s,
+    }
+}
+
+fn parse_pseudo_classes(s: &str) -> (String, Vec<PseudoClass>) {
+    let mut pseudo_classes = Vec::new();
+
+    // Find the first ':' that isn't inside parentheses
+    let bytes = s.as_bytes();
+    let mut split_pos = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' && (i == 0 || bytes[i - 1] != b':') {
+            split_pos = Some(i);
+            break;
+        }
+        i += 1;
+    }
+
+    let (main_part, pseudo_str) = match split_pos {
+        Some(pos) => (&s[..pos], &s[pos..]),
+        None => (s, ""),
+    };
+
+    if !pseudo_str.is_empty() {
+        let mut rest = pseudo_str;
+        while let Some(stripped) = rest.strip_prefix(':') {
+            rest = stripped;
+
+            // Extract the pseudo-class name (and optional parenthesized arg)
+            let (name, arg, remaining) = extract_pseudo(rest);
+            if let Some(pc) = parse_single_pseudo(&name, arg.as_deref()) {
+                pseudo_classes.push(pc);
+            }
+            rest = remaining;
+        }
+    }
+
+    (main_part.to_string(), pseudo_classes)
+}
+
+fn extract_pseudo(s: &str) -> (String, Option<String>, &str) {
+    let mut name = String::new();
+    let mut chars = s.char_indices();
+    let mut end = s.len();
+
+    while let Some((i, c)) = chars.next() {
+        if c == '(' {
+            let paren_start = i + 1;
+            let mut depth = 1;
+            let mut paren_end = s.len();
+            for (j, ch) in chars.by_ref() {
+                if ch == '(' { depth += 1; }
+                if ch == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        paren_end = j;
+                        end = j + 1;
+                        break;
+                    }
+                }
+            }
+            let arg = s[paren_start..paren_end].trim().to_string();
+            return (name, Some(arg), &s[end..]);
+        } else if c == ':' || c == '[' || c == ' ' {
+            end = i;
+            break;
+        } else {
+            name.push(c);
+            end = i + c.len_utf8();
+        }
+    }
+
+    (name, None, &s[end..])
+}
+
+fn parse_single_pseudo(name: &str, arg: Option<&str>) -> Option<PseudoClass> {
+    match name {
+        "hover" => Some(PseudoClass::Hover),
+        "focus" => Some(PseudoClass::Focus),
+        "active" => Some(PseudoClass::Active),
+        "visited" => Some(PseudoClass::Visited),
+        "disabled" => Some(PseudoClass::Disabled),
+        "enabled" => Some(PseudoClass::Enabled),
+        "checked" => Some(PseudoClass::Checked),
+        "first-child" => Some(PseudoClass::FirstChild),
+        "last-child" => Some(PseudoClass::LastChild),
+        "only-child" => Some(PseudoClass::OnlyChild),
+        "empty" => Some(PseudoClass::Empty),
+        "nth-child" => {
+            let expr = parse_nth_expr(arg.unwrap_or("0"))?;
+            Some(PseudoClass::NthChild(expr))
+        }
+        "nth-last-child" => {
+            let expr = parse_nth_expr(arg.unwrap_or("0"))?;
+            Some(PseudoClass::NthLastChild(expr))
+        }
+        "not" => {
+            let inner = arg.and_then(parse_single_selector)?;
+            Some(PseudoClass::Not(Box::new(inner)))
+        }
+        _ => None,
+    }
+}
+
+fn parse_nth_expr(s: &str) -> Option<NthExpr> {
+    let s = s.trim();
+    match s {
+        "odd" => return Some(NthExpr { a: 2, b: 1 }),
+        "even" => return Some(NthExpr { a: 2, b: 0 }),
+        _ => {}
+    }
+    if let Ok(n) = s.parse::<i32>() {
+        return Some(NthExpr { a: 0, b: n });
+    }
+    // Parse "An+B" or "An-B"
+    if let Some(n_pos) = s.find('n') {
+        let a_str = s[..n_pos].trim();
+        let a = match a_str {
+            "" | "+" => 1,
+            "-" => -1,
+            _ => a_str.parse().ok()?,
+        };
+        let rest = s[n_pos + 1..].trim();
+        let b = if rest.is_empty() {
+            0
+        } else {
+            rest.replace(' ', "").parse().ok()?
+        };
+        Some(NthExpr { a, b })
+    } else {
+        None
+    }
+}
+
+fn parse_attr_selector(s: &str) -> Option<AttrSelector> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // [attr~=value], [attr|=value], [attr^=value], [attr$=value], [attr*=value], [attr=value]
+    let ops = &[("~=", AttrOp::Includes as fn(String) -> AttrOp),
+                ("|=", AttrOp::DashMatch as fn(String) -> AttrOp),
+                ("^=", AttrOp::StartsWith as fn(String) -> AttrOp),
+                ("$=", AttrOp::EndsWith as fn(String) -> AttrOp),
+                ("*=", AttrOp::Contains as fn(String) -> AttrOp)];
+
+    for (op_str, constructor) in ops {
+        if let Some(pos) = s.find(op_str) {
+            let name = s[..pos].trim().to_string();
+            let value = unquote(s[pos + op_str.len()..].trim());
+            return Some(AttrSelector { name, op: constructor(value) });
+        }
+    }
+
+    if let Some(pos) = s.find('=') {
+        let name = s[..pos].trim().to_string();
+        let value = unquote(s[pos + 1..].trim());
+        return Some(AttrSelector { name, op: AttrOp::Exact(value) });
+    }
+
+    Some(AttrSelector {
+        name: s.to_string(),
+        op: AttrOp::Exists,
+    })
+}
+
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -458,7 +836,7 @@ mod tests {
         let sheet = parse_css(css);
         assert_eq!(sheet.rules.len(), 1);
         match &sheet.rules[0].selectors[0] {
-            Selector::Compound { element, classes } => {
+            Selector::Compound { element, classes, .. } => {
                 assert_eq!(element.as_deref(), Some("span"));
                 assert_eq!(classes, &["highlight"]);
             }
@@ -512,6 +890,8 @@ mod tests {
         let compound = Selector::Compound {
             element: Some("span".to_string()),
             classes: vec!["title".to_string()],
+            pseudo_classes: vec![],
+            attrs: vec![],
         };
         assert!(compound.matches("span", &["title"]));
         assert!(!compound.matches("div", &["title"]));
@@ -725,5 +1105,190 @@ mod tests {
             sheet.rules[0].layer.as_deref(),
             Some("framework.base")
         );
+    }
+
+    // ── Pseudo-class selector tests ──
+
+    #[test]
+    fn parse_hover_pseudo() {
+        let css = ".btn:hover { background: #fff; }";
+        let sheet = parse_css(css);
+        assert_eq!(sheet.rules.len(), 1);
+        match &sheet.rules[0].selectors[0] {
+            Selector::Compound { classes, pseudo_classes, .. } => {
+                assert_eq!(classes, &["btn"]);
+                assert_eq!(pseudo_classes.len(), 1);
+                assert!(matches!(pseudo_classes[0], PseudoClass::Hover));
+            }
+            _ => panic!("expected Compound selector with pseudo-class"),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_pseudo_classes() {
+        let css = "button:hover:active { color: red; }";
+        let sheet = parse_css(css);
+        match &sheet.rules[0].selectors[0] {
+            Selector::Compound { element, pseudo_classes, .. } => {
+                assert_eq!(element.as_deref(), Some("button"));
+                assert_eq!(pseudo_classes.len(), 2);
+                assert!(matches!(pseudo_classes[0], PseudoClass::Hover));
+                assert!(matches!(pseudo_classes[1], PseudoClass::Active));
+            }
+            _ => panic!("expected Compound"),
+        }
+    }
+
+    #[test]
+    fn parse_first_child() {
+        let css = "li:first-child { font-weight: bold; }";
+        let sheet = parse_css(css);
+        match &sheet.rules[0].selectors[0] {
+            Selector::Compound { pseudo_classes, .. } => {
+                assert!(matches!(pseudo_classes[0], PseudoClass::FirstChild));
+            }
+            _ => panic!("expected Compound"),
+        }
+    }
+
+    #[test]
+    fn parse_nth_child() {
+        let css = "tr:nth-child(2n+1) { background: #eee; }";
+        let sheet = parse_css(css);
+        match &sheet.rules[0].selectors[0] {
+            Selector::Compound { pseudo_classes, .. } => {
+                match &pseudo_classes[0] {
+                    PseudoClass::NthChild(expr) => {
+                        assert_eq!(expr.a, 2);
+                        assert_eq!(expr.b, 1);
+                    }
+                    _ => panic!("expected NthChild"),
+                }
+            }
+            _ => panic!("expected Compound"),
+        }
+    }
+
+    #[test]
+    fn nth_expr_odd_even() {
+        let odd = parse_nth_expr("odd").unwrap();
+        assert!(odd.matches(1));
+        assert!(!odd.matches(2));
+        assert!(odd.matches(3));
+
+        let even = parse_nth_expr("even").unwrap();
+        assert!(!even.matches(1));
+        assert!(even.matches(2));
+        assert!(!even.matches(3));
+    }
+
+    #[test]
+    fn nth_expr_constant() {
+        let expr = parse_nth_expr("3").unwrap();
+        assert!(!expr.matches(1));
+        assert!(!expr.matches(2));
+        assert!(expr.matches(3));
+        assert!(!expr.matches(4));
+    }
+
+    #[test]
+    fn pseudo_class_context_matching() {
+        let sel = Selector::Compound {
+            element: Some("div".to_string()),
+            classes: vec![],
+            pseudo_classes: vec![PseudoClass::Hover],
+            attrs: vec![],
+        };
+        let ctx_no_hover = MatchContext {
+            element_kind: "div",
+            class_names: &[],
+            attributes: &[],
+            child_index: 1,
+            sibling_count: 3,
+            child_count: 0,
+            pseudo_state: PseudoState::default(),
+        };
+        assert!(!sel.matches_with_context(&ctx_no_hover));
+
+        let ctx_hover = MatchContext {
+            pseudo_state: PseudoState { hovered: true, ..PseudoState::default() },
+            ..ctx_no_hover
+        };
+        assert!(sel.matches_with_context(&ctx_hover));
+    }
+
+    // ── Attribute selector tests ──
+
+    #[test]
+    fn parse_attr_exists() {
+        let css = "input[disabled] { opacity: 0.5; }";
+        let sheet = parse_css(css);
+        match &sheet.rules[0].selectors[0] {
+            Selector::Compound { element, attrs, .. } => {
+                assert_eq!(element.as_deref(), Some("input"));
+                assert_eq!(attrs.len(), 1);
+                assert_eq!(attrs[0].name, "disabled");
+                assert!(matches!(attrs[0].op, AttrOp::Exists));
+            }
+            _ => panic!("expected Compound"),
+        }
+    }
+
+    #[test]
+    fn parse_attr_exact() {
+        let css = r#"input[type="text"] { border: 1px; }"#;
+        let sheet = parse_css(css);
+        match &sheet.rules[0].selectors[0] {
+            Selector::Compound { attrs, .. } => {
+                assert_eq!(attrs[0].name, "type");
+                match &attrs[0].op {
+                    AttrOp::Exact(v) => assert_eq!(v, "text"),
+                    _ => panic!("expected Exact"),
+                }
+            }
+            _ => panic!("expected Compound"),
+        }
+    }
+
+    #[test]
+    fn parse_attr_contains() {
+        let css = r#"a[href*="example"] { color: blue; }"#;
+        let sheet = parse_css(css);
+        match &sheet.rules[0].selectors[0] {
+            Selector::Compound { attrs, .. } => {
+                match &attrs[0].op {
+                    AttrOp::Contains(v) => assert_eq!(v, "example"),
+                    _ => panic!("expected Contains"),
+                }
+            }
+            _ => panic!("expected Compound"),
+        }
+    }
+
+    #[test]
+    fn attr_selector_matching() {
+        let attr = AttrSelector { name: "type".to_string(), op: AttrOp::Exact("text".to_string()) };
+        assert!(attr.matches_value(Some("text")));
+        assert!(!attr.matches_value(Some("password")));
+        assert!(!attr.matches_value(None));
+
+        let exists = AttrSelector { name: "disabled".to_string(), op: AttrOp::Exists };
+        assert!(exists.matches_value(Some("")));
+        assert!(exists.matches_value(Some("true")));
+        assert!(!exists.matches_value(None));
+    }
+
+    #[test]
+    fn attr_starts_with() {
+        let attr = AttrSelector { name: "class".to_string(), op: AttrOp::StartsWith("btn".to_string()) };
+        assert!(attr.matches_value(Some("btn-primary")));
+        assert!(!attr.matches_value(Some("card-btn")));
+    }
+
+    #[test]
+    fn attr_includes() {
+        let attr = AttrSelector { name: "class".to_string(), op: AttrOp::Includes("active".to_string()) };
+        assert!(attr.matches_value(Some("btn active large")));
+        assert!(!attr.matches_value(Some("inactive")));
     }
 }

@@ -175,7 +175,7 @@ Runs directly on hardware             ← No runtime
 | Flexbox / Grid                          | ✅ Full |
 | Block layout                            | ✅      |
 | `position: relative / absolute`         | ✅      |
-| `position: fixed / sticky`              | 🔜     |
+| `position: fixed / sticky`              | ✅      |
 | `overflow: hidden / scroll`             | ✅      |
 | `z-index`                               | ✅      |
 | Units: `px, %, rem, em, vw, vh`         | ✅      |
@@ -183,7 +183,14 @@ Runs directly on hardware             ← No runtime
 | `box-shadow`                            | ✅      |
 | `transform: translate / scale / rotate` | ✅      |
 | `transition` (easing functions)         | ✅      |
-| `display: inline / inline-block`        | 🔜     |
+| `@keyframes` animation                  | ✅      |
+| `display: inline / inline-block`        | ✅      |
+| `@layer` cascade layers                 | ✅      |
+| `@media` queries                        | ✅      |
+| Container Queries                       | ✅      |
+| Pseudo-classes (`:hover`, `:focus`, `:nth-child`, etc.) | ✅ |
+| Attribute selectors (`[attr=value]`)    | ✅      |
+| CSS Custom Properties (`var(--x)`)      | ✅      |
 | Mouse events (hover, click)             | ✅      |
 
 
@@ -192,19 +199,23 @@ Runs directly on hardware             ← No runtime
 ```
 w3cos/
 ├── crates/
+│   ├── w3cos-core/        # JS-compatible Value type, reactive system, Proxy
 │   ├── w3cos-std/         # Type definitions (Style, Component, Color)
 │   ├── w3cos-dom/         # W3C DOM API (Document, Element, Events)
 │   ├── w3cos-a11y/        # Accessibility tree (ARIA, for AI + screen readers)
 │   ├── w3cos-ai-bridge/   # AI agent interface (3-layer access + permissions)
-│   ├── w3cos-compiler/    # TS → Rust transpiler
-│   ├── w3cos-runtime/     # Layout + Rendering + Window + Events
-│   └── w3cos-cli/         # CLI: w3cos build / w3cos run
+│   ├── w3cos-compiler/    # TS → Rust transpiler (SWC parser + CSS/SCSS)
+│   ├── w3cos-runtime/     # Layout + Rendering + Window + System APIs
+│   ├── w3cos-cli/         # CLI: w3cos build / run / dev / init
+│   ├── w3cos-shell/       # System-level desktop shell binary
+│   ├── w3cos-demo/        # Showcase demo binary
+│   └── w3cos-rn-compat/   # React Native API compatibility layer
 ├── system/
 │   ├── buildroot/         # Bootable ISO config
 │   ├── rootfs_overlay/    # System init scripts
 │   ├── scripts/           # build-iso.sh, run-qemu.sh
 │   └── INSTALL.md         # Installation guide
-├── examples/              # 4 example applications
+├── examples/              # 18+ example applications
 ├── .openclaw/             # OpenClaw + Lobster AI workflow configs
 ├── .devcontainer/         # One-click dev environment
 ├── Dockerfile             # Container build
