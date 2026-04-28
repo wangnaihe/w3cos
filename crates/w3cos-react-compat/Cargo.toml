@@ -1,0 +1,10 @@
+[package]
+name = "w3cos-react-compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "React hooks compatibility layer — useState/useEffect/useMemo/useRef/useReducer/useContext on top of w3cos-core signals"
+
+[dependencies]
+w3cos-core = { workspace = true }
+w3cos-std = { workspace = true }

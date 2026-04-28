@@ -17,6 +17,14 @@ pub enum AiBridgeRequest {
     Query { selector: String },
 }
 
+/// Source of frame snapshots — supplied by the runtime so the bridge can
+/// stay decoupled from the render pipeline.
+pub trait ScreenshotProvider: Send + Sync {
+    /// Return the latest framebuffer encoded as PNG. `None` when no frame
+    /// has been rendered yet (or the provider can't capture in this mode).
+    fn capture_png(&self) -> Option<Vec<u8>>;
+}
+
 /// Response from the main event loop back to the HTTP server thread.
 pub enum AiBridgeResponse {
     Text(String),
@@ -28,19 +36,25 @@ pub enum AiBridgeResponse {
 /// Handle held by the main event loop to poll and respond to AI bridge requests.
 pub struct AiBridgeHandle {
     rx: mpsc::Receiver<(AiBridgeRequest, mpsc::Sender<AiBridgeResponse>)>,
+    screenshot_provider: std::sync::Arc<dyn ScreenshotProvider>,
 }
 
 impl AiBridgeHandle {
+    /// Replace the screenshot provider after construction.
+    pub fn set_screenshot_provider(&mut self, provider: std::sync::Arc<dyn ScreenshotProvider>) {
+        self.screenshot_provider = provider;
+    }
+
     /// Poll for pending requests from the HTTP server.
     /// Called from the main event loop (same thread as Document).
     pub fn poll_and_respond(&self, doc: &mut Document) {
         while let Ok((request, reply_tx)) = self.rx.try_recv() {
-            let response = Self::handle_request(request, doc);
+            let response = self.handle_request(request, doc);
             let _ = reply_tx.send(response);
         }
     }
 
-    fn handle_request(request: AiBridgeRequest, doc: &mut Document) -> AiBridgeResponse {
+    fn handle_request(&self, request: AiBridgeRequest, doc: &mut Document) -> AiBridgeResponse {
         match request {
             AiBridgeRequest::GetA11yTree => {
                 let summary = a11y_api::get_ui_summary(doc);
@@ -50,9 +64,13 @@ impl AiBridgeHandle {
                 let json = a11y_api::get_tree_json(doc);
                 AiBridgeResponse::Json(json)
             }
-            AiBridgeRequest::Screenshot => {
-                AiBridgeResponse::Json(r#"{"error":"screenshot requires render pipeline integration"}"#.to_string())
-            }
+            AiBridgeRequest::Screenshot => match self.screenshot_provider.capture_png() {
+                Some(png) => AiBridgeResponse::Png(png),
+                None => AiBridgeResponse::Json(
+                    r#"{"error":"no frame captured yet — render at least one frame first or enable CPU rendering"}"#
+                        .to_string(),
+                ),
+            },
             AiBridgeRequest::Click { selector } => {
                 let action = DomAction {
                     action: ActionType::Click,
@@ -82,9 +100,26 @@ impl AiBridgeHandle {
     }
 }
 
+/// Default no-op screenshot provider used until the runtime supplies a real one.
+struct NullScreenshotProvider;
+
+impl ScreenshotProvider for NullScreenshotProvider {
+    fn capture_png(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
 /// Start the AI Bridge HTTP server on the given port.
 /// Returns a handle for the main event loop to poll.
 pub fn start(port: u16) -> AiBridgeHandle {
+    start_with_provider(port, std::sync::Arc::new(NullScreenshotProvider))
+}
+
+/// Start the AI Bridge HTTP server with a custom screenshot provider.
+pub fn start_with_provider(
+    port: u16,
+    provider: std::sync::Arc<dyn ScreenshotProvider>,
+) -> AiBridgeHandle {
     let (tx, rx) = mpsc::channel::<(AiBridgeRequest, mpsc::Sender<AiBridgeResponse>)>();
 
     thread::spawn(move || {
@@ -111,7 +146,10 @@ pub fn start(port: u16) -> AiBridgeHandle {
         }
     });
 
-    AiBridgeHandle { rx }
+    AiBridgeHandle {
+        rx,
+        screenshot_provider: provider,
+    }
 }
 
 fn handle_connection(

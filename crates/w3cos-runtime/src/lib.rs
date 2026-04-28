@@ -1,13 +1,18 @@
 pub mod dom;
 #[cfg(feature = "devtools")]
 pub mod devtools;
+pub mod dialog;
 pub mod fetch;
+pub mod frame_cache;
 pub mod fs;
 pub mod history;
 pub mod image_loader;
+pub mod indexed_db;
+pub mod ipc;
 pub mod layout;
 pub mod manifest;
 pub mod media;
+pub mod menu;
 pub mod multi_window;
 pub mod notification;
 pub mod observers;
@@ -18,6 +23,7 @@ pub mod state;
 pub mod storage;
 pub mod text_encoding;
 pub mod timers;
+pub mod websocket;
 
 #[cfg(feature = "gpu")]
 #[path = "render_gpu.rs"]

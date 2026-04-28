@@ -71,9 +71,9 @@
 - [x] Multi-window: w3cos:// URL scheme with app manifest + registry
 - [x] Multi-window: postMessage cross-window communication
 - [x] Multi-window: WindowManager with focus stack (z-order)
-- [ ] React hooks compatibility layer (@w3cos/react-compat)
-- [ ] React Native API mapping (@w3cos/rn-compat) (#19)
-- [ ] Wire up AI Bridge to runtime (end-to-end AI agent demo) (#14)
+- [x] React hooks compatibility layer (@w3cos/react-compat — useState/useEffect/useMemo/useRef/useReducer/useContext on top of `w3cos-core` signals)
+- [x] React Native API mapping (@w3cos/rn-compat) (#19 — View/Text/TouchableOpacity/Pressable/ScrollView/Image/TextInput/SafeAreaView/FlatList/Switch + StyleSheet.create + use_state)
+- [x] Wire up AI Bridge to runtime (end-to-end AI agent demo) (#14 — DOM-mode integration + `frame_cache` PNG screenshot pipeline + `ScreenshotProvider` trait)
 
 ## Phase 2.5 — Dynamic DOM & Performance ✅
 
@@ -187,16 +187,18 @@
 
 ### Remaining
 - [ ] Web Workers
-- [ ] WebSocket API
+- [x] WebSocket API (RFC 6455 client over `tungstenite`, ready-state machine, async event queue, send_text / send_binary / close, browser-style `onopen`/`onmessage`/`onclose`/`onerror` semantics)
 - [x] localStorage (Web Storage API with JSON file persistence)
-- [ ] IndexedDB
-- [ ] w3cos.dialog (open/save/message dialogs)
-- [ ] w3cos.ipc (inter-process communication)
-- [ ] w3cos.menu (application/context menus)
+- [x] IndexedDB (object stores + key paths + auto-increment + indexes + transactions; JSON-file backed at `~/.w3cos/indexeddb/<name>.json`)
+- [x] w3cos.dialog (open / open-multiple / open-directory / save / message via `rfd`, native XDG-Portal/GTK/Cocoa/Win32, non-blocking `DialogReceiver` API)
+- [x] w3cos.ipc (length-prefixed JSON message bus over Unix Domain Socket on Linux/macOS, TCP loopback fallback, `IpcServer::broadcast` / `send_to` + `IpcClient::send` / `try_recv`)
+- [x] w3cos.menu (application + context menu data model, MenuItem checkbox/radio/separator, `set_app_menu` / `pop_context` / `dispatch_event` / `poll_events`)
 - [ ] RegExp (full JS spec)
 - [x] TextEncoder / TextDecoder (UTF-8, UTF-16LE/BE, ASCII, BOM handling)
 
 ## Phase 3 — Compatibility & Migration
+- [x] React Native API mapping (`w3cos-rn-compat`: View/Text/TouchableOpacity/Pressable/ScrollView/Image/TextInput/SafeAreaView/FlatList/Switch/Button/StatusBar + StyleSheet.create + use_state)
+- [x] React hooks compatibility (`w3cos-react-compat`: useState/useEffect/useMemo/useCallback/useRef/useReducer/useContext + provideContext + flushSync, slot-table model on top of `w3cos-core` signals)
 - [ ] React Native app auto-migration tool (`w3cos migrate --from rn`)
 - [ ] Electron app AST transpiler (strip Chromium, map APIs)
 - [ ] PWA manifest support

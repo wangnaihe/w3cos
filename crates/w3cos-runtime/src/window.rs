@@ -202,6 +202,19 @@ enum GpuState {
 }
 
 // ---------------------------------------------------------------------------
+// AI Bridge screenshot provider — reads the cached framebuffer
+// ---------------------------------------------------------------------------
+#[cfg(feature = "ai-bridge")]
+struct FrameCacheScreenshot;
+
+#[cfg(feature = "ai-bridge")]
+impl w3cos_ai_bridge::server::ScreenshotProvider for FrameCacheScreenshot {
+    fn capture_png(&self) -> Option<Vec<u8>> {
+        crate::frame_cache::encode_png()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App struct
 // ---------------------------------------------------------------------------
 struct App {
@@ -880,6 +893,9 @@ impl App {
             self.request_repaint();
         }
 
+        // Snapshot the framebuffer for AI Bridge / DevTools screenshot endpoints.
+        crate::frame_cache::store(w, h, pixmap.data().to_vec());
+
         present_pixels(window, &pixmap, w, h);
     }
 
@@ -1392,7 +1408,11 @@ impl ApplicationHandler for App {
             if self.ai_bridge_handle.is_none() {
                 if let Ok(port_str) = std::env::var("W3COS_AI_PORT") {
                     if let Ok(port) = port_str.parse::<u16>() {
-                        self.ai_bridge_handle = Some(w3cos_ai_bridge::start_server(port));
+                        let provider: std::sync::Arc<dyn w3cos_ai_bridge::server::ScreenshotProvider> =
+                            std::sync::Arc::new(FrameCacheScreenshot);
+                        self.ai_bridge_handle = Some(
+                            w3cos_ai_bridge::server::start_with_provider(port, provider),
+                        );
                     }
                 }
             }
