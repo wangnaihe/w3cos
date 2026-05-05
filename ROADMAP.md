@@ -186,7 +186,7 @@
 - [x] Window.matchMedia (min-width, max-width, prefers-color-scheme)
 
 ### Remaining
-- [ ] Web Workers
+- [x] Web Workers (W3C `Worker` + `SharedWorker` over native threads — `WorkerScope` `recv`/`post_message`/`report_error`, `MessagePort`-style `SharedWorkerPort` with broadcast, cooperative `terminate()` semantics, queued `WorkerEvent` stream for reactive frame loops)
 - [x] WebSocket API (RFC 6455 client over `tungstenite`, ready-state machine, async event queue, send_text / send_binary / close, browser-style `onopen`/`onmessage`/`onclose`/`onerror` semantics)
 - [x] localStorage (Web Storage API with JSON file persistence)
 - [x] IndexedDB (object stores + key paths + auto-increment + indexes + transactions; JSON-file backed at `~/.w3cos/indexeddb/<name>.json`)
@@ -201,7 +201,7 @@
 - [x] React hooks compatibility (`w3cos-react-compat`: useState/useEffect/useMemo/useCallback/useRef/useReducer/useContext + provideContext + flushSync, slot-table model on top of `w3cos-core` signals)
 - [ ] React Native app auto-migration tool (`w3cos migrate --from rn`)
 - [ ] Electron app AST transpiler (strip Chromium, map APIs)
-- [ ] PWA manifest support
+- [x] PWA manifest support (`w3cos_runtime::pwa::PwaManifest` parses W3C Web App Manifest — `name`/`short_name`/`id`/`start_url`/`display`/`display_override`/`theme_color`/`background_color`/`icons`/`shortcuts` + closest-icon picker + `into_app_manifest` adapter for the W3C OS app registry)
 - [ ] npm package compatibility (pure-logic packages)
 - [ ] Cross-compilation: Linux x86/ARM, macOS
 

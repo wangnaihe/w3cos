@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Web Workers** (`w3cos_runtime::worker`) — W3C-standard background execution mapped onto native OS threads:
+  - `Worker::spawn(opts, body)` runs a Rust closure on a dedicated thread; the closure receives a `WorkerScope` with browser-equivalent `recv` / `try_recv` / `post_message` / `report_error` methods.
+  - `Worker::post_message` / `try_recv` / `poll_events` mirror the parent-side `MessageEvent` / `ErrorEvent` queue.
+  - Cooperative `Worker::terminate()` drops the inbound channel and joins the thread; `WorkerScope::is_terminated` plus a polling `recv_timeout` ensures workers always exit cleanly.
+  - `SharedWorker::spawn` keeps one thread alive across many `SharedWorkerPort`s (W3C `MessagePort` semantics) — `send_to(port_id, ...)`, `broadcast(...)`, per-port `poll_events`, and graceful disconnect when ports drop.
+  - Examples: `cargo run -p w3cos-runtime --example worker_prime_sieve`, `cargo run -p w3cos-runtime --example pwa_install`.
+- **PWA Web App Manifest support** (`w3cos_runtime::pwa`) — installs Progressive Web Apps as first-class W3C OS apps:
+  - `PwaManifest::from_json` / `from_file` parse the W3C Web App Manifest (`name`, `short_name`, `id`, `start_url`, `scope`, `display`, `display_override`, `orientation`, `theme_color`, `background_color`, `icons`, `screenshots`, `shortcuts`, `categories`).
+  - `PwaManifest::pick_icon(target_px)` selects the icon closest to a given square size (handles `sizes: any`, `purpose` filtering).
+  - `PwaManifest::effective_display()` honours `display_override` per the spec.
+  - `PwaManifest::into_app_manifest(fallback_id)` adapts a parsed manifest to a W3C OS `AppManifest` (frameless for `display: fullscreen`, derives a stable `id` from `start_url` when one isn't declared).
 - **Web Standard APIs** — completes Phase 2.75 platform layer:
   - **WebSocket** (`w3cos_runtime::websocket`) — RFC 6455 client over `tungstenite`. Browser-style `WebSocket::connect`/`send_text`/`send_binary`/`close`/`poll_events`, `ReadyState` enum, queued events for reactive frame loops.
   - **IndexedDB** (`w3cos_runtime::indexed_db`) — object stores with key paths, auto-increment, indexes, and transactions. Backed by `~/.w3cos/indexeddb/<name>.json` so data survives restarts. Mirrors `IDBDatabase`/`IDBTransaction`/`IDBObjectStore`.

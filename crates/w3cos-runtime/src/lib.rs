@@ -17,6 +17,7 @@ pub mod multi_window;
 pub mod notification;
 pub mod observers;
 pub mod process;
+pub mod pwa;
 #[cfg(unix)]
 pub mod pty;
 pub mod state;
@@ -24,6 +25,7 @@ pub mod storage;
 pub mod text_encoding;
 pub mod timers;
 pub mod websocket;
+pub mod worker;
 
 #[cfg(feature = "gpu")]
 #[path = "render_gpu.rs"]
