@@ -1,6 +1,7 @@
 use crate::atom::Atom;
 use crate::css_style::CSSStyleDeclaration;
 use crate::document::Document;
+use crate::dom_rect::DOMRect;
 use crate::events::{Event, EventHandler, EventType};
 use crate::node::{NodeId, NodeType};
 
@@ -284,6 +285,67 @@ impl Element {
             Self::collect_text(doc, child_id, out);
             child = doc.get_node(child_id).next_sibling;
         }
+    }
+
+    // ── W3C Layout API ─────────────────────────────────────────────────
+
+    /// W3C `Element.getBoundingClientRect()` — returns the element's layout rect.
+    ///
+    /// In w3cos the layout engine stores computed rects in `Document::layout_rects`.
+    /// If no layout has been computed yet (rect is zero), returns a zeroed DOMRect.
+    /// The runtime must call `Document::set_layout_rect` after each layout pass.
+    pub fn get_bounding_client_rect(&self, doc: &Document) -> DOMRect {
+        doc.get_layout_rect(self.id)
+    }
+
+    /// W3C `Element.getClientRects()` — returns a list containing the bounding rect.
+    /// For block-level elements this is always a single-element list.
+    pub fn get_client_rects(&self, doc: &Document) -> Vec<DOMRect> {
+        vec![self.get_bounding_client_rect(doc)]
+    }
+
+    /// W3C `window.getComputedStyle(element)` — returns the computed CSS style.
+    ///
+    /// In w3cos, computed style is the same as the inline style stored in the
+    /// document's style arena (CSS cascade is not yet fully implemented).
+    /// Returns a clone so callers can read properties without borrowing the doc.
+    pub fn get_computed_style(&self, doc: &Document) -> crate::css_style::CSSStyleDeclaration {
+        doc.get_style(self.id).clone()
+    }
+
+    /// W3C `Element.scrollTop` / `scrollLeft` — scroll position.
+    pub fn scroll_top(&self, doc: &Document) -> f32 {
+        doc.get_scroll(self.id).1
+    }
+
+    pub fn scroll_left(&self, doc: &Document) -> f32 {
+        doc.get_scroll(self.id).0
+    }
+
+    pub fn set_scroll_top(&self, doc: &mut Document, value: f32) {
+        doc.set_scroll(self.id, None, Some(value));
+    }
+
+    pub fn set_scroll_left(&self, doc: &mut Document, value: f32) {
+        doc.set_scroll(self.id, Some(value), None);
+    }
+
+    /// W3C `Element.scrollWidth` / `scrollHeight` — full scrollable size.
+    pub fn scroll_width(&self, doc: &Document) -> f32 {
+        doc.get_layout_rect(self.id).width
+    }
+
+    pub fn scroll_height(&self, doc: &Document) -> f32 {
+        doc.get_layout_rect(self.id).height
+    }
+
+    /// W3C `Element.clientWidth` / `clientHeight` — visible content size.
+    pub fn client_width(&self, doc: &Document) -> f32 {
+        doc.get_layout_rect(self.id).width
+    }
+
+    pub fn client_height(&self, doc: &Document) -> f32 {
+        doc.get_layout_rect(self.id).height
     }
 
     /// Serialize this element as an HTML string (read-only).

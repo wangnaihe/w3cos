@@ -203,6 +203,18 @@ impl CSSStyleDeclaration {
                 self.inner.color.r, self.inner.color.g, self.inner.color.b
             ),
             "opacity" => format!("{}", self.inner.opacity),
+            "width" => dimension_to_css(&self.inner.width),
+            "height" => dimension_to_css(&self.inner.height),
+            "min-width" | "minWidth" => dimension_to_css(&self.inner.min_width),
+            "min-height" | "minHeight" => dimension_to_css(&self.inner.min_height),
+            "max-width" | "maxWidth" => dimension_to_css(&self.inner.max_width),
+            "max-height" | "maxHeight" => dimension_to_css(&self.inner.max_height),
+            "flex-grow" | "flexGrow" => format!("{}", self.inner.flex_grow),
+            "flex-shrink" | "flexShrink" => format!("{}", self.inner.flex_shrink),
+            "flex-direction" | "flexDirection" => format!("{:?}", self.inner.flex_direction).to_lowercase(),
+            "justify-content" | "justifyContent" => format!("{:?}", self.inner.justify_content).to_lowercase(),
+            "align-items" | "alignItems" => format!("{:?}", self.inner.align_items).to_lowercase(),
+            "overflow" => format!("{:?}", self.inner.overflow).to_lowercase(),
             _ => String::new(),
         }
     }
@@ -215,6 +227,18 @@ impl CSSStyleDeclaration {
 impl Default for CSSStyleDeclaration {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
+    match dim {
+        w3cos_std::style::Dimension::Px(v) => format!("{v}px"),
+        w3cos_std::style::Dimension::Percent(v) => format!("{v}%"),
+        w3cos_std::style::Dimension::Rem(v) => format!("{v}rem"),
+        w3cos_std::style::Dimension::Em(v) => format!("{v}em"),
+        w3cos_std::style::Dimension::Vw(v) => format!("{v}vw"),
+        w3cos_std::style::Dimension::Vh(v) => format!("{v}vh"),
+        w3cos_std::style::Dimension::Auto => "auto".to_string(),
     }
 }
 

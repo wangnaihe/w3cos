@@ -1,10 +1,15 @@
 pub mod dom;
 #[cfg(feature = "devtools")]
 pub mod devtools;
+pub mod canvas2d;
+pub mod clipboard;
+pub mod font_face;
 pub mod dialog;
+pub mod eventsource;
 pub mod fetch;
 pub mod frame_cache;
 pub mod fs;
+pub mod fs_watch;
 pub mod history;
 pub mod image_loader;
 pub mod indexed_db;
@@ -22,10 +27,14 @@ pub mod pwa;
 pub mod pty;
 pub mod state;
 pub mod storage;
+pub mod streams;
 pub mod text_encoding;
 pub mod timers;
 pub mod websocket;
 pub mod worker;
+
+// Native capability extensions
+pub use w3cos_ffi as ffi;
 
 #[cfg(feature = "gpu")]
 #[path = "render_gpu.rs"]

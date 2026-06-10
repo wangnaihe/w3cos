@@ -2,6 +2,7 @@ pub mod atom;
 pub mod canvas;
 pub mod css_style;
 pub mod document;
+pub mod dom_rect;
 pub mod element;
 pub mod events;
 pub mod history;
@@ -11,6 +12,7 @@ pub mod selection;
 pub mod window;
 
 pub use document::Document;
+pub use dom_rect::DOMRect;
 pub use element::Element;
 pub use events::{
     Event, EventData, EventHandler, EventPhase, EventType, KeyboardEventData, ListenerOptions,

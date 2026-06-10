@@ -147,4 +147,63 @@ impl DomNode {
     pub fn child_count_hint(&self) -> bool {
         self.first_child.is_some()
     }
+
+    // ── contenteditable ───────────────────────────────────────────────────
+
+    /// W3C `HTMLElement.contentEditable` — "true" | "false" | "inherit".
+    pub fn content_editable(&self) -> &str {
+        let ce = Atom::intern("contenteditable");
+        for (k, v) in &self.attributes {
+            if *k == ce {
+                return v.as_str();
+            }
+        }
+        "inherit"
+    }
+
+    /// Returns true if this element is editable (contenteditable="true" or "").
+    pub fn is_content_editable(&self) -> bool {
+        matches!(self.content_editable(), "true" | "")
+    }
+
+    /// Set `contenteditable` attribute.
+    pub fn set_content_editable(&mut self, value: &str) {
+        let ce = Atom::intern("contenteditable");
+        for (k, v) in self.attributes.iter_mut() {
+            if *k == ce {
+                *v = value.to_string();
+                return;
+            }
+        }
+        self.attributes.push((ce, value.to_string()));
+    }
+
+    /// Get an attribute value by name.
+    pub fn get_attribute(&self, name: &str) -> Option<&str> {
+        let key = Atom::intern(name);
+        self.attributes
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Set an attribute value by name.
+    pub fn set_attribute(&mut self, name: &str, value: &str) {
+        let key = Atom::intern(name);
+        for (k, v) in self.attributes.iter_mut() {
+            if *k == key {
+                *v = value.to_string();
+                return;
+            }
+        }
+        self.attributes.push((key, value.to_string()));
+    }
+
+    /// Remove an attribute by name. Returns true if it existed.
+    pub fn remove_attribute(&mut self, name: &str) -> bool {
+        let key = Atom::intern(name);
+        let before = self.attributes.len();
+        self.attributes.retain(|(k, _)| *k != key);
+        self.attributes.len() < before
+    }
 }

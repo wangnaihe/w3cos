@@ -174,6 +174,159 @@ pub fn exec_shell(command: &str) -> ExecResult {
     exec("sh", &["-c", command])
 }
 
+// ---------------------------------------------------------------------------
+// Process info (w3cos.process.list / getpid / kill)
+// ---------------------------------------------------------------------------
+
+/// Information about a running process.
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_usage: f32,
+    pub memory_bytes: u64,
+    pub status: String,
+}
+
+/// List all running processes on the system.
+pub fn list_processes() -> Vec<ProcessInfo> {
+    use sysinfo::System;
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    sys.processes()
+        .values()
+        .map(|p| ProcessInfo {
+            pid: p.pid().as_u32(),
+            name: p.name().to_string_lossy().to_string(),
+            cpu_usage: p.cpu_usage(),
+            memory_bytes: p.memory(),
+            status: format!("{:?}", p.status()),
+        })
+        .collect()
+}
+
+/// Get the current process PID.
+pub fn getpid() -> u32 {
+    std::process::id()
+}
+
+/// Get CPU and memory usage for a specific PID.
+pub fn process_usage(pid: u32) -> Option<(f32, u64)> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    let spid = Pid::from_u32(pid);
+    sys.refresh_processes(ProcessesToUpdate::Some(&[spid]), false);
+    sys.process(spid).map(|p| (p.cpu_usage(), p.memory()))
+}
+
+/// Send a signal to a process by PID.
+///
+/// Common signals: 9 = SIGKILL, 15 = SIGTERM, 2 = SIGINT
+pub fn kill(pid: u32, signal: i32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{kill as nix_kill, Signal};
+        use nix::unistd::Pid;
+        let sig = Signal::try_from(signal).map_err(|e| e.to_string())?;
+        nix_kill(Pid::from_raw(pid as i32), sig).map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-Unix, fall back to TerminateProcess via std
+        let _ = signal;
+        let mut child = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+        child.map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+/// Set an environment variable for the current process.
+pub fn setenv(key: &str, value: &str) {
+    unsafe { std::env::set_var(key, value) };
+}
+
+/// Remove an environment variable from the current process.
+pub fn unsetenv(key: &str) {
+    unsafe { std::env::remove_var(key) };
+}
+
+/// Get an environment variable.
+pub fn getenv(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Pipe chain (w3cos.process.pipe)
+// ---------------------------------------------------------------------------
+
+/// Run a pipeline of shell commands connected by pipes.
+///
+/// Each element is a `(program, args)` pair. The stdout of each command
+/// is piped into the stdin of the next. Returns the final output.
+///
+/// # Example
+/// ```ignore
+/// let result = pipe_commands(&[
+///     ("echo", vec!["hello world"]),
+///     ("tr", vec!["a-z", "A-Z"]),
+/// ]);
+/// assert_eq!(result.stdout.trim(), "HELLO WORLD");
+/// ```
+pub fn pipe_commands(commands: &[(&str, Vec<&str>)]) -> ExecResult {
+    if commands.is_empty() {
+        return ExecResult { stdout: String::new(), stderr: String::new(), exit_code: 0, ok: true };
+    }
+
+    // Build shell pipeline string: cmd1 args | cmd2 args | ...
+    let pipeline: String = commands
+        .iter()
+        .map(|(prog, args)| {
+            let mut parts = vec![shell_escape(prog)];
+            parts.extend(args.iter().map(|a| shell_escape(a)));
+            parts.join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    exec_shell(&pipeline)
+}
+
+fn shell_escape(s: &str) -> String {
+    // Simple single-quote escaping for shell safety
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+// ---------------------------------------------------------------------------
+// System info (w3cos.process.sysinfo)
+// ---------------------------------------------------------------------------
+
+/// Basic system information.
+#[derive(Debug, Clone)]
+pub struct SysInfo {
+    pub total_memory_bytes: u64,
+    pub used_memory_bytes: u64,
+    pub cpu_count: usize,
+    pub os_name: String,
+    pub kernel_version: String,
+    pub hostname: String,
+}
+
+/// Get system-level information.
+pub fn sysinfo() -> SysInfo {
+    use sysinfo::System;
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    SysInfo {
+        total_memory_bytes: sys.total_memory(),
+        used_memory_bytes: sys.used_memory(),
+        cpu_count: sys.cpus().len(),
+        os_name: System::name().unwrap_or_default(),
+        kernel_version: System::kernel_version().unwrap_or_default(),
+        hostname: System::host_name().unwrap_or_default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

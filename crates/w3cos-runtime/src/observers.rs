@@ -69,7 +69,27 @@ impl Default for ResizeObserver {
     }
 }
 
-// --- MutationObserver types ---
+// --- MutationObserver ---
+
+/// W3C `MutationObserverInit` — configuration for `MutationObserver.observe()`.
+/// https://dom.spec.whatwg.org/#dictdef-mutationobserverinit
+#[derive(Debug, Clone, Default)]
+pub struct MutationObserverInit {
+    /// Observe child node additions/removals.
+    pub child_list: bool,
+    /// Observe attribute changes.
+    pub attributes: bool,
+    /// Observe text content changes.
+    pub character_data: bool,
+    /// Extend observation to all descendants.
+    pub subtree: bool,
+    /// Record old attribute value before change.
+    pub attribute_old_value: bool,
+    /// Record old character data before change.
+    pub character_data_old_value: bool,
+    /// Limit attribute observation to these names (None = all attributes).
+    pub attribute_filter: Option<Vec<String>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationType {
@@ -78,13 +98,154 @@ pub enum MutationType {
     CharacterData,
 }
 
+/// W3C `MutationRecord` — describes a single DOM mutation.
+#[derive(Debug, Clone)]
 pub struct MutationRecord {
     pub mutation_type: MutationType,
     pub target: NodeId,
     pub added_nodes: Vec<NodeId>,
     pub removed_nodes: Vec<NodeId>,
+    pub previous_sibling: Option<NodeId>,
+    pub next_sibling: Option<NodeId>,
     pub attribute_name: Option<String>,
+    pub attribute_namespace: Option<String>,
     pub old_value: Option<String>,
+}
+
+impl MutationRecord {
+    pub fn child_list(target: NodeId, added: Vec<NodeId>, removed: Vec<NodeId>) -> Self {
+        Self {
+            mutation_type: MutationType::ChildList,
+            target,
+            added_nodes: added,
+            removed_nodes: removed,
+            previous_sibling: None,
+            next_sibling: None,
+            attribute_name: None,
+            attribute_namespace: None,
+            old_value: None,
+        }
+    }
+
+    pub fn attributes(target: NodeId, name: &str, old_value: Option<String>) -> Self {
+        Self {
+            mutation_type: MutationType::Attributes,
+            target,
+            added_nodes: Vec::new(),
+            removed_nodes: Vec::new(),
+            previous_sibling: None,
+            next_sibling: None,
+            attribute_name: Some(name.to_string()),
+            attribute_namespace: None,
+            old_value,
+        }
+    }
+
+    pub fn character_data(target: NodeId, old_value: Option<String>) -> Self {
+        Self {
+            mutation_type: MutationType::CharacterData,
+            target,
+            added_nodes: Vec::new(),
+            removed_nodes: Vec::new(),
+            previous_sibling: None,
+            next_sibling: None,
+            attribute_name: None,
+            attribute_namespace: None,
+            old_value,
+        }
+    }
+}
+
+/// W3C `MutationObserver` — observes DOM mutations and delivers them via callback.
+/// https://dom.spec.whatwg.org/#interface-mutationobserver
+///
+/// Usage in w3cos:
+/// 1. Create with `MutationObserver::new(callback)`.
+/// 2. Call `observe(target, init)` to register targets.
+/// 3. The runtime calls `deliver(records)` after each DOM mutation batch.
+/// 4. Call `disconnect()` to stop all observations.
+/// 5. Call `take_records()` to drain the pending queue without firing callback.
+pub struct MutationObserver {
+    callback: Box<dyn FnMut(Vec<MutationRecord>)>,
+    observations: Vec<(NodeId, MutationObserverInit)>,
+    record_queue: Vec<MutationRecord>,
+}
+
+impl MutationObserver {
+    pub fn new(callback: impl FnMut(Vec<MutationRecord>) + 'static) -> Self {
+        Self {
+            callback: Box::new(callback),
+            observations: Vec::new(),
+            record_queue: Vec::new(),
+        }
+    }
+
+    /// Register a target node with the given observation options.
+    /// Calling `observe` on an already-observed target replaces its options.
+    pub fn observe(&mut self, target: NodeId, init: MutationObserverInit) {
+        if let Some(entry) = self.observations.iter_mut().find(|(id, _)| *id == target) {
+            entry.1 = init;
+        } else {
+            self.observations.push((target, init));
+        }
+    }
+
+    /// Stop observing all targets and clear the record queue.
+    pub fn disconnect(&mut self) {
+        self.observations.clear();
+        self.record_queue.clear();
+    }
+
+    /// Drain and return all queued records without invoking the callback.
+    pub fn take_records(&mut self) -> Vec<MutationRecord> {
+        std::mem::take(&mut self.record_queue)
+    }
+
+    /// Returns the list of currently observed (target, init) pairs.
+    pub fn observations(&self) -> &[(NodeId, MutationObserverInit)] {
+        &self.observations
+    }
+
+    /// Queue a mutation record if it matches any active observation.
+    /// Called by the DOM runtime after each mutation.
+    pub fn queue_mutation(&mut self, record: MutationRecord) {
+        let matches = self.observations.iter().any(|(target, init)| {
+            if *target != record.target {
+                // Check subtree: if subtree is set we'd need ancestor check;
+                // for now accept direct target matches (subtree handled by runtime).
+                return false;
+            }
+            match record.mutation_type {
+                MutationType::ChildList => init.child_list,
+                MutationType::Attributes => {
+                    if !init.attributes {
+                        return false;
+                    }
+                    if let Some(filter) = &init.attribute_filter {
+                        if let Some(name) = &record.attribute_name {
+                            return filter.iter().any(|f| f == name);
+                        }
+                        return false;
+                    }
+                    true
+                }
+                MutationType::CharacterData => init.character_data,
+            }
+        });
+        if matches {
+            self.record_queue.push(record);
+        }
+    }
+
+    /// Deliver all queued records to the callback and clear the queue.
+    /// The runtime should call this at the end of each microtask checkpoint.
+    pub fn deliver(&mut self) {
+        if self.record_queue.is_empty() {
+            return;
+        }
+        let records = std::mem::take(&mut self.record_queue);
+        (self.callback)(records);
+    }
 }
 
 // --- IntersectionObserver ---

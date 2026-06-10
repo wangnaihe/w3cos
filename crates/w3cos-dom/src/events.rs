@@ -41,6 +41,12 @@ pub enum EventType {
     CompositionStart,
     CompositionUpdate,
     CompositionEnd,
+    /// W3C `beforeinput` — fires before the DOM is mutated by user input.
+    /// CodeMirror uses this for Safari selection hacks and Android key handling.
+    BeforeInput,
+    /// W3C `selectionchange` — fires on `document` when the selection changes.
+    /// CodeMirror's DOMObserver listens to this to track cursor movement.
+    SelectionChange,
     PopState,
     HashChange,
     Custom(u32),
@@ -89,6 +95,8 @@ impl EventType {
             "compositionstart" => Some(Self::CompositionStart),
             "compositionupdate" => Some(Self::CompositionUpdate),
             "compositionend" => Some(Self::CompositionEnd),
+            "beforeinput" => Some(Self::BeforeInput),
+            "selectionchange" => Some(Self::SelectionChange),
             "popstate" => Some(Self::PopState),
             "hashchange" => Some(Self::HashChange),
             _ => {
@@ -108,6 +116,7 @@ impl EventType {
                 | EventType::PointerEnter
                 | EventType::PointerLeave
                 | EventType::Resize
+                | EventType::SelectionChange
         )
     }
 }
@@ -162,6 +171,139 @@ pub struct WheelEventData {
     pub delta_mode: u32,
 }
 
+/// W3C `InputEvent.inputType` — the type of change made to the editable content.
+/// https://www.w3.org/TR/input-events-2/#interface-InputEvent-Attributes
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputType {
+    // Insertion
+    InsertText,
+    InsertReplacementText,
+    InsertLineBreak,
+    InsertParagraph,
+    InsertOrderedList,
+    InsertUnorderedList,
+    InsertHorizontalRule,
+    InsertFromYank,
+    InsertFromDrop,
+    InsertFromPaste,
+    InsertFromPasteAsQuotation,
+    InsertTranspose,
+    InsertCompositionText,
+    InsertLink,
+    // Deletion
+    DeleteWordBackward,
+    DeleteWordForward,
+    DeleteSoftLineBackward,
+    DeleteSoftLineForward,
+    DeleteEntireSoftLine,
+    DeleteHardLineBackward,
+    DeleteHardLineForward,
+    DeleteByDrag,
+    DeleteByCut,
+    DeleteContent,
+    DeleteContentBackward,
+    DeleteContentForward,
+    // History
+    HistoryUndo,
+    HistoryRedo,
+    // Formatting
+    FormatBold,
+    FormatItalic,
+    FormatUnderline,
+    FormatStrikeThrough,
+    FormatSuperscript,
+    FormatSubscript,
+    FormatJustifyFull,
+    FormatJustifyCenter,
+    FormatJustifyRight,
+    FormatJustifyLeft,
+    FormatIndent,
+    FormatOutdent,
+    FormatRemove,
+    FormatSetBlockTextDirection,
+    FormatSetInlineTextDirection,
+    FormatBackColor,
+    FormatFontColor,
+    FormatFontName,
+}
+
+impl InputType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InsertText => "insertText",
+            Self::InsertReplacementText => "insertReplacementText",
+            Self::InsertLineBreak => "insertLineBreak",
+            Self::InsertParagraph => "insertParagraph",
+            Self::InsertOrderedList => "insertOrderedList",
+            Self::InsertUnorderedList => "insertUnorderedList",
+            Self::InsertHorizontalRule => "insertHorizontalRule",
+            Self::InsertFromYank => "insertFromYank",
+            Self::InsertFromDrop => "insertFromDrop",
+            Self::InsertFromPaste => "insertFromPaste",
+            Self::InsertFromPasteAsQuotation => "insertFromPasteAsQuotation",
+            Self::InsertTranspose => "insertTranspose",
+            Self::InsertCompositionText => "insertCompositionText",
+            Self::InsertLink => "insertLink",
+            Self::DeleteWordBackward => "deleteWordBackward",
+            Self::DeleteWordForward => "deleteWordForward",
+            Self::DeleteSoftLineBackward => "deleteSoftLineBackward",
+            Self::DeleteSoftLineForward => "deleteSoftLineForward",
+            Self::DeleteEntireSoftLine => "deleteEntireSoftLine",
+            Self::DeleteHardLineBackward => "deleteHardLineBackward",
+            Self::DeleteHardLineForward => "deleteHardLineForward",
+            Self::DeleteByDrag => "deleteByDrag",
+            Self::DeleteByCut => "deleteByCut",
+            Self::DeleteContent => "deleteContent",
+            Self::DeleteContentBackward => "deleteContentBackward",
+            Self::DeleteContentForward => "deleteContentForward",
+            Self::HistoryUndo => "historyUndo",
+            Self::HistoryRedo => "historyRedo",
+            Self::FormatBold => "formatBold",
+            Self::FormatItalic => "formatItalic",
+            Self::FormatUnderline => "formatUnderline",
+            Self::FormatStrikeThrough => "formatStrikeThrough",
+            Self::FormatSuperscript => "formatSuperscript",
+            Self::FormatSubscript => "formatSubscript",
+            Self::FormatJustifyFull => "formatJustifyFull",
+            Self::FormatJustifyCenter => "formatJustifyCenter",
+            Self::FormatJustifyRight => "formatJustifyRight",
+            Self::FormatJustifyLeft => "formatJustifyLeft",
+            Self::FormatIndent => "formatIndent",
+            Self::FormatOutdent => "formatOutdent",
+            Self::FormatRemove => "formatRemove",
+            Self::FormatSetBlockTextDirection => "formatSetBlockTextDirection",
+            Self::FormatSetInlineTextDirection => "formatSetInlineTextDirection",
+            Self::FormatBackColor => "formatBackColor",
+            Self::FormatFontColor => "formatFontColor",
+            Self::FormatFontName => "formatFontName",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "insertText" => Some(Self::InsertText),
+            "insertReplacementText" => Some(Self::InsertReplacementText),
+            "insertLineBreak" => Some(Self::InsertLineBreak),
+            "insertParagraph" => Some(Self::InsertParagraph),
+            "insertFromPaste" => Some(Self::InsertFromPaste),
+            "insertFromDrop" => Some(Self::InsertFromDrop),
+            "insertCompositionText" => Some(Self::InsertCompositionText),
+            "deleteWordBackward" => Some(Self::DeleteWordBackward),
+            "deleteWordForward" => Some(Self::DeleteWordForward),
+            "deleteContentBackward" => Some(Self::DeleteContentBackward),
+            "deleteContentForward" => Some(Self::DeleteContentForward),
+            "deleteByCut" => Some(Self::DeleteByCut),
+            "deleteByDrag" => Some(Self::DeleteByDrag),
+            "historyUndo" => Some(Self::HistoryUndo),
+            "historyRedo" => Some(Self::HistoryRedo),
+            "formatBold" => Some(Self::FormatBold),
+            "formatItalic" => Some(Self::FormatItalic),
+            "formatUnderline" => Some(Self::FormatUnderline),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EventData {
     Mouse(MouseEventData),
@@ -169,7 +311,24 @@ pub enum EventData {
     Pointer(PointerEventData),
     Wheel(WheelEventData),
     Focus,
-    Input { data: Option<String> },
+    /// W3C `InputEvent` — fired on `contenteditable` elements and `<input>`.
+    /// `input_type` identifies the kind of change (insert, delete, format, etc.).
+    /// `data` carries the inserted text for insertion types, `None` for deletions.
+    /// `is_composing` is true during IME composition.
+    Input {
+        data: Option<String>,
+        input_type: Option<InputType>,
+        is_composing: bool,
+    },
+    /// W3C `BeforeInputEvent` — fired before DOM mutation, allows cancellation.
+    /// `get_target_ranges()` returns the affected ranges (simplified: single range).
+    BeforeInput {
+        data: Option<String>,
+        input_type: Option<InputType>,
+        is_composing: bool,
+        /// Simplified target ranges: (anchor_node, anchor_offset, focus_node, focus_offset)
+        target_ranges: Vec<(NodeId, usize, NodeId, usize)>,
+    },
     Composition { data: String },
     Custom { detail: Option<String> },
     None,

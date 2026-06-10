@@ -13,6 +13,7 @@ members = [
     "crates/w3cos-shell",
     "crates/w3cos-rn-compat",
     "crates/w3cos-react-compat",
+    "crates/w3cos-ffi",
 ]
 
 [workspace.package]
@@ -56,6 +57,14 @@ ureq = { version = "3", features = ["json"] }
 
 # DevTools (Chrome DevTools Protocol over WebSocket)
 tungstenite = "0.24"
+
+# Native capability extensions
+notify = { version = "7", features = ["macos_fsevent"] }
+sysinfo = "0.33"
+nix = { version = "0.29", features = ["process", "signal", "fs", "user", "mman", "mqueue"] }
+tempfile = "3"
+glob = "0.3"
+libloading = "0.8"
 
 # Core
 anyhow = "1"
