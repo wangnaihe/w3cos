@@ -1,5 +1,9 @@
 pub mod codegen;
 pub mod css_parser;
+pub mod esm_codegen;
+pub mod esm_lowering;
+pub mod esm_resolver;
+pub mod npm_bridge;
 pub mod parser;
 pub mod scope_analysis;
 pub mod style_matcher;
@@ -30,6 +34,9 @@ pub struct CompileFlags {
     pub needs_core: bool,
     pub needs_fetch: bool,
     pub needs_history: bool,
+    pub needs_runtime: bool,
+    pub needs_dom: bool,
+    pub needs_std: bool,
 }
 
 /// Compile a TypeScript source file into a standalone Rust project.
@@ -37,7 +44,7 @@ pub struct CompileFlags {
 /// For UI apps: links against w3cos-runtime and produces a native GUI binary.
 /// For general TS: produces a standalone CLI binary.
 pub fn compile(ts_source: &str, output_dir: &std::path::Path) -> Result<()> {
-    compile_with_source_dir(ts_source, output_dir, None)
+    compile_with_source_dir(ts_source, output_dir, None, None)
 }
 
 /// Compile from a source file path, enabling CSS/SCSS import resolution.
@@ -48,13 +55,14 @@ pub fn compile_from_file(
     let ts_source = std::fs::read_to_string(source_path)
         .with_context(|| format!("Could not read {}", source_path.display()))?;
     let source_dir = source_path.parent().map(|p| p.to_path_buf());
-    compile_with_source_dir(&ts_source, output_dir, source_dir.as_deref())
+    compile_with_source_dir(&ts_source, output_dir, source_dir.as_deref(), Some(source_path))
 }
 
 fn compile_with_source_dir(
     ts_source: &str,
     output_dir: &std::path::Path,
     source_dir: Option<&std::path::Path>,
+    source_path: Option<&std::path::Path>,
 ) -> Result<()> {
     let is_ui = is_ui_dsl(ts_source);
 
@@ -69,6 +77,14 @@ fn compile_with_source_dir(
         std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
     } else {
         let output = ts_transpiler::transpile_with_flags(ts_source)?;
+        let (esm_diagnostics, esm_bundle_code) = if let Some(entry_path) = source_path {
+            match build_esm_artifacts(entry_path) {
+                Ok(artifacts) => (artifacts.diagnostics, artifacts.bundle_code),
+                Err(err) => (format!("//! ESM graph: unresolved ({err})\n\n"), None),
+            }
+        } else {
+            (String::new(), None)
+        };
         let flags = CompileFlags {
             needs_hashmap: output.needs_hashmap,
             needs_async: output.needs_async,
@@ -76,13 +92,83 @@ fn compile_with_source_dir(
             needs_core: output.needs_core,
             needs_fetch: output.needs_fetch,
             needs_history: output.needs_history,
+            needs_runtime: output.code.contains("use w3cos_runtime"),
+            needs_dom: output.code.contains("use w3cos_dom"),
+            needs_std: output.code.contains("use w3cos_std"),
         };
         let cargo_toml = generate_standalone_cargo_toml(&flags);
         std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
-        std::fs::write(output_dir.join("src/main.rs"), output.code)?;
+
+        let mut main_rs = format!("{esm_diagnostics}");
+        if esm_bundle_code.is_some() {
+            main_rs.push_str("mod esm_bundle;\n\n");
+        }
+        main_rs.push_str(&output.code);
+        std::fs::write(output_dir.join("src/main.rs"), main_rs)?;
+
+        if let Some(bundle_code) = esm_bundle_code {
+            std::fs::write(output_dir.join("src/esm_bundle.rs"), bundle_code)?;
+        }
     }
 
     Ok(())
+}
+
+struct EsmArtifacts {
+    diagnostics: String,
+    bundle_code: Option<String>,
+}
+
+fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
+    let project_root = find_project_root(entry_path.parent().unwrap_or_else(|| std::path::Path::new(".")));
+    let resolver = esm_resolver::EsmResolver::new(project_root);
+    let graph = resolver.build_graph_from_entry(entry_path)?;
+    let parsed = resolver.parse_graph_from_entry(entry_path)?;
+    let bundle = esm_resolver::EsmBundle::build(&parsed, &resolver, entry_path);
+
+    let mut diagnostics = String::new();
+    diagnostics.push_str("//! ESM graph: resolved at compile time\n");
+    diagnostics.push_str(&format!("//! ESM modules: {}\n", graph.nodes.len()));
+    diagnostics.push_str(&format!("//! ESM imports: {}\n", parsed.total_imports()));
+    diagnostics.push_str(&format!("//! ESM exports: {}\n", parsed.total_exports()));
+    let packages = graph.package_names();
+    if !packages.is_empty() {
+        diagnostics.push_str(&format!("//! ESM packages: {}\n", packages.join(", ")));
+    }
+    let exports = parsed.exported_names();
+    if !exports.is_empty() {
+        diagnostics.push_str(&format!("//! ESM exported names: {}\n", exports.join(", ")));
+    }
+    diagnostics.push_str(&format!("//! ESM bundle symbols: {}\n", bundle.symbol_count()));
+    diagnostics.push_str(&format!(
+        "//! ESM bundle resolved: {}\n",
+        if bundle.is_fully_resolved() { "yes" } else { "no" }
+    ));
+    if !bundle.unresolved.is_empty() {
+        diagnostics.push_str(&format!("//! ESM unresolved bindings: {}\n", bundle.unresolved.len()));
+    }
+    diagnostics.push('\n');
+
+    // Only generate bundle code if there are symbols to compile.
+    let bundle_code = if bundle.symbol_count() > 0 {
+        Some(esm_codegen::generate_with_bodies(&bundle))
+    } else {
+        None
+    };
+
+    Ok(EsmArtifacts { diagnostics, bundle_code })
+}
+
+fn find_project_root(start: &std::path::Path) -> std::path::PathBuf {
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join("package.json").exists() || dir.join("node_modules").exists() {
+            return dir;
+        }
+        if !dir.pop() {
+            return start.to_path_buf();
+        }
+    }
 }
 
 fn resolve_css_imports(
@@ -228,8 +314,14 @@ edition = "2024"
     if flags.needs_async {
         toml.push_str("tokio = { version = \"1\", features = [\"full\"] }\n");
     }
-    if flags.needs_fetch || flags.needs_history {
+    if flags.needs_fetch || flags.needs_history || flags.needs_runtime {
         toml.push_str("w3cos-runtime = { path = \"../../crates/w3cos-runtime\" }\n");
+    }
+    if flags.needs_dom {
+        toml.push_str("w3cos-dom = { path = \"../../crates/w3cos-dom\" }\n");
+    }
+    if flags.needs_std {
+        toml.push_str("w3cos-std = { path = \"../../crates/w3cos-std\" }\n");
     }
 
     toml
@@ -368,6 +460,9 @@ console.log("Done!");
             needs_core: false,
             needs_fetch: false,
             needs_history: false,
+            needs_runtime: false,
+            needs_dom: false,
+            needs_std: false,
         };
         let toml = generate_standalone_cargo_toml(&flags);
         assert!(!toml.contains("tokio"), "should not include tokio: {toml}");
@@ -382,6 +477,9 @@ console.log("Done!");
             needs_core: false,
             needs_fetch: false,
             needs_history: false,
+            needs_runtime: false,
+            needs_dom: false,
+            needs_std: false,
         };
         let toml = generate_standalone_cargo_toml(&flags);
         assert!(toml.contains("tokio"), "should include tokio: {toml}");
@@ -533,5 +631,355 @@ export default <Text className="t" style={{ color: "#fff" }}>Hi</Text>
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── npm bridge integration tests ──────────────────────────────────────
+
+    #[test]
+    fn codemirror_import_injects_use_stmts() {
+        let ts = r#"
+import { EditorView } from "@codemirror/view";
+import { EditorState } from "@codemirror/state";
+
+function createEditor(): void {
+    console.log("editor created");
+}
+createEditor();
+"#;
+        let rust = compile_to_rust(ts).unwrap();
+        eprintln!("=== codemirror import output ===\n{rust}\n=== end ===");
+
+        assert!(
+            rust.contains("w3cos_dom"),
+            "should inject w3cos_dom use: {rust}"
+        );
+        assert!(
+            rust.contains("w3cos_runtime"),
+            "should inject w3cos_runtime use: {rust}"
+        );
+        assert!(
+            rust.contains("fn createEditor"),
+            "should transpile function: {rust}"
+        );
+    }
+
+    #[test]
+    fn unknown_npm_package_emits_warning_comment() {
+        let ts = r#"
+import { something } from "some-unknown-package";
+let x = 42;
+console.log(x);
+"#;
+        let rust = compile_to_rust(ts).unwrap();
+        eprintln!("=== unknown npm output ===\n{rust}\n=== end ===");
+
+        assert!(
+            rust.contains("some-unknown-package"),
+            "should warn about unknown package: {rust}"
+        );
+        assert!(
+            rust.contains("WARNING"),
+            "should emit WARNING comment: {rust}"
+        );
+    }
+
+    #[test]
+    fn relative_import_is_silently_ignored() {
+        let ts = r#"
+import { helper } from "./utils";
+let y = 10;
+console.log(y);
+"#;
+        let rust = compile_to_rust(ts).unwrap();
+        // Relative imports should not produce warnings or use stmts
+        assert!(
+            !rust.contains("WARNING"),
+            "relative import should not warn: {rust}"
+        );
+        assert!(
+            rust.contains("fn main"),
+            "should still produce main: {rust}"
+        );
+    }
+
+    #[test]
+    fn codemirror_full_bundle_import() {
+        let ts = r#"
+import { EditorView, ViewPlugin, Decoration } from "@codemirror/view";
+import { EditorState, Transaction, Extension } from "@codemirror/state";
+import { javascript } from "@codemirror/lang-javascript";
+
+function setupEditor(): void {
+    let state = 0;
+    console.log("setup", state);
+}
+setupEditor();
+"#;
+        let rust = compile_to_rust(ts).unwrap();
+        eprintln!("=== full bundle output ===\n{rust}\n=== end ===");
+
+        // @codemirror/view and @codemirror/state are bridged
+        assert!(rust.contains("w3cos_dom"), "missing w3cos_dom: {rust}");
+        assert!(rust.contains("w3cos_runtime"), "missing w3cos_runtime: {rust}");
+
+        // @codemirror/lang-javascript has no bridge → warning
+        assert!(
+            rust.contains("lang-javascript") || rust.contains("WARNING"),
+            "unknown lang package should warn: {rust}"
+        );
+
+        assert!(rust.contains("fn setupEditor"), "missing fn: {rust}");
+    }
+
+    #[test]
+    fn style_mod_and_w3c_keyname_bridge() {
+        let ts = r#"
+import { StyleModule } from "style-mod";
+import { keyName } from "w3c-keyname";
+
+function test(): void {
+    console.log("ok");
+}
+test();
+"#;
+        let rust = compile_to_rust(ts).unwrap();
+        eprintln!("=== style-mod + w3c-keyname output ===\n{rust}\n=== end ===");
+
+        assert!(
+            rust.contains("w3cos_dom::css_style"),
+            "style-mod should map to css_style: {rust}"
+        );
+        assert!(
+            !rust.contains("WARNING"),
+            "known packages should not warn: {rust}"
+        );
+    }
+
+    #[test]
+    fn real_codemirror_editorview_integration_currently_requires_esm_compile_pipeline() {
+        let ts = r#"
+import { EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+
+const state = EditorState.create({ doc: "hello w3cos" });
+const view = new EditorView({ state, parent: document.body });
+console.log("view", view);
+"#;
+
+        let rust = compile_to_rust(ts).unwrap();
+        eprintln!("=== real CodeMirror EditorView diagnostic output ===\n{rust}\n=== end ===");
+
+        assert!(
+            rust.contains("w3cos_dom"),
+            "CodeMirror import should expose W3C DOM APIs: {rust}"
+        );
+        assert!(
+            rust.contains("w3cos_runtime"),
+            "CodeMirror import should expose W3C runtime APIs: {rust}"
+        );
+        assert!(
+            !rust.contains("w3cos_codemirror"),
+            "must not generate non-standard w3cos_codemirror shims: {rust}"
+        );
+        assert!(
+            rust.contains("EditorView::new") || rust.contains("EditorView"),
+            "real EditorView should still come from the npm JS package, not a Rust shim: {rust}"
+        );
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/w3cos_real_codemirror_editorview_probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        compile(ts, &dir).expect("source should transpile to a diagnostic Rust project");
+        let cargo_toml_path = dir.join("Cargo.toml");
+        let mut cargo_toml = std::fs::read_to_string(&cargo_toml_path).unwrap();
+        cargo_toml.push_str("\n[workspace]\n");
+        std::fs::write(&cargo_toml_path, cargo_toml).unwrap();
+
+        let output = std::process::Command::new("cargo")
+            .arg("check")
+            .current_dir(&dir)
+            .output()
+            .expect("cargo check should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("=== real CodeMirror cargo check stdout ===\n{stdout}\n=== stderr ===\n{stderr}\n=== end ===");
+
+        assert!(
+            !output.status.success(),
+            "real CodeMirror should not be reported runnable until the ESM compile pipeline lowers npm modules"
+        );
+        assert!(
+            stderr.contains("EditorView")
+                || stderr.contains("EditorState")
+                || stderr.contains("w3cos_dom")
+                || stderr.contains("w3cos_runtime"),
+            "failure should point at missing ESM compile lowering or generated deps, got: {stderr}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compile_from_file_builds_codemirror_esm_graph() {
+        let root = std::env::temp_dir().join("w3cos_compile_codemirror_esm_graph");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        let app = root.join("src/app.ts");
+        std::fs::write(
+            &app,
+            r#"import { EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+
+const state = EditorState.create({ doc: "hello" });
+const view = new EditorView({ state, parent: document.body });
+console.log("view", view);"#,
+        )
+        .unwrap();
+
+        let view = root.join("node_modules/@codemirror/view");
+        std::fs::create_dir_all(view.join("dist")).unwrap();
+        std::fs::write(view.join("package.json"), r#"{"exports":{".":{"import":"./dist/index.js"}}}"#).unwrap();
+        std::fs::write(
+            view.join("dist/index.js"),
+            r#"import { EditorState } from "@codemirror/state";
+import { StyleModule } from "style-mod";
+export class EditorView {}"#,
+        )
+        .unwrap();
+
+        let state = root.join("node_modules/@codemirror/state");
+        std::fs::create_dir_all(state.join("dist")).unwrap();
+        std::fs::write(state.join("package.json"), r#"{"module":"dist/index.js"}"#).unwrap();
+        std::fs::write(state.join("dist/index.js"), "export class EditorState {}").unwrap();
+
+        let style = root.join("node_modules/style-mod");
+        std::fs::create_dir_all(&style).unwrap();
+        std::fs::write(style.join("package.json"), r#"{"main":"index.js"}"#).unwrap();
+        std::fs::write(style.join("index.js"), "export class StyleModule {}").unwrap();
+
+        let out = root.join("build");
+        compile_from_file(&app, &out).expect("compile_from_file should build ESM diagnostics");
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
+
+        assert!(main_rs.contains("ESM graph: resolved at compile time"), "missing ESM graph diagnostics: {main_rs}");
+        assert!(main_rs.contains("ESM modules: 4"), "entry + 3 package modules expected: {main_rs}");
+        assert!(main_rs.contains("ESM imports:"), "missing ESM import metadata: {main_rs}");
+        assert!(main_rs.contains("ESM exports:"), "missing ESM export metadata: {main_rs}");
+        assert!(main_rs.contains("@codemirror/view"), "missing CodeMirror view package: {main_rs}");
+        assert!(main_rs.contains("@codemirror/state"), "missing CodeMirror state package: {main_rs}");
+        assert!(main_rs.contains("style-mod"), "missing transitive dependency: {main_rs}");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn compile_from_file_generates_esm_bundle_module() {
+        let root = std::env::temp_dir().join("w3cos_e2e_esm_bundle");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"import { EditorView } from "@codemirror/view";
+import { EditorState } from "@codemirror/state";
+
+export function boot() {
+  const state = EditorState.create({doc: "hello"});
+  const view = new EditorView({state});
+  return view;
+}"#,
+        ).unwrap();
+
+        let view = root.join("node_modules/@codemirror/view");
+        std::fs::create_dir_all(view.join("dist")).unwrap();
+        std::fs::write(view.join("package.json"), r#"{"module":"dist/index.js"}"#).unwrap();
+        std::fs::write(
+            view.join("dist/index.js"),
+            r#"export class EditorView {
+  mount() {
+    const el = document.createElement("div");
+    return el;
+  }
+}
+export function keymap() {}"#,
+        ).unwrap();
+
+        let state = root.join("node_modules/@codemirror/state");
+        std::fs::create_dir_all(state.join("dist")).unwrap();
+        std::fs::write(state.join("package.json"), r#"{"module":"dist/index.js"}"#).unwrap();
+        std::fs::write(
+            state.join("dist/index.js"),
+            r#"export class EditorState {
+  static create(config) { return new EditorState(); }
+}"#,
+        ).unwrap();
+
+        let out = root.join("build");
+        compile_from_file(&root.join("src/app.ts"), &out).expect("e2e compile should succeed");
+
+        // Verify main.rs
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
+        assert!(main_rs.contains("mod esm_bundle;"), "main.rs should include esm_bundle module: {main_rs}");
+        assert!(main_rs.contains("ESM bundle symbols:"), "main.rs should have bundle diagnostics: {main_rs}");
+        assert!(main_rs.contains("ESM bundle resolved: yes"), "bundle should be fully resolved: {main_rs}");
+
+        // Verify esm_bundle.rs is generated
+        let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs"))
+            .expect("esm_bundle.rs should be generated");
+        assert!(bundle_rs.contains("pub struct"), "should contain struct definitions: {bundle_rs}");
+        assert!(bundle_rs.contains("EditorView"), "should contain EditorView: {bundle_rs}");
+        assert!(bundle_rs.contains("EditorState"), "should contain EditorState: {bundle_rs}");
+        assert!(bundle_rs.contains("pub fn"), "should contain function definitions: {bundle_rs}");
+        // Function bodies should be lowered, not todo!()
+        assert!(bundle_rs.contains("document.createElement"), "method body should be lowered: {bundle_rs}");
+        assert!(!bundle_rs.contains("todo!(\"lower ESM body: keymap\")"), "keymap body should be lowered: {bundle_rs}");
+
+        // Verify Cargo.toml
+        let cargo = std::fs::read_to_string(out.join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("[package]"), "should have valid Cargo.toml: {cargo}");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Integration test with the real `@codemirror/state` npm package.
+    /// Requires: `npm install @codemirror/state` in /tmp/cm_real_test
+    #[test]
+    fn real_codemirror_state_npm_package_compile() {
+        let project = std::path::Path::new("/tmp/cm_real_test");
+        if !project.join("node_modules/@codemirror/state").exists() {
+            eprintln!("SKIP: /tmp/cm_real_test not set up (npm install @codemirror/state)");
+            return;
+        }
+
+        let entry = project.join("src/app.ts");
+        let out = project.join("build");
+        let _ = std::fs::remove_dir_all(&out);
+
+        compile_from_file(&entry, &out).expect("compile_from_file should handle real @codemirror/state");
+
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
+        eprintln!("=== main.rs (first 40 lines) ===");
+        for line in main_rs.lines().take(40) {
+            eprintln!("  {line}");
+        }
+
+        assert!(main_rs.contains("ESM graph: resolved at compile time"), "diagnostics: {}", &main_rs[..200.min(main_rs.len())]);
+        assert!(main_rs.contains("@codemirror/state"), "should detect package");
+        assert!(main_rs.contains("mod esm_bundle;"), "should generate esm_bundle module");
+
+        let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs"))
+            .expect("esm_bundle.rs should be generated");
+        eprintln!("=== esm_bundle.rs stats ===");
+        eprintln!("  lines: {}", bundle_rs.lines().count());
+        eprintln!("  structs: {}", bundle_rs.matches("pub struct").count());
+        eprintln!("  fns: {}", bundle_rs.matches("pub fn").count());
+
+        assert!(bundle_rs.contains("pub struct"), "should have struct defs");
+        assert!(bundle_rs.contains("pub fn"), "should have fn defs");
+        assert!(bundle_rs.contains("EditorState"), "should export EditorState");
+
+        eprintln!("=== real @codemirror/state compilation: SUCCESS ===");
     }
 }
