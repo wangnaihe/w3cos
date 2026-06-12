@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::atom::Atom;
 use crate::css_style::CSSStyleDeclaration;
+use crate::dom_rect::DOMRect;
 use crate::element::Element;
 use crate::events::EventRegistry;
 use crate::node::{DomNode, NodeId, NodeType};
@@ -18,6 +19,11 @@ use crate::selection::{Range, Selection};
 pub struct Document {
     nodes: Vec<Option<DomNode>>,
     styles: Vec<CSSStyleDeclaration>,
+    /// Layout rects computed by the layout engine after each pass.
+    /// Indexed by NodeId — same arena as nodes/styles.
+    layout_rects: Vec<DOMRect>,
+    /// Scroll offsets (scroll_left, scroll_top) per node.
+    scroll_offsets: Vec<(f32, f32)>,
     free_list: Vec<u32>,
     dirty: Vec<NodeId>,
     pub(crate) events: EventRegistry,
@@ -35,6 +41,8 @@ impl Document {
         let mut doc = Self {
             nodes: Vec::new(),
             styles: Vec::new(),
+            layout_rects: Vec::new(),
+            scroll_offsets: Vec::new(),
             free_list: Vec::new(),
             dirty: Vec::new(),
             events: EventRegistry::new(),
@@ -295,6 +303,8 @@ impl Document {
             let idx = slot as usize;
             self.nodes[idx] = Some(node);
             self.styles[idx] = CSSStyleDeclaration::new();
+            self.layout_rects[idx] = DOMRect::zero();
+            self.scroll_offsets[idx] = (0.0, 0.0);
             NodeId(slot)
         } else {
             let id = NodeId(self.nodes.len() as u32);
@@ -302,11 +312,68 @@ impl Document {
             let tag = node.tag;
             self.nodes.push(Some(node));
             self.styles.push(CSSStyleDeclaration::new());
+            self.layout_rects.push(DOMRect::zero());
+            self.scroll_offsets.push((0.0, 0.0));
             // Update tag index
             self.tag_index.entry(tag).or_default().push(id);
             id
         };
         id
+    }
+
+    // -----------------------------------------------------------------------
+    // Layout rect API — called by the layout engine after each pass
+    // -----------------------------------------------------------------------
+
+    /// Get the last computed bounding rect for a node.
+    /// Returns `DOMRect::zero()` if no layout has been run yet.
+    pub fn get_layout_rect(&self, id: NodeId) -> DOMRect {
+        self.layout_rects
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Store the computed bounding rect for a node.
+    /// Called by the layout engine after each layout pass.
+    pub fn set_layout_rect(&mut self, id: NodeId, rect: DOMRect) {
+        let idx = id.0 as usize;
+        if idx < self.layout_rects.len() {
+            self.layout_rects[idx] = rect;
+        }
+    }
+
+    /// Bulk-update layout rects from a slice of (NodeId, DOMRect) pairs.
+    /// More efficient than calling `set_layout_rect` in a loop.
+    pub fn apply_layout_rects(&mut self, rects: &[(NodeId, DOMRect)]) {
+        for &(id, rect) in rects {
+            self.set_layout_rect(id, rect);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Scroll offset API
+    // -----------------------------------------------------------------------
+
+    /// Get the scroll offset (scroll_left, scroll_top) for a node.
+    pub fn get_scroll(&self, id: NodeId) -> (f32, f32) {
+        self.scroll_offsets
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// Set scroll offset. Pass `None` to leave an axis unchanged.
+    pub fn set_scroll(&mut self, id: NodeId, left: Option<f32>, top: Option<f32>) {
+        let idx = id.0 as usize;
+        if idx < self.scroll_offsets.len() {
+            if let Some(l) = left {
+                self.scroll_offsets[idx].0 = l;
+            }
+            if let Some(t) = top {
+                self.scroll_offsets[idx].1 = t;
+            }
+        }
     }
 
     /// Free a node slot for reuse. Does NOT unlink from tree — call remove_child first.
@@ -634,6 +701,211 @@ impl Document {
 
     fn link_child(&mut self, parent: NodeId, child: NodeId) {
         self.append_child(parent, child);
+    }
+
+    // ── selectionchange ───────────────────────────────────────────────────
+
+    /// Fire a `selectionchange` event on the document root.
+    /// CodeMirror's DOMObserver listens to this to track cursor/selection changes.
+    /// Call this whenever `Selection` state is updated by the runtime.
+    pub fn dispatch_selection_change(&mut self) {
+        use crate::events::{Event, EventType};
+        let root = NodeId::ROOT;
+        let mut ev = Event::new(EventType::SelectionChange, root);
+        ev.bubbles = false;
+        self.events.dispatch_at_node(root, &mut ev);
+    }
+
+    /// Add an event listener on the document root (for document-level events
+    /// like `selectionchange`). Returns the listener id for later removal.
+    pub fn add_document_event_listener(
+        &mut self,
+        event: &str,
+        handler: crate::events::EventHandler,
+    ) -> u32 {
+        if let Some(event_type) = crate::events::EventType::from_str(event) {
+            self.events.add(NodeId::ROOT, event_type, handler)
+        } else {
+            0
+        }
+    }
+
+    /// Fire a `beforeinput` event on the given target element.
+    /// Returns `true` if `preventDefault()` was called (caller should suppress the input).
+    pub fn dispatch_before_input(
+        &mut self,
+        target: NodeId,
+        data: Option<String>,
+        input_type: Option<crate::events::InputType>,
+        target_ranges: Vec<(NodeId, usize, NodeId, usize)>,
+    ) -> bool {
+        use crate::events::{Event, EventData, EventType};
+        let mut ev = Event::new(EventType::BeforeInput, target);
+        ev.bubbles = true;
+        ev.cancelable = true;
+        ev.data = EventData::BeforeInput {
+            data,
+            input_type,
+            is_composing: false,
+            target_ranges,
+        };
+        self.dispatch_event_bubbling(&mut ev);
+        ev.prevent_default
+    }
+
+    // ── contenteditable ───────────────────────────────────────────────────
+
+    /// Returns true if the given node has `contenteditable="true"` or `""`.
+    pub fn is_content_editable(&self, id: NodeId) -> bool {
+        self.get_node(id).is_content_editable()
+    }
+
+    /// Walk up the ancestor chain to find the nearest contenteditable root.
+    pub fn editable_root(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = Some(id);
+        while let Some(node_id) = current {
+            let node = self.get_node(node_id);
+            if node.is_content_editable() {
+                return Some(node_id);
+            }
+            current = node.parent;
+        }
+        None
+    }
+
+    /// Handle a keyboard event on a `contenteditable` element.
+    /// Mutates the text content of the focused node and fires a W3C `InputEvent`.
+    /// Returns true if the event was handled (caller should call `preventDefault`).
+    pub fn handle_contenteditable_key(
+        &mut self,
+        target: NodeId,
+        key: &str,
+        ctrl: bool,
+        meta: bool,
+    ) -> bool {
+        use crate::events::{Event, EventData, EventType, InputType};
+
+        let editable_id = match self.editable_root(target) {
+            Some(id) => id,
+            None => return false,
+        };
+
+        // Find the text node child to mutate, or use the element's text_content
+        let text_node_id = {
+            let node = self.get_node(editable_id);
+            node.first_child
+        };
+
+        let (input_type, inserted_text) = match key {
+            // Printable character — insert
+            k if k.len() == 1 && !ctrl && !meta => {
+                (InputType::InsertText, Some(k.to_string()))
+            }
+            "Enter" => (InputType::InsertParagraph, Some("\n".to_string())),
+            "Backspace" => (InputType::DeleteContentBackward, None),
+            "Delete" => (InputType::DeleteContentForward, None),
+            // Ctrl/Cmd+Z — undo
+            "z" | "Z" if ctrl || meta => (InputType::HistoryUndo, None),
+            // Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z — redo
+            "y" | "Y" if ctrl || meta => (InputType::HistoryRedo, None),
+            // Ctrl/Cmd+X — cut
+            "x" | "X" if ctrl || meta => (InputType::DeleteByCut, None),
+            // Ctrl/Cmd+V — paste (caller handles actual clipboard read)
+            "v" | "V" if ctrl || meta => (InputType::InsertFromPaste, None),
+            _ => return false,
+        };
+
+        // Mutate text content
+        let target_id = text_node_id.unwrap_or(editable_id);
+        {
+            let node = self.get_node_mut(target_id);
+            let text = node.text_content.get_or_insert_with(String::new);
+            match &input_type {
+                InputType::InsertText | InputType::InsertParagraph => {
+                    if let Some(ref s) = inserted_text {
+                        text.push_str(s);
+                    }
+                }
+                InputType::DeleteContentBackward => {
+                    // Remove last char (respects multi-byte UTF-8)
+                    let mut chars = text.chars();
+                    chars.next_back();
+                    *text = chars.as_str().to_string();
+                }
+                InputType::DeleteContentForward => {
+                    if !text.is_empty() {
+                        let mut chars = text.chars();
+                        chars.next();
+                        *text = chars.as_str().to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.mark_dirty(target_id);
+
+        // Fire W3C InputEvent (bubbles, not cancelable per spec)
+        let mut input_event = Event::new(EventType::Input, editable_id);
+        input_event.bubbles = true;
+        input_event.cancelable = false;
+        input_event.data = EventData::Input {
+            data: inserted_text,
+            input_type: Some(input_type),
+            is_composing: false,
+        };
+        self.dispatch_event_bubbling(&mut input_event);
+
+        true
+    }
+
+    /// Handle IME composition events on a `contenteditable` element.
+    /// `phase`: "start" | "update" | "end"
+    pub fn handle_composition(
+        &mut self,
+        target: NodeId,
+        phase: &str,
+        data: &str,
+    ) {
+        use crate::events::{Event, EventData, EventType, InputType};
+
+        let editable_id = match self.editable_root(target) {
+            Some(id) => id,
+            None => return,
+        };
+
+        let event_type = match phase {
+            "start" => EventType::CompositionStart,
+            "update" => EventType::CompositionUpdate,
+            _ => EventType::CompositionEnd,
+        };
+
+        let mut comp_event = Event::new(event_type, editable_id);
+        comp_event.bubbles = true;
+        comp_event.data = EventData::Composition { data: data.to_string() };
+        self.dispatch_event_bubbling(&mut comp_event);
+
+        // On compositionend, fire an InputEvent with insertCompositionText
+        if phase == "end" && !data.is_empty() {
+            let text_node_id = self.get_node(editable_id).first_child;
+            let target_id = text_node_id.unwrap_or(editable_id);
+            {
+                let node = self.get_node_mut(target_id);
+                let text = node.text_content.get_or_insert_with(String::new);
+                text.push_str(data);
+            }
+            self.mark_dirty(target_id);
+
+            let mut input_event = Event::new(EventType::Input, editable_id);
+            input_event.bubbles = true;
+            input_event.cancelable = false;
+            input_event.data = EventData::Input {
+                data: Some(data.to_string()),
+                input_type: Some(InputType::InsertCompositionText),
+                is_composing: false,
+            };
+            self.dispatch_event_bubbling(&mut input_event);
+        }
     }
 }
 

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::io::Read as IoRead;
 use std::sync::mpsc;
 use std::thread;
+
+use crate::streams::{ReadResult, ReadableStream};
 
 #[derive(Debug, Clone, Default)]
 pub enum Method {
@@ -23,26 +24,55 @@ pub struct FetchOptions {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+/// W3C `Response` — mirrors the Fetch API Response interface.
+///
+/// The body is a `ReadableStream` — call `.text()` / `.json()` for buffered
+/// access, or `.body()` to get the raw stream for incremental consumption
+/// (e.g. SSE, streaming LLM responses).
 pub struct FetchResponse {
     pub status: u16,
     pub ok: bool,
     pub status_text: String,
     pub headers: HashMap<String, String>,
-    body: String,
+    /// The response body as a `ReadableStream<Uint8Array>`.
+    /// Consumed once — matches the W3C spec's "body used" flag.
+    body_stream: ReadableStream,
 }
 
 impl FetchResponse {
-    pub fn text(&self) -> &str {
-        &self.body
+    /// `Response.body` — the raw `ReadableStream`.
+    /// Use this for streaming / incremental consumption.
+    pub fn body(&self) -> &ReadableStream {
+        &self.body_stream
     }
 
+    /// `Response.text()` — buffer the entire body as a UTF-8 string.
+    /// Blocks until the stream is fully consumed.
+    pub fn text(&self) -> Result<String, String> {
+        let reader = self.body_stream.get_reader();
+        reader.read_to_string()
+    }
+
+    /// `Response.arrayBuffer()` — buffer the entire body as raw bytes.
+    pub fn array_buffer(&self) -> Result<Vec<u8>, String> {
+        let reader = self.body_stream.get_reader();
+        reader.read_to_end()
+    }
+
+    /// `Response.json()` — buffer and parse the body as JSON.
     pub fn json(&self) -> Result<serde_json::Value, String> {
-        serde_json::from_str(&self.body).map_err(|e| format!("JSON parse error: {e}"))
+        let text = self.text()?;
+        serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {e}"))
+    }
+
+    /// Convenience: clone headers without consuming the body.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).map(|s| s.as_str())
     }
 }
 
-/// Blocking fetch — performs an HTTP request and returns the response.
+/// Blocking fetch — performs an HTTP request and returns a `FetchResponse`.
+/// The response body is streamed lazily via `ReadableStream`.
 pub fn fetch(url: &str, options: FetchOptions) -> FetchResponse {
     match fetch_inner(url, &options) {
         Ok(resp) => resp,
@@ -51,7 +81,7 @@ pub fn fetch(url: &str, options: FetchOptions) -> FetchResponse {
             ok: false,
             status_text: e.to_string(),
             headers: HashMap::new(),
-            body: String::new(),
+            body_stream: ReadableStream::from_bytes(Vec::new()),
         },
     }
 }
@@ -71,31 +101,42 @@ fn build_agent(options: &FetchOptions) -> ureq::Agent {
     }
 }
 
-fn fetch_inner(url: &str, options: &FetchOptions) -> Result<FetchResponse, Box<dyn std::error::Error>> {
+fn fetch_inner(
+    url: &str,
+    options: &FetchOptions,
+) -> Result<FetchResponse, Box<dyn std::error::Error>> {
     let agent = build_agent(options);
 
-    let build_without_body = |mut req: ureq::RequestBuilder<ureq::typestate::WithoutBody>| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-        for (key, value) in &options.headers {
-            req = req.header(key.as_str(), value.as_str());
-        }
-        req.call()
-    };
-
-    let build_with_body = |mut req: ureq::RequestBuilder<ureq::typestate::WithBody>| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-        for (key, value) in &options.headers {
-            req = req.header(key.as_str(), value.as_str());
-        }
-        if let Some(ref body) = options.body {
-            if !options.headers.contains_key("content-type")
-                && !options.headers.contains_key("Content-Type")
-            {
-                req = req.header("Content-Type", "application/json");
+    let build_without_body =
+        |mut req: ureq::RequestBuilder<ureq::typestate::WithoutBody>| -> Result<
+            ureq::http::Response<ureq::Body>,
+            ureq::Error,
+        > {
+            for (key, value) in &options.headers {
+                req = req.header(key.as_str(), value.as_str());
             }
-            req.send(body.as_bytes())
-        } else {
-            req.send_empty()
-        }
-    };
+            req.call()
+        };
+
+    let build_with_body =
+        |mut req: ureq::RequestBuilder<ureq::typestate::WithBody>| -> Result<
+            ureq::http::Response<ureq::Body>,
+            ureq::Error,
+        > {
+            for (key, value) in &options.headers {
+                req = req.header(key.as_str(), value.as_str());
+            }
+            if let Some(ref body) = options.body {
+                if !options.headers.contains_key("content-type")
+                    && !options.headers.contains_key("Content-Type")
+                {
+                    req = req.header("Content-Type", "application/json");
+                }
+                req.send(body.as_bytes())
+            } else {
+                req.send_empty()
+            }
+        };
 
     let resp = match options.method {
         Method::Get => build_without_body(agent.get(url))?,
@@ -121,17 +162,18 @@ fn fetch_inner(url: &str, options: &FetchOptions) -> Result<FetchResponse, Box<d
         }
     }
 
-    let mut body_str = String::new();
-    resp.into_body()
-        .as_reader()
-        .read_to_string(&mut body_str)?;
+    // Wrap the response body in a ReadableStream — streamed in 16 KiB chunks.
+    // The reader runs on a background thread so the caller is never blocked
+    // waiting for the full body before processing begins.
+    let body_reader = resp.into_body().into_reader();
+    let body_stream = ReadableStream::from_reader(body_reader, 16 * 1024);
 
     Ok(FetchResponse {
         status,
         ok: (200..300).contains(&status),
         status_text,
         headers,
-        body: body_str,
+        body_stream,
     })
 }
 
@@ -141,6 +183,7 @@ pub enum FetchResult {
 }
 
 /// Non-blocking fetch — runs the request in a background thread.
+/// Returns a channel receiver that yields a single `FetchResult`.
 pub fn fetch_async(url: &str, options: FetchOptions) -> mpsc::Receiver<FetchResult> {
     let (tx, rx) = mpsc::channel();
     let url = url.to_string();
@@ -177,7 +220,7 @@ mod tests {
         let resp = fetch("https://httpbin.org/get", FetchOptions::default());
         assert!(resp.ok, "status: {} {}", resp.status, resp.status_text);
         assert_eq!(resp.status, 200);
-        assert!(!resp.text().is_empty());
+        assert!(!resp.text().unwrap().is_empty());
     }
 
     #[test]

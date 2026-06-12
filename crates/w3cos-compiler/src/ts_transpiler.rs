@@ -93,6 +93,12 @@ struct TranspileContext {
     closure_rename_stack: Vec<std::collections::HashMap<String, String>>,
     /// Track variables declared via `reactive()` for compile-time optimization.
     reactive_vars: std::collections::HashSet<String>,
+    /// Rust `use` statements injected from npm package bridge resolutions.
+    npm_use_stmts: Vec<String>,
+    /// Symbol aliases from npm bridge (TS name → Rust path).
+    npm_symbol_map: std::collections::HashMap<String, String>,
+    /// npm packages that had no bridge (logged as warnings).
+    npm_unsupported: Vec<String>,
 }
 
 impl TranspileContext {
@@ -112,6 +118,9 @@ impl TranspileContext {
             needs_history: false,
             closure_rename_stack: Vec::new(),
             reactive_vars: std::collections::HashSet::new(),
+            npm_use_stmts: Vec::new(),
+            npm_symbol_map: std::collections::HashMap::new(),
+            npm_unsupported: Vec::new(),
         }
     }
 
@@ -126,7 +135,18 @@ impl TranspileContext {
         if self.needs_hashmap {
             result.push_str("use std::collections::HashMap;\n");
         }
-        if self.needs_rc || self.needs_hashmap || self.needs_core {
+        // Inject npm bridge use statements
+        for stmt in &self.npm_use_stmts {
+            result.push_str(stmt);
+            result.push('\n');
+        }
+        if !self.npm_unsupported.is_empty() {
+            result.push_str("// WARNING: unsupported npm packages (no w3cos bridge):\n");
+            for pkg in &self.npm_unsupported {
+                result.push_str(&format!("// - {pkg}\n"));
+            }
+        }
+        if self.needs_rc || self.needs_hashmap || self.needs_core || !self.npm_use_stmts.is_empty() {
             result.push('\n');
         }
         for s in &self.struct_defs {
@@ -334,7 +354,33 @@ impl TranspileContext {
 
     fn transpile_module_decl(&mut self, decl: &ModuleDecl) -> Result<()> {
         match decl {
-            ModuleDecl::Import(_) => Ok(()),
+            ModuleDecl::Import(import_decl) => {
+                let specifier_owned = format!("{:?}", import_decl.src.value);
+                // {:?} on Wtf8Atom gives `"pkg-name"` with quotes — strip them
+                let specifier = specifier_owned.trim_matches('"');
+                match crate::npm_bridge::resolve_package(specifier) {
+                    Some(res) => {
+                        // Inject Rust use statements from bridge
+                        for stmt in &res.use_stmts {
+                            if !self.npm_use_stmts.contains(stmt) {
+                                self.npm_use_stmts.push(stmt.clone());
+                            }
+                        }
+                        // Register symbol aliases for later identifier resolution
+                        self.npm_symbol_map.extend(res.symbol_aliases);
+                    }
+                    None if !specifier.starts_with('.') && !specifier.starts_with('/') => {
+                        // External npm package with no bridge
+                        if !self.npm_unsupported.contains(&specifier.to_string()) {
+                            self.npm_unsupported.push(specifier.to_string());
+                        }
+                    }
+                    None => {
+                        // Relative import — ignore (local file, handled separately)
+                    }
+                }
+                Ok(())
+            }
             ModuleDecl::ExportDecl(export) => self.transpile_decl(&export.decl),
             ModuleDecl::ExportDefaultExpr(export) => {
                 self.push_indent();
@@ -3141,6 +3187,9 @@ mod tests {
             needs_core: true,
             needs_fetch: false,
             needs_history: false,
+            needs_runtime: false,
+            needs_dom: false,
+            needs_std: false,
         };
         let toml = crate::generate_standalone_cargo_toml(&flags);
         assert!(toml.contains("w3cos-core"), "missing w3cos-core dep: {toml}");

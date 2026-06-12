@@ -28,6 +28,12 @@ serde_json = { workspace = true }
 libc = "0.2"
 notify-rust = "4"
 arboard = "3.6.1"
+notify = { workspace = true }
+sysinfo = { workspace = true }
+nix = { workspace = true }
+tempfile = { workspace = true }
+glob = { workspace = true }
+w3cos-ffi = { path = "../w3cos-ffi" }
 
 # WebSocket client + DevTools
 tungstenite = { workspace = true }

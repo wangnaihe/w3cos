@@ -1,0 +1,15 @@
+[package]
+name = "w3cos-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "W3C OS native FFI bridge — dlopen, symbol lookup, C ABI calls"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libloading = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

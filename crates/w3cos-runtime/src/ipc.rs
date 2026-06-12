@@ -475,3 +475,365 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared Memory (w3cos.ipc.shm) — Unix only
+// ---------------------------------------------------------------------------
+
+/// A POSIX shared memory segment.
+///
+/// Creates or opens a named shared memory object. The segment is unmapped
+/// and unlinked when this struct is dropped (if `owner` is true).
+#[cfg(unix)]
+pub struct SharedMemory {
+    name: String,
+    ptr: *mut libc::c_void,
+    size: usize,
+    owner: bool,
+}
+
+#[cfg(unix)]
+unsafe impl Send for SharedMemory {}
+#[cfg(unix)]
+unsafe impl Sync for SharedMemory {}
+
+#[cfg(unix)]
+impl SharedMemory {
+    /// Create a new named shared memory segment of `size` bytes.
+    pub fn create(name: &str, size: usize) -> Result<Self, String> {
+        use libc::{ftruncate, mmap, shm_open};
+        use libc::{MAP_SHARED, O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, S_IRUSR, S_IWUSR};
+        use std::ffi::CString;
+
+        let cname = CString::new(name).map_err(|e| e.to_string())?;
+        let fd = unsafe { shm_open(cname.as_ptr(), O_CREAT | O_RDWR, (S_IRUSR | S_IWUSR) as libc::c_uint) };
+        if fd < 0 {
+            return Err(format!("shm_open failed: {}", std::io::Error::last_os_error()));
+        }
+        if unsafe { ftruncate(fd, size as libc::off_t) } < 0 {
+            unsafe { libc::close(fd) };
+            return Err(format!("ftruncate failed: {}", std::io::Error::last_os_error()));
+        }
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                size,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        unsafe { libc::close(fd) };
+        if ptr == libc::MAP_FAILED {
+            return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
+        }
+        Ok(Self { name: name.to_string(), ptr, size, owner: true })
+    }
+
+    /// Open an existing named shared memory segment.
+    pub fn open(name: &str, size: usize) -> Result<Self, String> {
+        use libc::{mmap, shm_open};
+        use libc::{MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE};
+        use std::ffi::CString;
+
+        let cname = CString::new(name).map_err(|e| e.to_string())?;
+        let fd = unsafe { shm_open(cname.as_ptr(), O_RDWR, 0) };
+        if fd < 0 {
+            return Err(format!("shm_open failed: {}", std::io::Error::last_os_error()));
+        }
+        let ptr = unsafe {
+            mmap(std::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+        };
+        unsafe { libc::close(fd) };
+        if ptr == libc::MAP_FAILED {
+            return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
+        }
+        Ok(Self { name: name.to_string(), ptr, size, owner: false })
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Write bytes into the shared memory at `offset`.
+    pub fn write(&mut self, offset: usize, data: &[u8]) -> Result<(), String> {
+        if offset + data.len() > self.size {
+            return Err("write out of bounds".to_string());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (self.ptr as *mut u8).add(offset),
+                data.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Read bytes from the shared memory at `offset`.
+    pub fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>, String> {
+        if offset + len > self.size {
+            return Err("read out of bounds".to_string());
+        }
+        let mut buf = vec![0u8; len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (self.ptr as *const u8).add(offset),
+                buf.as_mut_ptr(),
+                len,
+            );
+        }
+        Ok(buf)
+    }
+
+    /// Get a raw mutable pointer to the shared memory region.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr as *mut u8
+    }
+
+    /// Get a raw const pointer to the shared memory region.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr as *const u8
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SharedMemory {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr, self.size);
+            if self.owner {
+                let cname = std::ffi::CString::new(self.name.as_str()).unwrap();
+                libc::shm_unlink(cname.as_ptr());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Named Semaphore (w3cos.ipc.semaphore) — Unix only
+// ---------------------------------------------------------------------------
+
+/// A POSIX named semaphore for cross-process synchronization.
+#[cfg(unix)]
+pub struct NamedSemaphore {
+    name: String,
+    sem: *mut libc::sem_t,
+    owner: bool,
+}
+
+#[cfg(unix)]
+unsafe impl Send for NamedSemaphore {}
+#[cfg(unix)]
+unsafe impl Sync for NamedSemaphore {}
+
+#[cfg(unix)]
+impl NamedSemaphore {
+    /// Create a new named semaphore with an initial value.
+    pub fn create(name: &str, initial: u32) -> Result<Self, String> {
+        use libc::{sem_open, O_CREAT, O_EXCL, S_IRUSR, S_IWUSR};
+        use std::ffi::CString;
+
+        let cname = CString::new(name).map_err(|e| e.to_string())?;
+        let sem = unsafe {
+            sem_open(
+                cname.as_ptr(),
+                O_CREAT | O_EXCL,
+                (S_IRUSR | S_IWUSR) as libc::c_uint,
+                initial,
+            )
+        };
+        if sem == libc::SEM_FAILED {
+            return Err(format!("sem_open failed: {}", std::io::Error::last_os_error()));
+        }
+        Ok(Self { name: name.to_string(), sem, owner: true })
+    }
+
+    /// Open an existing named semaphore.
+    pub fn open(name: &str) -> Result<Self, String> {
+        use std::ffi::CString;
+        let cname = CString::new(name).map_err(|e| e.to_string())?;
+        let sem = unsafe { libc::sem_open(cname.as_ptr(), 0) };
+        if sem == libc::SEM_FAILED {
+            return Err(format!("sem_open failed: {}", std::io::Error::last_os_error()));
+        }
+        Ok(Self { name: name.to_string(), sem, owner: false })
+    }
+
+    /// Decrement (wait/lock) the semaphore. Blocks if value is 0.
+    pub fn wait(&self) -> Result<(), String> {
+        if unsafe { libc::sem_wait(self.sem) } == 0 {
+            Ok(())
+        } else {
+            Err(format!("sem_wait failed: {}", std::io::Error::last_os_error()))
+        }
+    }
+
+    /// Non-blocking decrement. Returns `false` if would block.
+    pub fn try_wait(&self) -> bool {
+        unsafe { libc::sem_trywait(self.sem) == 0 }
+    }
+
+    /// Increment (post/unlock) the semaphore.
+    pub fn post(&self) -> Result<(), String> {
+        if unsafe { libc::sem_post(self.sem) } == 0 {
+            Ok(())
+        } else {
+            Err(format!("sem_post failed: {}", std::io::Error::last_os_error()))
+        }
+    }
+
+    /// Get the current semaphore value.
+    pub fn value(&self) -> Result<i32, String> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut val: libc::c_int = 0;
+            if unsafe { libc::sem_getvalue(self.sem, &mut val) } == 0 {
+                Ok(val)
+            } else {
+                Err(format!("sem_getvalue failed: {}", std::io::Error::last_os_error()))
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // sem_getvalue is not reliably available on macOS; return -1 as unsupported.
+            Err("sem_getvalue not supported on this platform".to_string())
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for NamedSemaphore {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sem_close(self.sem);
+            if self.owner {
+                let cname = std::ffi::CString::new(self.name.as_str()).unwrap();
+                libc::sem_unlink(cname.as_ptr());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Message Queue (w3cos.ipc.mqueue) — Linux only
+// ---------------------------------------------------------------------------
+
+/// A POSIX message queue for typed inter-process messaging.
+///
+/// Available on Linux only (macOS removed mqueue support).
+#[cfg(target_os = "linux")]
+pub struct MessageQueue {
+    name: String,
+    mqd: libc::mqd_t,
+    owner: bool,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for MessageQueue {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for MessageQueue {}
+
+#[cfg(target_os = "linux")]
+impl MessageQueue {
+    /// Create a new message queue.
+    pub fn create(name: &str, max_msgs: i64, max_msg_size: i64) -> Result<Self, String> {
+        use libc::{mq_open, O_CREAT, O_RDWR, S_IRUSR, S_IWUSR};
+        use std::ffi::CString;
+
+        let cname = CString::new(name).map_err(|e| e.to_string())?;
+        let attr = libc::mq_attr {
+            mq_flags: 0,
+            mq_maxmsg: max_msgs,
+            mq_msgsize: max_msg_size,
+            mq_curmsgs: 0,
+            __pad: [0; 4],
+        };
+        let mqd = unsafe {
+            mq_open(
+                cname.as_ptr(),
+                O_CREAT | O_RDWR,
+                (S_IRUSR | S_IWUSR) as libc::c_uint,
+                &attr as *const libc::mq_attr,
+            )
+        };
+        if mqd == -1 as libc::mqd_t {
+            return Err(format!("mq_open failed: {}", std::io::Error::last_os_error()));
+        }
+        Ok(Self { name: name.to_string(), mqd, owner: true })
+    }
+
+    /// Open an existing message queue.
+    pub fn open(name: &str) -> Result<Self, String> {
+        use libc::{mq_open, O_RDWR};
+        use std::ffi::CString;
+
+        let cname = CString::new(name).map_err(|e| e.to_string())?;
+        let mqd = unsafe { mq_open(cname.as_ptr(), O_RDWR) };
+        if mqd == -1 as libc::mqd_t {
+            return Err(format!("mq_open failed: {}", std::io::Error::last_os_error()));
+        }
+        Ok(Self { name: name.to_string(), mqd, owner: false })
+    }
+
+    /// Send a message with the given priority (0 = lowest).
+    pub fn send(&self, data: &[u8], priority: u32) -> Result<(), String> {
+        let ret = unsafe {
+            libc::mq_send(self.mqd, data.as_ptr() as *const libc::c_char, data.len(), priority)
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(format!("mq_send failed: {}", std::io::Error::last_os_error()))
+        }
+    }
+
+    /// Receive the next message. Blocks until a message is available.
+    pub fn recv(&self, max_size: usize) -> Result<(Vec<u8>, u32), String> {
+        let mut buf = vec![0u8; max_size];
+        let mut priority: u32 = 0;
+        let n = unsafe {
+            libc::mq_receive(
+                self.mqd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                max_size,
+                &mut priority,
+            )
+        };
+        if n < 0 {
+            return Err(format!("mq_receive failed: {}", std::io::Error::last_os_error()));
+        }
+        buf.truncate(n as usize);
+        Ok((buf, priority))
+    }
+
+    /// Get current queue attributes (current message count, etc.).
+    pub fn attributes(&self) -> Result<(i64, i64, i64), String> {
+        let mut attr = libc::mq_attr {
+            mq_flags: 0,
+            mq_maxmsg: 0,
+            mq_msgsize: 0,
+            mq_curmsgs: 0,
+            __pad: [0; 4],
+        };
+        if unsafe { libc::mq_getattr(self.mqd, &mut attr) } == 0 {
+            Ok((attr.mq_maxmsg, attr.mq_msgsize, attr.mq_curmsgs))
+        } else {
+            Err(format!("mq_getattr failed: {}", std::io::Error::last_os_error()))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MessageQueue {
+    fn drop(&mut self) {
+        unsafe {
+            libc::mq_close(self.mqd);
+            if self.owner {
+                let cname = std::ffi::CString::new(self.name.as_str()).unwrap();
+                libc::mq_unlink(cname.as_ptr());
+            }
+        }
+    }
+}
