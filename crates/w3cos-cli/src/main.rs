@@ -1,3 +1,5 @@
+mod mobile;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -52,6 +54,28 @@ enum Commands {
         /// Project name (creates a directory with this name).
         project_name: PathBuf,
     },
+    /// Mobile app scaffolding (Android / iOS shell + w3cos.app.json).
+    Mobile {
+        #[command(subcommand)]
+        command: MobileCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum MobileCommands {
+    /// Create a new mobile project from generic templates.
+    Init {
+        project_name: PathBuf,
+        /// Target platform: android, ios, or both.
+        #[arg(long, default_value = "android")]
+        platform: String,
+    },
+    /// Build mobile artifact (APK/IPA) — M2 automation; prints M1 manual steps today.
+    Build {
+        /// Path to app.tsx entry (optional hint for M2).
+        #[arg(default_value = "app.tsx")]
+        entry: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -85,6 +109,13 @@ fn main() -> Result<()> {
         Commands::Init { project_name } => {
             init(&project_name)?;
         }
+        Commands::Mobile { command } => match command {
+            MobileCommands::Init {
+                project_name,
+                platform,
+            } => mobile::mobile_init(&project_name, &platform)?,
+            MobileCommands::Build { entry: _ } => mobile::mobile_build_hint()?,
+        },
     }
 
     Ok(())

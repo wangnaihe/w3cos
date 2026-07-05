@@ -14,6 +14,7 @@ members = [
     "crates/w3cos-rn-compat",
     "crates/w3cos-react-compat",
     "crates/w3cos-ffi",
+    "crates/w3cos-mobile",
 ]
 
 [workspace.package]
@@ -32,6 +33,7 @@ w3cos-a11y = { path = "crates/w3cos-a11y" }
 w3cos-ai-bridge = { path = "crates/w3cos-ai-bridge" }
 w3cos-rn-compat = { path = "crates/w3cos-rn-compat" }
 w3cos-react-compat = { path = "crates/w3cos-react-compat" }
+w3cos-mobile = { path = "crates/w3cos-mobile" }
 png = "0.17"
 image = "0.25"
 

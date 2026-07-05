@@ -1,0 +1,11 @@
+{
+  "name": "MyApp",
+  "bundle_id": "com.example.myapp",
+  "entry": "app.tsx",
+  "orientation": "portrait",
+  "safe_area": true,
+  "shell": {
+    "status_bar_style": "light",
+    "content_slot": "root"
+  }
+}

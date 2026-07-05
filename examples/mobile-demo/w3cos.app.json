@@ -1,0 +1,11 @@
+{
+  "name": "Mobile Demo",
+  "bundle_id": "com.example.w3cos.mobiledemo",
+  "entry": "app.tsx",
+  "orientation": "portrait",
+  "safe_area": true,
+  "shell": {
+    "status_bar_style": "light",
+    "content_slot": "root"
+  }
+}

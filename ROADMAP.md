@@ -203,7 +203,10 @@
 - [ ] Electron app AST transpiler (strip Chromium, map APIs)
 - [x] PWA manifest support (`w3cos_runtime::pwa::PwaManifest` parses W3C Web App Manifest — `name`/`short_name`/`id`/`start_url`/`display`/`display_override`/`theme_color`/`background_color`/`icons`/`shortcuts` + closest-icon picker + `into_app_manifest` adapter for the W3C OS app registry)
 - [ ] npm package compatibility (pure-logic packages)
-- [ ] Cross-compilation: Linux x86/ARM, macOS
+- [ ] Cross-compilation: Linux x86/ARM, macOS, **Android (APK), iOS**
+- [ ] **Mobile M1** 🚧 `w3cos-mobile` crate, `examples/mobile-demo`, `templates/android`, `w3cos mobile init`
+- [ ] **Mobile M2** `w3cos mobile build` → APK automation
+- [ ] **Mobile M3** `w3cos-mobile-shell` chrome (SafeArea, StatusBar)
 
 ## Phase 4 — Operating System ✅ (core done)
 - [x] w3cos-shell crate: native desktop shell binary (taskbar, icons, system tray)

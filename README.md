@@ -40,6 +40,20 @@ cargo build --release
 ./showcase    # Opens a native window — no browser involved
 ```
 
+## Mobile (Android / iOS)
+
+RN-like **shell + AOT app** — generic platform, no product-specific examples.
+
+```bash
+# Desktop dev (same TSX pipeline)
+w3cos build examples/mobile-demo/app.tsx -o mobile-demo --release
+
+# Scaffold Android shell project
+w3cos mobile init MyApp --platform android
+```
+
+See [docs/MOBILE.md](docs/MOBILE.md).
+
 ## Example
 
 ### TSX Syntax (recommended)
@@ -206,10 +220,15 @@ w3cos/
 │   ├── w3cos-ai-bridge/   # AI agent interface (3-layer access + permissions)
 │   ├── w3cos-compiler/    # TS → Rust transpiler (SWC parser + CSS/SCSS)
 │   ├── w3cos-runtime/     # Layout + Rendering + Window + System APIs
-│   ├── w3cos-cli/         # CLI: w3cos build / run / dev / init
+│   ├── w3cos-cli/         # CLI: w3cos build / run / dev / init / mobile
+│   ├── w3cos-mobile/    # Mobile platform (touch, safe area, Android JNI)
 │   ├── w3cos-shell/       # System-level desktop shell binary
 │   ├── w3cos-demo/        # Showcase demo binary
 │   └── w3cos-rn-compat/   # React Native API compatibility layer
+├── templates/
+│   ├── android/           # Gradle shell (RN-like)
+│   └── shared/            # app.tsx + w3cos.app.json starter
+├── docs/MOBILE.md         # Mobile build guide
 ├── system/
 │   ├── buildroot/         # Bootable ISO config
 │   ├── rootfs_overlay/    # System init scripts
