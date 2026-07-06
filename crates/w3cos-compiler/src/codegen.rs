@@ -84,7 +84,7 @@ w3cos-std = {{ path = "{std_}" }}
     ))
 }
 
-fn find_workspace_root() -> Result<std::path::PathBuf> {
+pub(crate) fn find_workspace_root() -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().unwrap_or_else(|_| std::env::current_dir().unwrap());
     let mut dir = exe.parent().unwrap().to_path_buf();
 
@@ -120,7 +120,7 @@ fn find_workspace_root() -> Result<std::path::PathBuf> {
     )
 }
 
-fn gen_node(node: &Node, depth: usize, signal_names: &[&str], stylesheet: &Stylesheet) -> String {
+pub(crate) fn gen_node(node: &Node, depth: usize, signal_names: &[&str], stylesheet: &Stylesheet) -> String {
     let indent = "    ".repeat(depth + 1);
     let resolved = style_matcher::resolve_style(node, stylesheet);
     let style_code = gen_style(&resolved, depth + 1);

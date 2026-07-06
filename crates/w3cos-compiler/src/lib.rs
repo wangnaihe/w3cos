@@ -3,6 +3,7 @@ pub mod css_parser;
 pub mod esm_codegen;
 pub mod esm_lowering;
 pub mod esm_resolver;
+pub mod mobile_codegen;
 pub mod npm_bridge;
 pub mod parser;
 pub mod scope_analysis;
@@ -45,6 +46,16 @@ pub struct CompileFlags {
 /// For general TS: produces a standalone CLI binary.
 pub fn compile(ts_source: &str, output_dir: &std::path::Path) -> Result<()> {
     compile_with_source_dir(ts_source, output_dir, None, None)
+}
+
+/// Compile a TSX UI app into a mobile cdylib project directory.
+pub fn compile_mobile_from_file(source_path: &std::path::Path, output_dir: &std::path::Path) -> Result<()> {
+    let ts_source = std::fs::read_to_string(source_path)
+        .with_context(|| format!("Could not read {}", source_path.display()))?;
+    let source_dir = source_path.parent();
+    let tree = parser::parse(&ts_source)?;
+    let stylesheet = resolve_css_imports(&tree.css_imports, source_dir)?;
+    mobile_codegen::write_mobile_project(&tree, &stylesheet, output_dir)
 }
 
 /// Compile from a source file path, enabling CSS/SCSS import resolution.

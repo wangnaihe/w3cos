@@ -70,11 +70,16 @@ enum MobileCommands {
         #[arg(long, default_value = "android")]
         platform: String,
     },
-    /// Build mobile artifact (APK/IPA) — M2 automation; prints M1 manual steps today.
+    /// Build mobile artifact (APK / iOS simulator).
     Build {
-        /// Path to app.tsx entry (optional hint for M2).
-        #[arg(default_value = "app.tsx")]
-        entry: PathBuf,
+        /// Project directory (contains app.tsx, android/, ios/).
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Target platform: android, ios, or both.
+        #[arg(long, default_value = "android")]
+        platform: String,
+        #[arg(long)]
+        release: bool,
     },
 }
 
@@ -114,7 +119,11 @@ fn main() -> Result<()> {
                 project_name,
                 platform,
             } => mobile::mobile_init(&project_name, &platform)?,
-            MobileCommands::Build { entry: _ } => mobile::mobile_build_hint()?,
+            MobileCommands::Build {
+                project,
+                platform,
+                release,
+            } => mobile::mobile_build(&project, &platform, release)?,
         },
     }
 

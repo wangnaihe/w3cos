@@ -19,8 +19,13 @@ w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
 parley = { workspace = true }
 fontdue = { workspace = true }
-winit = { workspace = true }
 anyhow = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { workspace = true, features = ["android-game-activity"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+winit = { workspace = true }
 image = { workspace = true }
 ureq = { workspace = true }
 serde = { workspace = true }

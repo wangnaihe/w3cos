@@ -1,57 +1,51 @@
 # W3C OS — Mobile (Android / iOS)
 
-RN-like **shell + AOT app** for iOS and Android. **Generic platform only** — product apps are built in downstream repos.
+RN-like **shell + AOT app** for iOS and Android. **Generic platform only** — product apps live in downstream repos (e.g. aiNativeTms `demo/native/`).
 
-## Layout
-
-```
-crates/w3cos-mobile/       # touch, safe area, lifecycle, Android JNI
-templates/android/         # Gradle shell (W3cosActivity)
-templates/shared/          # starter app.tsx + w3cos.app.json
-examples/mobile-demo/      # generic CI / docs example
-```
-
-## Quick start (desktop dev)
-
-Mobile apps compile with the same TSX pipeline as desktop:
+## Quick start
 
 ```bash
+# Desktop smoke test (same TSX pipeline)
 w3cos build examples/mobile-demo/app.tsx -o mobile-demo --release
 ./mobile-demo
-```
 
-## Scaffold a mobile project
-
-```bash
-w3cos mobile init MyApp --platform android
+# Scaffold
+w3cos mobile init MyApp --platform both
 cd MyApp
-w3cos build app.tsx -o myapp --release   # desktop test
-# Android APK: see templates/android/README.md (M1 pipeline)
+w3cos mobile build --platform both --release
 ```
 
-## Android APK (M1 skeleton)
+## Android
 
-1. Install [Rust NDK](https://github.com/bbqsrc/cargo-ndk): `cargo install cargo-ndk`
-2. Build `w3cos-mobile` + your app as `cdylib` for `aarch64-linux-android`
-3. Copy `.so` into `templates/android/app/src/main/jniLibs/`
-4. Open `templates/android/` in Android Studio → Run on emulator
+- **Shell:** `templates/android/` — NativeActivity + `libw3cos_mobile_app.so`
+- **Build:** `w3cos mobile build --platform android`
+- **Needs:** Android SDK 34+, NDK, `cargo install cargo-ndk`, `rustup target add aarch64-linux-android`
 
-Full automation (`w3cos mobile build`) lands in M2.
+See [templates/android/README.md](../templates/android/README.md).
 
 ## iOS
 
-Planned (M5). `templates/ios/` placeholder TBD.
+- **Shell:** `templates/ios/` — Xcode + `libw3cos_mobile_app.a`
+- **Build:** `w3cos mobile build --platform ios`
+- **Needs:** Full Xcode, `rustup target add aarch64-apple-ios-sim`
+
+See [templates/ios/README.md](../templates/ios/README.md).
 
 ## Status
 
 | Milestone | Item | Status |
 |-----------|------|--------|
-| M1 | `w3cos-mobile` crate | 🚧 skeleton |
-| M1 | `examples/mobile-demo` | ✅ |
-| M1 | `templates/android` | 🚧 skeleton |
-| M2 | `w3cos mobile build` → APK | 📋 |
+| M1 | `w3cos-mobile` crate | ✅ skeleton |
+| M2 | `w3cos mobile build` | ✅ android + ios lib + shell |
 | M3 | `w3cos-mobile-shell` chrome | 📋 |
 | M4 | W3C Geolocation / getUserMedia | 📋 |
-| M5 | iOS template | 📋 |
+| M5 | Device IPA + Play Store pipeline | 📋 |
 
-See also: [ROADMAP.md](../ROADMAP.md) Phase 3 cross-compilation.
+## Downstream (aiNativeTms)
+
+```bash
+cd demo/native
+./build-mobile.sh both    # after w3cos CLI built
+```
+
+Bump `vendor/w3cos` submodule when mobile APIs change.

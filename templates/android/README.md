@@ -1,47 +1,29 @@
-# Android shell template (M1 skeleton)
+# Android shell template (M2)
 
-Gradle project that hosts the W3C OS native library — similar to React Native's `android/` folder.
+Hosts `libw3cos_mobile_app.so` via **NativeActivity** (`android.app.lib_name=w3cos_mobile_app`).
 
 ## Prerequisites
 
 - Android Studio / SDK 34+
-- NDK (via SDK Manager)
-- `cargo-ndk` for building Rust `cdylib`
+- NDK (SDK Manager)
+- `cargo install cargo-ndk`
+- `rustup target add aarch64-linux-android`
 
-## Structure
+## Build (automated)
 
-```
-android/
-├── app/
-│   ├── build.gradle.kts
-│   └── src/main/
-│       ├── AndroidManifest.xml
-│       └── java/com/example/w3cos/W3cosActivity.kt
-├── build.gradle.kts
-└── settings.gradle.kts
-```
-
-## Build flow (manual M1)
-
-1. Build your app + `w3cos-mobile` for Android:
+From your mobile project root (contains `app.tsx` + `android/`):
 
 ```bash
-cargo ndk -t arm64-v8a build --release -p w3cos-mobile
+w3cos mobile build --platform android --release
 ```
 
-2. Copy `target/aarch64-linux-android/release/libw3cos_mobile.so` to:
+This compiles TSX → Rust cdylib, runs `cargo ndk`, copies to `jniLibs/`, and runs `gradlew assembleRelease` when wrapper exists.
 
-```
-app/src/main/jniLibs/arm64-v8a/libw3cos_mobile.so
-```
+## Build (Android Studio)
 
-3. Open this directory in Android Studio → Run on emulator.
+1. `w3cos mobile build --platform android` (native lib only)
+2. Open `android/` in Android Studio → Run on emulator
 
-## M2
+## Customize
 
-`w3cos mobile build` will automate steps 1–3 and produce `app-release.apk`.
-
-## Customization
-
-- Change `applicationId` in `app/build.gradle.kts` to match `w3cos.app.json` `bundle_id`
-- Replace `com.example.w3cos` package if needed (update manifest + Kotlin path)
+- `applicationId` in `app/build.gradle.kts` ↔ `bundle_id` in `w3cos.app.json`

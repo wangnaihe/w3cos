@@ -68,6 +68,15 @@ pub fn run_app_static(root: Component) -> Result<()> {
     window::run_static(root)
 }
 
+/// Run on Android with the activity-provided [`AndroidApp`] handle (NativeActivity entry).
+#[cfg(target_os = "android")]
+pub fn run_app_on_android(
+    android_app: winit::platform::android::activity::AndroidApp,
+    builder: fn() -> Component,
+) -> Result<()> {
+    window::run_reactive_android(android_app, builder)
+}
+
 /// Run a W3C OS application using the dynamic DOM model.
 /// The setup function builds the initial DOM tree via `w3cos_runtime::dom::*` APIs.
 /// DOM mutations and signal changes trigger automatic re-rendering.

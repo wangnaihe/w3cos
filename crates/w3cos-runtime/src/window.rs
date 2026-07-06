@@ -1667,3 +1667,17 @@ pub fn run_dom(setup: fn()) -> Result<()> {
     event_loop.run_app(&mut app)?;
     Ok(())
 }
+
+#[cfg(target_os = "android")]
+pub fn run_reactive_android(
+    android_app: winit::platform::android::activity::AndroidApp,
+    builder: fn() -> Component,
+) -> Result<()> {
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+    let event_loop = EventLoop::builder()
+        .with_android_app(android_app)
+        .build()?;
+    let mut app = App::new_reactive(builder);
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
