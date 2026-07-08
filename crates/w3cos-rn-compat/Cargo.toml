@@ -7,4 +7,4 @@ description = "React Native compatibility layer — maps RN components to W3C OS
 
 [dependencies]
 w3cos-std = { workspace = true }
-w3cos-runtime = { workspace = true }
+w3cos-runtime = { workspace = true, features = ["gpu"] }

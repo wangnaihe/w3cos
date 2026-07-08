@@ -96,9 +96,10 @@ pub fn mobile_build(
     platform: &str,
     release: bool,
 ) -> Result<()> {
-    let app_tsx = project_dir.join("app.tsx");
+    let (_, _, entry, safe_area) = read_app_manifest(project_dir);
+    let app_tsx = project_dir.join(&entry);
     if !app_tsx.exists() {
-        bail!("missing app.tsx in {}", project_dir.display());
+        bail!("missing entry {} in {}", entry, project_dir.display());
     }
 
     let build_dir = project_dir.join(".w3cos/mobile-build");
@@ -108,7 +109,7 @@ pub fn mobile_build(
     fs::create_dir_all(&build_dir)?;
 
     println!("⚡ Transpiling {} → mobile cdylib...", app_tsx.display());
-    w3cos_compiler::compile_mobile_from_file(&app_tsx, &build_dir)?;
+    w3cos_compiler::compile_mobile_from_file(&app_tsx, &build_dir, platform, safe_area)?;
 
     match platform {
         "android" => build_android(project_dir, &build_dir, release)?,
@@ -205,6 +206,75 @@ fn xcode_available() -> bool {
         .unwrap_or(false)
 }
 
+fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool) {
+    let manifest_path = project_dir.join("w3cos.app.json");
+    let mut display_name = "W3cosApp".to_string();
+    let mut bundle_id = "com.example.w3cos.app".to_string();
+    let mut entry = "app.tsx".to_string();
+    let mut safe_area = true;
+    if let Ok(raw) = fs::read_to_string(&manifest_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
+                display_name = name.to_string();
+            }
+            if let Some(id) = json.get("bundle_id").and_then(|v| v.as_str()) {
+                bundle_id = id.to_string();
+            }
+            if let Some(e) = json.get("entry").and_then(|v| v.as_str()) {
+                entry = e.to_string();
+            }
+            if let Some(sa) = json.get("safe_area").and_then(|v| v.as_bool()) {
+                safe_area = sa;
+            }
+        }
+    }
+    (display_name, bundle_id, entry, safe_area)
+}
+
+fn write_ios_plist(path: &Path, display_name: &str, bundle_id: &str) -> Result<()> {
+    let content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>{display_name}</string>
+    <key>CFBundleExecutable</key>
+    <string>W3cosApp</string>
+    <key>CFBundleIdentifier</key>
+    <string>{bundle_id}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>{display_name}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+</dict>
+</plist>
+"#
+    );
+    fs::write(path, content)?;
+    Ok(())
+}
+
 fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> {
     let ios_dir = project_dir.join("ios");
     if !ios_dir.exists() {
@@ -224,7 +294,7 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         .status();
 
     let profile = if release { "release" } else { "debug" };
-    println!("🔨 Building iOS simulator lib ({profile})...");
+    println!("🔨 Building iOS simulator binary ({profile})...");
     let mut cmd = Command::new("cargo");
     cmd.current_dir(build_dir)
         .args(["build", "--target", target]);
@@ -236,41 +306,81 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         bail!("iOS native build failed for target {target}");
     }
 
-    let lib_dir = build_dir.join("target").join(target).join(profile);
-    let lib_path = lib_dir.join("libw3cos_mobile_app.a");
-    if !lib_path.exists() {
-        bail!("missing {}", lib_path.display());
+    let bin = build_dir
+        .join("target")
+        .join(target)
+        .join(profile)
+        .join("W3cosApp");
+    if !bin.exists() {
+        bail!("missing iOS binary: {}", bin.display());
     }
 
-    let out_libs = ios_dir.join("libs");
-    fs::create_dir_all(&out_libs)?;
-    let dest = out_libs.join("libw3cos_mobile_app.a");
-    fs::copy(&lib_path, &dest)?;
-    println!("✅ Static lib: {}", dest.display());
+    let (display_name, bundle_id, _, _) = read_app_manifest(project_dir);
 
-    let xcodeproj = ios_dir.join("W3cosApp.xcodeproj");
-    if xcodeproj.exists() {
-        println!("📱 Building iOS app (simulator)...");
-        let mut xcode = Command::new("xcodebuild");
-        xcode
-            .current_dir(&ios_dir)
-            .args([
-                "-project",
-                "W3cosApp.xcodeproj",
-                "-scheme",
-                "W3cosApp",
-                "-sdk",
-                "iphonesimulator",
-                "-destination",
-                "platform=iOS Simulator,name=iPhone 16",
-                "build",
-            ]);
-        let x = xcode.status().context("xcodebuild failed")?;
-        if x.success() {
-            println!("✅ iOS simulator build OK. Open W3cosApp.xcodeproj in Xcode and Run.");
+    let plist_src = ios_dir.join("W3cosApp/Info.plist");
+    write_ios_plist(&plist_src, &display_name, &bundle_id)?;
+
+    let app_bundle = ios_dir.join("W3cosApp.app");
+    if app_bundle.exists() {
+        fs::remove_dir_all(&app_bundle)?;
+    }
+    fs::create_dir_all(&app_bundle)?;
+    fs::copy(&bin, app_bundle.join("W3cosApp"))?;
+    write_ios_plist(&app_bundle.join("Info.plist"), &display_name, &bundle_id)?;
+    println!("✅ iOS app bundle: {} ({})", app_bundle.display(), display_name);
+
+    if std::env::var("W3COS_SKIP_IOS_INSTALL").ok().as_deref() == Some("1") {
+        println!("ℹ️  Skipping simulator install (W3COS_SKIP_IOS_INSTALL=1)");
+        return Ok(());
+    }
+
+    let udid = std::env::var("W3COS_IOS_SIM").unwrap_or_else(|_| "iPhone 17".to_string());
+    println!("📱 Installing on simulator ({udid})...");
+    let list_out = Command::new("xcrun")
+        .args(["simctl", "list", "devices", "available"])
+        .output()
+        .ok();
+    let mut device_id = None;
+    if let Some(out) = list_out {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.contains(&udid) && line.contains("Shutdown") || line.contains(&udid) && line.contains("Booted") {
+                if let Some(start) = line.find('(') {
+                    if let Some(end) = line.find(')') {
+                        device_id = Some(line[start + 1..end].to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(id) = device_id {
+        let _ = Command::new("xcrun")
+            .args(["simctl", "boot", &id])
+            .status();
+        let _ = Command::new("open")
+            .arg("-a")
+            .arg("Simulator")
+            .status();
+        let _ = Command::new("xcrun")
+            .args(["simctl", "uninstall", &id, "com.example.w3cos.app"])
+            .status();
+        let _ = Command::new("xcrun")
+            .args(["simctl", "uninstall", &id, &bundle_id])
+            .status();
+        let install = Command::new("xcrun")
+            .args(["simctl", "install", &id, app_bundle.to_str().unwrap()])
+            .status();
+        if install.map(|s| s.success()).unwrap_or(false) {
+            let launch = Command::new("xcrun")
+                .args(["simctl", "launch", &id, &bundle_id])
+                .output();
+            if let Ok(out) = launch {
+                println!("{}", String::from_utf8_lossy(&out.stdout));
+                println!("✅ Launched on simulator. Check Simulator window.");
+            }
         }
     } else {
-        println!("ℹ️  Open ios/W3cosApp.xcodeproj in Xcode after template sync.");
+        println!("ℹ️  Run manually: xcrun simctl install booted {}", app_bundle.display());
     }
 
     Ok(())

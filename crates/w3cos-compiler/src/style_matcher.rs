@@ -1,5 +1,22 @@
-use crate::css_parser::Stylesheet;
+use crate::css_parser::{MatchContext, PseudoState, Selector, Stylesheet};
+use crate::media_query::{self, Viewport};
 use crate::parser::{Node, NodeKind, StyleDecl};
+
+/// Viewport used when resolving `@media` rules at compile time (mobile default).
+#[derive(Debug, Clone, Copy)]
+pub struct ResolveViewport {
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Default for ResolveViewport {
+    fn default() -> Self {
+        Self {
+            width: 402.0,
+            height: 874.0,
+        }
+    }
+}
 
 /// DOM tag name — the standard HTML element name for this node.
 pub fn dom_tag(node: &Node) -> &'static str {
@@ -37,23 +54,49 @@ fn component_name(node: &Node) -> &'static str {
 /// 3. Un-layered CSS rules
 /// 4. Inline `style` prop
 pub fn resolve_style(node: &Node, stylesheet: &Stylesheet) -> StyleDecl {
-    let tag = dom_tag(node);
+    let class_storage = class_names_vec(node);
+    let class_refs: Vec<&str> = class_storage.iter().map(|s| s.as_str()).collect();
+    let ctx = MatchContext {
+        element_kind: dom_tag(node),
+        class_names: &class_refs,
+        attributes: &[],
+        child_index: 1,
+        sibling_count: 1,
+        child_count: node.children.len(),
+        pseudo_state: PseudoState::default(),
+    };
+    resolve_style_ctx(node, stylesheet, &ctx, &ResolveViewport::default())
+}
+
+/// Full style resolution with structural pseudo-class and `@media` context.
+pub fn resolve_style_ctx(
+    node: &Node,
+    stylesheet: &Stylesheet,
+    ctx: &MatchContext<'_>,
+    viewport: &ResolveViewport,
+) -> StyleDecl {
     let component = component_name(node);
-    let class_names: Vec<&str> = node
-        .class_name
-        .as_deref()
-        .map(|s| s.split_whitespace().collect())
-        .unwrap_or_default();
+    let comp_ctx = MatchContext {
+        element_kind: component,
+        class_names: ctx.class_names,
+        attributes: ctx.attributes,
+        child_index: ctx.child_index,
+        sibling_count: ctx.sibling_count,
+        child_count: ctx.child_count,
+        pseudo_state: ctx.pseudo_state,
+    };
 
     let rule_matches = |rule: &crate::css_parser::CssRule| -> bool {
-        rule.selectors
-            .iter()
-            .any(|s| s.matches(tag, &class_names) || s.matches(component, &class_names))
+        if !media_matches(rule, viewport) {
+            return false;
+        }
+        rule.selectors.iter().any(|s| {
+            selector_matches(s, ctx) || selector_matches(s, &comp_ctx)
+        })
     };
 
     let mut merged = StyleDecl::default();
 
-    // 1. Apply layered rules in layer declaration order (earlier = lower priority)
     for layer_name in &stylesheet.layer_order {
         for rule in &stylesheet.rules {
             if rule.layer.as_deref() == Some(layer_name) && rule_matches(rule) {
@@ -62,17 +105,41 @@ pub fn resolve_style(node: &Node, stylesheet: &Stylesheet) -> StyleDecl {
         }
     }
 
-    // 2. Apply un-layered CSS rules (higher than any layer)
     for rule in &stylesheet.rules {
         if rule.layer.is_none() && rule_matches(rule) {
             merge_style(&mut merged, &rule.style);
         }
     }
 
-    // 3. Inline styles override all CSS
     merge_style(&mut merged, &node.style);
 
     merged
+}
+
+pub fn class_names_vec(node: &Node) -> Vec<String> {
+    node.class_name
+        .as_deref()
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn media_matches(rule: &crate::css_parser::CssRule, viewport: &ResolveViewport) -> bool {
+    let Some(ref query) = rule.media else {
+        return true;
+    };
+    media_query::parse_media_query(query)
+        .map(|cond| {
+            cond.matches(&Viewport::new(
+                viewport.width,
+                viewport.height,
+                1.0,
+            ))
+        })
+        .unwrap_or(true)
+}
+
+fn selector_matches(selector: &Selector, ctx: &MatchContext<'_>) -> bool {
+    selector.matches_with_context(ctx)
 }
 
 pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
@@ -84,6 +151,10 @@ pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
     merge!(
         gap,
         padding,
+        padding_top,
+        padding_right,
+        padding_bottom,
+        padding_left,
         margin,
         font_size,
         font_weight,
@@ -136,7 +207,13 @@ pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
         transform,
         transition,
         box_shadow,
+        animation,
+        contain,
+        will_change,
+        filter,
         custom_properties,
+        opacity_from_signal,
+        background_from_signal,
     );
 }
 
@@ -144,6 +221,7 @@ pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
 mod tests {
     use super::*;
     use crate::css_parser::parse_css;
+    use w3cos_std::style::Spacing;
 
     fn make_node(kind: NodeKind, class_name: Option<&str>, style: StyleDecl) -> Node {
         Node {
@@ -156,6 +234,7 @@ mod tests {
             src: None,
             placeholder: None,
             class_name: class_name.map(|s| s.to_string()),
+            show_when: None,
         }
     }
 
@@ -214,7 +293,7 @@ mod tests {
         let sheet = parse_css(css);
         let node = make_node(NodeKind::Column, None, StyleDecl::default());
         let resolved = resolve_style(&node, &sheet);
-        assert_eq!(resolved.padding, Some(10.0));
+        assert_eq!(resolved.padding, Some(Spacing::Px(10.0)));
         assert_eq!(resolved.gap, Some(8.0));
     }
 
@@ -233,7 +312,7 @@ mod tests {
         let sheet = parse_css(css);
         let node = make_node(NodeKind::Box, None, StyleDecl::default());
         let resolved = resolve_style(&node, &sheet);
-        assert_eq!(resolved.padding, Some(8.0));
+        assert_eq!(resolved.padding, Some(Spacing::Px(8.0)));
     }
 
     #[test]
@@ -270,7 +349,7 @@ mod tests {
         let sheet = parse_css(css);
         let node = make_node(NodeKind::TextInput, None, StyleDecl::default());
         let resolved = resolve_style(&node, &sheet);
-        assert_eq!(resolved.padding, Some(12.0));
+        assert_eq!(resolved.padding, Some(Spacing::Px(12.0)));
         assert_eq!(resolved.border_width, Some(1.0));
     }
 
@@ -447,7 +526,7 @@ mod tests {
         let node = make_node(NodeKind::Column, Some("card"), StyleDecl::default());
         let resolved = resolve_style(&node, &sheet);
         // components (last layer) wins for padding
-        assert_eq!(resolved.padding, Some(24.0));
+        assert_eq!(resolved.padding, Some(Spacing::Px(24.0)));
         // base wins for gap (components didn't set it)
         assert_eq!(resolved.gap, Some(8.0));
         // reset's background survives (not overridden)

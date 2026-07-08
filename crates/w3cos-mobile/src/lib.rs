@@ -27,6 +27,8 @@ pub fn run_mobile_app(builder: fn() -> Component) -> Result<()> {
 
     #[cfg(not(target_os = "android"))]
     {
+        #[cfg(target_os = "ios")]
+        w3cos_std::safe_area::set_enabled(true);
         w3cos_runtime::run_app(builder)
     }
 }

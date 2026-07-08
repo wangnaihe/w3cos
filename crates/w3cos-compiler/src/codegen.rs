@@ -1,6 +1,8 @@
-use crate::css_parser::Stylesheet;
+use crate::css_parser::{MatchContext, PseudoState, Stylesheet};
+use crate::css_values::{self, parse_animation, parse_box_shadow, parse_transform};
 use crate::parser::{AppTree, Node, NodeKind, SignalDecl, StyleDecl};
-use crate::style_matcher;
+use crate::style_matcher::{self, ResolveViewport};
+use w3cos_std::style::{SafeAreaEdge, Spacing};
 #[allow(unused_imports)]
 use anyhow::Context;
 use anyhow::Result;
@@ -9,7 +11,7 @@ use anyhow::Result;
 pub fn generate(tree: &AppTree, stylesheet: &Stylesheet) -> Result<String> {
     let is_reactive = !tree.signals.is_empty();
     let signal_names: Vec<&str> = tree.signals.iter().map(|s| s.name.as_str()).collect();
-    let component_code = gen_node(&tree.root, 0, &signal_names, stylesheet);
+    let component_code = gen_node(&tree.root, 0, &signal_names, stylesheet, 1, 1);
 
     if is_reactive {
         let signal_inits = gen_signal_inits(&tree.signals);
@@ -49,18 +51,23 @@ fn build_ui() -> Component {{
 }
 
 fn gen_signal_inits(signals: &[SignalDecl]) -> String {
-    signals
+    if signals.is_empty() {
+        return String::new();
+    }
+    let register: Vec<String> = signals
         .iter()
-        .enumerate()
-        .map(|(i, sig)| {
+        .map(|sig| {
             format!(
-                "    let _ = w3cos_runtime::state::create_signal({initial});\n    let {name} = w3cos_runtime::state::get_signal({i});",
-                initial = sig.initial,
+                "        w3cos_runtime::state::register_signal_name({name:?});\n        let _ = w3cos_runtime::state::create_signal({initial});",
                 name = sig.name,
+                initial = sig.initial,
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    format!(
+        "    w3cos_runtime::state::ensure_signals(|| {{\n{register}\n    }});\n",
+        register = register.join("\n"),
+    )
 }
 
 /// Generate a Cargo.toml for the compiled application.
@@ -120,15 +127,77 @@ pub(crate) fn find_workspace_root() -> Result<std::path::PathBuf> {
     )
 }
 
-pub(crate) fn gen_node(node: &Node, depth: usize, signal_names: &[&str], stylesheet: &Stylesheet) -> String {
+pub(crate) fn gen_node(
+    node: &Node,
+    depth: usize,
+    signal_names: &[&str],
+    stylesheet: &Stylesheet,
+    child_index: usize,
+    sibling_count: usize,
+) -> String {
     let indent = "    ".repeat(depth + 1);
-    let resolved = style_matcher::resolve_style(node, stylesheet);
-    let style_code = gen_style(&resolved, depth + 1);
+    let body = if let Some((sig, val)) = &node.show_when {
+        let sig_id = signal_index(sig, signal_names);
+        let inner = if node.children.len() == 1 {
+            gen_node_inner(&node.children[0], depth + 1, signal_names, stylesheet, 1, 1)
+        } else {
+            let sib = node.children.len();
+            let items: Vec<String> = node
+                .children
+                .iter()
+                .enumerate()
+                .map(|(i, c)| gen_node(c, depth + 2, signal_names, stylesheet, i + 1, sib))
+                .collect();
+            format!(
+                "{indent}Component::column(Style::default(), vec![\n{},{indent}])",
+                items.join(",\n")
+            )
+        };
+        return format!(
+            "{indent}{{\n{indent}    let mut __show_style = Style::default();\n{indent}    if w3cos_runtime::state::get_signal({sig_id}) != {val} {{\n{indent}        __show_style.display = Display::None;\n{indent}    }}\n{indent}    Component::column(__show_style, vec![\n{inner}\n{indent}    ])\n{indent}}}"
+        );
+    } else {
+        gen_node_inner(node, depth, signal_names, stylesheet, child_index, sibling_count)
+    };
+    body
+}
+
+fn gen_node_inner(
+    node: &Node,
+    depth: usize,
+    signal_names: &[&str],
+    stylesheet: &Stylesheet,
+    child_index: usize,
+    sibling_count: usize,
+) -> String {
+    let indent = "    ".repeat(depth + 1);
+    let class_storage = style_matcher::class_names_vec(node);
+    let class_refs: Vec<&str> = class_storage.iter().map(|s| s.as_str()).collect();
+    let match_ctx = MatchContext {
+        element_kind: style_matcher::dom_tag(node),
+        class_names: &class_refs,
+        attributes: &[],
+        child_index,
+        sibling_count,
+        child_count: node.children.len(),
+        pseudo_state: PseudoState::default(),
+    };
+    let resolved =
+        style_matcher::resolve_style_ctx(node, stylesheet, &match_ctx, &ResolveViewport::default());
+    let style_code = gen_style(&resolved, depth + 1, signal_names);
 
     match &node.kind {
         NodeKind::Text(content) => {
             let text = node.text.as_deref().unwrap_or(content.as_str());
             let text_expr = gen_text_expr(text, signal_names);
+            let mut text_style = resolved.clone();
+            if text_style.display.is_none() {
+                text_style.display = Some("inline-block".into());
+            }
+            if text_style.flex_shrink.is_none() {
+                text_style.flex_shrink = Some(0.0);
+            }
+            let style_code = gen_style(&text_style, depth + 1, signal_names);
             format!("{indent}Component::text({text_expr}, {style_code})")
         }
         NodeKind::Button(label) => {
@@ -158,14 +227,25 @@ pub(crate) fn gen_node(node: &Node, depth: usize, signal_names: &[&str], stylesh
             let children_code = if node.children.is_empty() {
                 "vec![]".to_string()
             } else {
+                let sib = node.children.len();
                 let items: Vec<String> = node
                     .children
                     .iter()
-                    .map(|c| gen_node(c, depth + 2, signal_names, stylesheet))
+                    .enumerate()
+                    .map(|(i, c)| {
+                        gen_node(c, depth + 2, signal_names, stylesheet, i + 1, sib)
+                    })
                     .collect();
                 format!("vec![\n{},\n{indent}]", items.join(",\n"))
             };
-            format!("{indent}{constructor}({style_code}, {children_code})")
+            if let Some(ref action_str) = node.on_click {
+                let action = gen_event_action(action_str, signal_names);
+                format!(
+                    "{indent}{{\n{indent}    let mut __comp = {constructor}({style_code}, {children_code});\n{indent}    __comp.on_click = {action};\n{indent}    __comp\n{indent}}}"
+                )
+            } else {
+                format!("{indent}{constructor}({style_code}, {children_code})")
+            }
         }
     }
 }
@@ -174,19 +254,17 @@ fn gen_text_expr(text: &str, signal_names: &[&str]) -> String {
     if !text.contains('{') {
         return format!("{text:?}");
     }
-    // Check for {signal_name} interpolation
+    // Raw strings avoid Rust 2024 `{ident}` implicit format interpolation in generated code.
+    let mut expr = format!("r{text:?}.to_string()");
     for (i, name) in signal_names.iter().enumerate() {
         let placeholder = format!("{{{name}}}");
-        if text == placeholder {
-            return format!("w3cos_runtime::state::get_signal({i}).to_string()");
-        }
         if text.contains(&placeholder) {
-            return format!(
-                "{text:?}.replace(\"{placeholder}\", &w3cos_runtime::state::get_signal({i}).to_string())"
+            expr = format!(
+                "{expr}.replace(r{placeholder:?}, &w3cos_runtime::state::get_signal({i}).to_string())"
             );
         }
     }
-    format!("{text:?}")
+    expr
 }
 
 fn gen_event_action(action_str: &str, signal_names: &[&str]) -> String {
@@ -200,6 +278,48 @@ fn gen_event_action(action_str: &str, signal_names: &[&str]) -> String {
         return format!(
             "EventAction::Notify({:?}.to_string(), {:?}.to_string())",
             title, body
+        );
+    }
+
+    if parts.len() >= 2 && parts[0].trim() == "history" {
+        let op = parts[1].trim();
+        let route_name = parts.get(2).map(|s| s.trim()).unwrap_or("route");
+        let route_id = signal_names
+            .iter()
+            .position(|&n| n == route_name)
+            .unwrap_or(0);
+        return match op {
+            "push" => {
+                let value = parts
+                    .get(3)
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+                let path = parts.get(4..).map(|p| p.join(":")).unwrap_or_default();
+                format!(
+                    "EventAction::HistoryPush {{ route_signal: {route_id}, route_value: {value}, path: {:?}.to_string() }}",
+                    path
+                )
+            }
+            "back" => format!("EventAction::HistoryBack {{ route_signal: {route_id} }}"),
+            _ => "EventAction::None".to_string(),
+        };
+    }
+
+    if parts.len() >= 5 && parts[0].trim() == "fetch" {
+        let status_name = parts[2].trim();
+        let bytes_name = parts[3].trim();
+        let status_id = signal_names
+            .iter()
+            .position(|&n| n == status_name)
+            .unwrap_or(0);
+        let bytes_id = signal_names
+            .iter()
+            .position(|&n| n == bytes_name)
+            .unwrap_or(0);
+        let url = parts[4..].join(":");
+        return format!(
+            "EventAction::FetchGet {{ url: {:?}.to_string(), status_signal: {status_id}, bytes_signal: {bytes_id} }}",
+            url
         );
     }
 
@@ -229,15 +349,128 @@ fn gen_event_action(action_str: &str, signal_names: &[&str]) -> String {
     }
 }
 
-fn gen_style(s: &StyleDecl, depth: usize) -> String {
+fn signal_index(name: &str, signal_names: &[&str]) -> usize {
+    signal_names.iter().position(|&n| n == name).unwrap_or(0)
+}
+
+fn gen_transition_rust(value: &str) -> String {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let property = match parts.first().copied().unwrap_or("all") {
+        "all" => "TransitionProperty::All",
+        "opacity" => "TransitionProperty::Opacity",
+        "transform" => "TransitionProperty::Transform",
+        "background" | "background-color" => "TransitionProperty::Background",
+        "color" => "TransitionProperty::Color",
+        _ => "TransitionProperty::All",
+    };
+    let duration_ms = parts
+        .get(1)
+        .and_then(|s| {
+            if let Some(ms) = s.strip_suffix("ms") {
+                ms.parse::<u32>().ok()
+            } else if let Some(sec) = s.strip_suffix('s') {
+                sec.parse::<f32>().ok().map(|v| (v * 1000.0) as u32)
+            } else {
+                s.parse().ok()
+            }
+        })
+        .unwrap_or(300);
+    let easing = match parts.get(2).copied().unwrap_or("ease") {
+        "linear" => "Easing::Linear",
+        "ease-in" => "Easing::EaseIn",
+        "ease-out" => "Easing::EaseOut",
+        "ease-in-out" => "Easing::EaseInOut",
+        _ => "Easing::Ease",
+    };
+    format!(
+        "Some(Transition {{ property: {property}, duration_ms: {duration_ms}, easing: {easing}, delay_ms: 0 }})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Style codegen helpers
+// ---------------------------------------------------------------------------
+
+fn gen_spacing(s: Spacing) -> String {
+    match s {
+        Spacing::Px(v) => format!("Spacing::Px({v}_f32)"),
+        Spacing::SafeAreaInset(SafeAreaEdge::Top) => {
+            "Spacing::SafeAreaInset(SafeAreaEdge::Top)".to_string()
+        }
+        Spacing::SafeAreaInset(SafeAreaEdge::Right) => {
+            "Spacing::SafeAreaInset(SafeAreaEdge::Right)".to_string()
+        }
+        Spacing::SafeAreaInset(SafeAreaEdge::Bottom) => {
+            "Spacing::SafeAreaInset(SafeAreaEdge::Bottom)".to_string()
+        }
+        Spacing::SafeAreaInset(SafeAreaEdge::Left) => {
+            "Spacing::SafeAreaInset(SafeAreaEdge::Left)".to_string()
+        }
+        Spacing::Composite { px, safe_area } => {
+            let edge = safe_area.map(|e| match e {
+                SafeAreaEdge::Top => "Some(SafeAreaEdge::Top)",
+                SafeAreaEdge::Right => "Some(SafeAreaEdge::Right)",
+                SafeAreaEdge::Bottom => "Some(SafeAreaEdge::Bottom)",
+                SafeAreaEdge::Left => "Some(SafeAreaEdge::Left)",
+            });
+            match edge {
+                Some(e) => format!("Spacing::Composite {{ px: {px}_f32, safe_area: {e} }}"),
+                None => format!("Spacing::Px({px}_f32)"),
+            }
+        }
+    }
+}
+
+fn gen_padding_edges(s: &StyleDecl) -> Option<String> {
+    let (t, r, b, l) = if s.padding_top.is_some()
+        || s.padding_right.is_some()
+        || s.padding_bottom.is_some()
+        || s.padding_left.is_some()
+    {
+        let fallback = s.padding.unwrap_or(Spacing::Px(0.0));
+        let t = s.padding_top.unwrap_or(fallback);
+        let r = s.padding_right.unwrap_or(fallback);
+        let b = s.padding_bottom.unwrap_or(fallback);
+        let l = s.padding_left.unwrap_or(fallback);
+        (t, r, b, l)
+    } else if let Some(p) = s.padding {
+        (p, p, p, p)
+    } else {
+        return None;
+    };
+
+    if t == r && r == b && b == l {
+        if let Spacing::Px(v) = t {
+            return Some(format!("padding: Edges::all({v}_f32)"));
+        }
+        let s = gen_spacing(t);
+        return Some(format!(
+            "padding: Edges {{ top: {s}, right: {s}, bottom: {s}, left: {s} }}"
+        ));
+    }
+    if t == b && r == l {
+        if let (Spacing::Px(x), Spacing::Px(y)) = (r, t) {
+            return Some(format!("padding: Edges::xy({x}_f32, {y}_f32)"));
+        }
+    }
+    Some(format!(
+        "padding: Edges {{ top: {}, right: {}, bottom: {}, left: {} }}",
+        gen_spacing(t),
+        gen_spacing(r),
+        gen_spacing(b),
+        gen_spacing(l),
+    ))
+}
+
+fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     let indent = "    ".repeat(depth);
     let mut fields = Vec::new();
 
     if let Some(gap) = s.gap {
         fields.push(format!("gap: {gap}_f32"));
     }
-    if let Some(p) = s.padding {
-        fields.push(format!("padding: Edges::all({p}_f32)"));
+    if let Some(padding) = gen_padding_edges(s) {
+        fields.push(padding);
     }
     if let Some(fs) = s.font_size {
         fields.push(format!("font_size: {fs}_f32"));
@@ -245,11 +478,16 @@ fn gen_style(s: &StyleDecl, depth: usize) -> String {
     if let Some(fw) = s.font_weight {
         fields.push(format!("font_weight: {fw}"));
     }
+    if let Some(lh) = s.line_height {
+        fields.push(format!("line_height: {lh}_f32"));
+    }
     if let Some(ref c) = s.color {
         fields.push(format!("color: Color::from_hex({c:?})"));
     }
-    if let Some(ref bg) = s.background {
-        fields.push(format!("background: Color::from_hex({bg:?})"));
+    if s.background_from_signal.is_none() {
+        if let Some(ref bg) = s.background {
+            fields.push(format!("background: Color::from_hex({bg:?})"));
+        }
     }
     if let Some(br) = s.border_radius {
         fields.push(format!("border_radius: {br}_f32"));
@@ -289,6 +527,9 @@ fn gen_style(s: &StyleDecl, depth: usize) -> String {
     }
     if let Some(fg) = s.flex_grow {
         fields.push(format!("flex_grow: {fg}_f32"));
+    }
+    if let Some(fs) = s.flex_shrink {
+        fields.push(format!("flex_shrink: {fs}_f32"));
     }
     if let Some(ref d) = s.display {
         let variant = match d.as_str() {
@@ -334,6 +575,146 @@ fn gen_style(s: &StyleDecl, depth: usize) -> String {
         };
         fields.push(format!("overflow: {variant}"));
     }
+    if let Some(m) = s.margin {
+        if let Spacing::Px(v) = m {
+            fields.push(format!("margin: Edges::all({v}_f32)"));
+        } else {
+            fields.push(format!("margin: Edges::all({})", gen_spacing(m)));
+        }
+    }
+    if let Some(ref fw) = s.flex_wrap {
+        let variant = match fw.as_str() {
+            "wrap" => "FlexWrap::Wrap",
+            "wrap-reverse" | "wrapReverse" => "FlexWrap::WrapReverse",
+            _ => "FlexWrap::NoWrap",
+        };
+        fields.push(format!("flex_wrap: {variant}"));
+    }
+    if let Some(ref ws) = s.white_space {
+        let variant = match ws.as_str() {
+            "nowrap" | "noWrap" => "WhiteSpace::NoWrap",
+            "pre" => "WhiteSpace::Pre",
+            "pre-wrap" | "preWrap" => "WhiteSpace::PreWrap",
+            "pre-line" | "preLine" => "WhiteSpace::PreLine",
+            _ => "WhiteSpace::Normal",
+        };
+        fields.push(format!("white_space: {variant}"));
+    }
+    if let Some(ref mw) = s.min_width {
+        fields.push(format!("min_width: {}", gen_dimension(mw)));
+    }
+    if let Some(ref mh) = s.min_height {
+        fields.push(format!("min_height: {}", gen_dimension(mh)));
+    }
+    if let Some(ref ta) = s.text_align {
+        let variant = match ta.as_str() {
+            "center" => "TextAlign::Center",
+            "right" => "TextAlign::Right",
+            "justify" => "TextAlign::Justify",
+            _ => "TextAlign::Left",
+        };
+        fields.push(format!("text_align: {variant}"));
+    }
+    if let Some(op) = s.opacity {
+        fields.push(format!("opacity: {op}_f32"));
+    }
+    if let Some(ref sig) = s.opacity_from_signal {
+        let id = signal_index(sig, signal_names);
+        fields.push(format!(
+            "opacity: w3cos_runtime::state::get_signal({id}) as f32 / 100.0"
+        ));
+    }
+    if let Some((ref sig, ref color_a, ref color_b)) = s.background_from_signal {
+        let id = signal_index(sig, signal_names);
+        fields.push(format!(
+            "background: if w3cos_runtime::state::get_signal({id}) == 0 {{ Color::from_hex({color_a:?}) }} else {{ Color::from_hex({color_b:?}) }}"
+        ));
+    }
+    if let Some(ref tr) = s.transition {
+        fields.push(format!("transition: {}", gen_transition_rust(tr)));
+    }
+    if let Some(ref fd) = s.flex_direction {
+        fields.push(format!("flex_direction: {}", gen_flex_direction(fd)));
+    }
+    if let Some(ref fb) = s.flex_basis {
+        fields.push(format!("flex_basis: {}", gen_dimension(fb)));
+    }
+    if let Some(order) = s.order {
+        fields.push(format!("order: {order}"));
+    }
+    if let Some(ref als) = s.align_self {
+        fields.push(format!("align_self: {}", gen_align_self(als)));
+    }
+    if let Some(ref alc) = s.align_content {
+        fields.push(format!("align_content: {}", gen_align_content(alc)));
+    }
+    if let Some(ref mw) = s.max_width {
+        fields.push(format!("max_width: {}", gen_dimension(mw)));
+    }
+    if let Some(ref mh) = s.max_height {
+        fields.push(format!("max_height: {}", gen_dimension(mh)));
+    }
+    if let Some(ref ff) = s.font_family {
+        fields.push(format!("font_family: Some({ff:?}.to_string())"));
+    }
+    if let Some(ref fs) = s.font_style {
+        fields.push(format!("font_style: {}", gen_font_style(fs)));
+    }
+    if let Some(ls) = s.letter_spacing {
+        fields.push(format!("letter_spacing: {ls}_f32"));
+    }
+    if let Some(ref td) = s.text_decoration {
+        fields.push(format!("text_decoration: {}", gen_text_decoration(td)));
+    }
+    if let Some(ref to) = s.text_overflow {
+        fields.push(format!("text_overflow: {}", gen_text_overflow(to)));
+    }
+    if let Some(ref wb) = s.word_break {
+        fields.push(format!("word_break: {}", gen_word_break(wb)));
+    }
+    if let Some(ref vis) = s.visibility {
+        fields.push(format!("visibility: {}", gen_visibility(vis)));
+    }
+    if let Some(ref cur) = s.cursor {
+        fields.push(format!("cursor: {}", gen_cursor(cur)));
+    }
+    if let Some(ref pe) = s.pointer_events {
+        fields.push(format!("pointer_events: {}", gen_pointer_events(pe)));
+    }
+    if let Some(ref us) = s.user_select {
+        fields.push(format!("user_select: {}", gen_user_select(us)));
+    }
+    if let Some(ow) = s.outline_width {
+        fields.push(format!("outline_width: {ow}_f32"));
+    }
+    if let Some(ref oc) = s.outline_color {
+        fields.push(format!("outline_color: Color::from_hex({oc:?})"));
+    }
+    if let Some(ref os) = s.outline_style {
+        fields.push(format!("outline_style: {}", gen_outline_style(os)));
+    }
+    if let Some(ref tr) = s.transform {
+        fields.push(format!("transform: {}", gen_transform_rust(tr)));
+    }
+    if let Some(ref bs) = s.box_shadow {
+        if let Some(code) = gen_box_shadow_rust(bs) {
+            fields.push(code);
+        }
+    }
+    if let Some(ref anim) = s.animation {
+        if let Some(code) = gen_animation_rust(anim) {
+            fields.push(code);
+        }
+    }
+    if let Some(ref c) = s.contain {
+        fields.push(format!("contain: {}", gen_contain(c)));
+    }
+    if let Some(ref wc) = s.will_change {
+        fields.push(format!("will_change: {}", gen_will_change(wc)));
+    }
+    if let Some(ref f) = s.filter {
+        fields.push(format!("filter: Some({f:?}.to_string())"));
+    }
 
     if fields.is_empty() {
         "Style::default()".to_string()
@@ -343,8 +724,167 @@ fn gen_style(s: &StyleDecl, depth: usize) -> String {
     }
 }
 
+fn gen_flex_direction(s: &str) -> String {
+    match s {
+        "row" => "FlexDirection::Row".to_string(),
+        "row-reverse" | "rowReverse" => "FlexDirection::RowReverse".to_string(),
+        "column-reverse" | "columnReverse" => "FlexDirection::ColumnReverse".to_string(),
+        _ => "FlexDirection::Column".to_string(),
+    }
+}
+
+fn gen_align_self(s: &str) -> String {
+    match s {
+        "center" => "AlignSelf::Center".to_string(),
+        "flex-start" | "flexStart" => "AlignSelf::FlexStart".to_string(),
+        "flex-end" | "flexEnd" => "AlignSelf::FlexEnd".to_string(),
+        "baseline" => "AlignSelf::Baseline".to_string(),
+        "stretch" => "AlignSelf::Stretch".to_string(),
+        _ => "AlignSelf::Auto".to_string(),
+    }
+}
+
+fn gen_align_content(s: &str) -> String {
+    match s {
+        "center" => "AlignContent::Center".to_string(),
+        "flex-start" | "flexStart" => "AlignContent::FlexStart".to_string(),
+        "flex-end" | "flexEnd" => "AlignContent::FlexEnd".to_string(),
+        "space-between" | "spaceBetween" => "AlignContent::SpaceBetween".to_string(),
+        "space-around" | "spaceAround" => "AlignContent::SpaceAround".to_string(),
+        _ => "AlignContent::Stretch".to_string(),
+    }
+}
+
+fn gen_font_style(s: &str) -> String {
+    match s {
+        "italic" => "FontStyle::Italic".to_string(),
+        "oblique" => "FontStyle::Oblique".to_string(),
+        _ => "FontStyle::Normal".to_string(),
+    }
+}
+
+fn gen_text_decoration(s: &str) -> String {
+    if s.contains("underline") {
+        "TextDecoration::Underline".to_string()
+    } else if s.contains("line-through") {
+        "TextDecoration::LineThrough".to_string()
+    } else {
+        "TextDecoration::None".to_string()
+    }
+}
+
+fn gen_text_overflow(s: &str) -> String {
+    match s {
+        "ellipsis" => "TextOverflow::Ellipsis".to_string(),
+        _ => "TextOverflow::Clip".to_string(),
+    }
+}
+
+fn gen_word_break(s: &str) -> String {
+    match s {
+        "break-all" | "breakAll" => "WordBreak::BreakAll".to_string(),
+        "keep-all" | "keepAll" => "WordBreak::KeepAll".to_string(),
+        _ => "WordBreak::Normal".to_string(),
+    }
+}
+
+fn gen_visibility(s: &str) -> String {
+    match s {
+        "hidden" => "Visibility::Hidden".to_string(),
+        "collapse" => "Visibility::Collapse".to_string(),
+        _ => "Visibility::Visible".to_string(),
+    }
+}
+
+fn gen_cursor(s: &str) -> String {
+    match s {
+        "pointer" => "Cursor::Pointer".to_string(),
+        "text" => "Cursor::Text".to_string(),
+        "not-allowed" | "notAllowed" => "Cursor::NotAllowed".to_string(),
+        "grab" => "Cursor::Grab".to_string(),
+        _ => "Cursor::Default".to_string(),
+    }
+}
+
+fn gen_pointer_events(s: &str) -> String {
+    match s {
+        "none" => "PointerEvents::None".to_string(),
+        _ => "PointerEvents::Auto".to_string(),
+    }
+}
+
+fn gen_user_select(s: &str) -> String {
+    match s {
+        "none" => "UserSelect::None".to_string(),
+        "text" => "UserSelect::Text".to_string(),
+        "all" => "UserSelect::All".to_string(),
+        _ => "UserSelect::Auto".to_string(),
+    }
+}
+
+fn gen_outline_style(s: &str) -> String {
+    match s {
+        "solid" => "OutlineStyle::Solid".to_string(),
+        "dashed" => "OutlineStyle::Dashed".to_string(),
+        "dotted" => "OutlineStyle::Dotted".to_string(),
+        _ => "OutlineStyle::None".to_string(),
+    }
+}
+
+fn gen_transform_rust(value: &str) -> String {
+    let t = parse_transform(value);
+    format!(
+        "Transform2D {{ translate_x: {}_f32, translate_y: {}_f32, scale_x: {}_f32, scale_y: {}_f32, rotate_deg: {}_f32 }}",
+        t.translate_x, t.translate_y, t.scale_x, t.scale_y, t.rotate_deg
+    )
+}
+
+fn gen_box_shadow_rust(value: &str) -> Option<String> {
+    let s = parse_box_shadow(value)?;
+    Some(format!(
+        "box_shadow: Some(BoxShadow::new({}_f32, {}_f32, {}_f32, {}_f32, Color::from_hex({:?})))",
+        s.offset_x, s.offset_y, s.blur, s.spread, s.color
+    ))
+}
+
+fn gen_animation_rust(value: &str) -> Option<String> {
+    let a = parse_animation(value)?;
+    let easing = match a.easing.as_str() {
+        "linear" => "Easing::Linear",
+        "ease-in" => "Easing::EaseIn",
+        "ease-out" => "Easing::EaseOut",
+        "ease-in-out" => "Easing::EaseInOut",
+        _ => "Easing::Ease",
+    };
+    Some(format!(
+        "animation: Some(Animation {{ name: {:?}.to_string(), duration_ms: {}, easing: {easing}, delay_ms: {}, iteration_count: AnimationIterationCount::Once, direction: AnimationDirection::Normal, fill_mode: AnimationFillMode::None }})",
+        a.name, a.duration_ms, a.delay_ms
+    ))
+}
+
+fn gen_contain(s: &str) -> String {
+    match s.trim().to_lowercase().as_str() {
+        "strict" => "Contain::Strict".to_string(),
+        "content" => "Contain::Content".to_string(),
+        "layout" => "Contain::Layout".to_string(),
+        "size" => "Contain::Size".to_string(),
+        _ => "Contain::None".to_string(),
+    }
+}
+
+fn gen_will_change(s: &str) -> String {
+    let wc = w3cos_std::style::WillChange::from_css(s);
+    format!(
+        "WillChange {{ transform: {}, opacity: {}, filter: {}, scroll_position: {} }}",
+        wc.transform, wc.opacity, wc.filter, wc.scroll_position
+    )
+}
+
 fn gen_dimension(val: &str) -> String {
     let val = val.trim();
+    if let Some(px) = css_values::css_parse_calc_px(val) {
+        return format!("Dimension::Px({px}_f32)");
+    }
     let suffixes: &[(&str, &str)] = &[
         ("%", "Dimension::Percent"),
         ("px", "Dimension::Px"),
@@ -516,7 +1056,31 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
         out.push_str(&sp("gap", &format!("{gap}px")));
     }
     if let Some(p) = style.padding {
-        out.push_str(&sp("padding", &format!("{p}px")));
+        let css = match p {
+            Spacing::Px(v) => format!("{v}px"),
+            Spacing::SafeAreaInset(SafeAreaEdge::Top) => "env(safe-area-inset-top)".to_string(),
+            Spacing::SafeAreaInset(SafeAreaEdge::Right) => {
+                "env(safe-area-inset-right)".to_string()
+            }
+            Spacing::SafeAreaInset(SafeAreaEdge::Bottom) => {
+                "env(safe-area-inset-bottom)".to_string()
+            }
+            Spacing::SafeAreaInset(SafeAreaEdge::Left) => "env(safe-area-inset-left)".to_string(),
+            Spacing::Composite { px, safe_area } => {
+                let env = safe_area.map(|e| match e {
+                    SafeAreaEdge::Top => "env(safe-area-inset-top)",
+                    SafeAreaEdge::Right => "env(safe-area-inset-right)",
+                    SafeAreaEdge::Bottom => "env(safe-area-inset-bottom)",
+                    SafeAreaEdge::Left => "env(safe-area-inset-left)",
+                });
+                match env {
+                    Some(e) if px.abs() > f32::EPSILON => format!("calc({px}px + {e})"),
+                    Some(e) => e.to_string(),
+                    None => format!("{px}px"),
+                }
+            }
+        };
+        out.push_str(&sp("padding", &css));
     }
     if let Some(fs) = style.font_size {
         out.push_str(&sp("font-size", &format!("{fs}px")));
@@ -594,6 +1158,7 @@ mod tests {
             src: None,
             placeholder: None,
             class_name: None,
+            show_when: None,
         }
     }
 

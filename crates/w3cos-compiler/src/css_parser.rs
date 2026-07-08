@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::parser::StyleDecl;
+use w3cos_std::style::Spacing;
 
 #[derive(Debug, Clone)]
 pub struct KeyframeStop {
@@ -57,6 +58,8 @@ pub struct CssRule {
     pub selectors: Vec<Selector>,
     pub style: StyleDecl,
     pub layer: Option<String>,
+    /// `@media` condition string when the rule originated inside a media block.
+    pub media: Option<String>,
 }
 
 /// CSS pseudo-class attached to a selector.
@@ -317,6 +320,7 @@ fn parse_block(
                     selectors,
                     style,
                     layer: current_layer.map(|s| s.to_string()),
+                    media: None,
                 });
             }
         }
@@ -428,13 +432,16 @@ fn parse_at_rule(
         while pos < bytes.len() && bytes[pos] != b'{' {
             pos += 1;
         }
-        let _condition = source[condition_start..pos].trim();
+        let condition = source[condition_start..pos].trim().to_string();
         if pos < bytes.len() {
             pos += 1;
             let (block_str, advance) = extract_brace_content(&source[pos..]);
             pos += advance;
             let inner = parse_block(block_str, layer_order, anon_counter, current_layer, keyframes, font_faces);
-            rules.extend(inner);
+            for mut rule in inner {
+                rule.media = Some(condition.clone());
+                rules.push(rule);
+            }
         }
     } else if keyword == "font-face" {
         while pos < bytes.len() && bytes[pos] != b'{' {
@@ -929,13 +936,14 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
     }
     match property {
         "gap" => style.gap = css_parse_px(value),
-        "padding" => style.padding = css_parse_px(value),
-        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
-            style.padding = css_parse_px(value);
-        }
-        "margin" => style.margin = css_parse_px(value),
+        "padding" => apply_padding_shorthand(style, value),
+        "padding-top" => style.padding_top = css_parse_spacing(value),
+        "padding-right" => style.padding_right = css_parse_spacing(value),
+        "padding-bottom" => style.padding_bottom = css_parse_spacing(value),
+        "padding-left" => style.padding_left = css_parse_spacing(value),
+        "margin" => style.margin = css_parse_spacing(value),
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
-            style.margin = css_parse_px(value);
+            style.margin = css_parse_spacing(value);
         }
         "font-size" => style.font_size = css_parse_px(value),
         "font-weight" => style.font_weight = parse_font_weight(value),
@@ -945,7 +953,13 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "background" | "background-color" => style.background = Some(value.to_string()),
         "border-radius" => style.border_radius = css_parse_px(value),
         "border-width" => style.border_width = css_parse_px(value),
-        "border-color" => style.border_color = Some(value.to_string()),
+        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
+            style.border_width = css_parse_px(value);
+        }
+        "border-color" | "border-top-color" | "border-right-color"
+        | "border-bottom-color" | "border-left-color" => {
+            style.border_color = Some(value.to_string());
+        }
         "align-items" => style.align_items = Some(value.to_string()),
         "align-self" => style.align_self = Some(value.to_string()),
         "align-content" => style.align_content = Some(value.to_string()),
@@ -989,6 +1003,10 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "outline" => parse_outline_shorthand(style, value),
         "transform" => style.transform = Some(value.to_string()),
         "transition" => style.transition = Some(value.to_string()),
+        "animation" => style.animation = Some(value.to_string()),
+        "contain" => style.contain = Some(value.to_string()),
+        "will-change" => style.will_change = Some(value.to_string()),
+        "filter" => style.filter = Some(value.to_string()),
         "box-shadow" => style.box_shadow = Some(value.to_string()),
         "border" => parse_border_shorthand(style, value),
         _ => {}
@@ -1072,13 +1090,63 @@ fn resolve_var(value: &str, custom_props: &HashMap<String, String>) -> String {
     result
 }
 
+fn css_parse_spacing(value: &str) -> Option<Spacing> {
+    crate::css_values::css_parse_spacing_value(value)
+}
+
 fn css_parse_px(value: &str) -> Option<f32> {
-    let trimmed = value.trim();
-    if trimmed.starts_with("calc(") {
-        return None;
+    crate::css_values::parse_plain_px(value)
+}
+
+/// CSS box-edge shorthand: 1–4 values (top [right [bottom [left]]]).
+fn css_parse_spacing_shorthand(value: &str) -> Option<(Spacing, Spacing, Spacing, Spacing)> {
+    let parts: Vec<Spacing> = value
+        .split_whitespace()
+        .filter_map(css_parse_spacing)
+        .collect();
+    match parts.len() {
+        1 => {
+            let v = parts[0];
+            Some((v, v, v, v))
+        }
+        2 => Some((parts[0], parts[1], parts[0], parts[1])),
+        3 => Some((parts[0], parts[1], parts[2], parts[1])),
+        4 => Some((parts[0], parts[1], parts[2], parts[3])),
+        _ => None,
     }
-    let v = trimmed.trim_end_matches("px");
-    v.parse().ok()
+}
+
+/// CSS box-edge shorthand: 1–4 values (top [right [bottom [left]]]).
+fn css_parse_edge_shorthand(value: &str) -> Option<(f32, f32, f32, f32)> {
+    let parts: Vec<f32> = value
+        .split_whitespace()
+        .filter_map(css_parse_px)
+        .collect();
+    match parts.len() {
+        1 => {
+            let v = parts[0];
+            Some((v, v, v, v))
+        }
+        2 => Some((parts[0], parts[1], parts[0], parts[1])),
+        3 => Some((parts[0], parts[1], parts[2], parts[1])),
+        4 => Some((parts[0], parts[1], parts[2], parts[3])),
+        _ => None,
+    }
+}
+
+fn apply_padding_shorthand(style: &mut StyleDecl, value: &str) {
+    let Some((t, r, b, l)) = css_parse_spacing_shorthand(value) else {
+        return;
+    };
+    style.padding_top = Some(t);
+    style.padding_right = Some(r);
+    style.padding_bottom = Some(b);
+    style.padding_left = Some(l);
+    if t == r && r == b && b == l {
+        style.padding = Some(t);
+    } else {
+        style.padding = None;
+    }
 }
 
 fn parse_font_weight(value: &str) -> Option<u16> {
@@ -1157,9 +1225,71 @@ mod tests {
         "#;
         let sheet = parse_css(css);
         assert_eq!(sheet.rules.len(), 2);
-        assert_eq!(sheet.rules[0].style.padding, Some(16.0));
+        assert_eq!(sheet.rules[0].style.padding, Some(Spacing::Px(16.0)));
         assert_eq!(sheet.rules[1].style.font_size, Some(32.0));
         assert_eq!(sheet.rules[1].style.font_weight, Some(700));
+    }
+
+    #[test]
+    fn parse_two_value_padding() {
+        let css = ".badge { padding: 4 8; }";
+        let sheet = parse_css(css);
+        let style = &sheet.rules[0].style;
+        assert_eq!(style.padding_top, Some(Spacing::Px(4.0)));
+        assert_eq!(style.padding_right, Some(Spacing::Px(8.0)));
+        assert_eq!(style.padding_bottom, Some(Spacing::Px(4.0)));
+        assert_eq!(style.padding_left, Some(Spacing::Px(8.0)));
+    }
+
+    #[test]
+    fn parse_three_value_padding() {
+        let css = ".header { padding: 10 16 12; }";
+        let sheet = parse_css(css);
+        let style = &sheet.rules[0].style;
+        assert_eq!(style.padding_top, Some(Spacing::Px(10.0)));
+        assert_eq!(style.padding_right, Some(Spacing::Px(16.0)));
+        assert_eq!(style.padding_bottom, Some(Spacing::Px(12.0)));
+        assert_eq!(style.padding_left, Some(Spacing::Px(16.0)));
+    }
+
+    #[test]
+    fn parse_env_safe_area_inset() {
+        use w3cos_std::style::SafeAreaEdge;
+        let css = ".composer { padding-bottom: env(safe-area-inset-bottom); }";
+        let sheet = parse_css(css);
+        let style = &sheet.rules[0].style;
+        assert_eq!(
+            style.padding_bottom,
+            Some(Spacing::SafeAreaInset(SafeAreaEdge::Bottom))
+        );
+    }
+
+    #[test]
+    fn parse_calc_spacing_with_env() {
+        use w3cos_std::style::SafeAreaEdge;
+        let css = ".screen { padding-top: calc(10px + env(safe-area-inset-top)); }";
+        let sheet = parse_css(css);
+        assert_eq!(
+            sheet.rules[0].style.padding_top,
+            Some(Spacing::Composite {
+                px: 10.0,
+                safe_area: Some(SafeAreaEdge::Top),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_media_attaches_condition() {
+        let css = r#"
+            @media (min-width: 600px) {
+                .title { font-size: 32; }
+            }
+            .title { font-size: 16; }
+        "#;
+        let sheet = parse_css(css);
+        let media_rule = sheet.rules.iter().find(|r| r.media.is_some()).unwrap();
+        assert!(media_rule.media.as_ref().unwrap().contains("min-width"));
+        assert_eq!(media_rule.style.font_size, Some(32.0));
     }
 
     #[test]

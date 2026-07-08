@@ -1,9 +1,12 @@
 pub mod codegen;
 pub mod css_parser;
+pub mod css_values;
+pub mod media_query;
 pub mod esm_codegen;
 pub mod esm_lowering;
 pub mod esm_resolver;
 pub mod mobile_codegen;
+pub mod web_codegen;
 pub mod npm_bridge;
 pub mod parser;
 pub mod scope_analysis;
@@ -48,14 +51,32 @@ pub fn compile(ts_source: &str, output_dir: &std::path::Path) -> Result<()> {
     compile_with_source_dir(ts_source, output_dir, None, None)
 }
 
-/// Compile a TSX UI app into a mobile cdylib project directory.
-pub fn compile_mobile_from_file(source_path: &std::path::Path, output_dir: &std::path::Path) -> Result<()> {
+/// Compile a TSX UI app into a mobile project directory.
+pub fn compile_mobile_from_file(
+    source_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    platform: &str,
+    safe_area: bool,
+) -> Result<()> {
     let ts_source = std::fs::read_to_string(source_path)
         .with_context(|| format!("Could not read {}", source_path.display()))?;
     let source_dir = source_path.parent();
     let tree = parser::parse(&ts_source)?;
     let stylesheet = resolve_css_imports(&tree.css_imports, source_dir)?;
-    mobile_codegen::write_mobile_project(&tree, &stylesheet, output_dir)
+    mobile_codegen::write_mobile_project(&tree, &stylesheet, output_dir, platform, safe_area)
+}
+
+/// Compile the same TSX UI app to static HTML/CSS/JS for browser preview.
+pub fn compile_web_from_file(
+    source_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<()> {
+    let ts_source = std::fs::read_to_string(source_path)
+        .with_context(|| format!("Could not read {}", source_path.display()))?;
+    let source_dir = source_path.parent();
+    let tree = parser::parse(&ts_source)?;
+    let stylesheet = resolve_css_imports(&tree.css_imports, source_dir)?;
+    web_codegen::write_web_project(&tree, &stylesheet, output_dir)
 }
 
 /// Compile from a source file path, enabling CSS/SCSS import resolution.

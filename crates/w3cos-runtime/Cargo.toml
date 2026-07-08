@@ -6,8 +6,8 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu"]
-gpu = ["dep:vello", "dep:skrifa", "dep:pollster"]
+default = ["gpu", "cpu-render"]
+gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 devtools = []
 ai-bridge = ["dep:w3cos-ai-bridge"]
@@ -20,17 +20,36 @@ taffy = { workspace = true }
 parley = { workspace = true }
 fontdue = { workspace = true }
 anyhow = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
+tempfile = { workspace = true }
+glob = { workspace = true }
+w3cos-ffi = { path = "../w3cos-ffi" }
+
+# GPU rendering (default)
+vello = { workspace = true, optional = true }
+skrifa = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
+# CPU rendering (fallback)
+tiny-skia = { workspace = true, optional = true }
+softbuffer = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { workspace = true, features = ["android-game-activity"] }
 
-[target.'cfg(not(target_os = "android"))'.dependencies]
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 winit = { workspace = true }
-image = { workspace = true }
+
+[target.'cfg(all(not(target_os = "android"), not(target_os = "ios"), not(target_os = "macos")))'.dependencies]
+winit = { workspace = true }
+
+# Desktop-only system bridges (not available on iOS/Android)
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
 ureq = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-libc = "0.2"
 notify-rust = "4"
 arboard = "3.6.1"
 notify = { workspace = true }
@@ -38,17 +57,14 @@ sysinfo = { workspace = true }
 nix = { workspace = true }
 tempfile = { workspace = true }
 glob = { workspace = true }
-w3cos-ffi = { path = "../w3cos-ffi" }
-
-# WebSocket client + DevTools
 tungstenite = { workspace = true }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal"] }
 
-# GPU rendering (default)
-vello = { workspace = true, optional = true }
-skrifa = { workspace = true, optional = true }
-pollster = { workspace = true, optional = true }
+[dev-dependencies]
+w3cos-a11y = { workspace = true }
+w3cos-react-compat = { workspace = true }
+w3cos-core = { workspace = true }
 
-# CPU rendering (fallback)
-tiny-skia = { workspace = true, optional = true }
-softbuffer = { workspace = true, optional = true }
+# Mobile-friendly HTTP (no file dialogs / desktop notifications)
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+ureq = { workspace = true }

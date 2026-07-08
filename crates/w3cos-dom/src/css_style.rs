@@ -1,7 +1,7 @@
 use w3cos_std::color::Color;
 use w3cos_std::style::{
-    AlignItems, Dimension, Display, Edges, FlexDirection, FlexWrap, JustifyContent, Overflow,
-    Position, Style,
+    AlignItems, Contain, Dimension, Display, Edges, FlexDirection, FlexWrap, JustifyContent,
+    Overflow, Position, Spacing, Style, WillChange,
 };
 
 /// CSSStyleDeclaration — the `element.style` property.
@@ -58,22 +58,22 @@ impl CSSStyleDeclaration {
             }
             "padding-top" | "paddingTop" => {
                 if let Some(v) = parse_px(value) {
-                    self.inner.padding.top = v
+                    self.inner.padding.top = Spacing::Px(v)
                 }
             }
             "padding-right" | "paddingRight" => {
                 if let Some(v) = parse_px(value) {
-                    self.inner.padding.right = v
+                    self.inner.padding.right = Spacing::Px(v)
                 }
             }
             "padding-bottom" | "paddingBottom" => {
                 if let Some(v) = parse_px(value) {
-                    self.inner.padding.bottom = v
+                    self.inner.padding.bottom = Spacing::Px(v)
                 }
             }
             "padding-left" | "paddingLeft" => {
                 if let Some(v) = parse_px(value) {
-                    self.inner.padding.left = v
+                    self.inner.padding.left = Spacing::Px(v)
                 }
             }
             "margin" => {
@@ -140,6 +140,22 @@ impl CSSStyleDeclaration {
             // Transform
             "transform" => {
                 self.inner.transform = parse_transform(value);
+            }
+
+            // Compositor hints (standard CSS — UA picks GPU/CPU internally)
+            "will-change" | "willChange" => {
+                self.inner.will_change = WillChange::from_css(value);
+            }
+            "contain" => {
+                self.inner.contain = Contain::from_css(value);
+            }
+            "filter" => {
+                let v = value.trim();
+                if v.is_empty() || v.eq_ignore_ascii_case("none") {
+                    self.inner.filter = None;
+                } else {
+                    self.inner.filter = Some(v.to_string());
+                }
             }
 
             // Transition: "property duration easing"
@@ -215,6 +231,13 @@ impl CSSStyleDeclaration {
             "justify-content" | "justifyContent" => format!("{:?}", self.inner.justify_content).to_lowercase(),
             "align-items" | "alignItems" => format!("{:?}", self.inner.align_items).to_lowercase(),
             "overflow" => format!("{:?}", self.inner.overflow).to_lowercase(),
+            "will-change" | "willChange" => will_change_to_css(&self.inner.will_change),
+            "contain" => contain_to_css(self.inner.contain),
+            "filter" => self
+                .inner
+                .filter
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
             _ => String::new(),
         }
     }
@@ -245,6 +268,37 @@ fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
 fn parse_px(value: &str) -> Option<f32> {
     let v = value.trim().trim_end_matches("px");
     v.parse().ok()
+}
+
+fn will_change_to_css(wc: &WillChange) -> String {
+    let mut parts = Vec::new();
+    if wc.transform {
+        parts.push("transform");
+    }
+    if wc.opacity {
+        parts.push("opacity");
+    }
+    if wc.filter {
+        parts.push("filter");
+    }
+    if wc.scroll_position {
+        parts.push("scroll-position");
+    }
+    if parts.is_empty() {
+        "auto".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn contain_to_css(c: Contain) -> String {
+    match c {
+        Contain::None => "none".to_string(),
+        Contain::Layout => "layout".to_string(),
+        Contain::Size => "size".to_string(),
+        Contain::Content => "content".to_string(),
+        Contain::Strict => "strict".to_string(),
+    }
 }
 
 fn parse_display(value: &str) -> Display {

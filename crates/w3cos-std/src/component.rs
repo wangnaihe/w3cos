@@ -12,6 +12,20 @@ pub enum EventAction {
     Set(usize, i64),
     Toggle(usize),
     Notify(String, String),
+    /// `history:push:route:2:/path` — pushState + set route signal
+    HistoryPush {
+        route_signal: usize,
+        route_value: i64,
+        path: String,
+    },
+    /// `history:back:route` — history.back() + restore route from state
+    HistoryBack { route_signal: usize },
+    /// `fetch:GET:statusSig:bytesSig:https://...` — blocking HTTP GET, store status + body len
+    FetchGet {
+        url: String,
+        status_signal: usize,
+        bytes_signal: usize,
+    },
 }
 
 impl EventAction {

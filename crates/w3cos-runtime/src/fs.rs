@@ -276,11 +276,13 @@ pub enum FsEventKind {
 }
 
 /// A handle to an active file watcher. Drop to stop watching.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub struct FsWatcher {
     _watcher: notify::RecommendedWatcher,
     pub rx: mpsc::Receiver<FsEvent>,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 impl FsWatcher {
     /// Drain all pending events (non-blocking).
     pub fn try_recv_all(&self) -> Vec<FsEvent> {
@@ -300,6 +302,7 @@ impl FsWatcher {
 /// Watch a path for changes. Returns a `FsWatcher` handle.
 ///
 /// The watcher runs on a background thread. Drop the handle to stop.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub fn watch(path: &str) -> Result<FsWatcher, String> {
     use notify::{EventKind, RecursiveMode, Watcher};
 
@@ -331,6 +334,11 @@ pub fn watch(path: &str) -> Result<FsWatcher, String> {
     Ok(FsWatcher { _watcher: watcher, rx })
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn watch(_path: &str) -> Result<(), String> {
+    Err("fs.watch is not available on mobile targets".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Permissions & ownership (w3cos.fs.chmod / chown)
 // ---------------------------------------------------------------------------
@@ -350,9 +358,9 @@ pub fn chmod(path: &str, mode: u32) -> Result<(), String> {
     }
 }
 
-/// Change file owner and group (Unix only).
+/// Change file owner and group (Unix desktop only).
 pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use nix::unistd::{Gid, Uid};
         nix::unistd::chown(
@@ -362,7 +370,7 @@ pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (path, uid, gid);
         Err("chown is only supported on Unix".to_string())

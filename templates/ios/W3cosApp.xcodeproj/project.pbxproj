@@ -7,14 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A10000010000000000000001 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000001 /* AppDelegate.swift */; };
-		A10000010000000000000002 /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000002 /* ViewController.swift */; };
 		A10000010000000000000003 /* libw3cos_mobile_app.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000020000000000000003 /* libw3cos_mobile_app.a */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		A10000020000000000000001 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
-		A10000020000000000000002 /* ViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewController.swift; sourceTree = "<group>"; };
 		A10000020000000000000003 /* libw3cos_mobile_app.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libw3cos_mobile_app.a; path = libs/libw3cos_mobile_app.a; sourceTree = "<group>"; };
 		A10000020000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A10000020000000000000005 /* W3cosApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = W3cosApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -43,8 +39,6 @@
 		A10000040000000000000002 /* W3cosApp */ = {
 			isa = PBXGroup;
 			children = (
-				A10000020000000000000001 /* AppDelegate.swift */,
-				A10000020000000000000002 /* ViewController.swift */,
 				A10000020000000000000004 /* Info.plist */,
 				A10000020000000000000003 /* libw3cos_mobile_app.a */,
 			);
@@ -66,7 +60,6 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = A10000060000000000000003 /* Build configuration list for PBXNativeTarget "W3cosApp" */;
 			buildPhases = (
-				A10000030000000000000002 /* Sources */,
 				A10000030000000000000001 /* Frameworks */,
 			);
 			buildRules = (
@@ -106,18 +99,6 @@
 		};
 /* End PBXProject section */
 
-/* Begin PBXSourcesBuildPhase section */
-		A10000030000000000000002 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				A10000010000000000000001 /* AppDelegate.swift in Sources */,
-				A10000010000000000000002 /* ViewController.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXSourcesBuildPhase section */
-
 /* Begin XCBuildConfiguration section */
 		A10000080000000000000001 /* Debug */ = {
 			isa = XCBuildConfiguration;
@@ -126,7 +107,6 @@
 				CLANG_ENABLE_MODULES = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				SDKROOT = iphoneos;
-				SWIFT_VERSION = 5.0;
 			};
 			name = Debug;
 		};
@@ -137,7 +117,6 @@
 				CLANG_ENABLE_MODULES = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				SDKROOT = iphoneos;
-				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
 		};
@@ -164,12 +143,12 @@
 					QuartzCore,
 					"-framework",
 					CoreGraphics,
+					"-Wl,-force_load,$(PROJECT_DIR)/libs/libw3cos_mobile_app.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.w3cos.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
-				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Debug;
@@ -197,12 +176,12 @@
 					QuartzCore,
 					"-framework",
 					CoreGraphics,
+					"-Wl,-force_load,$(PROJECT_DIR)/libs/libw3cos_mobile_app.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.w3cos.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
-				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;

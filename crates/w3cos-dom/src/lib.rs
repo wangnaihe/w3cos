@@ -343,10 +343,10 @@ mod tests {
     fn test_css_set_property_padding_margin() {
         let mut style = CSSStyleDeclaration::new();
         style.set_property("padding", "16px");
-        assert_eq!(style.inner.padding.top, 16.0);
-        assert_eq!(style.inner.padding.bottom, 16.0);
+        assert_eq!(style.inner.padding.top, w3cos_std::style::Spacing::Px(16.0));
+        assert_eq!(style.inner.padding.bottom, w3cos_std::style::Spacing::Px(16.0));
         style.set_property("margin", "8px");
-        assert_eq!(style.inner.margin.top, 8.0);
+        assert_eq!(style.inner.margin.top, w3cos_std::style::Spacing::Px(8.0));
     }
 
     #[test]
@@ -374,6 +374,24 @@ mod tests {
         let mut style = CSSStyleDeclaration::new();
         style.set_property("background-color", "#00ff00");
         assert_eq!(style.inner.background.g, 255);
+    }
+
+    #[test]
+    fn test_css_compositor_properties() {
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("will-change", "transform, opacity");
+        assert!(style.inner.will_change.transform);
+        assert!(style.inner.will_change.opacity);
+        assert_eq!(style.get_property("will-change"), "transform, opacity");
+
+        style.set_property("contain", "layout");
+        assert!(matches!(style.inner.contain, w3cos_std::style::Contain::Layout));
+
+        style.set_property("filter", "blur(4px)");
+        assert_eq!(style.inner.filter.as_deref(), Some("blur(4px)"));
+        style.set_property("filter", "none");
+        assert!(style.inner.filter.is_none());
+        assert_eq!(style.get_property("filter"), "none");
     }
 
     // --- Node tree tests ---

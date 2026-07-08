@@ -135,6 +135,7 @@ where
 }
 
 /// `w3cos.dialog.showOpen({filters})` → returns the chosen path (or `None`).
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub fn show_open(options: OpenDialogOptions) -> DialogReceiver<Option<PathBuf>> {
     spawn("open", move || {
         let mut dialog = rfd::FileDialog::new();
@@ -143,7 +144,13 @@ pub fn show_open(options: OpenDialogOptions) -> DialogReceiver<Option<PathBuf>> 
     })
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn show_open(_options: OpenDialogOptions) -> DialogReceiver<Option<PathBuf>> {
+    spawn("open", || None)
+}
+
 /// `w3cos.dialog.showOpen({multi: true})` → returns 0..N paths.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub fn show_open_multiple(options: OpenDialogOptions) -> DialogReceiver<Vec<PathBuf>> {
     spawn("open-multi", move || {
         let mut dialog = rfd::FileDialog::new();
@@ -152,7 +159,13 @@ pub fn show_open_multiple(options: OpenDialogOptions) -> DialogReceiver<Vec<Path
     })
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn show_open_multiple(_options: OpenDialogOptions) -> DialogReceiver<Vec<PathBuf>> {
+    spawn("open-multi", Vec::new)
+}
+
 /// `w3cos.dialog.showOpenDirectory()` → returns a directory path.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub fn show_open_directory(options: OpenDialogOptions) -> DialogReceiver<Option<PathBuf>> {
     spawn("open-dir", move || {
         let mut dialog = rfd::FileDialog::new();
@@ -166,7 +179,13 @@ pub fn show_open_directory(options: OpenDialogOptions) -> DialogReceiver<Option<
     })
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn show_open_directory(_options: OpenDialogOptions) -> DialogReceiver<Option<PathBuf>> {
+    spawn("open-dir", || None)
+}
+
 /// `w3cos.dialog.showSave({defaultPath, filters})` → user-confirmed save path.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub fn show_save(options: SaveDialogOptions) -> DialogReceiver<Option<PathBuf>> {
     spawn("save", move || {
         let mut dialog = rfd::FileDialog::new();
@@ -187,7 +206,13 @@ pub fn show_save(options: SaveDialogOptions) -> DialogReceiver<Option<PathBuf>> 
     })
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn show_save(_options: SaveDialogOptions) -> DialogReceiver<Option<PathBuf>> {
+    spawn("save", || None)
+}
+
 /// `w3cos.dialog.showMessage({...})` → which button the user pressed.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub fn show_message(options: MessageDialogOptions) -> DialogReceiver<MessageResult> {
     spawn("message", move || {
         let mut dialog = rfd::MessageDialog::new()
@@ -229,6 +254,12 @@ pub fn show_message(options: MessageDialogOptions) -> DialogReceiver<MessageResu
     })
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn show_message(_options: MessageDialogOptions) -> DialogReceiver<MessageResult> {
+    spawn("message", || MessageResult::Cancelled)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn apply_open_options(mut dialog: rfd::FileDialog, options: &OpenDialogOptions) -> rfd::FileDialog {
     if let Some(title) = options.title.as_deref() {
         dialog = dialog.set_title(title);

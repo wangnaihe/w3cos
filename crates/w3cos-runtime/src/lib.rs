@@ -1,7 +1,12 @@
+pub mod compositor;
 pub mod dom;
+pub mod filter;
+#[cfg(feature = "gpu")]
+pub mod gpu_filter;
 #[cfg(feature = "devtools")]
 pub mod devtools;
 pub mod canvas2d;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod clipboard;
 pub mod font_face;
 pub mod dialog;
@@ -9,27 +14,33 @@ pub mod eventsource;
 pub mod fetch;
 pub mod frame_cache;
 pub mod fs;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod fs_watch;
 pub mod history;
 pub mod image_loader;
 pub mod indexed_db;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod ipc;
 pub mod layout;
+pub mod text_layout;
 pub mod manifest;
 pub mod media;
 pub mod menu;
 pub mod multi_window;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod notification;
 pub mod observers;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod process;
 pub mod pwa;
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
 pub mod pty;
 pub mod state;
 pub mod storage;
 pub mod streams;
 pub mod text_encoding;
 pub mod timers;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod websocket;
 pub mod worker;
 
@@ -38,11 +49,17 @@ pub use w3cos_ffi as ffi;
 
 #[cfg(feature = "gpu")]
 #[path = "render_gpu.rs"]
-pub mod render;
+pub mod render_gpu;
 
 #[cfg(feature = "cpu-render")]
 #[path = "render_cpu.rs"]
-pub mod render;
+pub mod render_cpu;
+
+#[cfg(all(feature = "gpu", not(feature = "cpu-render")))]
+pub use render_gpu as render;
+
+#[cfg(all(feature = "cpu-render", not(feature = "gpu")))]
+pub use render_cpu as render;
 
 pub mod window;
 

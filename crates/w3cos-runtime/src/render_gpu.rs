@@ -12,6 +12,11 @@ use w3cos_std::color::Color as AppColor;
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::Style;
 
+use crate::compositor::{layer_opacity, promotes_compositor_layer};
+use crate::filter::{self, CssFilter};
+#[cfg(feature = "gpu")]
+use crate::gpu_filter::{self, GpuFilterCtx};
+
 use crate::layout::LayoutRect;
 
 // ---------------------------------------------------------------------------
@@ -82,6 +87,74 @@ fn color_to_vello(c: AppColor) -> Color {
     ])
 }
 
+fn resolved_color(c: AppColor, opacity: f32, chain: Option<&CssFilter>) -> AppColor {
+    let c = chain
+        .map(|f| filter::apply_filter_to_color(c, f))
+        .unwrap_or(c);
+    AppColor::rgba(
+        c.r,
+        c.g,
+        c.b,
+        (c.a as f32 * opacity).clamp(0.0, 255.0) as u8,
+    )
+}
+
+fn node_color(c: AppColor, opacity: f32, chain: Option<&CssFilter>) -> AppColor {
+    resolved_color(c, opacity, chain)
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn render_node_gpu_layer(
+    scene: &mut Scene,
+    filter_ctx: &mut GpuFilterCtx<'_>,
+    rect: LayoutRect,
+    kind: &ComponentKind,
+    style: &Style,
+    font_data: &FontData,
+    font: &fontdue::Font,
+    text_input_value: Option<&str>,
+    is_focused: bool,
+    glyph_cache: &mut GlyphCache,
+    dpi: Affine,
+    chain: &CssFilter,
+) {
+    let pad = chain.max_blur_px().ceil() as u32 + 2;
+    let lw = (rect.width as u32 + pad * 2).max(1);
+    let lh = (rect.height as u32 + pad * 2).max(1);
+    let mut layer_scene = Scene::new();
+    let inner = LayoutRect {
+        x: pad as f32,
+        y: pad as f32,
+        width: rect.width,
+        height: rect.height,
+    };
+    render_node(
+        &mut layer_scene,
+        inner,
+        kind,
+        style,
+        font_data,
+        font,
+        None,
+        text_input_value,
+        is_focused,
+        glyph_cache,
+        dpi,
+        true,
+        None,
+    );
+    if let Some(layer) = filter_ctx.rasterize_filtered_layer(&layer_scene, lw, lh, chain) {
+        gpu_filter::draw_filtered_image(
+            scene,
+            rect.x - pad as f32,
+            rect.y - pad as f32,
+            &layer,
+            dpi,
+        );
+    }
+}
+
 pub fn make_font_data(font_bytes: &'static [u8]) -> FontData {
     let blob = Blob::new(Arc::new(font_bytes.to_vec()));
     FontData::new(blob, 0)
@@ -100,6 +173,7 @@ pub fn render_frame(
     focused_index: Option<usize>,
     glyph_cache: &mut GlyphCache,
     scale_factor: f32,
+    #[cfg(feature = "gpu")] mut gpu_filter: Option<&mut GpuFilterCtx<'_>>,
 ) {
     let vw = width as f32 / scale_factor;
     let vh = height as f32 / scale_factor;
@@ -151,6 +225,9 @@ pub fn render_frame(
             is_focused,
             glyph_cache,
             dpi,
+            false,
+            #[cfg(feature = "gpu")]
+            gpu_filter.as_deref_mut(),
         );
     }
 }
@@ -168,6 +245,8 @@ fn render_node(
     is_focused: bool,
     glyph_cache: &mut GlyphCache,
     dpi: Affine,
+    in_layer: bool,
+    #[cfg(feature = "gpu")] mut gpu_filter: Option<&mut GpuFilterCtx<'_>>,
 ) {
     if style.opacity <= 0.0 {
         return;
@@ -194,9 +273,10 @@ fn render_node(
     };
 
     let opacity = style.opacity;
+    let css_filter = style.filter.as_deref().and_then(filter::parse_css_filter);
 
-    let needs_opacity_layer = opacity < 1.0;
-    if needs_opacity_layer {
+    let needs_compositor_layer = promotes_compositor_layer(style);
+    if needs_compositor_layer {
         let bounds = Rect::new(
             rect.x as f64,
             rect.y as f64,
@@ -206,27 +286,75 @@ fn render_node(
         scene.push_layer(
             Fill::NonZero,
             vello::peniko::Mix::Normal,
-            opacity,
+            layer_opacity(style),
             dpi,
             &bounds,
         );
     }
 
-    if let Some(ref shadow) = style.box_shadow {
-        draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
+    #[cfg(feature = "gpu")]
+    if !in_layer {
+        if let (Some(ref chain), Some(ctx)) = (css_filter.as_ref(), gpu_filter.as_deref_mut()) {
+            if chain.has_blur() {
+                if let Some(shadow) = chain.drop_shadow() {
+                    draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
+                }
+                if let Some(ref shadow) = style.box_shadow {
+                    draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
+                }
+                render_node_gpu_layer(
+                    scene,
+                    ctx,
+                    rect,
+                    kind,
+                    style,
+                    font_data,
+                    font,
+                    text_input_value,
+                    is_focused,
+                    glyph_cache,
+                    dpi,
+                    chain,
+                );
+                if needs_compositor_layer {
+                    scene.pop_layer();
+                }
+                if has_clip {
+                    scene.pop_layer();
+                }
+                return;
+            }
+        }
     }
 
-    let bg = style.background;
+    if !in_layer {
+        if let Some(ref chain) = css_filter {
+            if let Some(shadow) = chain.drop_shadow() {
+                draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
+            }
+        }
+        if let Some(ref shadow) = style.box_shadow {
+            draw_box_shadow(scene, rect, shadow, style.border_radius, dpi);
+        }
+    }
+
+    let color_chain = if in_layer {
+        None
+    } else {
+        css_filter.as_ref()
+    };
+    let bg = node_color(style.background, opacity, color_chain);
 
     if bg.a > 0 {
         draw_rect(scene, rect, bg, style.border_radius, dpi);
     }
 
     if style.border_width > 0.0 && style.border_color.a > 0 {
-        draw_border(scene, rect, style.border_color, style.border_width, style.border_radius, dpi);
+        let border = node_color(style.border_color, opacity, color_chain);
+        draw_border(scene, rect, border, style.border_width, style.border_radius, dpi);
     }
 
-    let text_color = style.color;
+    let text_color = node_color(style.color, opacity, color_chain);
 
     match kind {
         ComponentKind::Text { content } => {
@@ -244,23 +372,21 @@ fn render_node(
         }
         ComponentKind::Button { label } => {
             let btn_bg = if bg.a == 0 {
-                AppColor::rgb(55, 65, 81)
+                node_color(AppColor::rgb(55, 65, 81), opacity, color_chain)
             } else {
                 bg
             };
             draw_rect(scene, rect, btn_bg, style.border_radius.max(6.0), dpi);
-            let text_x = rect.x + 16.0;
-            let text_y = rect.y + 8.0;
-            draw_text(
+            draw_text_centered_in_rect(
                 scene,
-                text_x,
-                text_y,
+                rect,
                 label,
                 style.font_size,
                 text_color,
                 font_data,
                 font,
-                glyph_cache, dpi,
+                glyph_cache,
+                dpi,
             );
         }
         ComponentKind::Image { src } => {
@@ -364,7 +490,7 @@ fn render_node(
         _ => {}
     }
 
-    if needs_opacity_layer {
+    if needs_compositor_layer {
         scene.pop_layer();
     }
 
@@ -437,6 +563,30 @@ fn draw_border(scene: &mut Scene, r: LayoutRect, color: AppColor, width: f32, ra
         );
         scene.stroke(&stroke, dpi, vc, None, &rect);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_centered_in_rect(
+    scene: &mut Scene,
+    rect: LayoutRect,
+    text: &str,
+    font_size: f32,
+    color: AppColor,
+    font_data: &FontData,
+    fontdue_font: &fontdue::Font,
+    glyph_cache: &mut GlyphCache,
+    dpi: Affine,
+) {
+    let text_w: f32 = text
+        .chars()
+        .map(|ch| fontdue_font.rasterize(ch, font_size).0.advance_width)
+        .sum();
+    let text_h = font_size * 1.2;
+    let x = rect.x + (rect.width - text_w).max(0.0) * 0.5;
+    let y = rect.y + (rect.height - text_h).max(0.0) * 0.5;
+    draw_text(
+        scene, x, y, text, font_size, color, font_data, fontdue_font, glyph_cache, dpi,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -4,43 +4,135 @@ use crate::parser::{AppTree, SignalDecl};
 use anyhow::Result;
 use std::path::Path;
 
-pub fn write_mobile_project(tree: &AppTree, stylesheet: &Stylesheet, output_dir: &Path) -> Result<()> {
+pub fn write_mobile_project(
+    tree: &AppTree,
+    stylesheet: &Stylesheet,
+    output_dir: &Path,
+    platform: &str,
+    safe_area: bool,
+) -> Result<()> {
     std::fs::create_dir_all(output_dir.join("src"))?;
-    std::fs::write(
-        output_dir.join("src/lib.rs"),
-        generate_mobile_lib(tree, stylesheet)?,
-    )?;
-    std::fs::write(output_dir.join("Cargo.toml"), generate_mobile_cargo_toml()?)?;
+    let body = generate_app_body(tree, stylesheet)?;
+    if platform == "ios" {
+        std::fs::write(output_dir.join("src/app_ui.rs"), &body)?;
+        std::fs::write(
+            output_dir.join("src/layout_export.rs"),
+            generate_layout_export(tree, safe_area)?,
+        )?;
+        std::fs::write(output_dir.join("src/main.rs"), generate_ios_main(safe_area)?)?;
+        std::fs::write(output_dir.join("Cargo.toml"), generate_ios_cargo_toml()?)?;
+    } else {
+        std::fs::write(output_dir.join("src/lib.rs"), generate_android_lib(&body)?)?;
+        std::fs::write(output_dir.join("Cargo.toml"), generate_android_cargo_toml()?)?;
+    }
     Ok(())
 }
 
-pub fn generate_mobile_lib(tree: &AppTree, stylesheet: &Stylesheet) -> Result<String> {
+fn generate_app_body(tree: &AppTree, stylesheet: &Stylesheet) -> Result<String> {
     let is_reactive = !tree.signals.is_empty();
     let signal_names: Vec<&str> = tree.signals.iter().map(|s| s.name.as_str()).collect();
-    let component_code = gen_node(&tree.root, 0, &signal_names, stylesheet);
-
+    let component_code = gen_node(&tree.root, 0, &signal_names, stylesheet, 1, 1);
     let signal_inits = if is_reactive {
         gen_signal_inits(&tree.signals)
     } else {
         String::new()
     };
-
     let uses = if is_reactive {
         "use w3cos_std::{Component, EventAction, Style};\nuse w3cos_std::style::*;\nuse w3cos_std::color::Color;"
     } else {
         "use w3cos_std::{Component, Style};\nuse w3cos_std::style::*;\nuse w3cos_std::color::Color;"
     };
-
     Ok(format!(
-        r#"//! Auto-generated mobile lib — do not edit.
-{uses}
+        r#"{uses}
 
-fn build_ui() -> Component {{
+pub fn build_ui() -> Component {{
 {signal_inits}{component_code}
 }}
+"#,
+    ))
+}
 
-/// C ABI entry used by iOS shell and Android JNI fallback.
-#[no_mangle]
+fn generate_ios_main(safe_area: bool) -> Result<String> {
+    let safe_init = if safe_area {
+        r#"    w3cos_std::safe_area::set_enabled(true);
+"#
+    } else {
+        ""
+    };
+    Ok(format!(
+        r#"//! Auto-generated iOS app — do not edit.
+mod app_ui;
+use app_ui::build_ui;
+
+fn main() {{
+{safe_init}    if let Err(e) = w3cos_mobile::run_mobile_app(build_ui) {{
+        eprintln!("w3cos iOS app failed: {{e:#}}");
+    }}
+}}
+"#
+    ))
+}
+
+fn generate_layout_export(tree: &AppTree, safe_area: bool) -> Result<String> {
+    let signal_inits = gen_signal_inits(&tree.signals);
+    let safe_init = if safe_area {
+        r#"    w3cos_std::safe_area::set_enabled(true);
+    w3cos_std::safe_area::set_insets(w3cos_std::safe_area::SafeAreaInsets {
+        top: 59.0,
+        right: 0.0,
+        bottom: 34.0,
+        left: 0.0,
+    });
+"#
+    } else {
+        ""
+    };
+    Ok(format!(
+        r#"//! Auto-generated layout metrics export — do not edit.
+mod app_ui;
+use app_ui::build_ui;
+
+fn main() {{
+{signal_inits}{safe_init}
+    let root = build_ui();
+    let layout =
+        w3cos_runtime::layout::compute(&root, 402.0, 874.0).expect("layout compute");
+    let flat = w3cos_runtime::layout::pre_flatten(&root);
+
+    let mut nodes = serde_json::Map::new();
+    for (i, node) in flat.iter().enumerate() {{
+        let key = match node.kind {{
+            w3cos_std::ComponentKind::Text {{ content }} => Some(format!("text:{{}}", content)),
+            w3cos_std::ComponentKind::Button {{ label }} => Some(format!("btn:{{}}", label)),
+            _ => None,
+        }};
+        if let Some(key) = key {{
+            if let Some((rect, _)) = layout.iter().find(|(_, idx)| *idx == i) {{
+                nodes.insert(
+                    key,
+                    serde_json::json!({{
+                        "x": rect.x,
+                        "y": rect.y,
+                        "w": rect.width,
+                        "h": rect.height,
+                    }}),
+                );
+            }}
+        }}
+    }}
+    println!("{{}}", serde_json::Value::Object(nodes));
+}}
+"#,
+        signal_inits = signal_inits,
+        safe_init = safe_init,
+    ))
+}
+
+fn generate_android_lib(body: &str) -> Result<String> {
+    Ok(format!(
+        r#"//! Auto-generated Android lib — do not edit.
+{body}
+#[unsafe(no_mangle)]
 pub extern "C" fn w3cos_app_run() -> i32 {{
     match w3cos_mobile::run_mobile_app(build_ui) {{
         Ok(()) => 0,
@@ -52,7 +144,7 @@ pub extern "C" fn w3cos_app_run() -> i32 {{
 }}
 
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn android_main(app: winit::platform::android::activity::AndroidApp) {{
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
@@ -61,26 +153,67 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {{
         log::error!("android_main failed: {{e:#}}");
     }}
 }}
-"#,
+"#
     ))
 }
 
 fn gen_signal_inits(signals: &[SignalDecl]) -> String {
-    signals
+    if signals.is_empty() {
+        return String::new();
+    }
+    let register: Vec<String> = signals
         .iter()
-        .enumerate()
-        .map(|(i, sig)| {
+        .map(|sig| {
             format!(
-                "    let _ = w3cos_runtime::state::create_signal({initial});\n    let {name} = w3cos_runtime::state::get_signal({i});\n",
-                initial = sig.initial,
+                "        w3cos_runtime::state::register_signal_name({name:?});\n        let _ = w3cos_runtime::state::create_signal({initial});",
                 name = sig.name,
+                initial = sig.initial,
             )
         })
-        .collect::<Vec<_>>()
-        .join("")
+        .collect();
+    format!(
+        "    w3cos_runtime::state::ensure_signals(|| {{\n{register}\n    }});\n",
+        register = register.join("\n"),
+    )
 }
 
-pub fn generate_mobile_cargo_toml() -> Result<String> {
+fn deps_block(root: &Path) -> String {
+    format!(
+        r#"w3cos-mobile = {{ path = "{mobile}" }}
+w3cos-runtime = {{ path = "{runtime}" }}
+w3cos-std = {{ path = "{std}" }}
+log = "0.4""#,
+        mobile = root.join("crates/w3cos-mobile").display(),
+        runtime = root.join("crates/w3cos-runtime").display(),
+        std = root.join("crates/w3cos-std").display(),
+    )
+}
+
+pub fn generate_ios_cargo_toml() -> Result<String> {
+    let root = find_workspace_root()?;
+    Ok(format!(
+        r#"[package]
+name = "w3cos-mobile-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "W3cosApp"
+path = "src/main.rs"
+
+[[bin]]
+name = "layout-export"
+path = "src/layout_export.rs"
+
+[dependencies]
+{deps}
+serde_json = "1"
+"#,
+        deps = deps_block(&root),
+    ))
+}
+
+pub fn generate_android_cargo_toml() -> Result<String> {
     let root = find_workspace_root()?;
     Ok(format!(
         r#"[package]
@@ -93,17 +226,12 @@ name = "w3cos_mobile_app"
 crate-type = ["cdylib"]
 
 [dependencies]
-w3cos-mobile = {{ path = "{mobile}" }}
-w3cos-runtime = {{ path = "{runtime}", features = ["gpu"] }}
-w3cos-std = {{ path = "{std}" }}
-log = "0.4"
+{deps}
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"
 winit = {{ version = "0.30", features = ["android-game-activity"] }}
 "#,
-        mobile = root.join("crates/w3cos-mobile").display(),
-        runtime = root.join("crates/w3cos-runtime").display(),
-        std = root.join("crates/w3cos-std").display(),
+        deps = deps_block(&root),
     ))
 }

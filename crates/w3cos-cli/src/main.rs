@@ -38,6 +38,9 @@ enum Commands {
         /// Enable Link-Time Optimization for smaller, faster binaries.
         #[arg(long)]
         lto: bool,
+        /// Output target: native binary (default) or web (HTML/CSS/JS).
+        #[arg(long, default_value = "native")]
+        target: String,
     },
     /// Compile and immediately run the application.
     Run {
@@ -93,15 +96,16 @@ fn main() -> Result<()> {
             release,
             strip,
             lto,
+            target,
         } => {
             // Enable strip by default in release mode unless explicitly disabled
             let strip = if release || strip { Some(true) } else { None };
-            build(&input, &output, release, strip, lto)?;
+            build(&input, &output, release, strip, lto, &target)?;
         }
         Commands::Run { input } => {
             let tmp = std::env::temp_dir().join("w3cos-run");
             let bin = tmp.join("target").join("debug").join("w3cos-app");
-            build(&input, &bin, false, None, false)?;
+            build(&input, &bin, false, None, false, "native")?;
             println!("▶  Running...");
             let status = Command::new(&bin)
                 .status()
@@ -136,9 +140,29 @@ fn build(
     release: bool,
     strip: Option<bool>,
     lto: bool,
+    target: &str,
 ) -> Result<()> {
     let input_abs = std::fs::canonicalize(input)
         .with_context(|| format!("Could not find {}", input.display()))?;
+
+    if target == "web" {
+        println!("⚡ Transpiling {} → HTML/CSS/JS...", input.display());
+        if output.exists() {
+            if output.is_dir() {
+                std::fs::remove_dir_all(output)?;
+            } else {
+                anyhow::bail!("web output must be a directory, got file: {}", output.display());
+            }
+        }
+        std::fs::create_dir_all(output)?;
+        w3cos_compiler::compile_web_from_file(&input_abs, output)?;
+        println!("✅ Web output: {}/ (index.html, styles.css, app.js)", output.display());
+        return Ok(());
+    }
+
+    if target != "native" {
+        anyhow::bail!("unknown --target {target} (use native|web)");
+    }
 
     let build_dir = std::env::temp_dir().join("w3cos-build");
     if build_dir.exists() {
@@ -282,7 +306,7 @@ fn dev_watch(input: &PathBuf) -> Result<()> {
     loop {
         // Build
         println!("⚡ Building...");
-        if let Err(e) = build(&input, &bin, false, None, false) {
+        if let Err(e) = build(&input, &bin, false, None, false, "native") {
             eprintln!("❌ Build failed: {e}");
             wait_for_change(&input, &mut last_modified);
             continue;

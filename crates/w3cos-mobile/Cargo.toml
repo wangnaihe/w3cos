@@ -6,7 +6,7 @@ license.workspace = true
 description = "W3C OS mobile platform — touch, safe area, lifecycle; Android/iOS host integration"
 
 [dependencies]
-w3cos-runtime = { workspace = true, default-features = true, features = ["gpu"] }
+w3cos-runtime = { workspace = true }
 w3cos-std = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

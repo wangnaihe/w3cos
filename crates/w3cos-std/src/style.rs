@@ -1,6 +1,8 @@
 use crate::color::Color;
 use serde::{Deserialize, Serialize};
 
+pub use crate::safe_area::{SafeAreaEdge, SafeAreaInsets};
+
 /// CSS Modern Subset — Flexbox, Grid, Block, Inline, and positioning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Style {
@@ -65,6 +67,12 @@ pub struct Style {
 
     // CSS Containment — layout isolation boundaries (Chrome-inspired)
     pub contain: Contain,
+
+    /// CSS `will-change` — UA compositor layer promotion hint.
+    pub will_change: WillChange,
+
+    /// CSS `filter` — stored raw; non-none values promote compositor layers.
+    pub filter: Option<String>,
 
     // Box Shadow
     pub box_shadow: Option<BoxShadow>,
@@ -143,6 +151,8 @@ impl Default for Style {
             word_break: WordBreak::Normal,
             custom_properties: None,
             contain: Contain::None,
+            will_change: WillChange::default(),
+            filter: None,
             box_shadow: None,
             transform: Transform2D::IDENTITY,
             transition: None,
@@ -162,7 +172,7 @@ impl Default for Style {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Display {
     Block,
     #[default]
@@ -241,38 +251,95 @@ pub enum Dimension {
     Vh(f32),
 }
 
+/// CSS length for padding/margin — `px`, `env()`, or `calc(px + env())`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Edges {
+pub enum Spacing {
+    Px(f32),
+    SafeAreaInset(SafeAreaEdge),
+    /// `calc(Npx + env(safe-area-inset-*))` — `px` may be 0 for bare `env()`.
+    Composite {
+        px: f32,
+        safe_area: Option<SafeAreaEdge>,
+    },
+}
+
+impl Spacing {
+    pub fn resolve(&self, insets: &SafeAreaInsets) -> f32 {
+        match self {
+            Spacing::Px(v) => *v,
+            Spacing::SafeAreaInset(edge) => insets.value(*edge),
+            Spacing::Composite { px, safe_area } => {
+                *px + safe_area.map(|e| insets.value(e)).unwrap_or(0.0)
+            }
+        }
+    }
+}
+
+impl From<f32> for Spacing {
+    fn from(v: f32) -> Self {
+        Spacing::Px(v)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EdgeLengths {
     pub top: f32,
     pub right: f32,
     pub bottom: f32,
     pub left: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Edges {
+    pub top: Spacing,
+    pub right: Spacing,
+    pub bottom: Spacing,
+    pub left: Spacing,
+}
+
 impl Edges {
     pub const ZERO: Self = Self {
-        top: 0.0,
-        right: 0.0,
-        bottom: 0.0,
-        left: 0.0,
+        top: Spacing::Px(0.0),
+        right: Spacing::Px(0.0),
+        bottom: Spacing::Px(0.0),
+        left: Spacing::Px(0.0),
     };
 
     pub const fn all(v: f32) -> Self {
         Self {
-            top: v,
-            right: v,
-            bottom: v,
-            left: v,
+            top: Spacing::Px(v),
+            right: Spacing::Px(v),
+            bottom: Spacing::Px(v),
+            left: Spacing::Px(v),
         }
     }
 
     pub const fn xy(x: f32, y: f32) -> Self {
         Self {
-            top: y,
-            right: x,
-            bottom: y,
-            left: x,
+            top: Spacing::Px(y),
+            right: Spacing::Px(x),
+            bottom: Spacing::Px(y),
+            left: Spacing::Px(x),
         }
+    }
+
+    pub fn resolve_lengths(&self, insets: &SafeAreaInsets) -> EdgeLengths {
+        EdgeLengths {
+            top: self.top.resolve(insets),
+            right: self.right.resolve(insets),
+            bottom: self.bottom.resolve(insets),
+            left: self.left.resolve(insets),
+        }
+    }
+}
+
+impl Style {
+    pub fn padding_lengths(&self) -> EdgeLengths {
+        self.padding.resolve_lengths(&crate::safe_area::current())
+    }
+
+    pub fn margin_lengths(&self) -> EdgeLengths {
+        self.margin.resolve_lengths(&crate::safe_area::current())
     }
 }
 
@@ -299,6 +366,64 @@ pub enum Contain {
     Content,
     /// Layout + size + paint + style containment (strongest).
     Strict,
+}
+
+/// CSS `will-change` — hints the UA to promote a compositor layer early.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct WillChange {
+    pub transform: bool,
+    pub opacity: bool,
+    pub filter: bool,
+    pub scroll_position: bool,
+}
+
+impl WillChange {
+    pub fn from_css(value: &str) -> Self {
+        let v = value.trim().to_lowercase();
+        if v.is_empty() || v == "auto" {
+            return Self::default();
+        }
+        let mut wc = Self::default();
+        for part in v.split(',') {
+            match part.trim() {
+                "transform" => wc.transform = true,
+                "opacity" => wc.opacity = true,
+                "filter" => wc.filter = true,
+                "scroll-position" => wc.scroll_position = true,
+                _ => {}
+            }
+        }
+        wc
+    }
+
+    pub fn promotes_layer(&self) -> bool {
+        self.transform || self.opacity || self.filter
+    }
+}
+
+impl Contain {
+    pub fn from_css(value: &str) -> Self {
+        let v = value.trim().to_lowercase();
+        if v.contains("strict") {
+            Self::Strict
+        } else if v.contains("content") {
+            Self::Content
+        } else if v.contains("layout") && v.contains("size") {
+            Self::Strict
+        } else if v.contains("layout") {
+            Self::Layout
+        } else if v.contains("size") {
+            Self::Size
+        } else if v.contains("paint") {
+            Self::Content
+        } else {
+            Self::None
+        }
+    }
+
+    pub fn has_paint_containment(&self) -> bool {
+        matches!(self, Self::Content | Self::Strict)
+    }
 }
 
 // --- CSS Text (#31) ---
@@ -435,7 +560,7 @@ impl BoxShadow {
 
 // --- Transform ---
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Transform2D {
     pub translate_x: f32,
     pub translate_y: f32,

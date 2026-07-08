@@ -1,27 +1,17 @@
-//! Display cutout / home-indicator insets for mobile shell chrome.
+//! Display cutout / home-indicator insets — re-exports + C FFI for native shells.
 
-use serde::{Deserialize, Serialize};
+pub use w3cos_std::safe_area::{
+    current, is_enabled, set_enabled, set_insets, SafeAreaEdge, SafeAreaInsets,
+};
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
-pub struct SafeAreaInsets {
-    pub top: f32,
-    pub right: f32,
-    pub bottom: f32,
-    pub left: f32,
-}
-
-impl SafeAreaInsets {
-    pub fn uniform(v: f32) -> Self {
-        Self {
-            top: v,
-            right: v,
-            bottom: v,
-            left: v,
-        }
-    }
-
-    /// Dev fallback when shell has not reported insets yet.
-    pub fn zero() -> Self {
-        Self::default()
-    }
+/// Called from iOS/Android shell before `w3cos_app_run` (logical px).
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_set_safe_area_insets(top: f32, right: f32, bottom: f32, left: f32) {
+    set_enabled(true);
+    set_insets(SafeAreaInsets {
+        top,
+        right,
+        bottom,
+        left,
+    });
 }

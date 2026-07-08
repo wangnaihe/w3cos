@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use w3cos_std::style::Spacing;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalDecl {
@@ -37,6 +38,9 @@ pub struct Node {
     pub placeholder: Option<String>,
     #[serde(default)]
     pub class_name: Option<String>,
+    /// `Show when="route:0"` — render children only when signal equals value.
+    #[serde(default)]
+    pub show_when: Option<(String, i64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +61,11 @@ pub enum NodeKind {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StyleDecl {
     pub gap: Option<f32>,
-    pub padding: Option<f32>,
+    pub padding: Option<Spacing>,
+    pub padding_top: Option<Spacing>,
+    pub padding_right: Option<Spacing>,
+    pub padding_bottom: Option<Spacing>,
+    pub padding_left: Option<Spacing>,
     pub font_size: Option<f32>,
     pub font_weight: Option<u16>,
     pub color: Option<String>,
@@ -79,7 +87,7 @@ pub struct StyleDecl {
     pub overflow: Option<String>,
     pub display: Option<String>,
     // Phase 3 additions
-    pub margin: Option<f32>,
+    pub margin: Option<Spacing>,
     pub flex_direction: Option<String>,
     pub flex_wrap: Option<String>,
     pub flex_shrink: Option<f32>,
@@ -111,7 +119,15 @@ pub struct StyleDecl {
     pub transform: Option<String>,
     pub transition: Option<String>,
     pub box_shadow: Option<String>,
+    pub animation: Option<String>,
+    pub contain: Option<String>,
+    pub will_change: Option<String>,
+    pub filter: Option<String>,
     pub custom_properties: Option<HashMap<String, String>>,
+    /// `opacity: "@signalName"` — 0–100 scale bound to signal
+    pub opacity_from_signal: Option<String>,
+    /// `background: "@signal:a|b"` — toggle between two hex colors
+    pub background_from_signal: Option<(String, String, String)>,
 }
 
 pub fn parse(source: &str) -> Result<AppTree> {
@@ -313,13 +329,14 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
 
     if !matches!(
         tag_name,
-        "Column" | "Row" | "Box" | "Text" | "Button" | "Image" | "TextInput"
+        "Column" | "Row" | "Box" | "Text" | "Button" | "Image" | "TextInput" | "Show"
     ) {
         return None;
     }
 
     let after_tag = &after_lt[tag_end..];
-    let (style, class_name, on_click, src, placeholder, after_attrs) = parse_tsx_attrs(after_tag);
+    let (style, class_name, on_click, src, placeholder, show_when, after_attrs) =
+        parse_tsx_attrs(after_tag);
     let after_attrs = after_attrs.trim();
 
     if let Some(rest) = after_attrs.strip_prefix("/>") {
@@ -330,6 +347,7 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
             on_click,
             src,
             placeholder,
+            show_when,
             vec![],
             None,
         );
@@ -350,6 +368,7 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
         on_click,
         src,
         placeholder,
+        show_when,
         children,
         text_content,
     );
@@ -364,6 +383,7 @@ fn parse_tsx_attrs(
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<(String, i64)>,
     &str,
 ) {
     let mut style = StyleDecl::default();
@@ -371,6 +391,7 @@ fn parse_tsx_attrs(
     let mut on_click: Option<String> = None;
     let mut src: Option<String> = None;
     let mut placeholder: Option<String> = None;
+    let mut show_when: Option<(String, i64)> = None;
     let mut rest = s.trim();
 
     loop {
@@ -415,6 +436,16 @@ fn parse_tsx_attrs(
                 continue;
             }
         }
+        if let Some(after) = rest.strip_prefix("when=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                if let Some(parsed) = parse_show_when(&value) {
+                    show_when = Some(parsed);
+                }
+                rest = r;
+                continue;
+            }
+        }
         if let Some(after) = rest.strip_prefix("onClick=") {
             let after = after.trim();
             if let Some((value, r)) = extract_first_string_arg(after) {
@@ -449,7 +480,17 @@ fn parse_tsx_attrs(
         }
     }
 
-    (style, class_name, on_click, src, placeholder, rest)
+    (style, class_name, on_click, src, placeholder, show_when, rest)
+}
+
+fn parse_show_when(value: &str) -> Option<(String, i64)> {
+    let (sig, val) = value.split_once(':')?;
+    let val = val.trim().parse::<i64>().ok()?;
+    let sig = sig.trim();
+    if sig.is_empty() {
+        return None;
+    }
+    Some((sig.to_string(), val))
 }
 
 fn find_double_brace_end(s: &str) -> Option<usize> {
@@ -528,9 +569,24 @@ fn build_tsx_node(
     on_click: Option<String>,
     src: Option<String>,
     placeholder: Option<String>,
+    show_when: Option<(String, i64)>,
     children: Vec<Node>,
     text_content: Option<String>,
 ) -> Node {
+    if tag == "Show" {
+        return Node {
+            kind: NodeKind::Box,
+            style,
+            children,
+            text: None,
+            label: None,
+            on_click,
+            src: None,
+            placeholder: None,
+            class_name,
+            show_when,
+        };
+    }
     match tag {
         "Text" => {
             let content = text_content.unwrap_or_default();
@@ -544,6 +600,7 @@ fn build_tsx_node(
                 src: None,
                 placeholder: None,
                 class_name,
+                show_when: None,
             }
         }
         "Button" => {
@@ -558,6 +615,7 @@ fn build_tsx_node(
                 src: None,
                 placeholder: None,
                 class_name,
+                show_when: None,
             }
         }
         "Image" => {
@@ -572,6 +630,7 @@ fn build_tsx_node(
                 src: Some(src_val),
                 placeholder: None,
                 class_name,
+                show_when: None,
             }
         }
         "TextInput" => {
@@ -586,6 +645,7 @@ fn build_tsx_node(
                 src: None,
                 placeholder: Some(placeholder_val),
                 class_name,
+                show_when: None,
             }
         }
         "Row" => Node {
@@ -598,6 +658,7 @@ fn build_tsx_node(
             src: None,
             placeholder: None,
             class_name,
+            show_when: None,
         },
         "Box" => Node {
             kind: NodeKind::Box,
@@ -609,6 +670,7 @@ fn build_tsx_node(
             src: None,
             placeholder: None,
             class_name,
+            show_when: None,
         },
         _ => Node {
             kind: NodeKind::Column,
@@ -620,6 +682,7 @@ fn build_tsx_node(
             src: None,
             placeholder: None,
             class_name,
+            show_when: None,
         },
     }
 }
@@ -668,6 +731,7 @@ fn parse_container_call(kind: &str, inner: &str) -> Option<Node> {
         src: None,
         placeholder: None,
         class_name,
+        show_when: None,
     })
 }
 
@@ -707,6 +771,7 @@ fn parse_image_call(inner: &str) -> Option<Node> {
         src: Some(src_path),
         placeholder: None,
         class_name,
+        show_when: None,
     })
 }
 
@@ -743,6 +808,7 @@ fn parse_text_input_call(inner: &str) -> Option<Node> {
         src: None,
         placeholder: Some(placeholder_val),
         class_name,
+        show_when: None,
     })
 }
 
@@ -786,6 +852,7 @@ fn parse_text_or_button(inner: &str, is_text: bool) -> Option<Node> {
         src: None,
         placeholder: None,
         class_name,
+        show_when: None,
     })
 }
 
@@ -942,11 +1009,10 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
 
             match key {
                 "gap" => style.gap = val.parse().ok(),
-                "padding" => style.padding = val.parse().ok(),
+                "padding" => style.padding = val.parse().ok().map(Spacing::Px),
                 "fontSize" | "font_size" => style.font_size = val.parse().ok(),
                 "fontWeight" | "font_weight" => style.font_weight = val.parse().ok(),
                 "color" => style.color = Some(unquote(val)),
-                "background" => style.background = Some(unquote(val)),
                 "borderRadius" | "border_radius" => style.border_radius = val.parse().ok(),
                 "borderWidth" | "border_width" => style.border_width = val.parse().ok(),
                 "borderColor" | "border_color" => style.border_color = Some(unquote(val)),
@@ -963,6 +1029,39 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                 "height" => style.height = Some(unquote(val)),
                 "overflow" => style.overflow = Some(unquote(val)),
                 "display" => style.display = Some(unquote(val)),
+                "margin" | "marginTop" | "margin_top" => {
+                    style.margin = val.parse().ok().map(Spacing::Px)
+                }
+                "flexWrap" | "flex_wrap" => style.flex_wrap = Some(unquote(val)),
+                "minWidth" | "min_width" => style.min_width = Some(unquote(val)),
+                "textAlign" | "text_align" => style.text_align = Some(unquote(val)),
+                "opacity" => {
+                    let v = unquote(val);
+                    if let Some(name) = v.strip_prefix('@') {
+                        style.opacity_from_signal = Some(name.to_string());
+                    } else {
+                        style.opacity = v.parse().ok();
+                    }
+                }
+                "background" => {
+                    let v = unquote(val);
+                    if let Some(rest) = v.strip_prefix('@') {
+                        if let Some(pipe) = rest.find('|') {
+                            let left = &rest[..pipe];
+                            let color_b = rest[pipe + 1..].to_string();
+                            if let Some(colon) = left.find(':') {
+                                style.background_from_signal = Some((
+                                    left[..colon].to_string(),
+                                    left[colon + 1..].to_string(),
+                                    color_b,
+                                ));
+                            }
+                        }
+                    } else {
+                        style.background = Some(v);
+                    }
+                }
+                "transition" => style.transition = Some(unquote(val)),
                 _ => {}
             }
         }
@@ -1016,6 +1115,7 @@ fn empty_column() -> Node {
         src: None,
         placeholder: None,
         class_name: None,
+        show_when: None,
     }
 }
 

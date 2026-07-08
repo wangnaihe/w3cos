@@ -615,18 +615,20 @@ fn style_to_computed_properties(style: &Style) -> Vec<Value> {
     add("flex-grow", style.flex_grow.to_string());
     add("flex-shrink", style.flex_shrink.to_string());
     add("gap", format!("{}px", style.gap));
+    let pad = style.padding_lengths();
+    let mar = style.margin_lengths();
     add(
         "padding",
         format!(
             "{}px {}px {}px {}px",
-            style.padding.top, style.padding.right, style.padding.bottom, style.padding.left
+            pad.top, pad.right, pad.bottom, pad.left
         ),
     );
     add(
         "margin",
         format!(
             "{}px {}px {}px {}px",
-            style.margin.top, style.margin.right, style.margin.bottom, style.margin.left
+            mar.top, mar.right, mar.bottom, mar.left
         ),
     );
     add("width", format_dimension(&style.width));
@@ -715,20 +717,22 @@ fn style_to_css_properties(style: &Style) -> Vec<Value> {
         add("gap", format!("{}px", style.gap));
     }
     if style.padding != w3cos_std::style::Edges::ZERO {
+        let pad = style.padding_lengths();
         add(
             "padding",
             format!(
                 "{}px {}px {}px {}px",
-                style.padding.top, style.padding.right, style.padding.bottom, style.padding.left
+                pad.top, pad.right, pad.bottom, pad.left
             ),
         );
     }
     if style.margin != w3cos_std::style::Edges::ZERO {
+        let mar = style.margin_lengths();
         add(
             "margin",
             format!(
                 "{}px {}px {}px {}px",
-                style.margin.top, style.margin.right, style.margin.bottom, style.margin.left
+                mar.top, mar.right, mar.bottom, mar.left
             ),
         );
     }

@@ -1,5 +1,6 @@
 pub mod color;
 pub mod component;
+pub mod safe_area;
 pub mod style;
 
 pub use color::Color;
