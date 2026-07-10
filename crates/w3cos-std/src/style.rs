@@ -256,20 +256,36 @@ pub enum Dimension {
 pub enum Spacing {
     Px(f32),
     SafeAreaInset(SafeAreaEdge),
-    /// `calc(Npx + env(safe-area-inset-*))` — `px` may be 0 for bare `env()`.
+    /// `env(keyboard-inset-height)` — virtual keyboard occlusion (logical px).
+    KeyboardInsetHeight,
+    /// `calc(Npx + env(...))` — one optional `safe-area` and/or `keyboard-inset` term.
     Composite {
         px: f32,
+        #[serde(default)]
         safe_area: Option<SafeAreaEdge>,
+        #[serde(default)]
+        keyboard_inset: bool,
     },
 }
 
 impl Spacing {
     pub fn resolve(&self, insets: &SafeAreaInsets) -> f32 {
+        self.resolve_env(insets, crate::keyboard_inset::bottom())
+    }
+
+    pub fn resolve_env(&self, insets: &SafeAreaInsets, keyboard_bottom: f32) -> f32 {
         match self {
             Spacing::Px(v) => *v,
             Spacing::SafeAreaInset(edge) => insets.value(*edge),
-            Spacing::Composite { px, safe_area } => {
-                *px + safe_area.map(|e| insets.value(e)).unwrap_or(0.0)
+            Spacing::KeyboardInsetHeight => keyboard_bottom,
+            Spacing::Composite {
+                px,
+                safe_area,
+                keyboard_inset,
+            } => {
+                *px
+                    + safe_area.map(|e| insets.value(e)).unwrap_or(0.0)
+                    + if *keyboard_inset { keyboard_bottom } else { 0.0 }
             }
         }
     }

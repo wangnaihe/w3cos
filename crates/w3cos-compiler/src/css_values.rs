@@ -64,26 +64,36 @@ pub fn css_parse_spacing_value(value: &str) -> Option<Spacing> {
     if let Some(inner) = trimmed.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
         let mut px_sum = 0.0f32;
         let mut safe_area = None;
+        let mut keyboard_inset = false;
         for term in split_calc_terms(inner) {
             let negative = term.starts_with('-');
             let t = term.trim().trim_start_matches('-').trim_start_matches('+').trim();
             if let Some(inner_env) = t.strip_prefix("env(").and_then(|s| s.strip_suffix(')')) {
                 let name = inner_env.split(',').next()?.trim();
-                let edge = match name {
-                    "safe-area-inset-top" => SafeAreaEdge::Top,
-                    "safe-area-inset-right" => SafeAreaEdge::Right,
-                    "safe-area-inset-bottom" => SafeAreaEdge::Bottom,
-                    "safe-area-inset-left" => SafeAreaEdge::Left,
+                match name {
+                    "safe-area-inset-top" => safe_area = Some(SafeAreaEdge::Top),
+                    "safe-area-inset-right" => safe_area = Some(SafeAreaEdge::Right),
+                    "safe-area-inset-bottom" => safe_area = Some(SafeAreaEdge::Bottom),
+                    "safe-area-inset-left" => safe_area = Some(SafeAreaEdge::Left),
+                    "keyboard-inset-height" => keyboard_inset = true,
                     _ => return None,
-                };
-                safe_area = Some(edge);
+                }
             } else if let Some(v) = parse_plain_px(t) {
                 px_sum += if negative { -v } else { v };
+            } else {
+                return None;
             }
+        }
+        if px_sum.abs() < f32::EPSILON
+            && safe_area.is_none()
+            && !keyboard_inset
+        {
+            return None;
         }
         return Some(Spacing::Composite {
             px: px_sum,
             safe_area,
+            keyboard_inset,
         });
     }
     if let Some(inner) = trimmed.strip_prefix("env(").and_then(|s| s.strip_suffix(')')) {
@@ -93,6 +103,7 @@ pub fn css_parse_spacing_value(value: &str) -> Option<Spacing> {
             "safe-area-inset-right" => Some(Spacing::SafeAreaInset(SafeAreaEdge::Right)),
             "safe-area-inset-bottom" => Some(Spacing::SafeAreaInset(SafeAreaEdge::Bottom)),
             "safe-area-inset-left" => Some(Spacing::SafeAreaInset(SafeAreaEdge::Left)),
+            "keyboard-inset-height" => Some(Spacing::KeyboardInsetHeight),
             _ => None,
         };
     }

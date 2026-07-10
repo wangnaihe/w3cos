@@ -1274,6 +1274,33 @@ mod tests {
             Some(Spacing::Composite {
                 px: 10.0,
                 safe_area: Some(SafeAreaEdge::Top),
+                keyboard_inset: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_env_keyboard_inset_height() {
+        let css = ".composer { padding-bottom: env(keyboard-inset-height); }";
+        let sheet = parse_css(css);
+        assert_eq!(
+            sheet.rules[0].style.padding_bottom,
+            Some(Spacing::KeyboardInsetHeight)
+        );
+    }
+
+    #[test]
+    fn parse_calc_keyboard_and_safe_area() {
+        use w3cos_std::style::SafeAreaEdge;
+        let css =
+            ".composer { padding-bottom: calc(10px + env(safe-area-inset-bottom) + env(keyboard-inset-height)); }";
+        let sheet = parse_css(css);
+        assert_eq!(
+            sheet.rules[0].style.padding_bottom,
+            Some(Spacing::Composite {
+                px: 10.0,
+                safe_area: Some(SafeAreaEdge::Bottom),
+                keyboard_inset: true,
             })
         );
     }

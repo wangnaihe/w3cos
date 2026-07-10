@@ -29,6 +29,8 @@ pub struct MobileAppManifest {
     pub orientation: String,
     #[serde(default)]
     pub safe_area: bool,
+    #[serde(default = "default_interactive_widget")]
+    pub interactive_widget: String,
     #[serde(default)]
     pub ai_bridge_port: Option<u16>,
     #[serde(default)]
@@ -37,6 +39,10 @@ pub struct MobileAppManifest {
 
 fn default_orientation() -> String {
     "portrait".into()
+}
+
+fn default_interactive_widget() -> String {
+    "resizes-content".into()
 }
 
 impl MobileAppManifest {

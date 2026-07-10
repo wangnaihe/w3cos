@@ -35,7 +35,7 @@ pub fn run_mobile_app(builder: fn() -> Component) -> Result<()> {
 
 /// C ABI entry for Android shell (`templates/android` loads `libw3cos_mobile.so`).
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn w3cos_mobile_run() -> i32 {
     match android::run_from_shell() {
         Ok(()) => 0,

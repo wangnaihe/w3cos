@@ -67,6 +67,90 @@ fn update_safe_area_from_window(window: &Window, scale: f32) {
 #[cfg(not(target_os = "ios"))]
 fn update_safe_area_from_window(_window: &Window, _scale: f32) {}
 
+/// Layout viewport derived from the platform window (Visual Viewport semantics).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ViewportLayout {
+    layout_w: f32,
+    layout_h: f32,
+    offset_y: f32,
+    keyboard_inset_bottom: f32,
+}
+
+/// Estimated soft-keyboard height when the platform does not shrink `content_rect`
+/// (common with `NativeActivity` + pan). ~260 CSS px ≈ typical Android IME.
+const ANDROID_IME_FALLBACK_INSET: f32 = 260.0;
+
+impl ViewportLayout {
+    fn from_window(window: &Window, scale: f32, inset_top: f32, ime_open: bool) -> Self {
+        let size = window.inner_size();
+        let full_w = size.width as f32 / scale;
+        let full_h = size.height as f32 / scale;
+        let mut keyboard_inset_bottom = 0.0_f32;
+        let mut layout_w = full_w;
+        let mut layout_h = (full_h - inset_top).max(1.0);
+        let mut offset_y = inset_top;
+
+        #[cfg(target_os = "android")]
+        {
+            use winit::platform::android::WindowExtAndroid;
+            let rect = window.content_rect();
+            let rw = rect.right - rect.left;
+            let rh = rect.bottom - rect.top;
+            if rw > 0 && rh > 0 {
+                layout_w = rw as f32 / scale;
+                let visible_h = rh as f32 / scale;
+                offset_y = inset_top + rect.top as f32 / scale;
+                keyboard_inset_bottom =
+                    (full_h - visible_h - rect.top as f32 / scale).max(0.0);
+            }
+            if ime_open && keyboard_inset_bottom < 8.0 {
+                keyboard_inset_bottom = ANDROID_IME_FALLBACK_INSET;
+            }
+        }
+
+        if w3cos_std::viewport::interactive_widget().resizes_layout_viewport()
+            && keyboard_inset_bottom > 0.0
+        {
+            layout_h = (full_h - inset_top - keyboard_inset_bottom).max(1.0);
+            #[cfg(target_os = "android")]
+            if offset_y > inset_top + 0.5 {
+                offset_y = inset_top;
+            }
+        } else if keyboard_inset_bottom > 0.0 {
+            layout_h = (full_h - inset_top).max(1.0);
+            offset_y = inset_top;
+        } else {
+            #[cfg(target_os = "android")]
+            {
+                use winit::platform::android::WindowExtAndroid;
+                let rect = window.content_rect();
+                let rh = rect.bottom - rect.top;
+                if rh > 0 {
+                    layout_h = (rh as f32 / scale - inset_top).max(1.0);
+                    offset_y = inset_top + rect.top as f32 / scale;
+                }
+            }
+        }
+
+        w3cos_std::keyboard_inset::set_bottom(keyboard_inset_bottom);
+        Self {
+            layout_w,
+            layout_h,
+            offset_y,
+            keyboard_inset_bottom,
+        }
+    }
+
+    fn ime_open_for_app(app: &App) -> bool {
+        app.focused_index.is_some_and(|idx| {
+            matches!(
+                app.get_kind_at(idx),
+                Some(ComponentKind::TextInput { .. })
+            )
+        })
+    }
+}
+
 #[cfg(feature = "cpu-render")]
 use std::num::NonZeroU32;
 #[cfg(feature = "cpu-render")]
@@ -350,6 +434,7 @@ struct App {
     touch_drag_y: f32,
     touch_scroll_active: bool,
     content_inset_top: f32,
+    viewport: ViewportLayout,
     repaint_mode: RepaintMode,
 
     /// UA presenter selection when both GPU and CPU backends are compiled in.
@@ -461,6 +546,12 @@ impl App {
                 0.0
             } else {
                 IOS_CONTENT_INSET_TOP
+            },
+            viewport: ViewportLayout {
+                layout_w: 1.0,
+                layout_h: 1.0,
+                offset_y: 0.0,
+                keyboard_inset_bottom: 0.0,
             },
             repaint_mode: RepaintMode::Full,
             #[cfg(all(feature = "gpu", feature = "cpu-render"))]
@@ -690,17 +781,13 @@ impl App {
     }
 
     fn ensure_layout(&mut self) {
-        if !self.needs_layout && !self.layout_cache.is_empty() {
-            return;
-        }
         let window = match self.get_window() {
             Some(w) => w,
             None => return,
         };
-        let size = window.inner_size();
         let scale = self.scale_factor as f32;
-        let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
-        if w == 0.0 || h == 0.0 {
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
             return;
         }
         update_safe_area_from_window(&window, scale);
@@ -709,7 +796,24 @@ impl App {
         } else {
             self.content_inset_top
         };
-        let layout_h = (h - inset_top).max(1.0);
+        let viewport = ViewportLayout::from_window(
+            &window,
+            scale,
+            inset_top,
+            ViewportLayout::ime_open_for_app(self),
+        );
+
+        if !self.needs_layout
+            && !self.layout_cache.is_empty()
+            && self.viewport == viewport
+        {
+            return;
+        }
+        self.viewport = viewport;
+
+        let w = viewport.layout_w;
+        let layout_h = viewport.layout_h;
+        let layout_offset_y = viewport.offset_y;
 
         let flat = layout::pre_flatten(&self.root);
 
@@ -732,7 +836,7 @@ impl App {
         self.clip_only_nodes = results.clip_only_nodes;
         self.scroll_ancestor = results.scroll_ancestor;
         self.flat_parents = flat.iter().map(|n| n.parent).collect();
-        offset_layout_y(inset_top, &mut self.layout_cache, &mut self.scrollable_nodes, &mut self.clip_only_nodes);
+        offset_layout_y(layout_offset_y, &mut self.layout_cache, &mut self.scrollable_nodes, &mut self.clip_only_nodes);
 
         self.hit_nodes.clear();
         self.focusable_indices.clear();
@@ -759,10 +863,92 @@ impl App {
             }
         }
 
-        self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, h);
+        self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
 
         self.needs_layout = false;
         self.layout_generation += 1;
+        self.ensure_focused_input_visible();
+    }
+
+    /// Scroll focused `TextInput` into view (HTML `scrollIntoView` semantics).
+    fn ensure_focused_input_visible(&mut self) {
+        let focus_idx = match self.focused_index {
+            Some(i) => i,
+            None => return,
+        };
+        if !matches!(
+            self.get_kind_at(focus_idx),
+            Some(ComponentKind::TextInput { .. })
+        ) {
+            return;
+        }
+        let focus_rect = match self
+            .layout_cache
+            .iter()
+            .find(|(_, idx)| *idx == focus_idx)
+            .map(|(r, _)| *r)
+        {
+            Some(r) => r,
+            None => return,
+        };
+        let scroll_idx = self
+            .scroll_ancestor
+            .get(focus_idx)
+            .copied()
+            .flatten();
+        let scroll_idx = match scroll_idx {
+            Some(i) => i,
+            None => return,
+        };
+        let (scroll_rect, extent) = match self
+            .scrollable_nodes
+            .iter()
+            .find(|(i, _, _)| *i == scroll_idx)
+            .map(|(_, r, e)| (*r, *e))
+        {
+            Some(v) => v,
+            None => return,
+        };
+
+        let (ox, oy) = self.scroll_offsets.get(&scroll_idx).copied().unwrap_or((0.0, 0.0));
+        let mut new_oy = oy;
+        let margin = 12.0;
+        let focus_bottom = focus_rect.y + focus_rect.height;
+        let visible_bottom = scroll_rect.y + scroll_rect.height;
+        if focus_bottom > visible_bottom - margin {
+            new_oy = (new_oy + (focus_bottom - visible_bottom + margin)).min(extent.max_y);
+        }
+        if focus_rect.y < scroll_rect.y + margin {
+            new_oy = (new_oy + (focus_rect.y - scroll_rect.y - margin)).max(0.0);
+        }
+        if (new_oy - oy).abs() > 0.001 {
+            self.scroll_offsets.insert(scroll_idx, (ox, new_oy));
+            self.repaint_mode = RepaintMode::ScrollOnly(vec![scroll_idx]);
+        }
+    }
+
+    fn poll_viewport_inset(&mut self) {
+        let window = match self.get_window() {
+            Some(w) => w,
+            None => return,
+        };
+        let scale = self.scale_factor as f32;
+        let inset_top = if w3cos_std::safe_area::is_enabled() {
+            0.0
+        } else {
+            self.content_inset_top
+        };
+        let viewport = ViewportLayout::from_window(
+            &window,
+            scale,
+            inset_top,
+            ViewportLayout::ime_open_for_app(self),
+        );
+        if viewport != self.viewport {
+            self.viewport = viewport;
+            self.needs_layout = true;
+            self.request_repaint();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1253,6 +1439,8 @@ impl App {
             self.request_repaint();
         } else {
             self.focused_index = None;
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            self.sync_soft_keyboard();
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             self.request_repaint();
         }
@@ -1322,6 +1510,38 @@ impl App {
         }
     }
 
+    fn sync_soft_keyboard(&self) {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            use winit::dpi::{PhysicalPosition, PhysicalSize};
+
+            let Some(window) = self.get_window() else {
+                return;
+            };
+            let Some(focus_idx) = self.focused_index else {
+                window.set_ime_allowed(false);
+                return;
+            };
+            let Some(kind) = self.get_kind_at(focus_idx) else {
+                window.set_ime_allowed(false);
+                return;
+            };
+            if !matches!(kind, ComponentKind::TextInput { .. }) {
+                window.set_ime_allowed(false);
+                return;
+            }
+            window.set_ime_allowed(true);
+            if let Some(&(rect, idx)) = self.layout_cache.iter().find(|(_, i)| *i == focus_idx) {
+                let scale = self.scale_factor as f32;
+                let x = (rect.x * scale) as i32;
+                let y = ((rect.y + rect.height) * scale) as i32;
+                let w = (rect.width * scale).max(1.0) as u32;
+                let h = (rect.height * scale).max(1.0) as u32;
+                window.set_ime_cursor_area(PhysicalPosition::new(x, y), PhysicalSize::new(w, h));
+            }
+        }
+    }
+
     fn handle_click(&mut self, idx: usize) {
         if let Some(hit) = self.hit_nodes.iter().find(|h| h.index == idx) {
             let kind_is_text_input = matches!(
@@ -1335,6 +1555,8 @@ impl App {
 
             if kind_is_text_input {
                 self.focused_index = Some(idx);
+                self.sync_soft_keyboard();
+                self.needs_layout = true;
                 self.repaint_after_interaction();
                 return;
             }
@@ -1356,11 +1578,12 @@ impl App {
             }
         }
         self.focused_index = None;
+        self.sync_soft_keyboard();
         self.repaint_after_interaction();
     }
 
     fn repaint_after_interaction(&mut self) {
-        #[cfg(any(target_os = "ios", target_os = "android"))]
+        #[cfg(target_os = "ios")]
         {
             self.paint();
             return;
@@ -1405,6 +1628,7 @@ impl App {
         };
         if let Some(pos) = next_pos {
             self.focused_index = Some(self.focusable_indices[pos]);
+            self.sync_soft_keyboard();
         }
     }
 
@@ -1766,6 +1990,14 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // winit on Android can drop touch wakeups under Wait; keep polling input.
+        #[cfg(target_os = "android")]
+        {
+            self.poll_viewport_inset();
+            event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        }
+
         let has_animations = !self.animations.is_empty();
         let timer_deadline = crate::timers::next_deadline();
 
@@ -1813,6 +2045,13 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(all(feature = "gpu", feature = "cpu-render"))]
         {
+            // Android NativeActivity main thread must stay responsive — defer GPU probe.
+            #[cfg(target_os = "android")]
+            {
+                self.ensure_cpu_presenter(event_loop);
+                self.using_gpu = false;
+            }
+            #[cfg(not(target_os = "android"))]
             if self.try_init_gpu(event_loop) {
                 self.using_gpu = true;
             } else {
@@ -1857,6 +2096,9 @@ impl ApplicationHandler for App {
                 }
             }
         }
+
+        #[cfg(target_os = "android")]
+        self.request_repaint();
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -2056,13 +2298,16 @@ impl ApplicationHandler for App {
                     if let Some(kind) = self.get_kind_at(focus_idx) {
                         if let ComponentKind::TextInput { value, .. } = kind {
                             let value = value.clone();
-                            if let winit::event::Ime::Commit(commit) = ime {
-                                let current = self
-                                    .text_input_values
-                                    .entry(focus_idx)
-                                    .or_insert_with(|| value);
-                                current.push_str(&commit);
-                                self.request_repaint();
+                            match ime {
+                                winit::event::Ime::Commit(commit) => {
+                                    let current = self
+                                        .text_input_values
+                                        .entry(focus_idx)
+                                        .or_insert_with(|| value);
+                                    current.push_str(&commit);
+                                    self.request_repaint();
+                                }
+                                _ => {}
                             }
                         }
                     }

@@ -34,7 +34,7 @@ pub fn write_web_project(
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=402, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
   <title>W3C OS — web emit</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -143,6 +143,21 @@ document.getElementById('root').addEventListener('click', (e) => {{
 }});
 
 bindState();
+
+function syncKeyboardInset() {{
+  const vv = window.visualViewport;
+  if (!vv) {{
+    document.documentElement.style.setProperty('--w3cos-keyboard-inset-height', '0px');
+    return;
+  }}
+  const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+  document.documentElement.style.setProperty('--w3cos-keyboard-inset-height', inset + 'px');
+}}
+if (window.visualViewport) {{
+  window.visualViewport.addEventListener('resize', syncKeyboardInset);
+  window.visualViewport.addEventListener('scroll', syncKeyboardInset);
+}}
+syncKeyboardInset();
 "#
         ,
         state_lines = inits.join("\n"),
@@ -400,23 +415,38 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
 }
 
 fn spacing_css(s: Spacing) -> String {
+    const KB_ENV: &str = "env(keyboard-inset-height, var(--w3cos-keyboard-inset-height, 0px))";
     match s {
         Spacing::Px(v) => format!("{v}px"),
         Spacing::SafeAreaInset(SafeAreaEdge::Top) => "env(safe-area-inset-top)".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Right) => "env(safe-area-inset-right)".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Bottom) => "env(safe-area-inset-bottom)".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Left) => "env(safe-area-inset-left)".to_string(),
-        Spacing::Composite { px, safe_area } => {
-            let env = safe_area.map(|e| match e {
-                SafeAreaEdge::Top => "env(safe-area-inset-top)",
-                SafeAreaEdge::Right => "env(safe-area-inset-right)",
-                SafeAreaEdge::Bottom => "env(safe-area-inset-bottom)",
-                SafeAreaEdge::Left => "env(safe-area-inset-left)",
-            });
-            match env {
-                Some(e) if px.abs() > f32::EPSILON => format!("calc({px}px + {e})"),
-                Some(e) => e.to_string(),
-                None => format!("{px}px"),
+        Spacing::KeyboardInsetHeight => KB_ENV.to_string(),
+        Spacing::Composite {
+            px,
+            safe_area,
+            keyboard_inset,
+        } => {
+            let mut terms: Vec<String> = Vec::new();
+            if px.abs() > f32::EPSILON {
+                terms.push(format!("{px}px"));
+            }
+            if let Some(e) = safe_area {
+                terms.push(match e {
+                    SafeAreaEdge::Top => "env(safe-area-inset-top)".to_string(),
+                    SafeAreaEdge::Right => "env(safe-area-inset-right)".to_string(),
+                    SafeAreaEdge::Bottom => "env(safe-area-inset-bottom)".to_string(),
+                    SafeAreaEdge::Left => "env(safe-area-inset-left)".to_string(),
+                });
+            }
+            if keyboard_inset {
+                terms.push(KB_ENV.to_string());
+            }
+            match terms.len() {
+                0 => "0px".to_string(),
+                1 => terms[0].clone(),
+                _ => format!("calc({})", terms.join(" + ")),
             }
         }
     }

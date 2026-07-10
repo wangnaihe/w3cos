@@ -39,7 +39,7 @@ tiny-skia = { workspace = true, optional = true }
 softbuffer = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-winit = { workspace = true, features = ["android-game-activity"] }
+winit = { workspace = true, features = ["android-native-activity"] }
 
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 winit = { workspace = true }

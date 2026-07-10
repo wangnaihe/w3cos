@@ -4,6 +4,7 @@
   "entry": "app.tsx",
   "orientation": "portrait",
   "safe_area": true,
+  "interactive_widget": "resizes-content",
   "shell": {
     "status_bar_style": "light",
     "content_slot": "root"

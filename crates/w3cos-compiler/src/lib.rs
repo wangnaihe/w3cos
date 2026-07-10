@@ -57,13 +57,21 @@ pub fn compile_mobile_from_file(
     output_dir: &std::path::Path,
     platform: &str,
     safe_area: bool,
+    interactive_widget: &str,
 ) -> Result<()> {
     let ts_source = std::fs::read_to_string(source_path)
         .with_context(|| format!("Could not read {}", source_path.display()))?;
     let source_dir = source_path.parent();
     let tree = parser::parse(&ts_source)?;
     let stylesheet = resolve_css_imports(&tree.css_imports, source_dir)?;
-    mobile_codegen::write_mobile_project(&tree, &stylesheet, output_dir, platform, safe_area)
+    mobile_codegen::write_mobile_project(
+        &tree,
+        &stylesheet,
+        output_dir,
+        platform,
+        safe_area,
+        interactive_widget,
+    )
 }
 
 /// Compile the same TSX UI app to static HTML/CSS/JS for browser preview.

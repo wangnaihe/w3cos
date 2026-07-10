@@ -10,6 +10,7 @@ pub fn write_mobile_project(
     output_dir: &Path,
     platform: &str,
     safe_area: bool,
+    interactive_widget: &str,
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir.join("src"))?;
     let body = generate_app_body(tree, stylesheet)?;
@@ -19,10 +20,10 @@ pub fn write_mobile_project(
             output_dir.join("src/layout_export.rs"),
             generate_layout_export(tree, safe_area)?,
         )?;
-        std::fs::write(output_dir.join("src/main.rs"), generate_ios_main(safe_area)?)?;
+        std::fs::write(output_dir.join("src/main.rs"), generate_ios_main(safe_area, interactive_widget)?)?;
         std::fs::write(output_dir.join("Cargo.toml"), generate_ios_cargo_toml()?)?;
     } else {
-        std::fs::write(output_dir.join("src/lib.rs"), generate_android_lib(&body)?)?;
+        std::fs::write(output_dir.join("src/lib.rs"), generate_android_lib(&body, interactive_widget)?)?;
         std::fs::write(output_dir.join("Cargo.toml"), generate_android_cargo_toml()?)?;
     }
     Ok(())
@@ -52,20 +53,32 @@ pub fn build_ui() -> Component {{
     ))
 }
 
-fn generate_ios_main(safe_area: bool) -> Result<String> {
+fn gen_viewport_init(interactive_widget: &str) -> String {
+    let mode = match interactive_widget {
+        "resizes-visual" => "InteractiveWidget::ResizesVisual",
+        "overlays-content" => "InteractiveWidget::OverlaysContent",
+        _ => "InteractiveWidget::ResizesContent",
+    };
+    format!(
+        "    w3cos_std::viewport::set_interactive_widget({mode});\n",
+    )
+}
+
+fn generate_ios_main(safe_area: bool, interactive_widget: &str) -> Result<String> {
     let safe_init = if safe_area {
         r#"    w3cos_std::safe_area::set_enabled(true);
 "#
     } else {
         ""
     };
+    let viewport_init = gen_viewport_init(interactive_widget);
     Ok(format!(
         r#"//! Auto-generated iOS app — do not edit.
 mod app_ui;
 use app_ui::build_ui;
 
 fn main() {{
-{safe_init}    if let Err(e) = w3cos_mobile::run_mobile_app(build_ui) {{
+{safe_init}{viewport_init}    if let Err(e) = w3cos_mobile::run_mobile_app(build_ui) {{
         eprintln!("w3cos iOS app failed: {{e:#}}");
     }}
 }}
@@ -128,7 +141,8 @@ fn main() {{
     ))
 }
 
-fn generate_android_lib(body: &str) -> Result<String> {
+fn generate_android_lib(body: &str, interactive_widget: &str) -> Result<String> {
+    let viewport_init = gen_viewport_init(interactive_widget);
     Ok(format!(
         r#"//! Auto-generated Android lib — do not edit.
 {body}
@@ -149,7 +163,7 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {{
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
-    if let Err(e) = w3cos_runtime::run_app_on_android(app, build_ui) {{
+{viewport_init}    if let Err(e) = w3cos_runtime::run_app_on_android(app, build_ui) {{
         log::error!("android_main failed: {{e:#}}");
     }}
 }}
@@ -230,7 +244,7 @@ crate-type = ["cdylib"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"
-winit = {{ version = "0.30", features = ["android-game-activity"] }}
+winit = {{ version = "0.30", features = ["android-native-activity"] }}
 "#,
         deps = deps_block(&root),
     ))

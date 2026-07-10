@@ -406,16 +406,25 @@ fn gen_spacing(s: Spacing) -> String {
         Spacing::SafeAreaInset(SafeAreaEdge::Left) => {
             "Spacing::SafeAreaInset(SafeAreaEdge::Left)".to_string()
         }
-        Spacing::Composite { px, safe_area } => {
+        Spacing::KeyboardInsetHeight => "Spacing::KeyboardInsetHeight".to_string(),
+        Spacing::Composite {
+            px,
+            safe_area,
+            keyboard_inset,
+        } => {
             let edge = safe_area.map(|e| match e {
                 SafeAreaEdge::Top => "Some(SafeAreaEdge::Top)",
                 SafeAreaEdge::Right => "Some(SafeAreaEdge::Right)",
                 SafeAreaEdge::Bottom => "Some(SafeAreaEdge::Bottom)",
                 SafeAreaEdge::Left => "Some(SafeAreaEdge::Left)",
             });
-            match edge {
-                Some(e) => format!("Spacing::Composite {{ px: {px}_f32, safe_area: {e} }}"),
-                None => format!("Spacing::Px({px}_f32)"),
+            if edge.is_none() && !keyboard_inset {
+                format!("Spacing::Px({px}_f32)")
+            } else {
+                format!(
+                    "Spacing::Composite {{ px: {px}_f32, safe_area: {}, keyboard_inset: {keyboard_inset} }}",
+                    edge.unwrap_or("None")
+                )
             }
         }
     }
@@ -1066,17 +1075,36 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
                 "env(safe-area-inset-bottom)".to_string()
             }
             Spacing::SafeAreaInset(SafeAreaEdge::Left) => "env(safe-area-inset-left)".to_string(),
-            Spacing::Composite { px, safe_area } => {
-                let env = safe_area.map(|e| match e {
-                    SafeAreaEdge::Top => "env(safe-area-inset-top)",
-                    SafeAreaEdge::Right => "env(safe-area-inset-right)",
-                    SafeAreaEdge::Bottom => "env(safe-area-inset-bottom)",
-                    SafeAreaEdge::Left => "env(safe-area-inset-left)",
-                });
-                match env {
-                    Some(e) if px.abs() > f32::EPSILON => format!("calc({px}px + {e})"),
-                    Some(e) => e.to_string(),
-                    None => format!("{px}px"),
+            Spacing::KeyboardInsetHeight => {
+                "env(keyboard-inset-height, var(--w3cos-keyboard-inset-height, 0px))".to_string()
+            }
+            Spacing::Composite {
+                px,
+                safe_area,
+                keyboard_inset,
+            } => {
+                let mut terms: Vec<String> = Vec::new();
+                if px.abs() > f32::EPSILON {
+                    terms.push(format!("{px}px"));
+                }
+                if let Some(e) = safe_area {
+                    terms.push(match e {
+                        SafeAreaEdge::Top => "env(safe-area-inset-top)".to_string(),
+                        SafeAreaEdge::Right => "env(safe-area-inset-right)".to_string(),
+                        SafeAreaEdge::Bottom => "env(safe-area-inset-bottom)".to_string(),
+                        SafeAreaEdge::Left => "env(safe-area-inset-left)".to_string(),
+                    });
+                }
+                if keyboard_inset {
+                    terms.push(
+                        "env(keyboard-inset-height, var(--w3cos-keyboard-inset-height, 0px))"
+                            .to_string(),
+                    );
+                }
+                match terms.len() {
+                    0 => "0px".to_string(),
+                    1 => terms[0].clone(),
+                    _ => format!("calc({})", terms.join(" + ")),
                 }
             }
         };

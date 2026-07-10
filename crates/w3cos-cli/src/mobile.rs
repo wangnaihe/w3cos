@@ -96,7 +96,7 @@ pub fn mobile_build(
     platform: &str,
     release: bool,
 ) -> Result<()> {
-    let (_, _, entry, safe_area) = read_app_manifest(project_dir);
+    let (_, _, entry, safe_area, interactive_widget) = read_app_manifest(project_dir);
     let app_tsx = project_dir.join(&entry);
     if !app_tsx.exists() {
         bail!("missing entry {} in {}", entry, project_dir.display());
@@ -109,7 +109,13 @@ pub fn mobile_build(
     fs::create_dir_all(&build_dir)?;
 
     println!("⚡ Transpiling {} → mobile cdylib...", app_tsx.display());
-    w3cos_compiler::compile_mobile_from_file(&app_tsx, &build_dir, platform, safe_area)?;
+    w3cos_compiler::compile_mobile_from_file(
+        &app_tsx,
+        &build_dir,
+        platform,
+        safe_area,
+        &interactive_widget,
+    )?;
 
     match platform {
         "android" => build_android(project_dir, &build_dir, release)?,
@@ -146,13 +152,22 @@ fn build_android(project_dir: &Path, build_dir: &Path, release: bool) -> Result<
     }
 
     let profile = if release { "release" } else { "debug" };
-    let jni_dir = android_dir.join("app/src/main/jniLibs/arm64-v8a");
-    fs::create_dir_all(&jni_dir)?;
+    let jni_libs = android_dir.join("app/src/main/jniLibs");
+    fs::create_dir_all(&jni_libs)?;
+    let jni_out = jni_libs
+        .canonicalize()
+        .unwrap_or_else(|_| jni_libs.clone());
 
     println!("🔨 Building Android arm64-v8a ({profile})...");
     let mut cmd = Command::new("cargo");
     cmd.current_dir(build_dir).arg("ndk");
-    cmd.args(["-t", "arm64-v8a", "-o", jni_dir.to_str().unwrap(), "build"]);
+    cmd.args([
+        "-t",
+        "arm64-v8a",
+        "-o",
+        jni_out.to_str().context("jniLibs path is not valid UTF-8")?,
+        "build",
+    ]);
     if release {
         cmd.arg("--release");
     }
@@ -164,7 +179,7 @@ fn build_android(project_dir: &Path, build_dir: &Path, release: bool) -> Result<
     }
 
     let so_name = format!("libw3cos_mobile_app.so");
-    let so_path = jni_dir.join(&so_name);
+    let so_path = jni_libs.join("arm64-v8a").join(&so_name);
     if !so_path.exists() {
         bail!("expected {} after cargo ndk build", so_path.display());
     }
@@ -173,9 +188,10 @@ fn build_android(project_dir: &Path, build_dir: &Path, release: bool) -> Result<
     let gradlew = android_dir.join("gradlew");
     if gradlew.exists() {
         println!("📦 Assembling APK via Gradle...");
-        let mut gradle = Command::new(&gradlew);
+        let mut gradle = Command::new("bash");
         gradle
             .current_dir(&android_dir)
+            .arg("./gradlew")
             .arg(if release {
                 "assembleRelease"
             } else {
@@ -206,12 +222,13 @@ fn xcode_available() -> bool {
         .unwrap_or(false)
 }
 
-fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool) {
+fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, String) {
     let manifest_path = project_dir.join("w3cos.app.json");
     let mut display_name = "W3cosApp".to_string();
     let mut bundle_id = "com.example.w3cos.app".to_string();
     let mut entry = "app.tsx".to_string();
     let mut safe_area = true;
+    let mut interactive_widget = "resizes-content".to_string();
     if let Ok(raw) = fs::read_to_string(&manifest_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
@@ -226,9 +243,12 @@ fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool) {
             if let Some(sa) = json.get("safe_area").and_then(|v| v.as_bool()) {
                 safe_area = sa;
             }
+            if let Some(iw) = json.get("interactive_widget").and_then(|v| v.as_str()) {
+                interactive_widget = iw.to_string();
+            }
         }
     }
-    (display_name, bundle_id, entry, safe_area)
+    (display_name, bundle_id, entry, safe_area, interactive_widget)
 }
 
 fn write_ios_plist(path: &Path, display_name: &str, bundle_id: &str) -> Result<()> {
@@ -315,7 +335,7 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         bail!("missing iOS binary: {}", bin.display());
     }
 
-    let (display_name, bundle_id, _, _) = read_app_manifest(project_dir);
+    let (display_name, bundle_id, _, _, _) = read_app_manifest(project_dir);
 
     let plist_src = ios_dir.join("W3cosApp/Info.plist");
     write_ios_plist(&plist_src, &display_name, &bundle_id)?;

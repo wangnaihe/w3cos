@@ -41,7 +41,7 @@ pub mod jni {
     use jni::sys::jint;
     use jni::JNIEnv;
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "system" fn Java_com_example_w3cos_W3cosActivity_nativeRun(
         mut env: JNIEnv,
         _class: JClass,

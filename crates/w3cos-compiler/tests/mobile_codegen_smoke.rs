@@ -22,6 +22,7 @@ fn mobile_ios_writes_main_rs() {
         dir.path(),
         "ios",
         false,
+        "resizes-content",
     )
     .expect("write ios project");
 
@@ -44,10 +45,12 @@ fn mobile_android_writes_lib_rs() {
         dir.path(),
         "android",
         false,
+        "resizes-content",
     )
     .expect("write android project");
 
     let lib_rs = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
     assert!(lib_rs.contains("w3cos_app_run"));
     assert!(lib_rs.contains("android_main"));
+    assert!(lib_rs.contains("set_interactive_widget"));
 }
