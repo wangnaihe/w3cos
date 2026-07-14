@@ -256,10 +256,7 @@ impl PwaManifest {
             .map(|icon| icon.src.clone())
             .or_else(|| self.icons.first().map(|i| i.src.clone()));
 
-        let entry = self
-            .start_url
-            .clone()
-            .unwrap_or_else(|| "/".to_string());
+        let entry = self.start_url.clone().unwrap_or_else(|| "/".to_string());
 
         let frame = !matches!(self.display, DisplayMode::Fullscreen);
 

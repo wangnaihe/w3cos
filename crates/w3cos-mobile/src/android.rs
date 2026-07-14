@@ -37,9 +37,9 @@ pub fn run_from_shell() -> Result<()> {
 /// JNI: `W3cosActivity.nativeRun(manifestPath)`
 #[allow(non_snake_case)]
 pub mod jni {
+    use jni::JNIEnv;
     use jni::objects::{JClass, JString};
     use jni::sys::jint;
-    use jni::JNIEnv;
 
     #[unsafe(no_mangle)]
     pub extern "system" fn Java_com_example_w3cos_W3cosActivity_nativeRun(

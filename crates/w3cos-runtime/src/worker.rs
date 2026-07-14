@@ -45,7 +45,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -577,10 +577,7 @@ impl SharedWorkerScope {
         };
         let mut count = 0;
         for tx in map.values() {
-            if tx
-                .send(SharedWorkerEvent::Message(data.clone()))
-                .is_ok()
-            {
+            if tx.send(SharedWorkerEvent::Message(data.clone())).is_ok() {
                 count += 1;
             }
         }
@@ -674,9 +671,11 @@ mod tests {
         })
         .expect("error event");
 
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, WorkerEvent::Error(msg) if msg == "boom")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::Error(msg) if msg == "boom"))
+        );
     }
 
     #[test]

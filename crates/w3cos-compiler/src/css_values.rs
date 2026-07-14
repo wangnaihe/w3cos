@@ -42,7 +42,11 @@ pub fn css_parse_calc_px(value: &str) -> Option<f32> {
     let mut sum = 0.0f32;
     for term in split_calc_terms(inner) {
         let negative = term.starts_with('-');
-        let t = term.trim().trim_start_matches('-').trim_start_matches('+').trim();
+        let t = term
+            .trim()
+            .trim_start_matches('-')
+            .trim_start_matches('+')
+            .trim();
         let v = parse_plain_px(t)?;
         sum += if negative { -v } else { v };
     }
@@ -61,13 +65,20 @@ pub fn parse_plain_px(value: &str) -> Option<f32> {
 /// Parse spacing: `px`, `env()`, or `calc(px + env())`.
 pub fn css_parse_spacing_value(value: &str) -> Option<Spacing> {
     let trimmed = value.trim().trim_end_matches(';');
-    if let Some(inner) = trimmed.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = trimmed
+        .strip_prefix("calc(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let mut px_sum = 0.0f32;
         let mut safe_area = None;
         let mut keyboard_inset = false;
         for term in split_calc_terms(inner) {
             let negative = term.starts_with('-');
-            let t = term.trim().trim_start_matches('-').trim_start_matches('+').trim();
+            let t = term
+                .trim()
+                .trim_start_matches('-')
+                .trim_start_matches('+')
+                .trim();
             if let Some(inner_env) = t.strip_prefix("env(").and_then(|s| s.strip_suffix(')')) {
                 let name = inner_env.split(',').next()?.trim();
                 match name {
@@ -84,10 +95,7 @@ pub fn css_parse_spacing_value(value: &str) -> Option<Spacing> {
                 return None;
             }
         }
-        if px_sum.abs() < f32::EPSILON
-            && safe_area.is_none()
-            && !keyboard_inset
-        {
+        if px_sum.abs() < f32::EPSILON && safe_area.is_none() && !keyboard_inset {
             return None;
         }
         return Some(Spacing::Composite {
@@ -96,7 +104,10 @@ pub fn css_parse_spacing_value(value: &str) -> Option<Spacing> {
             keyboard_inset,
         });
     }
-    if let Some(inner) = trimmed.strip_prefix("env(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = trimmed
+        .strip_prefix("env(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let name = inner.split(',').next()?.trim();
         return match name {
             "safe-area-inset-top" => Some(Spacing::SafeAreaInset(SafeAreaEdge::Top)),

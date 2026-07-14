@@ -34,7 +34,10 @@ impl BridgeResolution {
     fn full(use_stmts: Vec<String>, aliases: &[(&str, &str)]) -> Self {
         Self {
             use_stmts,
-            symbol_aliases: aliases.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            symbol_aliases: aliases
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             fully_supported: true,
             note: "fully supported",
         }
@@ -43,7 +46,10 @@ impl BridgeResolution {
     fn partial(use_stmts: Vec<String>, aliases: &[(&str, &str)], note: &'static str) -> Self {
         Self {
             use_stmts,
-            symbol_aliases: aliases.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            symbol_aliases: aliases
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             fully_supported: false,
             note,
         }
@@ -167,7 +173,12 @@ pub fn resolve_imports(specifiers: &[&str]) -> ResolvedImports {
         }
     }
 
-    ResolvedImports { use_stmts, symbol_map, unsupported, notes }
+    ResolvedImports {
+        use_stmts,
+        symbol_map,
+        unsupported,
+        notes,
+    }
 }
 
 /// Result of resolving all imports in a source file.
@@ -205,7 +216,10 @@ mod tests {
         assert!(!res.use_stmts.is_empty());
         assert!(res.use_stmts.iter().any(|s| s.contains("w3cos_dom")));
         assert!(res.use_stmts.iter().any(|s| s.contains("w3cos_runtime")));
-        println!("[PASS] @codemirror/view resolves to {} use stmts", res.use_stmts.len());
+        println!(
+            "[PASS] @codemirror/view resolves to {} use stmts",
+            res.use_stmts.len()
+        );
     }
 
     #[test]
@@ -242,12 +256,18 @@ mod tests {
             "crelt",
         ];
         let resolved = resolve_imports(&specs);
-        assert!(resolved.unsupported.is_empty(),
-            "all CodeMirror deps should be known: {:?}", resolved.unsupported);
+        assert!(
+            resolved.unsupported.is_empty(),
+            "all CodeMirror deps should be known: {:?}",
+            resolved.unsupported
+        );
         assert!(!resolved.use_stmts.is_empty());
         println!("[PASS] Full CodeMirror import bundle resolved:");
-        println!("       {} use stmts, {} symbol mappings",
-            resolved.use_stmts.len(), resolved.symbol_map.len());
+        println!(
+            "       {} use stmts, {} symbol mappings",
+            resolved.use_stmts.len(),
+            resolved.symbol_map.len()
+        );
         for note in &resolved.notes {
             println!("       [shim] {note}");
         }

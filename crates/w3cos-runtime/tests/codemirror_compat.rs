@@ -12,19 +12,17 @@
 //! 9. getComputedStyle for CSS property reading
 //! 10. Selection + Range API for cursor tracking
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use w3cos_dom::document::Document;
 use w3cos_dom::dom_rect::DOMRect;
 use w3cos_dom::events::{EventType, InputType};
-use w3cos_runtime::observers::{
-    MutationObserver, MutationObserverInit, MutationRecord,
-    ResizeObserver, IntersectionObserver,
-};
 use w3cos_runtime::font_face::FontFaceSet;
+use w3cos_runtime::observers::{
+    IntersectionObserver, MutationObserver, MutationObserverInit, MutationRecord, ResizeObserver,
+};
 use w3cos_runtime::timers::{request_animation_frame, tick};
 use w3cos_std::EventAction;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
 
 // ── Step 1: DOM Construction ───────────────────────────────────────────────
 // Mirrors EditorView constructor:
@@ -63,17 +61,20 @@ fn cm_step1_dom_construction() {
     doc.body().append_child(&mut doc, editor_dom);
 
     // Verify structure
-    assert!(content_dom.is_connected(&doc), "contentDOM should be connected");
+    assert!(
+        content_dom.is_connected(&doc),
+        "contentDOM should be connected"
+    );
     assert_eq!(
         content_dom.get_attribute(&doc, "contenteditable"),
         Some("true"),
         "contenteditable should be set"
     );
-    assert_eq!(
-        content_dom.get_attribute(&doc, "role"),
-        Some("textbox")
+    assert_eq!(content_dom.get_attribute(&doc, "role"), Some("textbox"));
+    assert!(
+        doc.is_content_editable(content_dom.id),
+        "should be content editable"
     );
-    assert!(doc.is_content_editable(content_dom.id), "should be content editable");
 
     println!("[PASS] CM Step 1: DOM construction — editor/scroll/content/announce structure");
 }
@@ -100,13 +101,16 @@ fn cm_step2_mutation_observer_setup() {
     });
 
     // Exactly what CodeMirror does
-    observer.observe(content_dom.id, MutationObserverInit {
-        child_list: true,
-        character_data: true,
-        subtree: true,
-        character_data_old_value: true,
-        ..Default::default()
-    });
+    observer.observe(
+        content_dom.id,
+        MutationObserverInit {
+            child_list: true,
+            character_data: true,
+            subtree: true,
+            character_data_old_value: true,
+            ..Default::default()
+        },
+    );
 
     // Simulate DOM mutations the runtime would queue
     observer.queue_mutation(MutationRecord::child_list(
@@ -122,8 +126,11 @@ fn cm_step2_mutation_observer_setup() {
     // Deliver — like microtask checkpoint
     observer.deliver();
 
-    assert_eq!(mutation_count.load(Ordering::SeqCst), 2,
-        "both mutations should be delivered");
+    assert_eq!(
+        mutation_count.load(Ordering::SeqCst),
+        2,
+        "both mutations should be delivered"
+    );
 
     // takeRecords() should return empty after deliver
     assert_eq!(observer.take_records().len(), 0);
@@ -183,15 +190,15 @@ fn cm_step3_resize_and_intersection_observers() {
 
 #[test]
 fn cm_step4_request_animation_frame() {
-
-
     // Schedule a frame — like CodeMirror's requestMeasure
     request_animation_frame(EventAction::Increment(42));
 
     // Tick the timer — like the runtime's main loop
     let actions = tick();
     assert!(
-        actions.iter().any(|a| matches!(a, EventAction::Increment(42))),
+        actions
+            .iter()
+            .any(|a| matches!(a, EventAction::Increment(42))),
         "rAF callback should fire on tick"
     );
 
@@ -222,8 +229,10 @@ fn cm_step5_fonts_ready() {
     fonts.mark_ready();
 
     assert!(fonts.is_ready());
-    assert!(measure_requested.load(Ordering::SeqCst),
-        "fonts.ready callback should have fired");
+    assert!(
+        measure_requested.load(Ordering::SeqCst),
+        "fonts.ready callback should have fired"
+    );
 
     println!("[PASS] CM Step 5: document.fonts.ready.then() fires after mark_ready");
 }
@@ -239,15 +248,20 @@ fn cm_step6_selectionchange_listener() {
     let fired = Arc::new(AtomicBool::new(false));
     let f = fired.clone();
 
-    doc.add_document_event_listener("selectionchange", Box::new(move |_ev| {
-        f.store(true, Ordering::SeqCst);
-    }));
+    doc.add_document_event_listener(
+        "selectionchange",
+        Box::new(move |_ev| {
+            f.store(true, Ordering::SeqCst);
+        }),
+    );
 
     // Simulate cursor move — runtime calls this after selection update
     doc.dispatch_selection_change();
 
-    assert!(fired.load(Ordering::SeqCst),
-        "selectionchange should fire on document");
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "selectionchange should fire on document"
+    );
 
     println!("[PASS] CM Step 6: selectionchange fires on document root");
 }
@@ -268,11 +282,15 @@ fn cm_step7_beforeinput_event() {
     let received_data = Arc::new(Mutex::new(None::<String>));
     let rd = received_data.clone();
 
-    content_dom.add_event_listener(&mut doc, "beforeinput", Box::new(move |ev| {
-        if let w3cos_dom::events::EventData::BeforeInput { data, .. } = &ev.data {
-            *rd.lock().unwrap() = data.clone();
-        }
-    }));
+    content_dom.add_event_listener(
+        &mut doc,
+        "beforeinput",
+        Box::new(move |ev| {
+            if let w3cos_dom::events::EventData::BeforeInput { data, .. } = &ev.data {
+                *rd.lock().unwrap() = data.clone();
+            }
+        }),
+    );
 
     // Simulate user typing "a" — runtime dispatches beforeinput first
     let prevented = doc.dispatch_before_input(
@@ -323,8 +341,10 @@ fn cm_step8_get_bounding_client_rect() {
     assert_eq!(rects.len(), 1);
     assert_eq!(rects[0].width, 960.0);
 
-    println!("[PASS] CM Step 8: getBoundingClientRect — ({}, {}, {}, {})",
-        rect.x, rect.y, rect.width, rect.height);
+    println!(
+        "[PASS] CM Step 8: getBoundingClientRect — ({}, {}, {}, {})",
+        rect.x, rect.y, rect.width, rect.height
+    );
 }
 
 // ── Step 9: getComputedStyle ───────────────────────────────────────────────
@@ -340,8 +360,12 @@ fn cm_step9_get_computed_style() {
     doc.body().append_child(&mut doc, content_dom);
 
     // Set styles like CodeMirror theme would
-    content_dom.style_mut(&mut doc).set_property("display", "block");
-    content_dom.style_mut(&mut doc).set_property("width", "960px");
+    content_dom
+        .style_mut(&mut doc)
+        .set_property("display", "block");
+    content_dom
+        .style_mut(&mut doc)
+        .set_property("width", "960px");
 
     let computed = content_dom.get_computed_style(&doc);
     assert_eq!(computed.get_property("display"), "block");
@@ -393,8 +417,10 @@ fn cm_step10_selection_and_range() {
     // Zero before layout — expected
     assert_eq!(rect.x, 0.0);
 
-    println!("[PASS] CM Step 10: Selection + Range — cursor at [{}, {}]",
-        r.start_offset, r.end_offset);
+    println!(
+        "[PASS] CM Step 10: Selection + Range — cursor at [{}, {}]",
+        r.start_offset, r.end_offset
+    );
 }
 
 // ── Full Integration: CodeMirror EditorView init simulation ───────────────
@@ -405,10 +431,10 @@ fn cm_step10_selection_and_range() {
 fn cm_full_editorview_init_simulation() {
     // --- DOM setup (Step 1) ---
     let mut doc = Document::new();
-    let editor_dom  = doc.create_element("div");
-    let scroll_dom  = doc.create_element("div");
+    let editor_dom = doc.create_element("div");
+    let scroll_dom = doc.create_element("div");
     let content_dom = doc.create_element("div");
-    let announce    = doc.create_element("div");
+    let announce = doc.create_element("div");
 
     editor_dom.set_attribute(&mut doc, "class", "cm-editor");
     scroll_dom.set_attribute(&mut doc, "class", "cm-scroller");
@@ -430,13 +456,16 @@ fn cm_full_editorview_init_simulation() {
     let mut dom_observer = MutationObserver::new(move |records| {
         mr.fetch_add(records.len() as u32, Ordering::SeqCst);
     });
-    dom_observer.observe(content_dom.id, MutationObserverInit {
-        child_list: true,
-        character_data: true,
-        subtree: true,
-        character_data_old_value: true,
-        ..Default::default()
-    });
+    dom_observer.observe(
+        content_dom.id,
+        MutationObserverInit {
+            child_list: true,
+            character_data: true,
+            subtree: true,
+            character_data_old_value: true,
+            ..Default::default()
+        },
+    );
 
     // --- ResizeObserver (Step 3) ---
     let mut resize_obs = ResizeObserver::new();
@@ -457,26 +486,35 @@ fn cm_full_editorview_init_simulation() {
     let fonts_ready_fired = Arc::new(AtomicBool::new(false));
     let frf = fonts_ready_fired.clone();
     let fonts = FontFaceSet::new();
-    fonts.ready_then(move || { frf.store(true, Ordering::SeqCst); });
+    fonts.ready_then(move || {
+        frf.store(true, Ordering::SeqCst);
+    });
     fonts.mark_ready();
     assert!(fonts_ready_fired.load(Ordering::SeqCst));
 
     // --- selectionchange (Step 6) ---
     let sel_fired = Arc::new(AtomicBool::new(false));
     let sf = sel_fired.clone();
-    doc.add_document_event_listener("selectionchange", Box::new(move |_| {
-        sf.store(true, Ordering::SeqCst);
-    }));
+    doc.add_document_event_listener(
+        "selectionchange",
+        Box::new(move |_| {
+            sf.store(true, Ordering::SeqCst);
+        }),
+    );
 
     // --- Layout pass: set rects (Step 8) ---
-    doc.set_layout_rect(editor_dom.id,  DOMRect::new(0.0, 0.0, 1280.0, 800.0));
-    doc.set_layout_rect(scroll_dom.id,  DOMRect::new(0.0, 0.0, 1280.0, 800.0));
+    doc.set_layout_rect(editor_dom.id, DOMRect::new(0.0, 0.0, 1280.0, 800.0));
+    doc.set_layout_rect(scroll_dom.id, DOMRect::new(0.0, 0.0, 1280.0, 800.0));
     doc.set_layout_rect(content_dom.id, DOMRect::new(0.0, 0.0, 1280.0, 800.0));
 
     // --- Simulate rAF tick (measure cycle) ---
     let actions = tick();
-    assert!(actions.iter().any(|a| matches!(a, EventAction::Increment(1))),
-        "rAF should fire on tick");
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, EventAction::Increment(1))),
+        "rAF should fire on tick"
+    );
     ms.store(true, Ordering::SeqCst);
 
     // --- Verify getBoundingClientRect (Step 8) ---
@@ -485,7 +523,9 @@ fn cm_full_editorview_init_simulation() {
     assert_eq!(rect.height, 800.0);
 
     // --- getComputedStyle (Step 9) ---
-    content_dom.style_mut(&mut doc).set_property("display", "block");
+    content_dom
+        .style_mut(&mut doc)
+        .set_property("display", "block");
     let computed = content_dom.get_computed_style(&doc);
     assert_eq!(computed.get_property("display"), "block");
 
@@ -500,15 +540,22 @@ fn cm_full_editorview_init_simulation() {
 
     // Simulate selection update after typing
     doc.dispatch_selection_change();
-    assert!(sel_fired.load(Ordering::SeqCst), "selectionchange should fire");
+    assert!(
+        sel_fired.load(Ordering::SeqCst),
+        "selectionchange should fire"
+    );
 
     // --- Simulate DOM mutation (text inserted) ---
     dom_observer.queue_mutation(MutationRecord::character_data(
-        content_dom.id, Some(String::new()),
+        content_dom.id,
+        Some(String::new()),
     ));
     dom_observer.deliver();
-    assert_eq!(mutations_received.load(Ordering::SeqCst), 1,
-        "mutation observer should receive text change");
+    assert_eq!(
+        mutations_received.load(Ordering::SeqCst),
+        1,
+        "mutation observer should receive text change"
+    );
 
     // --- ResizeObserver: editor resized ---
     let new_sizes = vec![(scroll_dom.id, 1280.0f32, 400.0f32)];
@@ -524,7 +571,13 @@ fn cm_full_editorview_init_simulation() {
     println!("[PASS] CM Full Integration: EditorView init simulation complete");
     println!("       DOM: connected={}", content_dom.is_connected(&doc));
     println!("       Layout: {}x{}", rect.width, rect.height);
-    println!("       Mutations delivered: {}", mutations_received.load(Ordering::SeqCst));
+    println!(
+        "       Mutations delivered: {}",
+        mutations_received.load(Ordering::SeqCst)
+    );
     println!("       Fonts ready: {}", fonts.is_ready());
-    println!("       rAF fired: {}", measure_scheduled.load(Ordering::SeqCst));
+    println!(
+        "       rAF fired: {}",
+        measure_scheduled.load(Ordering::SeqCst)
+    );
 }

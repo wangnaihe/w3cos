@@ -41,11 +41,7 @@ fn assert_ui_rust_output(rust: &str, app: &Path) {
 }
 
 fn assert_general_ts_output(rust: &str, app: &Path) {
-    assert!(
-        rust.contains("fn main()"),
-        "{} missing main",
-        app.display()
-    );
+    assert!(rust.contains("fn main()"), "{} missing main", app.display());
 }
 
 /// Examples whose TSX parser currently fails (tracked gaps).
@@ -71,8 +67,8 @@ fn all_examples_compile_to_rust() {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let source = std::fs::read_to_string(app)
-            .unwrap_or_else(|e| panic!("read {}: {e}", app.display()));
+        let source =
+            std::fs::read_to_string(app).unwrap_or_else(|e| panic!("read {}: {e}", app.display()));
         let result = w3cos_compiler::compile_to_rust(&source);
 
         if KNOWN_PARSE_GAPS.contains(&example_name.as_str()) {
@@ -97,7 +93,8 @@ fn all_examples_compile_to_rust() {
         "expected at least 15 compiled examples, got {compiled}"
     );
     assert_eq!(
-        gaps, KNOWN_PARSE_GAPS.len(),
+        gaps,
+        KNOWN_PARSE_GAPS.len(),
         "expected all known-gap examples to fail parse until JSX comment support lands"
     );
 }
@@ -122,10 +119,12 @@ fn css_and_scss_examples_emit_standalone_projects() {
 
 #[test]
 fn logidesk_native_app_compiles_when_present() {
-    let app = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../demo/native/app.tsx");
+    let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../demo/native/app.tsx");
     if !app.is_file() {
-        eprintln!("skip logidesk_native_app_compiles_when_present: {}", app.display());
+        eprintln!(
+            "skip logidesk_native_app_compiles_when_present: {}",
+            app.display()
+        );
         return;
     }
     let source = std::fs::read_to_string(&app).unwrap();

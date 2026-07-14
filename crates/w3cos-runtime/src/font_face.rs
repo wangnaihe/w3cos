@@ -67,7 +67,9 @@ impl FontWeight {
 }
 
 impl Default for FontWeight {
-    fn default() -> Self { Self::NORMAL }
+    fn default() -> Self {
+        Self::NORMAL
+    }
 }
 
 // ── FontFaceStyle ──────────────────────────────────────────────────────────
@@ -271,7 +273,11 @@ impl FontRegistry {
         let fonts = self.fonts.lock().unwrap();
 
         // Exact match
-        let key = FontKey { family: family.to_string(), weight, style };
+        let key = FontKey {
+            family: family.to_string(),
+            weight,
+            style,
+        };
         if let Some(f) = fonts.get(&key) {
             return Some(f.clone());
         }
@@ -284,10 +290,8 @@ impl FontRegistry {
 
         if candidates.is_empty() {
             // Try ignoring style
-            let any_style: Vec<&LoadedFont> = fonts
-                .values()
-                .filter(|f| f.family == family)
-                .collect();
+            let any_style: Vec<&LoadedFont> =
+                fonts.values().filter(|f| f.family == family).collect();
             if any_style.is_empty() {
                 return None;
             }
@@ -321,11 +325,7 @@ impl FontRegistry {
 
     /// Returns true if any monospace font is registered.
     pub fn has_monospace(&self) -> bool {
-        self.fonts
-            .lock()
-            .unwrap()
-            .values()
-            .any(|f| f.is_monospace)
+        self.fonts.lock().unwrap().values().any(|f| f.is_monospace)
     }
 
     /// Get the first registered monospace font (for code editors).
@@ -480,13 +480,15 @@ mod tests {
         // Minimal valid TTF header (just enough to not crash)
         let fake_ttf = vec![0u8; 12];
         let registry = FontRegistry::new();
-        registry.register(FontFace {
-            family: "TestMono".into(),
-            src: FontSource::Bytes(fake_ttf),
-            weight: FontWeight::NORMAL,
-            style: FontFaceStyle::Normal,
-            ..Default::default()
-        }).unwrap();
+        registry
+            .register(FontFace {
+                family: "TestMono".into(),
+                src: FontSource::Bytes(fake_ttf),
+                weight: FontWeight::NORMAL,
+                style: FontFaceStyle::Normal,
+                ..Default::default()
+            })
+            .unwrap();
 
         let resolved = registry.resolve("TestMono", FontWeight::NORMAL, FontFaceStyle::Normal);
         assert!(resolved.is_some());
@@ -497,13 +499,15 @@ mod tests {
     fn closest_weight_fallback() {
         let registry = FontRegistry::new();
         // Register only bold
-        registry.register(FontFace {
-            family: "TestFont".into(),
-            src: FontSource::Bytes(vec![]),
-            weight: FontWeight::BOLD,
-            style: FontFaceStyle::Normal,
-            ..Default::default()
-        }).unwrap();
+        registry
+            .register(FontFace {
+                family: "TestFont".into(),
+                src: FontSource::Bytes(vec![]),
+                weight: FontWeight::BOLD,
+                style: FontFaceStyle::Normal,
+                ..Default::default()
+            })
+            .unwrap();
 
         // Request normal — should get bold as closest
         let resolved = registry.resolve("TestFont", FontWeight::NORMAL, FontFaceStyle::Normal);
@@ -527,13 +531,15 @@ mod tests {
     #[test]
     fn resolve_stack() {
         let registry = FontRegistry::new();
-        registry.register(FontFace {
-            family: "Fallback".into(),
-            src: FontSource::Bytes(vec![]),
-            weight: FontWeight::NORMAL,
-            style: FontFaceStyle::Normal,
-            ..Default::default()
-        }).unwrap();
+        registry
+            .register(FontFace {
+                family: "Fallback".into(),
+                src: FontSource::Bytes(vec![]),
+                weight: FontWeight::NORMAL,
+                style: FontFaceStyle::Normal,
+                ..Default::default()
+            })
+            .unwrap();
 
         let resolved = registry.resolve_stack(
             "\"Missing Font\", Fallback, sans-serif",
@@ -594,7 +600,8 @@ impl FontFaceSet {
     /// Mark all fonts as loaded and flush pending ready callbacks.
     /// The runtime should call this after the initial font registration pass.
     pub fn mark_ready(&self) {
-        self.is_ready.store(true, std::sync::atomic::Ordering::Release);
+        self.is_ready
+            .store(true, std::sync::atomic::Ordering::Release);
         self.flush_ready_callbacks();
     }
 
@@ -617,7 +624,9 @@ impl FontFaceSet {
 
     /// Check if a font matching the given family/weight/style is available.
     pub fn check(&self, family: &str, weight: FontWeight, style: FontFaceStyle) -> bool {
-        FontRegistry::global().resolve(family, weight, style).is_some()
+        FontRegistry::global()
+            .resolve(family, weight, style)
+            .is_some()
     }
 }
 

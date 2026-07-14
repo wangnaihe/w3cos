@@ -10,7 +10,12 @@ pub struct DOMRect {
 
 impl DOMRect {
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn zero() -> Self {
@@ -18,16 +23,24 @@ impl DOMRect {
     }
 
     /// `DOMRect.top` — same as `y` for standard (non-inverted) rects.
-    pub fn top(&self) -> f32 { self.y }
+    pub fn top(&self) -> f32 {
+        self.y
+    }
 
     /// `DOMRect.left` — same as `x`.
-    pub fn left(&self) -> f32 { self.x }
+    pub fn left(&self) -> f32 {
+        self.x
+    }
 
     /// `DOMRect.bottom` — `y + height`.
-    pub fn bottom(&self) -> f32 { self.y + self.height }
+    pub fn bottom(&self) -> f32 {
+        self.y + self.height
+    }
 
     /// `DOMRect.right` — `x + width`.
-    pub fn right(&self) -> f32 { self.x + self.width }
+    pub fn right(&self) -> f32 {
+        self.x + self.width
+    }
 
     /// Returns true if the rect has non-zero area.
     pub fn is_empty(&self) -> bool {

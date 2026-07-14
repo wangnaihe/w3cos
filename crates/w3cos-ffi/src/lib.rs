@@ -55,27 +55,27 @@ pub enum CType {
     U64,
     F32,
     F64,
-    Ptr,   // *mut c_void
+    Ptr, // *mut c_void
     Bool,
 }
 
 impl CType {
     pub fn from_str(s: &str) -> FfiResult<Self> {
         match s.trim() {
-            "void"  => Ok(CType::Void),
-            "i8"    => Ok(CType::I8),
-            "i16"   => Ok(CType::I16),
-            "i32"   => Ok(CType::I32),
-            "i64"   => Ok(CType::I64),
-            "u8"    => Ok(CType::U8),
-            "u16"   => Ok(CType::U16),
-            "u32"   => Ok(CType::U32),
-            "u64"   => Ok(CType::U64),
-            "f32"   => Ok(CType::F32),
-            "f64"   => Ok(CType::F64),
-            "ptr"   => Ok(CType::Ptr),
-            "bool"  => Ok(CType::Bool),
-            other   => Err(FfiError(format!("unknown C type: {other}"))),
+            "void" => Ok(CType::Void),
+            "i8" => Ok(CType::I8),
+            "i16" => Ok(CType::I16),
+            "i32" => Ok(CType::I32),
+            "i64" => Ok(CType::I64),
+            "u8" => Ok(CType::U8),
+            "u16" => Ok(CType::U16),
+            "u32" => Ok(CType::U32),
+            "u64" => Ok(CType::U64),
+            "f32" => Ok(CType::F32),
+            "f64" => Ok(CType::F64),
+            "ptr" => Ok(CType::Ptr),
+            "bool" => Ok(CType::Bool),
+            other => Err(FfiError(format!("unknown C type: {other}"))),
         }
     }
 }
@@ -106,18 +106,18 @@ unsafe impl Sync for CValue {}
 impl CValue {
     pub fn type_of(&self) -> CType {
         match self {
-            CValue::Void    => CType::Void,
-            CValue::I8(_)   => CType::I8,
-            CValue::I16(_)  => CType::I16,
-            CValue::I32(_)  => CType::I32,
-            CValue::I64(_)  => CType::I64,
-            CValue::U8(_)   => CType::U8,
-            CValue::U16(_)  => CType::U16,
-            CValue::U32(_)  => CType::U32,
-            CValue::U64(_)  => CType::U64,
-            CValue::F32(_)  => CType::F32,
-            CValue::F64(_)  => CType::F64,
-            CValue::Ptr(_)  => CType::Ptr,
+            CValue::Void => CType::Void,
+            CValue::I8(_) => CType::I8,
+            CValue::I16(_) => CType::I16,
+            CValue::I32(_) => CType::I32,
+            CValue::I64(_) => CType::I64,
+            CValue::U8(_) => CType::U8,
+            CValue::U16(_) => CType::U16,
+            CValue::U32(_) => CType::U32,
+            CValue::U64(_) => CType::U64,
+            CValue::F32(_) => CType::F32,
+            CValue::F64(_) => CType::F64,
+            CValue::Ptr(_) => CType::Ptr,
             CValue::Bool(_) => CType::Bool,
         }
     }
@@ -141,7 +141,10 @@ impl FfiLib {
     /// On macOS: `"libm.dylib"` or `"/usr/lib/libm.dylib"`
     pub fn open(path: &str) -> FfiResult<Self> {
         let lib = unsafe { Library::new(path) }?;
-        Ok(Self { lib, path: path.to_string() })
+        Ok(Self {
+            lib,
+            path: path.to_string(),
+        })
     }
 
     pub fn path(&self) -> &str {
@@ -162,7 +165,8 @@ impl FfiLib {
 
     /// Call a `(f64, f64) -> f64` function (e.g. `pow`, `atan2`).
     pub unsafe fn call_f64f64_f64(&self, symbol: &str, a: f64, b: f64) -> FfiResult<f64> {
-        let func: Symbol<unsafe extern "C" fn(f64, f64) -> f64> = self.lib.get(symbol.as_bytes())?;
+        let func: Symbol<unsafe extern "C" fn(f64, f64) -> f64> =
+            self.lib.get(symbol.as_bytes())?;
         Ok(func(a, b))
     }
 
@@ -217,7 +221,9 @@ pub struct FfiRegistry {
 
 impl FfiRegistry {
     pub fn new() -> Self {
-        Self { libs: Mutex::new(HashMap::new()) }
+        Self {
+            libs: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Open (or return cached) a library handle.
@@ -266,7 +272,9 @@ pub struct RawBuffer {
 
 impl RawBuffer {
     pub fn new(size: usize) -> Self {
-        Self { data: vec![0u8; size] }
+        Self {
+            data: vec![0u8; size],
+        }
     }
 
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
@@ -299,7 +307,11 @@ impl RawBuffer {
 
     /// Read a null-terminated C string from offset 0.
     pub fn read_cstr(&self) -> String {
-        let end = self.data.iter().position(|&b| b == 0).unwrap_or(self.data.len());
+        let end = self
+            .data
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.data.len());
         String::from_utf8_lossy(&self.data[..end]).to_string()
     }
 
@@ -335,7 +347,11 @@ pub struct StructLayout {
 
 impl StructLayout {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), fields: Vec::new(), total_size: 0 }
+        Self {
+            name: name.into(),
+            fields: Vec::new(),
+            total_size: 0,
+        }
     }
 
     /// Append a field, auto-computing offset with natural alignment.
@@ -395,26 +411,29 @@ fn c_type_size(ty: &CType) -> usize {
 }
 
 fn align_up(offset: usize, align: usize) -> usize {
-    if align == 0 { return offset; }
+    if align == 0 {
+        return offset;
+    }
     (offset + align - 1) & !(align - 1)
 }
 
 fn read_c_value(ty: &CType, bytes: &[u8]) -> CValue {
     match ty {
-        CType::Void  => CValue::Void,
-        CType::I8    => CValue::I8(bytes[0] as i8),
-        CType::U8    => CValue::U8(bytes[0]),
-        CType::Bool  => CValue::Bool(bytes[0] != 0),
-        CType::I16   => CValue::I16(i16::from_le_bytes(bytes[..2].try_into().unwrap())),
-        CType::U16   => CValue::U16(u16::from_le_bytes(bytes[..2].try_into().unwrap())),
-        CType::I32   => CValue::I32(i32::from_le_bytes(bytes[..4].try_into().unwrap())),
-        CType::U32   => CValue::U32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
-        CType::F32   => CValue::F32(f32::from_le_bytes(bytes[..4].try_into().unwrap())),
-        CType::I64   => CValue::I64(i64::from_le_bytes(bytes[..8].try_into().unwrap())),
-        CType::U64   => CValue::U64(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
-        CType::F64   => CValue::F64(f64::from_le_bytes(bytes[..8].try_into().unwrap())),
-        CType::Ptr   => {
-            let addr = usize::from_le_bytes(bytes[..std::mem::size_of::<usize>()].try_into().unwrap());
+        CType::Void => CValue::Void,
+        CType::I8 => CValue::I8(bytes[0] as i8),
+        CType::U8 => CValue::U8(bytes[0]),
+        CType::Bool => CValue::Bool(bytes[0] != 0),
+        CType::I16 => CValue::I16(i16::from_le_bytes(bytes[..2].try_into().unwrap())),
+        CType::U16 => CValue::U16(u16::from_le_bytes(bytes[..2].try_into().unwrap())),
+        CType::I32 => CValue::I32(i32::from_le_bytes(bytes[..4].try_into().unwrap())),
+        CType::U32 => CValue::U32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
+        CType::F32 => CValue::F32(f32::from_le_bytes(bytes[..4].try_into().unwrap())),
+        CType::I64 => CValue::I64(i64::from_le_bytes(bytes[..8].try_into().unwrap())),
+        CType::U64 => CValue::U64(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
+        CType::F64 => CValue::F64(f64::from_le_bytes(bytes[..8].try_into().unwrap())),
+        CType::Ptr => {
+            let addr =
+                usize::from_le_bytes(bytes[..std::mem::size_of::<usize>()].try_into().unwrap());
             CValue::Ptr(addr as *mut libc::c_void)
         }
     }
@@ -422,9 +441,9 @@ fn read_c_value(ty: &CType, bytes: &[u8]) -> CValue {
 
 fn write_c_value(ty: &CType, bytes: &mut [u8], val: CValue) -> FfiResult<()> {
     match (ty, val) {
-        (CType::I8,  CValue::I8(v))  => bytes[0] = v as u8,
-        (CType::U8,  CValue::U8(v))  => bytes[0] = v,
-        (CType::Bool,CValue::Bool(v))=> bytes[0] = v as u8,
+        (CType::I8, CValue::I8(v)) => bytes[0] = v as u8,
+        (CType::U8, CValue::U8(v)) => bytes[0] = v,
+        (CType::Bool, CValue::Bool(v)) => bytes[0] = v as u8,
         (CType::I16, CValue::I16(v)) => bytes[..2].copy_from_slice(&v.to_le_bytes()),
         (CType::U16, CValue::U16(v)) => bytes[..2].copy_from_slice(&v.to_le_bytes()),
         (CType::I32, CValue::I32(v)) => bytes[..4].copy_from_slice(&v.to_le_bytes()),

@@ -329,8 +329,12 @@ pub enum EventData {
         /// Simplified target ranges: (anchor_node, anchor_offset, focus_node, focus_offset)
         target_ranges: Vec<(NodeId, usize, NodeId, usize)>,
     },
-    Composition { data: String },
-    Custom { detail: Option<String> },
+    Composition {
+        data: String,
+    },
+    Custom {
+        detail: Option<String>,
+    },
     None,
 }
 

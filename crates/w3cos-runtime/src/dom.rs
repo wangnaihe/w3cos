@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
-use w3cos_dom::node::NodeId;
 use w3cos_dom::Document;
+use w3cos_dom::node::NodeId;
 use w3cos_std::EventAction;
 
 thread_local! {

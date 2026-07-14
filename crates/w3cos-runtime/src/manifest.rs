@@ -86,10 +86,7 @@ impl W3cosUrl {
             let query_str = &remaining[q_pos + 1..];
             for pair in query_str.split('&') {
                 if let Some(eq) = pair.find('=') {
-                    query.insert(
-                        pair[..eq].to_string(),
-                        pair[eq + 1..].to_string(),
-                    );
+                    query.insert(pair[..eq].to_string(), pair[eq + 1..].to_string());
                 } else if !pair.is_empty() {
                     query.insert(pair.to_string(), String::new());
                 }

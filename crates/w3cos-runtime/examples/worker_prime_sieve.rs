@@ -10,16 +10,13 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use w3cos_runtime::worker::{Worker, WorkerEvent, WorkerOptions};
 
 fn main() {
     let worker = Worker::spawn(WorkerOptions::named("prime-sieve"), |scope| {
         while let Some(msg) = scope.recv() {
-            let upper = msg
-                .get("upper")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize;
+            let upper = msg.get("upper").and_then(Value::as_u64).unwrap_or(0) as usize;
 
             let started = Instant::now();
             let primes = sieve(upper);

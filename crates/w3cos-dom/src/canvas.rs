@@ -125,27 +125,122 @@ pub enum CompositeOp {
 /// The runtime processes these during rendering.
 #[derive(Debug, Clone)]
 pub enum CanvasCommand {
-    FillRect { x: f32, y: f32, w: f32, h: f32, color: CanvasColor, alpha: f32 },
-    StrokeRect { x: f32, y: f32, w: f32, h: f32, color: CanvasColor, line_width: f32, alpha: f32 },
-    ClearRect { x: f32, y: f32, w: f32, h: f32 },
-    FillPath { segments: Vec<PathSegment>, color: CanvasColor, alpha: f32 },
-    StrokePath { segments: Vec<PathSegment>, color: CanvasColor, line_width: f32, alpha: f32 },
-    FillText { text: String, x: f32, y: f32, color: CanvasColor, font_size: f32, alpha: f32 },
-    StrokeText { text: String, x: f32, y: f32, color: CanvasColor, font_size: f32, line_width: f32, alpha: f32 },
-    DrawImage { image_data: Vec<u8>, width: u32, height: u32, dx: f32, dy: f32, dw: Option<f32>, dh: Option<f32> },
-    PutImageData { data: Vec<u8>, width: u32, height: u32, dx: f32, dy: f32 },
-    SetTransform { a: f32, b: f32, c: f32, d: f32, e: f32, f: f32 },
-    Clip { segments: Vec<PathSegment> },
+    FillRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: CanvasColor,
+        alpha: f32,
+    },
+    StrokeRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: CanvasColor,
+        line_width: f32,
+        alpha: f32,
+    },
+    ClearRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    FillPath {
+        segments: Vec<PathSegment>,
+        color: CanvasColor,
+        alpha: f32,
+    },
+    StrokePath {
+        segments: Vec<PathSegment>,
+        color: CanvasColor,
+        line_width: f32,
+        alpha: f32,
+    },
+    FillText {
+        text: String,
+        x: f32,
+        y: f32,
+        color: CanvasColor,
+        font_size: f32,
+        alpha: f32,
+    },
+    StrokeText {
+        text: String,
+        x: f32,
+        y: f32,
+        color: CanvasColor,
+        font_size: f32,
+        line_width: f32,
+        alpha: f32,
+    },
+    DrawImage {
+        image_data: Vec<u8>,
+        width: u32,
+        height: u32,
+        dx: f32,
+        dy: f32,
+        dw: Option<f32>,
+        dh: Option<f32>,
+    },
+    PutImageData {
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+        dx: f32,
+        dy: f32,
+    },
+    SetTransform {
+        a: f32,
+        b: f32,
+        c: f32,
+        d: f32,
+        e: f32,
+        f: f32,
+    },
+    Clip {
+        segments: Vec<PathSegment>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum PathSegment {
     MoveTo(f32, f32),
     LineTo(f32, f32),
-    Arc { cx: f32, cy: f32, r: f32, start_angle: f32, end_angle: f32, counter_clockwise: bool },
-    QuadraticCurveTo { cpx: f32, cpy: f32, x: f32, y: f32 },
-    BezierCurveTo { cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32 },
-    Ellipse { x: f32, y: f32, rx: f32, ry: f32, rotation: f32, start_angle: f32, end_angle: f32, counter_clockwise: bool },
+    Arc {
+        cx: f32,
+        cy: f32,
+        r: f32,
+        start_angle: f32,
+        end_angle: f32,
+        counter_clockwise: bool,
+    },
+    QuadraticCurveTo {
+        cpx: f32,
+        cpy: f32,
+        x: f32,
+        y: f32,
+    },
+    BezierCurveTo {
+        cp1x: f32,
+        cp1y: f32,
+        cp2x: f32,
+        cp2y: f32,
+        x: f32,
+        y: f32,
+    },
+    Ellipse {
+        x: f32,
+        y: f32,
+        rx: f32,
+        ry: f32,
+        rotation: f32,
+        start_angle: f32,
+        end_angle: f32,
+        counter_clockwise: bool,
+    },
     ClosePath,
 }
 
@@ -165,7 +260,10 @@ impl CanvasRenderingContext2D {
 
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
         self.commands.push(CanvasCommand::FillRect {
-            x, y, w, h,
+            x,
+            y,
+            w,
+            h,
             color: self.state.fill_style.clone(),
             alpha: self.state.global_alpha,
         });
@@ -173,7 +271,10 @@ impl CanvasRenderingContext2D {
 
     pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
         self.commands.push(CanvasCommand::StrokeRect {
-            x, y, w, h,
+            x,
+            y,
+            w,
+            h,
             color: self.state.stroke_style.clone(),
             line_width: self.state.line_width,
             alpha: self.state.global_alpha,
@@ -198,9 +299,22 @@ impl CanvasRenderingContext2D {
         self.current_path.push(PathSegment::LineTo(x, y));
     }
 
-    pub fn arc(&mut self, cx: f32, cy: f32, r: f32, start_angle: f32, end_angle: f32, counter_clockwise: bool) {
+    pub fn arc(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        r: f32,
+        start_angle: f32,
+        end_angle: f32,
+        counter_clockwise: bool,
+    ) {
         self.current_path.push(PathSegment::Arc {
-            cx, cy, r, start_angle, end_angle, counter_clockwise,
+            cx,
+            cy,
+            r,
+            start_angle,
+            end_angle,
+            counter_clockwise,
         });
     }
 
@@ -209,17 +323,41 @@ impl CanvasRenderingContext2D {
     }
 
     pub fn quadratic_curve_to(&mut self, cpx: f32, cpy: f32, x: f32, y: f32) {
-        self.current_path.push(PathSegment::QuadraticCurveTo { cpx, cpy, x, y });
+        self.current_path
+            .push(PathSegment::QuadraticCurveTo { cpx, cpy, x, y });
     }
 
     pub fn bezier_curve_to(&mut self, cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32) {
-        self.current_path.push(PathSegment::BezierCurveTo { cp1x, cp1y, cp2x, cp2y, x, y });
+        self.current_path.push(PathSegment::BezierCurveTo {
+            cp1x,
+            cp1y,
+            cp2x,
+            cp2y,
+            x,
+            y,
+        });
     }
 
-    pub fn ellipse(&mut self, x: f32, y: f32, rx: f32, ry: f32, rotation: f32, start: f32, end_angle: f32, ccw: bool) {
+    pub fn ellipse(
+        &mut self,
+        x: f32,
+        y: f32,
+        rx: f32,
+        ry: f32,
+        rotation: f32,
+        start: f32,
+        end_angle: f32,
+        ccw: bool,
+    ) {
         self.current_path.push(PathSegment::Ellipse {
-            x, y, rx, ry, rotation,
-            start_angle: start, end_angle, counter_clockwise: ccw,
+            x,
+            y,
+            rx,
+            ry,
+            rotation,
+            start_angle: start,
+            end_angle,
+            counter_clockwise: ccw,
         });
     }
 
@@ -260,7 +398,8 @@ impl CanvasRenderingContext2D {
     pub fn fill_text(&mut self, text: &str, x: f32, y: f32) {
         self.commands.push(CanvasCommand::FillText {
             text: text.to_string(),
-            x, y,
+            x,
+            y,
             color: self.state.fill_style.clone(),
             font_size: self.state.font_size,
             alpha: self.state.global_alpha,
@@ -270,7 +409,8 @@ impl CanvasRenderingContext2D {
     pub fn stroke_text(&mut self, text: &str, x: f32, y: f32) {
         self.commands.push(CanvasCommand::StrokeText {
             text: text.to_string(),
-            x, y,
+            x,
+            y,
             color: self.state.stroke_style.clone(),
             font_size: self.state.font_size,
             line_width: self.state.line_width,
@@ -409,7 +549,14 @@ impl CanvasRenderingContext2D {
 
     pub fn set_transform(&mut self, a: f32, b: f32, c: f32, d: f32, e: f32, f_val: f32) {
         self.state.transform = [a, b, c, d, e, f_val];
-        self.commands.push(CanvasCommand::SetTransform { a, b, c, d, e, f: f_val });
+        self.commands.push(CanvasCommand::SetTransform {
+            a,
+            b,
+            c,
+            d,
+            e,
+            f: f_val,
+        });
     }
 
     pub fn reset_transform(&mut self) {
@@ -447,14 +594,19 @@ impl CanvasRenderingContext2D {
     }
 
     pub fn put_image_data(&mut self, data: Vec<u8>, width: u32, height: u32, dx: f32, dy: f32) {
-        self.commands.push(CanvasCommand::PutImageData { data, width, height, dx, dy });
+        self.commands.push(CanvasCommand::PutImageData {
+            data,
+            width,
+            height,
+            dx,
+            dy,
+        });
     }
 
     /// Take and reset the command buffer. Called by the renderer after processing.
     pub fn drain_commands(&mut self) -> Vec<CanvasCommand> {
         std::mem::take(&mut self.commands)
     }
-
 }
 
 #[derive(Debug, Clone)]

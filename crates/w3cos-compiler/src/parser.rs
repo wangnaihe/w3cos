@@ -41,6 +41,14 @@ pub struct Node {
     /// `Show when="route:0"` — render children only when signal equals value.
     #[serde(default)]
     pub show_when: Option<(String, i64)>,
+    /// Repeat this container's child sequence at runtime without expanding
+    /// the generated Rust expression.
+    #[serde(default)]
+    pub repeat: Option<usize>,
+    /// `stickyCounter="todoCount"` — count this marker after it crosses the
+    /// top edge of its scroll container.
+    #[serde(default)]
+    pub sticky_counter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +68,10 @@ pub enum NodeKind {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StyleDecl {
+    /// Compiler-only metadata for `<VirtualList>`; not emitted as CSS.
+    pub virtual_count: Option<usize>,
+    pub estimated_item_height: Option<f32>,
+    pub virtual_overscan: Option<f32>,
     pub gap: Option<f32>,
     pub padding: Option<Spacing>,
     pub padding_top: Option<Spacing>,
@@ -329,14 +341,31 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
 
     if !matches!(
         tag_name,
-        "Column" | "Row" | "Box" | "Text" | "Button" | "Image" | "TextInput" | "Show"
+        "Column"
+            | "Row"
+            | "Box"
+            | "Text"
+            | "Button"
+            | "Image"
+            | "TextInput"
+            | "Show"
+            | "VirtualList"
     ) {
         return None;
     }
 
     let after_tag = &after_lt[tag_end..];
-    let (style, class_name, on_click, src, placeholder, show_when, after_attrs) =
-        parse_tsx_attrs(after_tag);
+    let (
+        style,
+        class_name,
+        on_click,
+        src,
+        placeholder,
+        show_when,
+        repeat,
+        sticky_counter,
+        after_attrs,
+    ) = parse_tsx_attrs(after_tag);
     let after_attrs = after_attrs.trim();
 
     if let Some(rest) = after_attrs.strip_prefix("/>") {
@@ -348,6 +377,8 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
             src,
             placeholder,
             show_when,
+            repeat,
+            sticky_counter,
             vec![],
             None,
         );
@@ -369,6 +400,8 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
         src,
         placeholder,
         show_when,
+        repeat,
+        sticky_counter,
         children,
         text_content,
     );
@@ -384,6 +417,8 @@ fn parse_tsx_attrs(
     Option<String>,
     Option<String>,
     Option<(String, i64)>,
+    Option<usize>,
+    Option<String>,
     &str,
 ) {
     let mut style = StyleDecl::default();
@@ -392,6 +427,8 @@ fn parse_tsx_attrs(
     let mut src: Option<String> = None;
     let mut placeholder: Option<String> = None;
     let mut show_when: Option<(String, i64)> = None;
+    let mut repeat: Option<usize> = None;
+    let mut sticky_counter: Option<String> = None;
     let mut rest = s.trim();
 
     loop {
@@ -446,6 +483,47 @@ fn parse_tsx_attrs(
                 continue;
             }
         }
+        if let Some(after) = rest.strip_prefix("repeat=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                repeat = value.parse::<usize>().ok().filter(|count| *count > 0);
+                rest = r;
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix("itemCount=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                style.virtual_count = value.parse::<usize>().ok().filter(|count| *count > 0);
+                rest = r;
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix("estimatedItemHeight=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                style.estimated_item_height =
+                    value.parse::<f32>().ok().filter(|value| *value > 0.0);
+                rest = r;
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix("overscan=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                style.virtual_overscan = value.parse::<f32>().ok().filter(|value| *value >= 0.0);
+                rest = r;
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix("stickyCounter=") {
+            let after = after.trim();
+            if let Some((value, r)) = extract_first_string_arg(after) {
+                sticky_counter = Some(value);
+                rest = r;
+                continue;
+            }
+        }
         if let Some(after) = rest.strip_prefix("onClick=") {
             let after = after.trim();
             if let Some((value, r)) = extract_first_string_arg(after) {
@@ -480,7 +558,17 @@ fn parse_tsx_attrs(
         }
     }
 
-    (style, class_name, on_click, src, placeholder, show_when, rest)
+    (
+        style,
+        class_name,
+        on_click,
+        src,
+        placeholder,
+        show_when,
+        repeat,
+        sticky_counter,
+        rest,
+    )
 }
 
 fn parse_show_when(value: &str) -> Option<(String, i64)> {
@@ -570,6 +658,8 @@ fn build_tsx_node(
     src: Option<String>,
     placeholder: Option<String>,
     show_when: Option<(String, i64)>,
+    repeat: Option<usize>,
+    sticky_counter: Option<String>,
     children: Vec<Node>,
     text_content: Option<String>,
 ) -> Node {
@@ -585,6 +675,8 @@ fn build_tsx_node(
             placeholder: None,
             class_name,
             show_when,
+            repeat,
+            sticky_counter,
         };
     }
     match tag {
@@ -601,6 +693,8 @@ fn build_tsx_node(
                 placeholder: None,
                 class_name,
                 show_when: None,
+                repeat: None,
+                sticky_counter: None,
             }
         }
         "Button" => {
@@ -616,6 +710,8 @@ fn build_tsx_node(
                 placeholder: None,
                 class_name,
                 show_when: None,
+                repeat: None,
+                sticky_counter: None,
             }
         }
         "Image" => {
@@ -631,6 +727,8 @@ fn build_tsx_node(
                 placeholder: None,
                 class_name,
                 show_when: None,
+                repeat: None,
+                sticky_counter: None,
             }
         }
         "TextInput" => {
@@ -646,6 +744,8 @@ fn build_tsx_node(
                 placeholder: Some(placeholder_val),
                 class_name,
                 show_when: None,
+                repeat: None,
+                sticky_counter: None,
             }
         }
         "Row" => Node {
@@ -659,6 +759,8 @@ fn build_tsx_node(
             placeholder: None,
             class_name,
             show_when: None,
+            repeat,
+            sticky_counter,
         },
         "Box" => Node {
             kind: NodeKind::Box,
@@ -671,6 +773,8 @@ fn build_tsx_node(
             placeholder: None,
             class_name,
             show_when: None,
+            repeat,
+            sticky_counter,
         },
         _ => Node {
             kind: NodeKind::Column,
@@ -683,6 +787,8 @@ fn build_tsx_node(
             placeholder: None,
             class_name,
             show_when: None,
+            repeat,
+            sticky_counter,
         },
     }
 }
@@ -732,6 +838,8 @@ fn parse_container_call(kind: &str, inner: &str) -> Option<Node> {
         placeholder: None,
         class_name,
         show_when: None,
+        repeat: None,
+        sticky_counter: None,
     })
 }
 
@@ -772,6 +880,8 @@ fn parse_image_call(inner: &str) -> Option<Node> {
         placeholder: None,
         class_name,
         show_when: None,
+        repeat: None,
+        sticky_counter: None,
     })
 }
 
@@ -809,6 +919,8 @@ fn parse_text_input_call(inner: &str) -> Option<Node> {
         placeholder: Some(placeholder_val),
         class_name,
         show_when: None,
+        repeat: None,
+        sticky_counter: None,
     })
 }
 
@@ -853,6 +965,8 @@ fn parse_text_or_button(inner: &str, is_text: bool) -> Option<Node> {
         placeholder: None,
         class_name,
         show_when: None,
+        repeat: None,
+        sticky_counter: None,
     })
 }
 
@@ -1116,6 +1230,8 @@ fn empty_column() -> Node {
         placeholder: None,
         class_name: None,
         show_when: None,
+        repeat: None,
+        sticky_counter: None,
     }
 }
 
@@ -1451,6 +1567,31 @@ export default <Column>
         let tree = parse(source).unwrap();
         assert_eq!(tree.root.class_name.as_deref(), Some("container"));
         assert_eq!(tree.root.children.len(), 1);
+    }
+
+    #[test]
+    fn tsx_repeat_parsed_for_runtime_child_repetition() {
+        let source = r#"<Column repeat="40"><Text>row</Text></Column>"#;
+        let tree = parse(source).unwrap();
+        assert_eq!(tree.root.repeat, Some(40));
+        assert_eq!(tree.root.children.len(), 1);
+    }
+
+    #[test]
+    fn tsx_virtual_list_metadata_is_parsed_without_expanding_items() {
+        let source = r#"<VirtualList itemCount="1000000" estimatedItemHeight="56" overscan="180"><Text>row-{index}</Text></VirtualList>"#;
+        let tree = parse(source).unwrap();
+        assert_eq!(tree.root.style.virtual_count, Some(1_000_000));
+        assert_eq!(tree.root.style.estimated_item_height, Some(56.0));
+        assert_eq!(tree.root.style.virtual_overscan, Some(180.0));
+        assert_eq!(tree.root.children.len(), 1);
+    }
+
+    #[test]
+    fn tsx_sticky_counter_parsed() {
+        let source = r#"<Column stickyCounter="todoCount"><Text>task</Text></Column>"#;
+        let tree = parse(source).unwrap();
+        assert_eq!(tree.root.sticky_counter.as_deref(), Some("todoCount"));
     }
 
     #[test]

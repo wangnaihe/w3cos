@@ -1,6 +1,6 @@
+use fontdue::Font;
 use serde::{Deserialize, Serialize};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
-use fontdue::Font;
 
 /// Layer 3: Annotated screenshot API.
 /// For compatibility with external AI tools (Claude Computer Use, UI-TARS, etc.)
@@ -124,7 +124,13 @@ fn draw_annotations(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
         pb.push_circle(cx, cy, r);
         let path = pb.finish().unwrap();
         // fill_path signature: (path, paint, transform, mask, fill_rule)
-        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
 
         // Render number text
         let text = ann.index.to_string();
@@ -220,7 +226,8 @@ fn draw_outlines(pixmap: &mut Pixmap, annotations: &[ElementAnnotation]) {
     };
 
     for ann in annotations {
-        if let Some(rect) = Rect::from_xywh(ann.bounds[0], ann.bounds[1], ann.bounds[2], ann.bounds[3])
+        if let Some(rect) =
+            Rect::from_xywh(ann.bounds[0], ann.bounds[1], ann.bounds[2], ann.bounds[3])
         {
             let mut pb = PathBuilder::new();
             pb.push_rect(rect);

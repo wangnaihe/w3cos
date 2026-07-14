@@ -29,7 +29,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -244,25 +244,30 @@ fn watch_loop(root: PathBuf, options: ObserveOptions, inner: Arc<ObserverInner>)
             let prev_entry = prev.iter().find(|e| e.path == entry.path);
             match prev_entry {
                 None => {
-                    push_record(&inner, FileSystemChangeRecord {
-                        path: entry.path.clone(),
-                        moved_to: None,
-                        change_type: ChangeType::Created,
-                        is_directory: entry.is_dir,
-                        timestamp: SystemTime::now(),
-                    });
-                }
-                Some(p) => {
-                    let content_changed = entry.size != p.size
-                        || entry.modified != p.modified;
-                    if content_changed {
-                        push_record(&inner, FileSystemChangeRecord {
+                    push_record(
+                        &inner,
+                        FileSystemChangeRecord {
                             path: entry.path.clone(),
                             moved_to: None,
-                            change_type: ChangeType::Modified,
+                            change_type: ChangeType::Created,
                             is_directory: entry.is_dir,
                             timestamp: SystemTime::now(),
-                        });
+                        },
+                    );
+                }
+                Some(p) => {
+                    let content_changed = entry.size != p.size || entry.modified != p.modified;
+                    if content_changed {
+                        push_record(
+                            &inner,
+                            FileSystemChangeRecord {
+                                path: entry.path.clone(),
+                                moved_to: None,
+                                change_type: ChangeType::Modified,
+                                is_directory: entry.is_dir,
+                                timestamp: SystemTime::now(),
+                            },
+                        );
                     }
                 }
             }
@@ -271,13 +276,16 @@ fn watch_loop(root: PathBuf, options: ObserveOptions, inner: Arc<ObserverInner>)
         // Detect deleted
         for entry in &prev {
             if !curr.iter().any(|e| e.path == entry.path) {
-                push_record(&inner, FileSystemChangeRecord {
-                    path: entry.path.clone(),
-                    moved_to: None,
-                    change_type: ChangeType::Deleted,
-                    is_directory: entry.is_dir,
-                    timestamp: SystemTime::now(),
-                });
+                push_record(
+                    &inner,
+                    FileSystemChangeRecord {
+                        path: entry.path.clone(),
+                        moved_to: None,
+                        change_type: ChangeType::Deleted,
+                        is_directory: entry.is_dir,
+                        timestamp: SystemTime::now(),
+                    },
+                );
             }
         }
 
@@ -382,9 +390,9 @@ impl FileSystemDirectoryHandle {
             let meta = entry.metadata().map_err(|e| e.to_string())?;
             let path = entry.path();
             if meta.is_dir() {
-                entries.push(FileSystemEntry::Directory(
-                    FileSystemDirectoryHandle::new(path),
-                ));
+                entries.push(FileSystemEntry::Directory(FileSystemDirectoryHandle::new(
+                    path,
+                )));
             } else {
                 entries.push(FileSystemEntry::File(FileSystemFileHandle::new(path)));
             }
@@ -413,15 +421,11 @@ impl FileSystemDirectoryHandle {
 
     /// `handle.resolve(child)` — get relative path from this dir to child.
     pub fn resolve(&self, child: &FileSystemFileHandle) -> Option<Vec<String>> {
-        child
-            .path
-            .strip_prefix(&self.path)
-            .ok()
-            .map(|rel| {
-                rel.components()
-                    .map(|c| c.as_os_str().to_string_lossy().to_string())
-                    .collect()
-            })
+        child.path.strip_prefix(&self.path).ok().map(|rel| {
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect()
+        })
     }
 }
 
@@ -502,9 +506,15 @@ mod tests {
 
         assert!(
             records.iter().any(|r| r.change_type == ChangeType::Created
-                && r.path.file_name().map(|n| n == "new_file.txt").unwrap_or(false)),
+                && r.path
+                    .file_name()
+                    .map(|n| n == "new_file.txt")
+                    .unwrap_or(false)),
             "expected Created record, got: {:?}",
-            records.iter().map(|r| (&r.path, &r.change_type)).collect::<Vec<_>>()
+            records
+                .iter()
+                .map(|r| (&r.path, &r.change_type))
+                .collect::<Vec<_>>()
         );
 
         std::fs::remove_dir_all(&tmp).ok();

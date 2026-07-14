@@ -85,10 +85,7 @@ fn build_node(doc: &Document, id: NodeId) -> A11yNode {
         _ => None,
     };
 
-    let disabled = dom_node
-        .attributes
-        .iter()
-        .any(|(k, _)| *k == disabled_atom);
+    let disabled = dom_node.attributes.iter().any(|(k, _)| *k == disabled_atom);
     let style = doc.get_style(id);
     let visible = style.inner.opacity > 0.0
         && !matches!(style.inner.display, w3cos_std::style::Display::None);

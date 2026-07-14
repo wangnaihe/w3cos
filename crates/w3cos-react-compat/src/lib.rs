@@ -45,7 +45,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use w3cos_core::{batch, Effect, Signal};
+use w3cos_core::{Effect, Signal, batch};
 
 // ---------------------------------------------------------------------------
 // Internal slot model
@@ -120,10 +120,7 @@ pub fn begin_render(id: ComponentId) {
 /// most-recent [`begin_render`].
 pub fn end_render(id: ComponentId) {
     with_host(|host| {
-        let frame = host
-            .active
-            .pop()
-            .expect("end_render without begin_render");
+        let frame = host.active.pop().expect("end_render without begin_render");
         debug_assert_eq!(frame.id, id, "render frame id mismatch");
     });
 }
@@ -214,7 +211,9 @@ where
     T: Clone + PartialEq + 'static,
 {
     let (id, idx) = current_frame_cursor();
-    ensure_slot(id, idx, || HookSlot::State(Box::new(Signal::new(initial()))));
+    ensure_slot(id, idx, || {
+        HookSlot::State(Box::new(Signal::new(initial())))
+    });
     let signal = with_slot(id, idx, |slot| {
         if let HookSlot::State(boxed) = slot {
             boxed
@@ -307,7 +306,11 @@ where
     if should_run {
         // Run cleanup from prior invocation first.
         let prior_cleanup = with_slot(id, idx, |slot| {
-            if let HookSlot::Effect { deps: prev, cleanup } = slot {
+            if let HookSlot::Effect {
+                deps: prev,
+                cleanup,
+            } = slot
+            {
                 *prev = deps.to_vec();
                 cleanup.take()
             } else {
@@ -498,18 +501,14 @@ impl<T: 'static> RefHook<T> {
     /// `ref.current` (mutable).
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         let mut guard = self.inner.borrow_mut();
-        let current = guard
-            .downcast_mut::<T>()
-            .expect("useRef type mismatch");
+        let current = guard.downcast_mut::<T>().expect("useRef type mismatch");
         f(current)
     }
 
     /// `ref.current` (read-only).
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let guard = self.inner.borrow();
-        let current = guard
-            .downcast_ref::<T>()
-            .expect("useRef type mismatch");
+        let current = guard.downcast_ref::<T>().expect("useRef type mismatch");
         f(current)
     }
 }

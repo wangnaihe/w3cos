@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use vello::peniko::{Blob, Color, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 use vello::wgpu;
-use vello::{AaConfig, Renderer, RenderParams, Scene};
+use vello::{AaConfig, RenderParams, Renderer, Scene};
 
 use crate::filter::{FilterChain, FilterOp};
 

@@ -209,7 +209,11 @@ impl ImageData {
     }
 
     pub fn from_bytes(data: Vec<u8>, width: u32, height: u32) -> Self {
-        Self { data, width, height }
+        Self {
+            data,
+            width,
+            height,
+        }
     }
 }
 
@@ -247,12 +251,22 @@ pub struct Path2D {
 }
 
 impl Path2D {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn move_to(&mut self, x: f32, y: f32) { self.ops.push(PathOp::MoveTo(x, y)); }
-    pub fn line_to(&mut self, x: f32, y: f32) { self.ops.push(PathOp::LineTo(x, y)); }
-    pub fn close_path(&mut self) { self.ops.push(PathOp::ClosePath); }
-    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32) { self.ops.push(PathOp::Rect(x, y, w, h)); }
+    pub fn move_to(&mut self, x: f32, y: f32) {
+        self.ops.push(PathOp::MoveTo(x, y));
+    }
+    pub fn line_to(&mut self, x: f32, y: f32) {
+        self.ops.push(PathOp::LineTo(x, y));
+    }
+    pub fn close_path(&mut self) {
+        self.ops.push(PathOp::ClosePath);
+    }
+    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.ops.push(PathOp::Rect(x, y, w, h));
+    }
     pub fn arc(&mut self, x: f32, y: f32, r: f32, start: f32, end: f32, ccw: bool) {
         self.ops.push(PathOp::Arc(x, y, r, start, end, ccw));
     }
@@ -260,10 +274,22 @@ impl Path2D {
         self.ops.push(PathOp::QuadraticCurveTo(cpx, cpy, x, y));
     }
     pub fn bezier_curve_to(&mut self, cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32) {
-        self.ops.push(PathOp::BezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y));
+        self.ops
+            .push(PathOp::BezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y));
     }
-    pub fn ellipse(&mut self, x: f32, y: f32, rx: f32, ry: f32, rot: f32, start: f32, end: f32, ccw: bool) {
-        self.ops.push(PathOp::Ellipse(x, y, rx, ry, rot, start, end, ccw));
+    pub fn ellipse(
+        &mut self,
+        x: f32,
+        y: f32,
+        rx: f32,
+        ry: f32,
+        rot: f32,
+        start: f32,
+        end: f32,
+        ccw: bool,
+    ) {
+        self.ops
+            .push(PathOp::Ellipse(x, y, rx, ry, rot, start, end, ccw));
     }
 }
 
@@ -325,7 +351,7 @@ impl Default for ContextState {
 pub struct CanvasRenderingContext2D {
     pub width: u32,
     pub height: u32,
-    pixels: Vec<u8>,          // RGBA row-major pixel buffer
+    pixels: Vec<u8>, // RGBA row-major pixel buffer
     current_path: Path2D,
     pub state: ContextState,
     state_stack: VecDeque<ContextState>,
@@ -366,8 +392,12 @@ impl CanvasRenderingContext2D {
     pub fn set_stroke_style(&mut self, style: &str) {
         self.state.stroke_style = CanvasStyle::from_str(style);
     }
-    pub fn set_line_width(&mut self, w: f32) { self.state.line_width = w; }
-    pub fn set_global_alpha(&mut self, a: f32) { self.state.global_alpha = a.clamp(0.0, 1.0); }
+    pub fn set_line_width(&mut self, w: f32) {
+        self.state.line_width = w;
+    }
+    pub fn set_global_alpha(&mut self, a: f32) {
+        self.state.global_alpha = a.clamp(0.0, 1.0);
+    }
     pub fn set_font(&mut self, font: &str) {
         // Parse "14px monospace" style font shorthand
         let parts: Vec<&str> = font.trim().splitn(2, ' ').collect();
@@ -398,9 +428,15 @@ impl CanvasRenderingContext2D {
             _ => TextBaseline::Alphabetic,
         };
     }
-    pub fn set_shadow_blur(&mut self, blur: f32) { self.state.shadow_blur = blur; }
-    pub fn set_shadow_offset_x(&mut self, x: f32) { self.state.shadow_offset_x = x; }
-    pub fn set_shadow_offset_y(&mut self, y: f32) { self.state.shadow_offset_y = y; }
+    pub fn set_shadow_blur(&mut self, blur: f32) {
+        self.state.shadow_blur = blur;
+    }
+    pub fn set_shadow_offset_x(&mut self, x: f32) {
+        self.state.shadow_offset_x = x;
+    }
+    pub fn set_shadow_offset_y(&mut self, y: f32) {
+        self.state.shadow_offset_y = y;
+    }
     pub fn set_shadow_color(&mut self, color: &str) {
         self.state.shadow_color = CanvasStyle::from_str(color);
     }
@@ -428,11 +464,21 @@ impl CanvasRenderingContext2D {
 
     // ── Path API ──────────────────────────────────────────────────────────
 
-    pub fn begin_path(&mut self) { self.current_path = Path2D::new(); }
-    pub fn close_path(&mut self) { self.current_path.close_path(); }
-    pub fn move_to(&mut self, x: f32, y: f32) { self.current_path.move_to(x, y); }
-    pub fn line_to(&mut self, x: f32, y: f32) { self.current_path.line_to(x, y); }
-    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32) { self.current_path.rect(x, y, w, h); }
+    pub fn begin_path(&mut self) {
+        self.current_path = Path2D::new();
+    }
+    pub fn close_path(&mut self) {
+        self.current_path.close_path();
+    }
+    pub fn move_to(&mut self, x: f32, y: f32) {
+        self.current_path.move_to(x, y);
+    }
+    pub fn line_to(&mut self, x: f32, y: f32) {
+        self.current_path.line_to(x, y);
+    }
+    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.current_path.rect(x, y, w, h);
+    }
     pub fn arc(&mut self, x: f32, y: f32, r: f32, start: f32, end: f32, ccw: bool) {
         self.current_path.arc(x, y, r, start, end, ccw);
     }
@@ -440,10 +486,22 @@ impl CanvasRenderingContext2D {
         self.current_path.quadratic_curve_to(cpx, cpy, x, y);
     }
     pub fn bezier_curve_to(&mut self, cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32) {
-        self.current_path.bezier_curve_to(cp1x, cp1y, cp2x, cp2y, x, y);
+        self.current_path
+            .bezier_curve_to(cp1x, cp1y, cp2x, cp2y, x, y);
     }
-    pub fn ellipse(&mut self, x: f32, y: f32, rx: f32, ry: f32, rot: f32, start: f32, end: f32, ccw: bool) {
-        self.current_path.ellipse(x, y, rx, ry, rot, start, end, ccw);
+    pub fn ellipse(
+        &mut self,
+        x: f32,
+        y: f32,
+        rx: f32,
+        ry: f32,
+        rot: f32,
+        start: f32,
+        end: f32,
+        ccw: bool,
+    ) {
+        self.current_path
+            .ellipse(x, y, rx, ry, rot, start, end, ccw);
     }
 
     // ── Rectangle drawing ─────────────────────────────────────────────────
@@ -537,18 +595,20 @@ impl CanvasRenderingContext2D {
         let mut cur_y = 0.0f32;
         for op in &path.ops {
             match op {
-                PathOp::MoveTo(x, y) => { cur_x = *x; cur_y = *y; }
+                PathOp::MoveTo(x, y) => {
+                    cur_x = *x;
+                    cur_y = *y;
+                }
                 PathOp::LineTo(x, y) => {
-                    self.draw_line(
-                        cur_x + tx, cur_y + ty,
-                        *x + tx, *y + ty,
-                        lw, r, g, b, alpha,
-                    );
-                    cur_x = *x; cur_y = *y;
+                    self.draw_line(cur_x + tx, cur_y + ty, *x + tx, *y + ty, lw, r, g, b, alpha);
+                    cur_x = *x;
+                    cur_y = *y;
                 }
                 PathOp::Rect(x, y, w, h) => {
-                    let x0 = *x + tx; let y0 = *y + ty;
-                    let x1 = x0 + *w; let y1 = y0 + *h;
+                    let x0 = *x + tx;
+                    let y0 = *y + ty;
+                    let x1 = x0 + *w;
+                    let y1 = y0 + *h;
                     self.draw_line(x0, y0, x1, y0, lw, r, g, b, alpha);
                     self.draw_line(x1, y0, x1, y1, lw, r, g, b, alpha);
                     self.draw_line(x1, y1, x0, y1, lw, r, g, b, alpha);
@@ -635,14 +695,14 @@ impl CanvasRenderingContext2D {
             for col in 0..image_data.width {
                 let dst_x = dx + col as i32;
                 let dst_y = dy + row as i32;
-                if dst_x >= 0 && dst_y >= 0
+                if dst_x >= 0
+                    && dst_y >= 0
                     && (dst_x as u32) < self.width
                     && (dst_y as u32) < self.height
                 {
                     let src = ((row * image_data.width + col) * 4) as usize;
                     let dst = ((dst_y as u32 * self.width + dst_x as u32) * 4) as usize;
-                    self.pixels[dst..dst + 4]
-                        .copy_from_slice(&image_data.data[src..src + 4]);
+                    self.pixels[dst..dst + 4].copy_from_slice(&image_data.data[src..src + 4]);
                 }
             }
         }
@@ -667,8 +727,17 @@ impl CanvasRenderingContext2D {
 
     // ── Internal helpers ──────────────────────────────────────────────────
 
-    fn fill_rect_pixels(&mut self, x0: i32, y0: i32, x1: i32, y1: i32,
-                        r: u8, g: u8, b: u8, alpha: f32) {
+    fn fill_rect_pixels(
+        &mut self,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        r: u8,
+        g: u8,
+        b: u8,
+        alpha: f32,
+    ) {
         let w = self.width as i32;
         let h = self.height as i32;
         for py in y0.max(0)..y1.min(h) {
@@ -681,7 +750,9 @@ impl CanvasRenderingContext2D {
     /// Alpha-composite a single pixel (Porter-Duff source-over).
     fn blend_pixel(&mut self, x: u32, y: u32, r: u8, g: u8, b: u8, src_alpha: f32) {
         let idx = ((y * self.width + x) * 4) as usize;
-        if idx + 3 >= self.pixels.len() { return; }
+        if idx + 3 >= self.pixels.len() {
+            return;
+        }
         let dst_a = self.pixels[idx + 3] as f32 / 255.0;
         let out_a = src_alpha + dst_a * (1.0 - src_alpha);
         if out_a < f32::EPSILON {
@@ -703,18 +774,39 @@ impl CanvasRenderingContext2D {
     }
 
     /// Bresenham line drawing with line width.
-    fn draw_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32,
-                 lw: f32, r: u8, g: u8, b: u8, alpha: f32) {
+    fn draw_line(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        lw: f32,
+        r: u8,
+        g: u8,
+        b: u8,
+        alpha: f32,
+    ) {
         let dx = (x1 - x0).abs();
         let dy = (y1 - y0).abs();
         let steps = dx.max(dy) as i32;
-        if steps == 0 { return; }
+        if steps == 0 {
+            return;
+        }
         let half = (lw / 2.0) as i32;
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
             let px = (x0 + t * (x1 - x0)) as i32;
             let py = (y0 + t * (y1 - y0)) as i32;
-            self.fill_rect_pixels(px - half, py - half, px + half + 1, py + half + 1, r, g, b, alpha);
+            self.fill_rect_pixels(
+                px - half,
+                py - half,
+                px + half + 1,
+                py + half + 1,
+                r,
+                g,
+                b,
+                alpha,
+            );
         }
     }
 }
@@ -732,8 +824,8 @@ mod tests {
         ctx.fill_rect(0.0, 0.0, 5.0, 5.0);
         let px = ctx.get_image_data(0, 0, 1, 1);
         assert_eq!(px.data[0], 255); // R
-        assert_eq!(px.data[1], 0);   // G
-        assert_eq!(px.data[2], 0);   // B
+        assert_eq!(px.data[1], 0); // G
+        assert_eq!(px.data[2], 0); // B
         assert_eq!(px.data[3], 255); // A
     }
 
@@ -753,7 +845,9 @@ mod tests {
         assert!(matches!(c, CanvasStyle::Color(0x1e, 0x1e, 0x1e, 255)));
         let c2 = CanvasStyle::from_str("rgba(255,0,128,0.5)");
         let (r, g, b, a) = c2.to_rgba();
-        assert_eq!(r, 255); assert_eq!(g, 0); assert_eq!(b, 128);
+        assert_eq!(r, 255);
+        assert_eq!(g, 0);
+        assert_eq!(b, 128);
         assert!((a as f32 - 127.5).abs() < 2.0);
     }
 
@@ -774,6 +868,8 @@ mod tests {
         ctx.set_fill_style("#00ff00");
         ctx.restore();
         let (r, g, b, _) = ctx.state.fill_style.to_rgba();
-        assert_eq!(r, 255); assert_eq!(g, 0); assert_eq!(b, 0);
+        assert_eq!(r, 255);
+        assert_eq!(g, 0);
+        assert_eq!(b, 0);
     }
 }

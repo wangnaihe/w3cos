@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 // ── ReadyState ─────────────────────────────────────────────────────────────
@@ -197,7 +197,9 @@ impl EventSource {
 
 impl Clone for EventSource {
     fn clone(&self) -> Self {
-        EventSource { inner: Arc::clone(&self.inner) }
+        EventSource {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
@@ -249,12 +251,16 @@ fn sse_worker(inner: Arc<EventSourceInner>, builder: EventSourceBuilder) {
         Err(e) => {
             push(&inner, SseEvent::Error(format!("connect failed: {e}")));
             push(&inner, SseEvent::Close);
-            inner.state.store(EventSourceState::Closed as u8, Ordering::SeqCst);
+            inner
+                .state
+                .store(EventSourceState::Closed as u8, Ordering::SeqCst);
             return;
         }
     };
 
-    inner.state.store(EventSourceState::Open as u8, Ordering::SeqCst);
+    inner
+        .state
+        .store(EventSourceState::Open as u8, Ordering::SeqCst);
     push(&inner, SseEvent::Open);
 
     // Parse SSE line-by-line
@@ -286,7 +292,9 @@ fn sse_worker(inner: Arc<EventSourceInner>, builder: EventSourceBuilder) {
                 // OpenAI / Anthropic sentinel
                 if data == "[DONE]" {
                     push(&inner, SseEvent::Close);
-                    inner.state.store(EventSourceState::Closed as u8, Ordering::SeqCst);
+                    inner
+                        .state
+                        .store(EventSourceState::Closed as u8, Ordering::SeqCst);
                     break;
                 }
 
@@ -343,7 +351,9 @@ fn sse_worker(inner: Arc<EventSourceInner>, builder: EventSourceBuilder) {
     // EOF
     if !is_closed(&inner) {
         push(&inner, SseEvent::Close);
-        inner.state.store(EventSourceState::Closed as u8, Ordering::SeqCst);
+        inner
+            .state
+            .store(EventSourceState::Closed as u8, Ordering::SeqCst);
     }
 }
 
@@ -408,7 +418,10 @@ mod tests {
         let es = EventSource::new("http://127.0.0.1:1"); // unreachable port
         // State is Connecting initially (may transition quickly to Closed)
         let s = es.ready_state();
-        assert!(matches!(s, EventSourceState::Connecting | EventSourceState::Closed));
+        assert!(matches!(
+            s,
+            EventSourceState::Connecting | EventSourceState::Closed
+        ));
         es.close();
         assert_eq!(es.ready_state(), EventSourceState::Closed);
     }

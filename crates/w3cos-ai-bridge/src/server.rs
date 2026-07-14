@@ -204,10 +204,7 @@ fn handle_connection(
         ("POST", "/click") => {
             let body: serde_json::Value =
                 serde_json::from_str(&body_str).unwrap_or(serde_json::Value::Null);
-            let selector = body["selector"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let selector = body["selector"].as_str().unwrap_or("").to_string();
             if selector.is_empty() {
                 send_response(
                     &mut stream,
@@ -222,14 +219,8 @@ fn handle_connection(
         ("POST", "/type") => {
             let body: serde_json::Value =
                 serde_json::from_str(&body_str).unwrap_or(serde_json::Value::Null);
-            let selector = body["selector"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let text = body["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let selector = body["selector"].as_str().unwrap_or("").to_string();
+            let text = body["text"].as_str().unwrap_or("").to_string();
             if selector.is_empty() {
                 send_response(
                     &mut stream,
@@ -297,7 +288,12 @@ fn handle_connection(
         match reply_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(response) => match response {
                 AiBridgeResponse::Text(text) => {
-                    send_response(&mut stream, 200, "text/plain; charset=utf-8", text.as_bytes())?;
+                    send_response(
+                        &mut stream,
+                        200,
+                        "text/plain; charset=utf-8",
+                        text.as_bytes(),
+                    )?;
                 }
                 AiBridgeResponse::Json(json) => {
                     send_response(&mut stream, 200, "application/json", json.as_bytes())?;

@@ -2,10 +2,10 @@ use crate::css_parser::{MatchContext, PseudoState, Stylesheet};
 use crate::css_values::{self, parse_animation, parse_box_shadow, parse_transform};
 use crate::parser::{AppTree, Node, NodeKind, SignalDecl, StyleDecl};
 use crate::style_matcher::{self, ResolveViewport};
-use w3cos_std::style::{SafeAreaEdge, Spacing};
 #[allow(unused_imports)]
 use anyhow::Context;
 use anyhow::Result;
+use w3cos_std::style::{SafeAreaEdge, Spacing};
 
 /// Generate a complete Rust main.rs that builds and runs a W3C OS application.
 pub fn generate(tree: &AppTree, stylesheet: &Stylesheet) -> Result<String> {
@@ -70,11 +70,26 @@ fn gen_signal_inits(signals: &[SignalDecl]) -> String {
     )
 }
 
+/// Options that influence generated Cargo.toml / runtime features.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompileOptions {
+    /// Enable Chrome DevTools Protocol (CDP) server in w3cos-runtime.
+    pub devtools: bool,
+}
+
 /// Generate a Cargo.toml for the compiled application.
-pub fn generate_cargo_toml(_output_dir: &std::path::Path) -> Result<String> {
+pub fn generate_cargo_toml(
+    _output_dir: &std::path::Path,
+    options: &CompileOptions,
+) -> Result<String> {
     let workspace_root = find_workspace_root()?;
     let runtime_path = workspace_root.join("crates/w3cos-runtime");
     let std_path = workspace_root.join("crates/w3cos-std");
+    let runtime_features = if options.devtools {
+        r#", features = ["devtools"]"#
+    } else {
+        ""
+    };
 
     Ok(format!(
         r#"[package]
@@ -83,7 +98,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-w3cos-runtime = {{ path = "{runtime}" }}
+w3cos-runtime = {{ path = "{runtime}"{runtime_features} }}
 w3cos-std = {{ path = "{std_}" }}
 "#,
         runtime = runtime_path.display(),
@@ -138,26 +153,36 @@ pub(crate) fn gen_node(
     let indent = "    ".repeat(depth + 1);
     let body = if let Some((sig, val)) = &node.show_when {
         let sig_id = signal_index(sig, signal_names);
-        let inner = if node.children.len() == 1 {
-            gen_node_inner(&node.children[0], depth + 1, signal_names, stylesheet, 1, 1)
-        } else {
-            let sib = node.children.len();
-            let items: Vec<String> = node
-                .children
-                .iter()
-                .enumerate()
-                .map(|(i, c)| gen_node(c, depth + 2, signal_names, stylesheet, i + 1, sib))
-                .collect();
-            format!(
-                "{indent}Component::column(Style::default(), vec![\n{},{indent}])",
-                items.join(",\n")
-            )
-        };
+        if node.children.len() == 1 {
+            let inner =
+                gen_node_inner(&node.children[0], depth + 1, signal_names, stylesheet, 1, 1);
+            return format!(
+                "{indent}{{\n{indent}    let mut __show_comp = {{\n{inner}\n{indent}    }};\n{indent}    if w3cos_runtime::state::get_signal({sig_id}) != {val} {{\n{indent}        __show_comp.style.display = Display::None;\n{indent}    }}\n{indent}    __show_comp\n{indent}}}"
+            );
+        }
+        let sib = node.children.len();
+        let items: Vec<String> = node
+            .children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| gen_node(c, depth + 2, signal_names, stylesheet, i + 1, sib))
+            .collect();
+        let inner = format!(
+            "{indent}Component::column(Style::default(), vec![\n{},{indent}])",
+            items.join(",\n")
+        );
         return format!(
             "{indent}{{\n{indent}    let mut __show_style = Style::default();\n{indent}    if w3cos_runtime::state::get_signal({sig_id}) != {val} {{\n{indent}        __show_style.display = Display::None;\n{indent}    }}\n{indent}    Component::column(__show_style, vec![\n{inner}\n{indent}    ])\n{indent}}}"
         );
     } else {
-        gen_node_inner(node, depth, signal_names, stylesheet, child_index, sibling_count)
+        gen_node_inner(
+            node,
+            depth,
+            signal_names,
+            stylesheet,
+            child_index,
+            sibling_count,
+        )
     };
     body
 }
@@ -224,7 +249,7 @@ fn gen_node_inner(
                 NodeKind::Box => "Component::boxed",
                 _ => unreachable!(),
             };
-            let children_code = if node.children.is_empty() {
+            let mut children_code = if node.children.is_empty() {
                 "vec![]".to_string()
             } else {
                 let sib = node.children.len();
@@ -232,16 +257,48 @@ fn gen_node_inner(
                     .children
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| {
-                        gen_node(c, depth + 2, signal_names, stylesheet, i + 1, sib)
-                    })
+                    .map(|(i, c)| gen_node(c, depth + 2, signal_names, stylesheet, i + 1, sib))
                     .collect();
                 format!("vec![\n{},\n{indent}]", items.join(",\n"))
             };
-            if let Some(ref action_str) = node.on_click {
-                let action = gen_event_action(action_str, signal_names);
+            if let Some(item_count) = node.style.virtual_count
+                && let Some(template) = node.children.first()
+            {
+                let template_code = gen_node(
+                    template,
+                    depth + 2,
+                    signal_names,
+                    stylesheet,
+                    1,
+                    node.children.len(),
+                );
+                let estimated = node.style.estimated_item_height.unwrap_or(72.0);
+                let overscan = node.style.virtual_overscan.unwrap_or(240.0);
+                return format!(
+                    "{indent}Component::virtual_list({item_count}, {estimated:?}, {overscan:?}, {style_code}, {template_code})"
+                );
+            }
+            if let Some(repeat) = node.repeat
+                && !node.children.is_empty()
+            {
+                children_code = format!(
+                    "{{\n{indent}    let __repeat_template = {children_code};\n{indent}    let mut __repeat_children = Vec::with_capacity(__repeat_template.len() * {repeat});\n{indent}    for _ in 0..{repeat} {{\n{indent}        __repeat_children.extend(__repeat_template.iter().cloned());\n{indent}    }}\n{indent}    __repeat_children\n{indent}}}"
+                );
+            }
+            if node.on_click.is_some() || node.sticky_counter.is_some() {
+                let mut assignments = String::new();
+                if let Some(ref action_str) = node.on_click {
+                    let action = gen_event_action(action_str, signal_names);
+                    assignments.push_str(&format!("{indent}    __comp.on_click = {action};\n"));
+                }
+                if let Some(ref signal_name) = node.sticky_counter {
+                    let signal_id = signal_index(signal_name, signal_names);
+                    assignments.push_str(&format!(
+                        "{indent}    __comp.sticky_counter_signal = Some({signal_id});\n"
+                    ));
+                }
                 format!(
-                    "{indent}{{\n{indent}    let mut __comp = {constructor}({style_code}, {children_code});\n{indent}    __comp.on_click = {action};\n{indent}    __comp\n{indent}}}"
+                    "{indent}{{\n{indent}    let mut __comp = {constructor}({style_code}, {children_code});\n{assignments}{indent}    __comp\n{indent}}}"
                 )
             } else {
                 format!("{indent}{constructor}({style_code}, {children_code})")
@@ -940,7 +997,9 @@ pub fn generate_dom(tree: &AppTree) -> Result<String> {
 
     let mut counter = 0;
     let root_var = gen_dom_node(&tree.root, &mut body, &mut counter, 1, &signal_names);
-    body.push_str(&format!("\n    let body = w3cos_runtime::dom::body_id();\n"));
+    body.push_str(&format!(
+        "\n    let body = w3cos_runtime::dom::body_id();\n"
+    ));
     body.push_str(&format!(
         "    w3cos_runtime::dom::append_child(body, {root_var});\n"
     ));
@@ -1068,9 +1127,7 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
         let css = match p {
             Spacing::Px(v) => format!("{v}px"),
             Spacing::SafeAreaInset(SafeAreaEdge::Top) => "env(safe-area-inset-top)".to_string(),
-            Spacing::SafeAreaInset(SafeAreaEdge::Right) => {
-                "env(safe-area-inset-right)".to_string()
-            }
+            Spacing::SafeAreaInset(SafeAreaEdge::Right) => "env(safe-area-inset-right)".to_string(),
             Spacing::SafeAreaInset(SafeAreaEdge::Bottom) => {
                 "env(safe-area-inset-bottom)".to_string()
             }
@@ -1155,10 +1212,18 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     if let Some(ref ov) = style.overflow {
         out.push_str(&sp("overflow", ov));
     }
-    if let Some(ref t) = style.top { out.push_str(&sp("top", t)); }
-    if let Some(ref r) = style.right { out.push_str(&sp("right", r)); }
-    if let Some(ref b) = style.bottom { out.push_str(&sp("bottom", b)); }
-    if let Some(ref l) = style.left { out.push_str(&sp("left", l)); }
+    if let Some(ref t) = style.top {
+        out.push_str(&sp("top", t));
+    }
+    if let Some(ref r) = style.right {
+        out.push_str(&sp("right", r));
+    }
+    if let Some(ref b) = style.bottom {
+        out.push_str(&sp("bottom", b));
+    }
+    if let Some(ref l) = style.left {
+        out.push_str(&sp("left", l));
+    }
     if let Some(zi) = style.z_index {
         out.push_str(&sp("z-index", &zi.to_string()));
     }
@@ -1187,6 +1252,8 @@ mod tests {
             placeholder: None,
             class_name: None,
             show_when: None,
+            repeat: None,
+            sticky_counter: None,
         }
     }
 
@@ -1196,6 +1263,16 @@ mod tests {
             signals: vec![],
             css_imports: vec![],
         }
+    }
+
+    #[test]
+    fn codegen_cargo_toml_devtools_feature() {
+        let opts = CompileOptions { devtools: true };
+        let toml = generate_cargo_toml(std::path::Path::new("."), &opts).unwrap();
+        assert!(
+            toml.contains(r#"features = ["devtools"]"#),
+            "devtools feature missing: {toml}"
+        );
     }
 
     #[test]
@@ -1229,6 +1306,22 @@ mod tests {
         assert!(rust.contains("Component::text(\"a\""));
         assert!(rust.contains("Component::text(\"b\""));
         assert!(rust.contains("vec!["));
+    }
+
+    #[test]
+    fn codegen_virtual_list_keeps_single_template() {
+        let mut style = StyleDecl::default();
+        style.virtual_count = Some(1_000_000);
+        style.estimated_item_height = Some(56.0);
+        style.virtual_overscan = Some(180.0);
+        let mut root = test_node(NodeKind::Column, style);
+        let mut template = test_node(NodeKind::Text("row-{index}".into()), StyleDecl::default());
+        template.text = Some("row-{index}".into());
+        root.children = vec![template];
+
+        let rust = generate(&test_tree(root), &empty_sheet()).unwrap();
+        assert!(rust.contains("Component::virtual_list(1000000, 56.0, 180.0"));
+        assert_eq!(rust.matches("row-{index}").count(), 1);
     }
 
     #[test]

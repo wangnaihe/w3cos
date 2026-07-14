@@ -216,12 +216,7 @@ impl WindowManager {
     pub fn all_windows(&self) -> Vec<WinId> {
         self.windows
             .keys()
-            .filter(|&&id| {
-                self.windows
-                    .get(&id)
-                    .map(|w| !w.closed)
-                    .unwrap_or(false)
-            })
+            .filter(|&&id| self.windows.get(&id).map(|w| !w.closed).unwrap_or(false))
             .copied()
             .collect()
     }
@@ -237,8 +232,7 @@ impl WindowManager {
         for id in closed {
             self.windows.remove(&id);
         }
-        self.focus_stack
-            .retain(|id| self.windows.contains_key(id));
+        self.focus_stack.retain(|id| self.windows.contains_key(id));
     }
 }
 
@@ -294,12 +288,7 @@ pub fn window_post_message(target: WinId, data: &str, source: WinId) {
 
 /// Check if a window is closed. Standard: `window.closed`
 pub fn window_closed(id: WinId) -> bool {
-    WM.with(|wm| {
-        wm.borrow()
-            .get(id)
-            .map(|w| w.closed)
-            .unwrap_or(true)
-    })
+    WM.with(|wm| wm.borrow().get(id).map(|w| w.closed).unwrap_or(true))
 }
 
 /// Get the opener window ID. Standard: `window.opener`

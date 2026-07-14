@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use tungstenite::protocol::Message;
-use tungstenite::{accept, WebSocket};
+use tungstenite::{WebSocket, accept};
 
 use super::cdp::{CdpEvent, CdpHandler, CdpRequest, CdpResponse};
-use serde_json::json;
 use crate::layout::LayoutRect;
+use serde_json::json;
 
 // ---------------------------------------------------------------------------
 // Snapshot — thread-safe serialized DOM state from the main thread
@@ -57,6 +57,8 @@ impl SerializedDocument {
             w3cos_dom::node::NodeType::Document => 9,
             w3cos_dom::node::NodeType::Element => 1,
             w3cos_dom::node::NodeType::Text => 3,
+            w3cos_dom::node::NodeType::DocumentFragment => 11,
+            w3cos_dom::node::NodeType::Comment => 8,
         };
 
         let attrs: Vec<(String, String)> = node
@@ -156,12 +158,26 @@ impl DevToolsServer {
         });
 
         eprintln!("[DevTools] Chrome DevTools listening on ws://127.0.0.1:{port}");
-        eprintln!(
-            "[DevTools] Open chrome://inspect or edge://inspect and configure target 127.0.0.1:{port}"
-        );
-        eprintln!(
-            "[DevTools] Or open: devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{port}"
-        );
+        #[cfg(target_os = "android")]
+        {
+            eprintln!("[DevTools] Android: adb forward tcp:{port} tcp:{port}");
+            eprintln!("[DevTools] Then Chrome → chrome://inspect → Configure → 127.0.0.1:{port}");
+        }
+        #[cfg(target_os = "ios")]
+        {
+            eprintln!(
+                "[DevTools] iOS Simulator: Chrome → chrome://inspect → Configure → 127.0.0.1:{port}"
+            );
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            eprintln!(
+                "[DevTools] Open chrome://inspect or edge://inspect and configure target 127.0.0.1:{port}"
+            );
+            eprintln!(
+                "[DevTools] Or open: devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{port}"
+            );
+        }
 
         DevToolsHandle {
             to_devtools: main_tx,
@@ -170,11 +186,7 @@ impl DevToolsServer {
         }
     }
 
-    fn run(
-        port: u16,
-        rx: mpsc::Receiver<MainToDevTools>,
-        tx: mpsc::Sender<DevToolsToMain>,
-    ) {
+    fn run(port: u16, rx: mpsc::Receiver<MainToDevTools>, tx: mpsc::Sender<DevToolsToMain>) {
         let listener = match TcpListener::bind(format!("127.0.0.1:{port}")) {
             Ok(l) => l,
             Err(e) => {
@@ -365,8 +377,7 @@ impl DevToolsServer {
 
         if needs_snapshot {
             let _ = tx.send(DevToolsToMain::RequestSnapshot);
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(200);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
             loop {
                 if snapshot_store.lock().unwrap().is_some() {
                     break;

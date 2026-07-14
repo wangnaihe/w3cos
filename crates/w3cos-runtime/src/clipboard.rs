@@ -153,7 +153,8 @@ impl Clipboard {
                     for byte in b {
                         let _ = write!(encoded, "{:02x}", byte);
                     }
-                    cb.set_text(&encoded).map_err(|e| ClipboardError(e.to_string()))?;
+                    cb.set_text(&encoded)
+                        .map_err(|e| ClipboardError(e.to_string()))?;
                 }
             }
         }
@@ -198,7 +199,9 @@ pub mod navigator {
         pub fn write_text(text: &str) -> Result<(), ClipboardError> {
             Clipboard::write_text(text)
         }
-        pub fn write_text_async(text: impl Into<String>) -> mpsc::Receiver<Result<(), ClipboardError>> {
+        pub fn write_text_async(
+            text: impl Into<String>,
+        ) -> mpsc::Receiver<Result<(), ClipboardError>> {
             Clipboard::write_text_async(text)
         }
         pub fn read_text() -> Result<String, ClipboardError> {

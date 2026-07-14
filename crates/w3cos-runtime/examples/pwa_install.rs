@@ -44,10 +44,7 @@ fn main() {
     println!("  icons (declared):    {}", pwa.icons.len());
 
     if let Some(icon) = pwa.pick_icon(192) {
-        println!(
-            "  best icon @ 192px:   {} ({:?})",
-            icon.src, icon.sizes
-        );
+        println!("  best icon @ 192px:   {} ({:?})", icon.src, icon.sizes);
     }
 
     let app = pwa.into_app_manifest("notes-fallback");

@@ -114,14 +114,16 @@ impl IpcClient {
         let mut reader = reader;
         thread::Builder::new()
             .name("w3cos-ipc-read".into())
-            .spawn(move || loop {
-                match read_message(&mut reader) {
-                    Ok(msg) => {
-                        if in_tx.send(msg).is_err() {
-                            break;
+            .spawn(move || {
+                loop {
+                    match read_message(&mut reader) {
+                        Ok(msg) => {
+                            if in_tx.send(msg).is_err() {
+                                break;
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
             })
             .expect("spawn ipc reader");
@@ -133,7 +135,11 @@ impl IpcClient {
     }
 
     /// Send a typed event to the peer.
-    pub fn send(&self, channel: impl Into<String>, payload: serde_json::Value) -> Result<(), String> {
+    pub fn send(
+        &self,
+        channel: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
         self.out_tx
             .send(IpcMessage::new(channel, payload))
             .map_err(|e| e.to_string())
@@ -192,9 +198,9 @@ impl IpcServer {
         let (inbox_tx, inbox_rx) = mpsc::channel();
 
         if let Some(rest) = endpoint.strip_prefix("tcp://") {
-            let addr: SocketAddr = rest
-                .parse()
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad tcp addr"))?;
+            let addr: SocketAddr = rest.parse().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad tcp addr")
+            })?;
             let listener = TcpListener::bind(addr)?;
             spawn_tcp_acceptor(listener, peers.clone(), next_id, inbox_tx);
         } else {
@@ -250,7 +256,9 @@ impl IpcServer {
     ) -> Result<(), String> {
         let msg = IpcMessage::new(channel, payload);
         let peers = self.peers.lock().map_err(|e| e.to_string())?;
-        let tx = peers.get(&peer).ok_or_else(|| "peer not connected".to_string())?;
+        let tx = peers
+            .get(&peer)
+            .ok_or_else(|| "peer not connected".to_string())?;
         tx.send(msg).map_err(|e| e.to_string())
     }
 
@@ -460,8 +468,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_round_trip() {
-        let path = std::env::temp_dir()
-            .join(format!("w3cos-ipc-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!("w3cos-ipc-{}.sock", std::process::id()));
         let endpoint = path.to_string_lossy().to_string();
 
         let server = IpcServer::bind(&endpoint).unwrap();
@@ -501,18 +508,30 @@ unsafe impl Sync for SharedMemory {}
 impl SharedMemory {
     /// Create a new named shared memory segment of `size` bytes.
     pub fn create(name: &str, size: usize) -> Result<Self, String> {
-        use libc::{ftruncate, mmap, shm_open};
         use libc::{MAP_SHARED, O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, S_IRUSR, S_IWUSR};
+        use libc::{ftruncate, mmap, shm_open};
         use std::ffi::CString;
 
         let cname = CString::new(name).map_err(|e| e.to_string())?;
-        let fd = unsafe { shm_open(cname.as_ptr(), O_CREAT | O_RDWR, (S_IRUSR | S_IWUSR) as libc::c_uint) };
+        let fd = unsafe {
+            shm_open(
+                cname.as_ptr(),
+                O_CREAT | O_RDWR,
+                (S_IRUSR | S_IWUSR) as libc::c_uint,
+            )
+        };
         if fd < 0 {
-            return Err(format!("shm_open failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "shm_open failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         if unsafe { ftruncate(fd, size as libc::off_t) } < 0 {
             unsafe { libc::close(fd) };
-            return Err(format!("ftruncate failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "ftruncate failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let ptr = unsafe {
             mmap(
@@ -528,28 +547,48 @@ impl SharedMemory {
         if ptr == libc::MAP_FAILED {
             return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
         }
-        Ok(Self { name: name.to_string(), ptr, size, owner: true })
+        Ok(Self {
+            name: name.to_string(),
+            ptr,
+            size,
+            owner: true,
+        })
     }
 
     /// Open an existing named shared memory segment.
     pub fn open(name: &str, size: usize) -> Result<Self, String> {
-        use libc::{mmap, shm_open};
         use libc::{MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE};
+        use libc::{mmap, shm_open};
         use std::ffi::CString;
 
         let cname = CString::new(name).map_err(|e| e.to_string())?;
         let fd = unsafe { shm_open(cname.as_ptr(), O_RDWR, 0) };
         if fd < 0 {
-            return Err(format!("shm_open failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "shm_open failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let ptr = unsafe {
-            mmap(std::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+            mmap(
+                std::ptr::null_mut(),
+                size,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                fd,
+                0,
+            )
         };
         unsafe { libc::close(fd) };
         if ptr == libc::MAP_FAILED {
             return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
         }
-        Ok(Self { name: name.to_string(), ptr, size, owner: false })
+        Ok(Self {
+            name: name.to_string(),
+            ptr,
+            size,
+            owner: false,
+        })
     }
 
     pub fn size(&self) -> usize {
@@ -632,7 +671,7 @@ unsafe impl Sync for NamedSemaphore {}
 impl NamedSemaphore {
     /// Create a new named semaphore with an initial value.
     pub fn create(name: &str, initial: u32) -> Result<Self, String> {
-        use libc::{sem_open, O_CREAT, O_EXCL, S_IRUSR, S_IWUSR};
+        use libc::{O_CREAT, O_EXCL, S_IRUSR, S_IWUSR, sem_open};
         use std::ffi::CString;
 
         let cname = CString::new(name).map_err(|e| e.to_string())?;
@@ -645,9 +684,16 @@ impl NamedSemaphore {
             )
         };
         if sem == libc::SEM_FAILED {
-            return Err(format!("sem_open failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "sem_open failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        Ok(Self { name: name.to_string(), sem, owner: true })
+        Ok(Self {
+            name: name.to_string(),
+            sem,
+            owner: true,
+        })
     }
 
     /// Open an existing named semaphore.
@@ -656,9 +702,16 @@ impl NamedSemaphore {
         let cname = CString::new(name).map_err(|e| e.to_string())?;
         let sem = unsafe { libc::sem_open(cname.as_ptr(), 0) };
         if sem == libc::SEM_FAILED {
-            return Err(format!("sem_open failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "sem_open failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        Ok(Self { name: name.to_string(), sem, owner: false })
+        Ok(Self {
+            name: name.to_string(),
+            sem,
+            owner: false,
+        })
     }
 
     /// Decrement (wait/lock) the semaphore. Blocks if value is 0.
@@ -666,7 +719,10 @@ impl NamedSemaphore {
         if unsafe { libc::sem_wait(self.sem) } == 0 {
             Ok(())
         } else {
-            Err(format!("sem_wait failed: {}", std::io::Error::last_os_error()))
+            Err(format!(
+                "sem_wait failed: {}",
+                std::io::Error::last_os_error()
+            ))
         }
     }
 
@@ -680,7 +736,10 @@ impl NamedSemaphore {
         if unsafe { libc::sem_post(self.sem) } == 0 {
             Ok(())
         } else {
-            Err(format!("sem_post failed: {}", std::io::Error::last_os_error()))
+            Err(format!(
+                "sem_post failed: {}",
+                std::io::Error::last_os_error()
+            ))
         }
     }
 
@@ -692,7 +751,10 @@ impl NamedSemaphore {
             if unsafe { libc::sem_getvalue(self.sem, &mut val) } == 0 {
                 Ok(val)
             } else {
-                Err(format!("sem_getvalue failed: {}", std::io::Error::last_os_error()))
+                Err(format!(
+                    "sem_getvalue failed: {}",
+                    std::io::Error::last_os_error()
+                ))
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -739,7 +801,7 @@ unsafe impl Sync for MessageQueue {}
 impl MessageQueue {
     /// Create a new message queue.
     pub fn create(name: &str, max_msgs: i64, max_msg_size: i64) -> Result<Self, String> {
-        use libc::{mq_open, O_CREAT, O_RDWR, S_IRUSR, S_IWUSR};
+        use libc::{O_CREAT, O_RDWR, S_IRUSR, S_IWUSR, mq_open};
         use std::ffi::CString;
 
         let cname = CString::new(name).map_err(|e| e.to_string())?;
@@ -759,33 +821,55 @@ impl MessageQueue {
             )
         };
         if mqd == -1 as libc::mqd_t {
-            return Err(format!("mq_open failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "mq_open failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        Ok(Self { name: name.to_string(), mqd, owner: true })
+        Ok(Self {
+            name: name.to_string(),
+            mqd,
+            owner: true,
+        })
     }
 
     /// Open an existing message queue.
     pub fn open(name: &str) -> Result<Self, String> {
-        use libc::{mq_open, O_RDWR};
+        use libc::{O_RDWR, mq_open};
         use std::ffi::CString;
 
         let cname = CString::new(name).map_err(|e| e.to_string())?;
         let mqd = unsafe { mq_open(cname.as_ptr(), O_RDWR) };
         if mqd == -1 as libc::mqd_t {
-            return Err(format!("mq_open failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "mq_open failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        Ok(Self { name: name.to_string(), mqd, owner: false })
+        Ok(Self {
+            name: name.to_string(),
+            mqd,
+            owner: false,
+        })
     }
 
     /// Send a message with the given priority (0 = lowest).
     pub fn send(&self, data: &[u8], priority: u32) -> Result<(), String> {
         let ret = unsafe {
-            libc::mq_send(self.mqd, data.as_ptr() as *const libc::c_char, data.len(), priority)
+            libc::mq_send(
+                self.mqd,
+                data.as_ptr() as *const libc::c_char,
+                data.len(),
+                priority,
+            )
         };
         if ret == 0 {
             Ok(())
         } else {
-            Err(format!("mq_send failed: {}", std::io::Error::last_os_error()))
+            Err(format!(
+                "mq_send failed: {}",
+                std::io::Error::last_os_error()
+            ))
         }
     }
 
@@ -802,7 +886,10 @@ impl MessageQueue {
             )
         };
         if n < 0 {
-            return Err(format!("mq_receive failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "mq_receive failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         buf.truncate(n as usize);
         Ok((buf, priority))
@@ -820,7 +907,10 @@ impl MessageQueue {
         if unsafe { libc::mq_getattr(self.mqd, &mut attr) } == 0 {
             Ok((attr.mq_maxmsg, attr.mq_msgsize, attr.mq_curmsgs))
         } else {
-            Err(format!("mq_getattr failed: {}", std::io::Error::last_os_error()))
+            Err(format!(
+                "mq_getattr failed: {}",
+                std::io::Error::last_os_error()
+            ))
         }
     }
 }

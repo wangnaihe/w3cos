@@ -4,12 +4,12 @@
 //! compile time so the compiler can load real package sources, build a module
 //! graph, and then lower the combined SWC AST into w3cos/Rust.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use swc_common::{sync::Lrc, FileName, SourceMap};
+use swc_common::{FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax};
 
@@ -133,29 +133,40 @@ impl ParsedModuleGraph {
 
         let module_info = match self.find_module(from_module) {
             Some(info) => info,
-            None => return SymbolResolution::Unresolved {
-                name: imported_name.to_string(),
-                reason: format!("module {} not in graph", from_module.display()),
-            },
+            None => {
+                return SymbolResolution::Unresolved {
+                    name: imported_name.to_string(),
+                    reason: format!("module {} not in graph", from_module.display()),
+                };
+            }
         };
 
         let from_dir = from_module.parent().unwrap_or_else(|| Path::new("."));
 
-        let import_binding = module_info.imports.iter().find(|imp| imp.local == imported_name);
+        let import_binding = module_info
+            .imports
+            .iter()
+            .find(|imp| imp.local == imported_name);
         if let Some(binding) = import_binding {
             let target_path = match resolver.resolve(&binding.source, from_dir) {
                 Ok(resolved) => resolved.path,
-                Err(e) => return SymbolResolution::Unresolved {
-                    name: imported_name.to_string(),
-                    reason: format!("could not resolve source `{}`: {e}", binding.source),
-                },
+                Err(e) => {
+                    return SymbolResolution::Unresolved {
+                        name: imported_name.to_string(),
+                        reason: format!("could not resolve source `{}`: {e}", binding.source),
+                    };
+                }
             };
             return self.resolve_export_from(&target_path, &binding.imported, resolver, visited);
         }
 
         SymbolResolution::Unresolved {
             name: imported_name.to_string(),
-            reason: format!("`{}` not found as import in {}", imported_name, from_module.display()),
+            reason: format!(
+                "`{}` not found as import in {}",
+                imported_name,
+                from_module.display()
+            ),
         }
     }
 
@@ -173,10 +184,12 @@ impl ParsedModuleGraph {
 
         let module_info = match self.find_module(module_path) {
             Some(info) => info,
-            None => return SymbolResolution::Unresolved {
-                name: export_name.to_string(),
-                reason: format!("module {} not in graph", module_path.display()),
-            },
+            None => {
+                return SymbolResolution::Unresolved {
+                    name: export_name.to_string(),
+                    reason: format!("module {} not in graph", module_path.display()),
+                };
+            }
         };
 
         for export in &module_info.exports {
@@ -188,10 +201,12 @@ impl ParsedModuleGraph {
                 let from_dir = module_path.parent().unwrap_or_else(|| Path::new("."));
                 let target_path = match resolver.resolve(source, from_dir) {
                     Ok(resolved) => resolved.path,
-                    Err(_) => return SymbolResolution::Unresolved {
-                        name: export_name.to_string(),
-                        reason: format!("re-export source `{source}` unresolvable"),
-                    },
+                    Err(_) => {
+                        return SymbolResolution::Unresolved {
+                            name: export_name.to_string(),
+                            reason: format!("re-export source `{source}` unresolvable"),
+                        };
+                    }
                 };
                 let orig_name = export.local.as_deref().unwrap_or(export_name);
                 return self.resolve_export_from(&target_path, orig_name, resolver, visited);
@@ -199,11 +214,20 @@ impl ParsedModuleGraph {
 
             return SymbolResolution::Resolved(ResolvedSymbol {
                 defining_module: module_path.to_path_buf(),
-                local_name: export.local.clone().unwrap_or_else(|| export_name.to_string()),
+                local_name: export
+                    .local
+                    .clone()
+                    .unwrap_or_else(|| export_name.to_string()),
                 exported_name: export_name.to_string(),
-                kind: if module_info.top_level_classes.contains(&export.local.clone().unwrap_or_default()) {
+                kind: if module_info
+                    .top_level_classes
+                    .contains(&export.local.clone().unwrap_or_default())
+                {
                     SymbolKind::Class
-                } else if module_info.top_level_functions.contains(&export.local.clone().unwrap_or_default()) {
+                } else if module_info
+                    .top_level_functions
+                    .contains(&export.local.clone().unwrap_or_default())
+                {
                     SymbolKind::Function
                 } else {
                     SymbolKind::Variable
@@ -213,7 +237,11 @@ impl ParsedModuleGraph {
 
         SymbolResolution::Unresolved {
             name: export_name.to_string(),
-            reason: format!("`{}` not exported from {}", export_name, module_path.display()),
+            reason: format!(
+                "`{}` not exported from {}",
+                export_name,
+                module_path.display()
+            ),
         }
     }
 }
@@ -301,8 +329,13 @@ impl EsmBundle {
             let mut local_to_bundled = Vec::new();
 
             if let Some(info) = parsed.find_module(path) {
-                for name in info.top_level_classes.iter().chain(info.top_level_functions.iter()) {
-                    let bundled_name = format!("{namespace}_{}", crate::esm_lowering::sanitize_ident(name));
+                for name in info
+                    .top_level_classes
+                    .iter()
+                    .chain(info.top_level_functions.iter())
+                {
+                    let bundled_name =
+                        format!("{namespace}_{}", crate::esm_lowering::sanitize_ident(name));
                     let kind = if info.top_level_classes.contains(name) {
                         SymbolKind::Class
                     } else {
@@ -447,7 +480,9 @@ pub struct EsmResolver {
 
 impl EsmResolver {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
-        Self { project_root: project_root.into() }
+        Self {
+            project_root: project_root.into(),
+        }
     }
 
     pub fn resolve_entry(&self, entry: &Path) -> Result<ResolvedModule> {
@@ -461,14 +496,19 @@ impl EsmResolver {
     }
 
     pub fn resolve(&self, specifier: &str, from_dir: &Path) -> Result<ResolvedModule> {
-        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/') {
+        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
+        {
             let candidate = if specifier.starts_with('/') {
                 PathBuf::from(specifier)
             } else {
                 from_dir.join(specifier)
             };
-            let path = self.resolve_path_like(&candidate)
-                .with_context(|| format!("Could not resolve relative import `{specifier}` from {}", from_dir.display()))?;
+            let path = self.resolve_path_like(&candidate).with_context(|| {
+                format!(
+                    "Could not resolve relative import `{specifier}` from {}",
+                    from_dir.display()
+                )
+            })?;
             return Ok(ResolvedModule {
                 specifier: specifier.to_string(),
                 path,
@@ -492,10 +532,13 @@ impl EsmResolver {
         let graph = self.build_graph_from_entry(entry)?;
         let mut parsed = ParsedModuleGraph::default();
         for node in graph.nodes {
-            let source = std::fs::read_to_string(&node.module.path)
-                .with_context(|| format!("Could not read ESM module {}", node.module.path.display()))?;
+            let source = std::fs::read_to_string(&node.module.path).with_context(|| {
+                format!("Could not read ESM module {}", node.module.path.display())
+            })?;
             let module = parse_esm_module(&source, &node.module.path)?;
-            parsed.modules.push(collect_module_info(&node.module.path, &module));
+            parsed
+                .modules
+                .push(collect_module_info(&node.module.path, &module));
         }
         Ok(parsed)
     }
@@ -515,7 +558,10 @@ impl EsmResolver {
         let imports = collect_static_imports(&source);
         let from_dir = module.path.parent().unwrap_or_else(|| Path::new("."));
 
-        graph.nodes.push(ModuleGraphNode { module: module.clone(), imports: imports.clone() });
+        graph.nodes.push(ModuleGraphNode {
+            module: module.clone(),
+            imports: imports.clone(),
+        });
 
         for import in imports {
             // CSS and other non-code assets are part of the asset pipeline, not this JS graph.
@@ -564,7 +610,10 @@ impl EsmResolver {
             return Ok(candidate);
         }
 
-        Err(anyhow!("Package `{package_name}` not found from {}", from_dir.display()))
+        Err(anyhow!(
+            "Package `{package_name}` not found from {}",
+            from_dir.display()
+        ))
     }
 
     fn resolve_package_entry(&self, package_dir: &Path) -> Result<PathBuf> {
@@ -585,7 +634,13 @@ impl EsmResolver {
 
         let entry = entry.trim_start_matches("./");
         self.resolve_path_like(&package_dir.join(entry))
-            .with_context(|| format!("Could not resolve package entry `{}` in {}", entry, package_dir.display()))
+            .with_context(|| {
+                format!(
+                    "Could not resolve package entry `{}` in {}",
+                    entry,
+                    package_dir.display()
+                )
+            })
     }
 
     fn resolve_path_like(&self, candidate: &Path) -> Result<PathBuf> {
@@ -603,7 +658,13 @@ impl EsmResolver {
         }
 
         if candidate.is_dir() {
-            for name in ["index.ts", "index.tsx", "index.js", "index.mjs", "index.jsx"] {
+            for name in [
+                "index.ts",
+                "index.tsx",
+                "index.js",
+                "index.mjs",
+                "index.jsx",
+            ] {
                 let index = candidate.join(name);
                 if index.is_file() {
                     return Ok(index);
@@ -644,7 +705,9 @@ fn split_package_specifier(specifier: &str) -> Result<(String, Option<String>)> 
     if specifier.starts_with('@') {
         let mut parts = specifier.splitn(3, '/');
         let scope = parts.next().unwrap_or_default();
-        let name = parts.next().ok_or_else(|| anyhow!("Invalid scoped package specifier `{specifier}`"))?;
+        let name = parts
+            .next()
+            .ok_or_else(|| anyhow!("Invalid scoped package specifier `{specifier}`"))?;
         let package_name = format!("{scope}/{name}");
         let subpath = parts.next().map(|s| s.to_string());
         Ok((package_name, subpath))
@@ -661,7 +724,9 @@ pub fn collect_static_imports(source: &str) -> Vec<String> {
     for line in source.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("import ") || trimmed.starts_with("export ") {
-            if let Some(spec) = extract_from_clause(trimmed).or_else(|| extract_bare_import(trimmed)) {
+            if let Some(spec) =
+                extract_from_clause(trimmed).or_else(|| extract_bare_import(trimmed))
+            {
                 if !imports.contains(&spec) {
                     imports.push(spec);
                 }
@@ -704,10 +769,16 @@ fn is_asset_import(specifier: &str) -> bool {
 
 fn parse_esm_module(source: &str, path: &Path) -> Result<Module> {
     let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(Lrc::new(FileName::Real(path.to_path_buf())), source.to_string());
+    let fm = cm.new_source_file(
+        Lrc::new(FileName::Real(path.to_path_buf())),
+        source.to_string(),
+    );
     let mut parser = Parser::new(
         Syntax::Typescript(TsSyntax {
-            tsx: matches!(path.extension().and_then(|e| e.to_str()), Some("tsx" | "jsx")),
+            tsx: matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("tsx" | "jsx")
+            ),
             ..Default::default()
         }),
         StringInput::from(&*fm),
@@ -731,7 +802,11 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
                 for spec in &import.specifiers {
                     match spec {
                         ImportSpecifier::Named(named) => {
-                            let imported = named.imported.as_ref().map(module_export_name).unwrap_or_else(|| named.local.sym.to_string());
+                            let imported = named
+                                .imported
+                                .as_ref()
+                                .map(module_export_name)
+                                .unwrap_or_else(|| named.local.sym.to_string());
                             info.imports.push(ImportBinding {
                                 imported,
                                 local: named.local.sym.to_string(),
@@ -764,7 +839,11 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
                     match spec {
                         ExportSpecifier::Named(named_spec) => {
                             let local = module_export_name(&named_spec.orig);
-                            let exported = named_spec.exported.as_ref().map(module_export_name).unwrap_or_else(|| local.clone());
+                            let exported = named_spec
+                                .exported
+                                .as_ref()
+                                .map(module_export_name)
+                                .unwrap_or_else(|| local.clone());
                             info.exports.push(ExportBinding {
                                 exported,
                                 local: Some(local),
@@ -839,18 +918,30 @@ fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
         Decl::Class(class) => {
             let name = class.ident.sym.to_string();
             info.top_level_classes.push(name.clone());
-            info.exports.push(ExportBinding { exported: name.clone(), local: Some(name), source: None });
+            info.exports.push(ExportBinding {
+                exported: name.clone(),
+                local: Some(name),
+                source: None,
+            });
         }
         Decl::Fn(function) => {
             let name = function.ident.sym.to_string();
             info.top_level_functions.push(name.clone());
-            info.exports.push(ExportBinding { exported: name.clone(), local: Some(name), source: None });
+            info.exports.push(ExportBinding {
+                exported: name.clone(),
+                local: Some(name),
+                source: None,
+            });
         }
         Decl::Var(var) => {
             for decl in &var.decls {
                 if let Pat::Ident(binding) = &decl.name {
                     let name = binding.id.sym.to_string();
-                    info.exports.push(ExportBinding { exported: name.clone(), local: Some(name), source: None });
+                    info.exports.push(ExportBinding {
+                        exported: name.clone(),
+                        local: Some(name),
+                        source: None,
+                    });
                 }
             }
         }
@@ -861,7 +952,9 @@ fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
 fn collect_top_level_decl(decl: &Decl, info: &mut ParsedModuleInfo) {
     match decl {
         Decl::Class(class) => info.top_level_classes.push(class.ident.sym.to_string()),
-        Decl::Fn(function) => info.top_level_functions.push(function.ident.sym.to_string()),
+        Decl::Fn(function) => info
+            .top_level_functions
+            .push(function.ident.sym.to_string()),
         _ => {}
     }
 }
@@ -890,12 +983,17 @@ mod tests {
 
     #[test]
     fn collect_imports_from_esm_source() {
-        let imports = collect_static_imports(r#"
+        let imports = collect_static_imports(
+            r#"
 import { EditorView } from "@codemirror/view";
 import "./theme.css";
 export { EditorState } from '@codemirror/state';
-"#);
-        assert_eq!(imports, vec!["@codemirror/view", "./theme.css", "@codemirror/state"]);
+"#,
+        );
+        assert_eq!(
+            imports,
+            vec!["@codemirror/view", "./theme.css", "@codemirror/state"]
+        );
     }
 
     #[test]
@@ -906,13 +1004,18 @@ export { EditorState } from '@codemirror/state';
         std::fs::write(
             pkg.join("package.json"),
             r#"{"exports":{".":{"import":"./dist/index.js","default":"./dist/index.cjs"}}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(pkg.join("dist/index.js"), "export class EditorView {}").unwrap();
 
         let resolver = EsmResolver::new(&root);
         let resolved = resolver.resolve("@codemirror/view", &root).unwrap();
         assert_eq!(resolved.package_name.as_deref(), Some("@codemirror/view"));
-        assert!(resolved.path.ends_with("node_modules/@codemirror/view/dist/index.js"));
+        assert!(
+            resolved
+                .path
+                .ends_with("node_modules/@codemirror/view/dist/index.js")
+        );
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -926,7 +1029,8 @@ export { EditorState } from '@codemirror/state';
             r#"import { EditorView } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
 new EditorView({ state: EditorState.create({ doc: "hi" }), parent: document.body });"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let view = root.join("node_modules/@codemirror/view");
         std::fs::create_dir_all(view.join("dist")).unwrap();
@@ -936,7 +1040,8 @@ new EditorView({ state: EditorState.create({ doc: "hi" }), parent: document.body
             r#"import { EditorState } from "@codemirror/state";
 import { StyleModule } from "style-mod";
 export class EditorView {}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let state = root.join("node_modules/@codemirror/state");
         std::fs::create_dir_all(state.join("dist")).unwrap();
@@ -949,7 +1054,9 @@ export class EditorView {}"#,
         std::fs::write(style.join("index.js"), "export class StyleModule {}").unwrap();
 
         let resolver = EsmResolver::new(&root);
-        let graph = resolver.build_graph_from_entry(&root.join("src/app.ts")).unwrap();
+        let graph = resolver
+            .build_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
         let packages = graph.package_names();
 
         assert_eq!(graph.nodes.len(), 4, "entry + view + state + style-mod");
@@ -971,7 +1078,8 @@ import { EditorState } from "@codemirror/state";
 export function boot() {
   return new EditorView({ state: EditorState.create({ doc: "hi" }), parent: document.body });
 }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let view = root.join("node_modules/@codemirror/view");
         std::fs::create_dir_all(view.join("dist")).unwrap();
@@ -983,7 +1091,8 @@ export class EditorView {
   constructor(config) { this.state = config.state }
 }
 export function keymap() {}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let state = root.join("node_modules/@codemirror/state");
         std::fs::create_dir_all(state.join("dist")).unwrap();
@@ -993,21 +1102,46 @@ export function keymap() {}"#,
             r#"export class EditorState {
   static create(config) { return new EditorState(config) }
 }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let resolver = EsmResolver::new(&root);
-        let parsed = resolver.parse_graph_from_entry(&root.join("src/app.ts")).unwrap();
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
         let exports = parsed.exported_names();
 
         assert_eq!(parsed.modules.len(), 3, "entry + view + state modules");
-        assert_eq!(parsed.total_imports(), 3, "entry has 2 imports, view has 1 import");
-        assert!(exports.contains(&"boot".to_string()), "entry export missing: {exports:?}");
-        assert!(exports.contains(&"EditorView".to_string()), "EditorView export missing: {exports:?}");
-        assert!(exports.contains(&"EditorState".to_string()), "EditorState export missing: {exports:?}");
-        assert!(exports.contains(&"keymap".to_string()), "keymap export missing: {exports:?}");
+        assert_eq!(
+            parsed.total_imports(),
+            3,
+            "entry has 2 imports, view has 1 import"
+        );
+        assert!(
+            exports.contains(&"boot".to_string()),
+            "entry export missing: {exports:?}"
+        );
+        assert!(
+            exports.contains(&"EditorView".to_string()),
+            "EditorView export missing: {exports:?}"
+        );
+        assert!(
+            exports.contains(&"EditorState".to_string()),
+            "EditorState export missing: {exports:?}"
+        );
+        assert!(
+            exports.contains(&"keymap".to_string()),
+            "keymap export missing: {exports:?}"
+        );
 
-        let view_info = parsed.modules.iter()
-            .find(|module| module.path.ends_with("node_modules/@codemirror/view/dist/index.js"))
+        let view_info = parsed
+            .modules
+            .iter()
+            .find(|module| {
+                module
+                    .path
+                    .ends_with("node_modules/@codemirror/view/dist/index.js")
+            })
             .expect("view module should exist");
         assert_eq!(view_info.top_level_classes, vec!["EditorView"]);
         assert_eq!(view_info.top_level_functions, vec!["keymap"]);
@@ -1024,7 +1158,8 @@ export function keymap() {}"#,
             r#"import { EditorView } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
 export function main() {}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let view = root.join("node_modules/@codemirror/view");
         std::fs::create_dir_all(view.join("dist")).unwrap();
@@ -1033,7 +1168,8 @@ export function main() {}"#,
             view.join("dist/index.js"),
             r#"export class EditorView {}
 export function keymap() {}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let state = root.join("node_modules/@codemirror/state");
         std::fs::create_dir_all(state.join("dist")).unwrap();
@@ -1041,7 +1177,9 @@ export function keymap() {}"#,
         std::fs::write(state.join("dist/index.js"), "export class EditorState {}").unwrap();
 
         let resolver = EsmResolver::new(&root);
-        let parsed = resolver.parse_graph_from_entry(&root.join("src/app.ts")).unwrap();
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
 
         let editor_view = parsed.resolve_binding(&root.join("src/app.ts"), "EditorView", &resolver);
         match &editor_view {
@@ -1049,17 +1187,24 @@ export function keymap() {}"#,
                 assert_eq!(sym.exported_name, "EditorView");
                 assert_eq!(sym.local_name, "EditorView");
                 assert_eq!(sym.kind, SymbolKind::Class);
-                assert!(sym.defining_module.ends_with("node_modules/@codemirror/view/dist/index.js"));
+                assert!(
+                    sym.defining_module
+                        .ends_with("node_modules/@codemirror/view/dist/index.js")
+                );
             }
             other => panic!("EditorView should resolve, got: {other:?}"),
         }
 
-        let editor_state = parsed.resolve_binding(&root.join("src/app.ts"), "EditorState", &resolver);
+        let editor_state =
+            parsed.resolve_binding(&root.join("src/app.ts"), "EditorState", &resolver);
         match &editor_state {
             SymbolResolution::Resolved(sym) => {
                 assert_eq!(sym.exported_name, "EditorState");
                 assert_eq!(sym.kind, SymbolKind::Class);
-                assert!(sym.defining_module.ends_with("node_modules/@codemirror/state/dist/index.js"));
+                assert!(
+                    sym.defining_module
+                        .ends_with("node_modules/@codemirror/state/dist/index.js")
+                );
             }
             other => panic!("EditorState should resolve, got: {other:?}"),
         }
@@ -1077,7 +1222,8 @@ export function keymap() {}"#,
         std::fs::write(
             root.join("src/app.ts"),
             r#"import { Theme } from "my-lib";"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let lib = root.join("node_modules/my-lib");
         std::fs::create_dir_all(&lib).unwrap();
@@ -1086,14 +1232,20 @@ export function keymap() {}"#,
         std::fs::write(lib.join("theme.js"), r#"export class Theme {}"#).unwrap();
 
         let resolver = EsmResolver::new(&root);
-        let parsed = resolver.parse_graph_from_entry(&root.join("src/app.ts")).unwrap();
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
 
         let theme = parsed.resolve_binding(&root.join("src/app.ts"), "Theme", &resolver);
         match &theme {
             SymbolResolution::Resolved(sym) => {
                 assert_eq!(sym.exported_name, "Theme");
                 assert_eq!(sym.kind, SymbolKind::Class);
-                assert!(sym.defining_module.ends_with("theme.js"), "should resolve through re-export to theme.js, got: {:?}", sym.defining_module);
+                assert!(
+                    sym.defining_module.ends_with("theme.js"),
+                    "should resolve through re-export to theme.js, got: {:?}",
+                    sym.defining_module
+                );
             }
             other => panic!("Theme should resolve through re-export chain, got: {other:?}"),
         }
@@ -1110,7 +1262,8 @@ export function keymap() {}"#,
             r#"import { EditorView } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
 export function main() { return new EditorView(EditorState.create({})); }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let view = root.join("node_modules/@codemirror/view");
         std::fs::create_dir_all(view.join("dist")).unwrap();
@@ -1120,44 +1273,102 @@ export function main() { return new EditorView(EditorState.create({})); }"#,
             r#"import { EditorState } from "@codemirror/state";
 export class EditorView {}
 export function keymap() {}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let state = root.join("node_modules/@codemirror/state");
         std::fs::create_dir_all(state.join("dist")).unwrap();
         std::fs::write(state.join("package.json"), r#"{"module":"dist/index.js"}"#).unwrap();
-        std::fs::write(state.join("dist/index.js"), r#"export class EditorState {}"#).unwrap();
+        std::fs::write(
+            state.join("dist/index.js"),
+            r#"export class EditorState {}"#,
+        )
+        .unwrap();
 
         let resolver = EsmResolver::new(&root);
-        let parsed = resolver.parse_graph_from_entry(&root.join("src/app.ts")).unwrap();
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
 
         // Dependency order: state before view before app (entry last)
         assert_eq!(bundle.modules.len(), 3);
-        let state_idx = bundle.modules.iter().position(|m| m.path.to_string_lossy().contains("@codemirror/state")).unwrap();
-        let view_idx = bundle.modules.iter().position(|m| m.path.to_string_lossy().contains("@codemirror/view")).unwrap();
-        let app_idx = bundle.modules.iter().position(|m| m.path.to_string_lossy().contains("src/app.ts")).unwrap();
+        let state_idx = bundle
+            .modules
+            .iter()
+            .position(|m| m.path.to_string_lossy().contains("@codemirror/state"))
+            .unwrap();
+        let view_idx = bundle
+            .modules
+            .iter()
+            .position(|m| m.path.to_string_lossy().contains("@codemirror/view"))
+            .unwrap();
+        let app_idx = bundle
+            .modules
+            .iter()
+            .position(|m| m.path.to_string_lossy().contains("src/app.ts"))
+            .unwrap();
         assert!(state_idx < view_idx, "state should come before view");
         assert!(view_idx < app_idx, "view should come before entry");
 
         // Symbols are lifted with namespace prefixes
-        assert!(bundle.symbols.iter().any(|s| s.original_name == "EditorView" && s.kind == SymbolKind::Class));
-        assert!(bundle.symbols.iter().any(|s| s.original_name == "EditorState" && s.kind == SymbolKind::Class));
-        assert!(bundle.symbols.iter().any(|s| s.original_name == "keymap" && s.kind == SymbolKind::Function));
-        assert!(bundle.symbols.iter().any(|s| s.original_name == "main" && s.kind == SymbolKind::Function));
+        assert!(
+            bundle
+                .symbols
+                .iter()
+                .any(|s| s.original_name == "EditorView" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            bundle
+                .symbols
+                .iter()
+                .any(|s| s.original_name == "EditorState" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            bundle
+                .symbols
+                .iter()
+                .any(|s| s.original_name == "keymap" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            bundle
+                .symbols
+                .iter()
+                .any(|s| s.original_name == "main" && s.kind == SymbolKind::Function)
+        );
 
         // Entry module's "EditorView" local should map to the view module's bundled name
         let app_module = &bundle.modules[app_idx];
-        let ev_bundled = app_module.lookup("EditorView").expect("EditorView should be bound in app");
-        assert!(ev_bundled.contains("EditorView"), "bundled name should contain original: {ev_bundled}");
-        let es_bundled = app_module.lookup("EditorState").expect("EditorState should be bound in app");
-        assert!(es_bundled.contains("EditorState"), "bundled name should contain original: {es_bundled}");
+        let ev_bundled = app_module
+            .lookup("EditorView")
+            .expect("EditorView should be bound in app");
+        assert!(
+            ev_bundled.contains("EditorView"),
+            "bundled name should contain original: {ev_bundled}"
+        );
+        let es_bundled = app_module
+            .lookup("EditorState")
+            .expect("EditorState should be bound in app");
+        assert!(
+            es_bundled.contains("EditorState"),
+            "bundled name should contain original: {es_bundled}"
+        );
 
         // View module's "EditorState" import should also be resolved
         let view_module = &bundle.modules[view_idx];
-        let view_es = view_module.lookup("EditorState").expect("EditorState should be bound in view");
-        assert_eq!(view_es, es_bundled, "view and app should reference the same bundled EditorState");
+        let view_es = view_module
+            .lookup("EditorState")
+            .expect("EditorState should be bound in view");
+        assert_eq!(
+            view_es, es_bundled,
+            "view and app should reference the same bundled EditorState"
+        );
 
-        assert!(bundle.is_fully_resolved(), "all imports should be resolved, unresolved: {:?}", bundle.unresolved);
+        assert!(
+            bundle.is_fully_resolved(),
+            "all imports should be resolved, unresolved: {:?}",
+            bundle.unresolved
+        );
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -1169,7 +1380,8 @@ export function keymap() {}"#,
         std::fs::write(
             root.join("src/app.ts"),
             r#"import { Theme } from "my-lib";"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let lib = root.join("node_modules/my-lib");
         std::fs::create_dir_all(&lib).unwrap();
@@ -1178,19 +1390,33 @@ export function keymap() {}"#,
         std::fs::write(lib.join("theme.js"), r#"export class Theme {}"#).unwrap();
 
         let resolver = EsmResolver::new(&root);
-        let parsed = resolver.parse_graph_from_entry(&root.join("src/app.ts")).unwrap();
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
 
         // Theme should have a unique bundled name, defined in theme.js
-        let theme_sym = bundle.symbols.iter().find(|s| s.original_name == "Theme").unwrap();
+        let theme_sym = bundle
+            .symbols
+            .iter()
+            .find(|s| s.original_name == "Theme")
+            .unwrap();
         assert!(theme_sym.module.ends_with("theme.js"));
 
         // app's local "Theme" should map to the same bundled name
-        let app_module = bundle.modules.iter().find(|m| m.path.to_string_lossy().contains("src/app.ts")).unwrap();
+        let app_module = bundle
+            .modules
+            .iter()
+            .find(|m| m.path.to_string_lossy().contains("src/app.ts"))
+            .unwrap();
         let theme_bundled = app_module.lookup("Theme").expect("Theme should be bound");
         assert_eq!(theme_bundled, &theme_sym.bundled_name);
 
-        assert!(bundle.is_fully_resolved(), "unresolved: {:?}", bundle.unresolved);
+        assert!(
+            bundle.is_fully_resolved(),
+            "unresolved: {:?}",
+            bundle.unresolved
+        );
 
         std::fs::remove_dir_all(root).ok();
     }

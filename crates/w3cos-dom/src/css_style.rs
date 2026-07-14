@@ -176,17 +176,24 @@ impl CSSStyleDeclaration {
                     self.inner.letter_spacing = v;
                 }
             }
-            "text-decoration" | "textDecoration" => self.inner.text_decoration = parse_text_decoration(value),
-            "text-overflow" | "textOverflow" => self.inner.text_overflow = parse_text_overflow(value),
+            "text-decoration" | "textDecoration" => {
+                self.inner.text_decoration = parse_text_decoration(value)
+            }
+            "text-overflow" | "textOverflow" => {
+                self.inner.text_overflow = parse_text_overflow(value)
+            }
             "font-family" | "fontFamily" => {
-                self.inner.font_family = Some(value.trim_matches('"').trim_matches('\'').to_string());
+                self.inner.font_family =
+                    Some(value.trim_matches('"').trim_matches('\'').to_string());
             }
             "font-style" | "fontStyle" => self.inner.font_style = parse_font_style(value),
             "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
 
             // Interaction
             "cursor" => self.inner.cursor = parse_cursor(value),
-            "pointer-events" | "pointerEvents" => self.inner.pointer_events = parse_pointer_events(value),
+            "pointer-events" | "pointerEvents" => {
+                self.inner.pointer_events = parse_pointer_events(value)
+            }
             "user-select" | "userSelect" => self.inner.user_select = parse_user_select(value),
 
             // Visibility
@@ -194,16 +201,26 @@ impl CSSStyleDeclaration {
 
             // Flex extras
             "flex-basis" | "flexBasis" => self.inner.flex_basis = parse_dimension(value),
-            "order" => { if let Ok(v) = value.parse() { self.inner.order = v } }
+            "order" => {
+                if let Ok(v) = value.parse() {
+                    self.inner.order = v
+                }
+            }
             "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
-            "align-content" | "alignContent" => self.inner.align_content = parse_align_content(value),
+            "align-content" | "alignContent" => {
+                self.inner.align_content = parse_align_content(value)
+            }
 
             // Outline
             "outline-width" | "outlineWidth" => {
-                if let Some(v) = parse_px(value) { self.inner.outline_width = v }
+                if let Some(v) = parse_px(value) {
+                    self.inner.outline_width = v
+                }
             }
             "outline-color" | "outlineColor" => self.inner.outline_color = Color::from_hex(value),
-            "outline-style" | "outlineStyle" => self.inner.outline_style = parse_outline_style(value),
+            "outline-style" | "outlineStyle" => {
+                self.inner.outline_style = parse_outline_style(value)
+            }
 
             _ => {}
         }
@@ -227,8 +244,12 @@ impl CSSStyleDeclaration {
             "max-height" | "maxHeight" => dimension_to_css(&self.inner.max_height),
             "flex-grow" | "flexGrow" => format!("{}", self.inner.flex_grow),
             "flex-shrink" | "flexShrink" => format!("{}", self.inner.flex_shrink),
-            "flex-direction" | "flexDirection" => format!("{:?}", self.inner.flex_direction).to_lowercase(),
-            "justify-content" | "justifyContent" => format!("{:?}", self.inner.justify_content).to_lowercase(),
+            "flex-direction" | "flexDirection" => {
+                format!("{:?}", self.inner.flex_direction).to_lowercase()
+            }
+            "justify-content" | "justifyContent" => {
+                format!("{:?}", self.inner.justify_content).to_lowercase()
+            }
             "align-items" | "alignItems" => format!("{:?}", self.inner.align_items).to_lowercase(),
             "overflow" => format!("{:?}", self.inner.overflow).to_lowercase(),
             "will-change" | "willChange" => will_change_to_css(&self.inner.will_change),

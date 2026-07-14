@@ -44,11 +44,7 @@ pub fn TouchableOpacity(
     Component::button_with_click(label, style, on_press)
 }
 
-pub fn Pressable(
-    label: impl Into<String>,
-    style: Style,
-    on_press: EventAction,
-) -> Component {
+pub fn Pressable(label: impl Into<String>, style: Style, on_press: EventAction) -> Component {
     Component::button_with_click(label, style, on_press)
 }
 
@@ -80,7 +76,11 @@ pub fn FlatList<T, F>(data: &[T], render_item: F, style: Style) -> Component
 where
     F: Fn(&T, usize) -> Component,
 {
-    let children: Vec<Component> = data.iter().enumerate().map(|(i, item)| render_item(item, i)).collect();
+    let children: Vec<Component> = data
+        .iter()
+        .enumerate()
+        .map(|(i, item)| render_item(item, i))
+        .collect();
     ScrollView(style, children)
 }
 
@@ -153,10 +153,7 @@ mod tests {
     #[test]
     fn view_creates_column_by_default() {
         let view = View(Style::default(), vec![]);
-        assert!(matches!(
-            view.kind,
-            w3cos_std::ComponentKind::Column
-        ));
+        assert!(matches!(view.kind, w3cos_std::ComponentKind::Column));
     }
 
     #[test]
@@ -166,19 +163,13 @@ mod tests {
             ..Style::default()
         };
         let view = View(style, vec![]);
-        assert!(matches!(
-            view.kind,
-            w3cos_std::ComponentKind::Row
-        ));
+        assert!(matches!(view.kind, w3cos_std::ComponentKind::Row));
     }
 
     #[test]
     fn text_creates_text_component() {
         let text = Text("Hello", Style::default());
-        assert!(matches!(
-            text.kind,
-            w3cos_std::ComponentKind::Text { .. }
-        ));
+        assert!(matches!(text.kind, w3cos_std::ComponentKind::Text { .. }));
     }
 
     #[test]
@@ -190,10 +181,7 @@ mod tests {
     #[test]
     fn image_creates_image_component() {
         let img = Image("test.png", Style::default());
-        assert!(matches!(
-            img.kind,
-            w3cos_std::ComponentKind::Image { .. }
-        ));
+        assert!(matches!(img.kind, w3cos_std::ComponentKind::Image { .. }));
     }
 
     #[test]
@@ -208,7 +196,11 @@ mod tests {
     #[test]
     fn flat_list_renders_items() {
         let data = vec!["Item 1", "Item 2", "Item 3"];
-        let list = FlatList(&data, |item, _| Text(*item, Style::default()), Style::default());
+        let list = FlatList(
+            &data,
+            |item, _| Text(*item, Style::default()),
+            Style::default(),
+        );
         assert_eq!(list.children.len(), 3);
     }
 

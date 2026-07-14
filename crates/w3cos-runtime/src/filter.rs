@@ -45,7 +45,9 @@ impl FilterChain {
     }
 
     pub fn has_blur(&self) -> bool {
-        self.ops.iter().any(|op| matches!(op, FilterOp::Blur(r) if *r > 0.0))
+        self.ops
+            .iter()
+            .any(|op| matches!(op, FilterOp::Blur(r) if *r > 0.0))
     }
 
     pub fn max_blur_px(&self) -> f32 {
@@ -81,15 +83,17 @@ pub fn parse_css_filter(value: &str) -> Option<FilterChain> {
     let mut chain = FilterChain::default();
     for part in split_filter_parts(v) {
         if let Some(inner) = extract_fn(&part, "blur") {
-            chain.ops.push(FilterOp::Blur(parse_length_px(inner).unwrap_or(0.0)));
+            chain
+                .ops
+                .push(FilterOp::Blur(parse_length_px(inner).unwrap_or(0.0)));
         } else if let Some(inner) = extract_fn(&part, "brightness") {
-            chain
-                .ops
-                .push(FilterOp::Brightness(parse_filter_amount(inner).unwrap_or(1.0)));
+            chain.ops.push(FilterOp::Brightness(
+                parse_filter_amount(inner).unwrap_or(1.0),
+            ));
         } else if let Some(inner) = extract_fn(&part, "contrast") {
-            chain
-                .ops
-                .push(FilterOp::Contrast(parse_filter_amount(inner).unwrap_or(1.0)));
+            chain.ops.push(FilterOp::Contrast(
+                parse_filter_amount(inner).unwrap_or(1.0),
+            ));
         } else if let Some(inner) = extract_fn(&part, "grayscale") {
             chain.ops.push(FilterOp::Grayscale(
                 parse_filter_amount(inner).unwrap_or(0.0).clamp(0.0, 1.0),
@@ -103,11 +107,13 @@ pub fn parse_css_filter(value: &str) -> Option<FilterChain> {
                 parse_filter_amount(inner).unwrap_or(0.0).clamp(0.0, 1.0),
             ));
         } else if let Some(inner) = extract_fn(&part, "saturate") {
+            chain.ops.push(FilterOp::Saturate(
+                parse_filter_amount(inner).unwrap_or(1.0),
+            ));
+        } else if let Some(inner) = extract_fn(&part, "hue-rotate") {
             chain
                 .ops
-                .push(FilterOp::Saturate(parse_filter_amount(inner).unwrap_or(1.0)));
-        } else if let Some(inner) = extract_fn(&part, "hue-rotate") {
-            chain.ops.push(FilterOp::HueRotate(parse_angle_deg(inner).unwrap_or(0.0)));
+                .push(FilterOp::HueRotate(parse_angle_deg(inner).unwrap_or(0.0)));
         } else if let Some(inner) = extract_fn(&part, "opacity") {
             chain.ops.push(FilterOp::Opacity(
                 parse_filter_amount(inner).unwrap_or(1.0).clamp(0.0, 1.0),
@@ -119,11 +125,7 @@ pub fn parse_css_filter(value: &str) -> Option<FilterChain> {
         }
     }
 
-    if chain.is_empty() {
-        None
-    } else {
-        Some(chain)
-    }
+    if chain.is_empty() { None } else { Some(chain) }
 }
 
 /// Apply only color-matrix ops (no blur) — used when content is not rasterized.

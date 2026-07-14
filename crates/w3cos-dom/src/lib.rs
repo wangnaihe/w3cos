@@ -344,7 +344,10 @@ mod tests {
         let mut style = CSSStyleDeclaration::new();
         style.set_property("padding", "16px");
         assert_eq!(style.inner.padding.top, w3cos_std::style::Spacing::Px(16.0));
-        assert_eq!(style.inner.padding.bottom, w3cos_std::style::Spacing::Px(16.0));
+        assert_eq!(
+            style.inner.padding.bottom,
+            w3cos_std::style::Spacing::Px(16.0)
+        );
         style.set_property("margin", "8px");
         assert_eq!(style.inner.margin.top, w3cos_std::style::Spacing::Px(8.0));
     }
@@ -385,7 +388,10 @@ mod tests {
         assert_eq!(style.get_property("will-change"), "transform, opacity");
 
         style.set_property("contain", "layout");
-        assert!(matches!(style.inner.contain, w3cos_std::style::Contain::Layout));
+        assert!(matches!(
+            style.inner.contain,
+            w3cos_std::style::Contain::Layout
+        ));
 
         style.set_property("filter", "blur(4px)");
         assert_eq!(style.inner.filter.as_deref(), Some("blur(4px)"));

@@ -1,18 +1,18 @@
 pub mod codegen;
 pub mod css_parser;
 pub mod css_values;
-pub mod media_query;
 pub mod esm_codegen;
 pub mod esm_lowering;
 pub mod esm_resolver;
+pub mod media_query;
 pub mod mobile_codegen;
-pub mod web_codegen;
 pub mod npm_bridge;
 pub mod parser;
 pub mod scope_analysis;
 pub mod style_matcher;
 pub mod ts_transpiler;
 pub mod ts_types;
+pub mod web_codegen;
 
 use anyhow::{Context, Result};
 
@@ -28,6 +28,23 @@ pub fn compile_to_rust(ts_source: &str) -> Result<String> {
     } else {
         ts_transpiler::transpile(ts_source)
     }
+}
+
+pub use codegen::CompileOptions;
+
+/// Collect entry + CSS import paths for dev file watching.
+pub fn collect_watch_paths(source_path: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let ts_source = std::fs::read_to_string(source_path)
+        .with_context(|| format!("Could not read {}", source_path.display()))?;
+    let source_dir = source_path.parent();
+    let tree = parser::parse(&ts_source)?;
+    let mut paths = vec![source_path.to_path_buf()];
+    if let Some(dir) = source_dir {
+        for import_path in &tree.css_imports {
+            paths.push(dir.join(import_path));
+        }
+    }
+    Ok(paths)
 }
 
 /// Compile flags that influence Cargo.toml / import generation.
@@ -48,7 +65,13 @@ pub struct CompileFlags {
 /// For UI apps: links against w3cos-runtime and produces a native GUI binary.
 /// For general TS: produces a standalone CLI binary.
 pub fn compile(ts_source: &str, output_dir: &std::path::Path) -> Result<()> {
-    compile_with_source_dir(ts_source, output_dir, None, None)
+    compile_with_source_dir(
+        ts_source,
+        output_dir,
+        None,
+        None,
+        &CompileOptions::default(),
+    )
 }
 
 /// Compile a TSX UI app into a mobile project directory.
@@ -58,6 +81,25 @@ pub fn compile_mobile_from_file(
     platform: &str,
     safe_area: bool,
     interactive_widget: &str,
+) -> Result<()> {
+    compile_mobile_from_file_with_options(
+        source_path,
+        output_dir,
+        platform,
+        safe_area,
+        interactive_widget,
+        &CompileOptions::default(),
+    )
+}
+
+/// Mobile compile with runtime flags (e.g. Chrome DevTools on device/simulator).
+pub fn compile_mobile_from_file_with_options(
+    source_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    platform: &str,
+    safe_area: bool,
+    interactive_widget: &str,
+    options: &CompileOptions,
 ) -> Result<()> {
     let ts_source = std::fs::read_to_string(source_path)
         .with_context(|| format!("Could not read {}", source_path.display()))?;
@@ -71,6 +113,7 @@ pub fn compile_mobile_from_file(
         platform,
         safe_area,
         interactive_widget,
+        options,
     )
 }
 
@@ -92,10 +135,25 @@ pub fn compile_from_file(
     source_path: &std::path::Path,
     output_dir: &std::path::Path,
 ) -> Result<()> {
+    compile_from_file_with_options(source_path, output_dir, &CompileOptions::default())
+}
+
+/// Compile from a source file with runtime feature flags (e.g. DevTools).
+pub fn compile_from_file_with_options(
+    source_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    options: &CompileOptions,
+) -> Result<()> {
     let ts_source = std::fs::read_to_string(source_path)
         .with_context(|| format!("Could not read {}", source_path.display()))?;
     let source_dir = source_path.parent().map(|p| p.to_path_buf());
-    compile_with_source_dir(&ts_source, output_dir, source_dir.as_deref(), Some(source_path))
+    compile_with_source_dir(
+        &ts_source,
+        output_dir,
+        source_dir.as_deref(),
+        Some(source_path),
+        options,
+    )
 }
 
 fn compile_with_source_dir(
@@ -103,6 +161,7 @@ fn compile_with_source_dir(
     output_dir: &std::path::Path,
     source_dir: Option<&std::path::Path>,
     source_path: Option<&std::path::Path>,
+    options: &CompileOptions,
 ) -> Result<()> {
     let is_ui = is_ui_dsl(ts_source);
 
@@ -112,7 +171,7 @@ fn compile_with_source_dir(
         let tree = parser::parse(ts_source)?;
         let stylesheet = resolve_css_imports(&tree.css_imports, source_dir)?;
         let rust_code = codegen::generate(&tree, &stylesheet)?;
-        let cargo_toml = codegen::generate_cargo_toml(output_dir)?;
+        let cargo_toml = codegen::generate_cargo_toml(output_dir, options)?;
         std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
         std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
     } else {
@@ -160,7 +219,11 @@ struct EsmArtifacts {
 }
 
 fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
-    let project_root = find_project_root(entry_path.parent().unwrap_or_else(|| std::path::Path::new(".")));
+    let project_root = find_project_root(
+        entry_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    );
     let resolver = esm_resolver::EsmResolver::new(project_root);
     let graph = resolver.build_graph_from_entry(entry_path)?;
     let parsed = resolver.parse_graph_from_entry(entry_path)?;
@@ -179,13 +242,23 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
     if !exports.is_empty() {
         diagnostics.push_str(&format!("//! ESM exported names: {}\n", exports.join(", ")));
     }
-    diagnostics.push_str(&format!("//! ESM bundle symbols: {}\n", bundle.symbol_count()));
+    diagnostics.push_str(&format!(
+        "//! ESM bundle symbols: {}\n",
+        bundle.symbol_count()
+    ));
     diagnostics.push_str(&format!(
         "//! ESM bundle resolved: {}\n",
-        if bundle.is_fully_resolved() { "yes" } else { "no" }
+        if bundle.is_fully_resolved() {
+            "yes"
+        } else {
+            "no"
+        }
     ));
     if !bundle.unresolved.is_empty() {
-        diagnostics.push_str(&format!("//! ESM unresolved bindings: {}\n", bundle.unresolved.len()));
+        diagnostics.push_str(&format!(
+            "//! ESM unresolved bindings: {}\n",
+            bundle.unresolved.len()
+        ));
     }
     diagnostics.push('\n');
 
@@ -196,7 +269,10 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
         None
     };
 
-    Ok(EsmArtifacts { diagnostics, bundle_code })
+    Ok(EsmArtifacts {
+        diagnostics,
+        bundle_code,
+    })
 }
 
 fn find_project_root(start: &std::path::Path) -> std::path::PathBuf {
@@ -286,17 +362,29 @@ fn is_ui_dsl(source: &str) -> bool {
     // Quick scan for W3C OS UI patterns (including React Native compat)
     let has_ui_import = trimmed.contains("@w3cos/std") || trimmed.contains("react-native");
     let has_component_call = [
-        "Column(", "Row(", "Text(", "Button(",
-        "View(", "ScrollView(", "TouchableOpacity(", "FlatList(",
+        "Column(",
+        "Row(",
+        "Text(",
+        "Button(",
+        "View(",
+        "ScrollView(",
+        "TouchableOpacity(",
+        "FlatList(",
     ]
-        .iter()
-        .any(|pat| trimmed.contains(pat));
+    .iter()
+    .any(|pat| trimmed.contains(pat));
     let has_tsx_component = [
-        "<Column", "<Row", "<Text", "<Button",
-        "<View", "<ScrollView", "<TouchableOpacity", "<FlatList",
+        "<Column",
+        "<Row",
+        "<Text",
+        "<Button",
+        "<View",
+        "<ScrollView",
+        "<TouchableOpacity",
+        "<FlatList",
     ]
-        .iter()
-        .any(|pat| trimmed.contains(pat));
+    .iter()
+    .any(|pat| trimmed.contains(pat));
 
     // If it imports @w3cos/std or react-native or directly uses component constructors
     if has_ui_import && (has_component_call || has_tsx_component) {
@@ -317,10 +405,28 @@ fn is_ui_dsl(source: &str) -> bool {
     let body = body.trim();
 
     let component_starts = [
-        "Column(", "Row(", "Text(", "Button(", "Image(", "TextInput(", "Box(",
-        "<Column", "<Row", "<Text", "<Button", "<Image", "<TextInput", "<Box",
-        "View(", "ScrollView(", "TouchableOpacity(", "FlatList(",
-        "<View", "<ScrollView", "<TouchableOpacity", "<FlatList",
+        "Column(",
+        "Row(",
+        "Text(",
+        "Button(",
+        "Image(",
+        "TextInput(",
+        "Box(",
+        "<Column",
+        "<Row",
+        "<Text",
+        "<Button",
+        "<Image",
+        "<TextInput",
+        "<Box",
+        "View(",
+        "ScrollView(",
+        "TouchableOpacity(",
+        "FlatList(",
+        "<View",
+        "<ScrollView",
+        "<TouchableOpacity",
+        "<FlatList",
     ];
     let starts_with_component = component_starts.iter().any(|pat| body.starts_with(pat));
 
@@ -385,6 +491,25 @@ mod tests {
         assert!(rust.contains("Component::column"));
         assert!(rust.contains("Component::text(\"a\""));
         assert!(rust.contains("Component::text(\"b\""));
+    }
+
+    #[test]
+    fn compile_to_rust_repeat_uses_runtime_loop() {
+        let rust = compile_to_rust(r#"<Column repeat="1000"><Text>row</Text></Column>"#).unwrap();
+        assert!(rust.contains("Vec::with_capacity(__repeat_template.len() * 1000)"));
+        assert!(rust.contains("for _ in 0..1000"));
+        assert_eq!(rust.matches("Component::text(\"row\"").count(), 1);
+    }
+
+    #[test]
+    fn compile_to_rust_sticky_counter_binds_signal() {
+        let rust =
+            compile_to_rust(r#"<Column stickyCounter="todoCount"><Text>task</Text></Column>"#)
+                .unwrap();
+        assert!(
+            rust.contains("__comp.sticky_counter_signal = Some(0)"),
+            "generated Rust did not bind sticky counter:\n{rust}"
+        );
     }
 
     #[test]
@@ -542,10 +667,16 @@ console.log("Done!");
 
         let main_rs = std::fs::read_to_string(dir.join("src/main.rs")).unwrap();
         assert!(main_rs.contains("async fn"), "missing async: {main_rs}");
-        assert!(main_rs.contains("#[tokio::main]"), "missing tokio::main: {main_rs}");
+        assert!(
+            main_rs.contains("#[tokio::main]"),
+            "missing tokio::main: {main_rs}"
+        );
 
         let cargo_toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
-        assert!(cargo_toml.contains("tokio"), "missing tokio dep: {cargo_toml}");
+        assert!(
+            cargo_toml.contains("tokio"),
+            "missing tokio dep: {cargo_toml}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -566,12 +697,24 @@ console.log("Done!");
         compile(input, &dir).expect("compile failed");
 
         let main_rs = std::fs::read_to_string(dir.join("src/main.rs")).unwrap();
-        assert!(main_rs.contains("use std::rc::Rc;"), "missing Rc import: {main_rs}");
-        assert!(main_rs.contains("use std::cell::RefCell;"), "missing RefCell import: {main_rs}");
-        assert!(main_rs.contains("Rc::new(RefCell::new("), "missing Rc wrapping: {main_rs}");
+        assert!(
+            main_rs.contains("use std::rc::Rc;"),
+            "missing Rc import: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("use std::cell::RefCell;"),
+            "missing RefCell import: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("Rc::new(RefCell::new("),
+            "missing Rc wrapping: {main_rs}"
+        );
 
         let cargo_toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
-        assert!(!cargo_toml.contains("tokio"), "should not have tokio: {cargo_toml}");
+        assert!(
+            !cargo_toml.contains("tokio"),
+            "should not have tokio: {cargo_toml}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -583,9 +726,7 @@ console.log("Done!");
         ));
         assert!(is_ui_dsl(r#"Column({ children: [Text("hi")] })"#));
         assert!(is_ui_dsl(r#"<Column><Text>hi</Text></Column>"#));
-        assert!(!is_ui_dsl(
-            r#"function main() { console.log("hello"); }"#
-        ));
+        assert!(!is_ui_dsl(r#"function main() { console.log("hello"); }"#));
         assert!(!is_ui_dsl(r#"let x = 42; console.log(x);"#));
     }
 
@@ -760,7 +901,10 @@ setupEditor();
 
         // @codemirror/view and @codemirror/state are bridged
         assert!(rust.contains("w3cos_dom"), "missing w3cos_dom: {rust}");
-        assert!(rust.contains("w3cos_runtime"), "missing w3cos_runtime: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime"),
+            "missing w3cos_runtime: {rust}"
+        );
 
         // @codemirror/lang-javascript has no bridge → warning
         assert!(
@@ -843,7 +987,9 @@ console.log("view", view);
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        eprintln!("=== real CodeMirror cargo check stdout ===\n{stdout}\n=== stderr ===\n{stderr}\n=== end ===");
+        eprintln!(
+            "=== real CodeMirror cargo check stdout ===\n{stdout}\n=== stderr ===\n{stderr}\n=== end ==="
+        );
 
         assert!(
             !output.status.success(),
@@ -880,7 +1026,11 @@ console.log("view", view);"#,
 
         let view = root.join("node_modules/@codemirror/view");
         std::fs::create_dir_all(view.join("dist")).unwrap();
-        std::fs::write(view.join("package.json"), r#"{"exports":{".":{"import":"./dist/index.js"}}}"#).unwrap();
+        std::fs::write(
+            view.join("package.json"),
+            r#"{"exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
         std::fs::write(
             view.join("dist/index.js"),
             r#"import { EditorState } from "@codemirror/state";
@@ -903,13 +1053,34 @@ export class EditorView {}"#,
         compile_from_file(&app, &out).expect("compile_from_file should build ESM diagnostics");
         let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
 
-        assert!(main_rs.contains("ESM graph: resolved at compile time"), "missing ESM graph diagnostics: {main_rs}");
-        assert!(main_rs.contains("ESM modules: 4"), "entry + 3 package modules expected: {main_rs}");
-        assert!(main_rs.contains("ESM imports:"), "missing ESM import metadata: {main_rs}");
-        assert!(main_rs.contains("ESM exports:"), "missing ESM export metadata: {main_rs}");
-        assert!(main_rs.contains("@codemirror/view"), "missing CodeMirror view package: {main_rs}");
-        assert!(main_rs.contains("@codemirror/state"), "missing CodeMirror state package: {main_rs}");
-        assert!(main_rs.contains("style-mod"), "missing transitive dependency: {main_rs}");
+        assert!(
+            main_rs.contains("ESM graph: resolved at compile time"),
+            "missing ESM graph diagnostics: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("ESM modules: 4"),
+            "entry + 3 package modules expected: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("ESM imports:"),
+            "missing ESM import metadata: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("ESM exports:"),
+            "missing ESM export metadata: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("@codemirror/view"),
+            "missing CodeMirror view package: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("@codemirror/state"),
+            "missing CodeMirror state package: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("style-mod"),
+            "missing transitive dependency: {main_rs}"
+        );
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -930,7 +1101,8 @@ export function boot() {
   const view = new EditorView({state});
   return view;
 }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let view = root.join("node_modules/@codemirror/view");
         std::fs::create_dir_all(view.join("dist")).unwrap();
@@ -944,7 +1116,8 @@ export function boot() {
   }
 }
 export function keymap() {}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let state = root.join("node_modules/@codemirror/state");
         std::fs::create_dir_all(state.join("dist")).unwrap();
@@ -954,31 +1127,62 @@ export function keymap() {}"#,
             r#"export class EditorState {
   static create(config) { return new EditorState(); }
 }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let out = root.join("build");
         compile_from_file(&root.join("src/app.ts"), &out).expect("e2e compile should succeed");
 
         // Verify main.rs
         let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
-        assert!(main_rs.contains("mod esm_bundle;"), "main.rs should include esm_bundle module: {main_rs}");
-        assert!(main_rs.contains("ESM bundle symbols:"), "main.rs should have bundle diagnostics: {main_rs}");
-        assert!(main_rs.contains("ESM bundle resolved: yes"), "bundle should be fully resolved: {main_rs}");
+        assert!(
+            main_rs.contains("mod esm_bundle;"),
+            "main.rs should include esm_bundle module: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("ESM bundle symbols:"),
+            "main.rs should have bundle diagnostics: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("ESM bundle resolved: yes"),
+            "bundle should be fully resolved: {main_rs}"
+        );
 
         // Verify esm_bundle.rs is generated
         let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs"))
             .expect("esm_bundle.rs should be generated");
-        assert!(bundle_rs.contains("pub struct"), "should contain struct definitions: {bundle_rs}");
-        assert!(bundle_rs.contains("EditorView"), "should contain EditorView: {bundle_rs}");
-        assert!(bundle_rs.contains("EditorState"), "should contain EditorState: {bundle_rs}");
-        assert!(bundle_rs.contains("pub fn"), "should contain function definitions: {bundle_rs}");
+        assert!(
+            bundle_rs.contains("pub struct"),
+            "should contain struct definitions: {bundle_rs}"
+        );
+        assert!(
+            bundle_rs.contains("EditorView"),
+            "should contain EditorView: {bundle_rs}"
+        );
+        assert!(
+            bundle_rs.contains("EditorState"),
+            "should contain EditorState: {bundle_rs}"
+        );
+        assert!(
+            bundle_rs.contains("pub fn"),
+            "should contain function definitions: {bundle_rs}"
+        );
         // Function bodies should be lowered, not todo!()
-        assert!(bundle_rs.contains("document.createElement"), "method body should be lowered: {bundle_rs}");
-        assert!(!bundle_rs.contains("todo!(\"lower ESM body: keymap\")"), "keymap body should be lowered: {bundle_rs}");
+        assert!(
+            bundle_rs.contains("document.createElement"),
+            "method body should be lowered: {bundle_rs}"
+        );
+        assert!(
+            !bundle_rs.contains("todo!(\"lower ESM body: keymap\")"),
+            "keymap body should be lowered: {bundle_rs}"
+        );
 
         // Verify Cargo.toml
         let cargo = std::fs::read_to_string(out.join("Cargo.toml")).unwrap();
-        assert!(cargo.contains("[package]"), "should have valid Cargo.toml: {cargo}");
+        assert!(
+            cargo.contains("[package]"),
+            "should have valid Cargo.toml: {cargo}"
+        );
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -997,7 +1201,8 @@ export function keymap() {}"#,
         let out = project.join("build");
         let _ = std::fs::remove_dir_all(&out);
 
-        compile_from_file(&entry, &out).expect("compile_from_file should handle real @codemirror/state");
+        compile_from_file(&entry, &out)
+            .expect("compile_from_file should handle real @codemirror/state");
 
         let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
         eprintln!("=== main.rs (first 40 lines) ===");
@@ -1005,9 +1210,19 @@ export function keymap() {}"#,
             eprintln!("  {line}");
         }
 
-        assert!(main_rs.contains("ESM graph: resolved at compile time"), "diagnostics: {}", &main_rs[..200.min(main_rs.len())]);
-        assert!(main_rs.contains("@codemirror/state"), "should detect package");
-        assert!(main_rs.contains("mod esm_bundle;"), "should generate esm_bundle module");
+        assert!(
+            main_rs.contains("ESM graph: resolved at compile time"),
+            "diagnostics: {}",
+            &main_rs[..200.min(main_rs.len())]
+        );
+        assert!(
+            main_rs.contains("@codemirror/state"),
+            "should detect package"
+        );
+        assert!(
+            main_rs.contains("mod esm_bundle;"),
+            "should generate esm_bundle module"
+        );
 
         let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs"))
             .expect("esm_bundle.rs should be generated");
@@ -1018,7 +1233,10 @@ export function keymap() {}"#,
 
         assert!(bundle_rs.contains("pub struct"), "should have struct defs");
         assert!(bundle_rs.contains("pub fn"), "should have fn defs");
-        assert!(bundle_rs.contains("EditorState"), "should export EditorState");
+        assert!(
+            bundle_rs.contains("EditorState"),
+            "should export EditorState"
+        );
 
         eprintln!("=== real @codemirror/state compilation: SUCCESS ===");
     }

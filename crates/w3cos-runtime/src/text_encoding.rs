@@ -120,9 +120,10 @@ impl TextDecoder {
                         message: "non-ASCII byte encountered".to_string(),
                     })
                 } else {
-                    Ok(data.iter().map(|&b| {
-                        if b <= 127 { b as char } else { '\u{FFFD}' }
-                    }).collect())
+                    Ok(data
+                        .iter()
+                        .map(|&b| if b <= 127 { b as char } else { '\u{FFFD}' })
+                        .collect())
                 }
             }
             "utf-16le" => Ok(decode_utf16le(data)),

@@ -1,18 +1,14 @@
 //! Emit browser HTML/CSS/JS from the same UI DSL pipeline as native/mobile.
 
-use crate::css_parser::{Selector, Stylesheet};
 use crate::codegen::find_workspace_root;
+use crate::css_parser::Stylesheet;
 use crate::parser::{AppTree, Node, NodeKind, SignalDecl, StyleDecl};
 use crate::style_matcher;
-use w3cos_std::style::{SafeAreaEdge, Spacing};
 use anyhow::Result;
 use std::path::Path;
+use w3cos_std::style::{SafeAreaEdge, Spacing};
 
-pub fn write_web_project(
-    tree: &AppTree,
-    stylesheet: &Stylesheet,
-    output_dir: &Path,
-) -> Result<()> {
+pub fn write_web_project(tree: &AppTree, stylesheet: &Stylesheet, output_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
     if let Ok(root) = find_workspace_root() {
         let font_src = root.join("crates/w3cos-runtime/assets/CJK-Subset.ttf");
@@ -158,8 +154,7 @@ if (window.visualViewport) {{
   window.visualViewport.addEventListener('scroll', syncKeyboardInset);
 }}
 syncKeyboardInset();
-"#
-        ,
+"#,
         state_lines = inits.join("\n"),
         index_lines = index_map.join("\n"),
     )
@@ -226,9 +221,7 @@ fn gen_html_node(
         }
         NodeKind::TextInput => {
             let ph = node.placeholder.as_deref().unwrap_or("Enter text");
-            format!(
-                r#"<input type="text" placeholder="{ph}"{class_attr}{style_attr} />"#
-            )
+            format!(r#"<input type="text" placeholder="{ph}"{class_attr}{style_attr} />"#)
         }
         NodeKind::Column | NodeKind::Row | NodeKind::Box => {
             let mut extra = String::new();
@@ -250,7 +243,11 @@ fn gen_html_node(
                 format!(
                     r#" style="{}{}""#,
                     extra,
-                    if inline.is_empty() { String::new() } else { inline.clone() }
+                    if inline.is_empty() {
+                        String::new()
+                    } else {
+                        inline.clone()
+                    }
                 )
             };
             let children: String = node
@@ -342,9 +339,7 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     }
     if let Some((sig, a, b)) = s.background_from_signal.as_ref() {
         if signal_names.contains(&sig.as_str()) {
-            parts.push(format!(
-                "background:var(--bg-{sig},{a})"
-            ));
+            parts.push(format!("background:var(--bg-{sig},{a})"));
             let _ = b;
         }
     }
@@ -360,6 +355,12 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     if let Some(jc) = s.justify_content.as_ref() {
         parts.push(format!("justify-content:{}", css_flex_justify(jc)));
     }
+    if let Some(display) = s.display.as_ref() {
+        parts.push(format!("display:{display}"));
+    }
+    if let Some(direction) = s.flex_direction.as_ref() {
+        parts.push(format!("flex-direction:{direction}"));
+    }
     if let Some(fg) = s.flex_grow {
         parts.push(format!("flex-grow:{fg}"));
     }
@@ -368,6 +369,9 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     }
     if let Some(fw) = s.flex_wrap.as_ref() {
         parts.push(format!("flex-wrap:{}", fw));
+    }
+    if let Some(fb) = s.flex_basis.as_ref() {
+        parts.push(format!("flex-basis:{}", css_dim(fb)));
     }
     if let Some(w) = s.width.as_ref() {
         parts.push(format!("width:{}", css_dim(w)));
@@ -380,6 +384,30 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     }
     if let Some(mh) = s.min_height.as_ref() {
         parts.push(format!("min-height:{}", css_dim(mh)));
+    }
+    if let Some(mw) = s.max_width.as_ref() {
+        parts.push(format!("max-width:{}", css_dim(mw)));
+    }
+    if let Some(mh) = s.max_height.as_ref() {
+        parts.push(format!("max-height:{}", css_dim(mh)));
+    }
+    if let Some(position) = s.position.as_ref() {
+        parts.push(format!("position:{position}"));
+    }
+    if let Some(top) = s.top.as_ref() {
+        parts.push(format!("top:{}", css_dim(top)));
+    }
+    if let Some(right) = s.right.as_ref() {
+        parts.push(format!("right:{}", css_dim(right)));
+    }
+    if let Some(bottom) = s.bottom.as_ref() {
+        parts.push(format!("bottom:{}", css_dim(bottom)));
+    }
+    if let Some(left) = s.left.as_ref() {
+        parts.push(format!("left:{}", css_dim(left)));
+    }
+    if let Some(z_index) = s.z_index {
+        parts.push(format!("z-index:{z_index}"));
     }
     if let Some(lh) = s.line_height {
         parts.push(format!("line-height:{lh}"));
@@ -408,8 +436,14 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     if let Some(tr) = s.transition.as_ref() {
         parts.push(format!("transition:{tr}"));
     }
+    if let Some(shadow) = s.box_shadow.as_ref() {
+        parts.push(format!("box-shadow:{shadow}"));
+    }
     if let Some(ta) = s.text_align.as_ref() {
         parts.push(format!("text-align:{ta}"));
+    }
+    if let Some(spacing) = s.letter_spacing {
+        parts.push(format!("letter-spacing:{spacing}px"));
     }
     parts.join(";")
 }

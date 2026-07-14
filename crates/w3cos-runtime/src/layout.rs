@@ -47,6 +47,7 @@ pub struct FlatNodeInfo<'a> {
     pub kind: &'a ComponentKind,
     pub style: &'a w3cos_std::style::Style,
     pub on_click: &'a EventAction,
+    pub sticky_counter_signal: Option<usize>,
     pub parent: Option<usize>,
 }
 
@@ -97,12 +98,7 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
 }
 
 fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
-    text_layout::text_intrinsic_size_font(
-        content,
-        style,
-        DEFAULT_TEXT_WRAP_WIDTH,
-        layout_font(),
-    )
+    text_layout::text_intrinsic_size_font(content, style, DEFAULT_TEXT_WRAP_WIDTH, layout_font())
 }
 
 fn button_intrinsic_size(label: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
@@ -145,6 +141,7 @@ fn kinds_layout_eq(a: &ComponentKind, b: &ComponentKind) -> bool {
         (ComponentKind::Column, ComponentKind::Column) => true,
         (ComponentKind::Row, ComponentKind::Row) => true,
         (ComponentKind::Box, ComponentKind::Box) => true,
+        (ComponentKind::VirtualList { .. }, ComponentKind::VirtualList { .. }) => true,
         (ComponentKind::Text { .. }, ComponentKind::Text { .. }) => true,
         (ComponentKind::Button { label: la }, ComponentKind::Button { label: lb }) => la == lb,
         (ComponentKind::Image { src: sa }, ComponentKind::Image { src: sb }) => sa == sb,
@@ -234,6 +231,7 @@ fn pre_flatten_recursive<'a>(
         kind: &comp.kind,
         style: &comp.style,
         on_click: &comp.on_click,
+        sticky_counter_signal: comp.sticky_counter_signal,
         parent,
     });
     for child in &comp.children {
@@ -305,7 +303,7 @@ impl LayoutEngine {
         if !self.tree_valid {
             self.tree.clear();
             let mut idx = 0;
-            self.root_node = Some(build_taffy_tree(&mut self.tree, root, &mut idx)?);
+            self.root_node = Some(build_taffy_tree(&mut self.tree, root, &mut idx, None)?);
             self.tree_valid = true;
         }
 
@@ -378,7 +376,15 @@ pub fn compute_with_scroll(
     let mut tree: TaffyTree<usize> = TaffyTree::new();
     let mut node_index: usize = 0;
 
-    let root_node = build_taffy_tree(&mut tree, root, &mut node_index)?;
+    let root_node = build_taffy_tree(&mut tree, root, &mut node_index, None)?;
+    tree.compute_layout(
+        root_node,
+        Size {
+            width: AvailableSpace::Definite(viewport_w),
+            height: AvailableSpace::Definite(viewport_h),
+        },
+    )?;
+    update_text_leaf_heights(&mut tree, root_node, &flat)?;
     tree.compute_layout(
         root_node,
         Size {
@@ -421,6 +427,7 @@ fn build_taffy_tree(
     tree: &mut TaffyTree<usize>,
     comp: &Component,
     idx: &mut usize,
+    parent_direction: Option<WDir>,
 ) -> Result<NodeId, taffy::TaffyError> {
     let my_idx = *idx;
     *idx += 1;
@@ -432,19 +439,29 @@ fn build_taffy_tree(
         let (min_w, size_w) = if matches!(comp.style.width, WDim::Auto) {
             match &comp.kind {
                 ComponentKind::Text { content } => {
-                    let mut w = text_intrinsic_size(content, &comp.style).0;
-                    if let WDim::Px(mw) = comp.style.min_width {
-                        w = w.max(mw);
-                    }
-                    let dim = Dimension::length(w);
                     let nowrap = matches!(
                         comp.style.white_space,
                         WWhiteSpace::NoWrap | WWhiteSpace::Pre
                     );
                     if nowrap {
+                        let mut w = text_intrinsic_size(content, &comp.style).0;
+                        if let WDim::Px(mw) = comp.style.min_width {
+                            w = w.max(mw);
+                        }
+                        let dim = Dimension::length(w);
                         (dim, dim)
+                    } else if matches!(parent_direction, Some(WDir::Column | WDir::ColumnReverse)) {
+                        let min_width = match comp.style.min_width {
+                            WDim::Px(mw) => Dimension::length(mw),
+                            _ => Dimension::length(0.0),
+                        };
+                        (min_width, Dimension::auto())
                     } else {
-                        (dim, Dimension::auto())
+                        let mut w = text_intrinsic_size(content, &comp.style).0;
+                        if let WDim::Px(mw) = comp.style.min_width {
+                            w = w.max(mw);
+                        }
+                        (Dimension::length(w), Dimension::auto())
                     }
                 }
                 ComponentKind::Button { label } => {
@@ -486,7 +503,7 @@ fn build_taffy_tree(
         let child_nodes: Vec<NodeId> = comp
             .children
             .iter()
-            .map(|c| build_taffy_tree(tree, c, idx))
+            .map(|c| build_taffy_tree(tree, c, idx, Some(comp.style.flex_direction)))
             .collect::<Result<_, _>>()?;
         let node = tree.new_with_children(style, &child_nodes)?;
         tree.set_node_context(node, Some(my_idx))?;
@@ -528,16 +545,18 @@ fn update_text_leaf_heights(
         if idx < flat.len() {
             if let ComponentKind::Text { content } = flat[idx].kind {
                 let style = flat[idx].style;
-                let h = text_layout::wrapped_block_height_font(
-                    content,
-                    node_width,
-                    style,
-                    layout_font(),
-                );
-                let mut taffy_style = tree.style(node)?.clone();
-                taffy_style.min_size.height = Dimension::length(h);
-                taffy_style.size.height = Dimension::length(h);
-                tree.set_style(node, taffy_style)?;
+                if matches!(style.height, WDim::Auto) {
+                    let h = text_layout::wrapped_block_height_font(
+                        content,
+                        node_width,
+                        style,
+                        layout_font(),
+                    );
+                    let mut taffy_style = tree.style(node)?.clone();
+                    taffy_style.min_size.height = Dimension::length(h);
+                    taffy_style.size.height = Dimension::length(h);
+                    tree.set_style(node, taffy_style)?;
+                }
             }
         }
     }
@@ -600,13 +619,8 @@ fn collect_layouts_fast(
             scroll_ancestor[ctx] = current_scroll_container;
 
             if matches!(info.style.position, WPos::Fixed) {
-                rect = compute_fixed_rect(
-                    info.style,
-                    viewport_w,
-                    viewport_h,
-                    rect.width,
-                    rect.height,
-                );
+                rect =
+                    compute_fixed_rect(info.style, viewport_w, viewport_h, rect.width, rect.height);
                 fixed_out.push((rect, ctx));
             } else {
                 out.push((rect, ctx));
@@ -615,7 +629,12 @@ fn collect_layouts_fast(
             match info.style.overflow {
                 WOverflow::Scroll | WOverflow::Auto => {
                     let max_x = layout.scroll_width().max(0.0);
-                    let max_y = layout.scroll_height().max(0.0);
+                    let max_y = match info.kind {
+                        ComponentKind::VirtualList { total_extent, .. } => {
+                            (*total_extent - rect.height).max(0.0)
+                        }
+                        _ => layout.scroll_height().max(0.0),
+                    };
                     if max_x > 0.0 || max_y > 0.0 {
                         scrollable.push((ctx, rect, ScrollExtent { max_x, max_y }));
                     } else {
@@ -920,6 +939,22 @@ mod tests {
     }
 
     #[test]
+    fn padded_column_stretches_card_inside_content_box() {
+        let card = Component::column(
+            Style {
+                border_width: 1.0,
+                ..Style::default()
+            },
+            vec![Component::text("card", s())],
+        );
+        let l = compute(&Component::column(col(), vec![card]), 400.0, 600.0).unwrap();
+        let card_rect = l[1].0;
+        assert_eq!(card_rect.x, 16.0);
+        assert_eq!(card_rect.width, 368.0);
+        assert!(card_rect.x + card_rect.width <= 400.0);
+    }
+
+    #[test]
     fn column_stacks_vertically() {
         let l = compute(
             &Component::column(
@@ -1152,11 +1187,14 @@ mod tests {
                         background: Color::from_hex("#1e1e28"),
                         ..Style::default()
                     },
-                    vec![Component::button("GET httpbin.org/get", Style {
-                        padding: w3cos_std::style::Edges::all(14.0),
-                        font_size: 14.0,
-                        ..Style::default()
-                    })],
+                    vec![Component::button(
+                        "GET httpbin.org/get",
+                        Style {
+                            padding: w3cos_std::style::Edges::all(14.0),
+                            font_size: 14.0,
+                            ..Style::default()
+                        },
+                    )],
                 )],
             ),
             402.0,
@@ -1177,6 +1215,61 @@ mod tests {
             "button should stretch to inner column width, got {}",
             btn.width
         );
+    }
+
+    #[test]
+    fn wrapping_text_shrinks_to_column_content_width() {
+        let text = "SH12345 预计 15:42 到达，等待费申诉缺 1 项材料。";
+        let l = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Flex,
+                    flex_direction: WDir::Column,
+                    padding: w3cos_std::style::Edges::all(16.0),
+                    width: WDim::Px(370.0),
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    text,
+                    Style {
+                        font_size: 15.0,
+                        line_height: 1.4,
+                        ..Style::default()
+                    },
+                )],
+            ),
+            402.0,
+            874.0,
+        )
+        .unwrap();
+        let text_rect = l.iter().find(|(_, idx)| *idx == 1).unwrap().0;
+        assert!(
+            (text_rect.width - 338.0).abs() < 2.0,
+            "wrapping text width {} expected parent content width 338",
+            text_rect.width
+        );
+        assert!(
+            text_rect.height > 21.0,
+            "text should wrap to multiple lines"
+        );
+    }
+
+    #[test]
+    fn explicit_text_height_is_preserved_after_wrap_pass() {
+        let l = compute(
+            &Component::text(
+                "✦",
+                Style {
+                    width: WDim::Px(40.0),
+                    height: WDim::Px(40.0),
+                    ..Style::default()
+                },
+            ),
+            402.0,
+            874.0,
+        )
+        .unwrap();
+        assert!((l[0].0.height - 40.0).abs() < 0.01);
     }
 
     #[test]
@@ -1355,10 +1448,7 @@ mod tests {
             &pre_flatten(&a),
             &pre_flatten(&b)
         ));
-        assert!(layout_shape_unchanged(
-            &pre_flatten(&a),
-            &pre_flatten(&b)
-        ));
+        assert!(layout_shape_unchanged(&pre_flatten(&a), &pre_flatten(&b)));
     }
 
     #[test]
@@ -1374,17 +1464,11 @@ mod tests {
         };
         let a = Component::column(
             col(),
-            vec![
-                Component::text("9", s()),
-                Component::button("Tap", s()),
-            ],
+            vec![Component::text("9", s()), Component::button("Tap", s())],
         );
         let b = Component::column(
             col(),
-            vec![
-                Component::text("1000", s()),
-                Component::button("Tap", s()),
-            ],
+            vec![Component::text("1000", s()), Component::button("Tap", s())],
         );
         let fa = pre_flatten(&a);
         let fb = pre_flatten(&b);
@@ -1397,10 +1481,7 @@ mod tests {
             display: WDisp::None,
             ..Style::default()
         };
-        let tree = Component::column(
-            wrap,
-            vec![Component::text("hidden", Style::default())],
-        );
+        let tree = Component::column(wrap, vec![Component::text("hidden", Style::default())]);
         let flat = pre_flatten(&tree);
         assert!(!is_node_visible(&flat, 1));
         assert!(!is_node_visible(&flat, 0));

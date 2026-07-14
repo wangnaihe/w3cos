@@ -124,7 +124,11 @@ impl JsObject {
                 return trap(&target);
             }
         }
-        let keys: Vec<Value> = self.properties.keys().map(|k| Value::String(k.clone())).collect();
+        let keys: Vec<Value> = self
+            .properties
+            .keys()
+            .map(|k| Value::String(k.clone()))
+            .collect();
         Value::array(keys)
     }
 
@@ -252,7 +256,9 @@ impl JsObject {
 }
 
 impl Default for JsObject {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

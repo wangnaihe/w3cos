@@ -242,8 +242,12 @@ pub fn show_message(options: MessageDialogOptions) -> DialogReceiver<MessageResu
         dialog = dialog.set_buttons(buttons);
 
         match dialog.show() {
-            rfd::MessageDialogResult::Yes | rfd::MessageDialogResult::Ok => MessageResult::Confirmed,
-            rfd::MessageDialogResult::No | rfd::MessageDialogResult::Cancel => MessageResult::Cancelled,
+            rfd::MessageDialogResult::Yes | rfd::MessageDialogResult::Ok => {
+                MessageResult::Confirmed
+            }
+            rfd::MessageDialogResult::No | rfd::MessageDialogResult::Cancel => {
+                MessageResult::Cancelled
+            }
             rfd::MessageDialogResult::Custom(label) => options
                 .buttons
                 .iter()

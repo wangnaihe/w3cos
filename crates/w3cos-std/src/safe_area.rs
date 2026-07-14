@@ -3,8 +3,8 @@
 //! See [CSS Environment Variables Module Level 1](https://www.w3.org/TR/css-env-1/).
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Which `env(safe-area-inset-*)` edge is referenced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

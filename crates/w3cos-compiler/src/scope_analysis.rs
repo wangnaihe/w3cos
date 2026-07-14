@@ -89,7 +89,9 @@ impl ScopeBuilder {
     }
 
     fn declare(&mut self, name: &str) {
-        self.scopes[self.current].declarations.insert(name.to_string());
+        self.scopes[self.current]
+            .declarations
+            .insert(name.to_string());
     }
 
     /// Find which scope a variable is declared in, walking up the scope chain.
@@ -294,12 +296,7 @@ fn declare_pat(pat: &Pat, builder: &mut ScopeBuilder) {
     }
 }
 
-fn analyze_expr(
-    expr: &Expr,
-    builder: &mut ScopeBuilder,
-    info: &mut CaptureInfo,
-    is_write: bool,
-) {
+fn analyze_expr(expr: &Expr, builder: &mut ScopeBuilder, info: &mut CaptureInfo, is_write: bool) {
     match expr {
         Expr::Ident(ident) => {
             let name = ident.sym.to_string();
@@ -434,11 +431,10 @@ fn analyze_assign_target(
                 if let Some(decl_scope) = builder.find_declaration(&name) {
                     if builder.is_inside_closure() && builder.is_captured_from_outer(decl_scope) {
                         let closure_id = builder.current_closure_id().unwrap_or(0);
-                        let detail =
-                            info.captures.entry(name).or_insert_with(|| CaptureDetail {
-                                captured_by: Vec::new(),
-                                is_mutated_in_closure: false,
-                            });
+                        let detail = info.captures.entry(name).or_insert_with(|| CaptureDetail {
+                            captured_by: Vec::new(),
+                            is_mutated_in_closure: false,
+                        });
                         if !detail.captured_by.contains(&closure_id) {
                             detail.captured_by.push(closure_id);
                         }
@@ -533,7 +529,11 @@ mod tests {
             "#,
         );
         assert!(info.is_captured("x"), "x should be captured");
-        assert_eq!(info.captures["x"].captured_by.len(), 2, "captured by 2 closures");
+        assert_eq!(
+            info.captures["x"].captured_by.len(),
+            2,
+            "captured by 2 closures"
+        );
         assert!(info.captures["x"].is_mutated_in_closure, "x is mutated");
     }
 
@@ -563,7 +563,10 @@ mod tests {
             }
             "#,
         );
-        assert!(!info.is_captured("x"), "param x is not captured (used in own scope)");
+        assert!(
+            !info.is_captured("x"),
+            "param x is not captured (used in own scope)"
+        );
     }
 
     #[test]
@@ -574,7 +577,10 @@ mod tests {
             let inc = () => { counter += 1; };
             "#,
         );
-        assert!(info.is_captured("counter"), "top-level counter captured by closure");
+        assert!(
+            info.is_captured("counter"),
+            "top-level counter captured by closure"
+        );
         assert!(info.captures["counter"].is_mutated_in_closure);
     }
 }

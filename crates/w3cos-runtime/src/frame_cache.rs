@@ -42,10 +42,7 @@ pub fn store(width: u32, height: u32, rgba: Vec<u8>) {
 
 /// Whether a frame has ever been stored.
 pub fn has_frame() -> bool {
-    cache()
-        .lock()
-        .map(|f| !f.rgba.is_empty())
-        .unwrap_or(false)
+    cache().lock().map(|f| !f.rgba.is_empty()).unwrap_or(false)
 }
 
 /// Snapshot the cached buffer (`width`, `height`, RGBA bytes, generation).
@@ -54,7 +51,12 @@ pub fn snapshot() -> Option<(u32, u32, Vec<u8>, u64)> {
     if frame.rgba.is_empty() {
         return None;
     }
-    Some((frame.width, frame.height, frame.rgba.clone(), frame.generation))
+    Some((
+        frame.width,
+        frame.height,
+        frame.rgba.clone(),
+        frame.generation,
+    ))
 }
 
 /// Encode the cached frame to PNG. `None` if no frame has been rendered yet

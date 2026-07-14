@@ -52,7 +52,10 @@ pub fn transpile(source: &str) -> Result<String> {
 
 fn parse_ts(source: &str) -> Result<Module> {
     let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(Lrc::new(FileName::Custom("input.ts".into())), source.to_string());
+    let fm = cm.new_source_file(
+        Lrc::new(FileName::Custom("input.ts".into())),
+        source.to_string(),
+    );
 
     let mut parser = Parser::new(
         Syntax::Typescript(TsSyntax {
@@ -146,7 +149,8 @@ impl TranspileContext {
                 result.push_str(&format!("// - {pkg}\n"));
             }
         }
-        if self.needs_rc || self.needs_hashmap || self.needs_core || !self.npm_use_stmts.is_empty() {
+        if self.needs_rc || self.needs_hashmap || self.needs_core || !self.npm_use_stmts.is_empty()
+        {
             result.push('\n');
         }
         for s in &self.struct_defs {
@@ -255,9 +259,7 @@ impl TranspileContext {
         }
 
         if !top_stmts.is_empty() && !has_main {
-            let has_top_level_await = top_stmts
-                .iter()
-                .any(|s| stmt_contains_await(s));
+            let has_top_level_await = top_stmts.iter().any(|s| stmt_contains_await(s));
 
             if has_top_level_await {
                 self.needs_async = true;
@@ -326,8 +328,17 @@ impl TranspileContext {
                                 let method = prop.sym.to_string();
                                 if matches!(
                                     method.as_str(),
-                                    "push" | "pop" | "shift" | "unshift" | "splice" | "sort"
-                                        | "reverse" | "fill" | "set" | "delete" | "clear"
+                                    "push"
+                                        | "pop"
+                                        | "shift"
+                                        | "unshift"
+                                        | "splice"
+                                        | "sort"
+                                        | "reverse"
+                                        | "fill"
+                                        | "set"
+                                        | "delete"
+                                        | "clear"
                                 ) {
                                     self.mutated_vars.insert(obj.sym.to_string());
                                 }
@@ -475,7 +486,10 @@ impl TranspileContext {
                 if self.try_transpile_reactive(&name, init)? {
                     self.vars.insert(
                         name.clone(),
-                        VarInfo { rust_type: RustType::Dynamic, mutable: false },
+                        VarInfo {
+                            rust_type: RustType::Dynamic,
+                            mutable: false,
+                        },
                     );
                     continue;
                 }
@@ -860,7 +874,11 @@ impl TranspileContext {
                     if actual_type.needs_hashmap_import() {
                         self.needs_hashmap = true;
                     }
-                    def.push_str(&format!("    pub {}: {},\n", field_name, actual_type.to_rust_str()));
+                    def.push_str(&format!(
+                        "    pub {}: {},\n",
+                        field_name,
+                        actual_type.to_rust_str()
+                    ));
                 }
             }
         }
@@ -934,9 +952,7 @@ impl TranspileContext {
                 self.push(".await");
                 Ok(())
             }
-            Expr::TsAs(as_expr) => {
-                self.transpile_expr(&as_expr.expr)
-            }
+            Expr::TsAs(as_expr) => self.transpile_expr(&as_expr.expr),
             Expr::TsNonNull(nn) => self.transpile_expr(&nn.expr),
             _ => {
                 self.push("/* unsupported expr */");
@@ -1212,7 +1228,9 @@ impl TranspileContext {
             if let Expr::Arrow(arrow) = &*cb.expr {
                 self.push("|");
                 for (i, param) in arrow.params.iter().enumerate() {
-                    if i > 0 { self.push(", "); }
+                    if i > 0 {
+                        self.push(", ");
+                    }
                     self.push(&pat_to_string(param));
                 }
                 self.push("| ");
@@ -1425,7 +1443,9 @@ impl TranspileContext {
                         if let Prop::KeyValue(kv) = &**prop {
                             let key = match &kv.key {
                                 PropName::Ident(id) => id.sym.to_string(),
-                                PropName::Str(s) => format!("{:?}", &*s.value).trim_matches('"').to_string(),
+                                PropName::Str(s) => {
+                                    format!("{:?}", &*s.value).trim_matches('"').to_string()
+                                }
                                 _ => continue,
                             };
                             match key.as_str() {
@@ -1458,7 +1478,11 @@ impl TranspileContext {
                                                 if let Prop::KeyValue(hkv) = &**hp {
                                                     let hk = match &hkv.key {
                                                         PropName::Ident(id) => id.sym.to_string(),
-                                                        PropName::Str(s) => format!("{:?}", &*s.value).trim_matches('"').to_string(),
+                                                        PropName::Str(s) => {
+                                                            format!("{:?}", &*s.value)
+                                                                .trim_matches('"')
+                                                                .to_string()
+                                                        }
                                                         _ => continue,
                                                     };
                                                     if let Expr::Lit(Lit::Str(s)) = &*hkv.value {
@@ -1478,9 +1502,15 @@ impl TranspileContext {
                         }
                     }
                 }
-                if !has_method { self.push("method: Default::default(), "); }
-                if !has_body { self.push("body: None, "); }
-                if !has_headers { self.push("headers: std::collections::HashMap::new(), "); }
+                if !has_method {
+                    self.push("method: Default::default(), ");
+                }
+                if !has_body {
+                    self.push("body: None, ");
+                }
+                if !has_headers {
+                    self.push("headers: std::collections::HashMap::new(), ");
+                }
                 self.push("timeout_ms: None }");
             } else {
                 self.push("Default::default()");
@@ -1501,9 +1531,7 @@ impl TranspileContext {
         args: &[ExprOrSpread],
     ) -> Result<Option<()>> {
         let (obj_name, method_name) = match (&*member.obj, &member.prop) {
-            (Expr::Ident(obj), MemberProp::Ident(prop)) => {
-                (obj.sym.as_ref(), prop.sym.as_ref())
-            }
+            (Expr::Ident(obj), MemberProp::Ident(prop)) => (obj.sym.as_ref(), prop.sym.as_ref()),
             _ => return Ok(None),
         };
 
@@ -1597,11 +1625,7 @@ impl TranspileContext {
         Ok(())
     }
 
-    fn transpile_method_call(
-        &mut self,
-        member: &MemberExpr,
-        args: &[ExprOrSpread],
-    ) -> Result<()> {
+    fn transpile_method_call(&mut self, member: &MemberExpr, args: &[ExprOrSpread]) -> Result<()> {
         let method_name = match &member.prop {
             MemberProp::Ident(ident) => ident.sym.to_string(),
             _ => {
@@ -2137,7 +2161,10 @@ impl TranspileContext {
     /// Transpile `new Proxy(target, { get(...){}, set(...){} })` into
     /// `Value::object(JsObject::with_proxy(target_props, ProxyBuilder::new().get(...).build()))`.
     fn transpile_proxy_new(&mut self, new_expr: &NewExpr) -> Result<()> {
-        let args = new_expr.args.as_ref().ok_or_else(|| anyhow!("Proxy requires arguments"))?;
+        let args = new_expr
+            .args
+            .as_ref()
+            .ok_or_else(|| anyhow!("Proxy requires arguments"))?;
         if args.len() < 2 {
             self.push("/* Proxy requires target and handler */");
             return Ok(());
@@ -2243,9 +2270,7 @@ impl TranspileContext {
                 let target = params.first().map(|s| s.as_str()).unwrap_or("_target");
                 let prop = params.get(1).map(|s| s.as_str()).unwrap_or("_prop");
                 let receiver = params.get(2).map(|s| s.as_str()).unwrap_or("_receiver");
-                self.push(&format!(
-                    ".get(|{target}, {prop}: &str, {receiver}| {{\n"
-                ));
+                self.push(&format!(".get(|{target}, {prop}: &str, {receiver}| {{\n"));
             }
             "set" => {
                 let target = params.first().map(|s| s.as_str()).unwrap_or("_target");
@@ -2313,9 +2338,7 @@ impl TranspileContext {
                 let target = params.first().map(|s| s.as_str()).unwrap_or("_target");
                 let prop = params.get(1).map(|s| s.as_str()).unwrap_or("_prop");
                 let receiver = params.get(2).map(|s| s.as_str()).unwrap_or("_receiver");
-                self.push(&format!(
-                    ".get(|{target}, {prop}: &str, {receiver}| {{\n"
-                ));
+                self.push(&format!(".get(|{target}, {prop}: &str, {receiver}| {{\n"));
             }
             "set" => {
                 let target = params.first().map(|s| s.as_str()).unwrap_or("_target");
@@ -2390,9 +2413,7 @@ fn pat_to_string(pat: &Pat) -> String {
 
 fn pat_target_name(target: &AssignTarget) -> Option<String> {
     match target {
-        AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
-            Some(ident.sym.to_string())
-        }
+        AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => Some(ident.sym.to_string()),
         _ => None,
     }
 }
@@ -2430,10 +2451,12 @@ fn is_promise_race(member: &MemberExpr) -> bool {
 fn stmt_contains_await(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Expr(e) => expr_contains_await(&e.expr),
-        Stmt::Decl(Decl::Var(vd)) => vd
-            .decls
-            .iter()
-            .any(|d| d.init.as_ref().map(|e| expr_contains_await(e)).unwrap_or(false)),
+        Stmt::Decl(Decl::Var(vd)) => vd.decls.iter().any(|d| {
+            d.init
+                .as_ref()
+                .map(|e| expr_contains_await(e))
+                .unwrap_or(false)
+        }),
         Stmt::Return(r) => r
             .arg
             .as_ref()
@@ -2757,13 +2780,19 @@ mod tests {
     #[test]
     fn string_variable() {
         let rust = transpile_ok(r#"let name: string = "hello";"#);
-        assert!(rust.contains(r#"let name: String = "hello".to_string();"#), "got: {rust}");
+        assert!(
+            rust.contains(r#"let name: String = "hello".to_string();"#),
+            "got: {rust}"
+        );
     }
 
     #[test]
     fn function_declaration() {
         let rust = transpile_ok("function add(a: number, b: number): number { return a + b; }");
-        assert!(rust.contains("fn add(a: f64, b: f64) -> f64"), "got: {rust}");
+        assert!(
+            rust.contains("fn add(a: f64, b: f64) -> f64"),
+            "got: {rust}"
+        );
     }
 
     #[test]
@@ -2787,7 +2816,8 @@ mod tests {
 
     #[test]
     fn if_else() {
-        let rust = transpile_ok("let x = 5; if (x > 3) { console.log(x); } else { console.log(0); }");
+        let rust =
+            transpile_ok("let x = 5; if (x > 3) { console.log(x); } else { console.log(0); }");
         assert!(rust.contains("if x > 3"), "got: {rust}");
         assert!(rust.contains("} else {"), "got: {rust}");
     }
@@ -2809,7 +2839,8 @@ mod tests {
 
     #[test]
     fn for_of_loop() {
-        let rust = transpile_ok("let items = [1, 2, 3]; for (let item of items) { console.log(item); }");
+        let rust =
+            transpile_ok("let items = [1, 2, 3]; for (let item of items) { console.log(item); }");
         assert!(rust.contains("for item in &items"), "got: {rust}");
     }
 
@@ -2868,14 +2899,29 @@ mod tests {
             "#,
         );
         eprintln!("=== closure_make_counter ===\n{rust}\n=== end ===");
-        assert!(rust.contains("Rc::new(RefCell::new("), "missing Rc wrapping: {rust}");
+        assert!(
+            rust.contains("Rc::new(RefCell::new("),
+            "missing Rc wrapping: {rust}"
+        );
         assert!(rust.contains(".clone()"), "missing clone: {rust}");
         assert!(rust.contains("move |"), "missing move: {rust}");
         assert!(rust.contains("borrow_mut()"), "missing borrow_mut: {rust}");
-        assert!(rust.contains("Box::new("), "missing Box::new for returned closure: {rust}");
-        assert!(rust.contains("Box<dyn FnMut"), "missing FnMut return type: {rust}");
-        assert!(rust.contains("use std::rc::Rc;"), "missing Rc import: {rust}");
-        assert!(rust.contains("use std::cell::RefCell;"), "missing RefCell import: {rust}");
+        assert!(
+            rust.contains("Box::new("),
+            "missing Box::new for returned closure: {rust}"
+        );
+        assert!(
+            rust.contains("Box<dyn FnMut"),
+            "missing FnMut return type: {rust}"
+        );
+        assert!(
+            rust.contains("use std::rc::Rc;"),
+            "missing Rc import: {rust}"
+        );
+        assert!(
+            rust.contains("use std::cell::RefCell;"),
+            "missing RefCell import: {rust}"
+        );
     }
 
     #[test]
@@ -2890,19 +2936,28 @@ mod tests {
             "#,
         );
         eprintln!("=== closure_multiple_sharing ===\n{rust}\n=== end ===");
-        assert!(rust.contains("Rc::new(RefCell::new("), "missing Rc wrapping: {rust}");
-        let clone_count = rust.matches("x.clone()").count()
-            + rust.matches("x_c.clone()").count();
-        assert!(clone_count >= 2, "expected 2+ clones, got {clone_count}: {rust}");
+        assert!(
+            rust.contains("Rc::new(RefCell::new("),
+            "missing Rc wrapping: {rust}"
+        );
+        let clone_count = rust.matches("x.clone()").count() + rust.matches("x_c.clone()").count();
+        assert!(
+            clone_count >= 2,
+            "expected 2+ clones, got {clone_count}: {rust}"
+        );
     }
 
     #[test]
     fn closure_pure_lambda_no_rc() {
-        let rust = transpile_ok(
-            "let nums = [1, 2, 3]; let doubled = nums.map((x) => x * 2);",
+        let rust = transpile_ok("let nums = [1, 2, 3]; let doubled = nums.map((x) => x * 2);");
+        assert!(
+            !rust.contains("Rc::new"),
+            "pure lambda should not use Rc: {rust}"
         );
-        assert!(!rust.contains("Rc::new"), "pure lambda should not use Rc: {rust}");
-        assert!(!rust.contains("move |"), "pure lambda should not use move: {rust}");
+        assert!(
+            !rust.contains("move |"),
+            "pure lambda should not use move: {rust}"
+        );
         assert!(rust.contains("|x| x * 2"), "got: {rust}");
     }
 
@@ -2928,7 +2983,10 @@ mod tests {
             "#,
         );
         eprintln!("=== closure_captured_param ===\n{rust}\n=== end ===");
-        assert!(rust.contains("Rc::new(RefCell::new(x))"), "captured param should be wrapped: {rust}");
+        assert!(
+            rust.contains("Rc::new(RefCell::new(x))"),
+            "captured param should be wrapped: {rust}"
+        );
     }
 
     #[test]
@@ -2942,7 +3000,10 @@ mod tests {
             "#,
         );
         eprintln!("=== async_function_basic ===\n{rust}\n=== end ===");
-        assert!(rust.contains("async fn fetchData("), "missing async fn: {rust}");
+        assert!(
+            rust.contains("async fn fetchData("),
+            "missing async fn: {rust}"
+        );
         assert!(rust.contains(".await"), "missing .await: {rust}");
     }
 
@@ -2955,8 +3016,14 @@ mod tests {
             "#,
         );
         eprintln!("=== async_top_level_await ===\n{rust}\n=== end ===");
-        assert!(rust.contains("#[tokio::main]"), "missing tokio::main: {rust}");
-        assert!(rust.contains("async fn main()"), "missing async fn main: {rust}");
+        assert!(
+            rust.contains("#[tokio::main]"),
+            "missing tokio::main: {rust}"
+        );
+        assert!(
+            rust.contains("async fn main()"),
+            "missing async fn main: {rust}"
+        );
         assert!(rust.contains(".await"), "missing .await: {rust}");
     }
 
@@ -2970,7 +3037,10 @@ mod tests {
             "#,
         );
         eprintln!("=== promise_all ===\n{rust}\n=== end ===");
-        assert!(rust.contains("tokio::join!("), "missing tokio::join!: {rust}");
+        assert!(
+            rust.contains("tokio::join!("),
+            "missing tokio::join!: {rust}"
+        );
     }
 
     #[test]
@@ -2983,7 +3053,10 @@ mod tests {
             "#,
         );
         eprintln!("=== promise_race ===\n{rust}\n=== end ===");
-        assert!(rust.contains("tokio::select!"), "missing tokio::select!: {rust}");
+        assert!(
+            rust.contains("tokio::select!"),
+            "missing tokio::select!: {rust}"
+        );
     }
 
     #[test]
@@ -2997,9 +3070,15 @@ mod tests {
             "#,
         );
         eprintln!("=== closure_top_level_capture ===\n{rust}\n=== end ===");
-        assert!(rust.contains("Rc::new(RefCell::new("), "missing Rc wrapping: {rust}");
+        assert!(
+            rust.contains("Rc::new(RefCell::new("),
+            "missing Rc wrapping: {rust}"
+        );
         assert!(rust.contains("borrow_mut()"), "missing borrow_mut: {rust}");
-        assert!(rust.contains(".borrow().clone()"), "missing borrow for read: {rust}");
+        assert!(
+            rust.contains(".borrow().clone()"),
+            "missing borrow for read: {rust}"
+        );
     }
 
     // ── P3: Proxy transpilation tests ──────────────────────────────────
@@ -3019,11 +3098,26 @@ mod tests {
             "#,
         );
         eprintln!("=== proxy_basic_get_set ===\n{rust}\n=== end ===");
-        assert!(rust.contains("ProxyBuilder::new()"), "missing ProxyBuilder: {rust}");
-        assert!(rust.contains(".get(|target, prop: &str, receiver|"), "missing get trap: {rust}");
-        assert!(rust.contains(".set(|target, prop: &str, value: Value, receiver|"), "missing set trap: {rust}");
-        assert!(rust.contains("JsObject::with_proxy("), "missing with_proxy: {rust}");
-        assert!(rust.contains("use w3cos_core::"), "missing w3cos_core import: {rust}");
+        assert!(
+            rust.contains("ProxyBuilder::new()"),
+            "missing ProxyBuilder: {rust}"
+        );
+        assert!(
+            rust.contains(".get(|target, prop: &str, receiver|"),
+            "missing get trap: {rust}"
+        );
+        assert!(
+            rust.contains(".set(|target, prop: &str, value: Value, receiver|"),
+            "missing set trap: {rust}"
+        );
+        assert!(
+            rust.contains("JsObject::with_proxy("),
+            "missing with_proxy: {rust}"
+        );
+        assert!(
+            rust.contains("use w3cos_core::"),
+            "missing w3cos_core import: {rust}"
+        );
     }
 
     #[test]
@@ -3038,7 +3132,10 @@ mod tests {
             "#,
         );
         eprintln!("=== proxy_has_trap ===\n{rust}\n=== end ===");
-        assert!(rust.contains(".has(|target, prop: &str|"), "missing has trap: {rust}");
+        assert!(
+            rust.contains(".has(|target, prop: &str|"),
+            "missing has trap: {rust}"
+        );
     }
 
     #[test]
@@ -3053,7 +3150,10 @@ mod tests {
             "#,
         );
         eprintln!("=== proxy_delete_trap ===\n{rust}\n=== end ===");
-        assert!(rust.contains(".delete_property(|target, prop: &str|"), "missing deleteProperty trap: {rust}");
+        assert!(
+            rust.contains(".delete_property(|target, prop: &str|"),
+            "missing deleteProperty trap: {rust}"
+        );
     }
 
     #[test]
@@ -3062,7 +3162,8 @@ mod tests {
             r#"
             const p = new Proxy({}, { get(t, p, r) { return 0; } });
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(output.needs_core, "needs_core should be true for Proxy");
     }
 
@@ -3076,11 +3177,26 @@ mod tests {
             "#,
         );
         eprintln!("=== reactive_expands ===\n{rust}\n=== end ===");
-        assert!(rust.contains("Signal::new(0)"), "missing Signal::new(0): {rust}");
-        assert!(rust.contains("Signal::new(\"hello\""), "missing Signal::new(\"hello\"): {rust}");
-        assert!(rust.contains("let state_count"), "missing state_count: {rust}");
-        assert!(rust.contains("let state_name"), "missing state_name: {rust}");
-        assert!(rust.contains("use w3cos_core::"), "missing w3cos_core import: {rust}");
+        assert!(
+            rust.contains("Signal::new(0)"),
+            "missing Signal::new(0): {rust}"
+        );
+        assert!(
+            rust.contains("Signal::new(\"hello\""),
+            "missing Signal::new(\"hello\"): {rust}"
+        );
+        assert!(
+            rust.contains("let state_count"),
+            "missing state_count: {rust}"
+        );
+        assert!(
+            rust.contains("let state_name"),
+            "missing state_name: {rust}"
+        );
+        assert!(
+            rust.contains("use w3cos_core::"),
+            "missing w3cos_core import: {rust}"
+        );
     }
 
     #[test]
@@ -3104,7 +3220,10 @@ mod tests {
             "#,
         );
         eprintln!("=== reactive_assign ===\n{rust}\n=== end ===");
-        assert!(rust.contains("state_count.set(42)"), "missing .set(42): {rust}");
+        assert!(
+            rust.contains("state_count.set(42)"),
+            "missing .set(42): {rust}"
+        );
     }
 
     #[test]
@@ -3116,7 +3235,10 @@ mod tests {
             "#,
         );
         eprintln!("=== reactive_update ===\n{rust}\n=== end ===");
-        assert!(rust.contains("state_count.update(|_v| _v + 1)"), "missing .update(): {rust}");
+        assert!(
+            rust.contains("state_count.update(|_v| _v + 1)"),
+            "missing .update(): {rust}"
+        );
     }
 
     #[test]
@@ -3130,8 +3252,14 @@ mod tests {
             "#,
         );
         eprintln!("=== watch ===\n{rust}\n=== end ===");
-        assert!(rust.contains("watch(&state_count"), "missing watch(&state_count): {rust}");
-        assert!(rust.contains("|newVal, oldVal|"), "missing callback params: {rust}");
+        assert!(
+            rust.contains("watch(&state_count"),
+            "missing watch(&state_count): {rust}"
+        );
+        assert!(
+            rust.contains("|newVal, oldVal|"),
+            "missing callback params: {rust}"
+        );
     }
 
     #[test]
@@ -3143,8 +3271,14 @@ mod tests {
             "#,
         );
         eprintln!("=== computed ===\n{rust}\n=== end ===");
-        assert!(rust.contains("Computed::new(||"), "missing Computed::new: {rust}");
-        assert!(rust.contains("state_count.get()"), "missing state_count.get(): {rust}");
+        assert!(
+            rust.contains("Computed::new(||"),
+            "missing Computed::new: {rust}"
+        );
+        assert!(
+            rust.contains("state_count.get()"),
+            "missing state_count.get(): {rust}"
+        );
     }
 
     #[test]
@@ -3158,7 +3292,10 @@ mod tests {
             "#,
         );
         eprintln!("=== effect ===\n{rust}\n=== end ===");
-        assert!(rust.contains("Effect::new(||"), "missing Effect::new: {rust}");
+        assert!(
+            rust.contains("Effect::new(||"),
+            "missing Effect::new: {rust}"
+        );
     }
 
     #[test]
@@ -3167,7 +3304,8 @@ mod tests {
             r#"
             const state = reactive({ x: 1 });
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(output.needs_core, "needs_core should be true for reactive");
     }
 
@@ -3177,7 +3315,8 @@ mod tests {
             r#"
             const p = new Proxy({}, { get(t, p, r) { return 0; } });
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(output.needs_core);
 
         let flags = crate::CompileFlags {
@@ -3192,13 +3331,19 @@ mod tests {
             needs_std: false,
         };
         let toml = crate::generate_standalone_cargo_toml(&flags);
-        assert!(toml.contains("w3cos-core"), "missing w3cos-core dep: {toml}");
+        assert!(
+            toml.contains("w3cos-core"),
+            "missing w3cos-core dep: {toml}"
+        );
     }
 
     #[test]
     fn history_push_state() {
         let rust = transpile_ok(r#"history.pushState(null, "", "/page2");"#);
-        assert!(rust.contains("w3cos_runtime::history::push_state("), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::push_state("),
+            "got: {rust}"
+        );
         assert!(rust.contains("None"), "null should map to None: {rust}");
         assert!(rust.contains("\"/page2\""), "got: {rust}");
     }
@@ -3206,16 +3351,25 @@ mod tests {
     #[test]
     fn history_replace_state() {
         let rust = transpile_ok(r#"history.replaceState("data", "title", "/new");"#);
-        assert!(rust.contains("w3cos_runtime::history::replace_state("), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::replace_state("),
+            "got: {rust}"
+        );
     }
 
     #[test]
     fn history_back_forward_go() {
         let rust = transpile_ok("history.back();");
-        assert!(rust.contains("w3cos_runtime::history::back()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::back()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("history.forward();");
-        assert!(rust.contains("w3cos_runtime::history::forward()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::forward()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("history.go(-2);");
         assert!(rust.contains("w3cos_runtime::history::go("), "got: {rust}");
@@ -3224,37 +3378,67 @@ mod tests {
     #[test]
     fn history_length_and_state() {
         let rust = transpile_ok("let len = history.length;");
-        assert!(rust.contains("w3cos_runtime::history::get_length()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_length()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("let s = history.state;");
-        assert!(rust.contains("w3cos_runtime::history::get_state()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_state()"),
+            "got: {rust}"
+        );
     }
 
     #[test]
     fn location_properties() {
         let rust = transpile_ok("let p = location.pathname;");
-        assert!(rust.contains("w3cos_runtime::history::get_pathname()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_pathname()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("let h = location.hash;");
-        assert!(rust.contains("w3cos_runtime::history::get_hash()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_hash()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("let s = location.search;");
-        assert!(rust.contains("w3cos_runtime::history::get_search()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_search()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("let h = location.href;");
-        assert!(rust.contains("w3cos_runtime::history::get_href()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_href()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("let o = location.origin;");
-        assert!(rust.contains("w3cos_runtime::history::get_origin()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_origin()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("let hn = location.hostname;");
-        assert!(rust.contains("w3cos_runtime::history::get_hostname()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_hostname()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("let pt = location.port;");
-        assert!(rust.contains("w3cos_runtime::history::get_port()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_port()"),
+            "got: {rust}"
+        );
 
         let rust = transpile_ok("let pr = location.protocol;");
-        assert!(rust.contains("w3cos_runtime::history::get_protocol()"), "got: {rust}");
+        assert!(
+            rust.contains("w3cos_runtime::history::get_protocol()"),
+            "got: {rust}"
+        );
     }
 
     #[test]
@@ -3263,9 +3447,15 @@ mod tests {
         assert!(output.needs_history, "needs_history should be true");
 
         let output = transpile_with_flags("let x = location.pathname;").unwrap();
-        assert!(output.needs_history, "needs_history should be true for location access");
+        assert!(
+            output.needs_history,
+            "needs_history should be true for location access"
+        );
 
         let output = transpile_with_flags(r#"console.log("no history");"#).unwrap();
-        assert!(!output.needs_history, "needs_history should be false when unused");
+        assert!(
+            !output.needs_history,
+            "needs_history should be false when unused"
+        );
     }
 }

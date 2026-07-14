@@ -62,7 +62,9 @@ impl ProxyHandler {
 }
 
 impl Default for ProxyHandler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Fluent builder for constructing a `ProxyHandler` trap by trap.
@@ -74,7 +76,9 @@ pub struct ProxyBuilder {
 
 impl ProxyBuilder {
     pub fn new() -> Self {
-        Self { handler: ProxyHandler::new() }
+        Self {
+            handler: ProxyHandler::new(),
+        }
     }
 
     pub fn get(mut self, f: impl Fn(&Value, &str, &Value) -> Value + 'static) -> Self {
@@ -105,10 +109,7 @@ impl ProxyBuilder {
         self
     }
 
-    pub fn define_property(
-        mut self,
-        f: impl Fn(&Value, &str, &Value) -> bool + 'static,
-    ) -> Self {
+    pub fn define_property(mut self, f: impl Fn(&Value, &str, &Value) -> bool + 'static) -> Self {
         self.handler.define_property = Some(Rc::new(f));
         self
     }
@@ -118,18 +119,12 @@ impl ProxyBuilder {
         self
     }
 
-    pub fn apply(
-        mut self,
-        f: impl Fn(&Value, &Value, Vec<Value>) -> Value + 'static,
-    ) -> Self {
+    pub fn apply(mut self, f: impl Fn(&Value, &Value, Vec<Value>) -> Value + 'static) -> Self {
         self.handler.apply = Some(Rc::new(f));
         self
     }
 
-    pub fn construct(
-        mut self,
-        f: impl Fn(&Value, Vec<Value>, &Value) -> Value + 'static,
-    ) -> Self {
+    pub fn construct(mut self, f: impl Fn(&Value, Vec<Value>, &Value) -> Value + 'static) -> Self {
         self.handler.construct = Some(Rc::new(f));
         self
     }
@@ -160,5 +155,7 @@ impl ProxyBuilder {
 }
 
 impl Default for ProxyBuilder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

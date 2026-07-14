@@ -31,7 +31,11 @@ impl LowerCtx {
     }
 
     pub fn lower_stmts(&mut self, stmts: &[Stmt]) -> String {
-        stmts.iter().map(|s| self.lower_stmt(s)).collect::<Vec<_>>().join("\n")
+        stmts
+            .iter()
+            .map(|s| self.lower_stmt(s))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn lower_stmt(&mut self, stmt: &Stmt) -> String {
@@ -61,9 +65,15 @@ impl LowerCtx {
             Stmt::While(while_stmt) => {
                 let test = self.lower_expr(&while_stmt.test);
                 let body = self.lower_stmt(&while_stmt.body);
-                format!("{}while {} {{\n{}\n{}}}", self.pad(), test, body, self.pad())
+                format!(
+                    "{}while {} {{\n{}\n{}}}",
+                    self.pad(),
+                    test,
+                    body,
+                    self.pad()
+                )
             }
-// PLACEHOLDER_REMAINING_STMTS
+            // PLACEHOLDER_REMAINING_STMTS
             Stmt::Try(try_stmt) => self.lower_try(try_stmt),
             Stmt::Throw(throw_stmt) => {
                 let arg = self.lower_expr(&throw_stmt.arg);
@@ -77,31 +87,56 @@ impl LowerCtx {
                 let body = self.lower_stmt(&do_while.body);
                 self.indent -= 4;
                 let test = self.lower_expr(&do_while.test);
-                format!("{}loop {{\n{}\n{}if !({}) {{ break; }}\n{}}}", self.pad(), body, " ".repeat(self.indent + 4), test, self.pad())
+                format!(
+                    "{}loop {{\n{}\n{}if !({}) {{ break; }}\n{}}}",
+                    self.pad(),
+                    body,
+                    " ".repeat(self.indent + 4),
+                    test,
+                    self.pad()
+                )
             }
             Stmt::ForIn(for_in) => {
                 let right = self.lower_expr(&for_in.right);
                 let left = match &for_in.left {
-                    ForHead::VarDecl(vd) => vd.decls.first().map(|d| self.lower_pat(&d.name)).unwrap_or_else(|| "_".to_string()),
+                    ForHead::VarDecl(vd) => vd
+                        .decls
+                        .first()
+                        .map(|d| self.lower_pat(&d.name))
+                        .unwrap_or_else(|| "_".to_string()),
                     ForHead::Pat(p) => self.lower_pat(p),
                     _ => "_".to_string(),
                 };
                 self.indent += 4;
                 let body = self.lower_stmt(&for_in.body);
                 self.indent -= 4;
-                format!("{}for {left} in {right} {{\n{}\n{}}}", self.pad(), body, self.pad())
+                format!(
+                    "{}for {left} in {right} {{\n{}\n{}}}",
+                    self.pad(),
+                    body,
+                    self.pad()
+                )
             }
             Stmt::ForOf(for_of) => {
                 let right = self.lower_expr(&for_of.right);
                 let left = match &for_of.left {
-                    ForHead::VarDecl(vd) => vd.decls.first().map(|d| self.lower_pat(&d.name)).unwrap_or_else(|| "_".to_string()),
+                    ForHead::VarDecl(vd) => vd
+                        .decls
+                        .first()
+                        .map(|d| self.lower_pat(&d.name))
+                        .unwrap_or_else(|| "_".to_string()),
                     ForHead::Pat(p) => self.lower_pat(p),
                     _ => "_".to_string(),
                 };
                 self.indent += 4;
                 let body = self.lower_stmt(&for_of.body);
                 self.indent -= 4;
-                format!("{}for {left} in {right}.iter() {{\n{}\n{}}}", self.pad(), body, self.pad())
+                format!(
+                    "{}for {left} in {right}.iter() {{\n{}\n{}}}",
+                    self.pad(),
+                    body,
+                    self.pad()
+                )
             }
             Stmt::Labeled(labeled) => {
                 let label = atom_str(&labeled.label.sym);
@@ -148,7 +183,11 @@ impl LowerCtx {
                     .as_ref()
                     .map(|b| self.lower_stmts(&b.stmts))
                     .unwrap_or_default();
-                format!("{}fn {name}({params}) {{\n{body}\n{}}}", self.pad(), self.pad())
+                format!(
+                    "{}fn {name}({params}) {{\n{body}\n{}}}",
+                    self.pad(),
+                    self.pad()
+                )
             }
             _ => format!("{}/* unsupported decl */", self.pad()),
         }
@@ -222,7 +261,13 @@ impl LowerCtx {
         self.indent += 4;
         let try_body = self.lower_stmts(&try_stmt.block.stmts);
         self.indent -= 4;
-        let mut out = format!("{}// try\n{}{{\n{}\n{}}}", self.pad(), self.pad(), try_body, self.pad());
+        let mut out = format!(
+            "{}// try\n{}{{\n{}\n{}}}",
+            self.pad(),
+            self.pad(),
+            try_body,
+            self.pad()
+        );
         if let Some(handler) = &try_stmt.handler {
             let param = handler
                 .param
@@ -234,7 +279,10 @@ impl LowerCtx {
             self.indent -= 4;
             out.push_str(&format!(
                 "\n{}// catch ({param})\n{}{{\n{}\n{}}}",
-                self.pad(), self.pad(), catch_body, self.pad()
+                self.pad(),
+                self.pad(),
+                catch_body,
+                self.pad()
             ));
         }
         if let Some(finalizer) = &try_stmt.finalizer {
@@ -243,7 +291,10 @@ impl LowerCtx {
             self.indent -= 4;
             out.push_str(&format!(
                 "\n{}// finally\n{}{{\n{}\n{}}}",
-                self.pad(), self.pad(), fin_body, self.pad()
+                self.pad(),
+                self.pad(),
+                fin_body,
+                self.pad()
             ));
         }
         out
@@ -259,7 +310,13 @@ impl LowerCtx {
                 None => "_".to_string(),
             };
             let body = self.lower_stmts(&case.cons);
-            out.push_str(&format!("{}{} => {{\n{}\n{}}}\n", self.pad(), pat, body, self.pad()));
+            out.push_str(&format!(
+                "{}{} => {{\n{}\n{}}}\n",
+                self.pad(),
+                pat,
+                body,
+                self.pad()
+            ));
         }
         self.indent -= 4;
         out.push_str(&format!("{}}}", self.pad()));
@@ -275,7 +332,12 @@ impl LowerCtx {
                 let args = new_expr
                     .args
                     .as_ref()
-                    .map(|a| a.iter().map(|arg| self.lower_expr(&arg.expr)).collect::<Vec<_>>().join(", "))
+                    .map(|a| {
+                        a.iter()
+                            .map(|arg| self.lower_expr(&arg.expr))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
                     .unwrap_or_default();
                 format!("{callee}::new({args})")
             }
@@ -306,7 +368,11 @@ impl LowerCtx {
             }
             Expr::Update(update) => {
                 let arg = self.lower_expr(&update.arg);
-                let op = if update.op == UpdateOp::PlusPlus { "+= 1" } else { "-= 1" };
+                let op = if update.op == UpdateOp::PlusPlus {
+                    "+= 1"
+                } else {
+                    "-= 1"
+                };
                 format!("{arg} {op}")
             }
             Expr::Paren(paren) => {
@@ -373,13 +439,19 @@ impl LowerCtx {
                         parts.push(format!("\"{raw}\""));
                     }
                     if i < tpl.exprs.len() {
-                        parts.push(format!("&format!(\"{{}}\", {})", self.lower_expr(&tpl.exprs[i])));
+                        parts.push(format!(
+                            "&format!(\"{{}}\", {})",
+                            self.lower_expr(&tpl.exprs[i])
+                        ));
                     }
                 }
                 if parts.is_empty() {
                     "String::new()".to_string()
                 } else {
-                    format!("format!(\"{{}}\"{})", parts.iter().map(|p| format!(", {p}")).collect::<String>())
+                    format!(
+                        "format!(\"{{}}\"{})",
+                        parts.iter().map(|p| format!(", {p}")).collect::<String>()
+                    )
                 }
             }
             Expr::This(_) => "self".to_string(),
@@ -401,30 +473,41 @@ impl LowerCtx {
                     if setup.is_empty() {
                         last.clone()
                     } else {
-                        format!("{{ {}; {} }}", setup.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; "), last)
+                        format!(
+                            "{{ {}; {} }}",
+                            setup
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                            last
+                        )
                     }
                 } else {
                     "()".to_string()
                 }
             }
-            Expr::OptChain(opt) => {
-                match opt.base.as_ref() {
-                    OptChainBase::Member(member) => {
-                        let obj = self.lower_expr(&member.obj);
-                        let prop = match &member.prop {
-                            MemberProp::Ident(id) => format!(".{}", atom_str(&id.sym)),
-                            MemberProp::Computed(c) => format!("[{}]", self.lower_expr(&c.expr)),
-                            MemberProp::PrivateName(p) => format!(".{}", atom_str(&p.name)),
-                        };
-                        format!("{obj}.as_ref().map(|v| v{prop})")
-                    }
-                    OptChainBase::Call(call) => {
-                        let callee = self.lower_expr(&call.callee);
-                        let args = call.args.iter().map(|a| self.lower_expr(&a.expr)).collect::<Vec<_>>().join(", ");
-                        format!("{callee}.map(|f| f({args}))")
-                    }
+            Expr::OptChain(opt) => match opt.base.as_ref() {
+                OptChainBase::Member(member) => {
+                    let obj = self.lower_expr(&member.obj);
+                    let prop = match &member.prop {
+                        MemberProp::Ident(id) => format!(".{}", atom_str(&id.sym)),
+                        MemberProp::Computed(c) => format!("[{}]", self.lower_expr(&c.expr)),
+                        MemberProp::PrivateName(p) => format!(".{}", atom_str(&p.name)),
+                    };
+                    format!("{obj}.as_ref().map(|v| v{prop})")
                 }
-            }
+                OptChainBase::Call(call) => {
+                    let callee = self.lower_expr(&call.callee);
+                    let args = call
+                        .args
+                        .iter()
+                        .map(|a| self.lower_expr(&a.expr))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{callee}.map(|f| f({args}))")
+                }
+            },
             Expr::Yield(yield_expr) => {
                 let arg = yield_expr
                     .arg
@@ -592,12 +675,11 @@ pub fn sanitize_ident(name: &str) -> String {
     }
     // Avoid Rust reserved keywords
     match out.as_str() {
-        "self" | "Self" | "super" | "crate" | "type" | "fn" | "mod" | "pub"
-        | "let" | "mut" | "ref" | "use" | "impl" | "trait" | "struct" | "enum"
-        | "match" | "if" | "else" | "for" | "while" | "loop" | "break"
-        | "continue" | "return" | "where" | "as" | "in" | "move" | "async"
-        | "await" | "dyn" | "static" | "const" | "unsafe" | "extern" | "true"
-        | "false" => {
+        "self" | "Self" | "super" | "crate" | "type" | "fn" | "mod" | "pub" | "let" | "mut"
+        | "ref" | "use" | "impl" | "trait" | "struct" | "enum" | "match" | "if" | "else"
+        | "for" | "while" | "loop" | "break" | "continue" | "return" | "where" | "as" | "in"
+        | "move" | "async" | "await" | "dyn" | "static" | "const" | "unsafe" | "extern"
+        | "true" | "false" => {
             out.push('_');
             out
         }
@@ -661,8 +743,8 @@ fn expr_kind_name(expr: &Expr) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swc_common::{sync::Lrc, FileName, SourceMap};
-    use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsSyntax};
+    use swc_common::{FileName, SourceMap, sync::Lrc};
+    use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 
     fn parse_stmts(code: &str) -> Vec<Stmt> {
         let cm: Lrc<SourceMap> = Default::default();
@@ -691,7 +773,10 @@ mod tests {
         let mut ctx = LowerCtx::new(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(code.contains("let x = 42"), "const → let: {code}");
-        assert!(code.contains("let mut y = \"hello\""), "let → let mut: {code}");
+        assert!(
+            code.contains("let mut y = \"hello\""),
+            "let → let mut: {code}"
+        );
     }
 
     #[test]
@@ -700,7 +785,10 @@ mod tests {
         let renames = vec![("EditorView".to_string(), "m1_EditorView".to_string())];
         let mut ctx = LowerCtx::new(renames);
         let code = ctx.lower_stmts(&stmts);
-        assert!(code.contains("m1_EditorView::new("), "new X() → X::new(): {code}");
+        assert!(
+            code.contains("m1_EditorView::new("),
+            "new X() → X::new(): {code}"
+        );
     }
 
     #[test]
@@ -731,7 +819,10 @@ mod tests {
         assert!(code.contains("loop"), "for → loop: {code}");
         assert!(code.contains("break"), "break condition: {code}");
         // init should appear before loop, not inside a comment
-        assert!(code.contains("let mut i = 0;"), "init declared before loop: {code}");
+        assert!(
+            code.contains("let mut i = 0;"),
+            "init declared before loop: {code}"
+        );
         // no double semicolons
         assert!(!code.contains(";;"), "no double semicolons: {code}");
         // update should appear

@@ -40,7 +40,11 @@ impl Atom {
     pub fn as_str(&self) -> String {
         INTERN_TABLE.with(|t| {
             let table = t.borrow();
-            table.strings.get(self.0 as usize).cloned().unwrap_or_default()
+            table
+                .strings
+                .get(self.0 as usize)
+                .cloned()
+                .unwrap_or_default()
         })
     }
 
@@ -80,51 +84,51 @@ impl InternTable {
         };
         // Pre-intern common strings (index 0 = empty)
         let preinterned = [
-            "",           // 0
-            "#document",  // 1
-            "#text",      // 2
-            "body",       // 3
-            "div",        // 4
-            "span",       // 5
-            "p",          // 6
-            "button",     // 7
-            "input",      // 8
-            "a",          // 9
-            "img",        // 10
-            "h1",         // 11
-            "h2",         // 12
-            "h3",         // 13
-            "h4",         // 14
-            "h5",         // 15
-            "h6",         // 16
-            "section",    // 17
-            "main",       // 18
-            "article",    // 19
-            "nav",        // 20
-            "header",     // 21
-            "footer",     // 22
-            "aside",      // 23
-            "form",       // 24
-            "label",      // 25
-            "ul",         // 26
-            "ol",         // 27
-            "li",         // 28
-            "em",         // 29
-            "strong",     // 30
-            "code",       // 31
-            "pre",        // 32
-            "table",      // 33
-            "tr",         // 34
-            "td",         // 35
-            "th",         // 36
-            "id",         // 37
-            "class",      // 38
-            "src",        // 39
-            "href",       // 40
-            "type",       // 41
-            "placeholder",// 42
-            "style",      // 43
-            "value",      // 44
+            "",            // 0
+            "#document",   // 1
+            "#text",       // 2
+            "body",        // 3
+            "div",         // 4
+            "span",        // 5
+            "p",           // 6
+            "button",      // 7
+            "input",       // 8
+            "a",           // 9
+            "img",         // 10
+            "h1",          // 11
+            "h2",          // 12
+            "h3",          // 13
+            "h4",          // 14
+            "h5",          // 15
+            "h6",          // 16
+            "section",     // 17
+            "main",        // 18
+            "article",     // 19
+            "nav",         // 20
+            "header",      // 21
+            "footer",      // 22
+            "aside",       // 23
+            "form",        // 24
+            "label",       // 25
+            "ul",          // 26
+            "ol",          // 27
+            "li",          // 28
+            "em",          // 29
+            "strong",      // 30
+            "code",        // 31
+            "pre",         // 32
+            "table",       // 33
+            "tr",          // 34
+            "td",          // 35
+            "th",          // 36
+            "id",          // 37
+            "class",       // 38
+            "src",         // 39
+            "href",        // 40
+            "type",        // 41
+            "placeholder", // 42
+            "style",       // 43
+            "value",       // 44
         ];
         for s in &preinterned {
             let id = t.strings.len() as u32;

@@ -91,9 +91,7 @@ pub fn clear() {
 
 /// `localStorage.key(index)` — returns the key at the given index.
 pub fn key(index: usize) -> Option<String> {
-    with_storage(|s| {
-        s.data.keys().nth(index).cloned()
-    })
+    with_storage(|s| s.data.keys().nth(index).cloned())
 }
 
 /// `localStorage.length`

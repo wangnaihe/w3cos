@@ -30,13 +30,7 @@ pub fn register_signal_name(name: &str) {
 }
 
 fn signal_id(name: &str) -> usize {
-    SIGNAL_NAMES.with(|names| {
-        names
-            .borrow()
-            .iter()
-            .position(|n| n == name)
-            .unwrap_or(0)
-    })
+    SIGNAL_NAMES.with(|names| names.borrow().iter().position(|n| n == name).unwrap_or(0))
 }
 
 /// Parse onClick action strings emitted by w3cos-compiler.

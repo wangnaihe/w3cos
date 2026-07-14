@@ -56,11 +56,7 @@ fn merge_orphan_punctuation_lines(lines: &mut Vec<String>) {
     }
 }
 
-fn wrap_greedy<F>(
-    text: &str,
-    max_width: f32,
-    mut char_width: F,
-) -> Vec<String>
+fn wrap_greedy<F>(text: &str, max_width: f32, mut char_width: F) -> Vec<String>
 where
     F: FnMut(char) -> f32,
 {
@@ -87,15 +83,17 @@ where
         let cw = char_width(ch);
         if !current.is_empty() && current_w + cw > max_width {
             if may_not_start_line(ch) {
-                current.push(ch);
-                current_w += cw;
-                continue;
-            }
-            if current
-                .chars()
-                .last()
-                .is_some_and(may_not_end_line)
-            {
+                // Keep closing punctuation with the preceding character
+                // without letting the completed line exceed its paint box.
+                // Moving one character is the usual CJK kinsoku fallback.
+                if let Some(last) = current.pop() {
+                    let last_w = char_width(last);
+                    current_w = (current_w - last_w).max(0.0);
+                    flush(&mut lines, &mut current, &mut current_w);
+                    current.push(last);
+                    current_w = last_w;
+                }
+            } else if current.chars().last().is_some_and(may_not_end_line) {
                 let last = current.pop().unwrap();
                 flush(&mut lines, &mut current, &mut current_w);
                 current.push(last);
@@ -179,10 +177,13 @@ pub fn text_intrinsic_size_estimate(content: &str, style: &Style, wrap_width: f3
         let w = measure_text_width_estimate(content, style.font_size)
             + style.padding_lengths().left
             + style.padding_lengths().right;
-        let h = style.font_size * style.line_height + style.padding_lengths().top + style.padding_lengths().bottom;
+        let h = style.font_size * style.line_height
+            + style.padding_lengths().top
+            + style.padding_lengths().bottom;
         return (w, h);
     }
-    let inner_w = (wrap_width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
+    let inner_w =
+        (wrap_width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
     let (lines, h) = wrap_text_estimate(
         content,
         inner_w,
@@ -219,14 +220,9 @@ pub fn text_intrinsic_size_font(
             + style.padding_lengths().bottom;
         return (w, h);
     }
-    let inner_w = (wrap_width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
-    let lines = wrap_text_font(
-        content,
-        inner_w,
-        style.font_size,
-        font,
-        style.white_space,
-    );
+    let inner_w =
+        (wrap_width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
+    let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
     let line_h = style.font_size * style.line_height;
     let h = if lines.len() == 1 {
         single_line_content_height(&lines[0], style.font_size, style.line_height, font)
@@ -243,15 +239,14 @@ pub fn text_intrinsic_size_font(
     )
 }
 
-pub fn wrapped_block_height_font(content: &str, width: f32, style: &Style, font: &fontdue::Font) -> f32 {
+pub fn wrapped_block_height_font(
+    content: &str,
+    width: f32,
+    style: &Style,
+    font: &fontdue::Font,
+) -> f32 {
     let inner_w = (width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
-    let lines = wrap_text_font(
-        content,
-        inner_w,
-        style.font_size,
-        font,
-        style.white_space,
-    );
+    let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
     let line_h = style.font_size * style.line_height;
     let block_h = if lines.len() == 1 {
         single_line_content_height(&lines[0], style.font_size, style.line_height, font)
@@ -262,7 +257,11 @@ pub fn wrapped_block_height_font(content: &str, width: f32, style: &Style, font:
 }
 
 /// Top/bottom extents relative to baseline at y = 0 (same coords as [`draw_text_line`]).
-pub fn single_line_vertical_metrics(text: &str, font_size: f32, font: &fontdue::Font) -> (f32, f32) {
+pub fn single_line_vertical_metrics(
+    text: &str,
+    font_size: f32,
+    font: &fontdue::Font,
+) -> (f32, f32) {
     let mut top = f32::MAX;
     let mut bottom = f32::MIN;
     for ch in text.chars() {
@@ -296,7 +295,12 @@ pub fn y_for_draw_text_line_centered(
     baseline - font_size
 }
 
-pub fn single_line_content_height(text: &str, font_size: f32, line_height: f32, font: &fontdue::Font) -> f32 {
+pub fn single_line_content_height(
+    text: &str,
+    font_size: f32,
+    line_height: f32,
+    font: &fontdue::Font,
+) -> f32 {
     let (top, bottom) = single_line_vertical_metrics(text, font_size, font);
     let visual = bottom - top;
     visual.max(font_size * line_height)
@@ -417,6 +421,18 @@ mod tests {
     }
 
     #[test]
+    fn cjk_closing_punctuation_stays_inside_wrap_width() {
+        let max_width = 4.0;
+        let lines = wrap_greedy("甲乙丙丁。戊", max_width, |_| 1.0);
+        assert_eq!(lines, vec!["甲乙丙", "丁。戊"]);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().count() as f32 <= max_width)
+        );
+    }
+
+    #[test]
     fn vertical_metrics_orders_top_bottom() {
         let data = include_bytes!("../assets/CJK-Subset.ttf");
         let font =
@@ -442,5 +458,17 @@ mod tests {
         let center_y = box_top + box_h * 0.5;
         let ink_center_y = ink_after.top + ink_after.height * 0.5;
         assert!((ink_center_y - center_y).abs() < 0.6);
+    }
+
+    #[test]
+    fn embedded_font_covers_common_simplified_chinese_input() {
+        let data = include_bytes!("../assets/CJK-Subset.ttf");
+        let font =
+            fontdue::Font::from_bytes(data as &[u8], fontdue::FontSettings::default()).unwrap();
+
+        for ch in "我说的是啥的都是和聊天候选输入法上海→杭州★▼×".chars()
+        {
+            assert_ne!(font.lookup_glyph_index(ch), 0, "missing glyph for {ch}");
+        }
     }
 }

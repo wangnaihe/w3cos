@@ -208,8 +208,12 @@ impl Document {
                 n.text_content = node.text_content.clone();
                 n
             }
-            NodeType::Text => DomNode::new_text(NodeId(0), node.text_content.as_deref().unwrap_or("")),
-            NodeType::Comment => DomNode::new_comment(NodeId(0), node.text_content.as_deref().unwrap_or("")),
+            NodeType::Text => {
+                DomNode::new_text(NodeId(0), node.text_content.as_deref().unwrap_or(""))
+            }
+            NodeType::Comment => {
+                DomNode::new_comment(NodeId(0), node.text_content.as_deref().unwrap_or(""))
+            }
             NodeType::DocumentFragment => DomNode::new_document_fragment(NodeId(0)),
             NodeType::Document => DomNode::new_element(NodeId(0), "div"),
         };
@@ -559,8 +563,7 @@ impl Document {
                             w3cos_std::Component::column(style, children)
                         }
                     }
-                    "span" | "label" | "em" | "strong" | "code" | "small" | "li" | "dd"
-                    | "dt" => {
+                    "span" | "label" | "em" | "strong" | "code" | "small" | "li" | "dd" | "dt" => {
                         if let Some(text) = &node.text_content {
                             if children.is_empty() {
                                 return w3cos_std::Component::text(text, style);
@@ -798,9 +801,7 @@ impl Document {
 
         let (input_type, inserted_text) = match key {
             // Printable character — insert
-            k if k.len() == 1 && !ctrl && !meta => {
-                (InputType::InsertText, Some(k.to_string()))
-            }
+            k if k.len() == 1 && !ctrl && !meta => (InputType::InsertText, Some(k.to_string())),
             "Enter" => (InputType::InsertParagraph, Some("\n".to_string())),
             "Backspace" => (InputType::DeleteContentBackward, None),
             "Delete" => (InputType::DeleteContentForward, None),
@@ -861,12 +862,7 @@ impl Document {
 
     /// Handle IME composition events on a `contenteditable` element.
     /// `phase`: "start" | "update" | "end"
-    pub fn handle_composition(
-        &mut self,
-        target: NodeId,
-        phase: &str,
-        data: &str,
-    ) {
+    pub fn handle_composition(&mut self, target: NodeId, phase: &str, data: &str) {
         use crate::events::{Event, EventData, EventType, InputType};
 
         let editable_id = match self.editable_root(target) {
@@ -882,7 +878,9 @@ impl Document {
 
         let mut comp_event = Event::new(event_type, editable_id);
         comp_event.bubbles = true;
-        comp_event.data = EventData::Composition { data: data.to_string() };
+        comp_event.data = EventData::Composition {
+            data: data.to_string(),
+        };
         self.dispatch_event_bubbling(&mut comp_event);
 
         // On compositionend, fire an InputEvent with insertCompositionText

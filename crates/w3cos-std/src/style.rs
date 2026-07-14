@@ -283,9 +283,12 @@ impl Spacing {
                 safe_area,
                 keyboard_inset,
             } => {
-                *px
-                    + safe_area.map(|e| insets.value(e)).unwrap_or(0.0)
-                    + if *keyboard_inset { keyboard_bottom } else { 0.0 }
+                *px + safe_area.map(|e| insets.value(e)).unwrap_or(0.0)
+                    + if *keyboard_inset {
+                        keyboard_bottom
+                    } else {
+                        0.0
+                    }
             }
         }
     }

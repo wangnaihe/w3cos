@@ -1,16 +1,20 @@
 //! Integration tests for new W3C standard APIs
 //! Tests: ReadableStream, EventSource, Canvas2D, Clipboard, contenteditable, FileSystemObserver, FontFace
 
-use w3cos_runtime::streams::{ReadableStream, ReadResult};
+use std::io::Cursor;
+use std::thread;
+use std::time::Duration;
+use w3cos_dom::document::Document;
+use w3cos_dom::events::{EventData, EventType, InputType};
 use w3cos_runtime::canvas2d::CanvasRenderingContext2D;
 use w3cos_runtime::clipboard::{Clipboard, ClipboardItem};
-use w3cos_runtime::fs_watch::{FileSystemObserver, FileSystemFileHandle, FileSystemDirectoryHandle, ObserveOptions, ChangeType};
-use w3cos_runtime::font_face::{FontFace, FontRegistry, FontSource, FontWeight, FontFaceStyle, parse_and_register};
-use w3cos_dom::events::{EventData, EventType, InputType};
-use w3cos_dom::document::Document;
-use std::io::Cursor;
-use std::time::Duration;
-use std::thread;
+use w3cos_runtime::font_face::{
+    FontFace, FontFaceStyle, FontRegistry, FontSource, FontWeight, parse_and_register,
+};
+use w3cos_runtime::fs_watch::{
+    ChangeType, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemObserver, ObserveOptions,
+};
+use w3cos_runtime::streams::{ReadResult, ReadableStream};
 
 // ── 1. ReadableStream ──────────────────────────────────────────────────────
 
@@ -28,7 +32,10 @@ fn stream_from_reader_chunks() {
         }
     }
     assert_eq!(collected, data);
-    println!("[PASS] ReadableStream: read {} bytes in 4-byte chunks", collected.len());
+    println!(
+        "[PASS] ReadableStream: read {} bytes in 4-byte chunks",
+        collected.len()
+    );
 }
 
 #[test]
@@ -68,8 +75,8 @@ fn canvas2d_fill_and_read_pixels() {
 
     let red = ctx.get_image_data(15, 15, 1, 1);
     assert_eq!(red.data[0], 255, "red R");
-    assert_eq!(red.data[1], 0,   "red G");
-    assert_eq!(red.data[2], 0,   "red B");
+    assert_eq!(red.data[1], 0, "red G");
+    assert_eq!(red.data[2], 0, "red B");
     println!("[PASS] Canvas2D: fill_rect + pixel verification bg=#1e1e1e, rect=red");
 }
 
@@ -100,11 +107,17 @@ fn canvas2d_save_restore() {
 fn canvas2d_measure_text() {
     let mut ctx = CanvasRenderingContext2D::new(400, 100);
     ctx.set_font("14px monospace");
-    let m4  = ctx.measure_text("abcd");
-    let m8  = ctx.measure_text("abcdefgh");
+    let m4 = ctx.measure_text("abcd");
+    let m8 = ctx.measure_text("abcdefgh");
     assert!(m4.width > 0.0);
-    assert!((m8.width - m4.width * 2.0).abs() < 1.0, "width should scale linearly");
-    println!("[PASS] Canvas2D: measureText 4-char={:.1}px 8-char={:.1}px", m4.width, m8.width);
+    assert!(
+        (m8.width - m4.width * 2.0).abs() < 1.0,
+        "width should scale linearly"
+    );
+    println!(
+        "[PASS] Canvas2D: measureText 4-char={:.1}px 8-char={:.1}px",
+        m4.width, m8.width
+    );
 }
 
 #[test]
@@ -153,7 +166,7 @@ fn clipboard_roundtrip() {
 fn contenteditable_typing() {
     let mut doc = Document::new();
     let editor = doc.create_element("div");
-    let editor_id = editor.id;  // NodeId is a public field
+    let editor_id = editor.id; // NodeId is a public field
     let body_id = doc.body().id;
     doc.append_child(body_id, editor_id);
     doc.get_node_mut(editor_id).set_content_editable("true");
@@ -166,7 +179,11 @@ fn contenteditable_typing() {
         assert!(handled, "char {ch} should be handled");
     }
 
-    let text = doc.get_node(editor_id).text_content.clone().unwrap_or_default();
+    let text = doc
+        .get_node(editor_id)
+        .text_content
+        .clone()
+        .unwrap_or_default();
     assert_eq!(text, "Hello");
     println!("[PASS] contenteditable: typed 5 chars -> text_content = '{text}'");
 }
@@ -184,7 +201,11 @@ fn contenteditable_backspace() {
     doc.handle_contenteditable_key(editor_id, "i", false, false);
     doc.handle_contenteditable_key(editor_id, "Backspace", false, false);
 
-    let text = doc.get_node(editor_id).text_content.clone().unwrap_or_default();
+    let text = doc
+        .get_node(editor_id)
+        .text_content
+        .clone()
+        .unwrap_or_default();
     assert_eq!(text, "H");
     println!("[PASS] contenteditable: Backspace removes last char -> '{text}'");
 }
@@ -203,13 +224,17 @@ fn input_event_input_type_fired() {
     let received_clone = received.clone();
     // Use Element.add_event_listener which takes &mut Document
     let editor_elem = w3cos_dom::element::Element::new(editor_id);
-    editor_elem.add_event_listener(&mut doc, "input", Box::new(move |ev| {
-        if let EventData::Input { input_type, .. } = &ev.data {
-            if let Some(it) = input_type {
-                received_clone.lock().unwrap().push(it.as_str().to_string());
+    editor_elem.add_event_listener(
+        &mut doc,
+        "input",
+        Box::new(move |ev| {
+            if let EventData::Input { input_type, .. } = &ev.data {
+                if let Some(it) = input_type {
+                    received_clone.lock().unwrap().push(it.as_str().to_string());
+                }
             }
-        }
-    }));
+        }),
+    );
 
     doc.handle_contenteditable_key(editor_id, "A", false, false);
     doc.handle_contenteditable_key(editor_id, "Backspace", false, false);
@@ -266,12 +291,18 @@ fn fs_observer_detects_created() {
     let records = observer.poll_records();
     observer.disconnect();
 
-    let created = records.iter().any(|r|
-        r.change_type == ChangeType::Created &&
-        r.path.file_name().map(|n| n == "new.txt").unwrap_or(false)
+    let created = records.iter().any(|r| {
+        r.change_type == ChangeType::Created
+            && r.path.file_name().map(|n| n == "new.txt").unwrap_or(false)
+    });
+    assert!(
+        created,
+        "expected Created event, got: {:?}",
+        records
+            .iter()
+            .map(|r| (&r.change_type, r.path.file_name()))
+            .collect::<Vec<_>>()
     );
-    assert!(created, "expected Created event, got: {:?}",
-        records.iter().map(|r| (&r.change_type, r.path.file_name())).collect::<Vec<_>>());
     std::fs::remove_dir_all(&tmp).ok();
     println!("[PASS] FileSystemObserver: detected Created event for new.txt");
 }
@@ -281,28 +312,37 @@ fn fs_observer_detects_created() {
 #[test]
 fn font_registry_register_and_resolve() {
     // Use global registry with unique family names to avoid test interference
-    FontRegistry::global().register(FontFace {
-        family: "IntTestMono".into(),
-        src: FontSource::Bytes(vec![0u8; 16]),
-        weight: FontWeight::NORMAL,
-        style: FontFaceStyle::Normal,
-        ..Default::default()
-    }).unwrap();
+    FontRegistry::global()
+        .register(FontFace {
+            family: "IntTestMono".into(),
+            src: FontSource::Bytes(vec![0u8; 16]),
+            weight: FontWeight::NORMAL,
+            style: FontFaceStyle::Normal,
+            ..Default::default()
+        })
+        .unwrap();
 
-    FontRegistry::global().register(FontFace {
-        family: "IntTestMono".into(),
-        src: FontSource::Bytes(vec![0u8; 16]),
-        weight: FontWeight::BOLD,
-        style: FontFaceStyle::Normal,
-        ..Default::default()
-    }).unwrap();
+    FontRegistry::global()
+        .register(FontFace {
+            family: "IntTestMono".into(),
+            src: FontSource::Bytes(vec![0u8; 16]),
+            weight: FontWeight::BOLD,
+            style: FontFaceStyle::Normal,
+            ..Default::default()
+        })
+        .unwrap();
 
-    let normal = FontRegistry::global().resolve("IntTestMono", FontWeight::NORMAL, FontFaceStyle::Normal);
+    let normal =
+        FontRegistry::global().resolve("IntTestMono", FontWeight::NORMAL, FontFaceStyle::Normal);
     assert!(normal.is_some());
-    assert!(normal.unwrap().is_monospace, "IntTestMono should be detected as monospace");
+    assert!(
+        normal.unwrap().is_monospace,
+        "IntTestMono should be detected as monospace"
+    );
 
     // Request weight 500 — should fall back to 400 (closer than 700)
-    let medium = FontRegistry::global().resolve("IntTestMono", FontWeight(500), FontFaceStyle::Normal);
+    let medium =
+        FontRegistry::global().resolve("IntTestMono", FontWeight(500), FontFaceStyle::Normal);
     assert!(medium.is_some());
     assert_eq!(medium.unwrap().weight, FontWeight::NORMAL);
     println!("[PASS] FontRegistry: register + resolve + closest-weight fallback");
@@ -310,13 +350,15 @@ fn font_registry_register_and_resolve() {
 
 #[test]
 fn font_registry_family_stack() {
-    FontRegistry::global().register(FontFace {
-        family: "IntFallbackSans".into(),
-        src: FontSource::Bytes(vec![]),
-        weight: FontWeight::NORMAL,
-        style: FontFaceStyle::Normal,
-        ..Default::default()
-    }).unwrap();
+    FontRegistry::global()
+        .register(FontFace {
+            family: "IntFallbackSans".into(),
+            src: FontSource::Bytes(vec![]),
+            weight: FontWeight::NORMAL,
+            style: FontFaceStyle::Normal,
+            ..Default::default()
+        })
+        .unwrap();
 
     let resolved = FontRegistry::global().resolve_stack(
         "Missing Font, IntFallbackSans, sans-serif",
@@ -338,9 +380,8 @@ fn font_face_css_parse() {
         font-display: swap;
     "#;
     parse_and_register(css).expect("CSS @font-face parse failed");
-    let resolved = FontRegistry::global().resolve(
-        "IntCSSFont", FontWeight::BOLD, FontFaceStyle::Italic
-    );
+    let resolved =
+        FontRegistry::global().resolve("IntCSSFont", FontWeight::BOLD, FontFaceStyle::Italic);
     assert!(resolved.is_some());
     println!("[PASS] @font-face CSS parse and register");
 }
@@ -349,8 +390,10 @@ fn font_face_css_parse() {
 
 #[test]
 fn mutation_observer_callback_and_init() {
-    use w3cos_runtime::observers::{MutationObserver, MutationObserverInit, MutationRecord, MutationType};
     use w3cos_dom::node::NodeId;
+    use w3cos_runtime::observers::{
+        MutationObserver, MutationObserverInit, MutationRecord, MutationType,
+    };
 
     let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<MutationRecord>::new()));
     let received_clone = received.clone();
@@ -360,12 +403,15 @@ fn mutation_observer_callback_and_init() {
     });
 
     let target = NodeId::from_u32(1);
-    observer.observe(target, MutationObserverInit {
-        child_list: true,
-        character_data: true,
-        subtree: true,
-        ..Default::default()
-    });
+    observer.observe(
+        target,
+        MutationObserverInit {
+            child_list: true,
+            character_data: true,
+            subtree: true,
+            ..Default::default()
+        },
+    );
 
     // Queue a child_list mutation
     observer.queue_mutation(MutationRecord::child_list(
@@ -381,10 +427,18 @@ fn mutation_observer_callback_and_init() {
     // Attributes not observed — should be filtered out
     observer.queue_mutation(MutationRecord::attributes(target, "class", None));
 
-    assert_eq!(observer.take_records().len(), 2, "attributes should be filtered");
+    assert_eq!(
+        observer.take_records().len(),
+        2,
+        "attributes should be filtered"
+    );
 
     // Queue again and deliver via callback
-    observer.queue_mutation(MutationRecord::child_list(target, vec![], vec![NodeId::from_u32(3)]));
+    observer.queue_mutation(MutationRecord::child_list(
+        target,
+        vec![],
+        vec![NodeId::from_u32(3)],
+    ));
     observer.deliver();
 
     let got = received.lock().unwrap();
@@ -395,15 +449,25 @@ fn mutation_observer_callback_and_init() {
 
 #[test]
 fn mutation_observer_disconnect_clears_queue() {
-    use w3cos_runtime::observers::{MutationObserver, MutationObserverInit, MutationRecord};
     use w3cos_dom::node::NodeId;
+    use w3cos_runtime::observers::{MutationObserver, MutationObserverInit, MutationRecord};
 
     let mut observer = MutationObserver::new(|_| {});
     let target = NodeId::from_u32(5);
-    observer.observe(target, MutationObserverInit { child_list: true, ..Default::default() });
+    observer.observe(
+        target,
+        MutationObserverInit {
+            child_list: true,
+            ..Default::default()
+        },
+    );
     observer.queue_mutation(MutationRecord::child_list(target, vec![], vec![]));
     observer.disconnect();
-    assert_eq!(observer.take_records().len(), 0, "disconnect should clear queue");
+    assert_eq!(
+        observer.take_records().len(),
+        0,
+        "disconnect should clear queue"
+    );
     println!("[PASS] MutationObserver: disconnect clears queue and observations");
 }
 
@@ -444,7 +508,10 @@ fn get_bounding_client_rect_after_set_layout() {
     assert_eq!(rect.height, 150.0);
     assert_eq!(rect.right(), 310.0);
     assert_eq!(rect.bottom(), 170.0);
-    println!("[PASS] getBoundingClientRect: ({}, {}, {}, {})", rect.x, rect.y, rect.width, rect.height);
+    println!(
+        "[PASS] getBoundingClientRect: ({}, {}, {}, {})",
+        rect.x, rect.y, rect.width, rect.height
+    );
 }
 
 // ── 9. beforeinput + selectionchange ──────────────────────────────────────
@@ -462,10 +529,14 @@ fn beforeinput_event_fires_and_cancellable() {
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fired_clone = fired.clone();
 
-    editor.add_event_listener(&mut doc, "beforeinput", Box::new(move |ev| {
-        fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-        ev.prevent_default();
-    }));
+    editor.add_event_listener(
+        &mut doc,
+        "beforeinput",
+        Box::new(move |ev| {
+            fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            ev.prevent_default();
+        }),
+    );
 
     let prevented = doc.dispatch_before_input(
         editor.id,
@@ -474,7 +545,10 @@ fn beforeinput_event_fires_and_cancellable() {
         vec![],
     );
 
-    assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "beforeinput handler not called");
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "beforeinput handler not called"
+    );
     assert!(prevented, "preventDefault should have been recorded");
     println!("[PASS] beforeinput: fires on contenteditable, preventDefault works");
 }
@@ -482,8 +556,8 @@ fn beforeinput_event_fires_and_cancellable() {
 #[test]
 fn selectionchange_fires_on_document() {
     use w3cos_dom::document::Document;
-    use w3cos_dom::node::NodeId;
     use w3cos_dom::events::EventType;
+    use w3cos_dom::node::NodeId;
 
     let mut doc = Document::new();
 
@@ -491,13 +565,19 @@ fn selectionchange_fires_on_document() {
     let fired_clone = fired.clone();
 
     // selectionchange is dispatched on document root (NodeId::ROOT)
-    doc.add_document_event_listener("selectionchange", Box::new(move |_ev| {
-        fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-    }));
+    doc.add_document_event_listener(
+        "selectionchange",
+        Box::new(move |_ev| {
+            fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        }),
+    );
 
     doc.dispatch_selection_change();
 
-    assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "selectionchange not fired");
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "selectionchange not fired"
+    );
     println!("[PASS] selectionchange: fires on document root");
 }
 
@@ -519,13 +599,16 @@ fn font_face_set_ready_callback() {
     set.mark_ready();
 
     assert!(set.is_ready(), "should be ready after mark_ready");
-    assert!(called.load(std::sync::atomic::Ordering::SeqCst), "ready callback not called");
+    assert!(
+        called.load(std::sync::atomic::Ordering::SeqCst),
+        "ready callback not called"
+    );
     println!("[PASS] FontFaceSet.ready: callback fires on mark_ready");
 }
 
 #[test]
 fn font_face_set_add_and_check() {
-    use w3cos_runtime::font_face::{FontFaceSet, FontFace, FontSource, FontWeight, FontFaceStyle};
+    use w3cos_runtime::font_face::{FontFace, FontFaceSet, FontFaceStyle, FontSource, FontWeight};
 
     let set = FontFaceSet::new();
     set.add(FontFace {
@@ -534,7 +617,8 @@ fn font_face_set_add_and_check() {
         weight: FontWeight::NORMAL,
         style: FontFaceStyle::Normal,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     assert!(set.check("IntTestFaceSet", FontWeight::NORMAL, FontFaceStyle::Normal));
     assert!(!set.check("NonExistent", FontWeight::NORMAL, FontFaceStyle::Normal));

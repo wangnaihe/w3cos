@@ -15,7 +15,10 @@ impl PseudoTerminal {
     pub fn write(&mut self, data: &str) -> Result<(), String> {
         use std::os::fd::AsFd;
         let mut f = std::fs::File::from(
-            self.master_fd.as_fd().try_clone_to_owned().map_err(|e| e.to_string())?
+            self.master_fd
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| e.to_string())?,
         );
         f.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
         f.flush().map_err(|e| e.to_string())
@@ -63,8 +66,13 @@ impl PseudoTerminal {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let ret =
-            unsafe { libc::ioctl(self.master_fd.as_raw_fd(), libc::TIOCSWINSZ, &ws as *const _) };
+        let ret = unsafe {
+            libc::ioctl(
+                self.master_fd.as_raw_fd(),
+                libc::TIOCSWINSZ,
+                &ws as *const _,
+            )
+        };
         if ret < 0 {
             Err("ioctl TIOCSWINSZ failed".to_string())
         } else {

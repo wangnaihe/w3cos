@@ -95,9 +95,9 @@ pub fn resolve_ts_type(ts_type: &swc_ecma_ast::TsType) -> RustType {
             RustType::Vec(Box::new(inner))
         }
         TsTypeRef(type_ref) => resolve_type_ref(type_ref),
-        TsUnionOrIntersectionType(
-            swc_ecma_ast::TsUnionOrIntersectionType::TsUnionType(union),
-        ) => resolve_union(union),
+        TsUnionOrIntersectionType(swc_ecma_ast::TsUnionOrIntersectionType::TsUnionType(union)) => {
+            resolve_union(union)
+        }
         TsParenthesizedType(paren) => resolve_ts_type(&paren.type_ann),
         TsOptionalType(opt) => {
             let inner = resolve_ts_type(&opt.type_ann);
@@ -111,19 +111,16 @@ pub fn resolve_ts_type(ts_type: &swc_ecma_ast::TsType) -> RustType {
                 .collect();
             RustType::Tuple(elems)
         }
-        TsFnOrConstructorType(
-            swc_ecma_ast::TsFnOrConstructorType::TsFnType(fn_type),
-        ) => {
+        TsFnOrConstructorType(swc_ecma_ast::TsFnOrConstructorType::TsFnType(fn_type)) => {
             let params: Vec<_> = fn_type
                 .params
                 .iter()
-                .filter_map(|p| {
-                    match p {
-                        swc_ecma_ast::TsFnParam::Ident(ident) => {
-                            ident.type_ann.as_ref().map(|t| resolve_ts_type(&t.type_ann))
-                        }
-                        _ => None,
-                    }
+                .filter_map(|p| match p {
+                    swc_ecma_ast::TsFnParam::Ident(ident) => ident
+                        .type_ann
+                        .as_ref()
+                        .map(|t| resolve_ts_type(&t.type_ann)),
+                    _ => None,
                 })
                 .collect();
             let ret = resolve_ts_type(&fn_type.type_ann.type_ann);
@@ -162,13 +159,7 @@ fn resolve_type_ref(type_ref: &swc_ecma_ast::TsTypeRef) -> RustType {
     let type_params: Vec<RustType> = type_ref
         .type_params
         .as_ref()
-        .map(|params| {
-            params
-                .params
-                .iter()
-                .map(|p| resolve_ts_type(p))
-                .collect()
-        })
+        .map(|params| params.params.iter().map(|p| resolve_ts_type(p)).collect())
         .unwrap_or_default();
 
     match name.as_str() {
@@ -182,9 +173,7 @@ fn resolve_type_ref(type_ref: &swc_ecma_ast::TsTypeRef) -> RustType {
             let v = iter.next().unwrap_or(RustType::Dynamic);
             RustType::HashMap(Box::new(k), Box::new(v))
         }
-        "Promise" => {
-            type_params.into_iter().next().unwrap_or(RustType::Void)
-        }
+        "Promise" => type_params.into_iter().next().unwrap_or(RustType::Void),
         _ => RustType::Struct(name),
     }
 }

@@ -1,7 +1,7 @@
 //! Display cutout / home-indicator insets — re-exports + C FFI for native shells.
 
 pub use w3cos_std::safe_area::{
-    current, is_enabled, set_enabled, set_insets, SafeAreaEdge, SafeAreaInsets,
+    SafeAreaEdge, SafeAreaInsets, current, is_enabled, set_enabled, set_insets,
 };
 
 /// Called from iOS/Android shell before `w3cos_app_run` (logical px).

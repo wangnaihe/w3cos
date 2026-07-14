@@ -89,7 +89,8 @@ impl Location {
             format!("{}:{}", self.hostname, self.port)
         };
         format!(
-            "//{}{}{}{}", authority, self.pathname, self.search, self.hash
+            "//{}{}{}{}",
+            authority, self.pathname, self.search, self.hash
         )
     }
 

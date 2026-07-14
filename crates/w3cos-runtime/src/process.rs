@@ -225,7 +225,7 @@ pub fn process_usage(pid: u32) -> Option<(f32, u64)> {
 pub fn kill(pid: u32, signal: i32) -> Result<(), String> {
     #[cfg(unix)]
     {
-        use nix::sys::signal::{kill as nix_kill, Signal};
+        use nix::sys::signal::{Signal, kill as nix_kill};
         use nix::unistd::Pid;
         let sig = Signal::try_from(signal).map_err(|e| e.to_string())?;
         nix_kill(Pid::from_raw(pid as i32), sig).map_err(|e| e.to_string())
@@ -275,7 +275,12 @@ pub fn getenv(key: &str) -> Option<String> {
 /// ```
 pub fn pipe_commands(commands: &[(&str, Vec<&str>)]) -> ExecResult {
     if commands.is_empty() {
-        return ExecResult { stdout: String::new(), stderr: String::new(), exit_code: 0, ok: true };
+        return ExecResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            ok: true,
+        };
     }
 
     // Build shell pipeline string: cmd1 args | cmd2 args | ...

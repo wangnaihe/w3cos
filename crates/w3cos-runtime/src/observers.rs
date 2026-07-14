@@ -314,9 +314,10 @@ impl IntersectionObserver {
         for (i, target) in self.targets.iter().enumerate() {
             if let Some(&(_, ratio, rect)) = ratios.iter().find(|(id, _, _)| id == target) {
                 let last = self.last_ratios[i];
-                let crossed = self.thresholds.iter().any(|&t| {
-                    (last < t && ratio >= t) || (last >= t && ratio < t)
-                });
+                let crossed = self
+                    .thresholds
+                    .iter()
+                    .any(|&t| (last < t && ratio >= t) || (last >= t && ratio < t));
                 if crossed || last < 0.0 {
                     self.last_ratios[i] = ratio;
                     entries.push(IntersectionObserverEntry {

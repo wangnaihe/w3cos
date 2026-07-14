@@ -1,9 +1,9 @@
-mod value;
 mod object;
 mod proxy;
 mod reactive;
+mod value;
 
-pub use value::{Value, JsFunction, type_of};
 pub use object::JsObject;
-pub use proxy::{ProxyHandler, ProxyBuilder};
-pub use reactive::{Signal, Computed, Effect, watch, batch};
+pub use proxy::{ProxyBuilder, ProxyHandler};
+pub use reactive::{Computed, Effect, Signal, batch, watch};
+pub use value::{JsFunction, Value, type_of};

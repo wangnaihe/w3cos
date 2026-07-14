@@ -1,10 +1,12 @@
+mod dev;
 mod mobile;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::fs;
+use w3cos_compiler::CompileOptions;
 
 #[derive(Parser)]
 #[command(
@@ -41,16 +43,40 @@ enum Commands {
         /// Output target: native binary (default) or web (HTML/CSS/JS).
         #[arg(long, default_value = "native")]
         target: String,
+        /// Enable Chrome DevTools Protocol (native desktop or mobile debug builds).
+        #[arg(long)]
+        devtools: bool,
     },
     /// Compile and immediately run the application.
     Run {
         /// Path to the TypeScript or JSON source file.
         input: PathBuf,
+        /// Enable Chrome DevTools Protocol (native desktop or mobile debug builds).
+        #[arg(long)]
+        devtools: bool,
+        /// DevTools listen port (default: 9229).
+        #[arg(long, default_value_t = 9229)]
+        devtools_port: u16,
     },
     /// Start a dev server with hot reload (recompile + restart on file changes).
     Dev {
         /// Path to the TypeScript or JSON source file.
         input: PathBuf,
+        /// Output target: native (default) or web (HTML/CSS/JS + static server).
+        #[arg(long, default_value = "native")]
+        target: String,
+        /// Web output directory (web target only).
+        #[arg(short, long, default_value = "./dist")]
+        output: PathBuf,
+        /// Static server port (web target only).
+        #[arg(long, default_value_t = 5173)]
+        port: u16,
+        /// Enable Chrome DevTools Protocol (native target).
+        #[arg(long, default_value_t = true)]
+        devtools: bool,
+        /// DevTools listen port.
+        #[arg(long, default_value_t = 9229)]
+        devtools_port: u16,
     },
     /// Initialize a new W3C OS project with template files.
     Init {
@@ -83,6 +109,33 @@ enum MobileCommands {
         platform: String,
         #[arg(long)]
         release: bool,
+        /// Enable Chrome DevTools (default: on for debug, off for --release).
+        #[arg(long)]
+        devtools: bool,
+        /// Disable Chrome DevTools even in debug builds.
+        #[arg(long)]
+        no_devtools: bool,
+    },
+    /// Watch entry + CSS, rebuild and reinstall on change.
+    Dev {
+        /// Project directory (contains app.tsx, android/, ios/).
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Target platform: android or ios.
+        #[arg(long, default_value = "android")]
+        platform: String,
+        /// Release build (slower; default is debug).
+        #[arg(long)]
+        release: bool,
+        /// Force-enable Chrome DevTools CDP server in the app.
+        #[arg(long)]
+        devtools: bool,
+        /// Disable Chrome DevTools.
+        #[arg(long)]
+        no_devtools: bool,
+        /// DevTools port on device/simulator (default 9229).
+        #[arg(long, default_value_t = 9229)]
+        devtools_port: u16,
     },
 }
 
@@ -97,23 +150,67 @@ fn main() -> Result<()> {
             strip,
             lto,
             target,
+            devtools,
         } => {
-            // Enable strip by default in release mode unless explicitly disabled
             let strip = if release || strip { Some(true) } else { None };
-            build(&input, &output, release, strip, lto, &target)?;
+            build(
+                &input,
+                &output,
+                release,
+                strip,
+                lto,
+                &target,
+                CompileOptions { devtools },
+            )?;
         }
-        Commands::Run { input } => {
+        Commands::Run {
+            input,
+            devtools,
+            devtools_port,
+        } => {
             let tmp = std::env::temp_dir().join("w3cos-run");
             let bin = tmp.join("target").join("debug").join("w3cos-app");
-            build(&input, &bin, false, None, false, "native")?;
+            build(
+                &input,
+                &bin,
+                false,
+                None,
+                false,
+                "native",
+                CompileOptions { devtools },
+            )?;
             println!("▶  Running...");
-            let status = Command::new(&bin)
-                .status()
-                .context("Failed to run compiled binary")?;
+            let config = dev::DevConfig {
+                devtools,
+                devtools_port,
+                web_port: 5173,
+            };
+            let status = {
+                let mut child = dev::spawn_native_app(&bin, &config)?;
+                child.wait().context("Failed to wait on app")?
+            };
             std::process::exit(status.code().unwrap_or(1));
         }
-        Commands::Dev { input } => {
-            dev_watch(&input)?;
+        Commands::Dev {
+            input,
+            target,
+            output,
+            port,
+            devtools,
+            devtools_port,
+        } => {
+            let config = dev::DevConfig {
+                devtools,
+                devtools_port,
+                web_port: port,
+            };
+            if target == "web" {
+                dev_watch_web(&input, &output, &config)?;
+            } else if target == "native" {
+                dev_watch_native(&input, &config)?;
+            } else {
+                anyhow::bail!("unknown --target {target} (use native|web)");
+            }
         }
         Commands::Init { project_name } => {
             init(&project_name)?;
@@ -127,7 +224,27 @@ fn main() -> Result<()> {
                 project,
                 platform,
                 release,
-            } => mobile::mobile_build(&project, &platform, release)?,
+                devtools,
+                no_devtools,
+            } => {
+                let devtools = mobile::resolve_mobile_devtools(release, devtools, no_devtools);
+                mobile::mobile_build(&project, &platform, release, devtools)?;
+            }
+            MobileCommands::Dev {
+                project,
+                platform,
+                release,
+                devtools,
+                no_devtools,
+                devtools_port,
+            } => mobile::mobile_dev(
+                &project,
+                &platform,
+                release,
+                devtools,
+                no_devtools,
+                devtools_port,
+            )?,
         },
     }
 
@@ -141,22 +258,32 @@ fn build(
     strip: Option<bool>,
     lto: bool,
     target: &str,
+    options: CompileOptions,
 ) -> Result<()> {
     let input_abs = std::fs::canonicalize(input)
         .with_context(|| format!("Could not find {}", input.display()))?;
 
     if target == "web" {
+        if options.devtools {
+            println!("ℹ️  --devtools ignored for web target.");
+        }
         println!("⚡ Transpiling {} → HTML/CSS/JS...", input.display());
         if output.exists() {
             if output.is_dir() {
                 std::fs::remove_dir_all(output)?;
             } else {
-                anyhow::bail!("web output must be a directory, got file: {}", output.display());
+                anyhow::bail!(
+                    "web output must be a directory, got file: {}",
+                    output.display()
+                );
             }
         }
         std::fs::create_dir_all(output)?;
         w3cos_compiler::compile_web_from_file(&input_abs, output)?;
-        println!("✅ Web output: {}/ (index.html, styles.css, app.js)", output.display());
+        println!(
+            "✅ Web output: {}/ (index.html, styles.css, app.js)",
+            output.display()
+        );
         return Ok(());
     }
 
@@ -170,7 +297,7 @@ fn build(
     }
 
     println!("⚡ Transpiling {} → Rust...", input.display());
-    w3cos_compiler::compile_from_file(&input_abs, &build_dir)?;
+    w3cos_compiler::compile_from_file_with_options(&input_abs, &build_dir, &options)?;
 
     println!("🔨 Compiling native binary...");
     let mut cmd = Command::new("cargo");
@@ -217,12 +344,13 @@ fn build(
 fn init(project_name: &PathBuf) -> Result<()> {
     println!("🚀 Initializing W3C OS project: {}", project_name.display());
 
-    // Check if directory already exists
     if project_name.exists() {
-        anyhow::bail!("Error: Directory '{}' already exists", project_name.display());
+        anyhow::bail!(
+            "Error: Directory '{}' already exists",
+            project_name.display()
+        );
     }
 
-    // Create project directory
     fs::create_dir_all(project_name)
         .with_context(|| format!("Could not create directory {}", project_name.display()))?;
 
@@ -240,9 +368,9 @@ export default
         .with_context(|| format!("Could not create {}", app_tsx_path.display()))?;
     println!("✅ Created: {}", app_tsx_path.display());
 
-    // Create README.md
     let readme_path = project_name.join("README.md");
-    let readme_content = format!(r#"# {}
+    let readme_content = format!(
+        r#"# {}
 
 A W3C OS Application.
 
@@ -256,14 +384,17 @@ A W3C OS Application.
 ### Usage
 
 ```bash
-# Run the application
-w3cos run app.tsx
+# Dev mode with Chrome DevTools
+w3cos dev app.tsx
 
-# Or build a native binary
+# Run once
+w3cos run app.tsx --devtools
+
+# Build a native binary
 w3cos build app.tsx -o myapp --release
 
-# Run the binary
-./myapp
+# Web preview
+w3cos dev app.tsx --target web -o dist
 ```
 
 ## Project Structure
@@ -277,7 +408,10 @@ w3cos build app.tsx -o myapp --release
 ## License
 
 Apache-2.0
-"#, project_name.display(), project_name.display());
+"#,
+        project_name.display(),
+        project_name.display()
+    );
     fs::write(&readme_path, readme_content)
         .with_context(|| format!("Could not create {}", readme_path.display()))?;
     println!("✅ Created: {}", readme_path.display());
@@ -285,47 +419,52 @@ Apache-2.0
     println!("\n✨ Project initialized successfully!");
     println!("📁 Next steps:");
     println!("   cd {}", project_name.display());
-    println!("   w3cos run app.tsx");
+    println!("   w3cos dev app.tsx");
 
     Ok(())
 }
 
-fn dev_watch(input: &PathBuf) -> Result<()> {
-    use std::time::{Duration, SystemTime};
+fn dev_watch_native(input: &PathBuf, config: &dev::DevConfig) -> Result<()> {
+    use std::process::Child;
 
     let input = std::fs::canonicalize(input)
         .with_context(|| format!("Could not find {}", input.display()))?;
+    let watch_paths = dev::watch_paths_for(&input)?;
+    let watch_list: Vec<_> = watch_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
 
-    println!("🔄 W3C OS Dev Mode — watching {}", input.display());
+    println!("🔄 W3C OS Dev Mode (native) — watching:");
+    for p in &watch_list {
+        println!("   • {p}");
+    }
     println!("   Press Ctrl+C to stop\n");
 
-    let mut last_modified = file_mtime(&input);
+    let mut last_mtimes = dev::snapshot_mtimes(&watch_paths);
     let tmp = std::env::temp_dir().join("w3cos-dev");
     let bin = tmp.join("target").join("debug").join("w3cos-app");
+    let options = CompileOptions {
+        devtools: config.devtools,
+    };
 
     loop {
-        // Build
         println!("⚡ Building...");
-        if let Err(e) = build(&input, &bin, false, None, false, "native") {
+        if let Err(e) = build(&input, &bin, false, None, false, "native", options) {
             eprintln!("❌ Build failed: {e}");
-            wait_for_change(&input, &mut last_modified);
+            dev::wait_for_change(&watch_paths, &mut last_mtimes);
             continue;
         }
         println!("✅ Built successfully");
 
-        // Run
         println!("▶  Running...\n");
-        let mut child = Command::new(&bin)
-            .spawn()
-            .context("Failed to run compiled binary")?;
+        let mut child: Child = dev::spawn_native_app(&bin, config)?;
 
-        // Watch for file changes while the app is running
         loop {
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(400));
 
-            let current_mtime = file_mtime(&input);
-            if current_mtime != last_modified {
-                last_modified = current_mtime;
+            if dev::any_mtime_changed(&watch_paths, &last_mtimes) {
+                dev::refresh_mtimes(&watch_paths, &mut last_mtimes);
                 println!("\n🔄 File changed — rebuilding...");
                 let _ = child.kill();
                 let _ = child.wait();
@@ -335,7 +474,7 @@ fn dev_watch(input: &PathBuf) -> Result<()> {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     println!("\n⏹  App exited (code: {})", status.code().unwrap_or(-1));
-                    wait_for_change(&input, &mut last_modified);
+                    dev::wait_for_change(&watch_paths, &mut last_mtimes);
                     break;
                 }
                 Ok(None) => {}
@@ -345,22 +484,45 @@ fn dev_watch(input: &PathBuf) -> Result<()> {
     }
 }
 
-fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-}
+fn dev_watch_web(input: &PathBuf, output: &PathBuf, config: &dev::DevConfig) -> Result<()> {
+    let input = std::fs::canonicalize(input)
+        .with_context(|| format!("Could not find {}", input.display()))?;
+    let watch_paths = dev::watch_paths_for(&input)?;
+    let watch_list: Vec<_> = watch_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
 
-fn wait_for_change(path: &std::path::Path, last_modified: &mut Option<SystemTime>) {
-    println!("👀 Waiting for file changes...");
+    println!("🔄 W3C OS Dev Mode (web) — watching:");
+    for p in &watch_list {
+        println!("   • {p}");
+    }
+    println!("   Press Ctrl+C to stop\n");
+
+    let mut last_mtimes = dev::snapshot_mtimes(&watch_paths);
+    let _server_stop = dev::start_web_server(output, config.web_port)?;
+
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let current = file_mtime(path);
-        if current != *last_modified {
-            *last_modified = current;
-            return;
+        println!("⚡ Building web...");
+        if let Err(e) = build(
+            &input,
+            output,
+            false,
+            None,
+            false,
+            "web",
+            CompileOptions::default(),
+        ) {
+            eprintln!("❌ Build failed: {e}");
+            dev::wait_for_change(&watch_paths, &mut last_mtimes);
+            continue;
         }
+        println!(
+            "✅ Built — refresh http://127.0.0.1:{}/index.html",
+            config.web_port
+        );
+
+        dev::wait_for_change(&watch_paths, &mut last_mtimes);
+        println!("\n🔄 File changed — rebuilding...");
     }
 }
-
-use std::time::SystemTime;

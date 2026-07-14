@@ -186,7 +186,9 @@ where
 /// Delete a database entirely. Mirrors `indexedDB.deleteDatabase(name)`.
 pub fn delete(name: &str) -> Result<()> {
     let path = {
-        let mut reg = registry().lock().map_err(|e| IndexedDbError::invalid(e.to_string()))?;
+        let mut reg = registry()
+            .lock()
+            .map_err(|e| IndexedDbError::invalid(e.to_string()))?;
         reg.databases.remove(name);
         reg.path_for(name)
     };
@@ -218,7 +220,9 @@ pub fn databases() -> Vec<String> {
 }
 
 fn load_or_create(name: &str) -> Result<Arc<Mutex<DatabaseState>>> {
-    let mut reg = registry().lock().map_err(|e| IndexedDbError::invalid(e.to_string()))?;
+    let mut reg = registry()
+        .lock()
+        .map_err(|e| IndexedDbError::invalid(e.to_string()))?;
     if let Some(existing) = reg.databases.get(name) {
         return Ok(Arc::clone(existing));
     }
@@ -253,10 +257,9 @@ fn flush(name: &str, state: &Arc<Mutex<DatabaseState>>) -> Result<()> {
         .lock()
         .map_err(|e| IndexedDbError::invalid(e.to_string()))?
         .clone();
-    let bytes = serde_json::to_vec_pretty(&snapshot)
-        .map_err(|e| IndexedDbError::data(e.to_string()))?;
-    std::fs::write(&path, bytes)
-        .map_err(|e| IndexedDbError::invalid(format!("write db: {e}")))?;
+    let bytes =
+        serde_json::to_vec_pretty(&snapshot).map_err(|e| IndexedDbError::data(e.to_string()))?;
+    std::fs::write(&path, bytes).map_err(|e| IndexedDbError::invalid(format!("write db: {e}")))?;
     Ok(())
 }
 
@@ -299,7 +302,10 @@ impl Database {
     ) -> Result<()> {
         let name = name.into();
         let key_path = key_path.into();
-        let mut state = self.state.lock().map_err(|e| IndexedDbError::invalid(e.to_string()))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| IndexedDbError::invalid(e.to_string()))?;
         if state.stores.contains_key(&name) {
             return Err(IndexedDbError::constraint(format!(
                 "object store '{name}' already exists"
@@ -322,7 +328,10 @@ impl Database {
 
     /// `db.deleteObjectStore(name)`.
     pub fn delete_object_store(&self, name: &str) -> Result<()> {
-        let mut state = self.state.lock().map_err(|e| IndexedDbError::invalid(e.to_string()))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| IndexedDbError::invalid(e.to_string()))?;
         if state.stores.remove(name).is_none() {
             return Err(IndexedDbError::not_found(format!(
                 "object store '{name}' not found"
@@ -333,8 +342,16 @@ impl Database {
     }
 
     /// `db.createObjectStore(...).createIndex(name, keyPath)`.
-    pub fn create_index(&self, store: &str, name: impl Into<String>, key_path: impl Into<String>) -> Result<()> {
-        let mut state = self.state.lock().map_err(|e| IndexedDbError::invalid(e.to_string()))?;
+    pub fn create_index(
+        &self,
+        store: &str,
+        name: impl Into<String>,
+        key_path: impl Into<String>,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| IndexedDbError::invalid(e.to_string()))?;
         let store = state
             .stores
             .get_mut(store)
@@ -346,7 +363,10 @@ impl Database {
 
     /// `db.transaction(stores, mode)`.
     pub fn transaction(&self, store_names: &[&str], mode: TransactionMode) -> Result<Transaction> {
-        let state = self.state.lock().map_err(|e| IndexedDbError::invalid(e.to_string()))?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|e| IndexedDbError::invalid(e.to_string()))?;
         for name in store_names {
             if !state.stores.contains_key(*name) {
                 return Err(IndexedDbError::not_found(format!(
@@ -409,20 +429,24 @@ impl<'a> ObjectStore<'a> {
     }
 
     fn with_state_mut<R, F: FnOnce(&mut ObjectStoreState) -> Result<R>>(&self, f: F) -> Result<R> {
-        let mut state = self.db_state.lock().map_err(|e| IndexedDbError::invalid(e.to_string()))?;
-        let store = state
-            .stores
-            .get_mut(&self.store_name)
-            .ok_or_else(|| IndexedDbError::not_found(format!("store '{}' not found", self.store_name)))?;
+        let mut state = self
+            .db_state
+            .lock()
+            .map_err(|e| IndexedDbError::invalid(e.to_string()))?;
+        let store = state.stores.get_mut(&self.store_name).ok_or_else(|| {
+            IndexedDbError::not_found(format!("store '{}' not found", self.store_name))
+        })?;
         f(store)
     }
 
     fn with_state<R, F: FnOnce(&ObjectStoreState) -> R>(&self, f: F) -> Result<R> {
-        let state = self.db_state.lock().map_err(|e| IndexedDbError::invalid(e.to_string()))?;
-        let store = state
-            .stores
-            .get(&self.store_name)
-            .ok_or_else(|| IndexedDbError::not_found(format!("store '{}' not found", self.store_name)))?;
+        let state = self
+            .db_state
+            .lock()
+            .map_err(|e| IndexedDbError::invalid(e.to_string()))?;
+        let store = state.stores.get(&self.store_name).ok_or_else(|| {
+            IndexedDbError::not_found(format!("store '{}' not found", self.store_name))
+        })?;
         Ok(f(store))
     }
 
@@ -527,7 +551,11 @@ impl<'a> ObjectStore<'a> {
     }
 }
 
-fn resolve_key(store: &mut ObjectStoreState, value: &mut Value, explicit: Option<Value>) -> Result<String> {
+fn resolve_key(
+    store: &mut ObjectStoreState,
+    value: &mut Value,
+    explicit: Option<Value>,
+) -> Result<String> {
     if let Some(k) = explicit {
         return canonicalize_key(&k);
     }
@@ -596,7 +624,12 @@ fn inject_key_path(value: &mut Value, path: &str, new_value: Value) {
         }
         current = current
             .as_object_mut()
-            .and_then(|m| Some(m.entry(segment.to_string()).or_insert(Value::Object(serde_json::Map::new()))))
+            .and_then(|m| {
+                Some(
+                    m.entry(segment.to_string())
+                        .or_insert(Value::Object(serde_json::Map::new())),
+                )
+            })
             .unwrap();
     }
 }
@@ -612,11 +645,7 @@ mod tests {
     static IDB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn fresh_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "w3cos-idb-{}-{}",
-            std::process::id(),
-            label,
-        ));
+        let dir = std::env::temp_dir().join(format!("w3cos-idb-{}-{}", std::process::id(), label,));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -649,10 +678,11 @@ mod tests {
     fn add_rejects_duplicates() {
         let _g = IDB_TEST_LOCK.lock().unwrap();
         set_base_dir(fresh_dir("dup"));
-        let db = open("dup", 1, |db, _, _| db.create_object_store("s", "id", false)).unwrap();
-        let tx = db
-            .transaction(&["s"], TransactionMode::ReadWrite)
-            .unwrap();
+        let db = open("dup", 1, |db, _, _| {
+            db.create_object_store("s", "id", false)
+        })
+        .unwrap();
+        let tx = db.transaction(&["s"], TransactionMode::ReadWrite).unwrap();
         let store = tx.object_store("s").unwrap();
         store.add(json!({ "id": 1, "v": "a" })).unwrap();
         let err = store.add(json!({ "id": 1, "v": "b" })).unwrap_err();
@@ -683,9 +713,15 @@ mod tests {
             .transaction(&["users"], TransactionMode::ReadWrite)
             .unwrap();
         let store = tx.object_store("users").unwrap();
-        store.put(json!({ "email": "a@x.com", "name": "A" })).unwrap();
-        store.put(json!({ "email": "b@x.com", "name": "B" })).unwrap();
-        store.put(json!({ "email": "a@x.com", "name": "A2" })).unwrap();
+        store
+            .put(json!({ "email": "a@x.com", "name": "A" }))
+            .unwrap();
+        store
+            .put(json!({ "email": "b@x.com", "name": "B" }))
+            .unwrap();
+        store
+            .put(json!({ "email": "a@x.com", "name": "A2" }))
+            .unwrap();
 
         let hits = store.index_get("by_email", &json!("a@x.com")).unwrap();
         assert_eq!(hits.len(), 2);
@@ -718,7 +754,10 @@ mod tests {
         let _g = IDB_TEST_LOCK.lock().unwrap();
         let dir = fresh_dir("del");
         set_base_dir(dir);
-        let _ = open("trash", 1, |db, _, _| db.create_object_store("s", "id", true)).unwrap();
+        let _ = open("trash", 1, |db, _, _| {
+            db.create_object_store("s", "id", true)
+        })
+        .unwrap();
         delete("trash").unwrap();
         let dbs = databases();
         assert!(!dbs.iter().any(|d| d == "trash"));

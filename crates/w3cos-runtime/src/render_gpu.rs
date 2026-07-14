@@ -10,7 +10,7 @@ use vello::peniko::{
 use vello::{Glyph, Scene};
 use w3cos_std::color::Color as AppColor;
 use w3cos_std::component::ComponentKind;
-use w3cos_std::style::Style;
+use w3cos_std::style::{Style, TextAlign};
 
 use crate::compositor::{layer_opacity, promotes_compositor_layer};
 use crate::filter::{self, CssFilter};
@@ -338,11 +338,7 @@ fn render_node(
         }
     }
 
-    let color_chain = if in_layer {
-        None
-    } else {
-        css_filter.as_ref()
-    };
+    let color_chain = if in_layer { None } else { css_filter.as_ref() };
     let bg = node_color(style.background, opacity, color_chain);
 
     if bg.a > 0 {
@@ -351,23 +347,30 @@ fn render_node(
 
     if style.border_width > 0.0 && style.border_color.a > 0 {
         let border = node_color(style.border_color, opacity, color_chain);
-        draw_border(scene, rect, border, style.border_width, style.border_radius, dpi);
+        draw_border(
+            scene,
+            rect,
+            border,
+            style.border_width,
+            style.border_radius,
+            dpi,
+        );
     }
 
     let text_color = node_color(style.color, opacity, color_chain);
 
     match kind {
         ComponentKind::Text { content } => {
-            draw_text(
+            draw_text_in_rect(
                 scene,
-                rect.x,
-                rect.y,
+                rect,
                 content,
-                style.font_size,
+                style,
                 text_color,
                 font_data,
                 font,
-                glyph_cache, dpi,
+                glyph_cache,
+                dpi,
             );
         }
         ComponentKind::Button { label } => {
@@ -391,9 +394,7 @@ fn render_node(
         }
         ComponentKind::Image { src } => {
             if let Some(decoded) = crate::image_loader::get_or_load(src) {
-                let blob = Blob::new(
-                    decoded.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>,
-                );
+                let blob = Blob::new(decoded.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
                 let image_data = ImageData {
                     data: blob,
                     format: ImageFormat::Rgba8,
@@ -419,7 +420,14 @@ fn render_node(
                 } else {
                     AppColor::rgb(100, 100, 120)
                 };
-                draw_border(scene, rect, border_color, style.border_width.max(1.0), style.border_radius, dpi);
+                draw_border(
+                    scene,
+                    rect,
+                    border_color,
+                    style.border_width.max(1.0),
+                    style.border_radius,
+                    dpi,
+                );
                 let label = format!("[Image: {}]", src);
                 draw_text(
                     scene,
@@ -430,7 +438,8 @@ fn render_node(
                     text_color,
                     font_data,
                     font,
-                    glyph_cache, dpi,
+                    glyph_cache,
+                    dpi,
                 );
             }
         }
@@ -459,9 +468,30 @@ fn render_node(
             } else {
                 style.border_width.max(1.0)
             };
-            draw_border(scene, rect, border_color, border_w, style.border_radius.max(4.0), dpi);
-            let text_x = rect.x + 12.0;
-            let text_y = rect.y + (rect.height - style.font_size) / 2.0 + style.font_size;
+            draw_border(
+                scene,
+                rect,
+                border_color,
+                border_w,
+                style.border_radius.max(4.0),
+                dpi,
+            );
+            let border = style.border_width;
+            let padding = style.padding_lengths();
+            let content = LayoutRect {
+                x: rect.x + border + padding.left,
+                y: rect.y + border + padding.top,
+                width: (rect.width - border * 2.0 - padding.left - padding.right).max(1.0),
+                height: (rect.height - border * 2.0 - padding.top - padding.bottom).max(0.0),
+            };
+            let text_x = content.x;
+            let text_y = crate::text_layout::y_for_draw_text_line_centered(
+                display_text,
+                style.font_size,
+                font,
+                content.y,
+                content.height,
+            );
             draw_text(
                 scene,
                 text_x,
@@ -471,12 +501,13 @@ fn render_node(
                 text_color_final,
                 font_data,
                 font,
-                glyph_cache, dpi,
+                glyph_cache,
+                dpi,
             );
             if is_focused {
                 draw_blinking_cursor(
                     scene,
-                    rect,
+                    content,
                     display_value,
                     style.font_size,
                     text_color,
@@ -541,7 +572,14 @@ fn draw_rect(scene: &mut Scene, r: LayoutRect, color: AppColor, radius: f32, dpi
     }
 }
 
-fn draw_border(scene: &mut Scene, r: LayoutRect, color: AppColor, width: f32, radius: f32, dpi: Affine) {
+fn draw_border(
+    scene: &mut Scene,
+    r: LayoutRect,
+    color: AppColor,
+    width: f32,
+    radius: f32,
+    dpi: Affine,
+) {
     let vc = color_to_vello(color);
     let stroke = Stroke::new(width as f64);
     let half = width as f64 / 2.0;
@@ -585,7 +623,16 @@ fn draw_text_centered_in_rect(
     let x = rect.x + (rect.width - text_w).max(0.0) * 0.5;
     let y = rect.y + (rect.height - text_h).max(0.0) * 0.5;
     draw_text(
-        scene, x, y, text, font_size, color, font_data, fontdue_font, glyph_cache, dpi,
+        scene,
+        x,
+        y,
+        text,
+        font_size,
+        color,
+        font_data,
+        fontdue_font,
+        glyph_cache,
+        dpi,
     );
 }
 
@@ -645,10 +692,113 @@ fn draw_text(
     }
 }
 
+fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
+    let border = style.border_width;
+    let pad = style.padding_lengths();
+    LayoutRect {
+        x: rect.x + pad.left + border,
+        y: rect.y + pad.top + border,
+        width: (rect.width - pad.left - pad.right - border * 2.0).max(1.0),
+        height: (rect.height - pad.top - pad.bottom - border * 2.0).max(0.0),
+    }
+}
+
+fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
+    if style.background.a > 0 {
+        let border = style.border_width;
+        LayoutRect {
+            x: rect.x + border,
+            y: rect.y + border,
+            width: (rect.width - border * 2.0).max(1.0),
+            height: (rect.height - border * 2.0).max(0.0),
+        }
+    } else {
+        text_content_box(rect, style)
+    }
+}
+
+fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
+    match style.text_align {
+        TextAlign::Center | TextAlign::Right => style.text_align,
+        TextAlign::Left if style.background.a > 0 => TextAlign::Center,
+        TextAlign::Left
+            if matches!(
+                style.white_space,
+                w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre
+            ) && box_w > ink_w + 1.5 =>
+        {
+            TextAlign::Center
+        }
+        TextAlign::Left | TextAlign::Justify => TextAlign::Left,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_in_rect(
+    scene: &mut Scene,
+    rect: LayoutRect,
+    text: &str,
+    style: &Style,
+    color: AppColor,
+    font_data: &FontData,
+    font: &fontdue::Font,
+    glyph_cache: &mut GlyphCache,
+    dpi: Affine,
+) {
+    let content = text_paint_box(rect, style);
+    let line_h = style.font_size * style.line_height;
+    let lines = crate::text_layout::wrap_text_font(
+        text,
+        content.width,
+        style.font_size,
+        font,
+        style.white_space,
+    );
+    let block_h = if lines.len() == 1 {
+        crate::text_layout::single_line_content_height(
+            &lines[0],
+            style.font_size,
+            style.line_height,
+            font,
+        )
+    } else {
+        lines.len() as f32 * line_h
+    };
+    let block_top = content.y + (content.height - block_h).max(0.0) * 0.5;
+
+    for (index, line) in lines.iter().enumerate() {
+        let ink =
+            crate::text_layout::measure_text_ink_bounds(line, style.font_size, font, 0.0, 0.0);
+        let align = single_line_h_align(style, content.width, ink.width);
+        let x = match align {
+            TextAlign::Right => content.x + content.width - ink.width - ink.left,
+            TextAlign::Center => content.x + (content.width - ink.width) * 0.5 - ink.left,
+            TextAlign::Left | TextAlign::Justify => content.x - ink.left,
+        };
+        let y = if lines.len() == 1 {
+            content.y + (content.height - ink.height).max(0.0) * 0.5 - ink.top
+        } else {
+            block_top + index as f32 * line_h
+        };
+        draw_text(
+            scene,
+            x,
+            y,
+            line,
+            style.font_size,
+            color,
+            font_data,
+            font,
+            glyph_cache,
+            dpi,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_blinking_cursor(
     scene: &mut Scene,
-    rect: LayoutRect,
+    content: LayoutRect,
     text: &str,
     font_size: f32,
     color: AppColor,
@@ -676,7 +826,7 @@ fn draw_blinking_cursor(
         skrifa::instance::LocationRef::default(),
     );
 
-    let mut cursor_x = rect.x + 12.0;
+    let mut cursor_x = content.x;
     for ch in text.chars() {
         let entry =
             glyph_cache.lookup_or_insert(ch, font_size, &charmap, &glyph_metrics, fontdue_font);
@@ -684,7 +834,7 @@ fn draw_blinking_cursor(
     }
 
     let cursor_w = 2.0f32.max(font_size * 0.1);
-    let cursor_y = rect.y + (rect.height - font_size) / 2.0;
+    let cursor_y = content.y + (content.height - font_size) / 2.0;
     let cursor_rect = Rect::new(
         cursor_x as f64,
         cursor_y as f64,

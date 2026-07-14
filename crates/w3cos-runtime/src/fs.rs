@@ -152,9 +152,7 @@ pub fn read_dir(path: &str) -> Result<Vec<FileInfo>, String> {
             size: metadata.len(),
         });
     }
-    result.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name))
-    });
+    result.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
     Ok(result)
 }
 
@@ -331,7 +329,10 @@ pub fn watch(path: &str) -> Result<FsWatcher, String> {
         .watch(Path::new(path), RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
 
-    Ok(FsWatcher { _watcher: watcher, rx })
+    Ok(FsWatcher {
+        _watcher: watcher,
+        rx,
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -363,12 +364,8 @@ pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use nix::unistd::{Gid, Uid};
-        nix::unistd::chown(
-            path,
-            Some(Uid::from_raw(uid)),
-            Some(Gid::from_raw(gid)),
-        )
-        .map_err(|e| e.to_string())
+        nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .map_err(|e| e.to_string())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

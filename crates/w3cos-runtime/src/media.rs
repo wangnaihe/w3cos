@@ -46,9 +46,9 @@ pub enum Orientation {
 /// Breakpoint size classes (similar to HarmonyOS breakpoints / SwiftUI SizeClass).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SizeClass {
-    Compact,   // < 600px (phone)
-    Medium,    // 600-1024px (tablet)
-    Expanded,  // > 1024px (desktop)
+    Compact,  // < 600px (phone)
+    Medium,   // 600-1024px (tablet)
+    Expanded, // > 1024px (desktop)
 }
 
 /// A CSS @media query condition.
@@ -115,9 +115,9 @@ pub fn matches_container(condition: &ContainerCondition, width: f32, height: f32
         ContainerCondition::MaxWidth(w) => width <= *w,
         ContainerCondition::MinHeight(h) => height >= *h,
         ContainerCondition::MaxHeight(h) => height <= *h,
-        ContainerCondition::And(conditions) => {
-            conditions.iter().all(|c| matches_container(c, width, height))
-        }
+        ContainerCondition::And(conditions) => conditions
+            .iter()
+            .all(|c| matches_container(c, width, height)),
     }
 }
 
@@ -168,12 +168,11 @@ fn parse_single_condition(s: &str) -> Option<MediaCondition> {
             "landscape" => Some(MediaCondition::Orientation(Orientation::Landscape)),
             _ => None,
         },
-        "min-resolution" => {
-            val.strip_suffix("dppx")
-                .or_else(|| val.strip_suffix("x"))
-                .and_then(|n| n.trim().parse::<f32>().ok())
-                .map(MediaCondition::MinResolution)
-        }
+        "min-resolution" => val
+            .strip_suffix("dppx")
+            .or_else(|| val.strip_suffix("x"))
+            .and_then(|n| n.trim().parse::<f32>().ok())
+            .map(MediaCondition::MinResolution),
         "prefers-color-scheme" => match val {
             "dark" => Some(MediaCondition::PrefersColorScheme(ColorScheme::Dark)),
             "light" => Some(MediaCondition::PrefersColorScheme(ColorScheme::Light)),
@@ -245,8 +244,8 @@ mod tests {
             MediaCondition::MaxWidth(1024.0),
         ]);
         assert!(!matches_media(&cond, &desktop())); // 1920 > 1024
-        assert!(matches_media(&cond, &tablet()));    // 768 in range
-        assert!(!matches_media(&cond, &phone()));    // 375 < 600
+        assert!(matches_media(&cond, &tablet())); // 768 in range
+        assert!(!matches_media(&cond, &phone())); // 375 < 600
     }
 
     #[test]
@@ -260,8 +259,8 @@ mod tests {
     fn resolution_query() {
         let cond = MediaCondition::MinResolution(2.0);
         assert!(!matches_media(&cond, &desktop())); // 1x
-        assert!(matches_media(&cond, &tablet()));    // 2x
-        assert!(matches_media(&cond, &phone()));     // 3x
+        assert!(matches_media(&cond, &tablet())); // 2x
+        assert!(matches_media(&cond, &phone())); // 3x
     }
 
     #[test]

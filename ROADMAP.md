@@ -29,7 +29,7 @@
 - [x] position: fixed / sticky
 - [x] CSS transitions (animated with 60fps frame loop)
 - [x] @keyframes animation support (Animation struct, keyframe types) (#11)
-- [x] Scroll support (overflow: scroll with mouse wheel)
+- [x] Scroll support (overflow scroll, mouse wheel, touch slop, velocity sampling, kinetic deceleration)
 - [x] Image component (placeholder rendering, full decode #2)
 - [x] Focus management + keyboard navigation (Tab/Shift+Tab)
 
@@ -121,6 +121,7 @@
 - [x] Spatial index: `SpatialGrid` (64px grid hash) for hit testing — O(n) → O(k) per `CursorMoved` (k ≈ 1–5)
 - [x] Buffer reuse: `LayoutEngine`, `GlyphCache`, `SpatialGrid` persist in `App` — eliminates per-frame heap allocations
 - [x] Dirty generation tracking: `paint_generation` / `layout_generation` + `needs_tree_rebuild` flag — distinguishes tree change from resize-only
+- [x] Keyed virtual list core: sparse Fenwick height corrections, O(log n) offset lookup, overscan windowing, bounded node recycling, offscreen state restoration, anchor correction, per-item layer invalidation, and explicit logical scroll extent without materializing every item
 
 ### Multi-Device Adaptive Layout ✅
 - [x] @media query engine: min-width, max-width, orientation, resolution, prefers-color-scheme
@@ -207,6 +208,10 @@
 - [ ] **Mobile M1** 🚧 `w3cos-mobile` crate, `examples/mobile-demo`, `templates/android`, `w3cos mobile init`
 - [ ] **Mobile M2** `w3cos mobile build` → APK automation
 - [ ] **Mobile M3** `w3cos-mobile-shell` chrome (SafeArea, StatusBar)
+- [ ] **Mobile Immersive P0** edge-to-edge viewport, `viewport-fit=cover`, CSS `env(safe-area-inset-*)`, `svh` / `lvh` / `dvh`, VisualViewport geometry, and virtual-keyboard insets; native adapters own iOS/Android system-bar integration
+- [ ] **Mobile Immersive P1** Fullscreen API, Web App Manifest `display` / `display-mode`, Screen Orientation lock, fullscreen lifecycle/events, and physical-device conformance tests; do not introduce a non-standard `immersive` component property
+- [ ] **Mobile IME P0** `<input>` / `TextInput` native focus bridge, iOS keyboard activation, caret/baseline alignment, UTF-8 commit/delete, keyboard viewport resize, and physical-device UI regression
+- [ ] **Mobile IME P1** W3C UI Events + Input Events Level 2 composition lifecycle (`beforeinput` / `input` / `composition*`), marked text, selection ranges, input traits (`inputmode` / `enterkeyhint`), and EditContext-compatible geometry
 
 ## Phase 4 — Operating System ✅ (core done)
 - [x] w3cos-shell crate: native desktop shell binary (taskbar, icons, system tray)

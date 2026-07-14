@@ -90,9 +90,9 @@ pub fn resolve_style_ctx(
         if !media_matches(rule, viewport) {
             return false;
         }
-        rule.selectors.iter().any(|s| {
-            selector_matches(s, ctx) || selector_matches(s, &comp_ctx)
-        })
+        rule.selectors
+            .iter()
+            .any(|s| selector_matches(s, ctx) || selector_matches(s, &comp_ctx))
     };
 
     let mut merged = StyleDecl::default();
@@ -128,13 +128,7 @@ fn media_matches(rule: &crate::css_parser::CssRule, viewport: &ResolveViewport) 
         return true;
     };
     media_query::parse_media_query(query)
-        .map(|cond| {
-            cond.matches(&Viewport::new(
-                viewport.width,
-                viewport.height,
-                1.0,
-            ))
-        })
+        .map(|cond| cond.matches(&Viewport::new(viewport.width, viewport.height, 1.0)))
         .unwrap_or(true)
 }
 
@@ -235,6 +229,8 @@ mod tests {
             placeholder: None,
             class_name: class_name.map(|s| s.to_string()),
             show_when: None,
+            repeat: None,
+            sticky_counter: None,
         }
     }
 
@@ -319,11 +315,7 @@ mod tests {
     fn dom_button_matches_button() {
         let css = "button { background: #e94560; border-radius: 8; }";
         let sheet = parse_css(css);
-        let node = make_node(
-            NodeKind::Button("Go".into()),
-            None,
-            StyleDecl::default(),
-        );
+        let node = make_node(NodeKind::Button("Go".into()), None, StyleDecl::default());
         let resolved = resolve_style(&node, &sheet);
         assert_eq!(resolved.background.as_deref(), Some("#e94560"));
         assert_eq!(resolved.border_radius, Some(8.0));

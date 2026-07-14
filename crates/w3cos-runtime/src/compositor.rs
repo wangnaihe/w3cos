@@ -12,7 +12,10 @@ pub fn promotes_compositor_layer(style: &Style) -> bool {
     style.opacity < OPACITY_EPSILON
         || !style.transform.is_identity()
         || style.will_change.promotes_layer()
-        || style.filter.as_ref().is_some_and(|f| crate::filter::filter_promotes_layer(f))
+        || style
+            .filter
+            .as_ref()
+            .is_some_and(|f| crate::filter::filter_promotes_layer(f))
         || style.contain.has_paint_containment()
         || style.animation.is_some()
 }

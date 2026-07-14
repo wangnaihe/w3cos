@@ -19,7 +19,7 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 // ── Chunk ──────────────────────────────────────────────────────────────────
@@ -136,7 +136,9 @@ impl ReadableStream {
 
 impl Clone for ReadableStream {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 

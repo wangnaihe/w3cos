@@ -126,12 +126,12 @@ impl AttrSelector {
             AttrOp::Contains(sub) => value.is_some_and(|v| v.contains(sub.as_str())),
             AttrOp::StartsWith(prefix) => value.is_some_and(|v| v.starts_with(prefix.as_str())),
             AttrOp::EndsWith(suffix) => value.is_some_and(|v| v.ends_with(suffix.as_str())),
-            AttrOp::DashMatch(val) => value.is_some_and(|v| {
-                v == val || v.starts_with(&format!("{val}-"))
-            }),
-            AttrOp::Includes(word) => value.is_some_and(|v| {
-                v.split_whitespace().any(|w| w == word)
-            }),
+            AttrOp::DashMatch(val) => {
+                value.is_some_and(|v| v == val || v.starts_with(&format!("{val}-")))
+            }
+            AttrOp::Includes(word) => {
+                value.is_some_and(|v| v.split_whitespace().any(|w| w == word))
+            }
         }
     }
 }
@@ -176,7 +176,12 @@ impl Selector {
             Selector::Universal => true,
             Selector::Element(e) => e == element_kind,
             Selector::Class(c) => class_names.contains(&c.as_str()),
-            Selector::Compound { element, classes, pseudo_classes, attrs } => {
+            Selector::Compound {
+                element,
+                classes,
+                pseudo_classes,
+                attrs,
+            } => {
                 if let Some(e) = element
                     && e != element_kind
                 {
@@ -196,13 +201,21 @@ impl Selector {
             Selector::Universal => true,
             Selector::Element(e) => e == ctx.element_kind,
             Selector::Class(c) => ctx.class_names.contains(&c.as_str()),
-            Selector::Compound { element, classes, pseudo_classes, attrs } => {
+            Selector::Compound {
+                element,
+                classes,
+                pseudo_classes,
+                attrs,
+            } => {
                 if let Some(e) = element
                     && e != ctx.element_kind
                 {
                     return false;
                 }
-                if !classes.iter().all(|c| ctx.class_names.contains(&c.as_str())) {
+                if !classes
+                    .iter()
+                    .all(|c| ctx.class_names.contains(&c.as_str()))
+                {
                     return false;
                 }
                 for pc in pseudo_classes {
@@ -211,7 +224,9 @@ impl Selector {
                     }
                 }
                 for attr_sel in attrs {
-                    let val = ctx.attributes.iter()
+                    let val = ctx
+                        .attributes
+                        .iter()
                         .find(|(k, _)| *k == attr_sel.name)
                         .map(|(_, v)| *v);
                     if !attr_sel.matches_value(val) {
@@ -260,7 +275,12 @@ pub fn parse_css(source: &str) -> Stylesheet {
         &mut keyframes,
         &mut font_faces,
     );
-    Stylesheet { layer_order, rules, keyframes, font_faces }
+    Stylesheet {
+        layer_order,
+        rules,
+        keyframes,
+        font_faces,
+    }
 }
 
 /// Parse a block of CSS, which can be the top level or the inside of an @layer.
@@ -364,7 +384,14 @@ fn parse_at_rule(
             pos += 1;
             let (block_str, advance) = extract_brace_content(&source[pos..]);
             pos += advance;
-            let inner = parse_block(block_str, layer_order, anon_counter, Some(&full_name), keyframes, font_faces);
+            let inner = parse_block(
+                block_str,
+                layer_order,
+                anon_counter,
+                Some(&full_name),
+                keyframes,
+                font_faces,
+            );
             rules.extend(inner);
         } else if bytes[pos] == b';' {
             pos += 1;
@@ -401,7 +428,14 @@ fn parse_at_rule(
                 pos = scan + 1;
                 let (block_str, advance) = extract_brace_content(&source[pos..]);
                 pos += advance;
-                let inner = parse_block(block_str, layer_order, anon_counter, Some(&full_name), keyframes, font_faces);
+                let inner = parse_block(
+                    block_str,
+                    layer_order,
+                    anon_counter,
+                    Some(&full_name),
+                    keyframes,
+                    font_faces,
+                );
                 rules.extend(inner);
             }
         }
@@ -422,7 +456,10 @@ fn parse_at_rule(
             let (block_str, advance) = extract_brace_content(&source[pos..]);
             pos += advance;
             let stops = parse_keyframe_block(block_str);
-            keyframes.push(KeyframeAnimation { name: anim_name, stops });
+            keyframes.push(KeyframeAnimation {
+                name: anim_name,
+                stops,
+            });
         }
     } else if keyword == "media" {
         while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
@@ -437,7 +474,14 @@ fn parse_at_rule(
             pos += 1;
             let (block_str, advance) = extract_brace_content(&source[pos..]);
             pos += advance;
-            let inner = parse_block(block_str, layer_order, anon_counter, current_layer, keyframes, font_faces);
+            let inner = parse_block(
+                block_str,
+                layer_order,
+                anon_counter,
+                current_layer,
+                keyframes,
+                font_faces,
+            );
             for mut rule in inner {
                 rule.media = Some(condition.clone());
                 rules.push(rule);
@@ -509,7 +553,10 @@ fn parse_keyframe_block(source: &str) -> Vec<KeyframeStop> {
         let style = parse_declarations(block_str);
 
         for offset in offsets {
-            stops.push(KeyframeStop { offset, style: style.clone() });
+            stops.push(KeyframeStop {
+                offset,
+                style: style.clone(),
+            });
         }
     }
 
@@ -523,7 +570,9 @@ fn parse_keyframe_selectors(s: &str) -> Vec<f32> {
             match part {
                 "from" => Some(0.0),
                 "to" => Some(1.0),
-                _ => part.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok().map(|v| v / 100.0)),
+                _ => part
+                    .strip_suffix('%')
+                    .and_then(|n| n.trim().parse::<f32>().ok().map(|v| v / 100.0)),
             }
         })
         .collect()
@@ -550,7 +599,12 @@ fn parse_font_face_block(source: &str) -> FontFace {
         }
     }
 
-    FontFace { family, src, weight, style }
+    FontFace {
+        family,
+        src,
+        weight,
+        style,
+    }
 }
 
 fn qualify_layer_name(parent: Option<&str>, child: &str) -> String {
@@ -649,7 +703,9 @@ fn parse_single_selector(s: &str) -> Option<Selector> {
             for c in chars.by_ref() {
                 if c == ']' {
                     depth -= 1;
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                 } else if c == '[' {
                     depth += 1;
                 }
@@ -686,10 +742,19 @@ fn parse_single_selector(s: &str) -> Option<Selector> {
 
     if classes.is_empty() && pseudo_classes.is_empty() && attrs.is_empty() {
         element.map(Selector::Element)
-    } else if element.is_none() && classes.len() == 1 && pseudo_classes.is_empty() && attrs.is_empty() {
+    } else if element.is_none()
+        && classes.len() == 1
+        && pseudo_classes.is_empty()
+        && attrs.is_empty()
+    {
         Some(Selector::Class(classes.into_iter().next().unwrap()))
     } else {
-        Some(Selector::Compound { element, classes, pseudo_classes, attrs })
+        Some(Selector::Compound {
+            element,
+            classes,
+            pseudo_classes,
+            attrs,
+        })
     }
 }
 
@@ -764,7 +829,9 @@ fn extract_pseudo(s: &str) -> (String, Option<String>, &str) {
             let mut depth = 1;
             let mut paren_end = s.len();
             for (j, ch) in chars.by_ref() {
-                if ch == '(' { depth += 1; }
+                if ch == '(' {
+                    depth += 1;
+                }
                 if ch == ')' {
                     depth -= 1;
                     if depth == 0 {
@@ -854,24 +921,32 @@ fn parse_attr_selector(s: &str) -> Option<AttrSelector> {
     }
 
     // [attr~=value], [attr|=value], [attr^=value], [attr$=value], [attr*=value], [attr=value]
-    let ops = &[("~=", AttrOp::Includes as fn(String) -> AttrOp),
-                ("|=", AttrOp::DashMatch as fn(String) -> AttrOp),
-                ("^=", AttrOp::StartsWith as fn(String) -> AttrOp),
-                ("$=", AttrOp::EndsWith as fn(String) -> AttrOp),
-                ("*=", AttrOp::Contains as fn(String) -> AttrOp)];
+    let ops = &[
+        ("~=", AttrOp::Includes as fn(String) -> AttrOp),
+        ("|=", AttrOp::DashMatch as fn(String) -> AttrOp),
+        ("^=", AttrOp::StartsWith as fn(String) -> AttrOp),
+        ("$=", AttrOp::EndsWith as fn(String) -> AttrOp),
+        ("*=", AttrOp::Contains as fn(String) -> AttrOp),
+    ];
 
     for (op_str, constructor) in ops {
         if let Some(pos) = s.find(op_str) {
             let name = s[..pos].trim().to_string();
             let value = unquote(s[pos + op_str.len()..].trim());
-            return Some(AttrSelector { name, op: constructor(value) });
+            return Some(AttrSelector {
+                name,
+                op: constructor(value),
+            });
         }
     }
 
     if let Some(pos) = s.find('=') {
         let name = s[..pos].trim().to_string();
         let value = unquote(s[pos + 1..].trim());
-        return Some(AttrSelector { name, op: AttrOp::Exact(value) });
+        return Some(AttrSelector {
+            name,
+            op: AttrOp::Exact(value),
+        });
     }
 
     Some(AttrSelector {
@@ -947,7 +1022,9 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         }
         "font-size" => style.font_size = css_parse_px(value),
         "font-weight" => style.font_weight = parse_font_weight(value),
-        "font-family" => style.font_family = Some(value.trim_matches('"').trim_matches('\'').to_string()),
+        "font-family" => {
+            style.font_family = Some(value.trim_matches('"').trim_matches('\'').to_string())
+        }
         "font-style" => style.font_style = Some(value.to_string()),
         "color" => style.color = Some(value.to_string()),
         "background" | "background-color" => style.background = Some(value.to_string()),
@@ -956,8 +1033,11 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             style.border_width = css_parse_px(value);
         }
-        "border-color" | "border-top-color" | "border-right-color"
-        | "border-bottom-color" | "border-left-color" => {
+        "border-color"
+        | "border-top-color"
+        | "border-right-color"
+        | "border-bottom-color"
+        | "border-left-color" => {
             style.border_color = Some(value.to_string());
         }
         "align-items" => style.align_items = Some(value.to_string()),
@@ -1118,10 +1198,7 @@ fn css_parse_spacing_shorthand(value: &str) -> Option<(Spacing, Spacing, Spacing
 
 /// CSS box-edge shorthand: 1–4 values (top [right [bottom [left]]]).
 fn css_parse_edge_shorthand(value: &str) -> Option<(f32, f32, f32, f32)> {
-    let parts: Vec<f32> = value
-        .split_whitespace()
-        .filter_map(css_parse_px)
-        .collect();
+    let parts: Vec<f32> = value.split_whitespace().filter_map(css_parse_px).collect();
     match parts.len() {
         1 => {
             let v = parts[0];
@@ -1201,7 +1278,9 @@ mod tests {
         let sheet = parse_css(css);
         assert_eq!(sheet.rules.len(), 1);
         match &sheet.rules[0].selectors[0] {
-            Selector::Compound { element, classes, .. } => {
+            Selector::Compound {
+                element, classes, ..
+            } => {
                 assert_eq!(element.as_deref(), Some("span"));
                 assert_eq!(classes, &["highlight"]);
             }
@@ -1292,8 +1371,7 @@ mod tests {
     #[test]
     fn parse_calc_keyboard_and_safe_area() {
         use w3cos_std::style::SafeAreaEdge;
-        let css =
-            ".composer { padding-bottom: calc(10px + env(safe-area-inset-bottom) + env(keyboard-inset-height)); }";
+        let css = ".composer { padding-bottom: calc(10px + env(safe-area-inset-bottom) + env(keyboard-inset-height)); }";
         let sheet = parse_css(css);
         assert_eq!(
             sheet.rules[0].style.padding_bottom,
@@ -1385,10 +1463,7 @@ mod tests {
         let css = "* { gap: 4; }";
         let sheet = parse_css(css);
         assert_eq!(sheet.rules.len(), 1);
-        assert!(matches!(
-            &sheet.rules[0].selectors[0],
-            Selector::Universal
-        ));
+        assert!(matches!(&sheet.rules[0].selectors[0], Selector::Universal));
         assert!(sheet.rules[0].selectors[0].matches("Anything", &[]));
     }
 
@@ -1489,14 +1564,8 @@ mod tests {
             vec!["framework", "framework.reset", "framework.base"]
         );
         assert_eq!(sheet.rules.len(), 2);
-        assert_eq!(
-            sheet.rules[0].layer.as_deref(),
-            Some("framework.reset")
-        );
-        assert_eq!(
-            sheet.rules[1].layer.as_deref(),
-            Some("framework.base")
-        );
+        assert_eq!(sheet.rules[0].layer.as_deref(), Some("framework.reset"));
+        assert_eq!(sheet.rules[1].layer.as_deref(), Some("framework.base"));
     }
 
     #[test]
@@ -1555,10 +1624,7 @@ mod tests {
         "#;
         let sheet = parse_css(css);
         assert_eq!(sheet.layer_order, vec!["framework.base"]);
-        assert_eq!(
-            sheet.rules[0].layer.as_deref(),
-            Some("framework.base")
-        );
+        assert_eq!(sheet.rules[0].layer.as_deref(), Some("framework.base"));
     }
 
     // ── Pseudo-class selector tests ──
@@ -1569,7 +1635,11 @@ mod tests {
         let sheet = parse_css(css);
         assert_eq!(sheet.rules.len(), 1);
         match &sheet.rules[0].selectors[0] {
-            Selector::Compound { classes, pseudo_classes, .. } => {
+            Selector::Compound {
+                classes,
+                pseudo_classes,
+                ..
+            } => {
                 assert_eq!(classes, &["btn"]);
                 assert_eq!(pseudo_classes.len(), 1);
                 assert!(matches!(pseudo_classes[0], PseudoClass::Hover));
@@ -1583,7 +1653,11 @@ mod tests {
         let css = "button:hover:active { color: red; }";
         let sheet = parse_css(css);
         match &sheet.rules[0].selectors[0] {
-            Selector::Compound { element, pseudo_classes, .. } => {
+            Selector::Compound {
+                element,
+                pseudo_classes,
+                ..
+            } => {
                 assert_eq!(element.as_deref(), Some("button"));
                 assert_eq!(pseudo_classes.len(), 2);
                 assert!(matches!(pseudo_classes[0], PseudoClass::Hover));
@@ -1610,15 +1684,13 @@ mod tests {
         let css = "tr:nth-child(2n+1) { background: #eee; }";
         let sheet = parse_css(css);
         match &sheet.rules[0].selectors[0] {
-            Selector::Compound { pseudo_classes, .. } => {
-                match &pseudo_classes[0] {
-                    PseudoClass::NthChild(expr) => {
-                        assert_eq!(expr.a, 2);
-                        assert_eq!(expr.b, 1);
-                    }
-                    _ => panic!("expected NthChild"),
+            Selector::Compound { pseudo_classes, .. } => match &pseudo_classes[0] {
+                PseudoClass::NthChild(expr) => {
+                    assert_eq!(expr.a, 2);
+                    assert_eq!(expr.b, 1);
                 }
-            }
+                _ => panic!("expected NthChild"),
+            },
             _ => panic!("expected Compound"),
         }
     }
@@ -1665,7 +1737,10 @@ mod tests {
         assert!(!sel.matches_with_context(&ctx_no_hover));
 
         let ctx_hover = MatchContext {
-            pseudo_state: PseudoState { hovered: true, ..PseudoState::default() },
+            pseudo_state: PseudoState {
+                hovered: true,
+                ..PseudoState::default()
+            },
             ..ctx_no_hover
         };
         assert!(sel.matches_with_context(&ctx_hover));
@@ -1709,24 +1784,28 @@ mod tests {
         let css = r#"a[href*="example"] { color: blue; }"#;
         let sheet = parse_css(css);
         match &sheet.rules[0].selectors[0] {
-            Selector::Compound { attrs, .. } => {
-                match &attrs[0].op {
-                    AttrOp::Contains(v) => assert_eq!(v, "example"),
-                    _ => panic!("expected Contains"),
-                }
-            }
+            Selector::Compound { attrs, .. } => match &attrs[0].op {
+                AttrOp::Contains(v) => assert_eq!(v, "example"),
+                _ => panic!("expected Contains"),
+            },
             _ => panic!("expected Compound"),
         }
     }
 
     #[test]
     fn attr_selector_matching() {
-        let attr = AttrSelector { name: "type".to_string(), op: AttrOp::Exact("text".to_string()) };
+        let attr = AttrSelector {
+            name: "type".to_string(),
+            op: AttrOp::Exact("text".to_string()),
+        };
         assert!(attr.matches_value(Some("text")));
         assert!(!attr.matches_value(Some("password")));
         assert!(!attr.matches_value(None));
 
-        let exists = AttrSelector { name: "disabled".to_string(), op: AttrOp::Exists };
+        let exists = AttrSelector {
+            name: "disabled".to_string(),
+            op: AttrOp::Exists,
+        };
         assert!(exists.matches_value(Some("")));
         assert!(exists.matches_value(Some("true")));
         assert!(!exists.matches_value(None));
@@ -1734,14 +1813,20 @@ mod tests {
 
     #[test]
     fn attr_starts_with() {
-        let attr = AttrSelector { name: "class".to_string(), op: AttrOp::StartsWith("btn".to_string()) };
+        let attr = AttrSelector {
+            name: "class".to_string(),
+            op: AttrOp::StartsWith("btn".to_string()),
+        };
         assert!(attr.matches_value(Some("btn-primary")));
         assert!(!attr.matches_value(Some("card-btn")));
     }
 
     #[test]
     fn attr_includes() {
-        let attr = AttrSelector { name: "class".to_string(), op: AttrOp::Includes("active".to_string()) };
+        let attr = AttrSelector {
+            name: "class".to_string(),
+            op: AttrOp::Includes("active".to_string()),
+        };
         assert!(attr.matches_value(Some("btn active large")));
         assert!(!attr.matches_value(Some("inactive")));
     }

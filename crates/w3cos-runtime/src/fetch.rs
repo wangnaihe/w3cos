@@ -254,9 +254,7 @@ mod tests {
     #[test]
     fn fetch_async_works() {
         let rx = fetch_async("https://httpbin.org/get", FetchOptions::default());
-        let result = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap();
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         match result {
             FetchResult::Success(resp) => {
                 assert!(resp.ok);

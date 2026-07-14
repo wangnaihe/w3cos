@@ -74,7 +74,13 @@ impl Value {
         match self {
             Value::Undefined => f64::NAN,
             Value::Null => 0.0,
-            Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+            Value::Bool(b) => {
+                if *b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             Value::Number(n) => *n,
             Value::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
             _ => f64::NAN,
@@ -91,7 +97,11 @@ impl Value {
                 if n.is_nan() {
                     "NaN".into()
                 } else if n.is_infinite() {
-                    if *n > 0.0 { "Infinity".into() } else { "-Infinity".into() }
+                    if *n > 0.0 {
+                        "Infinity".into()
+                    } else {
+                        "-Infinity".into()
+                    }
                 } else if *n == 0.0 {
                     "0".into()
                 } else if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
@@ -110,16 +120,34 @@ impl Value {
         }
     }
 
-    pub fn is_undefined(&self) -> bool { matches!(self, Value::Undefined) }
-    pub fn is_null(&self) -> bool { matches!(self, Value::Null) }
-    pub fn is_nullish(&self) -> bool { matches!(self, Value::Undefined | Value::Null) }
+    pub fn is_undefined(&self) -> bool {
+        matches!(self, Value::Undefined)
+    }
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+    pub fn is_nullish(&self) -> bool {
+        matches!(self, Value::Undefined | Value::Null)
+    }
 
-    pub fn is_number(&self) -> bool { matches!(self, Value::Number(_)) }
-    pub fn is_string(&self) -> bool { matches!(self, Value::String(_)) }
-    pub fn is_bool(&self) -> bool { matches!(self, Value::Bool(_)) }
-    pub fn is_object(&self) -> bool { matches!(self, Value::Object(_)) }
-    pub fn is_array(&self) -> bool { matches!(self, Value::Array(_)) }
-    pub fn is_function(&self) -> bool { matches!(self, Value::Function(_)) }
+    pub fn is_number(&self) -> bool {
+        matches!(self, Value::Number(_))
+    }
+    pub fn is_string(&self) -> bool {
+        matches!(self, Value::String(_))
+    }
+    pub fn is_bool(&self) -> bool {
+        matches!(self, Value::Bool(_))
+    }
+    pub fn is_object(&self) -> bool {
+        matches!(self, Value::Object(_))
+    }
+    pub fn is_array(&self) -> bool {
+        matches!(self, Value::Array(_))
+    }
+    pub fn is_function(&self) -> bool {
+        matches!(self, Value::Function(_))
+    }
 
     /// ECMAScript `ToInt32`.
     pub fn to_i32(&self) -> i32 {
@@ -167,7 +195,10 @@ impl Value {
             }
             Value::String(s) => {
                 if let Ok(idx) = key.parse::<usize>() {
-                    s.chars().nth(idx).map(|c| Value::String(c.to_string())).unwrap_or(Value::Undefined)
+                    s.chars()
+                        .nth(idx)
+                        .map(|c| Value::String(c.to_string()))
+                        .unwrap_or(Value::Undefined)
                 } else if key == "length" {
                     Value::Number(s.len() as f64)
                 } else {
@@ -181,7 +212,9 @@ impl Value {
     /// Property assignment: `obj[key] = value`.
     pub fn set_property(&self, key: &str, value: Value) {
         match self {
-            Value::Object(o) => { o.borrow_mut().set(key, value, &Value::Undefined); }
+            Value::Object(o) => {
+                o.borrow_mut().set(key, value, &Value::Undefined);
+            }
             Value::Array(arr) => {
                 if let Ok(idx) = key.parse::<usize>() {
                     let mut a = arr.borrow_mut();
@@ -199,9 +232,15 @@ impl Value {
 // ── Constructors ───────────────────────────────────────────────────────
 
 impl Value {
-    pub fn from_f64(n: f64) -> Self { Value::Number(n) }
-    pub fn from_bool(b: bool) -> Self { Value::Bool(b) }
-    pub fn string(s: &str) -> Self { Value::String(s.to_string()) }
+    pub fn from_f64(n: f64) -> Self {
+        Value::Number(n)
+    }
+    pub fn from_bool(b: bool) -> Self {
+        Value::Bool(b)
+    }
+    pub fn string(s: &str) -> Self {
+        Value::String(s.to_string())
+    }
 
     pub fn array(items: Vec<Value>) -> Self {
         Value::Array(Rc::new(RefCell::new(items)))
@@ -292,7 +331,11 @@ impl Value {
             (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Number(a), Value::Number(b)) => {
-                if a.is_nan() || b.is_nan() { false } else { a == b }
+                if a.is_nan() || b.is_nan() {
+                    false
+                } else {
+                    a == b
+                }
             }
             (Value::String(a), Value::String(b)) => a == b,
             _ => false,
@@ -444,8 +487,14 @@ mod tests {
 
     #[test]
     fn power_operator() {
-        assert_eq!(Value::Number(2.0).js_pow(&Value::Number(10.0)).to_number(), 1024.0);
-        assert_eq!(Value::Number(9.0).js_pow(&Value::Number(0.5)).to_number(), 3.0);
+        assert_eq!(
+            Value::Number(2.0).js_pow(&Value::Number(10.0)).to_number(),
+            1024.0
+        );
+        assert_eq!(
+            Value::Number(9.0).js_pow(&Value::Number(0.5)).to_number(),
+            3.0
+        );
     }
 
     #[test]

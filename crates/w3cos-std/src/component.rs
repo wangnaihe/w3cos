@@ -19,7 +19,9 @@ pub enum EventAction {
         path: String,
     },
     /// `history:back:route` — history.back() + restore route from state
-    HistoryBack { route_signal: usize },
+    HistoryBack {
+        route_signal: usize,
+    },
     /// `fetch:GET:statusSig:bytesSig:https://...` — blocking HTTP GET, store status + body len
     FetchGet {
         url: String,
@@ -42,6 +44,10 @@ pub struct Component {
     pub children: Vec<Component>,
     #[serde(default)]
     pub on_click: EventAction,
+    /// Signal whose value is increased when this node crosses its scrollport's
+    /// sticky threshold. Used by declarative sticky-group summaries.
+    #[serde(default)]
+    pub sticky_counter_signal: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,12 +55,32 @@ pub enum ComponentKind {
     Root,
     Column,
     Row,
-    Text { content: String },
-    Button { label: String },
+    Text {
+        content: String,
+    },
+    Button {
+        label: String,
+    },
     Box,
-    Image { src: String },
-    TextInput { value: String, placeholder: String },
-    Canvas { width: u32, height: u32 },
+    Image {
+        src: String,
+    },
+    TextInput {
+        value: String,
+        placeholder: String,
+    },
+    Canvas {
+        width: u32,
+        height: u32,
+    },
+    /// Runtime-windowed list. `children` contains the item template before the
+    /// runtime materializes the current keyed window.
+    VirtualList {
+        item_count: usize,
+        estimated_item_height: f32,
+        overscan: f32,
+        total_extent: f32,
+    },
 }
 
 impl Component {
@@ -64,6 +90,7 @@ impl Component {
             style: Style::default(),
             children,
             on_click: EventAction::None,
+            sticky_counter_signal: None,
         }
     }
 
@@ -73,6 +100,7 @@ impl Component {
             style,
             children,
             on_click: EventAction::None,
+            sticky_counter_signal: None,
         }
     }
 
@@ -85,6 +113,7 @@ impl Component {
             },
             children,
             on_click: EventAction::None,
+            sticky_counter_signal: None,
         }
     }
 
@@ -96,6 +125,7 @@ impl Component {
             style,
             children: vec![],
             on_click: EventAction::None,
+            sticky_counter_signal: None,
         }
     }
 
@@ -107,6 +137,7 @@ impl Component {
             style,
             children: vec![],
             on_click: EventAction::None,
+            sticky_counter_signal: None,
         }
     }
 
@@ -122,6 +153,7 @@ impl Component {
             style,
             children: vec![],
             on_click,
+            sticky_counter_signal: None,
         }
     }
 
@@ -131,6 +163,7 @@ impl Component {
             style,
             children,
             on_click: EventAction::None,
+            sticky_counter_signal: None,
         }
     }
 
@@ -140,6 +173,7 @@ impl Component {
             style,
             children: vec![],
             on_click: EventAction::None,
+            sticky_counter_signal: None,
         }
     }
 
@@ -156,6 +190,7 @@ impl Component {
             style,
             children: vec![],
             on_click: EventAction::None,
+            sticky_counter_signal: None,
         }
     }
 
@@ -165,6 +200,28 @@ impl Component {
             style,
             children: vec![],
             on_click: EventAction::None,
+            sticky_counter_signal: None,
+        }
+    }
+
+    pub fn virtual_list(
+        item_count: usize,
+        estimated_item_height: f32,
+        overscan: f32,
+        style: Style,
+        item_template: Component,
+    ) -> Self {
+        Self {
+            kind: ComponentKind::VirtualList {
+                item_count,
+                estimated_item_height: estimated_item_height.max(1.0),
+                overscan: overscan.max(0.0),
+                total_extent: item_count as f32 * estimated_item_height.max(1.0),
+            },
+            style,
+            children: vec![item_template],
+            on_click: EventAction::None,
+            sticky_counter_signal: None,
         }
     }
 }

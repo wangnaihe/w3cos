@@ -1,10 +1,20 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use w3cos_std::style::Style;
+use w3cos_std::style::{EdgeLengths, Style};
 
 use super::server::SerializedDocument;
 use crate::layout::LayoutRect;
+
+fn resolve_edges(edges: &w3cos_std::style::Edges) -> EdgeLengths {
+    let insets = w3cos_std::safe_area::SafeAreaInsets::default();
+    EdgeLengths {
+        top: edges.top.resolve(&insets),
+        right: edges.right.resolve(&insets),
+        bottom: edges.bottom.resolve(&insets),
+        left: edges.left.resolve(&insets),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CDP message envelope
@@ -91,10 +101,7 @@ impl CdpHandler {
         layout_rects: &[(LayoutRect, usize)],
     ) -> CdpResponse {
         let result = self.dispatch(&req.method, &req.params, doc, layout_rects);
-        CdpResponse {
-            id: req.id,
-            result,
-        }
+        CdpResponse { id: req.id, result }
     }
 
     fn dispatch(
@@ -312,8 +319,8 @@ impl CdpHandler {
                 .map(|n| &n.style)
                 .cloned()
                 .unwrap_or_default();
-            let p = &style.padding;
-            let m = &style.margin;
+            let p = resolve_edges(&style.padding);
+            let m = resolve_edges(&style.margin);
             let bw = style.border_width;
 
             let content = quad(
@@ -360,11 +367,7 @@ impl CdpHandler {
         let y = params["y"].as_f64().unwrap_or(0.0) as f32;
 
         for (rect, idx) in layout_rects.iter().rev() {
-            if x >= rect.x
-                && x <= rect.x + rect.width
-                && y >= rect.y
-                && y <= rect.y + rect.height
-            {
+            if x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height {
                 return json!({
                     "backendNodeId": *idx as i64,
                     "frameId": "main",
@@ -520,7 +523,12 @@ impl CdpHandler {
         obj
     }
 
-    fn serialize_children(&self, doc: &SerializedDocument, parent_id: u32, depth: i32) -> Vec<Value> {
+    fn serialize_children(
+        &self,
+        doc: &SerializedDocument,
+        parent_id: u32,
+        depth: i32,
+    ) -> Vec<Value> {
         let node = match doc.get_node(parent_id) {
             Some(n) => n,
             None => return Vec::new(),
@@ -563,30 +571,47 @@ impl CdpHandler {
     // Simple selector matching on the serialized document
     fn query_selector_impl(&self, doc: &SerializedDocument, selector: &str) -> Option<u32> {
         if let Some(id) = selector.strip_prefix('#') {
-            return doc.nodes.iter().find(|n| {
-                n.attributes.iter().any(|(k, v)| k == "id" && v == id)
-            }).map(|n| n.id);
+            return doc
+                .nodes
+                .iter()
+                .find(|n| n.attributes.iter().any(|(k, v)| k == "id" && v == id))
+                .map(|n| n.id);
         }
         if let Some(class) = selector.strip_prefix('.') {
-            return doc.nodes.iter().find(|n| {
-                n.class_list.iter().any(|c| c == class)
-            }).map(|n| n.id);
+            return doc
+                .nodes
+                .iter()
+                .find(|n| n.class_list.iter().any(|c| c == class))
+                .map(|n| n.id);
         }
-        doc.nodes.iter().find(|n| n.tag == selector && n.node_type == 1).map(|n| n.id)
+        doc.nodes
+            .iter()
+            .find(|n| n.tag == selector && n.node_type == 1)
+            .map(|n| n.id)
     }
 
     fn query_selector_all_impl(&self, doc: &SerializedDocument, selector: &str) -> Vec<u32> {
         if let Some(id) = selector.strip_prefix('#') {
-            return doc.nodes.iter().filter(|n| {
-                n.attributes.iter().any(|(k, v)| k == "id" && v == id)
-            }).map(|n| n.id).collect();
+            return doc
+                .nodes
+                .iter()
+                .filter(|n| n.attributes.iter().any(|(k, v)| k == "id" && v == id))
+                .map(|n| n.id)
+                .collect();
         }
         if let Some(class) = selector.strip_prefix('.') {
-            return doc.nodes.iter().filter(|n| {
-                n.class_list.iter().any(|c| c == class)
-            }).map(|n| n.id).collect();
+            return doc
+                .nodes
+                .iter()
+                .filter(|n| n.class_list.iter().any(|c| c == class))
+                .map(|n| n.id)
+                .collect();
         }
-        doc.nodes.iter().filter(|n| n.tag == selector && n.node_type == 1).map(|n| n.id).collect()
+        doc.nodes
+            .iter()
+            .filter(|n| n.tag == selector && n.node_type == 1)
+            .map(|n| n.id)
+            .collect()
     }
 }
 
@@ -606,10 +631,7 @@ fn style_to_computed_properties(style: &Style) -> Vec<Value> {
         "flex-direction",
         format!("{:?}", style.flex_direction).to_lowercase(),
     );
-    add(
-        "justify-content",
-        format_justify(&style.justify_content),
-    );
+    add("justify-content", format_justify(&style.justify_content));
     add("align-items", format_align(&style.align_items));
     add("flex-wrap", format_flex_wrap(&style.flex_wrap));
     add("flex-grow", style.flex_grow.to_string());
@@ -759,7 +781,10 @@ fn style_to_css_properties(style: &Style) -> Vec<Value> {
             "color",
             format!(
                 "rgba({}, {}, {}, {})",
-                style.color.r, style.color.g, style.color.b, style.color.a as f32 / 255.0
+                style.color.r,
+                style.color.g,
+                style.color.b,
+                style.color.a as f32 / 255.0
             ),
         );
     }

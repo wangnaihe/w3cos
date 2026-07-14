@@ -41,7 +41,9 @@ fn mark_dirty() {
 pub fn push_state(state: Option<&str>, title: &str, url: &str) {
     STORE.with(|s| {
         let mut store = s.borrow_mut();
-        store.history.push_state(state.map(|s| s.to_string()), title, url);
+        store
+            .history
+            .push_state(state.map(|s| s.to_string()), title, url);
         store.sync_location();
     });
     mark_dirty();
@@ -50,7 +52,9 @@ pub fn push_state(state: Option<&str>, title: &str, url: &str) {
 pub fn replace_state(state: Option<&str>, title: &str, url: &str) {
     STORE.with(|s| {
         let mut store = s.borrow_mut();
-        store.history.replace_state(state.map(|s| s.to_string()), title, url);
+        store
+            .history
+            .replace_state(state.map(|s| s.to_string()), title, url);
         store.sync_location();
     });
     mark_dirty();

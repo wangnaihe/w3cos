@@ -19,8 +19,8 @@
 
 use std::collections::VecDeque;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -66,7 +66,11 @@ pub enum WebSocketEvent {
     /// `onerror` — a transport or protocol failure occurred.
     Error(String),
     /// `onclose` — connection closed (cleanly when `was_clean`).
-    Close { code: u16, reason: String, was_clean: bool },
+    Close {
+        code: u16,
+        reason: String,
+        was_clean: bool,
+    },
 }
 
 /// Outbound command sent from the application thread to the worker thread.
@@ -136,13 +140,19 @@ impl WebSocket {
     pub fn send_text(&self, payload: impl Into<String>) -> Result<(), String> {
         let payload = payload.into();
         let len = payload.len();
-        self.send_command(OutboundCommand::Send(Message::Text(payload.into())), len as u32)
+        self.send_command(
+            OutboundCommand::Send(Message::Text(payload.into())),
+            len as u32,
+        )
     }
 
     /// `WebSocket.send(buffer)` — queue a binary frame.
     pub fn send_binary(&self, payload: Vec<u8>) -> Result<(), String> {
         let len = payload.len();
-        self.send_command(OutboundCommand::Send(Message::Binary(payload.into())), len as u32)
+        self.send_command(
+            OutboundCommand::Send(Message::Binary(payload.into())),
+            len as u32,
+        )
     }
 
     /// `WebSocket.close([code[, reason]])` — initiate a clean close.
@@ -183,8 +193,11 @@ impl WebSocket {
         let tx = guard
             .as_ref()
             .ok_or_else(|| "WebSocket already closed".to_string())?;
-        self.inner.buffered.fetch_add(queued_bytes, Ordering::SeqCst);
-        tx.send(cmd).map_err(|e| format!("WebSocket send failed: {e}"))
+        self.inner
+            .buffered
+            .fetch_add(queued_bytes, Ordering::SeqCst);
+        tx.send(cmd)
+            .map_err(|e| format!("WebSocket send failed: {e}"))
     }
 }
 
@@ -220,7 +233,10 @@ fn worker_loop(inner: Arc<WebSocketInner>, cmd_rx: mpsc::Receiver<OutboundComman
     let (mut socket, _response) = match tungstenite::connect(request) {
         Ok(pair) => pair,
         Err(e) => {
-            push_event(&inner, WebSocketEvent::Error(format!("connect failed: {e}")));
+            push_event(
+                &inner,
+                WebSocketEvent::Error(format!("connect failed: {e}")),
+            );
             push_event(
                 &inner,
                 WebSocketEvent::Close {
@@ -260,15 +276,10 @@ fn worker_loop(inner: Arc<WebSocketInner>, cmd_rx: mpsc::Receiver<OutboundComman
                     let bytes = message_byte_len(&msg);
                     match socket.send(msg) {
                         Ok(_) => {
-                            inner
-                                .buffered
-                                .fetch_sub(bytes, Ordering::SeqCst);
+                            inner.buffered.fetch_sub(bytes, Ordering::SeqCst);
                         }
                         Err(e) => {
-                            push_event(
-                                &inner,
-                                WebSocketEvent::Error(format!("send failed: {e}")),
-                            );
+                            push_event(&inner, WebSocketEvent::Error(format!("send failed: {e}")));
                             close_code = 1006;
                             close_reason = e.to_string();
                             was_clean = false;
@@ -312,8 +323,7 @@ fn worker_loop(inner: Arc<WebSocketInner>, cmd_rx: mpsc::Receiver<OutboundComman
                 }
                 break;
             }
-            Err(tungstenite::Error::ConnectionClosed)
-            | Err(tungstenite::Error::AlreadyClosed) => {
+            Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
                 was_clean = true;
                 break;
             }
@@ -417,9 +427,11 @@ mod tests {
         let _ = drain_until(&ws, |e| matches!(e, WebSocketEvent::Open));
         ws.send_text("ping").unwrap();
         let events = drain_until(&ws, |e| matches!(e, WebSocketEvent::Text(_)));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, WebSocketEvent::Text(t) if t == "ping")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WebSocketEvent::Text(t) if t == "ping"))
+        );
         let _ = ws.close(1000, "bye");
         let _ = drain_until(&ws, |e| matches!(e, WebSocketEvent::Close { .. }));
         let _ = server.join();

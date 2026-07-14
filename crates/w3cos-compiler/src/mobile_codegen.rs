@@ -1,4 +1,4 @@
-use crate::codegen::{find_workspace_root, gen_node};
+use crate::codegen::{CompileOptions, find_workspace_root, gen_node};
 use crate::css_parser::Stylesheet;
 use crate::parser::{AppTree, SignalDecl};
 use anyhow::Result;
@@ -11,6 +11,7 @@ pub fn write_mobile_project(
     platform: &str,
     safe_area: bool,
     interactive_widget: &str,
+    options: &CompileOptions,
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir.join("src"))?;
     let body = generate_app_body(tree, stylesheet)?;
@@ -20,11 +21,23 @@ pub fn write_mobile_project(
             output_dir.join("src/layout_export.rs"),
             generate_layout_export(tree, safe_area)?,
         )?;
-        std::fs::write(output_dir.join("src/main.rs"), generate_ios_main(safe_area, interactive_widget)?)?;
-        std::fs::write(output_dir.join("Cargo.toml"), generate_ios_cargo_toml()?)?;
+        std::fs::write(
+            output_dir.join("src/main.rs"),
+            generate_ios_main(safe_area, interactive_widget)?,
+        )?;
+        std::fs::write(
+            output_dir.join("Cargo.toml"),
+            generate_ios_cargo_toml(options)?,
+        )?;
     } else {
-        std::fs::write(output_dir.join("src/lib.rs"), generate_android_lib(&body, interactive_widget)?)?;
-        std::fs::write(output_dir.join("Cargo.toml"), generate_android_cargo_toml()?)?;
+        std::fs::write(
+            output_dir.join("src/lib.rs"),
+            generate_android_lib(&body, interactive_widget)?,
+        )?;
+        std::fs::write(
+            output_dir.join("Cargo.toml"),
+            generate_android_cargo_toml(options)?,
+        )?;
     }
     Ok(())
 }
@@ -55,13 +68,11 @@ pub fn build_ui() -> Component {{
 
 fn gen_viewport_init(interactive_widget: &str) -> String {
     let mode = match interactive_widget {
-        "resizes-visual" => "InteractiveWidget::ResizesVisual",
-        "overlays-content" => "InteractiveWidget::OverlaysContent",
-        _ => "InteractiveWidget::ResizesContent",
+        "resizes-visual" => "w3cos_std::viewport::InteractiveWidget::ResizesVisual",
+        "overlays-content" => "w3cos_std::viewport::InteractiveWidget::OverlaysContent",
+        _ => "w3cos_std::viewport::InteractiveWidget::ResizesContent",
     };
-    format!(
-        "    w3cos_std::viewport::set_interactive_widget({mode});\n",
-    )
+    format!("    w3cos_std::viewport::set_interactive_widget({mode});\n",)
 }
 
 fn generate_ios_main(safe_area: bool, interactive_widget: &str) -> Result<String> {
@@ -191,10 +202,15 @@ fn gen_signal_inits(signals: &[SignalDecl]) -> String {
     )
 }
 
-fn deps_block(root: &Path) -> String {
+fn deps_block(root: &Path, options: &CompileOptions) -> String {
+    let runtime_features = if options.devtools {
+        r#", features = ["devtools"]"#
+    } else {
+        ""
+    };
     format!(
         r#"w3cos-mobile = {{ path = "{mobile}" }}
-w3cos-runtime = {{ path = "{runtime}" }}
+w3cos-runtime = {{ path = "{runtime}"{runtime_features} }}
 w3cos-std = {{ path = "{std}" }}
 log = "0.4""#,
         mobile = root.join("crates/w3cos-mobile").display(),
@@ -203,7 +219,7 @@ log = "0.4""#,
     )
 }
 
-pub fn generate_ios_cargo_toml() -> Result<String> {
+pub fn generate_ios_cargo_toml(options: &CompileOptions) -> Result<String> {
     let root = find_workspace_root()?;
     Ok(format!(
         r#"[package]
@@ -223,11 +239,11 @@ path = "src/layout_export.rs"
 {deps}
 serde_json = "1"
 "#,
-        deps = deps_block(&root),
+        deps = deps_block(&root, options),
     ))
 }
 
-pub fn generate_android_cargo_toml() -> Result<String> {
+pub fn generate_android_cargo_toml(options: &CompileOptions) -> Result<String> {
     let root = find_workspace_root()?;
     Ok(format!(
         r#"[package]
@@ -246,6 +262,6 @@ crate-type = ["cdylib"]
 android_logger = "0.14"
 winit = {{ version = "0.30", features = ["android-native-activity"] }}
 "#,
-        deps = deps_block(&root),
+        deps = deps_block(&root, options),
     ))
 }

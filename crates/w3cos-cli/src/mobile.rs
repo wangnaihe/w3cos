@@ -1,9 +1,11 @@
 //! `w3cos mobile init` / `w3cos mobile build` — generic mobile pipeline.
 
-use anyhow::{bail, Context, Result};
+use crate::dev;
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use w3cos_compiler::CompileOptions;
 
 fn w3cos_root() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -91,10 +93,22 @@ Manifest: `w3cos.app.json`
     Ok(())
 }
 
+/// Debug mobile builds enable DevTools by default; release builds require `--devtools`.
+pub fn resolve_mobile_devtools(release: bool, devtools: bool, no_devtools: bool) -> bool {
+    if no_devtools {
+        false
+    } else if devtools {
+        true
+    } else {
+        !release
+    }
+}
+
 pub fn mobile_build(
     project_dir: &Path,
     platform: &str,
     release: bool,
+    devtools: bool,
 ) -> Result<()> {
     let (_, _, entry, safe_area, interactive_widget) = read_app_manifest(project_dir);
     let app_tsx = project_dir.join(&entry);
@@ -108,13 +122,18 @@ pub fn mobile_build(
     }
     fs::create_dir_all(&build_dir)?;
 
+    if devtools {
+        println!("🔧 Mobile DevTools enabled (CDP port 9229 on device/simulator)");
+    }
+
     println!("⚡ Transpiling {} → mobile cdylib...", app_tsx.display());
-    w3cos_compiler::compile_mobile_from_file(
+    w3cos_compiler::compile_mobile_from_file_with_options(
         &app_tsx,
         &build_dir,
         platform,
         safe_area,
         &interactive_widget,
+        &CompileOptions { devtools },
     )?;
 
     match platform {
@@ -130,6 +149,182 @@ pub fn mobile_build(
     Ok(())
 }
 
+/// Watch entry + CSS imports, rebuild mobile artifact, reinstall on device/simulator.
+pub fn mobile_dev(
+    project_dir: &Path,
+    platform: &str,
+    release: bool,
+    devtools: bool,
+    no_devtools: bool,
+    devtools_port: u16,
+) -> Result<()> {
+    let devtools = resolve_mobile_devtools(release, devtools, no_devtools);
+    let (_, bundle_id, entry, _, _) = read_app_manifest(project_dir);
+    let app_tsx = project_dir.join(&entry);
+    if !app_tsx.exists() {
+        bail!("missing entry {} in {}", entry, project_dir.display());
+    }
+
+    let watch_paths = w3cos_compiler::collect_watch_paths(&app_tsx)?;
+    let watch_list: Vec<_> = watch_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+
+    println!("🔄 W3C OS Mobile Dev — platform: {platform}");
+    println!("   Watching:");
+    for p in &watch_list {
+        println!("   • {p}");
+    }
+    println!("   Press Ctrl+C to stop\n");
+
+    if devtools {
+        dev::print_mobile_devtools_hint(devtools_port, platform);
+        if platform == "android" {
+            dev::setup_android_devtools_forward(devtools_port);
+        }
+    }
+
+    let mut last_mtimes: std::collections::HashMap<
+        std::path::PathBuf,
+        Option<std::time::SystemTime>,
+    > = watch_paths
+        .iter()
+        .map(|p| (p.clone(), file_mtime(p)))
+        .collect();
+
+    loop {
+        println!("⚡ Mobile build ({platform})...");
+        if let Err(e) = mobile_build(project_dir, platform, release, devtools) {
+            eprintln!("❌ Build failed: {e}");
+            wait_mobile_change(&watch_paths, &mut last_mtimes);
+            continue;
+        }
+
+        match platform {
+            "android" => {
+                if devtools {
+                    dev::setup_android_devtools_forward(devtools_port);
+                }
+                reinstall_android(project_dir, release)?;
+            }
+            "ios" => reinstall_ios(project_dir, &bundle_id)?,
+            other => bail!("mobile dev supports android|ios, got {other}"),
+        }
+
+        wait_mobile_change(&watch_paths, &mut last_mtimes);
+        println!("\n🔄 File changed — rebuilding...");
+    }
+}
+
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn wait_mobile_change(
+    paths: &[PathBuf],
+    last: &mut std::collections::HashMap<PathBuf, Option<std::time::SystemTime>>,
+) {
+    println!("👀 Waiting for file changes...");
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for p in paths {
+            let current = file_mtime(p);
+            if current != *last.get(p).unwrap_or(&None) {
+                for path in paths {
+                    last.insert(path.clone(), file_mtime(path));
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn reinstall_android(project_dir: &Path, release: bool) -> Result<()> {
+    let android_dir = project_dir.join("android");
+    let apk = android_dir.join(format!(
+        "app/build/outputs/apk/{}/app-{}.apk",
+        if release { "release" } else { "debug" },
+        if release { "release" } else { "debug" }
+    ));
+    if !apk.exists() {
+        println!(
+            "ℹ️  APK not found at {} — open Android Studio to run.",
+            apk.display()
+        );
+        return Ok(());
+    }
+
+    let adb_ok = Command::new("adb")
+        .arg("devices")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !adb_ok {
+        println!("ℹ️  adb not available — APK: {}", apk.display());
+        return Ok(());
+    }
+
+    let device = Command::new("adb")
+        .args(["devices"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find(|l| l.contains("device") && !l.starts_with("List"))
+                .map(|_| ())
+        });
+    if device.is_none() {
+        println!("ℹ️  No adb device — APK ready: {}", apk.display());
+        return Ok(());
+    }
+
+    println!("📱 adb install -r {}", apk.display());
+    let status = Command::new("adb")
+        .args(["install", "-r", apk.to_str().context("apk path")?])
+        .status()
+        .context("adb install failed")?;
+    if status.success() {
+        let (_, bundle_id, _, _, _) = read_app_manifest(project_dir);
+        let _ = Command::new("adb")
+            .args(["shell", "am", "force-stop", &bundle_id])
+            .status();
+        let _ = Command::new("adb")
+            .args([
+                "shell",
+                "am",
+                "start",
+                "-n",
+                &format!("{bundle_id}/android.app.NativeActivity"),
+            ])
+            .status();
+        println!("✅ Installed and launched on device/emulator");
+    }
+    Ok(())
+}
+
+fn reinstall_ios(project_dir: &Path, bundle_id: &str) -> Result<()> {
+    let app_bundle = project_dir.join("ios/W3cosApp.app");
+    if !app_bundle.exists() {
+        println!("ℹ️  iOS bundle not found — {}", app_bundle.display());
+        return Ok(());
+    }
+
+    let udid = std::env::var("W3COS_IOS_SIM").unwrap_or_else(|_| "booted".to_string());
+    println!("📱 simctl install {udid} {}", app_bundle.display());
+    let install = Command::new("xcrun")
+        .args(["simctl", "install", &udid, app_bundle.to_str().unwrap()])
+        .status();
+    if install.map(|s| s.success()).unwrap_or(false) {
+        let _ = Command::new("xcrun")
+            .args(["simctl", "launch", &udid, bundle_id])
+            .status();
+        println!("✅ Installed and launched on simulator");
+    }
+    Ok(())
+}
+
 fn cargo_ndk_available() -> bool {
     Command::new("cargo")
         .args(["ndk", "--version"])
@@ -141,9 +336,7 @@ fn cargo_ndk_available() -> bool {
 fn build_android(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> {
     let android_dir = project_dir.join("android");
     if !android_dir.exists() {
-        bail!(
-            "android/ not found — run: w3cos mobile init . --platform android (in project dir)"
-        );
+        bail!("android/ not found — run: w3cos mobile init . --platform android (in project dir)");
     }
 
     if !cargo_ndk_available() {
@@ -154,9 +347,7 @@ fn build_android(project_dir: &Path, build_dir: &Path, release: bool) -> Result<
     let profile = if release { "release" } else { "debug" };
     let jni_libs = android_dir.join("app/src/main/jniLibs");
     fs::create_dir_all(&jni_libs)?;
-    let jni_out = jni_libs
-        .canonicalize()
-        .unwrap_or_else(|_| jni_libs.clone());
+    let jni_out = jni_libs.canonicalize().unwrap_or_else(|_| jni_libs.clone());
 
     println!("🔨 Building Android arm64-v8a ({profile})...");
     let mut cmd = Command::new("cargo");
@@ -165,7 +356,9 @@ fn build_android(project_dir: &Path, build_dir: &Path, release: bool) -> Result<
         "-t",
         "arm64-v8a",
         "-o",
-        jni_out.to_str().context("jniLibs path is not valid UTF-8")?,
+        jni_out
+            .to_str()
+            .context("jniLibs path is not valid UTF-8")?,
         "build",
     ]);
     if release {
@@ -248,7 +441,13 @@ fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, Strin
             }
         }
     }
-    (display_name, bundle_id, entry, safe_area, interactive_widget)
+    (
+        display_name,
+        bundle_id,
+        entry,
+        safe_area,
+        interactive_widget,
+    )
 }
 
 fn write_ios_plist(path: &Path, display_name: &str, bundle_id: &str) -> Result<()> {
@@ -347,7 +546,11 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
     fs::create_dir_all(&app_bundle)?;
     fs::copy(&bin, app_bundle.join("W3cosApp"))?;
     write_ios_plist(&app_bundle.join("Info.plist"), &display_name, &bundle_id)?;
-    println!("✅ iOS app bundle: {} ({})", app_bundle.display(), display_name);
+    println!(
+        "✅ iOS app bundle: {} ({})",
+        app_bundle.display(),
+        display_name
+    );
 
     if std::env::var("W3COS_SKIP_IOS_INSTALL").ok().as_deref() == Some("1") {
         println!("ℹ️  Skipping simulator install (W3COS_SKIP_IOS_INSTALL=1)");
@@ -363,7 +566,9 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
     let mut device_id = None;
     if let Some(out) = list_out {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if line.contains(&udid) && line.contains("Shutdown") || line.contains(&udid) && line.contains("Booted") {
+            if line.contains(&udid) && line.contains("Shutdown")
+                || line.contains(&udid) && line.contains("Booted")
+            {
                 if let Some(start) = line.find('(') {
                     if let Some(end) = line.find(')') {
                         device_id = Some(line[start + 1..end].to_string());
@@ -374,13 +579,8 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         }
     }
     if let Some(id) = device_id {
-        let _ = Command::new("xcrun")
-            .args(["simctl", "boot", &id])
-            .status();
-        let _ = Command::new("open")
-            .arg("-a")
-            .arg("Simulator")
-            .status();
+        let _ = Command::new("xcrun").args(["simctl", "boot", &id]).status();
+        let _ = Command::new("open").arg("-a").arg("Simulator").status();
         let _ = Command::new("xcrun")
             .args(["simctl", "uninstall", &id, "com.example.w3cos.app"])
             .status();
@@ -400,7 +600,10 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
             }
         }
     } else {
-        println!("ℹ️  Run manually: xcrun simctl install booted {}", app_bundle.display());
+        println!(
+            "ℹ️  Run manually: xcrun simctl install booted {}",
+            app_bundle.display()
+        );
     }
 
     Ok(())
