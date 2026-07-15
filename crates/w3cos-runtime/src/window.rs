@@ -212,7 +212,7 @@ use crate::render_gpu;
 use crate::state;
 use crate::virtual_list::{KeyedVirtualList, VirtualListConfig, VisibleWindow};
 use w3cos_std::color::Color;
-use w3cos_std::style::{Dimension, Display, Easing, Transform2D, TransitionProperty};
+use w3cos_std::style::{Dimension, Easing, Position, Transform2D, TransitionProperty};
 use w3cos_std::{Component, ComponentKind, EventAction};
 
 #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -276,6 +276,34 @@ struct KineticScroll {
 
 fn decelerate_scroll_velocity(velocity: f32, elapsed_seconds: f32) -> f32 {
     velocity * KINETIC_SCROLL_DECELERATION_PER_FRAME.powf(elapsed_seconds * 60.0)
+}
+
+fn scroll_damage_crosses_stacking_context(
+    damages: &[ScrollDamage],
+    paint_z: &[i32],
+    scrollable: &[(usize, LayoutRect, ScrollExtent)],
+    painted_rects: &[(usize, LayoutRect)],
+) -> bool {
+    damages.iter().any(|damage| {
+        let target_z = paint_z.get(damage.index).copied().unwrap_or_default();
+        if target_z != 0 {
+            return true;
+        }
+        let Some(scroll_rect) = scrollable
+            .iter()
+            .find(|(idx, _, _)| *idx == damage.index)
+            .map(|(_, rect, _)| *rect)
+        else {
+            return true;
+        };
+        painted_rects.iter().any(|(idx, rect)| {
+            paint_z.get(*idx).copied().unwrap_or_default() > target_z
+                && rect.x < scroll_rect.x + scroll_rect.width
+                && rect.x + rect.width > scroll_rect.x
+                && rect.y < scroll_rect.y + scroll_rect.height
+                && rect.y + rect.height > scroll_rect.y
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +405,18 @@ impl SpatialGrid {
 // ---------------------------------------------------------------------------
 
 enum ActiveAnimation {
+    LayoutHeight {
+        target_id: u64,
+        node_index: usize,
+        from: f32,
+        to: f32,
+        start: Instant,
+        duration_ms: f64,
+        delay_ms: f64,
+        easing: Easing,
+    },
     Opacity {
+        target_id: u64,
         node_index: usize,
         from: f32,
         to: f32,
@@ -387,6 +426,7 @@ enum ActiveAnimation {
         easing: Easing,
     },
     Background {
+        target_id: u64,
         node_index: usize,
         from: Color,
         to: Color,
@@ -396,6 +436,7 @@ enum ActiveAnimation {
         easing: Easing,
     },
     Transform {
+        target_id: u64,
         node_index: usize,
         from: Transform2D,
         to: Transform2D,
@@ -406,9 +447,36 @@ enum ActiveAnimation {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimatedProperty {
+    LayoutHeight,
+    Opacity,
+    Background,
+    Transform,
+}
+
 impl ActiveAnimation {
+    fn target_id(&self) -> u64 {
+        match self {
+            ActiveAnimation::LayoutHeight { target_id, .. }
+            | ActiveAnimation::Opacity { target_id, .. }
+            | ActiveAnimation::Background { target_id, .. }
+            | ActiveAnimation::Transform { target_id, .. } => *target_id,
+        }
+    }
+
+    fn property(&self) -> AnimatedProperty {
+        match self {
+            ActiveAnimation::LayoutHeight { .. } => AnimatedProperty::LayoutHeight,
+            ActiveAnimation::Opacity { .. } => AnimatedProperty::Opacity,
+            ActiveAnimation::Background { .. } => AnimatedProperty::Background,
+            ActiveAnimation::Transform { .. } => AnimatedProperty::Transform,
+        }
+    }
+
     fn node_index(&self) -> usize {
         match self {
+            ActiveAnimation::LayoutHeight { node_index, .. } => *node_index,
             ActiveAnimation::Opacity { node_index, .. } => *node_index,
             ActiveAnimation::Background { node_index, .. } => *node_index,
             ActiveAnimation::Transform { node_index, .. } => *node_index,
@@ -418,6 +486,7 @@ impl ActiveAnimation {
     fn progress(&self, now: Instant) -> f32 {
         let elapsed_ms = now
             .duration_since(match self {
+                ActiveAnimation::LayoutHeight { start, .. } => *start,
                 ActiveAnimation::Opacity { start, .. } => *start,
                 ActiveAnimation::Background { start, .. } => *start,
                 ActiveAnimation::Transform { start, .. } => *start,
@@ -425,11 +494,13 @@ impl ActiveAnimation {
             .as_secs_f64()
             * 1000.0;
         let delay_ms = match self {
+            ActiveAnimation::LayoutHeight { delay_ms, .. } => *delay_ms,
             ActiveAnimation::Opacity { delay_ms, .. } => *delay_ms,
             ActiveAnimation::Background { delay_ms, .. } => *delay_ms,
             ActiveAnimation::Transform { delay_ms, .. } => *delay_ms,
         };
         let duration_ms = match self {
+            ActiveAnimation::LayoutHeight { duration_ms, .. } => *duration_ms,
             ActiveAnimation::Opacity { duration_ms, .. } => *duration_ms,
             ActiveAnimation::Background { duration_ms, .. } => *duration_ms,
             ActiveAnimation::Transform { duration_ms, .. } => *duration_ms,
@@ -444,6 +515,121 @@ impl ActiveAnimation {
     fn is_complete(&self, now: Instant) -> bool {
         self.progress(now) >= 1.0
     }
+
+    fn eased_progress(&self, now: Instant) -> f32 {
+        let progress = self.progress(now);
+        match self {
+            ActiveAnimation::LayoutHeight { easing, .. }
+            | ActiveAnimation::Opacity { easing, .. }
+            | ActiveAnimation::Background { easing, .. }
+            | ActiveAnimation::Transform { easing, .. } => easing.interpolate(progress),
+        }
+    }
+
+    fn sampled_height(&self, now: Instant) -> Option<f32> {
+        let ActiveAnimation::LayoutHeight { from, to, .. } = self else {
+            return None;
+        };
+        Some(*from + self.eased_progress(now) * (*to - *from))
+    }
+
+    fn sampled_opacity(&self, now: Instant) -> Option<f32> {
+        let ActiveAnimation::Opacity { from, to, .. } = self else {
+            return None;
+        };
+        Some(*from + self.eased_progress(now) * (*to - *from))
+    }
+
+    fn sampled_background(&self, now: Instant) -> Option<Color> {
+        let ActiveAnimation::Background { from, to, .. } = self else {
+            return None;
+        };
+        let progress = self.eased_progress(now);
+        Some(Color::rgba(
+            lerp_u8(from.r, to.r, progress),
+            lerp_u8(from.g, to.g, progress),
+            lerp_u8(from.b, to.b, progress),
+            lerp_u8(from.a, to.a, progress),
+        ))
+    }
+
+    fn sampled_transform(&self, now: Instant) -> Option<Transform2D> {
+        let ActiveAnimation::Transform { from, to, .. } = self else {
+            return None;
+        };
+        Some(lerp_transform(*from, *to, self.eased_progress(now)))
+    }
+}
+
+fn transition_pair_id(parent_id: u64, old_id: u64, new_id: u64) -> u64 {
+    let (first, second) = if old_id <= new_id {
+        (old_id, new_id)
+    } else {
+        (new_id, old_id)
+    };
+    parent_id.rotate_left(13) ^ first.rotate_left(29) ^ second.rotate_left(47)
+}
+
+fn animated_layout_cache(
+    layout_cache: &[(LayoutRect, usize)],
+    animations: &[ActiveAnimation],
+    now: Instant,
+) -> Option<Vec<(LayoutRect, usize)>> {
+    if !animations
+        .iter()
+        .any(|animation| matches!(animation, ActiveAnimation::LayoutHeight { .. }))
+    {
+        return None;
+    }
+
+    let mut animated = layout_cache.to_vec();
+    for animation in animations {
+        let ActiveAnimation::LayoutHeight {
+            node_index,
+            from,
+            to,
+            ..
+        } = animation
+        else {
+            continue;
+        };
+        let eased = animation.eased_progress(now);
+        if let Some((rect, _)) = animated.iter_mut().find(|(_, idx)| idx == node_index) {
+            rect.height = from + eased * (to - from);
+        }
+    }
+    Some(animated)
+}
+
+fn animated_clip_nodes(
+    clip_nodes: &[(usize, LayoutRect)],
+    animations: &[ActiveAnimation],
+    now: Instant,
+) -> Option<Vec<(usize, LayoutRect)>> {
+    if !animations
+        .iter()
+        .any(|animation| matches!(animation, ActiveAnimation::LayoutHeight { .. }))
+    {
+        return None;
+    }
+
+    let mut animated = clip_nodes.to_vec();
+    for animation in animations {
+        let ActiveAnimation::LayoutHeight {
+            node_index,
+            from,
+            to,
+            ..
+        } = animation
+        else {
+            continue;
+        };
+        let eased = animation.eased_progress(now);
+        if let Some((_, rect)) = animated.iter_mut().find(|(idx, _)| idx == node_index) {
+            rect.height = from + eased * (to - from);
+        }
+    }
+    Some(animated)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +704,8 @@ struct App {
     scrollable_nodes: Vec<(usize, LayoutRect, ScrollExtent)>,
     clip_only_nodes: Vec<(usize, LayoutRect)>,
     scroll_offsets: HashMap<usize, (f32, f32)>,
+    initialized_scroll_targets: HashSet<usize>,
+    user_scrolled_nodes: HashSet<usize>,
     sticky_counter_bases: HashMap<usize, i64>,
     sticky_marker_index: HashMap<usize, HashMap<usize, Vec<f32>>>,
     pending_sticky_scrolls: HashSet<usize>,
@@ -640,6 +828,8 @@ impl App {
             scrollable_nodes: Vec::new(),
             clip_only_nodes: Vec::new(),
             scroll_offsets: HashMap::new(),
+            initialized_scroll_targets: HashSet::new(),
+            user_scrolled_nodes: HashSet::new(),
             sticky_counter_bases: HashMap::new(),
             sticky_marker_index: HashMap::new(),
             pending_sticky_scrolls: HashSet::new(),
@@ -822,12 +1012,12 @@ impl App {
             let new_flat = layout::pre_flatten(&self.root);
             let display_changed = !layout::layout_display_unchanged(&old_flat, &new_flat);
             self.needs_layout = true;
-            // A subtree first built under display:none has no usable cached
-            // geometry for its descendants. Rebuild the Taffy tree when a Show
-            // slot changes visibility instead of patching only the root display.
-            self.needs_tree_rebuild =
-                !layout::layout_shape_unchanged(&old_flat, &new_flat) || display_changed;
-            self.needs_style_refresh = false;
+            // Stable Show slots already exist in the persistent Taffy tree.
+            // Patch their display styles and let Taffy dirty only affected
+            // ancestors; rebuilding the entire tree makes a local card toggle
+            // proportional to a long conversation's total node count.
+            self.needs_tree_rebuild = !layout::layout_shape_unchanged(&old_flat, &new_flat);
+            self.needs_style_refresh = display_changed && !self.needs_tree_rebuild;
             self.repaint_mode = RepaintMode::Full;
             self.hovered_index = None;
             self.pressed_index = None;
@@ -934,11 +1124,20 @@ impl App {
         let old_flat = layout::pre_flatten(old_root);
         let new_flat = layout::pre_flatten(&self.root);
         let now = Instant::now();
+        let old_by_id: HashMap<u64, (usize, &layout::FlatNodeInfo<'_>)> = old_flat
+            .iter()
+            .enumerate()
+            .map(|(idx, node)| (node.stable_id, (idx, node)))
+            .collect();
 
-        for (idx, (old_node, new_node)) in old_flat.iter().zip(new_flat.iter()).enumerate() {
+        for (idx, new_node) in new_flat.iter().enumerate() {
+            let Some((old_idx, old_node)) = old_by_id.get(&new_node.stable_id).copied() else {
+                continue;
+            };
             let Some(transition) = &new_node.style.transition else {
                 continue;
             };
+            let target_id = new_node.stable_id;
             let duration_ms = transition.duration_ms as f64;
             let delay_ms = transition.delay_ms as f64;
             let easing = transition.easing;
@@ -955,19 +1154,40 @@ impl App {
                 transition.property,
                 TransitionProperty::All | TransitionProperty::Transform
             );
-            let became_visible = matches!(old_node.style.display, Display::None)
-                && !matches!(new_node.style.display, Display::None);
+            // A Show/conditional normally toggles display on a stable wrapper,
+            // while the transitioning child keeps display:flex in both trees.
+            // CSS transitions on that child still need to observe the effective
+            // visibility change through its ancestors.
+            let became_visible = !layout::is_node_visible(&old_flat, old_idx)
+                && layout::is_node_visible(&new_flat, idx);
 
             if animates_opacity
                 && (old_node.style.opacity != new_node.style.opacity || became_visible)
             {
+                let from = self
+                    .animations
+                    .iter()
+                    .rev()
+                    .find(|animation| {
+                        animation.target_id() == target_id
+                            && animation.property() == AnimatedProperty::Opacity
+                    })
+                    .and_then(|animation| animation.sampled_opacity(now))
+                    .unwrap_or_else(|| {
+                        if became_visible {
+                            0.0
+                        } else {
+                            old_node.style.opacity
+                        }
+                    });
+                self.animations.retain(|animation| {
+                    animation.target_id() != target_id
+                        || animation.property() != AnimatedProperty::Opacity
+                });
                 self.animations.push(ActiveAnimation::Opacity {
+                    target_id,
                     node_index: idx,
-                    from: if became_visible {
-                        0.0
-                    } else {
-                        old_node.style.opacity
-                    },
+                    from,
                     to: new_node.style.opacity,
                     start: now,
                     duration_ms,
@@ -981,9 +1201,24 @@ impl App {
                     || old_node.style.background.b != new_node.style.background.b
                     || old_node.style.background.a != new_node.style.background.a)
             {
+                let from = self
+                    .animations
+                    .iter()
+                    .rev()
+                    .find(|animation| {
+                        animation.target_id() == target_id
+                            && animation.property() == AnimatedProperty::Background
+                    })
+                    .and_then(|animation| animation.sampled_background(now))
+                    .unwrap_or(old_node.style.background);
+                self.animations.retain(|animation| {
+                    animation.target_id() != target_id
+                        || animation.property() != AnimatedProperty::Background
+                });
                 self.animations.push(ActiveAnimation::Background {
+                    target_id,
                     node_index: idx,
-                    from: old_node.style.background,
+                    from,
                     to: new_node.style.background,
                     start: now,
                     duration_ms,
@@ -994,12 +1229,52 @@ impl App {
             if animates_transform
                 && (old_node.style.transform != new_node.style.transform || became_visible)
             {
-                let mut from = old_node.style.transform;
-                if became_visible {
-                    from = new_node.style.transform;
-                    from.translate_y += 10.0;
-                }
+                let from = self
+                    .animations
+                    .iter()
+                    .rev()
+                    .find(|animation| {
+                        animation.target_id() == target_id
+                            && animation.property() == AnimatedProperty::Transform
+                    })
+                    .and_then(|animation| animation.sampled_transform(now))
+                    .unwrap_or_else(|| {
+                        let mut from = old_node.style.transform;
+                        if became_visible {
+                            from = new_node.style.transform;
+                            let is_side_panel = matches!(
+                                new_node.style.width,
+                                Dimension::Percent(percent) if percent >= 50.0
+                            ) && matches!(
+                                new_node.style.height,
+                                Dimension::Percent(percent) if percent >= 90.0
+                            );
+                            if is_side_panel
+                                || matches!(
+                                    new_node.style.position,
+                                    Position::Absolute | Position::Fixed
+                                )
+                            {
+                                let panel_width = match new_node.style.width {
+                                    Dimension::Percent(percent) => {
+                                        self.viewport.layout_w * percent / 100.0
+                                    }
+                                    Dimension::Px(width) => width,
+                                    _ => self.viewport.layout_w * 0.8,
+                                };
+                                from.translate_x -= panel_width.max(48.0);
+                            } else {
+                                from.translate_y += 10.0;
+                            }
+                        }
+                        from
+                    });
+                self.animations.retain(|animation| {
+                    animation.target_id() != target_id
+                        || animation.property() != AnimatedProperty::Transform
+                });
                 self.animations.push(ActiveAnimation::Transform {
+                    target_id,
                     node_index: idx,
                     from,
                     to: new_node.style.transform,
@@ -1070,7 +1345,6 @@ impl App {
         }
 
         let flat = layout::pre_flatten(&self.root);
-
         if self.needs_tree_rebuild {
             self.layout_engine.invalidate();
             self.needs_tree_rebuild = false;
@@ -1104,6 +1378,15 @@ impl App {
             &mut self.layout_cache,
             &mut self.scrollable_nodes,
             &mut self.clip_only_nodes,
+        );
+        apply_initial_scroll_targets(
+            &flat,
+            &self.layout_cache,
+            &self.scrollable_nodes,
+            &self.scroll_ancestor,
+            &mut self.scroll_offsets,
+            &mut self.initialized_scroll_targets,
+            &mut self.user_scrolled_nodes,
         );
         self.sticky_marker_index =
             build_sticky_marker_index(&flat, &self.layout_cache, &self.scroll_ancestor);
@@ -1196,10 +1479,38 @@ impl App {
             .iter()
             .map(|(rect, idx)| (*idx, *rect))
             .collect();
+        let new_indices: HashSet<usize> = layout_cache.iter().map(|(_, idx)| *idx).collect();
         let now = Instant::now();
         let before_count = animations.len();
         for &(new_rect, idx) in layout_cache {
-            let Some(old_rect) = old_rects.get(&idx).copied() else {
+            let Some(node) = flat.get(idx) else {
+                continue;
+            };
+            let Some(transition) = &node.style.transition else {
+                continue;
+            };
+            // Compiled conditional branches remain sibling nodes and switch
+            // `display`, so the entering branch has a different flat index.
+            // Pair it with the nearest transitioned sibling that left layout;
+            // this preserves the visual box across a Show/conditional swap.
+            let old_entry = old_rects
+                .get(&idx)
+                .copied()
+                .map(|rect| (rect, idx))
+                .or_else(|| {
+                    old_layout_cache
+                        .iter()
+                        .filter(|(_, old_idx)| !new_indices.contains(old_idx))
+                        .filter(|(_, old_idx)| {
+                            flat.get(*old_idx).is_some_and(|old_node| {
+                                old_node.parent == node.parent
+                                    && old_node.style.transition.is_some()
+                            })
+                        })
+                        .min_by_key(|(_, old_idx)| old_idx.abs_diff(idx))
+                        .map(|(rect, old_idx)| (*rect, *old_idx))
+                });
+            let Some((old_rect, old_idx)) = old_entry else {
                 continue;
             };
             if old_rect.width <= 0.0
@@ -1209,12 +1520,50 @@ impl App {
             {
                 continue;
             }
-            let Some(node) = flat.get(idx) else {
-                continue;
-            };
-            let Some(transition) = &node.style.transition else {
-                continue;
-            };
+            let animates_height = matches!(transition.property, TransitionProperty::All)
+                || matches!(
+                    &transition.property,
+                    TransitionProperty::Custom(property) if property.eq_ignore_ascii_case("height")
+                );
+            if animates_height && (old_rect.height - new_rect.height).abs() >= 0.5 {
+                let target_id = if old_idx == idx {
+                    node.stable_id
+                } else {
+                    let parent_id = node
+                        .parent
+                        .and_then(|parent| flat.get(parent))
+                        .map(|parent| parent.stable_id)
+                        .unwrap_or(0);
+                    let old_id = flat
+                        .get(old_idx)
+                        .map(|old_node| old_node.stable_id)
+                        .unwrap_or(old_idx as u64);
+                    transition_pair_id(parent_id, old_id, node.stable_id)
+                };
+                let from = animations
+                    .iter()
+                    .rev()
+                    .find(|animation| {
+                        animation.target_id() == target_id
+                            && animation.property() == AnimatedProperty::LayoutHeight
+                    })
+                    .and_then(|animation| animation.sampled_height(now))
+                    .unwrap_or(old_rect.height);
+                animations.retain(|animation| {
+                    animation.target_id() != target_id
+                        || animation.property() != AnimatedProperty::LayoutHeight
+                });
+                animations.push(ActiveAnimation::LayoutHeight {
+                    target_id,
+                    node_index: idx,
+                    from,
+                    to: new_rect.height,
+                    start: now,
+                    duration_ms: transition.duration_ms as f64,
+                    delay_ms: transition.delay_ms as f64,
+                    easing: transition.easing,
+                });
+            }
             if !matches!(
                 transition.property,
                 TransitionProperty::All | TransitionProperty::Transform
@@ -1235,11 +1584,22 @@ impl App {
             let mut from = node.style.transform;
             from.translate_x += delta_x;
             from.translate_y += delta_y;
+            let target_id = node.stable_id;
+            let from = animations
+                .iter()
+                .rev()
+                .find(|animation| {
+                    animation.target_id() == target_id
+                        && animation.property() == AnimatedProperty::Transform
+                })
+                .and_then(|animation| animation.sampled_transform(now))
+                .unwrap_or(from);
             animations.retain(|animation| {
-                !(animation.node_index() == idx
-                    && matches!(animation, ActiveAnimation::Transform { .. }))
+                animation.target_id() != target_id
+                    || animation.property() != AnimatedProperty::Transform
             });
             animations.push(ActiveAnimation::Transform {
+                target_id,
                 node_index: idx,
                 from,
                 to: node.style.transform,
@@ -1428,40 +1788,9 @@ impl App {
             .map(|node| node.style.background)
             .unwrap_or(Color::WHITE);
 
-        // Compute style overrides for animated/hovered nodes (only clones 0-2 styles)
-        let mut style_overrides: HashMap<usize, w3cos_std::style::Style> = HashMap::new();
-
-        for anim in &self.animations {
-            let idx = anim.node_index();
-            if idx >= flat.len() {
-                continue;
-            }
-            let t = anim.progress(now);
-            let eased = match anim {
-                ActiveAnimation::Opacity { easing, .. } => easing.interpolate(t),
-                ActiveAnimation::Background { easing, .. } => easing.interpolate(t),
-                ActiveAnimation::Transform { easing, .. } => easing.interpolate(t),
-            };
-            let entry = style_overrides
-                .entry(idx)
-                .or_insert_with(|| flat[idx].style.clone());
-            match anim {
-                ActiveAnimation::Opacity { from, to, .. } => {
-                    entry.opacity = *from + eased * (to - from);
-                }
-                ActiveAnimation::Background { from, to, .. } => {
-                    entry.background = Color::rgba(
-                        lerp_u8(from.r, to.r, eased),
-                        lerp_u8(from.g, to.g, eased),
-                        lerp_u8(from.b, to.b, eased),
-                        lerp_u8(from.a, to.a, eased),
-                    );
-                }
-                ActiveAnimation::Transform { from, to, .. } => {
-                    entry.transform = lerp_transform(*from, *to, eased);
-                }
-            }
-        }
+        // A CSS transform establishes a transformed subtree, so animated
+        // translation must affect descendants as well as the panel box.
+        let mut style_overrides = animated_style_overrides(&flat, &self.animations, now);
 
         if let Some(hover_idx) = self.hovered_index {
             if hover_idx < flat.len() {
@@ -1478,12 +1807,21 @@ impl App {
             }
         }
 
+        let animated_layout = animated_layout_cache(&self.layout_cache, &self.animations, now);
+        let layout_cache = animated_layout
+            .as_deref()
+            .unwrap_or(self.layout_cache.as_slice());
+        let animated_clips = animated_clip_nodes(&self.clip_only_nodes, &self.animations, now);
+        let clip_only_nodes = animated_clips
+            .as_deref()
+            .unwrap_or(self.clip_only_nodes.as_slice());
+
         let scroll_info = build_scroll_info_fast(
             &self.scroll_ancestor,
             &self.scrollable_nodes,
-            &self.clip_only_nodes,
+            clip_only_nodes,
             &self.scroll_offsets,
-            &self.layout_cache,
+            layout_cache,
             &flat,
             self.viewport.layout_w,
             self.viewport.layout_h,
@@ -1493,7 +1831,7 @@ impl App {
         // building Vello display items so offscreen list nodes never enter the
         // scene or its z-sort. Keep a small overscan for shadows/transforms.
         let mut render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> =
-            self.layout_cache
+            layout_cache
                 .iter()
                 .filter_map(|&(rect, idx)| {
                     if !node_intersects_paint_cull(
@@ -1731,39 +2069,7 @@ impl App {
         let now = Instant::now();
         let flat = layout::pre_flatten(&self.root);
 
-        // Compute style overrides
-        let mut style_overrides: HashMap<usize, w3cos_std::style::Style> = HashMap::new();
-        for anim in &self.animations {
-            let idx = anim.node_index();
-            if idx >= flat.len() {
-                continue;
-            }
-            let t = anim.progress(now);
-            let eased = match anim {
-                ActiveAnimation::Opacity { easing, .. } => easing.interpolate(t),
-                ActiveAnimation::Background { easing, .. } => easing.interpolate(t),
-                ActiveAnimation::Transform { easing, .. } => easing.interpolate(t),
-            };
-            let entry = style_overrides
-                .entry(idx)
-                .or_insert_with(|| flat[idx].style.clone());
-            match anim {
-                ActiveAnimation::Opacity { from, to, .. } => {
-                    entry.opacity = *from + eased * (to - from);
-                }
-                ActiveAnimation::Background { from, to, .. } => {
-                    entry.background = Color::rgba(
-                        lerp_u8(from.r, to.r, eased),
-                        lerp_u8(from.g, to.g, eased),
-                        lerp_u8(from.b, to.b, eased),
-                        lerp_u8(from.a, to.a, eased),
-                    );
-                }
-                ActiveAnimation::Transform { from, to, .. } => {
-                    entry.transform = lerp_transform(*from, *to, eased);
-                }
-            }
-        }
+        let mut style_overrides = animated_style_overrides(&flat, &self.animations, now);
         if let Some(hover_idx) = self.hovered_index {
             if hover_idx < flat.len() {
                 let entry = style_overrides
@@ -1779,12 +2085,21 @@ impl App {
             }
         }
 
+        let animated_layout = animated_layout_cache(&self.layout_cache, &self.animations, now);
+        let layout_cache = animated_layout
+            .as_deref()
+            .unwrap_or(self.layout_cache.as_slice());
+        let animated_clips = animated_clip_nodes(&self.clip_only_nodes, &self.animations, now);
+        let clip_only_nodes = animated_clips
+            .as_deref()
+            .unwrap_or(self.clip_only_nodes.as_slice());
+
         let scroll_info_raw = build_scroll_info_fast(
             &self.scroll_ancestor,
             &self.scrollable_nodes,
-            &self.clip_only_nodes,
+            clip_only_nodes,
             &self.scroll_offsets,
-            &self.layout_cache,
+            layout_cache,
             &flat,
             self.viewport.layout_w,
             self.viewport.layout_h,
@@ -1793,8 +2108,7 @@ impl App {
         // Cull before cloning/scaling styles. The previous raster path skipped
         // offscreen nodes only after allocating a Style and render tuple for
         // every node, which made long lists O(total nodes) in expensive work.
-        let visible_layout: Vec<(LayoutRect, usize)> = self
-            .layout_cache
+        let visible_layout: Vec<(LayoutRect, usize)> = layout_cache
             .iter()
             .copied()
             .filter(|&(rect, idx)| {
@@ -1890,18 +2204,44 @@ impl App {
                     .iter()
                     .map(|damage| (damage.index, damage.delta_y * scale))
                     .collect();
-                render_cpu::render_scroll_damage(
-                    &mut pixmap,
-                    &render_nodes,
-                    &self.font,
-                    &scroll_info,
-                    &self.text_input_values,
-                    self.focused_index,
-                    &scaled_damages,
+                let painted_rects: Vec<(usize, LayoutRect)> = render_nodes
+                    .iter()
+                    .map(|(idx, rect, _, _)| (*idx, *rect))
+                    .collect();
+                if scroll_damage_crosses_stacking_context(
+                    &damages,
+                    &paint_z,
                     &scaled_scrollable,
-                    &self.scroll_ancestor,
-                    &mut self.cpu.as_mut().unwrap().clip_masks,
-                );
+                    &painted_rects,
+                ) {
+                    // Raster-copying moves already-composited pixels. Inside
+                    // an overlay stacking context this can copy the page below
+                    // through translucent list gaps. CPU layers do not yet own
+                    // independent backing stores, so repaint the composed
+                    // overlay frame for correctness.
+                    render_cpu::render_frame(
+                        &mut pixmap,
+                        &render_nodes,
+                        &self.font,
+                        &scroll_info,
+                        &self.text_input_values,
+                        self.focused_index,
+                        &mut self.cpu.as_mut().unwrap().clip_masks,
+                    );
+                } else {
+                    render_cpu::render_scroll_damage(
+                        &mut pixmap,
+                        &render_nodes,
+                        &self.font,
+                        &scroll_info,
+                        &self.text_input_values,
+                        self.focused_index,
+                        &scaled_damages,
+                        &scaled_scrollable,
+                        &self.scroll_ancestor,
+                        &mut self.cpu.as_mut().unwrap().clip_masks,
+                    );
+                }
             }
             RepaintMode::Full => {
                 render_cpu::render_frame(
@@ -2197,7 +2537,26 @@ impl App {
                 node.style.z_index
             };
         }
-        topmost_scroll_node_at(x, y, &self.scrollable_nodes, &scroll_info, &paint_z)
+        let overlay_blockers: Vec<(usize, LayoutRect)> = self
+            .layout_cache
+            .iter()
+            .filter_map(|&(rect, idx)| {
+                let node = flat.get(idx)?;
+                matches!(
+                    node.style.position,
+                    w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+                )
+                .then_some((idx, rect))
+            })
+            .collect();
+        topmost_scroll_node_at(
+            x,
+            y,
+            &self.scrollable_nodes,
+            &scroll_info,
+            &paint_z,
+            &overlay_blockers,
+        )
     }
 
     fn scroll_at_pointer(&mut self, dy: f32) {
@@ -2225,6 +2584,7 @@ impl App {
         let new_oy = (oy + dy).clamp(0.0, max_y);
         let applied = new_oy - oy;
         if applied.abs() > 0.001 {
+            self.user_scrolled_nodes.insert(idx);
             self.scroll_offsets.insert(idx, (ox, new_oy));
             if let Some(ordinal) = self.virtual_scroll_indices.get(&idx).copied() {
                 let viewport_extent = self
@@ -2851,6 +3211,75 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
+fn animated_style_overrides(
+    flat: &[layout::FlatNodeInfo<'_>],
+    animations: &[ActiveAnimation],
+    now: Instant,
+) -> HashMap<usize, w3cos_std::style::Style> {
+    let mut overrides = HashMap::new();
+    let mut subtree_translations = Vec::new();
+
+    for animation in animations {
+        let idx = animation.node_index();
+        if idx >= flat.len() {
+            continue;
+        }
+        let eased = animation.eased_progress(now);
+        let entry = overrides
+            .entry(idx)
+            .or_insert_with(|| flat[idx].style.clone());
+        match animation {
+            ActiveAnimation::LayoutHeight { .. } => {}
+            ActiveAnimation::Opacity { from, to, .. } => {
+                entry.opacity = *from + eased * (to - from);
+            }
+            ActiveAnimation::Background { from, to, .. } => {
+                entry.background = Color::rgba(
+                    lerp_u8(from.r, to.r, eased),
+                    lerp_u8(from.g, to.g, eased),
+                    lerp_u8(from.b, to.b, eased),
+                    lerp_u8(from.a, to.a, eased),
+                );
+            }
+            ActiveAnimation::Transform { from, to, .. } => {
+                let sampled = lerp_transform(*from, *to, eased);
+                entry.transform = sampled;
+                subtree_translations.push((
+                    idx,
+                    sampled.translate_x - flat[idx].style.transform.translate_x,
+                    sampled.translate_y - flat[idx].style.transform.translate_y,
+                ));
+            }
+        }
+    }
+
+    // Flat nodes are depth-first. Once the ancestor chain no longer reaches
+    // the animated node, its contiguous subtree has ended.
+    for (ancestor, dx, dy) in subtree_translations {
+        for idx in (ancestor + 1)..flat.len() {
+            let mut parent = flat[idx].parent;
+            let mut belongs_to_subtree = false;
+            while let Some(parent_idx) = parent {
+                if parent_idx == ancestor {
+                    belongs_to_subtree = true;
+                    break;
+                }
+                parent = flat[parent_idx].parent;
+            }
+            if !belongs_to_subtree {
+                break;
+            }
+            let entry = overrides
+                .entry(idx)
+                .or_insert_with(|| flat[idx].style.clone());
+            entry.transform.translate_x += dx;
+            entry.transform.translate_y += dy;
+        }
+    }
+
+    overrides
+}
+
 fn get_kind_recursive<'a>(
     comp: &'a Component,
     target: usize,
@@ -2975,8 +3404,9 @@ fn topmost_scroll_node_at(
     scrollable: &[(usize, LayoutRect, ScrollExtent)],
     scroll_info: &[Option<(f32, f32, LayoutRect)>],
     paint_z: &[i32],
+    overlay_blockers: &[(usize, LayoutRect)],
 ) -> Option<usize> {
-    scrollable
+    let candidate = scrollable
         .iter()
         .filter_map(|(idx, rect, _)| {
             let (visual_rect, clip) = match scroll_info.get(*idx).copied().flatten() {
@@ -3000,7 +3430,16 @@ fn topmost_scroll_node_at(
             (inside_rect && inside_clip).then_some((paint_z.get(*idx).copied().unwrap_or(0), *idx))
         })
         .max()
-        .map(|(_, idx)| idx)
+        .map(|(z, idx)| (z, idx));
+    let candidate_z = candidate.map(|(z, _)| z).unwrap_or(i32::MIN);
+    let blocked = overlay_blockers.iter().any(|(idx, rect)| {
+        paint_z.get(*idx).copied().unwrap_or_default() > candidate_z
+            && x >= rect.x
+            && x <= rect.x + rect.width
+            && y >= rect.y
+            && y <= rect.y + rect.height
+    });
+    (!blocked).then(|| candidate.map(|(_, idx)| idx)).flatten()
 }
 
 /// Build scroll info using pre-computed scroll_ancestor map.
@@ -3088,7 +3527,42 @@ fn build_scroll_info_fast(
                     }
                     Some((sx, sy, effective_clip))
                 } else if let Some(&clip) = clip_only_rect.get(anc_idx) {
-                    Some((0.0, 0.0, clip))
+                    let mut sx = 0.0;
+                    let mut sy = 0.0;
+                    let mut effective_clip = clip;
+                    if let Some(owner) = sticky_owner.get(idx).copied().flatten()
+                        && let Some(owner_rect) = rect_by_index.get(owner).copied().flatten()
+                    {
+                        let style = flat[owner].style;
+                        if let Some(sticky_scroll_idx) = scroll_ancestor[owner]
+                            && let Some(&sticky_clip) = scrollable_rect.get(&sticky_scroll_idx)
+                        {
+                            let (sticky_sx, sticky_sy) = offsets
+                                .get(&sticky_scroll_idx)
+                                .copied()
+                                .unwrap_or((0.0, 0.0));
+                            let top = style
+                                .top
+                                .resolve(
+                                    sticky_clip.height,
+                                    16.0,
+                                    style.font_size,
+                                    viewport_w,
+                                    viewport_h,
+                                )
+                                .unwrap_or(0.0);
+                            sx = sticky_sx;
+                            sy = clamp_sticky_scroll_offset(
+                                owner_rect.y,
+                                sticky_clip.y,
+                                top,
+                                sticky_sy,
+                            );
+                            effective_clip.x -= sx;
+                            effective_clip.y -= sy;
+                        }
+                    }
+                    Some((sx, sy, effective_clip))
                 } else {
                     None
                 }
@@ -3251,6 +3725,22 @@ impl ApplicationHandler for App {
         }
 
         let has_animations = !self.animations.is_empty() || self.kinetic_scroll.is_some();
+        let now = Instant::now();
+        let animation_deadline = has_animations.then(|| {
+            self.last_frame_time.unwrap_or(now)
+                + std::time::Duration::from_millis(ANIMATION_FRAME_INTERVAL_MS)
+        });
+
+        // Keep animation cadence anchored to the previous frame start. Using
+        // `now + 16ms` here adds layout/paint time to every interval and can
+        // turn a 60 Hz transition into a visibly uneven 15–30 Hz sequence.
+        // An overdue frame is requested once, then the next paint advances
+        // `last_frame_time`, so Poll cannot become an idle busy loop.
+        if animation_deadline.is_some_and(|deadline| deadline <= now) {
+            self.request_repaint();
+            event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        }
         #[cfg(target_os = "ios")]
         let mut timer_deadline = crate::timers::next_deadline();
         #[cfg(not(target_os = "ios"))]
@@ -3292,7 +3782,7 @@ impl ApplicationHandler for App {
             }
             (true, None) => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    Instant::now() + std::time::Duration::from_millis(ANIMATION_FRAME_INTERVAL_MS),
+                    animation_deadline.expect("active animation has a deadline"),
                 ));
             }
             (false, Some(deadline)) => {
@@ -3305,8 +3795,7 @@ impl ApplicationHandler for App {
                 }
             }
             (true, Some(deadline)) => {
-                let anim_deadline =
-                    Instant::now() + std::time::Duration::from_millis(ANIMATION_FRAME_INTERVAL_MS);
+                let anim_deadline = animation_deadline.expect("active animation has a deadline");
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline.min(anim_deadline)));
             }
         }
@@ -3690,6 +4179,66 @@ fn offset_layout_y(
     }
 }
 
+/// CSS Scroll Snap Level 2 `scroll-initial-target`: the first rendered target
+/// in tree order establishes the initial position of its nearest scrollport.
+/// A late target is honored until the user manually scrolls that container.
+fn apply_initial_scroll_targets(
+    flat: &[layout::FlatNodeInfo<'_>],
+    layout_cache: &[(LayoutRect, usize)],
+    scrollable_nodes: &[(usize, LayoutRect, ScrollExtent)],
+    scroll_ancestor: &[Option<usize>],
+    scroll_offsets: &mut HashMap<usize, (f32, f32)>,
+    initialized: &mut HashSet<usize>,
+    user_scrolled: &mut HashSet<usize>,
+) {
+    let rects: HashMap<usize, LayoutRect> = layout_cache
+        .iter()
+        .map(|(rect, index)| (*index, *rect))
+        .collect();
+    let scrollports: HashMap<usize, (LayoutRect, ScrollExtent)> = scrollable_nodes
+        .iter()
+        .map(|(index, rect, extent)| (*index, (*rect, *extent)))
+        .collect();
+    let active_scrollports: HashSet<usize> = scrollports.keys().copied().collect();
+    initialized.retain(|index| active_scrollports.contains(index));
+    user_scrolled.retain(|index| active_scrollports.contains(index));
+
+    let mut claimed_scrollports = HashSet::new();
+    for (target_index, node) in flat.iter().enumerate() {
+        if node.style.scroll_initial_target != w3cos_std::style::ScrollInitialTarget::Nearest
+            || !layout::is_node_visible(flat, target_index)
+        {
+            continue;
+        }
+        let Some(scroll_index) = scroll_ancestor.get(target_index).copied().flatten() else {
+            continue;
+        };
+        let (Some(target_rect), Some((scroll_rect, extent))) = (
+            rects.get(&target_index).copied(),
+            scrollports.get(&scroll_index).copied(),
+        ) else {
+            continue;
+        };
+        if !claimed_scrollports.insert(scroll_index)
+            || initialized.contains(&scroll_index)
+            || user_scrolled.contains(&scroll_index)
+        {
+            continue;
+        }
+        let y = initial_scroll_target_offset(target_rect.y, scroll_rect.y, extent.max_y);
+        let x = scroll_offsets
+            .get(&scroll_index)
+            .map(|(x, _)| *x)
+            .unwrap_or(0.0);
+        scroll_offsets.insert(scroll_index, (x, y));
+        initialized.insert(scroll_index);
+    }
+}
+
+fn initial_scroll_target_offset(target_y: f32, scrollport_y: f32, max_y: f32) -> f32 {
+    (target_y - scrollport_y).clamp(0.0, max_y)
+}
+
 #[cfg(test)]
 mod scroll_physics_tests {
     use super::*;
@@ -3710,6 +4259,137 @@ mod scroll_physics_tests {
     fn kinetic_velocity_keeps_scroll_direction() {
         assert!(decelerate_scroll_velocity(500.0, 0.016) > 0.0);
         assert!(decelerate_scroll_velocity(-500.0, 0.016) < 0.0);
+    }
+
+    #[test]
+    fn initial_scroll_target_aligns_block_start() {
+        assert_eq!(initial_scroll_target_offset(640.0, 80.0, 2_000.0), 560.0);
+    }
+
+    #[test]
+    fn initial_scroll_target_clamps_tail_to_scroll_end() {
+        assert_eq!(
+            initial_scroll_target_offset(2_400.0, 80.0, 2_000.0),
+            2_000.0
+        );
+    }
+
+    #[test]
+    fn first_initial_scroll_target_in_tree_order_wins() {
+        let target_style = w3cos_std::style::Style {
+            scroll_initial_target: w3cos_std::style::ScrollInitialTarget::Nearest,
+            ..w3cos_std::style::Style::default()
+        };
+        let root = Component::root(vec![Component::column(
+            w3cos_std::style::Style {
+                overflow: w3cos_std::style::Overflow::Scroll,
+                ..w3cos_std::style::Style::default()
+            },
+            vec![
+                Component::boxed(target_style.clone(), vec![]),
+                Component::boxed(target_style, vec![]),
+            ],
+        )]);
+        let flat = layout::pre_flatten(&root);
+        let layout_cache = vec![
+            (
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 375.0,
+                    height: 500.0,
+                },
+                1,
+            ),
+            (
+                LayoutRect {
+                    x: 0.0,
+                    y: 700.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                2,
+            ),
+            (
+                LayoutRect {
+                    x: 0.0,
+                    y: 1_400.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                3,
+            ),
+        ];
+        let scrollable = vec![(
+            1,
+            layout_cache[0].0,
+            ScrollExtent {
+                max_x: 0.0,
+                max_y: 1_000.0,
+            },
+        )];
+        let ancestors = vec![None, None, Some(1), Some(1)];
+        let mut offsets = HashMap::new();
+        let mut initialized = HashSet::new();
+        let mut user_scrolled = HashSet::new();
+
+        apply_initial_scroll_targets(
+            &flat,
+            &layout_cache,
+            &scrollable,
+            &ancestors,
+            &mut offsets,
+            &mut initialized,
+            &mut user_scrolled,
+        );
+
+        assert_eq!(offsets.get(&1), Some(&(0.0, 700.0)));
+        assert!(initialized.contains(&1));
+    }
+
+    #[test]
+    fn late_initial_scroll_target_does_not_override_user_scroll() {
+        let target_style = w3cos_std::style::Style {
+            scroll_initial_target: w3cos_std::style::ScrollInitialTarget::Nearest,
+            ..w3cos_std::style::Style::default()
+        };
+        let root = Component::root(vec![Component::column(
+            w3cos_std::style::Style::default(),
+            vec![Component::boxed(target_style, vec![])],
+        )]);
+        let flat = layout::pre_flatten(&root);
+        let viewport = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 375.0,
+            height: 500.0,
+        };
+        let layout_cache = vec![(viewport, 1), (viewport, 2)];
+        let scrollable = vec![(
+            1,
+            viewport,
+            ScrollExtent {
+                max_x: 0.0,
+                max_y: 1_000.0,
+            },
+        )];
+        let ancestors = vec![None, None, Some(1)];
+        let mut offsets = HashMap::from([(1, (0.0, 120.0))]);
+        let mut initialized = HashSet::new();
+        let mut user_scrolled = HashSet::from([1]);
+
+        apply_initial_scroll_targets(
+            &flat,
+            &layout_cache,
+            &scrollable,
+            &ancestors,
+            &mut offsets,
+            &mut initialized,
+            &mut user_scrolled,
+        );
+
+        assert_eq!(offsets.get(&1), Some(&(0.0, 120.0)));
+        assert!(!initialized.contains(&1));
     }
 
     #[test]
@@ -3761,13 +4441,113 @@ mod scroll_physics_tests {
         ];
 
         assert_eq!(
-            topmost_scroll_node_at(100.0, 180.0, &scrollable, &scroll_info, &[0, 20]),
+            topmost_scroll_node_at(100.0, 180.0, &scrollable, &scroll_info, &[0, 20], &[]),
             Some(1)
         );
         assert_eq!(
-            topmost_scroll_node_at(10.0, 180.0, &scrollable, &scroll_info, &[0, 20]),
+            topmost_scroll_node_at(10.0, 180.0, &scrollable, &scroll_info, &[0, 20], &[]),
             Some(0)
         );
+    }
+
+    #[test]
+    fn overlay_without_scroll_extent_blocks_page_scroll_below() {
+        let extent = ScrollExtent {
+            max_x: 0.0,
+            max_y: 1_000.0,
+        };
+        let feed = vec![(
+            0,
+            LayoutRect {
+                x: 0.0,
+                y: 80.0,
+                width: 375.0,
+                height: 700.0,
+            },
+            extent,
+        )];
+        let drawer = [(
+            1,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 800.0,
+            },
+        )];
+
+        assert_eq!(
+            topmost_scroll_node_at(150.0, 400.0, &feed, &[None], &[0, 100], &drawer),
+            None
+        );
+        assert_eq!(
+            topmost_scroll_node_at(350.0, 400.0, &feed, &[None], &[0, 100], &drawer),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn clip_only_descendants_follow_their_sticky_owner() {
+        let mut feed_style = w3cos_std::Style::default();
+        feed_style.overflow = w3cos_std::style::Overflow::Scroll;
+        let mut sticky_style = w3cos_std::Style::default();
+        sticky_style.position = w3cos_std::style::Position::Sticky;
+        sticky_style.top = w3cos_std::style::Dimension::Px(0.0);
+        let mut clip_style = w3cos_std::Style::default();
+        clip_style.overflow = w3cos_std::style::Overflow::Hidden;
+        let root = Component::root(vec![Component::column(
+            feed_style,
+            vec![Component::column(
+                sticky_style,
+                vec![Component::column(
+                    clip_style,
+                    vec![Component::column(w3cos_std::Style::default(), vec![])],
+                )],
+            )],
+        )]);
+        let flat = layout::pre_flatten(&root);
+        let feed_rect = LayoutRect {
+            x: 0.0,
+            y: 100.0,
+            width: 375.0,
+            height: 600.0,
+        };
+        let sticky_rect = LayoutRect {
+            x: 10.0,
+            y: 300.0,
+            width: 355.0,
+            height: 180.0,
+        };
+        let clip_rect = sticky_rect;
+        let layout_cache = vec![
+            (feed_rect, 1),
+            (sticky_rect, 2),
+            (clip_rect, 3),
+            (clip_rect, 4),
+        ];
+        let scrollable = vec![(
+            1,
+            feed_rect,
+            ScrollExtent {
+                max_x: 0.0,
+                max_y: 1_000.0,
+            },
+        )];
+        let scroll_ancestor = vec![None, None, Some(1), Some(1), Some(3)];
+        let scroll_info = build_scroll_info_fast(
+            &scroll_ancestor,
+            &scrollable,
+            &[(3, clip_rect)],
+            &HashMap::from([(1, (0.0, 250.0))]),
+            &layout_cache,
+            &flat,
+            375.0,
+            700.0,
+        );
+
+        let (_, sy, visual_clip) = scroll_info[4].unwrap();
+        assert_eq!(sy, 200.0);
+        assert_eq!(visual_clip.y, 100.0);
     }
 
     #[test]
@@ -3824,6 +4604,233 @@ mod scroll_physics_tests {
             }
             _ => panic!("expected FLIP transform animation"),
         }
+    }
+
+    #[test]
+    fn animated_parent_translation_moves_entire_subtree() {
+        let root = Component::root(vec![Component::column(
+            w3cos_std::Style::default(),
+            vec![Component::text("drawer child", w3cos_std::Style::default())],
+        )]);
+        let flat = layout::pre_flatten(&root);
+        let now = Instant::now();
+        let animations = vec![ActiveAnimation::Transform {
+            target_id: flat[1].stable_id,
+            node_index: 1,
+            from: Transform2D {
+                translate_x: -300.0,
+                ..Transform2D::IDENTITY
+            },
+            to: Transform2D::IDENTITY,
+            start: now,
+            duration_ms: 280.0,
+            delay_ms: 0.0,
+            easing: Easing::Linear,
+        }];
+
+        let overrides = animated_style_overrides(&flat, &animations, now);
+
+        assert_eq!(overrides[&1].transform.translate_x, -300.0);
+        assert_eq!(overrides[&2].transform.translate_x, -300.0);
+    }
+
+    #[test]
+    fn layout_transition_interpolates_height_without_scaling_content() {
+        let mut style = w3cos_std::Style::default();
+        style.transition = Some(w3cos_std::style::Transition {
+            property: TransitionProperty::All,
+            duration_ms: 240,
+            easing: Easing::Linear,
+            delay_ms: 0,
+        });
+        let root = Component::column(style, vec![]);
+        let flat = layout::pre_flatten(&root);
+        let old = vec![(
+            LayoutRect {
+                x: 10.0,
+                y: 100.0,
+                width: 355.0,
+                height: 180.0,
+            },
+            0,
+        )];
+        let new = vec![(
+            LayoutRect {
+                x: 10.0,
+                y: 100.0,
+                width: 355.0,
+                height: 52.0,
+            },
+            0,
+        )];
+        let viewport = ViewportLayout {
+            layout_w: 375.0,
+            layout_h: 700.0,
+            offset_y: 0.0,
+            keyboard_inset_bottom: 0.0,
+        };
+        let mut animations = Vec::new();
+
+        App::collect_layout_transition_animations(
+            &mut animations,
+            &flat,
+            &new,
+            &old,
+            viewport,
+            viewport,
+        );
+
+        assert_eq!(animations.len(), 1);
+        match &animations[0] {
+            ActiveAnimation::LayoutHeight { from, to, .. } => {
+                assert_eq!(*from, 180.0);
+                assert_eq!(*to, 52.0);
+            }
+            _ => panic!("expected layout height animation"),
+        }
+
+        let now = Instant::now();
+        if let ActiveAnimation::LayoutHeight { start, .. } = &mut animations[0] {
+            *start = now - std::time::Duration::from_millis(120);
+        }
+        let animated = animated_layout_cache(&new, &animations, now).unwrap();
+        assert!((animated[0].0.height - 116.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn layout_transition_retargets_from_current_sample() {
+        let mut style = w3cos_std::Style::default();
+        style.transition = Some(w3cos_std::style::Transition {
+            property: TransitionProperty::All,
+            duration_ms: 240,
+            easing: Easing::Linear,
+            delay_ms: 0,
+        });
+        let root = Component::column(style, vec![]);
+        let flat = layout::pre_flatten(&root);
+        let expanded = vec![(
+            LayoutRect {
+                x: 10.0,
+                y: 100.0,
+                width: 355.0,
+                height: 180.0,
+            },
+            0,
+        )];
+        let compact = vec![(
+            LayoutRect {
+                x: 10.0,
+                y: 100.0,
+                width: 355.0,
+                height: 52.0,
+            },
+            0,
+        )];
+        let viewport = ViewportLayout {
+            layout_w: 375.0,
+            layout_h: 700.0,
+            offset_y: 0.0,
+            keyboard_inset_bottom: 0.0,
+        };
+        let now = Instant::now();
+        let mut animations = Vec::new();
+
+        App::collect_layout_transition_animations(
+            &mut animations,
+            &flat,
+            &compact,
+            &expanded,
+            viewport,
+            viewport,
+        );
+        if let ActiveAnimation::LayoutHeight { start, .. } = &mut animations[0] {
+            *start = now - std::time::Duration::from_millis(120);
+        }
+        App::collect_layout_transition_animations(
+            &mut animations,
+            &flat,
+            &expanded,
+            &compact,
+            viewport,
+            viewport,
+        );
+
+        assert_eq!(animations.len(), 1);
+        match animations[0] {
+            ActiveAnimation::LayoutHeight { from, to, .. } => {
+                assert!((from - 116.0).abs() < 1.0, "retargeted from={from}");
+                assert_eq!(to, 180.0);
+            }
+            _ => panic!("expected retargeted layout height animation"),
+        }
+    }
+
+    #[test]
+    fn layout_transition_pairs_conditional_sibling_replacement() {
+        let transition = Some(w3cos_std::style::Transition {
+            property: TransitionProperty::All,
+            duration_ms: 520,
+            easing: Easing::EaseInOut,
+            delay_ms: 0,
+        });
+        let mut compact_style = w3cos_std::Style::default();
+        compact_style.height = Dimension::Px(52.0);
+        compact_style.transition = transition.clone();
+        let mut card_style = w3cos_std::Style::default();
+        card_style.display = w3cos_std::style::Display::None;
+        card_style.transition = transition;
+        let root = Component::column(
+            Default::default(),
+            vec![
+                Component::row(compact_style, vec![]),
+                Component::column(card_style, vec![]),
+            ],
+        );
+        let flat = layout::pre_flatten(&root);
+        let old = vec![(
+            LayoutRect {
+                x: 10.0,
+                y: 100.0,
+                width: 355.0,
+                height: 180.0,
+            },
+            2,
+        )];
+        let new = vec![(
+            LayoutRect {
+                x: 10.0,
+                y: 100.0,
+                width: 355.0,
+                height: 52.0,
+            },
+            1,
+        )];
+        let viewport = ViewportLayout {
+            layout_w: 375.0,
+            layout_h: 700.0,
+            offset_y: 0.0,
+            keyboard_inset_bottom: 0.0,
+        };
+        let mut animations = Vec::new();
+
+        App::collect_layout_transition_animations(
+            &mut animations,
+            &flat,
+            &new,
+            &old,
+            viewport,
+            viewport,
+        );
+
+        assert!(matches!(
+            animations.as_slice(),
+            [ActiveAnimation::LayoutHeight {
+                node_index: 1,
+                from: 180.0,
+                to: 52.0,
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -4001,6 +5008,47 @@ mod scroll_physics_tests {
             375.0,
             812.0,
             0.0,
+        ));
+    }
+
+    #[test]
+    fn overlay_scroll_damage_requires_composed_repaint() {
+        let damage = ScrollDamage {
+            index: 2,
+            delta_y: 24.0,
+        };
+        let scrollable = [(
+            2,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 600.0,
+            },
+            ScrollExtent {
+                max_x: 0.0,
+                max_y: 1_000.0,
+            },
+        )];
+        assert!(!scroll_damage_crosses_stacking_context(
+            &[damage],
+            &[0, 0, 0],
+            &scrollable,
+            &[(2, scrollable[0].1)]
+        ));
+        assert!(scroll_damage_crosses_stacking_context(
+            &[damage],
+            &[0, 100, 0],
+            &scrollable,
+            &[(
+                1,
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 240.0,
+                    height: 600.0,
+                }
+            )]
         ));
     }
 

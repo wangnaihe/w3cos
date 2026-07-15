@@ -44,6 +44,10 @@ pub struct ScrollExtent {
 // ---------------------------------------------------------------------------
 
 pub struct FlatNodeInfo<'a> {
+    /// Stable identity for this compiled tree slot across reactive rebuilds.
+    /// The compiler keeps conditional branches mounted and only toggles
+    /// display, so a structural path is stable even when visibility changes.
+    pub stable_id: u64,
     pub kind: &'a ComponentKind,
     pub style: &'a w3cos_std::style::Style,
     pub on_click: &'a EventAction,
@@ -54,7 +58,7 @@ pub struct FlatNodeInfo<'a> {
 pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
     let n = count_nodes(root);
     let mut out = Vec::with_capacity(n);
-    pre_flatten_recursive(root, None, &mut out);
+    pre_flatten_recursive(root, None, 0xcbf2_9ce4_8422_2325, &mut out);
     out
 }
 
@@ -224,18 +228,27 @@ pub fn is_node_visible(flat: &[FlatNodeInfo<'_>], idx: usize) -> bool {
 fn pre_flatten_recursive<'a>(
     comp: &'a Component,
     parent: Option<usize>,
+    stable_id: u64,
     out: &mut Vec<FlatNodeInfo<'a>>,
 ) {
     let my_idx = out.len();
     out.push(FlatNodeInfo {
+        stable_id,
         kind: &comp.kind,
         style: &comp.style,
         on_click: &comp.on_click,
         sticky_counter_signal: comp.sticky_counter_signal,
         parent,
     });
-    for child in &comp.children {
-        pre_flatten_recursive(child, Some(my_idx), out);
+    for (child_index, child) in comp.children.iter().enumerate() {
+        // FNV-1a over the child ordinal gives each persistent tree slot an
+        // identity independent from its current flattened array index.
+        let mut child_id = stable_id;
+        for byte in (child_index as u64).to_le_bytes() {
+            child_id ^= byte as u64;
+            child_id = child_id.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        pre_flatten_recursive(child, Some(my_idx), child_id, out);
     }
 }
 
@@ -1140,7 +1153,9 @@ mod tests {
             600.0,
         )
         .unwrap();
-        let gap_visible = visible[3].0.y - (visible[1].0.y + visible[1].0.height);
+        // `display:none` nodes are omitted from the exported layout cache, so
+        // B is entry 2 here and entry 3 when the middle node participates.
+        let gap_visible = visible[2].0.y - (visible[1].0.y + visible[1].0.height);
         let gap_hidden = hidden[3].0.y - (hidden[1].0.y + hidden[1].0.height);
         assert!(
             gap_visible < gap_hidden,
@@ -1417,6 +1432,13 @@ mod tests {
         assert_eq!(flat[1].parent, Some(0));
         assert_eq!(flat[2].parent, Some(0));
         assert_eq!(flat[3].parent, Some(2));
+        assert_ne!(flat[1].stable_id, flat[2].stable_id);
+
+        let mut rebuilt = tree.clone();
+        rebuilt.children[0].style.opacity = 0.5;
+        let rebuilt_flat = pre_flatten(&rebuilt);
+        assert_eq!(flat[1].stable_id, rebuilt_flat[1].stable_id);
+        assert_eq!(flat[3].stable_id, rebuilt_flat[3].stable_id);
     }
 
     #[test]

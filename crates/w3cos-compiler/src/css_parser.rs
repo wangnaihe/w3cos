@@ -1064,6 +1064,7 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "left" => style.left = Some(value.to_string()),
         "z-index" => style.z_index = value.parse().ok(),
         "overflow" => style.overflow = Some(value.to_string()),
+        "scroll-initial-target" => style.scroll_initial_target = Some(value.to_string()),
         "display" => style.display = Some(value.to_string()),
         "opacity" => style.opacity = value.parse().ok(),
         "visibility" => style.visibility = Some(value.to_string()),
@@ -1380,6 +1381,15 @@ mod tests {
                 safe_area: Some(SafeAreaEdge::Bottom),
                 keyboard_inset: true,
             })
+        );
+    }
+
+    #[test]
+    fn parse_scroll_initial_target() {
+        let sheet = parse_css(".tail { scroll-initial-target: nearest; }");
+        assert_eq!(
+            sheet.rules[0].style.scroll_initial_target.as_deref(),
+            Some("nearest")
         );
     }
 

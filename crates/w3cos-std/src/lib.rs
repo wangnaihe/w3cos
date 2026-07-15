@@ -125,6 +125,12 @@ mod tests {
     }
 
     #[test]
+    fn css_named_color_through_codegen_parser() {
+        assert_eq!(Color::from_hex("transparent"), Color::TRANSPARENT);
+        assert_eq!(Color::from_hex("white"), Color::WHITE);
+    }
+
+    #[test]
     fn color_constants() {
         assert_eq!(Color::WHITE.r, 255);
         assert_eq!(Color::WHITE.g, 255);

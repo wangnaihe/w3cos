@@ -641,6 +641,13 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
         };
         fields.push(format!("overflow: {variant}"));
     }
+    if let Some(ref target) = s.scroll_initial_target {
+        let variant = match target.as_str() {
+            "nearest" => "ScrollInitialTarget::Nearest",
+            _ => "ScrollInitialTarget::None",
+        };
+        fields.push(format!("scroll_initial_target: {variant}"));
+    }
     if let Some(m) = s.margin {
         if let Spacing::Px(v) = m {
             fields.push(format!("margin: Edges::all({v}_f32)"));

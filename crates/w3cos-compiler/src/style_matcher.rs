@@ -182,6 +182,7 @@ pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
         left,
         z_index,
         overflow,
+        scroll_initial_target,
         display,
         opacity,
         visibility,

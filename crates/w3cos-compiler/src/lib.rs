@@ -513,6 +513,15 @@ mod tests {
     }
 
     #[test]
+    fn compile_to_rust_scroll_initial_target() {
+        let rust = compile_to_rust(
+            r#"<Column style={{ scrollInitialTarget: "nearest" }}><Text>latest</Text></Column>"#,
+        )
+        .unwrap();
+        assert!(rust.contains("scroll_initial_target: ScrollInitialTarget::Nearest"));
+    }
+
+    #[test]
     fn compile_to_rust_full_pipeline() {
         let input = r##"Column({
             style: { gap: 8, padding: 16 },

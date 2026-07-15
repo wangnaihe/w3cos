@@ -97,6 +97,7 @@ pub struct StyleDecl {
     pub left: Option<String>,
     pub z_index: Option<i32>,
     pub overflow: Option<String>,
+    pub scroll_initial_target: Option<String>,
     pub display: Option<String>,
     // Phase 3 additions
     pub margin: Option<Spacing>,
@@ -1142,6 +1143,9 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                 "width" => style.width = Some(unquote(val)),
                 "height" => style.height = Some(unquote(val)),
                 "overflow" => style.overflow = Some(unquote(val)),
+                "scrollInitialTarget" | "scroll_initial_target" => {
+                    style.scroll_initial_target = Some(unquote(val))
+                }
                 "display" => style.display = Some(unquote(val)),
                 "margin" | "marginTop" | "margin_top" => {
                     style.margin = val.parse().ok().map(Spacing::Px)

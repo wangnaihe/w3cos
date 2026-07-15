@@ -40,6 +40,9 @@ pub struct Style {
 
     // Overflow
     pub overflow: Overflow,
+    /// CSS Scroll Snap Level 2 `scroll-initial-target`.
+    #[serde(default)]
+    pub scroll_initial_target: ScrollInitialTarget,
 
     // Visual
     pub background: Color,
@@ -132,6 +135,7 @@ impl Default for Style {
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             overflow: Overflow::Visible,
+            scroll_initial_target: ScrollInitialTarget::None,
             background: Color::TRANSPARENT,
             color: Color::WHITE,
             font_size: 16.0,
@@ -199,6 +203,13 @@ pub enum Overflow {
     Hidden,
     Scroll,
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ScrollInitialTarget {
+    #[default]
+    None,
+    Nearest,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -657,12 +668,54 @@ impl Easing {
     }
 }
 
-fn cubic_bezier(_x1: f32, y1: f32, _x2: f32, y2: f32, t: f32) -> f32 {
-    // Simple approximation: sample the curve
-    let ct = 1.0 - t;
-    let ct2 = ct * ct;
-    let t2 = t * t;
-    3.0 * ct2 * t * y1 + 3.0 * ct * t2 * y2 + t2 * t
+fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+    fn sample(a1: f32, a2: f32, t: f32) -> f32 {
+        ((1.0 - 3.0 * a2 + 3.0 * a1) * t + (3.0 * a2 - 6.0 * a1)) * t * t + 3.0 * a1 * t
+    }
+
+    fn slope(a1: f32, a2: f32, t: f32) -> f32 {
+        3.0 * (1.0 - 3.0 * a2 + 3.0 * a1) * t * t + 2.0 * (3.0 * a2 - 6.0 * a1) * t + 3.0 * a1
+    }
+
+    // CSS timing functions map time through the curve's x axis; evaluating
+    // y directly at `t` ignores both x control points. Follow browser engines:
+    // Newton iteration for the common case, with bisection for flat slopes.
+    let mut curve_t = x;
+    for _ in 0..8 {
+        let error = sample(x1, x2, curve_t) - x;
+        if error.abs() < 1.0e-6 {
+            return sample(y1, y2, curve_t);
+        }
+        let derivative = slope(x1, x2, curve_t);
+        if derivative.abs() < 1.0e-6 {
+            break;
+        }
+        curve_t = (curve_t - error / derivative).clamp(0.0, 1.0);
+    }
+
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..12 {
+        curve_t = (low + high) * 0.5;
+        if sample(x1, x2, curve_t) < x {
+            low = curve_t;
+        } else {
+            high = curve_t;
+        }
+    }
+    sample(y1, y2, curve_t)
+}
+
+#[cfg(test)]
+mod easing_tests {
+    use super::Easing;
+
+    #[test]
+    fn css_easing_solves_the_curve_x_axis() {
+        let midpoint = Easing::Ease.interpolate(0.5);
+        assert!((midpoint - 0.802).abs() < 0.002, "midpoint={midpoint}");
+        assert_eq!(Easing::Ease.interpolate(0.0), 0.0);
+        assert_eq!(Easing::Ease.interpolate(1.0), 1.0);
+    }
 }
 
 // --- New enums for Phase 3 ---
