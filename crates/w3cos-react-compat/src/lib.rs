@@ -47,6 +47,484 @@ use std::rc::Rc;
 
 use w3cos_core::{Effect, Signal, batch};
 
+/// Dynamic host ABI used by the npm ESM AOT pipeline. These functions expose
+/// React's public runtime contract in terms of `w3cos_core::Value`; third-party
+/// component code is still compiled from its real package source.
+pub mod aot {
+    #![allow(non_snake_case)]
+
+    use super::{use_effect, use_memo, use_ref, use_state};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use w3cos_core::Value;
+    use w3cos_std::color::Color;
+    use w3cos_std::component::Component;
+    use w3cos_std::style::{
+        AlignItems, Dimension, Edges, FlexDirection, JustifyContent, Overflow, Position, Style,
+        Transform2D,
+    };
+
+    thread_local! {
+        static NEXT_AOT_COMPONENT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+        static NEXT_HOST_ELEMENT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+        static HOST_ELEMENTS: std::cell::RefCell<std::collections::HashMap<u64, Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
+        static SCROLL_LISTENERS: std::cell::RefCell<std::collections::HashMap<u64, Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    fn deps(value: &Value) -> Vec<u64> {
+        let Value::Array(values) = value else {
+            return Vec::new();
+        };
+        values
+            .borrow()
+            .iter()
+            .map(|value| {
+                let mut hasher = DefaultHasher::new();
+                value.to_js_string().hash(&mut hasher);
+                hasher.finish()
+            })
+            .collect()
+    }
+
+    pub fn call_host(path: &str, arguments: Vec<Value>) -> Value {
+        let argument = |index| arguments.get(index).cloned().unwrap_or(Value::Undefined);
+        match path.rsplit("::").next().unwrap_or(path) {
+            "useState" => useState(argument(0)),
+            "useMemo" => useMemo(argument(0), argument(1)),
+            "useCallback" => useCallback(argument(0), argument(1)),
+            "useRef" => useRef(argument(0)),
+            "useEffect" => useEffect(argument(0), argument(1)),
+            "useLayoutEffect" => useLayoutEffect(argument(0), argument(1)),
+            "useImperativeHandle" => useImperativeHandle(argument(0), argument(1), argument(2)),
+            "memo" => memo(argument(0)),
+            "createElement" => createElement(arguments),
+            "jsx" | "jsxs" => createElement(arguments),
+            "Fragment" => Fragment(),
+            _ => Value::Undefined,
+        }
+    }
+
+    pub fn render_to_component(value: Value) -> Component {
+        NEXT_AOT_COMPONENT.with(|next| next.set(1));
+        NEXT_HOST_ELEMENT.with(|next| next.set(1));
+        render_value(value)
+    }
+
+    pub fn dispatch_scroll(host_id: u64, offset: f32) {
+        HOST_ELEMENTS.with(|elements| {
+            if let Some(element) = elements.borrow().get(&host_id) {
+                element.set_property("scrollTop", Value::Number(offset as f64));
+            }
+        });
+        let listener = SCROLL_LISTENERS.with(|listeners| listeners.borrow().get(&host_id).cloned());
+        if let Some(listener) = listener {
+            listener.call(
+                Value::Undefined,
+                vec![Value::object(std::collections::HashMap::new())],
+            );
+        }
+    }
+
+    pub fn has_pending_render() -> bool {
+        !super::take_dirty().is_empty()
+    }
+
+    pub fn component_count(component: &Component) -> usize {
+        1 + component
+            .children
+            .iter()
+            .map(component_count)
+            .sum::<usize>()
+    }
+
+    fn render_value(value: Value) -> Component {
+        match value {
+            Value::Array(values) => Component::column(
+                Style::default(),
+                values.borrow().iter().cloned().map(render_value).collect(),
+            ),
+            Value::String(text) => Component::text(text, Style::default()),
+            Value::Number(number) => {
+                Component::text(Value::Number(number).to_js_string(), Style::default())
+            }
+            Value::Object(_) => {
+                let element_type = value.get_property("type");
+                if element_type.is_undefined() {
+                    return Component::boxed(Style::default(), Vec::new());
+                }
+                let props = value.get_property("props");
+                if element_type.is_function() {
+                    let id = NEXT_AOT_COMPONENT.with(|next| {
+                        let id = next.get();
+                        next.set(id + 1);
+                        super::ComponentId(id)
+                    });
+                    super::begin_render(id);
+                    let rendered = element_type.call(Value::Undefined, vec![props]);
+                    super::end_render(id);
+                    if std::env::var_os("W3COS_AOT_TRACE").is_some() {
+                        eprintln!("[w3cos-aot] component {id:?} -> {}", value_shape(&rendered));
+                    }
+                    return render_value(rendered);
+                }
+                let host_id = NEXT_HOST_ELEMENT.with(|next| {
+                    let id = next.get();
+                    next.set(id + 1);
+                    id
+                });
+                let (host, created) = HOST_ELEMENTS.with(|elements| {
+                    let mut elements = elements.borrow_mut();
+                    if let Some(host) = elements.get(&host_id) {
+                        (host.clone(), false)
+                    } else {
+                        let host = host_element(host_id);
+                        elements.insert(host_id, host.clone());
+                        (host, true)
+                    }
+                });
+                if created {
+                    let reference = props.get_property("ref_");
+                    if reference.is_function() {
+                        reference.call(Value::Undefined, vec![host]);
+                    }
+                }
+                let children = props.get_property("children");
+                let children = match children {
+                    Value::Array(values) => {
+                        values.borrow().iter().cloned().map(render_value).collect()
+                    }
+                    Value::Undefined | Value::Null => Vec::new(),
+                    child => vec![render_value(child)],
+                };
+                let mut component = match element_type.to_js_string().as_str() {
+                    "span" | "p" => {
+                        let text = children
+                            .iter()
+                            .filter_map(|child| match &child.kind {
+                                w3cos_std::component::ComponentKind::Text { content } => {
+                                    Some(content.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        Component::text(text, style_from_props(&props))
+                    }
+                    "button" => Component::button("", Style::default()),
+                    _ => Component::boxed(style_from_props(&props), children),
+                };
+                if SCROLL_LISTENERS.with(|listeners| listeners.borrow().contains_key(&host_id)) {
+                    component.on_click = w3cos_std::EventAction::NativeScroll(host_id);
+                }
+                component
+            }
+            Value::Function(function) => render_value(function.call(Value::Undefined, vec![])),
+            Value::Bool(boolean) => Component::text(boolean.to_string(), Style::default()),
+            Value::Undefined | Value::Null => Component::boxed(Style::default(), Vec::new()),
+        }
+    }
+
+    fn value_shape(value: &Value) -> String {
+        match value {
+            Value::Array(values) => format!("array({})", values.borrow().len()),
+            Value::Object(_) => {
+                let children = value.get_property("props").get_property("children");
+                format!("element children={}", value_shape(&children))
+            }
+            _ => value.type_of().to_string(),
+        }
+    }
+
+    fn host_element(host_id: u64) -> Value {
+        let host = Value::object(std::collections::HashMap::new());
+        host.set_property("scrollTop", Value::Number(0.0));
+        host.set_property("scrollLeft", Value::Number(0.0));
+        host.set_property("children", Value::array(Vec::new()));
+        host.set_property(
+            "addEventListener",
+            Value::function(move |_, arguments| {
+                if arguments
+                    .first()
+                    .is_some_and(|event| event.to_js_string() == "scroll")
+                {
+                    let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                    SCROLL_LISTENERS
+                        .with(|listeners| listeners.borrow_mut().insert(host_id, callback));
+                }
+                Value::Undefined
+            }),
+        );
+        host.set_property(
+            "removeEventListener",
+            Value::function(move |_, arguments| {
+                if arguments
+                    .first()
+                    .is_some_and(|event| event.to_js_string() == "scroll")
+                {
+                    SCROLL_LISTENERS.with(|listeners| listeners.borrow_mut().remove(&host_id));
+                }
+                Value::Undefined
+            }),
+        );
+        host
+    }
+
+    fn style_from_props(props: &Value) -> Style {
+        let source = props.get_property("style");
+        let mut style = Style::default();
+        style.width = dimension(&source.get_property("width"));
+        style.height = dimension(&source.get_property("height"));
+        style.max_width = dimension(&source.get_property("maxWidth"));
+        style.max_height = dimension(&source.get_property("maxHeight"));
+        style.flex_grow = source.get_property("flexGrow").to_number().max(0.0) as f32;
+        let flex_shrink = source.get_property("flexShrink").to_number();
+        if flex_shrink.is_finite() {
+            style.flex_shrink = flex_shrink.max(0.0) as f32;
+        }
+        style.flex_direction = match source.get_property("flexDirection").to_js_string().as_str() {
+            "row" => FlexDirection::Row,
+            "row-reverse" => FlexDirection::RowReverse,
+            "column-reverse" => FlexDirection::ColumnReverse,
+            _ => FlexDirection::Column,
+        };
+        style.justify_content = match source.get_property("justifyContent").to_js_string().as_str() {
+            "center" => JustifyContent::Center,
+            "flex-end" => JustifyContent::FlexEnd,
+            "space-between" => JustifyContent::SpaceBetween,
+            "space-around" => JustifyContent::SpaceAround,
+            "space-evenly" => JustifyContent::SpaceEvenly,
+            _ => JustifyContent::FlexStart,
+        };
+        style.align_items = match source.get_property("alignItems").to_js_string().as_str() {
+            "center" => AlignItems::Center,
+            "flex-start" => AlignItems::FlexStart,
+            "flex-end" => AlignItems::FlexEnd,
+            "baseline" => AlignItems::Baseline,
+            _ => AlignItems::Stretch,
+        };
+        style.gap = source.get_property("gap").to_number().max(0.0) as f32;
+        let padding = source.get_property("padding").to_number();
+        if padding.is_finite() {
+            style.padding = Edges::all(padding as f32);
+        }
+        style.font_size = source
+            .get_property("fontSize")
+            .to_number()
+            .is_finite()
+            .then(|| source.get_property("fontSize").to_number() as f32)
+            .unwrap_or(style.font_size);
+        let font_weight = source.get_property("fontWeight").to_number();
+        if font_weight.is_finite() {
+            style.font_weight = font_weight.max(1.0) as u16;
+        }
+        if let Some(color) = css_color(&source.get_property("color")) {
+            style.color = color;
+        }
+        if let Some(background) = css_color(&source.get_property("backgroundColor"))
+            .or_else(|| css_color(&source.get_property("background")))
+        {
+            style.background = background;
+        }
+        let border_radius = source.get_property("borderRadius").to_number();
+        if border_radius.is_finite() {
+            style.border_radius = border_radius.max(0.0) as f32;
+        }
+        let border_width = source.get_property("borderWidth").to_number();
+        if border_width.is_finite() {
+            style.border_width = border_width.max(0.0) as f32;
+        }
+        if let Some(border_color) = css_color(&source.get_property("borderColor")) {
+            style.border_color = border_color;
+        }
+        style.position = match source.get_property("position").to_js_string().as_str() {
+            "absolute" => Position::Absolute,
+            "fixed" => Position::Fixed,
+            "sticky" => Position::Sticky,
+            _ => Position::Relative,
+        };
+        style.overflow = match source.get_property("overflowY").to_js_string().as_str() {
+            "auto" => Overflow::Auto,
+            "scroll" => Overflow::Scroll,
+            "hidden" => Overflow::Hidden,
+            _ => Overflow::Visible,
+        };
+        let transform = source.get_property("transform").to_js_string();
+        if let Some(value) = transform
+            .strip_prefix("translateY(")
+            .and_then(|value| value.strip_suffix("px)"))
+        {
+            let translate_y = value.parse().unwrap_or(0.0);
+            if matches!(style.position, Position::Absolute) {
+                // react-window positions rows with an absolute box plus
+                // translateY. The native layout tree paints descendants as
+                // independent nodes, so keeping this as a paint-only transform
+                // would leave every row's text at y=0. Fold the translation
+                // into the absolute layout offset so the whole subtree moves.
+                style.top = Dimension::Px(translate_y);
+            } else {
+                style.transform = Transform2D {
+                    translate_y,
+                    ..Transform2D::IDENTITY
+                };
+            }
+        }
+        style
+    }
+
+    fn css_color(value: &Value) -> Option<Color> {
+        let value = value.to_js_string();
+        (value.starts_with('#') || value == "transparent").then(|| Color::from_hex(&value))
+    }
+
+    fn dimension(value: &Value) -> Dimension {
+        match value {
+            Value::Number(number) if number.is_finite() => Dimension::Px(*number as f32),
+            Value::String(value) if value.ends_with('%') => value[..value.len() - 1]
+                .parse()
+                .map(Dimension::Percent)
+                .unwrap_or(Dimension::Auto),
+            Value::String(value) if value.ends_with("px") => value[..value.len() - 2]
+                .parse()
+                .map(Dimension::Px)
+                .unwrap_or(Dimension::Auto),
+            _ => Dimension::Auto,
+        }
+    }
+
+    pub fn useState(initial: Value) -> Value {
+        let initial = if initial.is_function() {
+            initial.call(Value::Undefined, vec![])
+        } else {
+            initial
+        };
+        if std::env::var_os("W3COS_AOT_TRACE").is_some() {
+            eprintln!(
+                "[w3cos-aot] useState {} range=({}, {})",
+                value_shape(&initial),
+                initial.get_property("startIndexOverscan").to_js_string(),
+                initial.get_property("stopIndexOverscan").to_js_string()
+            );
+        }
+        let state = use_state(|| initial);
+        let setter_state = state.clone();
+        let setter = Value::function(move |_, arguments| {
+            let next = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let next = if next.is_function() {
+                next.call(Value::Undefined, vec![setter_state.get()])
+            } else {
+                next
+            };
+            setter_state.set(next);
+            Value::Undefined
+        });
+        Value::array(vec![state.get(), setter])
+    }
+
+    pub fn useMemo(factory: Value, dependencies: Value) -> Value {
+        let dependencies = deps(&dependencies);
+        use_memo(
+            move || factory.call(Value::Undefined, vec![]),
+            &dependencies,
+        )
+        .get()
+    }
+
+    pub fn useCallback(callback: Value, dependencies: Value) -> Value {
+        let dependencies = deps(&dependencies);
+        use_memo(move || callback, &dependencies).get()
+    }
+
+    pub fn useRef(initial: Value) -> Value {
+        let reference = use_ref(|| {
+            let object = crate::aot_object();
+            object.set_property("current", initial);
+            object
+        });
+        reference.with(Clone::clone)
+    }
+
+    pub fn useEffect(effect: Value, dependencies: Value) -> Value {
+        let dependencies = deps(&dependencies);
+        use_effect(
+            move || {
+                let cleanup = effect.call(Value::Undefined, vec![]);
+                cleanup.is_function().then(|| {
+                    Box::new(move || {
+                        cleanup.call(Value::Undefined, vec![]);
+                    }) as Box<dyn FnOnce()>
+                })
+            },
+            &dependencies,
+        );
+        Value::Undefined
+    }
+
+    pub fn useLayoutEffect(effect: Value, dependencies: Value) -> Value {
+        useEffect(effect, dependencies)
+    }
+
+    pub fn memo(component: Value) -> Value {
+        component
+    }
+
+    pub fn createElement(arguments: Vec<Value>) -> Value {
+        let element_type = arguments.first().cloned().unwrap_or(Value::Undefined);
+        let props = arguments.get(1).cloned().unwrap_or_else(crate::aot_object);
+        if arguments.len() > 2 {
+            let children = if arguments.len() == 3 {
+                arguments[2].clone()
+            } else {
+                Value::array(arguments[2..].to_vec())
+            };
+            props.set_property("children", children);
+        }
+        let element = crate::aot_object();
+        element.set_property("type", element_type);
+        element.set_property("props", props);
+        element
+    }
+
+    pub fn useImperativeHandle(reference: Value, factory: Value, dependencies: Value) -> Value {
+        let value = useMemo(factory, dependencies);
+        reference.set_property("current", value);
+        Value::Undefined
+    }
+
+    pub fn jsx(element_type: Value, props: Value) -> Value {
+        createElement(vec![element_type, props])
+    }
+
+    pub fn jsxs(element_type: Value, props: Value) -> Value {
+        createElement(vec![element_type, props])
+    }
+
+    pub fn Fragment() -> Value {
+        Value::from("react.fragment")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn absolute_translate_y_positions_the_entire_host_subtree() {
+            let style = Value::object(std::collections::HashMap::new());
+            style.set_property("position", Value::from("absolute"));
+            style.set_property("transform", Value::from("translateY(76px)"));
+            let props = Value::object(std::collections::HashMap::new());
+            props.set_property("style", style);
+
+            let native = style_from_props(&props);
+            assert!(matches!(native.position, Position::Absolute));
+            assert!(matches!(native.top, Dimension::Px(value) if value == 76.0));
+            assert!(native.transform.is_identity());
+        }
+    }
+}
+
+fn aot_object() -> w3cos_core::Value {
+    w3cos_core::Value::object(std::collections::HashMap::new())
+}
+
 // ---------------------------------------------------------------------------
 // Internal slot model
 // ---------------------------------------------------------------------------

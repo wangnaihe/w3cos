@@ -1,6 +1,6 @@
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "cpu-render")]
 use std::rc::Rc;
@@ -204,7 +204,9 @@ use vello::wgpu;
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
 
 use crate::compositor::lerp_transform;
+use crate::fling::MobileFlingCurve;
 use crate::layout::{self, LayoutEngine, LayoutRect, ScrollExtent};
+use crate::overscroll::OverscrollState;
 #[cfg(feature = "cpu-render")]
 use crate::render_cpu;
 #[cfg(feature = "gpu")]
@@ -212,7 +214,9 @@ use crate::render_gpu;
 use crate::state;
 use crate::virtual_list::{KeyedVirtualList, VirtualListConfig, VisibleWindow};
 use w3cos_std::color::Color;
-use w3cos_std::style::{Dimension, Easing, Position, Transform2D, TransitionProperty};
+use w3cos_std::style::{
+    Dimension, Easing, OverscrollBehavior, Position, Transform2D, TransitionProperty,
+};
 use w3cos_std::{Component, ComponentKind, EventAction};
 
 #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -240,8 +244,11 @@ struct IosImeRetry {
     attempts: u8,
 }
 const KINETIC_SCROLL_STOP_VELOCITY: f32 = 12.0;
+// At large virtual-list offsets f32's representable step can exceed 0.001px.
+// A sub-0.05px remainder is numerical noise, not an unconsumed boundary delta.
+const SCROLL_CHAIN_EPSILON: f32 = 0.05;
 const KINETIC_SCROLL_MAX_VELOCITY: f32 = 6_000.0;
-const KINETIC_SCROLL_DECELERATION_PER_FRAME: f32 = 0.96;
+const KINETIC_VELOCITY_WINDOW: Duration = Duration::from_millis(150);
 
 // ---------------------------------------------------------------------------
 // HitNode — interactive region for click/focus
@@ -270,12 +277,31 @@ enum RepaintMode {
 
 struct KineticScroll {
     index: usize,
-    velocity_y: f32,
-    last_tick: Instant,
+    curve: MobileFlingCurve,
+    started_at: Instant,
+    last_offset: f32,
 }
 
-fn decelerate_scroll_velocity(velocity: f32, elapsed_seconds: f32) -> f32 {
-    velocity * KINETIC_SCROLL_DECELERATION_PER_FRAME.powf(elapsed_seconds * 60.0)
+fn estimate_touch_velocity(samples: &VecDeque<(Instant, f32)>, now: Instant) -> Option<f32> {
+    let &(latest_time, latest_y) = samples.back()?;
+    if now.duration_since(latest_time) > KINETIC_VELOCITY_WINDOW {
+        return None;
+    }
+    // The queue deliberately retains one sample immediately before the
+    // window boundary. Including it avoids iOS's tiny terminal Move events
+    // collapsing an otherwise fast fling to zero velocity.
+    let &(earliest_time, earliest_y) = samples.front()?;
+    let elapsed = latest_time.duration_since(earliest_time).as_secs_f32();
+    (elapsed >= 0.008).then(|| {
+        ((earliest_y - latest_y) / elapsed)
+            .clamp(-KINETIC_SCROLL_MAX_VELOCITY, KINETIC_SCROLL_MAX_VELOCITY)
+    })
+}
+
+fn bounded_scroll_step(stored_offset: f32, delta: f32, max_offset: f32) -> (f32, f32, f32) {
+    let base_offset = stored_offset.clamp(0.0, max_offset);
+    let next_offset = (base_offset + delta).clamp(0.0, max_offset);
+    (base_offset, next_offset, next_offset - base_offset)
 }
 
 fn scroll_damage_crosses_stacking_context(
@@ -678,6 +704,16 @@ struct ComponentVirtualList {
     scroll_offset: f32,
 }
 
+/// Retained PrePaint data. Blink keeps this information beside the layout
+/// tree and only rebuilds it after layout/style invalidation; scroll frames
+/// then consume it without walking the component tree again.
+#[derive(Clone)]
+struct RetainedPaintNode {
+    kind: ComponentKind,
+    style: w3cos_std::style::Style,
+    parent: Option<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // App struct
 // ---------------------------------------------------------------------------
@@ -704,6 +740,8 @@ struct App {
     scrollable_nodes: Vec<(usize, LayoutRect, ScrollExtent)>,
     clip_only_nodes: Vec<(usize, LayoutRect)>,
     scroll_offsets: HashMap<usize, (f32, f32)>,
+    overscroll_states: HashMap<usize, OverscrollState>,
+    last_overscroll_tick: Option<Instant>,
     initialized_scroll_targets: HashSet<usize>,
     user_scrolled_nodes: HashSet<usize>,
     sticky_counter_bases: HashMap<usize, i64>,
@@ -718,9 +756,8 @@ struct App {
     last_frame_time: Option<Instant>,
     modifiers: ModifiersState,
     last_touch_y: Option<f32>,
-    last_touch_time: Option<Instant>,
+    touch_samples: VecDeque<(Instant, f32)>,
     touch_drag_y: f32,
-    touch_velocity_y: f32,
     touch_scroll_active: bool,
     touch_scroll_index: Option<usize>,
     kinetic_scroll: Option<KineticScroll>,
@@ -737,6 +774,10 @@ struct App {
     // Performance: scroll ancestor map (avoids O(n*depth) parent walk)
     scroll_ancestor: Vec<Option<usize>>,
     flat_parents: Vec<Option<usize>>,
+    retained_paint_nodes: Vec<RetainedPaintNode>,
+    retained_paint_z: Vec<i32>,
+    retained_sticky_owner: Vec<Option<usize>>,
+    retained_rect_by_index: Vec<Option<LayoutRect>>,
     // Performance: spatial grid for O(1) hit testing
     spatial_grid: SpatialGrid,
     // Performance: dirty frame detection
@@ -828,6 +869,8 @@ impl App {
             scrollable_nodes: Vec::new(),
             clip_only_nodes: Vec::new(),
             scroll_offsets: HashMap::new(),
+            overscroll_states: HashMap::new(),
+            last_overscroll_tick: None,
             initialized_scroll_targets: HashSet::new(),
             user_scrolled_nodes: HashSet::new(),
             sticky_counter_bases: HashMap::new(),
@@ -842,9 +885,8 @@ impl App {
             last_frame_time: None,
             modifiers: ModifiersState::default(),
             last_touch_y: None,
-            last_touch_time: None,
+            touch_samples: VecDeque::new(),
             touch_drag_y: 0.0,
-            touch_velocity_y: 0.0,
             touch_scroll_active: false,
             touch_scroll_index: None,
             kinetic_scroll: None,
@@ -866,6 +908,10 @@ impl App {
             layout_engine: LayoutEngine::new(),
             scroll_ancestor: Vec::new(),
             flat_parents: Vec::new(),
+            retained_paint_nodes: Vec::new(),
+            retained_paint_z: Vec::new(),
+            retained_sticky_owner: Vec::new(),
+            retained_rect_by_index: Vec::new(),
             spatial_grid: SpatialGrid::empty(),
             paint_generation: 0,
             layout_generation: 0,
@@ -982,7 +1028,7 @@ impl App {
     }
 
     fn rebuild_if_dirty(&mut self) {
-        let signal_dirty = state::is_dirty();
+        let signal_dirty = state::is_dirty() || w3cos_react_compat::aot::has_pending_render();
         let dom_dirty = self.dom_mode && crate::dom::is_document_dirty();
 
         if !signal_dirty && !dom_dirty {
@@ -1362,6 +1408,20 @@ impl App {
 
         self.layout_cache = results.layout_cache;
         self.scrollable_nodes = results.scrollable_nodes;
+        for (idx, _, extent) in &self.scrollable_nodes {
+            if let Some((x, y)) = self.scroll_offsets.get_mut(idx) {
+                *x = (*x).clamp(0.0, extent.max_x);
+                *y = (*y).clamp(0.0, extent.max_y);
+            }
+        }
+        self.overscroll_states.retain(|idx, _| {
+            self.scrollable_nodes
+                .iter()
+                .any(|(scroll_idx, _, _)| scroll_idx == idx)
+        });
+        if self.overscroll_states.is_empty() {
+            self.last_overscroll_tick = None;
+        }
         self.clip_only_nodes = results.clip_only_nodes;
         self.scroll_ancestor = results.scroll_ancestor;
         self.flat_parents = flat.iter().map(|n| n.parent).collect();
@@ -1451,6 +1511,12 @@ impl App {
             &mut self.virtual_lists,
             &mut self.scroll_offsets,
         );
+        let (paint_nodes, paint_z, sticky_owner, rect_by_index) =
+            build_retained_prepaint(&flat, &self.layout_cache);
+        self.retained_paint_nodes = paint_nodes;
+        self.retained_paint_z = paint_z;
+        self.retained_sticky_owner = sticky_owner;
+        self.retained_rect_by_index = rect_by_index;
         self.needs_layout = virtual_heights_changed;
         if virtual_heights_changed {
             self.needs_tree_rebuild = true;
@@ -1482,6 +1548,9 @@ impl App {
         let new_indices: HashSet<usize> = layout_cache.iter().map(|(_, idx)| *idx).collect();
         let now = Instant::now();
         let before_count = animations.len();
+        let viewport_changed = (old_viewport.layout_w - new_viewport.layout_w).abs() >= 0.5
+            || (old_viewport.layout_h - new_viewport.layout_h).abs() >= 0.5
+            || (old_viewport.offset_y - new_viewport.offset_y).abs() >= 0.5;
         for &(new_rect, idx) in layout_cache {
             let Some(node) = flat.get(idx) else {
                 continue;
@@ -1489,6 +1558,15 @@ impl App {
             let Some(transition) = &node.style.transition else {
                 continue;
             };
+            let belongs_to_sticky_subtree = std::iter::successors(Some(idx), |current| {
+                flat.get(*current)
+                    .and_then(|current_node| current_node.parent)
+            })
+            .any(|current| {
+                flat.get(current).is_some_and(|current_node| {
+                    matches!(current_node.style.position, Position::Sticky)
+                })
+            });
             // Compiled conditional branches remain sibling nodes and switch
             // `display`, so the entering branch has a different flat index.
             // Pair it with the nearest transitioned sibling that left layout;
@@ -1525,7 +1603,16 @@ impl App {
                     &transition.property,
                     TransitionProperty::Custom(property) if property.eq_ignore_ascii_case("height")
                 );
-            if animates_height && (old_rect.height - new_rect.height).abs() >= 0.5 {
+            // `display:none` sibling replacement is discrete in Blink. Pairing
+            // two Show branches inside a sticky container makes the entering
+            // child paint with the leaving branch's 55vh height while its
+            // parent already owns the compact final layout, exposing a large
+            // blank panel. Same-node height transitions remain supported.
+            let can_animate_height = old_idx == idx || !belongs_to_sticky_subtree;
+            if can_animate_height
+                && animates_height
+                && (old_rect.height - new_rect.height).abs() >= 0.5
+            {
                 let target_id = if old_idx == idx {
                     node.stable_id
                 } else {
@@ -1568,6 +1655,17 @@ impl App {
                 transition.property,
                 TransitionProperty::All | TransitionProperty::Transform
             ) {
+                continue;
+            }
+            if viewport_changed && belongs_to_sticky_subtree {
+                // Sticky geometry is resolved against the scrollport during
+                // painting. Applying a flow-space FLIP translation on top of
+                // that resolved position makes sticky content drift while the
+                // software keyboard resizes the viewport.
+                animations.retain(|animation| {
+                    animation.target_id() != node.stable_id
+                        || animation.property() != AnimatedProperty::Transform
+                });
                 continue;
             }
             let delta_x = old_rect.x - new_rect.x;
@@ -1772,8 +1870,7 @@ impl App {
 
         let now = Instant::now();
 
-        // Pre-flatten once for this frame (borrows self.root)
-        let flat = layout::pre_flatten(&self.root);
+        let flat = self.retained_paint_nodes.as_slice();
         // CSS canvas background propagation: the platform surface continues
         // behind translucent system UI such as the rounded iOS keyboard. Use
         // the root (or its document-element child) instead of exposing the
@@ -1790,7 +1887,7 @@ impl App {
 
         // A CSS transform establishes a transformed subtree, so animated
         // translation must affect descendants as well as the panel box.
-        let mut style_overrides = animated_style_overrides(&flat, &self.animations, now);
+        let mut style_overrides = animated_style_overrides(flat, &self.animations, now);
 
         if let Some(hover_idx) = self.hovered_index {
             if hover_idx < flat.len() {
@@ -1821,12 +1918,13 @@ impl App {
             &self.scrollable_nodes,
             clip_only_nodes,
             &self.scroll_offsets,
+            &self.overscroll_states,
             layout_cache,
-            &flat,
+            flat,
+            Some((&self.retained_sticky_owner, &self.retained_rect_by_index)),
             self.viewport.layout_w,
             self.viewport.layout_h,
         );
-
         // Blink computes cull rects during PrePaint. Do the equivalent before
         // building Vello display items so offscreen list nodes never enter the
         // scene or its z-sort. Keep a small overscan for shadows/transforms.
@@ -1845,19 +1943,11 @@ impl App {
                         return None;
                     }
                     let node = flat.get(idx)?;
-                    let style = style_overrides.get(&idx).unwrap_or(node.style);
-                    Some((idx, rect, node.kind, style))
+                    let style = style_overrides.get(&idx).unwrap_or(&node.style);
+                    Some((idx, rect, &node.kind, style))
                 })
                 .collect();
-        let mut paint_z = vec![0; flat.len()];
-        for (idx, node) in flat.iter().enumerate() {
-            let inherited = node.parent.map(|parent| paint_z[parent]).unwrap_or(0);
-            paint_z[idx] = if node.style.z_index == 0 {
-                inherited
-            } else {
-                node.style.z_index
-            };
-        }
+        let paint_z = &self.retained_paint_z;
         render_nodes.sort_by_key(|(idx, _, _, _)| paint_z[*idx]);
 
         let scale = self.scale_factor as f32;
@@ -1919,7 +2009,7 @@ impl App {
         if let Some(focus_idx) = self.focused_index {
             if self.hovered_index != Some(focus_idx) {
                 if let Some(node) = flat.get(focus_idx) {
-                    if matches!(node.kind, ComponentKind::Button { .. }) {
+                    if matches!(&node.kind, ComponentKind::Button { .. }) {
                         if let Some(hit) = self
                             .hit_nodes
                             .iter()
@@ -1932,10 +2022,8 @@ impl App {
             }
         }
 
-        // Drop borrows on self.root (via flat/render_nodes/style_overrides)
         drop(render_nodes);
         drop(style_overrides);
-        drop(flat);
 
         // Cleanup animations
         self.animations.retain(|a| !a.is_complete(now));
@@ -2099,8 +2187,10 @@ impl App {
             &self.scrollable_nodes,
             clip_only_nodes,
             &self.scroll_offsets,
+            &self.overscroll_states,
             layout_cache,
             &flat,
+            None,
             self.viewport.layout_w,
             self.viewport.layout_h,
         );
@@ -2358,6 +2448,13 @@ impl App {
         crate::uitest::set_pointer_hit(self.mouse_x, self.mouse_y, hit);
         if let Some(idx) = hit {
             self.pressed_index = Some(idx);
+            #[cfg(target_os = "ios")]
+            if matches!(self.get_kind_at(idx), Some(ComponentKind::TextInput { .. })) {
+                // Keep keyboard activation inside the native touch-down user
+                // gesture. Small real-finger movement can promote the gesture
+                // to scrolling before touch-up and would otherwise drop focus.
+                self.focus_text_input(idx);
+            }
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             self.request_repaint();
         } else {
@@ -2409,8 +2506,10 @@ impl App {
                 &self.scrollable_nodes,
                 &self.clip_only_nodes,
                 &self.scroll_offsets,
+                &self.overscroll_states,
                 &self.layout_cache,
                 &flat,
+                None,
                 self.viewport.layout_w,
                 self.viewport.layout_h,
             );
@@ -2475,8 +2574,17 @@ impl App {
             self.scroll_ancestor
                 .get(idx)
                 .and_then(|ancestor| *ancestor)
-                .and_then(|ancestor| self.scroll_offsets.get(&ancestor))
-                .is_none_or(|(sx, sy)| sx.abs() <= 0.001 && sy.abs() <= 0.001)
+                .is_none_or(|ancestor| {
+                    let (sx, sy) = self
+                        .scroll_offsets
+                        .get(&ancestor)
+                        .copied()
+                        .unwrap_or((0.0, 0.0));
+                    sx.abs() <= 0.001
+                        && sy.abs() <= 0.001
+                        && overscroll_displacement_y(&self.overscroll_states, ancestor).abs()
+                            <= 0.001
+                })
         }) {
             return direct;
         }
@@ -2506,11 +2614,12 @@ impl App {
     fn viewport_to_layout(&self, x: f32, y: f32) -> (f32, f32) {
         for (idx, rect, _) in self.scrollable_nodes.iter().rev() {
             let (sx, sy) = self.scroll_offsets.get(idx).copied().unwrap_or((0.0, 0.0));
+            let visual_sy = sy - overscroll_displacement_y(&self.overscroll_states, *idx);
             // The scroll viewport is stationary; only its contents move. Using
             // an offset viewport makes adjacent fixed controls (for example a
             // composer below a feed) hit-test as scrolled content.
             if x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height {
-                return (x + sx, y + sy);
+                return (x + sx, y + visual_sy);
             }
         }
         (x, y)
@@ -2523,8 +2632,10 @@ impl App {
             &self.scrollable_nodes,
             &self.clip_only_nodes,
             &self.scroll_offsets,
+            &self.overscroll_states,
             &self.layout_cache,
             &flat,
+            None,
             self.viewport.layout_w,
             self.viewport.layout_h,
         );
@@ -2580,12 +2691,27 @@ impl App {
         else {
             return 0.0;
         };
-        let (ox, oy) = self.scroll_offsets.get(&idx).copied().unwrap_or((0.0, 0.0));
-        let new_oy = (oy + dy).clamp(0.0, max_y);
-        let applied = new_oy - oy;
+        let (ox, stored_oy) = self.scroll_offsets.get(&idx).copied().unwrap_or((0.0, 0.0));
+        let (oy, new_oy, applied) = bounded_scroll_step(stored_oy, dy, max_y);
+        if (stored_oy - oy).abs() > 0.001 {
+            self.scroll_offsets.insert(idx, (ox, oy));
+            crate::uitest::set_scroll_offset(idx, oy);
+        }
         if applied.abs() > 0.001 {
             self.user_scrolled_nodes.insert(idx);
             self.scroll_offsets.insert(idx, (ox, new_oy));
+            crate::uitest::set_scroll_offset(idx, new_oy);
+            let native_scroll =
+                layout::pre_flatten(&self.root)
+                    .get(idx)
+                    .and_then(|node| match node.on_click {
+                        EventAction::NativeScroll(id) => Some(*id),
+                        _ => None,
+                    });
+            if let Some(host_id) = native_scroll {
+                w3cos_react_compat::aot::dispatch_scroll(host_id, new_oy);
+                self.rebuild_if_dirty();
+            }
             if let Some(ordinal) = self.virtual_scroll_indices.get(&idx).copied() {
                 let viewport_extent = self
                     .scrollable_nodes
@@ -2606,6 +2732,161 @@ impl App {
             self.request_repaint();
         }
         applied
+    }
+
+    fn overscroll_behavior(&self, idx: usize) -> OverscrollBehavior {
+        self.retained_paint_nodes
+            .get(idx)
+            .map(|node| node.style.overscroll_behavior)
+            .unwrap_or_default()
+    }
+
+    fn scrollport_height(&self, idx: usize) -> f32 {
+        self.scrollable_nodes
+            .iter()
+            .find(|(node_idx, _, _)| *node_idx == idx)
+            .map(|(_, rect, _)| rect.height)
+            .unwrap_or(self.viewport.layout_h)
+    }
+
+    /// Return the next user-scrollable container in the scroll chain.
+    ///
+    /// `scroll_ancestor` also contains `overflow: hidden` clip owners. Those
+    /// establish a clip/scroll container for painting, but they cannot consume
+    /// a direct-manipulation gesture. Handing boundary delta to one of them
+    /// used to attach rubber-band state to an unpainted node and made both the
+    /// bounce and the remaining momentum disappear.
+    fn scroll_chain_parent(&self, idx: usize) -> Option<usize> {
+        direct_scroll_chain_parent(idx, &self.scroll_ancestor, &self.scrollable_nodes)
+    }
+
+    /// Apply direct-manipulation scrolling with CSS scroll chaining. Any
+    /// unconsumed boundary delta becomes a compositor-only rubber-band unless
+    /// `overscroll-behavior: none` suppresses the local affordance.
+    fn apply_touch_scroll(&mut self, start_idx: usize, dy: f32) -> usize {
+        let mut remaining = if let Some(state) = self.overscroll_states.get_mut(&start_idx) {
+            state.consume_restoring_drag(dy)
+        } else {
+            dy
+        };
+        if remaining.abs() <= SCROLL_CHAIN_EPSILON {
+            self.repaint_mode = RepaintMode::Full;
+            self.request_repaint();
+            return start_idx;
+        }
+
+        let mut current = start_idx;
+        loop {
+            remaining -= self.scroll_node_by(current, remaining);
+            if remaining.abs() <= SCROLL_CHAIN_EPSILON {
+                return current;
+            }
+
+            let behavior = self.overscroll_behavior(current);
+            if behavior == OverscrollBehavior::Auto
+                && let Some(parent) = self.scroll_chain_parent(current)
+            {
+                current = parent;
+                continue;
+            }
+
+            if behavior != OverscrollBehavior::None {
+                let viewport_height = self.scrollport_height(current);
+                let state = self.overscroll_states.entry(current).or_default();
+                state.drag_past_boundary(remaining, viewport_height);
+                if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                    eprintln!(
+                        "[W3C OS][SCROLL] boundary index={} remaining={:.1} visual={:.1}",
+                        current, remaining, state.displacement_y
+                    );
+                }
+                self.last_overscroll_tick = None;
+                self.repaint_mode = RepaintMode::Full;
+                self.request_repaint();
+            }
+            return current;
+        }
+    }
+
+    fn release_active_overscroll(&mut self, visual_velocity_y: f32) -> bool {
+        let mut released = false;
+        for state in self.overscroll_states.values_mut() {
+            if state.displacement_y.abs() > 0.001 {
+                state.release(visual_velocity_y);
+                released = true;
+            }
+        }
+        if released {
+            self.last_overscroll_tick = Some(Instant::now());
+            self.repaint_mode = RepaintMode::Full;
+            self.request_repaint();
+        }
+        released
+    }
+
+    /// Advance inertial scrolling through the same CSS scroll chain as direct
+    /// manipulation. When momentum reaches the terminal boundary, transfer
+    /// its remaining velocity into the rubber-band spring instead of dropping
+    /// the gesture abruptly.
+    fn apply_kinetic_scroll(&mut self, start_idx: usize, dy: f32, velocity_y: f32) -> bool {
+        let mut current = start_idx;
+        let mut remaining = dy;
+        loop {
+            let requested = remaining;
+            let applied = self.scroll_node_by(current, requested);
+            remaining -= applied;
+            let offset = self.scroll_offsets.get(&current).map(|(_, y)| *y);
+            let extent = self
+                .scrollable_nodes
+                .iter()
+                .find(|(idx, _, _)| *idx == current)
+                .map(|(_, _, extent)| extent.max_y);
+            crate::uitest::set_kinetic_attempt(current, extent, offset, applied);
+            if remaining.abs() <= SCROLL_CHAIN_EPSILON {
+                return true;
+            }
+
+            let behavior = self.overscroll_behavior(current);
+            if behavior == OverscrollBehavior::Auto
+                && let Some(parent) = self.scroll_chain_parent(current)
+            {
+                current = parent;
+                continue;
+            }
+
+            if behavior != OverscrollBehavior::None {
+                let viewport_height = self.scrollport_height(current);
+                let state = self.overscroll_states.entry(current).or_default();
+                state.drag_past_boundary(remaining, viewport_height);
+                state.release(-velocity_y * 0.25);
+                self.last_overscroll_tick = Some(Instant::now());
+                self.repaint_mode = RepaintMode::Full;
+                self.request_repaint();
+            }
+            return false;
+        }
+    }
+
+    fn tick_overscroll(&mut self) {
+        if self.overscroll_states.is_empty() || self.touch_scroll_active {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = self
+            .last_overscroll_tick
+            .replace(now)
+            .map(|last| now.duration_since(last).as_secs_f32())
+            .unwrap_or(0.0);
+        if elapsed <= 0.0 {
+            return;
+        }
+        self.overscroll_states
+            .retain(|_, state| state.tick(elapsed));
+        if self.overscroll_states.is_empty() {
+            self.last_overscroll_tick = None;
+        }
+        self.repaint_mode = RepaintMode::Full;
+        self.request_repaint();
     }
 
     fn update_sticky_counters(&mut self, scroll_idx: usize) {
@@ -2657,17 +2938,26 @@ impl App {
             return;
         };
         let now = Instant::now();
-        let elapsed = now.duration_since(kinetic.last_tick).as_secs_f32();
-        if elapsed < 0.008 {
+        let elapsed = now.duration_since(kinetic.started_at).as_secs_f32();
+        let sample = kinetic.curve.sample(elapsed);
+        let delta = sample.offset - kinetic.last_offset;
+        if delta.abs() < 0.001 && sample.active {
             self.kinetic_scroll = Some(kinetic);
             return;
         }
-
-        let frame_seconds = elapsed.min(0.05);
-        let applied = self.scroll_node_by(kinetic.index, kinetic.velocity_y * frame_seconds);
-        kinetic.velocity_y = decelerate_scroll_velocity(kinetic.velocity_y, frame_seconds);
-        kinetic.last_tick = now;
-        if applied.abs() > 0.001 && kinetic.velocity_y.abs() >= KINETIC_SCROLL_STOP_VELOCITY {
+        let continued = self.apply_kinetic_scroll(kinetic.index, delta, sample.velocity);
+        kinetic.last_offset = sample.offset;
+        let remains_active =
+            continued && sample.active && sample.velocity.abs() >= KINETIC_SCROLL_STOP_VELOCITY;
+        crate::uitest::set_kinetic_tick(
+            remains_active,
+            elapsed,
+            delta,
+            sample.velocity,
+            sample.active,
+            continued,
+        );
+        if remains_active {
             self.kinetic_scroll = Some(kinetic);
         } else {
             self.flush_pending_sticky_counters();
@@ -2790,6 +3080,25 @@ impl App {
         }
     }
 
+    fn focus_text_input(&mut self, idx: usize) {
+        if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+            eprintln!("[W3C OS][IME] TextInput focus index={idx}");
+        }
+        self.focused_index = Some(idx);
+        crate::uitest::set_focused_index(self.focused_index);
+        self.sync_soft_keyboard();
+        #[cfg(target_os = "ios")]
+        {
+            self.ios_ime_viewport_poll = Some(IosImeRetry {
+                deadline: Instant::now()
+                    + std::time::Duration::from_millis(IOS_IME_RETRY_INTERVAL_MS),
+                attempts: 0,
+            });
+        }
+        self.needs_layout = true;
+        self.repaint_after_interaction();
+    }
+
     fn handle_click(&mut self, idx: usize) {
         if let Some(hit) = self.hit_nodes.iter().find(|h| h.index == idx) {
             let kind_is_text_input =
@@ -2798,27 +3107,18 @@ impl App {
                 matches!(self.get_kind_at(idx), Some(ComponentKind::Button { .. }));
 
             if kind_is_text_input {
-                if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
-                    eprintln!("[W3C OS][IME] TextInput click index={idx}");
-                }
-                self.focused_index = Some(idx);
-                crate::uitest::set_focused_index(self.focused_index);
-                self.sync_soft_keyboard();
-                #[cfg(target_os = "ios")]
-                {
-                    self.ios_ime_viewport_poll = Some(IosImeRetry {
-                        deadline: Instant::now()
-                            + std::time::Duration::from_millis(IOS_IME_RETRY_INTERVAL_MS),
-                        attempts: 0,
-                    });
-                }
-                self.needs_layout = true;
-                self.repaint_after_interaction();
+                self.focus_text_input(idx);
                 return;
             }
             if kind_is_button {
-                if !hit.on_click.is_none() {
-                    state::execute_action(&hit.on_click);
+                let action = hit.on_click.clone();
+                if self.focused_index.take().is_some() {
+                    crate::uitest::set_focused_index(self.focused_index);
+                    self.sync_soft_keyboard();
+                    self.needs_layout = true;
+                }
+                if !action.is_none() {
+                    state::execute_action(&action);
                     self.rebuild_if_dirty();
                 } else {
                     eprintln!("[W3C OS] Click → Button (no action)");
@@ -3211,8 +3511,33 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
-fn animated_style_overrides(
-    flat: &[layout::FlatNodeInfo<'_>],
+trait PaintNodeView {
+    fn paint_style(&self) -> &w3cos_std::style::Style;
+    fn paint_parent(&self) -> Option<usize>;
+}
+
+impl PaintNodeView for layout::FlatNodeInfo<'_> {
+    fn paint_style(&self) -> &w3cos_std::style::Style {
+        self.style
+    }
+
+    fn paint_parent(&self) -> Option<usize> {
+        self.parent
+    }
+}
+
+impl PaintNodeView for RetainedPaintNode {
+    fn paint_style(&self) -> &w3cos_std::style::Style {
+        &self.style
+    }
+
+    fn paint_parent(&self) -> Option<usize> {
+        self.parent
+    }
+}
+
+fn animated_style_overrides<T: PaintNodeView>(
+    flat: &[T],
     animations: &[ActiveAnimation],
     now: Instant,
 ) -> HashMap<usize, w3cos_std::style::Style> {
@@ -3227,7 +3552,7 @@ fn animated_style_overrides(
         let eased = animation.eased_progress(now);
         let entry = overrides
             .entry(idx)
-            .or_insert_with(|| flat[idx].style.clone());
+            .or_insert_with(|| flat[idx].paint_style().clone());
         match animation {
             ActiveAnimation::LayoutHeight { .. } => {}
             ActiveAnimation::Opacity { from, to, .. } => {
@@ -3246,8 +3571,8 @@ fn animated_style_overrides(
                 entry.transform = sampled;
                 subtree_translations.push((
                     idx,
-                    sampled.translate_x - flat[idx].style.transform.translate_x,
-                    sampled.translate_y - flat[idx].style.transform.translate_y,
+                    sampled.translate_x - flat[idx].paint_style().transform.translate_x,
+                    sampled.translate_y - flat[idx].paint_style().transform.translate_y,
                 ));
             }
         }
@@ -3257,21 +3582,21 @@ fn animated_style_overrides(
     // the animated node, its contiguous subtree has ended.
     for (ancestor, dx, dy) in subtree_translations {
         for idx in (ancestor + 1)..flat.len() {
-            let mut parent = flat[idx].parent;
+            let mut parent = flat[idx].paint_parent();
             let mut belongs_to_subtree = false;
             while let Some(parent_idx) = parent {
                 if parent_idx == ancestor {
                     belongs_to_subtree = true;
                     break;
                 }
-                parent = flat[parent_idx].parent;
+                parent = flat[parent_idx].paint_parent();
             }
             if !belongs_to_subtree {
                 break;
             }
             let entry = overrides
                 .entry(idx)
-                .or_insert_with(|| flat[idx].style.clone());
+                .or_insert_with(|| flat[idx].paint_style().clone());
             entry.transform.translate_x += dx;
             entry.transform.translate_y += dy;
         }
@@ -3442,15 +3767,72 @@ fn topmost_scroll_node_at(
     (!blocked).then(|| candidate.map(|(_, idx)| idx)).flatten()
 }
 
-/// Build scroll info using pre-computed scroll_ancestor map.
-/// O(n) instead of O(n * tree_depth).
-fn build_scroll_info_fast(
+fn direct_scroll_chain_parent(
+    idx: usize,
+    scroll_ancestor: &[Option<usize>],
+    scrollable: &[(usize, LayoutRect, ScrollExtent)],
+) -> Option<usize> {
+    let parent = scroll_ancestor.get(idx).copied().flatten()?;
+    scrollable
+        .iter()
+        .any(|(scroll_idx, _, _)| *scroll_idx == parent)
+        .then_some(parent)
+}
+
+fn build_retained_prepaint(
+    flat: &[layout::FlatNodeInfo<'_>],
+    layout_cache: &[(LayoutRect, usize)],
+) -> (
+    Vec<RetainedPaintNode>,
+    Vec<i32>,
+    Vec<Option<usize>>,
+    Vec<Option<LayoutRect>>,
+) {
+    let mut paint_z = vec![0; flat.len()];
+    let mut sticky_owner = vec![None; flat.len()];
+    let paint_nodes = flat
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| {
+            let inherited_z = node.parent.map(|parent| paint_z[parent]).unwrap_or(0);
+            paint_z[idx] = if node.style.z_index == 0 {
+                inherited_z
+            } else {
+                node.style.z_index
+            };
+            sticky_owner[idx] = if matches!(node.style.position, Position::Sticky) {
+                Some(idx)
+            } else {
+                node.parent.and_then(|parent| sticky_owner[parent])
+            };
+            RetainedPaintNode {
+                kind: node.kind.clone(),
+                style: node.style.clone(),
+                parent: node.parent,
+            }
+        })
+        .collect();
+    let mut rect_by_index = vec![None; flat.len()];
+    for &(rect, idx) in layout_cache {
+        if idx < rect_by_index.len() {
+            rect_by_index[idx] = Some(rect);
+        }
+    }
+    (paint_nodes, paint_z, sticky_owner, rect_by_index)
+}
+
+/// Build scroll info using pre-computed scroll ancestors and optionally the
+/// retained PrePaint ownership/geometry produced by the last layout pass.
+/// O(n) instead of O(n * tree_depth), with no tree walk on compositor scroll.
+fn build_scroll_info_fast<T: PaintNodeView>(
     scroll_ancestor: &[Option<usize>],
     scrollable: &[(usize, LayoutRect, ScrollExtent)],
     clip_only: &[(usize, LayoutRect)],
     offsets: &HashMap<usize, (f32, f32)>,
+    overscroll_states: &HashMap<usize, OverscrollState>,
     layout_cache: &[(LayoutRect, usize)],
-    flat: &[layout::FlatNodeInfo<'_>],
+    flat: &[T],
+    retained_prepaint: Option<(&[Option<usize>], &[Option<LayoutRect>])>,
     viewport_w: f32,
     viewport_h: f32,
 ) -> Vec<Option<(f32, f32, LayoutRect)>> {
@@ -3462,20 +3844,31 @@ fn build_scroll_info_fast(
         scrollable.iter().map(|(i, r, _)| (*i, *r)).collect();
     let clip_only_rect: HashMap<usize, LayoutRect> =
         clip_only.iter().map(|(i, r)| (*i, *r)).collect();
-    let mut rect_by_index = vec![None; flat.len()];
-    for &(rect, idx) in layout_cache {
-        if idx < rect_by_index.len() {
-            rect_by_index[idx] = Some(rect);
+    let mut owned_rect_by_index = Vec::new();
+    let mut owned_sticky_owner = Vec::new();
+    let (sticky_owner, rect_by_index) = if let Some(retained) = retained_prepaint {
+        retained
+    } else {
+        owned_rect_by_index.resize(flat.len(), None);
+        for &(rect, idx) in layout_cache {
+            if idx < owned_rect_by_index.len() {
+                owned_rect_by_index[idx] = Some(rect);
+            }
         }
-    }
-    let mut sticky_owner = vec![None; flat.len()];
-    for (idx, node) in flat.iter().enumerate() {
-        sticky_owner[idx] = if matches!(node.style.position, w3cos_std::style::Position::Sticky) {
-            Some(idx)
-        } else {
-            node.parent.and_then(|parent| sticky_owner[parent])
-        };
-    }
+        owned_sticky_owner.resize(flat.len(), None);
+        for (idx, node) in flat.iter().enumerate() {
+            owned_sticky_owner[idx] = if matches!(node.paint_style().position, Position::Sticky) {
+                Some(idx)
+            } else {
+                node.paint_parent()
+                    .and_then(|parent| owned_sticky_owner[parent])
+            };
+        }
+        (
+            owned_sticky_owner.as_slice(),
+            owned_rect_by_index.as_slice(),
+        )
+    };
 
     scroll_ancestor
         .iter()
@@ -3488,7 +3881,7 @@ fn build_scroll_info_fast(
                     if let Some(owner) = sticky_owner.get(idx).copied().flatten()
                         && let Some(owner_rect) = rect_by_index.get(owner).copied().flatten()
                     {
-                        let style = flat[owner].style;
+                        let style = flat[owner].paint_style();
                         if let Some(sticky_scroll_idx) = scroll_ancestor[owner]
                             && let Some(&sticky_clip) = scrollable_rect.get(&sticky_scroll_idx)
                         {
@@ -3519,12 +3912,18 @@ fn build_scroll_info_fast(
                                 // both its own scroll and the panel's clamped
                                 // outer-scroll transform.
                                 sx += sticky_sx;
-                                sy += sticky_effective_y;
+                                let sticky_visual_y = sticky_effective_y
+                                    - overscroll_displacement_y(
+                                        overscroll_states,
+                                        sticky_scroll_idx,
+                                    );
+                                sy += sticky_visual_y;
                                 effective_clip.x -= sticky_sx;
-                                effective_clip.y -= sticky_effective_y;
+                                effective_clip.y -= sticky_visual_y;
                             }
                         }
                     }
+                    sy -= overscroll_displacement_y(overscroll_states, *anc_idx);
                     Some((sx, sy, effective_clip))
                 } else if let Some(&clip) = clip_only_rect.get(anc_idx) {
                     let mut sx = 0.0;
@@ -3533,7 +3932,7 @@ fn build_scroll_info_fast(
                     if let Some(owner) = sticky_owner.get(idx).copied().flatten()
                         && let Some(owner_rect) = rect_by_index.get(owner).copied().flatten()
                     {
-                        let style = flat[owner].style;
+                        let style = flat[owner].paint_style();
                         if let Some(sticky_scroll_idx) = scroll_ancestor[owner]
                             && let Some(&sticky_clip) = scrollable_rect.get(&sticky_scroll_idx)
                         {
@@ -3552,12 +3951,13 @@ fn build_scroll_info_fast(
                                 )
                                 .unwrap_or(0.0);
                             sx = sticky_sx;
-                            sy = clamp_sticky_scroll_offset(
-                                owner_rect.y,
-                                sticky_clip.y,
-                                top,
-                                sticky_sy,
-                            );
+                            sy =
+                                clamp_sticky_scroll_offset(
+                                    owner_rect.y,
+                                    sticky_clip.y,
+                                    top,
+                                    sticky_sy,
+                                ) - overscroll_displacement_y(overscroll_states, sticky_scroll_idx);
                             effective_clip.x -= sx;
                             effective_clip.y -= sy;
                         }
@@ -3570,6 +3970,13 @@ fn build_scroll_info_fast(
             None => None,
         })
         .collect()
+}
+
+fn overscroll_displacement_y(states: &HashMap<usize, OverscrollState>, scroll_idx: usize) -> f32 {
+    states
+        .get(&scroll_idx)
+        .map(|state| state.displacement_y)
+        .unwrap_or(0.0)
 }
 
 fn clamp_sticky_scroll_offset(
@@ -3654,6 +4061,12 @@ fn draw_focus_ring_cpu(pixmap: &mut Pixmap, rect: LayoutRect) {
 impl ApplicationHandler for App {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         self.tick_kinetic_scroll();
+        self.tick_overscroll();
+
+        if crate::speech::poll() {
+            self.rebuild_if_dirty();
+            self.request_repaint();
+        }
 
         #[cfg(target_os = "ios")]
         if self
@@ -3724,7 +4137,9 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let has_animations = !self.animations.is_empty() || self.kinetic_scroll.is_some();
+        let has_animations = !self.animations.is_empty()
+            || self.kinetic_scroll.is_some()
+            || !self.overscroll_states.is_empty();
         let now = Instant::now();
         let animation_deadline = has_animations.then(|| {
             self.last_frame_time.unwrap_or(now)
@@ -3741,10 +4156,7 @@ impl ApplicationHandler for App {
             event_loop.set_control_flow(ControlFlow::Poll);
             return;
         }
-        #[cfg(target_os = "ios")]
         let mut timer_deadline = crate::timers::next_deadline();
-        #[cfg(not(target_os = "ios"))]
-        let timer_deadline = crate::timers::next_deadline();
         #[cfg(target_os = "ios")]
         if let Some(retry) = self.ios_ime_retry {
             timer_deadline = Some(
@@ -3759,6 +4171,13 @@ impl ApplicationHandler for App {
                 timer_deadline
                     .map(|deadline| deadline.min(poll.deadline))
                     .unwrap_or(poll.deadline),
+            );
+        }
+        if let Some(speech_deadline) = crate::speech::next_deadline() {
+            timer_deadline = Some(
+                timer_deadline
+                    .map(|deadline| deadline.min(speech_deadline))
+                    .unwrap_or(speech_deadline),
             );
         }
 
@@ -3950,10 +4369,12 @@ impl ApplicationHandler for App {
                 match touch.phase {
                     TouchPhase::Started => {
                         self.kinetic_scroll = None;
+                        self.last_overscroll_tick = None;
+                        let now = Instant::now();
                         self.last_touch_y = Some(self.mouse_y);
-                        self.last_touch_time = Some(Instant::now());
+                        self.touch_samples.clear();
+                        self.touch_samples.push_back((now, self.mouse_y));
                         self.touch_drag_y = 0.0;
-                        self.touch_velocity_y = 0.0;
                         self.touch_scroll_active = false;
                         self.touch_scroll_index = self.hit_test_scroll(self.mouse_x, self.mouse_y);
                         self.pointer_pressed();
@@ -3963,16 +4384,12 @@ impl ApplicationHandler for App {
                             let now = Instant::now();
                             let dy = last_y - self.mouse_y;
                             self.touch_drag_y += dy.abs();
-                            if let Some(last_time) = self.last_touch_time {
-                                let elapsed = now.duration_since(last_time).as_secs_f32();
-                                if elapsed > 0.0 {
-                                    let instantaneous = (dy / elapsed).clamp(
-                                        -KINETIC_SCROLL_MAX_VELOCITY,
-                                        KINETIC_SCROLL_MAX_VELOCITY,
-                                    );
-                                    self.touch_velocity_y =
-                                        self.touch_velocity_y * 0.65 + instantaneous * 0.35;
-                                }
+                            self.touch_samples.push_back((now, self.mouse_y));
+                            while self.touch_samples.len() > 2
+                                && now.duration_since(self.touch_samples[1].0)
+                                    > KINETIC_VELOCITY_WINDOW
+                            {
+                                self.touch_samples.pop_front();
                             }
                             if !self.touch_scroll_active
                                 && self.touch_drag_y > TOUCH_SCROLL_SLOP
@@ -3983,52 +4400,73 @@ impl ApplicationHandler for App {
                             }
                             if self.touch_scroll_active {
                                 if let Some(index) = self.touch_scroll_index {
-                                    self.scroll_node_by(index, dy);
+                                    self.touch_scroll_index =
+                                        Some(self.apply_touch_scroll(index, dy));
                                 }
                             } else {
                                 self.update_hover_at_pointer();
                             }
                             self.last_touch_y = Some(self.mouse_y);
-                            self.last_touch_time = Some(now);
                         }
                     }
                     TouchPhase::Ended => {
-                        let recent_velocity = self
-                            .last_touch_time
-                            .is_some_and(|time| time.elapsed().as_millis() <= 120);
-                        if self.touch_scroll_active
-                            && recent_velocity
-                            && self.touch_velocity_y.abs() >= KINETIC_SCROLL_MIN_VELOCITY
-                        {
+                        let release_velocity =
+                            estimate_touch_velocity(&self.touch_samples, Instant::now())
+                                .unwrap_or(0.0);
+                        let recent_velocity = release_velocity.abs() >= KINETIC_SCROLL_MIN_VELOCITY;
+                        let released_overscroll = self.touch_scroll_active
+                            && self.release_active_overscroll(-release_velocity * 0.35);
+                        if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                            let displacement = self
+                                .overscroll_states
+                                .values()
+                                .map(|state| state.displacement_y.abs())
+                                .fold(0.0_f32, f32::max);
+                            eprintln!(
+                                "[W3C OS][SCROLL] end active={} recent={} velocity={:.1} overscroll={:.1} released={}",
+                                self.touch_scroll_active,
+                                recent_velocity,
+                                release_velocity,
+                                displacement,
+                                released_overscroll
+                            );
+                        }
+                        let mut started_kinetic = false;
+                        if self.touch_scroll_active && recent_velocity {
                             if let Some(index) = self.touch_scroll_index {
+                                crate::uitest::set_kinetic_started(release_velocity);
                                 self.kinetic_scroll = Some(KineticScroll {
                                     index,
-                                    velocity_y: self.touch_velocity_y,
-                                    last_tick: Instant::now(),
+                                    curve: MobileFlingCurve::new(release_velocity),
+                                    started_at: Instant::now(),
+                                    last_offset: 0.0,
                                 });
+                                started_kinetic = true;
                                 self.request_repaint();
                             }
                         }
                         self.last_touch_y = None;
-                        self.last_touch_time = None;
+                        self.touch_samples.clear();
                         self.touch_drag_y = 0.0;
-                        self.touch_velocity_y = 0.0;
                         self.touch_scroll_index = None;
                         if self.touch_scroll_active {
                             self.touch_scroll_active = false;
                         } else {
                             self.pointer_released();
                         }
-                        // Commit aggregate counters once per gesture. Kinetic
-                        // scrolling may add one later commit when it settles,
-                        // but the drag itself never rebuilds at marker edges.
-                        self.flush_pending_sticky_counters();
+                        // A sticky-counter commit can rebuild the flattened
+                        // tree and invalidate the scroll-node index captured by
+                        // the fling. Treat drag + inertia as one gesture and
+                        // defer that rebuild until kinetic scrolling settles.
+                        if !started_kinetic {
+                            self.flush_pending_sticky_counters();
+                        }
                     }
                     TouchPhase::Cancelled => {
+                        self.release_active_overscroll(0.0);
                         self.last_touch_y = None;
-                        self.last_touch_time = None;
+                        self.touch_samples.clear();
                         self.touch_drag_y = 0.0;
-                        self.touch_velocity_y = 0.0;
                         self.touch_scroll_active = false;
                         self.touch_scroll_index = None;
                         self.pressed_index = None;
@@ -4244,21 +4682,97 @@ mod scroll_physics_tests {
     use super::*;
 
     #[test]
-    fn kinetic_velocity_decelerates_consistently_across_frame_rates() {
-        let at_60_hz = decelerate_scroll_velocity(1_000.0, 1.0 / 60.0);
-        let at_120_hz_twice = decelerate_scroll_velocity(
-            decelerate_scroll_velocity(1_000.0, 1.0 / 120.0),
-            1.0 / 120.0,
-        );
+    fn touch_velocity_uses_recent_motion_window_instead_of_last_delta() {
+        let now = Instant::now();
+        let samples = VecDeque::from([
+            (now - Duration::from_millis(120), 300.0),
+            (now - Duration::from_millis(40), 200.0),
+            (now - Duration::from_millis(5), 198.0),
+        ]);
 
-        assert!((at_60_hz - at_120_hz_twice).abs() < 0.01);
-        assert!(at_60_hz < 1_000.0);
+        let velocity = estimate_touch_velocity(&samples, now).unwrap();
+        assert!(velocity > 800.0);
     }
 
     #[test]
-    fn kinetic_velocity_keeps_scroll_direction() {
-        assert!(decelerate_scroll_velocity(500.0, 0.016) > 0.0);
-        assert!(decelerate_scroll_velocity(-500.0, 0.016) < 0.0);
+    fn stale_touch_motion_does_not_start_kinetic_scroll() {
+        let now = Instant::now();
+        let samples = VecDeque::from([
+            (now - Duration::from_millis(300), 300.0),
+            (now - Duration::from_millis(200), 200.0),
+        ]);
+
+        assert_eq!(estimate_touch_velocity(&samples, now), None);
+    }
+
+    #[test]
+    fn stale_offset_above_new_extent_does_not_consume_kinetic_delta() {
+        let (base, next, applied) = bounded_scroll_step(140.0, -20.0, 100.0);
+        assert_eq!(base, 100.0);
+        assert_eq!(next, 80.0);
+        assert_eq!(applied, -20.0);
+    }
+
+    #[test]
+    fn large_offset_rounding_is_not_treated_as_a_scroll_boundary() {
+        let requested = -23.666_f32;
+        let (_, _, applied) = bounded_scroll_step(78_142.68, requested, 78_466.0);
+        assert!((requested - applied).abs() <= SCROLL_CHAIN_EPSILON);
+    }
+
+    #[test]
+    fn hidden_clip_owner_does_not_receive_scroll_chain_delta() {
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 375.0,
+            height: 600.0,
+        };
+        let scrollable = vec![(
+            2,
+            rect,
+            ScrollExtent {
+                max_x: 0.0,
+                max_y: 1_000.0,
+            },
+        )];
+        let ancestors = vec![None, None, Some(1)];
+
+        assert_eq!(direct_scroll_chain_parent(2, &ancestors, &scrollable), None);
+    }
+
+    #[test]
+    fn direct_scrollable_owner_receives_scroll_chain_delta() {
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 375.0,
+            height: 600.0,
+        };
+        let scrollable = vec![
+            (
+                1,
+                rect,
+                ScrollExtent {
+                    max_x: 0.0,
+                    max_y: 500.0,
+                },
+            ),
+            (
+                2,
+                rect,
+                ScrollExtent {
+                    max_x: 0.0,
+                    max_y: 1_000.0,
+                },
+            ),
+        ];
+        let ancestors = vec![None, None, Some(1)];
+
+        assert_eq!(
+            direct_scroll_chain_parent(2, &ancestors, &scrollable),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4539,8 +5053,10 @@ mod scroll_physics_tests {
             &scrollable,
             &[(3, clip_rect)],
             &HashMap::from([(1, (0.0, 250.0))]),
+            &HashMap::new(),
             &layout_cache,
             &flat,
+            None,
             375.0,
             700.0,
         );
@@ -4548,6 +5064,28 @@ mod scroll_physics_tests {
         let (_, sy, visual_clip) = scroll_info[4].unwrap();
         assert_eq!(sy, 200.0);
         assert_eq!(visual_clip.y, 100.0);
+
+        let bouncing_scroll_info = build_scroll_info_fast(
+            &scroll_ancestor,
+            &scrollable,
+            &[(3, clip_rect)],
+            &HashMap::from([(1, (0.0, 250.0))]),
+            &HashMap::from([(
+                1,
+                OverscrollState {
+                    displacement_y: 30.0,
+                    velocity_y: 0.0,
+                },
+            )]),
+            &layout_cache,
+            &flat,
+            None,
+            375.0,
+            700.0,
+        );
+        let (_, bouncing_sy, bouncing_clip) = bouncing_scroll_info[4].unwrap();
+        assert_eq!(bouncing_sy, 170.0);
+        assert_eq!(bouncing_clip.y, 130.0);
     }
 
     #[test]
@@ -4834,6 +5372,76 @@ mod scroll_physics_tests {
     }
 
     #[test]
+    fn sticky_show_collapse_does_not_retain_leaving_branch_height() {
+        let transition = Some(w3cos_std::style::Transition {
+            property: TransitionProperty::All,
+            duration_ms: 280,
+            easing: Easing::EaseOut,
+            delay_ms: 0,
+        });
+        let mut compact_style = w3cos_std::Style::default();
+        compact_style.height = Dimension::Px(52.0);
+        compact_style.transition = transition.clone();
+        let mut expanded_style = w3cos_std::Style::default();
+        expanded_style.display = w3cos_std::style::Display::None;
+        expanded_style.transition = transition;
+        let mut sticky_style = w3cos_std::Style::default();
+        sticky_style.position = Position::Sticky;
+        let root = Component::column(
+            Default::default(),
+            vec![Component::column(
+                sticky_style,
+                vec![
+                    Component::row(compact_style, vec![]),
+                    Component::column(expanded_style, vec![]),
+                ],
+            )],
+        );
+        let flat = layout::pre_flatten(&root);
+        let old = vec![(
+            LayoutRect {
+                x: 10.0,
+                y: 100.0,
+                width: 355.0,
+                height: 520.0,
+            },
+            3,
+        )];
+        let new = vec![(
+            LayoutRect {
+                x: 10.0,
+                y: 100.0,
+                width: 355.0,
+                height: 52.0,
+            },
+            2,
+        )];
+        let viewport = ViewportLayout {
+            layout_w: 375.0,
+            layout_h: 700.0,
+            offset_y: 0.0,
+            keyboard_inset_bottom: 0.0,
+        };
+        let mut animations = Vec::new();
+
+        App::collect_layout_transition_animations(
+            &mut animations,
+            &flat,
+            &new,
+            &old,
+            viewport,
+            viewport,
+        );
+
+        assert!(
+            animations
+                .iter()
+                .all(|animation| animation.property() != AnimatedProperty::LayoutHeight),
+            "sticky Show replacement must use its compact final height immediately"
+        );
+    }
+
+    #[test]
     fn flip_transition_uses_viewport_delta_for_bottom_anchored_ime_ui() {
         let mut style = w3cos_std::Style::default();
         style.transition = Some(w3cos_std::style::Transition {
@@ -4878,6 +5486,79 @@ mod scroll_physics_tests {
             ActiveAnimation::Transform { from, .. } => assert_eq!(from.translate_y, 100.0),
             _ => panic!("expected viewport FLIP transform animation"),
         }
+    }
+
+    #[test]
+    fn keyboard_viewport_change_does_not_flip_sticky_subtree() {
+        let mut sticky_style = w3cos_std::Style::default();
+        sticky_style.position = Position::Sticky;
+        sticky_style.top = Dimension::Px(0.0);
+        let mut card_style = w3cos_std::Style::default();
+        card_style.transition = Some(w3cos_std::style::Transition {
+            property: TransitionProperty::All,
+            duration_ms: 280,
+            easing: Easing::EaseOut,
+            delay_ms: 0,
+        });
+        let root = Component::root(vec![Component::column(
+            sticky_style,
+            vec![Component::column(card_style, vec![])],
+        )]);
+        let flat = layout::pre_flatten(&root);
+        let old = vec![(
+            LayoutRect {
+                x: 16.0,
+                y: 280.0,
+                width: 343.0,
+                height: 180.0,
+            },
+            2,
+        )];
+        let new = vec![(
+            LayoutRect {
+                x: 16.0,
+                y: 120.0,
+                width: 343.0,
+                height: 180.0,
+            },
+            2,
+        )];
+        let old_viewport = ViewportLayout {
+            layout_w: 375.0,
+            layout_h: 812.0,
+            offset_y: 0.0,
+            keyboard_inset_bottom: 0.0,
+        };
+        let new_viewport = ViewportLayout {
+            layout_w: 375.0,
+            layout_h: 479.0,
+            offset_y: 0.0,
+            keyboard_inset_bottom: 333.0,
+        };
+        let mut animations = vec![ActiveAnimation::Transform {
+            target_id: flat[2].stable_id,
+            node_index: 2,
+            from: Transform2D {
+                translate_y: 24.0,
+                ..Default::default()
+            },
+            to: Transform2D::default(),
+            start: Instant::now(),
+            duration_ms: 280.0,
+            delay_ms: 0.0,
+            easing: Easing::EaseOut,
+        }];
+
+        App::collect_layout_transition_animations(
+            &mut animations,
+            &flat,
+            &new,
+            &old,
+            old_viewport,
+            new_viewport,
+        );
+
+        assert!(animations.is_empty());
     }
 
     #[test]

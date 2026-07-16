@@ -40,6 +40,9 @@ pub struct Style {
 
     // Overflow
     pub overflow: Overflow,
+    /// CSS Overscroll Behavior Level 1, block-axis subset.
+    #[serde(default)]
+    pub overscroll_behavior: OverscrollBehavior,
     /// CSS Scroll Snap Level 2 `scroll-initial-target`.
     #[serde(default)]
     pub scroll_initial_target: ScrollInitialTarget,
@@ -135,6 +138,7 @@ impl Default for Style {
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             overflow: Overflow::Visible,
+            overscroll_behavior: OverscrollBehavior::Auto,
             scroll_initial_target: ScrollInitialTarget::None,
             background: Color::TRANSPARENT,
             color: Color::WHITE,
@@ -203,6 +207,14 @@ pub enum Overflow {
     Hidden,
     Scroll,
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OverscrollBehavior {
+    #[default]
+    Auto,
+    Contain,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

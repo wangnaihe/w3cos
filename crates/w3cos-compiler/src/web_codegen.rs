@@ -50,7 +50,7 @@ pub fn write_web_project(tree: &AppTree, stylesheet: &Stylesheet, output_dir: &P
 fn gen_runtime(signals: &[SignalDecl], names: &[&str]) -> String {
     let inits: Vec<String> = signals
         .iter()
-        .map(|s| format!("  {}: {},", s.name, s.initial))
+        .map(|s| format!("  {}: {},", s.name, s.initial.js_initializer()))
         .collect();
     let index_map: Vec<String> = names
         .iter()
@@ -223,6 +223,10 @@ fn gen_html_node(
             let ph = node.placeholder.as_deref().unwrap_or("Enter text");
             format!(r#"<input type="text" placeholder="{ph}"{class_attr}{style_attr} />"#)
         }
+        NodeKind::ReactAot => format!(
+            r#"<div data-w3cos-react-aot="{}"{class_attr}{style_attr}></div>"#,
+            node.src.as_deref().unwrap_or_default()
+        ),
         NodeKind::Column | NodeKind::Row | NodeKind::Box => {
             let mut extra = String::new();
             if matches!(node.kind, NodeKind::Column) {
@@ -424,6 +428,9 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     }
     if let Some(ov) = s.overflow.as_ref() {
         parts.push(format!("overflow:{ov}"));
+    }
+    if let Some(behavior) = s.overscroll_behavior.as_ref() {
+        parts.push(format!("overscroll-behavior:{behavior}"));
     }
     if let Some(op) = s.opacity {
         parts.push(format!("opacity:{op}"));

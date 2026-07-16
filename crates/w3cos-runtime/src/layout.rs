@@ -1,4 +1,6 @@
 use anyhow::Result;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use taffy::prelude::*;
 use w3cos_std::component::EventAction;
@@ -16,6 +18,45 @@ const ROOT_FONT_SIZE: f32 = 16.0;
 const DEFAULT_TEXT_WRAP_WIDTH: f32 = 360.0;
 
 static LAYOUT_FONT: OnceLock<fontdue::Font> = OnceLock::new();
+
+const TEXT_MEASURE_CACHE_CAPACITY: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextMeasureKey {
+    width: u32,
+    font_size: u32,
+    line_height: u32,
+    padding_top: u32,
+    padding_right: u32,
+    padding_bottom: u32,
+    padding_left: u32,
+    min_width: Option<u32>,
+    white_space: u8,
+}
+
+#[derive(Default)]
+struct TextMeasureCache {
+    intrinsic: HashMap<String, Vec<(TextMeasureKey, (f32, f32))>>,
+    wrapped_height: HashMap<String, Vec<(TextMeasureKey, f32)>>,
+    entries: usize,
+}
+
+impl TextMeasureCache {
+    fn make_room(&mut self) {
+        if self.entries >= TEXT_MEASURE_CACHE_CAPACITY {
+            self.intrinsic.clear();
+            self.wrapped_height.clear();
+            self.entries = 0;
+        }
+    }
+}
+
+thread_local! {
+    /// Blink keeps font metrics and shaped text runs across layout passes. This
+    /// bounded per-UI-thread cache provides the same retained-measure behavior
+    /// without coupling the layout engine to a particular application tree.
+    static TEXT_MEASURE_CACHE: RefCell<TextMeasureCache> = RefCell::new(TextMeasureCache::default());
+}
 
 fn layout_font() -> &'static fontdue::Font {
     LAYOUT_FONT.get_or_init(|| {
@@ -102,7 +143,86 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
 }
 
 fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
-    text_layout::text_intrinsic_size_font(content, style, DEFAULT_TEXT_WRAP_WIDTH, layout_font())
+    let key = text_measure_key(DEFAULT_TEXT_WRAP_WIDTH, style);
+    if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .intrinsic
+            .get(content)
+            .and_then(|entries| entries.iter().find(|(cached, _)| *cached == key))
+            .map(|(_, measured)| *measured)
+    }) {
+        return measured;
+    }
+
+    let measured = text_layout::text_intrinsic_size_font(
+        content,
+        style,
+        DEFAULT_TEXT_WRAP_WIDTH,
+        layout_font(),
+    );
+    TEXT_MEASURE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.make_room();
+        cache
+            .intrinsic
+            .entry(content.to_owned())
+            .or_default()
+            .push((key, measured));
+        cache.entries += 1;
+    });
+    measured
+}
+
+fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::style::Style) -> f32 {
+    let key = text_measure_key(width, style);
+    if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .wrapped_height
+            .get(content)
+            .and_then(|entries| entries.iter().find(|(cached, _)| *cached == key))
+            .map(|(_, measured)| *measured)
+    }) {
+        return measured;
+    }
+
+    let measured = text_layout::wrapped_block_height_font(content, width, style, layout_font());
+    TEXT_MEASURE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.make_room();
+        cache
+            .wrapped_height
+            .entry(content.to_owned())
+            .or_default()
+            .push((key, measured));
+        cache.entries += 1;
+    });
+    measured
+}
+
+fn text_measure_key(width: f32, style: &w3cos_std::style::Style) -> TextMeasureKey {
+    let padding = style.padding_lengths();
+    TextMeasureKey {
+        width: width.to_bits(),
+        font_size: style.font_size.to_bits(),
+        line_height: style.line_height.to_bits(),
+        padding_top: padding.top.to_bits(),
+        padding_right: padding.right.to_bits(),
+        padding_bottom: padding.bottom.to_bits(),
+        padding_left: padding.left.to_bits(),
+        min_width: match style.min_width {
+            WDim::Px(value) => Some(value.to_bits()),
+            _ => None,
+        },
+        white_space: match style.white_space {
+            WWhiteSpace::Normal => 0,
+            WWhiteSpace::NoWrap => 1,
+            WWhiteSpace::Pre => 2,
+            WWhiteSpace::PreWrap => 3,
+            WWhiteSpace::PreLine => 4,
+        },
+    }
 }
 
 fn button_intrinsic_size(label: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
@@ -559,16 +679,16 @@ fn update_text_leaf_heights(
             if let ComponentKind::Text { content } = flat[idx].kind {
                 let style = flat[idx].style;
                 if matches!(style.height, WDim::Auto) {
-                    let h = text_layout::wrapped_block_height_font(
-                        content,
-                        node_width,
-                        style,
-                        layout_font(),
-                    );
+                    let h = wrapped_text_height(content, node_width, style);
                     let mut taffy_style = tree.style(node)?.clone();
-                    taffy_style.min_size.height = Dimension::length(h);
-                    taffy_style.size.height = Dimension::length(h);
-                    tree.set_style(node, taffy_style)?;
+                    let measured_height = Dimension::length(h);
+                    if taffy_style.min_size.height != measured_height
+                        || taffy_style.size.height != measured_height
+                    {
+                        taffy_style.min_size.height = measured_height;
+                        taffy_style.size.height = measured_height;
+                        tree.set_style(node, taffy_style)?;
+                    }
                 }
             }
         }
@@ -1507,6 +1627,97 @@ mod tests {
         let flat = pre_flatten(&tree);
         assert!(!is_node_visible(&flat, 1));
         assert!(!is_node_visible(&flat, 0));
+    }
+
+    #[test]
+    fn repeated_text_measurements_reuse_retained_metrics() {
+        TEXT_MEASURE_CACHE.with(|cache| *cache.borrow_mut() = TextMeasureCache::default());
+        let style = Style {
+            font_size: 15.0,
+            line_height: 1.4,
+            ..Style::default()
+        };
+        for _ in 0..1_000 {
+            let _ = text_intrinsic_size("上海 → 杭州运输节点已更新", &style);
+            let _ = wrapped_text_height("上海 → 杭州运输节点已更新", 320.0, &style);
+        }
+        let entries = TEXT_MEASURE_CACHE.with(|cache| cache.borrow().entries);
+        assert_eq!(
+            entries, 2,
+            "identical layout measurements should be retained"
+        );
+
+        let _ = wrapped_text_height("上海 → 杭州运输节点已更新", 280.0, &style);
+        let entries = TEXT_MEASURE_CACHE.with(|cache| cache.borrow().entries);
+        assert_eq!(entries, 3, "assigned width is part of the cache key");
+    }
+
+    #[test]
+    fn persistent_layout_reflows_parent_when_show_branch_collapses() {
+        let hidden = Style {
+            display: WDisp::None,
+            ..Style::default()
+        };
+        let visible = Style::default();
+        let compact = Component::column(
+            Style {
+                height: WDim::Px(52.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let expanded = Component::column(
+            Style {
+                height: WDim::Px(520.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let make_tree = |compact_display: Style, expanded_display: Style| {
+            Component::column(
+                col(),
+                vec![
+                    Component::column(
+                        Style {
+                            position: WPos::Sticky,
+                            ..Style::default()
+                        },
+                        vec![
+                            Component::column(compact_display, vec![compact.clone()]),
+                            Component::column(expanded_display, vec![expanded.clone()]),
+                        ],
+                    ),
+                    Component::boxed(
+                        Style {
+                            height: WDim::Px(100.0),
+                            ..Style::default()
+                        },
+                        vec![],
+                    ),
+                ],
+            )
+        };
+        let old_tree = make_tree(hidden.clone(), visible.clone());
+        let new_tree = make_tree(visible, hidden);
+        let old_flat = pre_flatten(&old_tree);
+        let new_flat = pre_flatten(&new_tree);
+        assert!(layout_shape_unchanged(&old_flat, &new_flat));
+
+        let mut engine = LayoutEngine::new();
+        let old = engine.compute(&old_tree, &old_flat, 375.0, 700.0).unwrap();
+        engine.patch_display_styles(&new_flat).unwrap();
+        let new = engine.compute(&new_tree, &new_flat, 375.0, 700.0).unwrap();
+        let rect = |results: &LayoutResults, idx| {
+            results
+                .layout_cache
+                .iter()
+                .find(|(_, node_idx)| *node_idx == idx)
+                .map(|(rect, _)| *rect)
+                .unwrap()
+        };
+        assert_eq!(rect(&old, 1).height, 520.0);
+        assert_eq!(rect(&new, 1).height, 52.0);
+        assert_eq!(rect(&new, 6).y, 78.0);
     }
 
     /// Host micro-bench for CI — logs 402×874 layout time budget.

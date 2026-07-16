@@ -20,6 +20,20 @@ static POINTER_Y_MILLI: AtomicI64 = AtomicI64::new(-1);
 static PRESSED_INDEX: AtomicI64 = AtomicI64::new(-1);
 static NATIVE_FIRST_RESPONDER: AtomicI64 = AtomicI64::new(-1);
 static NATIVE_KEY_WINDOW: AtomicI64 = AtomicI64::new(-1);
+static LAST_SCROLL_INDEX: AtomicI64 = AtomicI64::new(-1);
+static LAST_SCROLL_Y_MILLI: AtomicI64 = AtomicI64::new(0);
+static LAST_RELEASE_VELOCITY_MILLI: AtomicI64 = AtomicI64::new(0);
+static KINETIC_ACTIVE: AtomicBool = AtomicBool::new(false);
+static KINETIC_TICKS: AtomicI64 = AtomicI64::new(0);
+static KINETIC_ELAPSED_MILLI: AtomicI64 = AtomicI64::new(0);
+static KINETIC_DELTA_MILLI: AtomicI64 = AtomicI64::new(0);
+static KINETIC_SAMPLE_VELOCITY_MILLI: AtomicI64 = AtomicI64::new(0);
+static KINETIC_CURVE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static KINETIC_CONTINUED: AtomicBool = AtomicBool::new(false);
+static KINETIC_NODE_INDEX: AtomicI64 = AtomicI64::new(-1);
+static KINETIC_NODE_MAX_MILLI: AtomicI64 = AtomicI64::new(-1);
+static KINETIC_NODE_OFFSET_MILLI: AtomicI64 = AtomicI64::new(-1);
+static KINETIC_APPLIED_MILLI: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Clone, serde::Serialize)]
 pub struct UiHitTarget {
@@ -81,16 +95,44 @@ fn build_snapshot_json() -> String {
             -1 => serde_json::Value::Null,
             value => serde_json::json!(value == 1),
         },
+        "lastScroll": {
+            "index": match LAST_SCROLL_INDEX.load(Ordering::SeqCst) {
+                -1 => serde_json::Value::Null,
+                index => serde_json::json!(index),
+            },
+            "y": LAST_SCROLL_Y_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
+        },
+        "kinetic": {
+            "releaseVelocity": LAST_RELEASE_VELOCITY_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
+            "active": KINETIC_ACTIVE.load(Ordering::SeqCst),
+            "ticks": KINETIC_TICKS.load(Ordering::SeqCst),
+            "elapsed": KINETIC_ELAPSED_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
+            "delta": KINETIC_DELTA_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
+            "sampleVelocity": KINETIC_SAMPLE_VELOCITY_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
+            "curveActive": KINETIC_CURVE_ACTIVE.load(Ordering::SeqCst),
+            "continued": KINETIC_CONTINUED.load(Ordering::SeqCst),
+            "nodeIndex": KINETIC_NODE_INDEX.load(Ordering::SeqCst),
+            "nodeMax": KINETIC_NODE_MAX_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
+            "nodeOffset": KINETIC_NODE_OFFSET_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
+            "applied": KINETIC_APPLIED_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
+        },
     })
     .to_string()
 }
 
-fn latest_snapshot_json() -> String {
-    SNAPSHOT
-        .lock()
-        .ok()
-        .and_then(|snapshot| snapshot.clone())
-        .unwrap_or_else(build_snapshot_json)
+pub fn set_kinetic_attempt(index: usize, max_y: Option<f32>, offset_y: Option<f32>, applied: f32) {
+    if hook_enabled() {
+        KINETIC_NODE_INDEX.store(index as i64, Ordering::SeqCst);
+        KINETIC_NODE_MAX_MILLI.store(
+            max_y.map(|v| (v * 1000.0) as i64).unwrap_or(-1),
+            Ordering::SeqCst,
+        );
+        KINETIC_NODE_OFFSET_MILLI.store(
+            offset_y.map(|v| (v * 1000.0) as i64).unwrap_or(-1),
+            Ordering::SeqCst,
+        );
+        KINETIC_APPLIED_MILLI.store((applied * 1000.0) as i64, Ordering::SeqCst);
+    }
 }
 
 pub fn set_focused_index(index: Option<usize>) {
@@ -128,6 +170,40 @@ pub fn set_native_key_window(value: Option<bool>) {
             value.map(|is_key| i64::from(is_key)).unwrap_or(-1),
             Ordering::SeqCst,
         );
+    }
+}
+
+pub fn set_scroll_offset(index: usize, y: f32) {
+    if hook_enabled() {
+        LAST_SCROLL_INDEX.store(index as i64, Ordering::SeqCst);
+        LAST_SCROLL_Y_MILLI.store((y * 1000.0) as i64, Ordering::SeqCst);
+    }
+}
+
+pub fn set_kinetic_started(velocity: f32) {
+    if hook_enabled() {
+        LAST_RELEASE_VELOCITY_MILLI.store((velocity * 1000.0) as i64, Ordering::SeqCst);
+        KINETIC_TICKS.store(0, Ordering::SeqCst);
+        KINETIC_ACTIVE.store(true, Ordering::SeqCst);
+    }
+}
+
+pub fn set_kinetic_tick(
+    active: bool,
+    elapsed: f32,
+    delta: f32,
+    sample_velocity: f32,
+    curve_active: bool,
+    continued: bool,
+) {
+    if hook_enabled() {
+        KINETIC_TICKS.fetch_add(1, Ordering::SeqCst);
+        KINETIC_ACTIVE.store(active, Ordering::SeqCst);
+        KINETIC_ELAPSED_MILLI.store((elapsed * 1000.0) as i64, Ordering::SeqCst);
+        KINETIC_DELTA_MILLI.store((delta * 1000.0) as i64, Ordering::SeqCst);
+        KINETIC_SAMPLE_VELOCITY_MILLI.store((sample_velocity * 1000.0) as i64, Ordering::SeqCst);
+        KINETIC_CURVE_ACTIVE.store(curve_active, Ordering::SeqCst);
+        KINETIC_CONTINUED.store(continued, Ordering::SeqCst);
     }
 }
 
@@ -374,7 +450,7 @@ fn handle_client(mut stream: TcpStream) {
             queue_scroll(dy);
             ("200 OK", format!(r#"{{"dy":{dy}}}"#))
         }
-        _ => ("200 OK", latest_snapshot_json()),
+        _ => ("200 OK", build_snapshot_json()),
     };
 
     let resp = format!(

@@ -10,6 +10,7 @@
 
 use crate::esm_lowering::{LowerCtx, sanitize_ident};
 use crate::esm_resolver::{BundledModule, EsmBundle, SymbolKind};
+use std::collections::HashSet;
 use std::path::Path;
 use swc_common::{FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
@@ -41,6 +42,12 @@ fn generate_module(bundle: &EsmBundle, module: &BundledModule) -> String {
         module.path.display(),
         module.namespace
     ));
+    for (local, host_path) in &module.host_imports {
+        out.push_str(&format!(
+            "    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ w3cos_react_compat::aot::call_host({host_path:?}, __args) }}\n",
+            sanitize_ident(local),
+        ));
+    }
 
     // Emit `use` aliases for imported bindings so local names resolve to the
     // bundled definition living in another module's namespace.
@@ -131,6 +138,23 @@ pub fn generate_with_bodies(bundle: &EsmBundle) -> String {
         out.push('\n');
     }
 
+    if let Some(symbol) = bundle
+        .symbols
+        .iter()
+        .find(|symbol| symbol.module == bundle.entry && symbol.original_name == "main")
+        && let Some(module) = bundle
+            .modules
+            .iter()
+            .find(|module| module.path == bundle.entry)
+    {
+        out.push_str(&format!(
+            "pub fn run_entry() -> w3cos_core::Value {{ {}::{}(vec![]) }}\n",
+            module.namespace, symbol.bundled_name
+        ));
+    } else {
+        out.push_str("pub fn run_entry() -> w3cos_core::Value { w3cos_core::Value::Undefined }\n");
+    }
+
     out
 }
 
@@ -141,6 +165,15 @@ fn generate_module_with_bodies(bundle: &EsmBundle, module: &BundledModule) -> St
         module.path.display(),
         module.namespace
     ));
+    out.push_str(
+        "    #[allow(unused_imports)]\n    use w3cos_core::{Array, Error, ErrorValue, Map, Math, Object, RangeError, ResizeObserver, console, document, parseFloat, parseInt};\n",
+    );
+    for (local, host_path) in &module.host_imports {
+        out.push_str(&format!(
+            "    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ w3cos_react_compat::aot::call_host({host_path:?}, __args) }}\n",
+            sanitize_ident(local),
+        ));
+    }
 
     // Emit cross-module use aliases (same as skeleton).
     for (local, bundled) in &module.local_to_bundled {
@@ -168,6 +201,13 @@ fn generate_module_with_bodies(bundle: &EsmBundle, module: &BundledModule) -> St
 
     // Parse the module's source to get function bodies.
     let functions = parse_module_functions(&module.path);
+    let value_bindings: HashSet<String> = functions
+        .iter()
+        .filter_map(|item| match item {
+            TopLevelItem::Variable { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
 
     // Emit definitions with bodies.
     for sym in bundle.symbols.iter().filter(|s| s.module == module.path) {
@@ -194,10 +234,19 @@ fn generate_module_with_bodies(bundle: &EsmBundle, module: &BundledModule) -> St
                 }
             }
             SymbolKind::Function => {
-                let renames = module.local_to_bundled.clone();
-                let body = find_function_body(&functions, &sym.original_name, &renames);
+                let renames = lowering_names(module);
+                let (params, body) =
+                    find_function(&functions, &sym.original_name, &renames, &value_bindings)
+                        .unwrap_or_else(|| {
+                            (
+                                Vec::new(),
+                                format!("        todo!(\"body not found: {}\")", sym.original_name),
+                            )
+                        });
+                let bindings = lower_dynamic_params(&params, &renames);
+                let body = format!("{bindings}{body}");
                 out.push_str(&format!(
-                    "\n    /// function {} (from ESM)\n    pub fn {}() {{\n{}\n    }}\n",
+                    "\n    /// function {} (from ESM)\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n",
                     sym.original_name, sym.bundled_name, body
                 ));
                 let alias = sanitize_ident(&sym.original_name);
@@ -209,10 +258,63 @@ fn generate_module_with_bodies(bundle: &EsmBundle, module: &BundledModule) -> St
                 }
             }
             SymbolKind::Variable => {
-                out.push_str(&format!(
-                    "\n    // variable {} (from ESM) — lowering pending\n",
-                    sym.original_name
-                ));
+                let renames = lowering_names(module);
+                if let Some((params, body)) =
+                    find_function(&functions, &sym.original_name, &renames, &value_bindings)
+                {
+                    let bindings = lower_dynamic_params(&params, &renames);
+                    let body = format!("{bindings}{body}");
+                    out.push_str(&format!(
+                        "\n    /// function-valued variable {} (from ESM)\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n",
+                        sym.original_name, sym.bundled_name, body
+                    ));
+                    let alias = sanitize_ident(&sym.original_name);
+                    if alias != sym.bundled_name {
+                        out.push_str(&format!(
+                            "    pub use self::{} as {};\n",
+                            sym.bundled_name, alias
+                        ));
+                    }
+                } else if let Some(target) = find_alias(&functions, &sym.original_name) {
+                    out.push_str(&format!(
+                        "\n    pub use self::{} as {};\n",
+                        sanitize_ident(target),
+                        sym.bundled_name
+                    ));
+                    let alias = sanitize_ident(&sym.original_name);
+                    if alias != sym.bundled_name {
+                        out.push_str(&format!(
+                            "    pub use self::{} as {};\n",
+                            sym.bundled_name, alias
+                        ));
+                    }
+                } else if let Some(initializer) = find_variable(&functions, &sym.original_name) {
+                    let ctx = LowerCtx::new_dynamic_with_bindings(
+                        renames.clone(),
+                        value_bindings.clone(),
+                    );
+                    let initializer = ctx.lower_expr(initializer);
+                    out.push_str(&format!(
+                        "\n    std::thread_local! {{ static {}_CELL: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }}; }}\n    pub fn {}_get() -> w3cos_core::Value {{ {}_CELL.with(|cell| {{ if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }} let value = {initializer}; *cell.borrow_mut() = Some(value.clone()); value }}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ {}_CELL.with(|cell| *cell.borrow_mut() = Some(value.clone())); value }}\n",
+                        sym.bundled_name,
+                        sym.bundled_name,
+                        sym.bundled_name,
+                        sym.bundled_name,
+                        sym.bundled_name,
+                    ));
+                    let alias = sanitize_ident(&sym.original_name);
+                    if alias != sym.bundled_name {
+                        out.push_str(&format!(
+                            "    pub use self::{}_get as {};\n",
+                            sym.bundled_name, alias
+                        ));
+                    }
+                } else {
+                    out.push_str(&format!(
+                        "\n    // variable {} (from ESM) — value lowering pending\n",
+                        sym.original_name
+                    ));
+                }
             }
         }
     }
@@ -221,15 +323,35 @@ fn generate_module_with_bodies(bundle: &EsmBundle, module: &BundledModule) -> St
     out
 }
 
+fn lowering_names(module: &BundledModule) -> Vec<(String, String)> {
+    let mut names = module.local_to_bundled.clone();
+    names.extend(
+        module
+            .host_imports
+            .iter()
+            .map(|(local, _)| (local.clone(), sanitize_ident(local))),
+    );
+    names
+}
+
 /// Parsed function/class from a module source.
 enum TopLevelItem {
     Function {
         name: String,
+        params: Vec<Pat>,
         body: Vec<Stmt>,
     },
     Class {
         name: String,
         methods: Vec<(String, Vec<Stmt>)>,
+    },
+    Variable {
+        name: String,
+        initializer: Box<Expr>,
+    },
+    Alias {
+        name: String,
+        target: String,
     },
 }
 
@@ -275,13 +397,19 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
     match decl {
         Decl::Fn(fn_decl) => {
             let name = fn_decl.ident.sym.to_string();
+            let params = fn_decl
+                .function
+                .params
+                .iter()
+                .map(|param| param.pat.clone())
+                .collect();
             let body = fn_decl
                 .function
                 .body
                 .as_ref()
                 .map(|b| b.stmts.clone())
                 .unwrap_or_default();
-            items.push(TopLevelItem::Function { name, body });
+            items.push(TopLevelItem::Function { name, params, body });
         }
         Decl::Class(class_decl) => {
             let name = class_decl.ident.sym.to_string();
@@ -306,24 +434,217 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
             }
             items.push(TopLevelItem::Class { name, methods });
         }
+        Decl::Var(var_decl) => {
+            for declarator in &var_decl.decls {
+                let Pat::Ident(binding) = &declarator.name else {
+                    continue;
+                };
+                let Some(init) = &declarator.init else {
+                    continue;
+                };
+                let (params, body) = match init.as_ref() {
+                    Expr::Arrow(arrow) => {
+                        let params = arrow.params.clone();
+                        let body = match arrow.body.as_ref() {
+                            BlockStmtOrExpr::BlockStmt(block) => block.stmts.clone(),
+                            BlockStmtOrExpr::Expr(expr) => vec![Stmt::Return(ReturnStmt {
+                                span: arrow.span,
+                                arg: Some(expr.clone()),
+                            })],
+                        };
+                        (params, body)
+                    }
+                    Expr::Fn(function) => {
+                        let params = function
+                            .function
+                            .params
+                            .iter()
+                            .map(|param| param.pat.clone())
+                            .collect();
+                        let body = function
+                            .function
+                            .body
+                            .as_ref()
+                            .map(|block| block.stmts.clone())
+                            .unwrap_or_default();
+                        (params, body)
+                    }
+                    Expr::Ident(target) => {
+                        items.push(TopLevelItem::Alias {
+                            name: binding.id.sym.to_string(),
+                            target: target.sym.to_string(),
+                        });
+                        continue;
+                    }
+                    Expr::Cond(condition)
+                        if is_typeof_window_test(&condition.test)
+                            && matches!(condition.cons.as_ref(), Expr::Ident(_))
+                            && matches!(condition.alt.as_ref(), Expr::Ident(_)) =>
+                    {
+                        let Expr::Ident(target) = condition.alt.as_ref() else {
+                            unreachable!()
+                        };
+                        items.push(TopLevelItem::Alias {
+                            name: binding.id.sym.to_string(),
+                            target: target.sym.to_string(),
+                        });
+                        continue;
+                    }
+                    _ => {
+                        items.push(TopLevelItem::Variable {
+                            name: binding.id.sym.to_string(),
+                            initializer: init.clone(),
+                        });
+                        continue;
+                    }
+                };
+                items.push(TopLevelItem::Function {
+                    name: binding.id.sym.to_string(),
+                    params,
+                    body,
+                });
+            }
+        }
         _ => {}
     }
 }
 
-fn find_function_body(items: &[TopLevelItem], name: &str, renames: &[(String, String)]) -> String {
+fn find_function(
+    items: &[TopLevelItem],
+    name: &str,
+    renames: &[(String, String)],
+    value_bindings: &HashSet<String>,
+) -> Option<(Vec<Pat>, String)> {
     for item in items {
         if let TopLevelItem::Function {
             name: fn_name,
+            params,
             body,
         } = item
         {
             if fn_name == name {
-                let mut ctx = LowerCtx::new(renames.to_vec());
-                return ctx.lower_stmts(body);
+                let mut ctx =
+                    LowerCtx::new_dynamic_with_bindings(renames.to_vec(), value_bindings.clone());
+                ctx.bind_patterns(params);
+                return Some((params.clone(), ctx.lower_stmts(body)));
             }
         }
     }
-    format!("        todo!(\"body not found: {name}\")")
+    None
+}
+
+fn find_variable<'a>(items: &'a [TopLevelItem], name: &str) -> Option<&'a Expr> {
+    items.iter().find_map(|item| match item {
+        TopLevelItem::Variable {
+            name: variable_name,
+            initializer,
+        } if variable_name == name => Some(initializer.as_ref()),
+        _ => None,
+    })
+}
+
+fn find_alias<'a>(items: &'a [TopLevelItem], name: &str) -> Option<&'a str> {
+    items.iter().find_map(|item| match item {
+        TopLevelItem::Alias {
+            name: alias_name,
+            target,
+        } if alias_name == name => Some(target.as_str()),
+        _ => None,
+    })
+}
+
+fn is_typeof_window_test(expression: &Expr) -> bool {
+    match expression {
+        Expr::Bin(binary) => {
+            is_typeof_window_test(&binary.left) || is_typeof_window_test(&binary.right)
+        }
+        Expr::Unary(unary) if unary.op == UnaryOp::TypeOf => {
+            matches!(unary.arg.as_ref(), Expr::Ident(ident) if ident.sym == *"window")
+        }
+        Expr::Paren(parenthesized) => is_typeof_window_test(&parenthesized.expr),
+        _ => false,
+    }
+}
+
+fn lower_dynamic_params(params: &[Pat], renames: &[(String, String)]) -> String {
+    let mut bindings = String::new();
+    for (index, pattern) in params.iter().enumerate() {
+        let argument =
+            format!("__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined)");
+        lower_dynamic_pattern(pattern, &argument, &mut bindings, renames, 8);
+    }
+    bindings
+}
+
+fn lower_dynamic_pattern(
+    pattern: &Pat,
+    source: &str,
+    output: &mut String,
+    renames: &[(String, String)],
+    indent: usize,
+) {
+    let pad = " ".repeat(indent);
+    match pattern {
+        Pat::Ident(ident) => {
+            output.push_str(&format!(
+                "{pad}let mut {} = {source};\n",
+                sanitize_ident(&ident.id.sym.to_string())
+            ));
+        }
+        Pat::Object(object) => {
+            for property in &object.props {
+                match property {
+                    ObjectPatProp::Assign(assign) => {
+                        let name = sanitize_ident(&assign.key.sym.to_string());
+                        let value =
+                            format!("{source}.get_property({:?})", assign.key.sym.to_string());
+                        if let Some(default) = &assign.value {
+                            let ctx = LowerCtx::new_dynamic(renames.to_vec());
+                            let fallback = ctx.lower_expr(default);
+                            output.push_str(&format!(
+                                "{pad}let {name} = {{ let value = {value}; if value.is_undefined() {{ {fallback} }} else {{ value }} }};\n"
+                            ));
+                        } else {
+                            output.push_str(&format!("{pad}let {name} = {value};\n"));
+                        }
+                    }
+                    ObjectPatProp::KeyValue(key_value) => {
+                        let key = match &key_value.key {
+                            PropName::Ident(ident) => ident.sym.to_string(),
+                            PropName::Str(value) => {
+                                format!("{:?}", value.value).trim_matches('"').to_string()
+                            }
+                            PropName::Num(value) => value.value.to_string(),
+                            _ => continue,
+                        };
+                        let nested = format!("{source}.get_property({key:?})");
+                        lower_dynamic_pattern(&key_value.value, &nested, output, renames, indent);
+                    }
+                    ObjectPatProp::Rest(rest) => {
+                        lower_dynamic_pattern(&rest.arg, source, output, renames, indent);
+                    }
+                }
+            }
+        }
+        Pat::Array(array) => {
+            for (index, element) in array.elems.iter().enumerate() {
+                if let Some(element) = element {
+                    let nested = format!("{source}.get_property({:?})", index.to_string());
+                    lower_dynamic_pattern(element, &nested, output, renames, indent);
+                }
+            }
+        }
+        Pat::Assign(assign) => {
+            let ctx = LowerCtx::new_dynamic(renames.to_vec());
+            let fallback = ctx.lower_expr(&assign.right);
+            let value = format!(
+                "{{ let value = {source}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}"
+            );
+            lower_dynamic_pattern(&assign.left, &value, output, renames, indent);
+        }
+        Pat::Rest(rest) => lower_dynamic_pattern(&rest.arg, source, output, renames, indent),
+        _ => {}
+    }
 }
 
 fn find_class_methods(items: &[TopLevelItem], class_name: &str) -> Vec<(String, String)> {
@@ -491,7 +812,9 @@ export function makeTheme() {}"#,
 export function boot() {
   const view = new EditorView({});
   return view;
-}"#,
+}
+export const identity = (value) => value;
+export const readSize = ({height: h, width: w = 10}) => h + w;"#,
         )
         .unwrap();
 
@@ -524,6 +847,17 @@ export function boot() {
         assert!(
             code.contains("return view"),
             "return should be lowered: {code}"
+        );
+        assert!(
+            code.contains("function-valued variable identity")
+                && code.contains("let mut value = __args.get(0)"),
+            "top-level arrow functions should lower to callable Rust functions: {code}"
+        );
+        assert!(
+            code.contains(
+                "get(0).cloned().unwrap_or(w3cos_core::Value::Undefined).get_property(\"height\")"
+            ) && code.contains("get_property(\"width\"); if value.is_undefined()"),
+            "destructured parameters should bind properties and defaults: {code}"
         );
         // Class method body should be lowered
         assert!(

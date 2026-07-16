@@ -78,6 +78,7 @@ pub struct ParsedModuleInfo {
     pub exports: Vec<ExportBinding>,
     pub top_level_classes: Vec<String>,
     pub top_level_functions: Vec<String>,
+    pub top_level_variables: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -289,6 +290,9 @@ pub struct BundledModule {
     /// Local identifier (as written in this module) -> bundled name it refers to.
     /// Covers both this module's own definitions and its imported bindings.
     pub local_to_bundled: Vec<(String, String)>,
+    /// Imports implemented by a native AOT host ABI rather than another ESM
+    /// source module (for example React hooks and JSX runtime entry points).
+    pub host_imports: Vec<(String, String)>,
 }
 
 impl BundledModule {
@@ -333,11 +337,14 @@ impl EsmBundle {
                     .top_level_classes
                     .iter()
                     .chain(info.top_level_functions.iter())
+                    .chain(info.top_level_variables.iter())
                 {
                     let bundled_name =
                         format!("{namespace}_{}", crate::esm_lowering::sanitize_ident(name));
                     let kind = if info.top_level_classes.contains(name) {
                         SymbolKind::Class
+                    } else if info.top_level_variables.contains(name) {
+                        SymbolKind::Variable
                     } else {
                         SymbolKind::Function
                     };
@@ -356,6 +363,7 @@ impl EsmBundle {
                 index,
                 namespace,
                 local_to_bundled,
+                host_imports: Vec::new(),
             });
         }
 
@@ -368,6 +376,12 @@ impl EsmBundle {
             };
 
             for import in &info.imports {
+                if let Some(host_path) = host_import_path(&import.source, &import.imported) {
+                    bundle.modules[module_index]
+                        .host_imports
+                        .push((import.local.clone(), host_path.to_string()));
+                    continue;
+                }
                 match parsed.resolve_binding(&path, &import.local, resolver) {
                     SymbolResolution::Resolved(sym) => {
                         let bundled = bundle
@@ -417,6 +431,24 @@ impl EsmBundle {
 
     pub fn is_fully_resolved(&self) -> bool {
         self.unresolved.is_empty()
+    }
+}
+
+fn host_import_path(source: &str, imported: &str) -> Option<&'static str> {
+    match (source, imported) {
+        ("react", "useState") => Some("w3cos_react_compat::aot::useState"),
+        ("react", "useMemo") => Some("w3cos_react_compat::aot::useMemo"),
+        ("react", "useCallback") => Some("w3cos_react_compat::aot::useCallback"),
+        ("react", "useRef") => Some("w3cos_react_compat::aot::useRef"),
+        ("react", "useEffect") => Some("w3cos_react_compat::aot::useEffect"),
+        ("react", "useLayoutEffect") => Some("w3cos_react_compat::aot::useLayoutEffect"),
+        ("react", "useImperativeHandle") => Some("w3cos_react_compat::aot::useImperativeHandle"),
+        ("react", "memo") => Some("w3cos_react_compat::aot::memo"),
+        ("react", "createElement") => Some("w3cos_react_compat::aot::createElement"),
+        ("react/jsx-runtime", "jsx") => Some("w3cos_react_compat::aot::jsx"),
+        ("react/jsx-runtime", "jsxs") => Some("w3cos_react_compat::aot::jsxs"),
+        ("react/jsx-runtime", "Fragment") => Some("w3cos_react_compat::aot::Fragment"),
+        _ => None,
     }
 }
 
@@ -937,6 +969,7 @@ fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
             for decl in &var.decls {
                 if let Pat::Ident(binding) = &decl.name {
                     let name = binding.id.sym.to_string();
+                    info.top_level_variables.push(name.clone());
                     info.exports.push(ExportBinding {
                         exported: name.clone(),
                         local: Some(name),
@@ -955,6 +988,13 @@ fn collect_top_level_decl(decl: &Decl, info: &mut ParsedModuleInfo) {
         Decl::Fn(function) => info
             .top_level_functions
             .push(function.ident.sym.to_string()),
+        Decl::Var(var) => {
+            for declaration in &var.decls {
+                if let Pat::Ident(binding) = &declaration.name {
+                    info.top_level_variables.push(binding.id.sym.to_string());
+                }
+            }
+        }
         _ => {}
     }
 }

@@ -1064,6 +1064,9 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "left" => style.left = Some(value.to_string()),
         "z-index" => style.z_index = value.parse().ok(),
         "overflow" => style.overflow = Some(value.to_string()),
+        "overscroll-behavior" | "overscroll-behavior-y" => {
+            style.overscroll_behavior = Some(value.to_string())
+        }
         "scroll-initial-target" => style.scroll_initial_target = Some(value.to_string()),
         "display" => style.display = Some(value.to_string()),
         "opacity" => style.opacity = value.parse().ok(),
@@ -1390,6 +1393,15 @@ mod tests {
         assert_eq!(
             sheet.rules[0].style.scroll_initial_target.as_deref(),
             Some("nearest")
+        );
+    }
+
+    #[test]
+    fn parse_overscroll_behavior() {
+        let sheet = parse_css(".feed { overscroll-behavior: contain; }");
+        assert_eq!(
+            sheet.rules[0].style.overscroll_behavior.as_deref(),
+            Some("contain")
         );
     }
 

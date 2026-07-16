@@ -4,6 +4,7 @@
 //! source text. It is intentionally a "best effort" structural lowering: JS
 //! semantics that have no Rust equivalent emit a `todo!()` with a comment.
 
+use std::collections::HashSet;
 use swc_ecma_ast::*;
 
 /// Context carried while lowering a single function/method body.
@@ -11,11 +12,47 @@ pub struct LowerCtx {
     indent: usize,
     /// local name → bundled name (for cross-module references).
     pub renames: Vec<(String, String)>,
+    dynamic_values: bool,
+    temp_index: usize,
+    value_bindings: HashSet<String>,
+    known_values: HashSet<String>,
 }
 
 impl LowerCtx {
     pub fn new(renames: Vec<(String, String)>) -> Self {
-        Self { indent: 2, renames }
+        Self {
+            indent: 2,
+            renames,
+            dynamic_values: false,
+            temp_index: 0,
+            value_bindings: HashSet::new(),
+            known_values: HashSet::new(),
+        }
+    }
+
+    pub fn new_dynamic(renames: Vec<(String, String)>) -> Self {
+        Self {
+            indent: 2,
+            renames,
+            dynamic_values: true,
+            temp_index: 0,
+            value_bindings: HashSet::new(),
+            known_values: HashSet::new(),
+        }
+    }
+
+    pub fn new_dynamic_with_bindings(
+        renames: Vec<(String, String)>,
+        value_bindings: HashSet<String>,
+    ) -> Self {
+        Self {
+            indent: 2,
+            renames,
+            dynamic_values: true,
+            temp_index: 0,
+            value_bindings,
+            known_values: HashSet::new(),
+        }
     }
 
     fn pad(&self) -> String {
@@ -23,11 +60,44 @@ impl LowerCtx {
     }
 
     fn resolve_name(&self, name: &str) -> String {
-        self.renames
+        let has_mapping = self.renames.iter().any(|(local, _)| local == name);
+        let resolved = self
+            .renames
             .iter()
             .find(|(local, _)| local == name)
-            .map(|(_, bundled)| bundled.clone())
-            .unwrap_or_else(|| name.to_string())
+            .map(|(_, bundled)| {
+                if !self.dynamic_values || self.value_bindings.contains(name) {
+                    bundled.clone()
+                } else {
+                    sanitize_ident(name)
+                }
+            })
+            .unwrap_or_else(|| name.to_string());
+        if self.dynamic_values && self.value_bindings.contains(name) && has_mapping {
+            format!("{resolved}_get()")
+        } else {
+            resolved
+        }
+    }
+
+    fn resolve_value(&self, name: &str) -> String {
+        let resolved = self.resolve_name(name);
+        if self.dynamic_values && self.known_values.contains(name) {
+            format!("{resolved}.clone()")
+        } else if self.dynamic_values
+            && self.renames.iter().any(|(local, _)| local == name)
+            && !self.value_bindings.contains(name)
+        {
+            format!("w3cos_core::Value::function(move |_this, __args| {resolved}(__args))")
+        } else {
+            resolved
+        }
+    }
+
+    pub fn bind_patterns(&mut self, patterns: &[Pat]) {
+        for pattern in patterns {
+            collect_pattern_names(pattern, &mut self.known_values);
+        }
     }
 
     pub fn lower_stmts(&mut self, stmts: &[Stmt]) -> String {
@@ -46,10 +116,14 @@ impl LowerCtx {
             }
             Stmt::Return(ret) => match &ret.arg {
                 Some(expr) => format!("{}return {};", self.pad(), self.lower_expr(expr)),
+                None if self.dynamic_values => {
+                    format!("{}return w3cos_core::Value::Undefined;", self.pad())
+                }
                 None => format!("{}return;", self.pad()),
             },
             Stmt::Decl(decl) => self.lower_decl(decl),
             Stmt::Block(block) => {
+                let outer_values = self.known_values.clone();
                 let mut out = format!("{}{{\n", self.pad());
                 self.indent += 4;
                 for s in &block.stmts {
@@ -57,6 +131,7 @@ impl LowerCtx {
                     out.push('\n');
                 }
                 self.indent -= 4;
+                self.known_values = outer_values;
                 out.push_str(&format!("{}}}", self.pad()));
                 out
             }
@@ -65,6 +140,11 @@ impl LowerCtx {
             Stmt::While(while_stmt) => {
                 let test = self.lower_expr(&while_stmt.test);
                 let body = self.lower_stmt(&while_stmt.body);
+                let test = if self.dynamic_values {
+                    format!("{test}.to_bool()")
+                } else {
+                    test
+                };
                 format!(
                     "{}while {} {{\n{}\n{}}}",
                     self.pad(),
@@ -111,7 +191,7 @@ impl LowerCtx {
                 let body = self.lower_stmt(&for_in.body);
                 self.indent -= 4;
                 format!(
-                    "{}for {left} in {right} {{\n{}\n{}}}",
+                    "{}for {left} in Object.call_method(\"keys\", vec![{right}]).iter() {{\n{}\n{}}}",
                     self.pad(),
                     body,
                     self.pad()
@@ -153,18 +233,38 @@ impl LowerCtx {
             Decl::Var(var_decl) => {
                 let mut lines = Vec::new();
                 for d in &var_decl.decls {
-                    let name = self.lower_pat(&d.name);
                     let val = d
                         .init
                         .as_ref()
                         .map(|e| self.lower_expr(e))
-                        .unwrap_or_else(|| "Default::default()".to_string());
+                        .unwrap_or_else(|| {
+                            if self.dynamic_values {
+                                "w3cos_core::Value::Undefined".to_string()
+                            } else {
+                                "Default::default()".to_string()
+                            }
+                        });
+                    if self.dynamic_values && !matches!(d.name, Pat::Ident(_)) {
+                        let temporary = format!("__binding{}", self.temp_index);
+                        self.temp_index += 1;
+                        lines.push(format!("{}let {temporary} = {val};", self.pad()));
+                        self.lower_dynamic_local_pattern(
+                            &d.name,
+                            &temporary,
+                            &mut lines,
+                            self.indent,
+                        );
+                        collect_pattern_names(&d.name, &mut self.known_values);
+                        continue;
+                    }
+                    let name = self.lower_pat(&d.name);
                     let kw = if var_decl.kind == VarDeclKind::Const {
                         "let"
                     } else {
                         "let mut"
                     };
                     lines.push(format!("{}{kw} {name} = {val};", self.pad()));
+                    collect_pattern_names(&d.name, &mut self.known_values);
                 }
                 lines.join("\n")
             }
@@ -174,7 +274,14 @@ impl LowerCtx {
                     .function
                     .params
                     .iter()
-                    .map(|p| self.lower_pat(&p.pat))
+                    .map(|p| {
+                        let name = self.lower_pat(&p.pat);
+                        if self.dynamic_values {
+                            format!("{name}: w3cos_core::Value")
+                        } else {
+                            name
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 let body = fn_decl
@@ -183,18 +290,30 @@ impl LowerCtx {
                     .as_ref()
                     .map(|b| self.lower_stmts(&b.stmts))
                     .unwrap_or_default();
-                format!(
-                    "{}fn {name}({params}) {{\n{body}\n{}}}",
-                    self.pad(),
-                    self.pad()
-                )
+                if self.dynamic_values {
+                    format!(
+                        "{}fn {name}({params}) -> w3cos_core::Value {{\n{body}\n{}w3cos_core::Value::Undefined\n{}}}",
+                        self.pad(),
+                        " ".repeat(self.indent + 4),
+                        self.pad()
+                    )
+                } else {
+                    format!(
+                        "{}fn {name}({params}) {{\n{body}\n{}}}",
+                        self.pad(),
+                        self.pad()
+                    )
+                }
             }
             _ => format!("{}/* unsupported decl */", self.pad()),
         }
     }
 
     fn lower_if(&mut self, if_stmt: &IfStmt) -> String {
-        let test = self.lower_expr(&if_stmt.test);
+        let mut test = self.lower_expr(&if_stmt.test);
+        if self.dynamic_values {
+            test = format!("{test}.to_bool()");
+        }
         self.indent += 4;
         let cons = self.lower_stmt(&if_stmt.cons);
         self.indent -= 4;
@@ -243,7 +362,12 @@ impl LowerCtx {
         out.push_str(&format!("{}loop {{\n", self.pad()));
         // Emit break condition
         if test != "true" {
-            out.push_str(&format!("{inner_pad}if !({test}) {{ break; }}\n"));
+            let condition = if self.dynamic_values {
+                format!("{test}.to_bool()")
+            } else {
+                test
+            };
+            out.push_str(&format!("{inner_pad}if !({condition}) {{ break; }}\n"));
         }
         out.push_str(&body);
         out.push('\n');
@@ -302,6 +426,35 @@ impl LowerCtx {
 
     fn lower_switch(&mut self, switch: &SwitchStmt) -> String {
         let disc = self.lower_expr(&switch.discriminant);
+        if self.dynamic_values {
+            let pad = self.pad();
+            let mut out = format!("{pad}'__switch: {{\n{pad}    let __disc = {disc};\n");
+            let mut default_body = None;
+            self.indent += 4;
+            for case in &switch.cases {
+                let body = self
+                    .lower_stmts(&case.cons)
+                    .replace("break;", "break '__switch;");
+                if let Some(test) = &case.test {
+                    let test = self.lower_expr(test);
+                    out.push_str(&format!(
+                        "{}if __disc.strict_eq(&{test}) {{\n{body}\n{}    break '__switch;\n{}}}\n",
+                        self.pad(),
+                        self.pad(),
+                        self.pad()
+                    ));
+                } else {
+                    default_body = Some(body);
+                }
+            }
+            if let Some(body) = default_body {
+                out.push_str(&body);
+                out.push('\n');
+            }
+            self.indent -= 4;
+            out.push_str(&format!("{pad}}}"));
+            return out;
+        }
         let mut out = format!("{}match {} {{\n", self.pad(), disc);
         self.indent += 4;
         for case in &switch.cases {
@@ -325,25 +478,70 @@ impl LowerCtx {
 
     pub fn lower_expr(&self, expr: &Expr) -> String {
         match expr {
-            Expr::Ident(ident) => self.resolve_name(&atom_str(&ident.sym)),
+            Expr::Ident(ident) => self.resolve_value(&atom_str(&ident.sym)),
             Expr::Lit(lit) => self.lower_lit(lit),
             Expr::New(new_expr) => {
-                let callee = self.lower_expr(&new_expr.callee);
+                let callee = match new_expr.callee.as_ref() {
+                    Expr::Ident(identifier) => self.resolve_name(&atom_str(&identifier.sym)),
+                    expression => self.lower_expr(expression),
+                };
                 let args = new_expr
                     .args
                     .as_ref()
                     .map(|a| {
                         a.iter()
-                            .map(|arg| self.lower_expr(&arg.expr))
+                            .map(|arg| self.lower_argument(&arg.expr))
                             .collect::<Vec<_>>()
                             .join(", ")
                     })
                     .unwrap_or_default();
-                format!("{callee}::new({args})")
+                if self.dynamic_values {
+                    if matches!(callee.as_str(), "Error" | "Map" | "ResizeObserver") {
+                        format!("{callee}::new(vec![{args}])")
+                    } else {
+                        format!("{callee}::new()")
+                    }
+                } else {
+                    format!("{callee}::new({args})")
+                }
             }
             Expr::Call(call) => self.lower_call(call),
             Expr::Member(member) => self.lower_member(member),
             Expr::Assign(assign) => {
+                if self.dynamic_values
+                    && let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left
+                {
+                    let object = self.lower_expr(&member.obj);
+                    let key = match &member.prop {
+                        MemberProp::Ident(ident) => format!("{:?}", atom_str(&ident.sym)),
+                        MemberProp::Computed(computed) => {
+                            format!("{}.to_js_string()", self.lower_expr(&computed.expr))
+                        }
+                        MemberProp::PrivateName(name) => {
+                            format!("{:?}", atom_str(&name.name))
+                        }
+                    };
+                    let right = self.lower_expr(&assign.right);
+                    return format!(
+                        "{{ let value = {right}; {object}.set_property(&{key}, value.clone()); value }}"
+                    );
+                }
+                if self.dynamic_values
+                    && let AssignTarget::Simple(SimpleAssignTarget::Ident(identifier)) =
+                        &assign.left
+                {
+                    let local = atom_str(&identifier.id.sym);
+                    if self.value_bindings.contains(&local) {
+                        let bundled = self
+                            .renames
+                            .iter()
+                            .find(|(name, _)| name == &local)
+                            .map(|(_, bundled)| bundled.as_str())
+                            .unwrap_or(&local);
+                        let right = self.lower_expr(&assign.right);
+                        return format!("{bundled}_set({right})");
+                    }
+                }
                 let left = match &assign.left {
                     AssignTarget::Simple(simple) => match simple {
                         SimpleAssignTarget::Ident(i) => self.resolve_name(&atom_str(&i.id.sym)),
@@ -353,21 +551,56 @@ impl LowerCtx {
                     AssignTarget::Pat(_) => "/* pattern assign */".to_string(),
                 };
                 let right = self.lower_expr(&assign.right);
-                format!("{left} = {right}")
+                if self.dynamic_values {
+                    format!("{{ let value = {right}; {left} = value.clone(); value }}")
+                } else {
+                    format!("{left} = {right}")
+                }
             }
             Expr::Bin(bin) => {
                 let left = self.lower_expr(&bin.left);
                 let right = self.lower_expr(&bin.right);
-                let op = lower_bin_op(bin.op);
-                format!("{left} {op} {right}")
+                if self.dynamic_values {
+                    lower_dynamic_bin_op(bin.op, &left, &right)
+                } else {
+                    let op = lower_bin_op(bin.op);
+                    format!("{left} {op} {right}")
+                }
             }
             Expr::Unary(unary) => {
                 let arg = self.lower_expr(&unary.arg);
-                let op = lower_unary_op(unary.op);
-                format!("{op}{arg}")
+                if self.dynamic_values {
+                    match unary.op {
+                        UnaryOp::Bang => format!("{arg}.js_not()"),
+                        UnaryOp::Minus => format!("{arg}.js_neg()"),
+                        UnaryOp::TypeOf => format!("w3cos_core::type_of(&{arg})"),
+                        UnaryOp::Void => "w3cos_core::Value::Undefined".to_string(),
+                        _ => format!("{arg}"),
+                    }
+                } else {
+                    let op = lower_unary_op(unary.op);
+                    format!("{op}{arg}")
+                }
             }
             Expr::Update(update) => {
-                let arg = self.lower_expr(&update.arg);
+                let arg = if self.dynamic_values {
+                    match update.arg.as_ref() {
+                        Expr::Ident(identifier) => self.resolve_name(&atom_str(&identifier.sym)),
+                        expression => self.lower_expr(expression),
+                    }
+                } else {
+                    self.lower_expr(&update.arg)
+                };
+                if self.dynamic_values {
+                    let delta = if update.op == UpdateOp::PlusPlus {
+                        "js_add"
+                    } else {
+                        "js_sub"
+                    };
+                    return format!(
+                        "{{ let previous = {arg}.clone(); {arg} = {arg}.{delta}(&w3cos_core::Value::Number(1.0)); previous }}"
+                    );
+                }
                 let op = if update.op == UpdateOp::PlusPlus {
                     "+= 1"
                 } else {
@@ -380,6 +613,44 @@ impl LowerCtx {
                 format!("({inner})")
             }
             Expr::Arrow(arrow) => {
+                if self.dynamic_values {
+                    let bindings =
+                        lower_closure_params(&arrow.params, &self.renames, &self.value_bindings);
+                    let parameter_names = pattern_names(&arrow.params);
+                    let captures = self
+                        .known_values
+                        .difference(&parameter_names)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let capture_bindings = captures
+                        .iter()
+                        .map(|name| format!("let mut {name} = {name}.clone(); "))
+                        .collect::<String>();
+                    let body = match arrow.body.as_ref() {
+                        BlockStmtOrExpr::Expr(expression) => {
+                            let mut ctx = LowerCtx::new_dynamic_with_bindings(
+                                self.renames.clone(),
+                                self.value_bindings.clone(),
+                            );
+                            ctx.known_values.extend(captures.iter().cloned());
+                            ctx.bind_patterns(&arrow.params);
+                            format!("return {};", ctx.lower_expr(expression))
+                        }
+                        BlockStmtOrExpr::BlockStmt(block) => {
+                            let mut ctx = LowerCtx::new_dynamic_with_bindings(
+                                self.renames.clone(),
+                                self.value_bindings.clone(),
+                            );
+                            ctx.known_values.extend(captures.iter().cloned());
+                            ctx.bind_patterns(&arrow.params);
+                            ctx.indent = self.indent + 4;
+                            ctx.lower_stmts(&block.stmts)
+                        }
+                    };
+                    return format!(
+                        "{{ {capture_bindings} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
+                    );
+                }
                 let params = arrow
                     .params
                     .iter()
@@ -398,7 +669,37 @@ impl LowerCtx {
             }
             Expr::Object(obj) => {
                 if obj.props.is_empty() {
-                    return "Default::default()".to_string();
+                    return "w3cos_core::js_object! {}".to_string();
+                }
+                if obj
+                    .props
+                    .iter()
+                    .any(|property| matches!(property, PropOrSpread::Spread(_)))
+                {
+                    let parts = obj
+                        .props
+                        .iter()
+                        .filter_map(|property| match property {
+                            PropOrSpread::Spread(spread) => Some(self.lower_expr(&spread.expr)),
+                            PropOrSpread::Prop(property) => match property.as_ref() {
+                                Prop::KeyValue(key_value) => Some(format!(
+                                    "w3cos_core::js_object! {{ {} => {} }}",
+                                    self.lower_object_key(&key_value.key),
+                                    self.lower_expr(&key_value.value)
+                                )),
+                                Prop::Shorthand(identifier) => {
+                                    let name = atom_str(&identifier.sym);
+                                    Some(format!(
+                                        "w3cos_core::js_object! {{ {name:?} => {} }}",
+                                        self.resolve_name(&name)
+                                    ))
+                                }
+                                _ => None,
+                            },
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return format!("w3cos_core::Value::object_from_parts(vec![{parts}])");
                 }
                 let fields = obj
                     .props
@@ -406,13 +707,52 @@ impl LowerCtx {
                     .filter_map(|prop| match prop {
                         PropOrSpread::Prop(p) => match p.as_ref() {
                             Prop::KeyValue(kv) => {
-                                let key = self.lower_prop_name(&kv.key);
+                                let key = self.lower_object_key(&kv.key);
                                 let val = self.lower_expr(&kv.value);
-                                Some(format!("{key}: {val}"))
+                                Some(format!("{key} => {val}"))
                             }
                             Prop::Shorthand(ident) => {
                                 let name = atom_str(&ident.sym);
-                                Some(format!("{name}: {}", self.resolve_name(&name)))
+                                Some(format!("{name:?} => {}", self.resolve_name(&name)))
+                            }
+                            Prop::Method(method) => {
+                                let key = self.lower_object_key(&method.key);
+                                let params = method
+                                    .function
+                                    .params
+                                    .iter()
+                                    .map(|parameter| parameter.pat.clone())
+                                    .collect::<Vec<_>>();
+                                let body = method
+                                    .function
+                                    .body
+                                    .as_ref()
+                                    .map(|body| body.stmts.as_slice())
+                                    .unwrap_or_default();
+                                Some(format!(
+                                    "{key} => {}",
+                                    self.lower_dynamic_function_value(&params, body)
+                                ))
+                            }
+                            Prop::Getter(getter) => {
+                                let key = match &getter.key {
+                                    PropName::Ident(identifier) => {
+                                        format!(
+                                            "{:?}",
+                                            format!("__w3cos_getter_{}", identifier.sym)
+                                        )
+                                    }
+                                    _ => return None,
+                                };
+                                let body = getter
+                                    .body
+                                    .as_ref()
+                                    .map(|body| body.stmts.as_slice())
+                                    .unwrap_or_default();
+                                Some(format!(
+                                    "{key} => {}",
+                                    self.lower_dynamic_function_value(&[], body)
+                                ))
                             }
                             _ => None,
                         },
@@ -420,7 +760,7 @@ impl LowerCtx {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("{{ {fields} }}")
+                format!("w3cos_core::js_object! {{ {fields} }}")
             }
             Expr::Array(arr) => {
                 let items = arr
@@ -429,34 +769,35 @@ impl LowerCtx {
                     .filter_map(|e| e.as_ref().map(|el| self.lower_expr(&el.expr)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("vec![{items}]")
+                if self.dynamic_values {
+                    format!("w3cos_core::Value::array(vec![{items}])")
+                } else {
+                    format!("vec![{items}]")
+                }
             }
             Expr::Tpl(tpl) => {
-                let mut parts = Vec::new();
+                let mut value = "w3cos_core::Value::from(\"\")".to_string();
                 for (i, quasi) in tpl.quasis.iter().enumerate() {
                     let raw = quasi.raw.to_string();
                     if !raw.is_empty() {
-                        parts.push(format!("\"{raw}\""));
+                        value = format!("{value}.js_add(&w3cos_core::Value::from({raw:?}))");
                     }
                     if i < tpl.exprs.len() {
-                        parts.push(format!(
-                            "&format!(\"{{}}\", {})",
-                            self.lower_expr(&tpl.exprs[i])
-                        ));
+                        value = format!("{value}.js_add(&{})", self.lower_expr(&tpl.exprs[i]));
                     }
                 }
-                if parts.is_empty() {
-                    "String::new()".to_string()
+                if self.dynamic_values {
+                    value
                 } else {
-                    format!(
-                        "format!(\"{{}}\"{})",
-                        parts.iter().map(|p| format!(", {p}")).collect::<String>()
-                    )
+                    format!("{value}.to_js_string()")
                 }
             }
             Expr::This(_) => "self".to_string(),
             Expr::Cond(cond) => {
-                let test = self.lower_expr(&cond.test);
+                let mut test = self.lower_expr(&cond.test);
+                if self.dynamic_values {
+                    test = format!("{test}.to_bool()");
+                }
                 let cons = self.lower_expr(&cond.cons);
                 let alt = self.lower_expr(&cond.alt);
                 format!("if {test} {{ {cons} }} else {{ {alt} }}")
@@ -490,6 +831,26 @@ impl LowerCtx {
             Expr::OptChain(opt) => match opt.base.as_ref() {
                 OptChainBase::Member(member) => {
                     let obj = self.lower_expr(&member.obj);
+                    if self.dynamic_values {
+                        let property = match &member.prop {
+                            MemberProp::Ident(id) => format!("{:?}", atom_str(&id.sym)),
+                            MemberProp::Computed(computed) => {
+                                format!("&{}.to_js_string()", self.lower_expr(&computed.expr))
+                            }
+                            MemberProp::PrivateName(name) => {
+                                format!("{:?}", atom_str(&name.name))
+                            }
+                        };
+                        return if property.starts_with('&') {
+                            format!(
+                                "if {obj}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ {obj}.get_property({property}) }}"
+                            )
+                        } else {
+                            format!(
+                                "if {obj}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ {obj}.get_property({property}) }}"
+                            )
+                        };
+                    }
                     let prop = match &member.prop {
                         MemberProp::Ident(id) => format!(".{}", atom_str(&id.sym)),
                         MemberProp::Computed(c) => format!("[{}]", self.lower_expr(&c.expr)),
@@ -505,7 +866,13 @@ impl LowerCtx {
                         .map(|a| self.lower_expr(&a.expr))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!("{callee}.map(|f| f({args}))")
+                    if self.dynamic_values {
+                        format!(
+                            "if {callee}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ {callee}.call(w3cos_core::Value::Undefined, vec![{args}]) }}"
+                        )
+                    } else {
+                        format!("{callee}.map(|f| f({args}))")
+                    }
                 }
             },
             Expr::Yield(yield_expr) => {
@@ -517,6 +884,44 @@ impl LowerCtx {
                 format!("/* yield */ {arg}")
             }
             Expr::Fn(fn_expr) => {
+                if self.dynamic_values {
+                    let params = fn_expr
+                        .function
+                        .params
+                        .iter()
+                        .map(|param| param.pat.clone())
+                        .collect::<Vec<_>>();
+                    let bindings =
+                        lower_closure_params(&params, &self.renames, &self.value_bindings);
+                    let parameter_names = pattern_names(&params);
+                    let captures = self
+                        .known_values
+                        .difference(&parameter_names)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let capture_bindings = captures
+                        .iter()
+                        .map(|name| format!("let mut {name} = {name}.clone(); "))
+                        .collect::<String>();
+                    let body = fn_expr
+                        .function
+                        .body
+                        .as_ref()
+                        .map(|block| {
+                            let mut ctx = LowerCtx::new_dynamic_with_bindings(
+                                self.renames.clone(),
+                                self.value_bindings.clone(),
+                            );
+                            ctx.known_values.extend(captures.iter().cloned());
+                            ctx.bind_patterns(&params);
+                            ctx.indent = self.indent + 4;
+                            ctx.lower_stmts(&block.stmts)
+                        })
+                        .unwrap_or_default();
+                    return format!(
+                        "{{ {capture_bindings} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
+                    );
+                }
                 let params = fn_expr
                     .function
                     .params
@@ -547,6 +952,60 @@ impl LowerCtx {
     }
 
     fn lower_call(&self, call: &CallExpr) -> String {
+        if self.dynamic_values
+            && let Callee::Expr(callee) = &call.callee
+            && let Expr::Member(member) = callee.as_ref()
+            && matches!(&member.prop, MemberProp::Ident(identifier) if identifier.sym == *"forEach")
+            && let Some(first) = call.args.first()
+            && let Expr::Arrow(arrow) = first.expr.as_ref()
+        {
+            let object = self.lower_expr(&member.obj);
+            let mut ctx = LowerCtx::new_dynamic_with_bindings(
+                self.renames.clone(),
+                self.value_bindings.clone(),
+            );
+            ctx.known_values = self.known_values.clone();
+            ctx.bind_patterns(&arrow.params);
+            let mut bindings = String::new();
+            if let Some(pattern) = arrow.params.first() {
+                lower_closure_pattern(
+                    pattern,
+                    "__item",
+                    &mut bindings,
+                    &self.renames,
+                    &self.value_bindings,
+                );
+            }
+            let body = match arrow.body.as_ref() {
+                BlockStmtOrExpr::Expr(expression) => {
+                    format!("{};", ctx.lower_expr(expression))
+                }
+                BlockStmtOrExpr::BlockStmt(block) => ctx.lower_stmts(&block.stmts),
+            };
+            return format!(
+                "{{ for __item in {object}.iter() {{ {bindings}{body} }} w3cos_core::Value::Undefined }}"
+            );
+        }
+        if self.dynamic_values
+            && let Callee::Expr(callee) = &call.callee
+            && let Expr::Member(member) = callee.as_ref()
+        {
+            let object = self.lower_expr(&member.obj);
+            let key = match &member.prop {
+                MemberProp::Ident(id) => format!("{:?}", atom_str(&id.sym)),
+                MemberProp::Computed(computed) => {
+                    format!("&{}.to_js_string()", self.lower_expr(&computed.expr))
+                }
+                MemberProp::PrivateName(name) => format!("{:?}", atom_str(&name.name)),
+            };
+            let args = call
+                .args
+                .iter()
+                .map(|arg| self.lower_argument(&arg.expr))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("{object}.call_method({key}, vec![{args}])");
+        }
         let callee = match &call.callee {
             Callee::Expr(e) => self.lower_expr(e),
             _ => "/* super/import call */".to_string(),
@@ -554,14 +1013,60 @@ impl LowerCtx {
         let args = call
             .args
             .iter()
-            .map(|arg| self.lower_expr(&arg.expr))
+            .map(|arg| self.lower_argument(&arg.expr))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{callee}({args})")
+        if self.dynamic_values
+            && let Callee::Expr(expression) = &call.callee
+            && let Expr::Ident(identifier) = expression.as_ref()
+        {
+            let name = atom_str(&identifier.sym);
+            let is_static = self.renames.iter().any(|(local, _)| local == &name)
+                || matches!(
+                    name.as_str(),
+                    "parseInt" | "parseFloat" | "RangeError" | "Error"
+                );
+            if !is_static {
+                return format!("{callee}.call(w3cos_core::Value::Undefined, vec![{args}])");
+            }
+        }
+        if self.dynamic_values {
+            let callee = match &call.callee {
+                Callee::Expr(expression) => match expression.as_ref() {
+                    Expr::Ident(identifier) => {
+                        let name = atom_str(&identifier.sym);
+                        if name == "Error" {
+                            "ErrorValue".to_string()
+                        } else {
+                            self.resolve_name(&name)
+                        }
+                    }
+                    _ => callee,
+                },
+                _ => callee,
+            };
+            format!("{callee}(vec![{args}])")
+        } else {
+            format!("{callee}({args})")
+        }
     }
 
     fn lower_member(&self, member: &MemberExpr) -> String {
         let obj = self.lower_expr(&member.obj);
+        if self.dynamic_values {
+            return match &member.prop {
+                MemberProp::Ident(id) => {
+                    format!("{obj}.get_property({:?})", atom_str(&id.sym))
+                }
+                MemberProp::Computed(computed) => format!(
+                    "{obj}.get_property(&{}.to_js_string())",
+                    self.lower_expr(&computed.expr)
+                ),
+                MemberProp::PrivateName(name) => {
+                    format!("{obj}.get_property({:?})", atom_str(&name.name))
+                }
+            };
+        }
         let prop = match &member.prop {
             MemberProp::Ident(id) => format!(".{}", atom_str(&id.sym)),
             MemberProp::Computed(c) => format!("[{}]", self.lower_expr(&c.expr)),
@@ -570,7 +1075,30 @@ impl LowerCtx {
         format!("{obj}{prop}")
     }
 
+    fn lower_argument(&self, expression: &Expr) -> String {
+        let value = self.lower_expr(expression);
+        if self.dynamic_values {
+            format!("{value}.clone()")
+        } else {
+            value
+        }
+    }
+
     fn lower_lit(&self, lit: &Lit) -> String {
+        if self.dynamic_values {
+            return match lit {
+                Lit::Str(value) => format!(
+                    "w3cos_core::Value::from({:?})",
+                    wtf8_to_string(&value.value)
+                ),
+                Lit::Num(value) => {
+                    format!("w3cos_core::Value::Number({:?})", value.value)
+                }
+                Lit::Bool(value) => format!("w3cos_core::Value::Bool({})", value.value),
+                Lit::Null(_) => "w3cos_core::Value::Null".to_string(),
+                _ => "w3cos_core::Value::Undefined".to_string(),
+            };
+        }
         match lit {
             Lit::Str(s) => {
                 let raw = wtf8_to_string(&s.value);
@@ -643,6 +1171,238 @@ impl LowerCtx {
             PropName::BigInt(b) => format!("{}", b.value),
         }
     }
+
+    fn lower_object_key(&self, name: &PropName) -> String {
+        match name {
+            PropName::Ident(id) => format!("{:?}", atom_str(&id.sym)),
+            PropName::Str(value) => format!("{:?}", wtf8_to_string(&value.value)),
+            PropName::Num(value) => format!("{:?}", value.value.to_string()),
+            PropName::Computed(value) => {
+                format!("{}.to_js_string()", self.lower_expr(&value.expr))
+            }
+            PropName::BigInt(value) => format!("{:?}", value.value.to_string()),
+        }
+    }
+
+    fn lower_dynamic_function_value(&self, params: &[Pat], body: &[Stmt]) -> String {
+        let bindings = lower_closure_params(params, &self.renames, &self.value_bindings);
+        let parameter_names = pattern_names(params);
+        let captures = self
+            .known_values
+            .difference(&parameter_names)
+            .cloned()
+            .collect::<Vec<_>>();
+        let capture_bindings = captures
+            .iter()
+            .map(|name| format!("let mut {name} = {name}.clone(); "))
+            .collect::<String>();
+        let mut ctx =
+            LowerCtx::new_dynamic_with_bindings(self.renames.clone(), self.value_bindings.clone());
+        ctx.known_values.extend(captures.iter().cloned());
+        ctx.bind_patterns(params);
+        let body = ctx.lower_stmts(body);
+        format!(
+            "{{ {capture_bindings} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
+        )
+    }
+
+    fn lower_dynamic_local_pattern(
+        &mut self,
+        pattern: &Pat,
+        source: &str,
+        lines: &mut Vec<String>,
+        indent: usize,
+    ) {
+        let pad = " ".repeat(indent);
+        match pattern {
+            Pat::Ident(ident) => lines.push(format!(
+                "{pad}let {} = {source};",
+                sanitize_ident(&ident.id.sym.to_string())
+            )),
+            Pat::Array(array) => {
+                for (index, element) in array.elems.iter().enumerate() {
+                    if let Some(element) = element {
+                        let nested = format!("{source}.get_property({:?})", index.to_string());
+                        self.lower_dynamic_local_pattern(element, &nested, lines, indent);
+                    }
+                }
+            }
+            Pat::Object(object) => {
+                for property in &object.props {
+                    match property {
+                        ObjectPatProp::Assign(assign) => {
+                            let name = sanitize_ident(&assign.key.sym.to_string());
+                            let value =
+                                format!("{source}.get_property({:?})", assign.key.sym.to_string());
+                            if let Some(default) = &assign.value {
+                                let fallback = self.lower_expr(default);
+                                lines.push(format!(
+                                    "{pad}let {name} = {{ let value = {value}; if value.is_undefined() {{ {fallback} }} else {{ value }} }};"
+                                ));
+                            } else {
+                                lines.push(format!("{pad}let {name} = {value};"));
+                            }
+                        }
+                        ObjectPatProp::KeyValue(key_value) => {
+                            let key = match &key_value.key {
+                                PropName::Ident(ident) => ident.sym.to_string(),
+                                PropName::Str(value) => wtf8_to_string(&value.value),
+                                PropName::Num(value) => value.value.to_string(),
+                                _ => continue,
+                            };
+                            let nested = format!("{source}.get_property({key:?})");
+                            self.lower_dynamic_local_pattern(
+                                &key_value.value,
+                                &nested,
+                                lines,
+                                indent,
+                            );
+                        }
+                        ObjectPatProp::Rest(rest) => {
+                            self.lower_dynamic_local_pattern(&rest.arg, source, lines, indent)
+                        }
+                    }
+                }
+            }
+            Pat::Assign(assign) => {
+                let fallback = self.lower_expr(&assign.right);
+                let value = format!(
+                    "{{ let value = {source}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}"
+                );
+                self.lower_dynamic_local_pattern(&assign.left, &value, lines, indent);
+            }
+            Pat::Rest(rest) => self.lower_dynamic_local_pattern(&rest.arg, source, lines, indent),
+            _ => {}
+        }
+    }
+}
+
+fn lower_closure_params(
+    params: &[Pat],
+    renames: &[(String, String)],
+    value_bindings: &HashSet<String>,
+) -> String {
+    let mut output = String::new();
+    for (index, pattern) in params.iter().enumerate() {
+        let source =
+            format!("__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined)");
+        lower_closure_pattern(pattern, &source, &mut output, renames, value_bindings);
+    }
+    output
+}
+
+fn pattern_names(patterns: &[Pat]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for pattern in patterns {
+        collect_pattern_names(pattern, &mut names);
+    }
+    names
+}
+
+fn collect_pattern_names(pattern: &Pat, names: &mut HashSet<String>) {
+    match pattern {
+        Pat::Ident(identifier) => {
+            names.insert(sanitize_ident(&identifier.id.sym.to_string()));
+        }
+        Pat::Array(array) => {
+            for element in array.elems.iter().flatten() {
+                collect_pattern_names(element, names);
+            }
+        }
+        Pat::Object(object) => {
+            for property in &object.props {
+                match property {
+                    ObjectPatProp::Assign(assign) => {
+                        names.insert(sanitize_ident(&assign.key.sym.to_string()));
+                    }
+                    ObjectPatProp::KeyValue(key_value) => {
+                        collect_pattern_names(&key_value.value, names)
+                    }
+                    ObjectPatProp::Rest(rest) => collect_pattern_names(&rest.arg, names),
+                }
+            }
+        }
+        Pat::Assign(assign) => collect_pattern_names(&assign.left, names),
+        Pat::Rest(rest) => collect_pattern_names(&rest.arg, names),
+        _ => {}
+    }
+}
+
+fn lower_closure_pattern(
+    pattern: &Pat,
+    source: &str,
+    output: &mut String,
+    renames: &[(String, String)],
+    value_bindings: &HashSet<String>,
+) {
+    match pattern {
+        Pat::Ident(ident) => output.push_str(&format!(
+            "let {} = {source}; ",
+            sanitize_ident(&ident.id.sym.to_string())
+        )),
+        Pat::Array(array) => {
+            for (index, element) in array.elems.iter().enumerate() {
+                if let Some(element) = element {
+                    let nested = format!("{source}.get_property({:?})", index.to_string());
+                    lower_closure_pattern(element, &nested, output, renames, value_bindings);
+                }
+            }
+        }
+        Pat::Object(object) => {
+            for property in &object.props {
+                match property {
+                    ObjectPatProp::Assign(assign) => {
+                        let name = sanitize_ident(&assign.key.sym.to_string());
+                        let value =
+                            format!("{source}.get_property({:?})", assign.key.sym.to_string());
+                        if let Some(default) = &assign.value {
+                            let ctx = LowerCtx::new_dynamic_with_bindings(
+                                renames.to_vec(),
+                                value_bindings.clone(),
+                            );
+                            let fallback = ctx.lower_expr(default);
+                            output.push_str(&format!(
+                                "let {name} = {{ let value = {value}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}; "
+                            ));
+                        } else {
+                            output.push_str(&format!("let {name} = {value}; "));
+                        }
+                    }
+                    ObjectPatProp::KeyValue(key_value) => {
+                        let key = match &key_value.key {
+                            PropName::Ident(ident) => ident.sym.to_string(),
+                            PropName::Str(value) => wtf8_to_string(&value.value),
+                            PropName::Num(value) => value.value.to_string(),
+                            _ => continue,
+                        };
+                        let nested = format!("{source}.get_property({key:?})");
+                        lower_closure_pattern(
+                            &key_value.value,
+                            &nested,
+                            output,
+                            renames,
+                            value_bindings,
+                        );
+                    }
+                    ObjectPatProp::Rest(rest) => {
+                        lower_closure_pattern(&rest.arg, source, output, renames, value_bindings)
+                    }
+                }
+            }
+        }
+        Pat::Assign(assign) => {
+            let ctx = LowerCtx::new_dynamic_with_bindings(renames.to_vec(), value_bindings.clone());
+            let fallback = ctx.lower_expr(&assign.right);
+            let nested = format!(
+                "{{ let value = {source}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}"
+            );
+            lower_closure_pattern(&assign.left, &nested, output, renames, value_bindings);
+        }
+        Pat::Rest(rest) => {
+            lower_closure_pattern(&rest.arg, source, output, renames, value_bindings)
+        }
+        _ => {}
+    }
 }
 
 fn atom_str(atom: &impl ToString) -> String {
@@ -657,8 +1417,8 @@ fn wtf8_to_string(atom: &impl std::fmt::Debug) -> String {
 /// Sanitize a JS identifier to be valid Rust: replace `$` with `_d`, leading
 /// digits get prefixed with `_`, and Rust keywords get suffixed with `_`.
 pub fn sanitize_ident(name: &str) -> String {
-    if name.is_empty() {
-        return "_".to_string();
+    if name.is_empty() || name == "_" {
+        return "_unused".to_string();
     }
     let mut out = String::with_capacity(name.len());
     for (i, ch) in name.chars().enumerate() {
@@ -712,6 +1472,42 @@ fn lower_bin_op(op: BinaryOp) -> &'static str {
         BinaryOp::Exp => "/* ** */",
         BinaryOp::In => "/* in */==",
         BinaryOp::InstanceOf => "/* instanceof */==",
+    }
+}
+
+fn lower_dynamic_bin_op(op: BinaryOp, left: &str, right: &str) -> String {
+    match op {
+        BinaryOp::Add => format!("{left}.js_add(&{right})"),
+        BinaryOp::Sub => format!("{left}.js_sub(&{right})"),
+        BinaryOp::Mul => format!("{left}.js_mul(&{right})"),
+        BinaryOp::Div => format!("{left}.js_div(&{right})"),
+        BinaryOp::Mod => format!("{left}.js_rem(&{right})"),
+        BinaryOp::Exp => format!("{left}.js_pow(&{right})"),
+        BinaryOp::EqEqEq => format!("w3cos_core::Value::Bool({left}.strict_eq(&{right}))"),
+        BinaryOp::NotEqEq => format!("w3cos_core::Value::Bool(!{left}.strict_eq(&{right}))"),
+        BinaryOp::EqEq => format!("w3cos_core::Value::Bool({left}.abstract_eq(&{right}))"),
+        BinaryOp::NotEq => format!("w3cos_core::Value::Bool(!{left}.abstract_eq(&{right}))"),
+        BinaryOp::Lt => format!("w3cos_core::Value::Bool({left}.js_lt(&{right}))"),
+        BinaryOp::LtEq => format!("w3cos_core::Value::Bool({left}.js_le(&{right}))"),
+        BinaryOp::Gt => format!("w3cos_core::Value::Bool({left}.js_gt(&{right}))"),
+        BinaryOp::GtEq => format!("w3cos_core::Value::Bool({left}.js_ge(&{right}))"),
+        BinaryOp::LogicalAnd => {
+            format!("if {left}.to_bool() {{ {right} }} else {{ {left}.clone() }}")
+        }
+        BinaryOp::LogicalOr => {
+            format!("if {left}.to_bool() {{ {left}.clone() }} else {{ {right} }}")
+        }
+        BinaryOp::NullishCoalescing => {
+            format!("if {left}.is_nullish() {{ {right} }} else {{ {left}.clone() }}")
+        }
+        BinaryOp::BitAnd => format!("{left}.js_bitand(&{right})"),
+        BinaryOp::BitOr => format!("{left}.js_bitor(&{right})"),
+        BinaryOp::BitXor => format!("{left}.js_bitxor(&{right})"),
+        BinaryOp::LShift => format!("{left}.js_shl(&{right})"),
+        BinaryOp::RShift => format!("{left}.js_shr(&{right})"),
+        BinaryOp::ZeroFillRShift => format!("{left}.js_ushr(&{right})"),
+        BinaryOp::In => format!("{left}.js_in(&{right})"),
+        BinaryOp::InstanceOf => "w3cos_core::Value::Bool(false)".to_string(),
     }
 }
 
@@ -797,7 +1593,59 @@ mod tests {
         let mut ctx = LowerCtx::new(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(code.contains("state.create("), "method call: {code}");
-        assert!(code.contains("doc: \"hi\""), "object arg: {code}");
+        assert!(
+            code.contains("w3cos_core::js_object! { \"doc\" => \"hi\" }"),
+            "object arg: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_object_literals_to_dynamic_js_values() {
+        let stmts = parse_stmts("const props = { rowCount: 1000, 'aria-label': \"rows\" };");
+        let mut ctx = LowerCtx::new(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("\"rowCount\" => 1000"),
+            "identifier key: {code}"
+        );
+        assert!(
+            code.contains("\"aria-label\" => \"rows\""),
+            "string key: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_binds_local_destructuring_patterns() {
+        let stmts =
+            parse_stmts("const [value, setValue] = state; const {height: h, width = 10} = size;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("let value = __binding0.get_property(\"0\")")
+                && code.contains("let setValue = __binding0.get_property(\"1\")"),
+            "array destructuring: {code}"
+        );
+        assert!(
+            code.contains("let h = __binding1.get_property(\"height\")")
+                && code.contains("let width = { let value = __binding1.get_property(\"width\")"),
+            "object destructuring: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_wraps_arrow_functions_and_member_assignment() {
+        let stmts = parse_stmts(
+            "const update = ({current}, value) => { current.value = value; return current?.value; };",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("Value::function(move |_this, __args|")
+                && code.contains("let current = __args.get(0)")
+                && code.contains("set_property(&\"value\"")
+                && code.contains("is_nullish()"),
+            "dynamic closure lowering: {code}"
+        );
     }
 
     #[test]

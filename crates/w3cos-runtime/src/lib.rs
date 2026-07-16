@@ -9,6 +9,7 @@ pub mod dom;
 pub mod eventsource;
 pub mod fetch;
 pub mod filter;
+mod fling;
 pub mod font_face;
 pub mod frame_cache;
 pub mod fs;
@@ -31,12 +32,14 @@ pub mod multi_window;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod notification;
 pub mod observers;
+mod overscroll;
 pub mod perf;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod process;
 #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
 pub mod pty;
 pub mod pwa;
+pub mod speech;
 pub mod state;
 pub mod storage;
 pub mod streams;

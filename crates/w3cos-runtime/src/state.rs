@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use w3cos_std::EventAction;
 
 /// Thread-local reactive signal store.
@@ -6,6 +7,7 @@ use w3cos_std::EventAction;
 /// When any signal changes, the `dirty` flag is set, prompting a UI rebuild.
 pub(crate) struct SignalStore {
     values: Vec<i64>,
+    text_values: HashMap<usize, String>,
     pub(crate) dirty: bool,
 }
 
@@ -13,6 +15,7 @@ impl SignalStore {
     fn new() -> Self {
         Self {
             values: Vec::new(),
+            text_values: HashMap::new(),
             dirty: false,
         }
     }
@@ -36,6 +39,28 @@ fn signal_id(name: &str) -> usize {
 /// Parse onClick action strings emitted by w3cos-compiler.
 pub fn parse_action_string(action_str: &str) -> EventAction {
     let parts: Vec<&str> = action_str.split(':').collect();
+    if parts.first().is_some_and(|part| part.trim() == "speech") {
+        return match parts.get(1).map(|part| part.trim()) {
+            Some("start") if parts.len() >= 10 => EventAction::SpeechRecognitionStart {
+                transcript_signal: signal_id(parts[2].trim()),
+                final_signal: signal_id(parts[3].trim()),
+                confidence_signal: signal_id(parts[4].trim()),
+                status_signal: signal_id(parts[5].trim()),
+                lang: parts[6].trim().to_string(),
+                process_locally: matches!(parts[7].trim(), "1" | "true"),
+                continuous: matches!(parts[8].trim(), "1" | "true"),
+                interim_results: matches!(parts[9].trim(), "1" | "true"),
+            },
+            Some("stop") => EventAction::SpeechRecognitionStop {
+                after_signal: parts.get(2).map(|name| signal_id(name.trim())),
+                after_value: parts
+                    .get(3)
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+                    .unwrap_or(0),
+            },
+            _ => EventAction::None,
+        };
+    }
     if parts.len() >= 2 && parts[0].trim() == "history" {
         let op = parts[1].trim();
         let route_name = parts.get(2).map(|s| s.trim()).unwrap_or("route");
@@ -107,9 +132,33 @@ pub fn create_signal(initial: i64) -> usize {
     })
 }
 
+/// Create a string-valued reactive signal. Numeric reads return zero, while
+/// generated text interpolation uses [`get_signal_text`].
+pub fn create_text_signal(initial: &str) -> usize {
+    STORE.with(|s| {
+        let mut store = s.borrow_mut();
+        let id = store.values.len();
+        store.values.push(0);
+        store.text_values.insert(id, initial.to_string());
+        id
+    })
+}
+
 /// Read the current value of a signal.
 pub fn get_signal(id: usize) -> i64 {
     STORE.with(|s| s.borrow().values.get(id).copied().unwrap_or(0))
+}
+
+/// Read a signal in display form, preserving string-valued signals.
+pub fn get_signal_text(id: usize) -> String {
+    STORE.with(|s| {
+        let store = s.borrow();
+        store
+            .text_values
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| store.values.get(id).copied().unwrap_or(0).to_string())
+    })
 }
 
 /// Set a signal to a new value. Marks the store as dirty.
@@ -120,6 +169,19 @@ pub fn set_signal(id: usize, value: i64) {
             && *slot != value
         {
             *slot = value;
+            store.dirty = true;
+        }
+    })
+}
+
+/// Update a string-valued signal and mark the component tree dirty.
+pub fn set_text_signal(id: usize, value: impl Into<String>) {
+    let value = value.into();
+    STORE.with(|s| {
+        let mut store = s.borrow_mut();
+        let changed = store.text_values.get(&id) != Some(&value);
+        if changed {
+            store.text_values.insert(id, value);
             store.dirty = true;
         }
     })
@@ -201,6 +263,39 @@ pub fn execute_action(action: &w3cos_std::EventAction) {
             let bytes = resp.array_buffer().map(|b| b.len() as i64).unwrap_or(-1);
             set_signal(*bytes_signal, bytes);
         }
+        w3cos_std::EventAction::SpeechRecognitionStart {
+            transcript_signal,
+            final_signal,
+            confidence_signal,
+            status_signal,
+            lang,
+            process_locally,
+            continuous,
+            interim_results,
+        } => {
+            crate::speech::start(crate::speech::SpeechRecognitionBinding {
+                transcript_signal: *transcript_signal,
+                final_signal: *final_signal,
+                confidence_signal: *confidence_signal,
+                status_signal: *status_signal,
+                options: crate::speech::SpeechRecognitionOptions {
+                    lang: lang.clone(),
+                    process_locally: *process_locally,
+                    continuous: *continuous,
+                    interim_results: *interim_results,
+                },
+            });
+        }
+        w3cos_std::EventAction::SpeechRecognitionStop {
+            after_signal,
+            after_value,
+        } => {
+            crate::speech::stop();
+            if let Some(signal) = after_signal {
+                set_signal(*signal, *after_value);
+            }
+        }
+        w3cos_std::EventAction::NativeScroll(_) => {}
     }
 }
 
@@ -230,6 +325,16 @@ mod tests {
         clear_dirty();
         set_signal(id, 5);
         assert!(!is_dirty());
+    }
+
+    #[test]
+    fn text_signal_preserves_utf8_and_marks_dirty() {
+        let id = create_text_signal("等待识别");
+        assert_eq!(get_signal_text(id), "等待识别");
+        clear_dirty();
+        set_text_signal(id, "上海到杭州");
+        assert!(is_dirty());
+        assert_eq!(get_signal_text(id), "上海到杭州");
     }
 
     #[test]
@@ -265,5 +370,24 @@ mod tests {
         let _ = create_signal(0);
         execute_action(&parse_action_string("history:push:route:2:/css"));
         assert_eq!(get_signal(0), 2);
+    }
+
+    #[test]
+    fn parse_speech_recognition_start() {
+        for name in ["transcript", "final", "confidence", "status"] {
+            register_signal_name(name);
+            let _ = create_signal(0);
+        }
+        let action =
+            parse_action_string("speech:start:transcript:final:confidence:status:zh-CN:1:1:1");
+        assert!(matches!(
+            action,
+            EventAction::SpeechRecognitionStart {
+                process_locally: true,
+                continuous: true,
+                interim_results: true,
+                ..
+            }
+        ));
     }
 }

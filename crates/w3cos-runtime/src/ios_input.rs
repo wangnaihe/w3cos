@@ -181,7 +181,10 @@ fn text_field(window: &Window, create: bool) -> Option<&AnyObject> {
     // Keep UIKit's full UITextInput implementation for marked text/candidate
     // handling, while w3cos remains responsible for drawing the visible field.
     let frame = CGRect {
-        origin: CGPoint { x: -2.0, y: -2.0 },
+        // Keep the transparent IME client inside the window. Newer UIKit
+        // versions can show a keyboard for an offscreen first responder while
+        // still withholding the effective text-input focus.
+        origin: CGPoint { x: 1.0, y: 1.0 },
         size: CGSize {
             width: 1.0,
             height: 1.0,
@@ -192,7 +195,10 @@ fn text_field(window: &Window, create: bool) -> Option<&AnyObject> {
         return None;
     }
     let _: () = unsafe { objc2::msg_send![&*field, setTag: IME_TEXT_FIELD_TAG] };
-    let _: () = unsafe { objc2::msg_send![&*field, setAccessibilityElementsHidden: true] };
+    let _: () = unsafe { objc2::msg_send![&*field, setIsAccessibilityElement: true] };
+    if let Some(identifier) = ns_string("w3cos-native-text-input") {
+        let _: () = unsafe { objc2::msg_send![&*field, setAccessibilityIdentifier: &*identifier] };
+    }
     let color_class = AnyClass::get("UIColor")?;
     let clear: *mut AnyObject = unsafe { objc2::msg_send![color_class, clearColor] };
     let _: () = unsafe { objc2::msg_send![&*field, setTextColor: clear] };

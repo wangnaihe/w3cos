@@ -20,6 +20,21 @@ pub enum Value {
     Function(JsFunction),
 }
 
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
+            (Value::Bool(left), Value::Bool(right)) => left == right,
+            (Value::Number(left), Value::Number(right)) => left == right,
+            (Value::String(left), Value::String(right)) => left == right,
+            (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
+            (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
+            (Value::Function(_), Value::Function(_)) => false,
+            _ => false,
+        }
+    }
+}
+
 /// A callable JS function stored as a reference-counted closure.
 #[derive(Clone)]
 pub struct JsFunction {
@@ -183,7 +198,18 @@ impl Value {
     /// Property access: `obj[key]` or `obj.key`.
     pub fn get_property(&self, key: &str) -> Value {
         match self {
-            Value::Object(o) => o.borrow().get(key, self).clone(),
+            Value::Object(o) => {
+                let value = o.borrow().get(key, self).clone();
+                if !value.is_undefined() {
+                    value
+                } else {
+                    let getter = o
+                        .borrow()
+                        .get(&format!("__w3cos_getter_{key}"), self)
+                        .clone();
+                    getter.call(self.clone(), vec![])
+                }
+            }
             Value::Array(arr) => {
                 if let Ok(idx) = key.parse::<usize>() {
                     arr.borrow().get(idx).cloned().unwrap_or(Value::Undefined)
@@ -250,9 +276,143 @@ impl Value {
         Value::Object(Rc::new(RefCell::new(crate::JsObject::from_map(props))))
     }
 
+    pub fn object_from_parts(parts: Vec<Value>) -> Self {
+        let mut properties = HashMap::new();
+        for part in parts {
+            if let Value::Object(object) = part {
+                let object = object.borrow();
+                for key in object.keys() {
+                    properties.insert(key.clone(), object.get_direct(&key));
+                }
+            }
+        }
+        Value::object(properties)
+    }
+
     pub fn function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
         Value::Function(JsFunction::new(f))
     }
+
+    /// Invoke a dynamically lowered JavaScript function value.
+    pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
+        match self {
+            Value::Function(function) => function.call(this, args),
+            _ => Value::Undefined,
+        }
+    }
+
+    /// Invoke a property as a method while preserving the JavaScript receiver.
+    pub fn call_method(&self, key: &str, args: Vec<Value>) -> Value {
+        match (self, key) {
+            (Value::String(value), "endsWith") => {
+                return Value::Bool(
+                    args.first()
+                        .is_some_and(|suffix| value.ends_with(&suffix.to_js_string())),
+                );
+            }
+            (Value::Array(values), "filter") => {
+                let predicate = args.first().cloned().unwrap_or(Value::Undefined);
+                let filtered = values
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, value)| {
+                        predicate
+                            .call(
+                                Value::Undefined,
+                                vec![value.clone(), Value::Number(index as f64)],
+                            )
+                            .to_bool()
+                            .then(|| value.clone())
+                    })
+                    .collect();
+                return Value::array(filtered);
+            }
+            (Value::Array(values), "push") => {
+                let mut values = values.borrow_mut();
+                values.extend(args);
+                return Value::Number(values.len() as f64);
+            }
+            (Value::Array(values), "forEach") => {
+                let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                for (index, value) in values.borrow().iter().cloned().enumerate() {
+                    callback.call(
+                        Value::Undefined,
+                        vec![value, Value::Number(index as f64), self.clone()],
+                    );
+                }
+                return Value::Undefined;
+            }
+            _ => {}
+        }
+        self.get_property(key).call(self.clone(), args)
+    }
+
+    pub fn iter(&self) -> std::vec::IntoIter<Value> {
+        match self {
+            Value::Array(values) => values.borrow().clone().into_iter(),
+            _ => Vec::new().into_iter(),
+        }
+    }
+}
+
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        Value::String(value.to_string())
+    }
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Value::String(value)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Value::Bool(value)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(value: f64) -> Self {
+        Value::Number(value)
+    }
+}
+
+impl From<f32> for Value {
+    fn from(value: f32) -> Self {
+        Value::Number(value as f64)
+    }
+}
+
+macro_rules! impl_number_value_from {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl From<$ty> for Value {
+                fn from(value: $ty) -> Self {
+                    Value::Number(value as f64)
+                }
+            }
+        )*
+    };
+}
+
+impl_number_value_from!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+
+impl From<Vec<Value>> for Value {
+    fn from(value: Vec<Value>) -> Self {
+        Value::array(value)
+    }
+}
+
+#[macro_export]
+macro_rules! js_object {
+    ($($key:expr => $value:expr),* $(,)?) => {{
+        let mut properties = ::std::collections::HashMap::new();
+        $(properties.insert(($key).to_string(), $crate::Value::from($value));)*
+        $crate::Value::object(properties)
+    }};
 }
 
 // ── Arithmetic / comparison operators ──────────────────────────────────
@@ -517,6 +677,28 @@ mod tests {
         assert!(Value::Number(0.0).js_in(&arr).to_bool());
         assert!(Value::Number(1.0).js_in(&arr).to_bool());
         assert!(!Value::Number(2.0).js_in(&arr).to_bool());
+    }
+
+    #[test]
+    fn js_object_macro_builds_dynamic_properties() {
+        let object = crate::js_object! {
+            "rowCount" => 1_000,
+            "label" => "rows",
+            "enabled" => true,
+        };
+        assert_eq!(object.get_property("rowCount").to_number(), 1_000.0);
+        assert_eq!(object.get_property("label").to_js_string(), "rows");
+        assert!(object.get_property("enabled").to_bool());
+    }
+
+    #[test]
+    fn dynamic_function_call_preserves_receiver() {
+        let receiver = crate::js_object! { "value" => 42 };
+        receiver.set_property(
+            "read",
+            Value::function(|this, _| this.get_property("value")),
+        );
+        assert_eq!(receiver.call_method("read", vec![]).to_number(), 42.0);
     }
 
     #[test]

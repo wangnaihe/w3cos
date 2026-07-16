@@ -110,7 +110,7 @@ pub fn mobile_build(
     release: bool,
     devtools: bool,
 ) -> Result<()> {
-    let (_, _, entry, safe_area, interactive_widget) = read_app_manifest(project_dir);
+    let (_, _, entry, safe_area, interactive_widget, _) = read_app_manifest(project_dir);
     let app_tsx = project_dir.join(&entry);
     if !app_tsx.exists() {
         bail!("missing entry {} in {}", entry, project_dir.display());
@@ -159,7 +159,7 @@ pub fn mobile_dev(
     devtools_port: u16,
 ) -> Result<()> {
     let devtools = resolve_mobile_devtools(release, devtools, no_devtools);
-    let (_, bundle_id, entry, _, _) = read_app_manifest(project_dir);
+    let (_, bundle_id, entry, _, _, _) = read_app_manifest(project_dir);
     let app_tsx = project_dir.join(&entry);
     if !app_tsx.exists() {
         bail!("missing entry {} in {}", entry, project_dir.display());
@@ -286,7 +286,7 @@ fn reinstall_android(project_dir: &Path, release: bool) -> Result<()> {
         .status()
         .context("adb install failed")?;
     if status.success() {
-        let (_, bundle_id, _, _, _) = read_app_manifest(project_dir);
+        let (_, bundle_id, _, _, _, _) = read_app_manifest(project_dir);
         let _ = Command::new("adb")
             .args(["shell", "am", "force-stop", &bundle_id])
             .status();
@@ -415,13 +415,14 @@ fn xcode_available() -> bool {
         .unwrap_or(false)
 }
 
-fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, String) {
+fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, String, Vec<String>) {
     let manifest_path = project_dir.join("w3cos.app.json");
     let mut display_name = "W3cosApp".to_string();
     let mut bundle_id = "com.example.w3cos.app".to_string();
     let mut entry = "app.tsx".to_string();
     let mut safe_area = true;
     let mut interactive_widget = "resizes-content".to_string();
+    let mut permissions = Vec::new();
     if let Ok(raw) = fs::read_to_string(&manifest_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
@@ -439,6 +440,12 @@ fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, Strin
             if let Some(iw) = json.get("interactive_widget").and_then(|v| v.as_str()) {
                 interactive_widget = iw.to_string();
             }
+            if let Some(values) = json.get("permissions").and_then(|v| v.as_array()) {
+                permissions = values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect();
+            }
         }
     }
     (
@@ -447,10 +454,28 @@ fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, Strin
         entry,
         safe_area,
         interactive_widget,
+        permissions,
     )
 }
 
-fn write_ios_plist(path: &Path, display_name: &str, bundle_id: &str) -> Result<()> {
+fn write_ios_plist(
+    path: &Path,
+    display_name: &str,
+    bundle_id: &str,
+    permissions: &[String],
+) -> Result<()> {
+    let speech_permissions = if permissions
+        .iter()
+        .any(|value| value == "speech-recognition")
+    {
+        r#"    <key>NSMicrophoneUsageDescription</key>
+    <string>Record speech for on-device recognition.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Transcribe speech into structured application input.</string>
+"#
+    } else {
+        ""
+    };
     let content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -476,7 +501,7 @@ fn write_ios_plist(path: &Path, display_name: &str, bundle_id: &str) -> Result<(
     <string>1</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
-    <key>UILaunchScreen</key>
+{speech_permissions}    <key>UILaunchScreen</key>
     <dict/>
     <key>UIRequiredDeviceCapabilities</key>
     <array>
@@ -534,10 +559,10 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         bail!("missing iOS binary: {}", bin.display());
     }
 
-    let (display_name, bundle_id, _, _, _) = read_app_manifest(project_dir);
+    let (display_name, bundle_id, _, _, _, permissions) = read_app_manifest(project_dir);
 
     let plist_src = ios_dir.join("W3cosApp/Info.plist");
-    write_ios_plist(&plist_src, &display_name, &bundle_id)?;
+    write_ios_plist(&plist_src, &display_name, &bundle_id, &permissions)?;
 
     let app_bundle = ios_dir.join("W3cosApp.app");
     if app_bundle.exists() {
@@ -545,7 +570,12 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
     }
     fs::create_dir_all(&app_bundle)?;
     fs::copy(&bin, app_bundle.join("W3cosApp"))?;
-    write_ios_plist(&app_bundle.join("Info.plist"), &display_name, &bundle_id)?;
+    write_ios_plist(
+        &app_bundle.join("Info.plist"),
+        &display_name,
+        &bundle_id,
+        &permissions,
+    )?;
     println!(
         "✅ iOS app bundle: {} ({})",
         app_bundle.display(),

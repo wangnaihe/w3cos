@@ -27,6 +27,7 @@ libc = "0.2"
 tempfile = { workspace = true }
 glob = { workspace = true }
 w3cos-ffi = { path = "../w3cos-ffi" }
+w3cos-react-compat = { workspace = true }
 
 # GPU rendering (default)
 vello = { workspace = true, optional = true }
@@ -66,7 +67,6 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal"] }
 
 [dev-dependencies]
 w3cos-a11y = { workspace = true }
-w3cos-react-compat = { workspace = true }
 w3cos-core = { workspace = true }
 
 # Mobile-friendly HTTP + DevTools CDP (Chrome remote debug via adb forward / sim localhost)

@@ -13,23 +13,76 @@ pub fn write_mobile_project(
     interactive_widget: &str,
     options: &CompileOptions,
 ) -> Result<()> {
+    write_mobile_project_with_react(
+        tree,
+        stylesheet,
+        output_dir,
+        platform,
+        safe_area,
+        interactive_widget,
+        options,
+        None,
+    )
+}
+
+pub fn write_mobile_hybrid_project(
+    tree: &AppTree,
+    stylesheet: &Stylesheet,
+    react_bundle: &str,
+    output_dir: &Path,
+    platform: &str,
+    safe_area: bool,
+    interactive_widget: &str,
+    options: &CompileOptions,
+) -> Result<()> {
+    write_mobile_project_with_react(
+        tree,
+        stylesheet,
+        output_dir,
+        platform,
+        safe_area,
+        interactive_widget,
+        options,
+        Some(react_bundle),
+    )
+}
+
+fn write_mobile_project_with_react(
+    tree: &AppTree,
+    stylesheet: &Stylesheet,
+    output_dir: &Path,
+    platform: &str,
+    safe_area: bool,
+    interactive_widget: &str,
+    options: &CompileOptions,
+    react_bundle: Option<&str>,
+) -> Result<()> {
     std::fs::create_dir_all(output_dir.join("src"))?;
     let body = generate_app_body(tree, stylesheet)?;
+    if let Some(bundle) = react_bundle {
+        std::fs::write(output_dir.join("src/esm_bundle.rs"), bundle)?;
+    }
     if platform == "ios" {
         std::fs::write(output_dir.join("src/app_ui.rs"), &body)?;
         std::fs::write(
             output_dir.join("src/layout_export.rs"),
-            generate_layout_export(tree, safe_area)?,
+            generate_layout_export(tree, safe_area, react_bundle.is_some())?,
         )?;
-        std::fs::write(
-            output_dir.join("src/main.rs"),
-            generate_ios_main(safe_area, interactive_widget)?,
-        )?;
+        let mut main = generate_ios_main(safe_area, interactive_widget)?;
+        if react_bundle.is_some() {
+            main = main.replacen("mod app_ui;", "mod esm_bundle;\nmod app_ui;", 1);
+        }
+        std::fs::write(output_dir.join("src/main.rs"), main)?;
         std::fs::write(
             output_dir.join("Cargo.toml"),
             generate_ios_cargo_toml(options)?,
         )?;
     } else {
+        let body = if react_bundle.is_some() {
+            format!("mod esm_bundle;\n{body}")
+        } else {
+            body
+        };
         std::fs::write(
             output_dir.join("src/lib.rs"),
             generate_android_lib(&body, interactive_widget)?,
@@ -40,6 +93,63 @@ pub fn write_mobile_project(
         )?;
     }
     Ok(())
+}
+
+pub fn write_mobile_react_project(
+    bundle: &str,
+    output_dir: &Path,
+    platform: &str,
+    safe_area: bool,
+    interactive_widget: &str,
+    options: &CompileOptions,
+) -> Result<()> {
+    std::fs::create_dir_all(output_dir.join("src"))?;
+    std::fs::write(output_dir.join("src/esm_bundle.rs"), bundle)?;
+    let body = r#"use w3cos_std::Component;
+
+pub fn build_ui() -> Component {
+    w3cos_react_compat::aot::render_to_component(crate::esm_bundle::run_entry())
+}
+"#;
+    if platform == "ios" {
+        std::fs::write(output_dir.join("src/app_ui.rs"), body)?;
+        std::fs::write(
+            output_dir.join("src/layout_export.rs"),
+            generate_react_layout_export(safe_area),
+        )?;
+        let main = generate_ios_main(safe_area, interactive_widget)?.replacen(
+            "mod app_ui;",
+            "mod esm_bundle;\nmod app_ui;",
+            1,
+        );
+        std::fs::write(output_dir.join("src/main.rs"), main)?;
+        std::fs::write(
+            output_dir.join("Cargo.toml"),
+            generate_ios_cargo_toml(options)?,
+        )?;
+    } else {
+        let body = format!("mod esm_bundle;\n{body}");
+        std::fs::write(
+            output_dir.join("src/lib.rs"),
+            generate_android_lib(&body, interactive_widget)?,
+        )?;
+        std::fs::write(
+            output_dir.join("Cargo.toml"),
+            generate_android_cargo_toml(options)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn generate_react_layout_export(safe_area: bool) -> String {
+    let safe_init = if safe_area {
+        "    w3cos_std::safe_area::set_enabled(true);\n"
+    } else {
+        ""
+    };
+    format!(
+        "mod esm_bundle;\nmod app_ui;\nfn main() {{\n{safe_init}    let root = app_ui::build_ui();\n    let layout = w3cos_runtime::layout::compute(&root, 402.0, 874.0).expect(\"layout compute\");\n    println!(\"{{}}\", serde_json::json!({{\"nodes\": layout.len()}}));\n}}\n"
+    )
 }
 
 fn generate_app_body(tree: &AppTree, stylesheet: &Stylesheet) -> Result<String> {
@@ -97,7 +207,7 @@ fn main() {{
     ))
 }
 
-fn generate_layout_export(tree: &AppTree, safe_area: bool) -> Result<String> {
+fn generate_layout_export(tree: &AppTree, safe_area: bool, react_bundle: bool) -> Result<String> {
     let signal_inits = gen_signal_inits(&tree.signals);
     let safe_init = if safe_area {
         r#"    w3cos_std::safe_area::set_enabled(true);
@@ -111,9 +221,14 @@ fn generate_layout_export(tree: &AppTree, safe_area: bool) -> Result<String> {
     } else {
         ""
     };
+    let modules = if react_bundle {
+        "mod esm_bundle;\nmod app_ui;"
+    } else {
+        "mod app_ui;"
+    };
     Ok(format!(
         r#"//! Auto-generated layout metrics export — do not edit.
-mod app_ui;
+{modules}
 use app_ui::build_ui;
 
 fn main() {{
@@ -149,6 +264,7 @@ fn main() {{
 "#,
         signal_inits = signal_inits,
         safe_init = safe_init,
+        modules = modules,
     ))
 }
 
@@ -189,10 +305,10 @@ fn gen_signal_inits(signals: &[SignalDecl]) -> String {
     let register: Vec<String> = signals
         .iter()
         .map(|sig| {
+            let initializer = sig.initial.rust_initializer();
             format!(
-                "        w3cos_runtime::state::register_signal_name({name:?});\n        let _ = w3cos_runtime::state::create_signal({initial});",
+                "        w3cos_runtime::state::register_signal_name({name:?});\n        let _ = {initializer};",
                 name = sig.name,
-                initial = sig.initial,
             )
         })
         .collect();
@@ -212,10 +328,14 @@ fn deps_block(root: &Path, options: &CompileOptions) -> String {
         r#"w3cos-mobile = {{ path = "{mobile}" }}
 w3cos-runtime = {{ path = "{runtime}"{runtime_features} }}
 w3cos-std = {{ path = "{std}" }}
+w3cos-core = {{ path = "{core}" }}
+w3cos-react-compat = {{ path = "{react}" }}
 log = "0.4""#,
         mobile = root.join("crates/w3cos-mobile").display(),
         runtime = root.join("crates/w3cos-runtime").display(),
         std = root.join("crates/w3cos-std").display(),
+        core = root.join("crates/w3cos-core").display(),
+        react = root.join("crates/w3cos-react-compat").display(),
     )
 }
 

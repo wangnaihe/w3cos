@@ -7,7 +7,29 @@ use w3cos_std::style::Spacing;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalDecl {
     pub name: String,
-    pub initial: i64,
+    pub initial: SignalInitial,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SignalInitial {
+    Number(i64),
+    Text(String),
+}
+
+impl SignalInitial {
+    pub fn rust_initializer(&self) -> String {
+        match self {
+            Self::Number(value) => format!("w3cos_runtime::state::create_signal({value})"),
+            Self::Text(value) => format!("w3cos_runtime::state::create_text_signal({value:?})"),
+        }
+    }
+
+    pub fn js_initializer(&self) -> String {
+        match self {
+            Self::Number(value) => value.to_string(),
+            Self::Text(value) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +77,8 @@ pub struct Node {
 pub enum NodeKind {
     Column,
     Row,
+    /// A real React AOT subtree compiled from the module in `src`.
+    ReactAot,
     #[serde(alias = "text")]
     Text(#[serde(default)] String),
     #[serde(alias = "button")]
@@ -97,6 +121,7 @@ pub struct StyleDecl {
     pub left: Option<String>,
     pub z_index: Option<i32>,
     pub overflow: Option<String>,
+    pub overscroll_behavior: Option<String>,
     pub scroll_initial_target: Option<String>,
     pub display: Option<String>,
     // Phase 3 additions
@@ -281,7 +306,16 @@ fn parse_signal_decl(s: &str) -> Option<SignalDecl> {
     let rest = rest.strip_prefix('(')?;
     let paren_end = rest.find(')')?;
     let value_str = rest[..paren_end].trim();
-    let initial = value_str.parse::<i64>().ok()?;
+    let initial = if let Ok(value) = value_str.parse::<i64>() {
+        SignalInitial::Number(value)
+    } else if value_str.len() >= 2
+        && ((value_str.starts_with('"') && value_str.ends_with('"'))
+            || (value_str.starts_with('\'') && value_str.ends_with('\'')))
+    {
+        SignalInitial::Text(value_str[1..value_str.len() - 1].to_string())
+    } else {
+        return None;
+    };
     Some(SignalDecl { name, initial })
 }
 
@@ -351,6 +385,7 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
             | "TextInput"
             | "Show"
             | "VirtualList"
+            | "ReactAot"
     ) {
         return None;
     }
@@ -749,6 +784,20 @@ fn build_tsx_node(
                 sticky_counter: None,
             }
         }
+        "ReactAot" => Node {
+            kind: NodeKind::ReactAot,
+            style,
+            children: vec![],
+            text: None,
+            label: None,
+            on_click: None,
+            src,
+            placeholder: None,
+            class_name,
+            show_when: None,
+            repeat: None,
+            sticky_counter: None,
+        },
         "Row" => Node {
             kind: NodeKind::Row,
             style,
@@ -1143,6 +1192,9 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                 "width" => style.width = Some(unquote(val)),
                 "height" => style.height = Some(unquote(val)),
                 "overflow" => style.overflow = Some(unquote(val)),
+                "overscrollBehavior" | "overscroll_behavior" => {
+                    style.overscroll_behavior = Some(unquote(val))
+                }
                 "scrollInitialTarget" | "scroll_initial_target" => {
                     style.scroll_initial_target = Some(unquote(val))
                 }
@@ -1632,6 +1684,19 @@ export default <Column />
 "#;
         let tree = parse(source).unwrap();
         assert!(tree.css_imports.is_empty());
+    }
+
+    #[test]
+    fn text_signal_preserves_utf8_initial_value() {
+        let source = r#"
+const transcript = signal("等待识别")
+export default <Text>{transcript}</Text>
+"#;
+        let tree = parse(source).unwrap();
+        assert!(matches!(
+            tree.signals.first().map(|signal| &signal.initial),
+            Some(SignalInitial::Text(value)) if value == "等待识别"
+        ));
     }
 
     #[test]

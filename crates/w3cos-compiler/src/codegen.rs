@@ -57,10 +57,10 @@ fn gen_signal_inits(signals: &[SignalDecl]) -> String {
     let register: Vec<String> = signals
         .iter()
         .map(|sig| {
+            let initializer = sig.initial.rust_initializer();
             format!(
-                "        w3cos_runtime::state::register_signal_name({name:?});\n        let _ = w3cos_runtime::state::create_signal({initial});",
+                "        w3cos_runtime::state::register_signal_name({name:?});\n        let _ = {initializer};",
                 name = sig.name,
-                initial = sig.initial,
             )
         })
         .collect();
@@ -242,6 +242,9 @@ fn gen_node_inner(
             let placeholder = node.placeholder.as_deref().unwrap_or("Enter text");
             format!("{indent}Component::text_input(\"\", {placeholder:?}, {style_code})")
         }
+        NodeKind::ReactAot => format!(
+            "{indent}w3cos_react_compat::aot::render_to_component(crate::esm_bundle::run_entry())"
+        ),
         NodeKind::Column | NodeKind::Row | NodeKind::Box => {
             let constructor = match &node.kind {
                 NodeKind::Column => "Component::column",
@@ -317,7 +320,7 @@ fn gen_text_expr(text: &str, signal_names: &[&str]) -> String {
         let placeholder = format!("{{{name}}}");
         if text.contains(&placeholder) {
             expr = format!(
-                "{expr}.replace(r{placeholder:?}, &w3cos_runtime::state::get_signal({i}).to_string())"
+                "{expr}.replace(r{placeholder:?}, &w3cos_runtime::state::get_signal_text({i}))"
             );
         }
     }
@@ -326,6 +329,48 @@ fn gen_text_expr(text: &str, signal_names: &[&str]) -> String {
 
 fn gen_event_action(action_str: &str, signal_names: &[&str]) -> String {
     let parts: Vec<&str> = action_str.split(':').collect();
+    if parts.first().is_some_and(|part| part.trim() == "speech") {
+        return match parts.get(1).map(|part| part.trim()) {
+            Some("start") if parts.len() >= 10 => {
+                let signal_id = |index: usize| {
+                    let name = parts[index].trim();
+                    signal_names
+                        .iter()
+                        .position(|&candidate| candidate == name)
+                        .unwrap_or(0)
+                };
+                let transcript_signal = signal_id(2);
+                let final_signal = signal_id(3);
+                let confidence_signal = signal_id(4);
+                let status_signal = signal_id(5);
+                let lang = parts[6].trim();
+                let flag = |index: usize| matches!(parts[index].trim(), "1" | "true");
+                let process_locally = flag(7);
+                let continuous = flag(8);
+                let interim_results = flag(9);
+                format!(
+                    "EventAction::SpeechRecognitionStart {{ transcript_signal: {transcript_signal}, final_signal: {final_signal}, confidence_signal: {confidence_signal}, status_signal: {status_signal}, lang: {lang:?}.to_string(), process_locally: {process_locally}, continuous: {continuous}, interim_results: {interim_results} }}"
+                )
+            }
+            Some("stop") => {
+                if parts.len() >= 4 {
+                    let signal_name = parts[2].trim();
+                    let signal_id = signal_names
+                        .iter()
+                        .position(|&candidate| candidate == signal_name)
+                        .unwrap_or(0);
+                    let value = parts[3].trim().parse::<i64>().unwrap_or(0);
+                    format!(
+                        "EventAction::SpeechRecognitionStop {{ after_signal: Some({signal_id}), after_value: {value} }}"
+                    )
+                } else {
+                    "EventAction::SpeechRecognitionStop { after_signal: None, after_value: 0 }"
+                        .to_string()
+                }
+            }
+            _ => "EventAction::None".to_string(),
+        };
+    }
     if !parts.is_empty() && parts[0].trim() == "notify" {
         if parts.len() < 3 {
             return "EventAction::None".to_string();
@@ -640,6 +685,14 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
             _ => "Overflow::Visible",
         };
         fields.push(format!("overflow: {variant}"));
+    }
+    if let Some(ref behavior) = s.overscroll_behavior {
+        let variant = match behavior.as_str() {
+            "contain" => "OverscrollBehavior::Contain",
+            "none" => "OverscrollBehavior::None",
+            _ => "OverscrollBehavior::Auto",
+        };
+        fields.push(format!("overscroll_behavior: {variant}"));
     }
     if let Some(ref target) = s.scroll_initial_target {
         let variant = match target.as_str() {
@@ -995,8 +1048,10 @@ pub fn generate_dom(tree: &AppTree) -> Result<String> {
     if is_reactive {
         for (i, sig) in tree.signals.iter().enumerate() {
             body.push_str(&format!(
-                "    let _ = w3cos_runtime::state::create_signal({});\n    let {} = w3cos_runtime::state::get_signal({});\n",
-                sig.initial, sig.name, i
+                "    let _ = {};\n    let {} = w3cos_runtime::state::get_signal({});\n",
+                sig.initial.rust_initializer(),
+                sig.name,
+                i
             ));
         }
         body.push('\n');
@@ -1085,6 +1140,12 @@ fn gen_dom_node(
             ));
             out.push_str(&format!(
                 "{indent}w3cos_runtime::dom::set_attribute({var}, \"placeholder\", {placeholder:?});\n"
+            ));
+            gen_dom_style_calls(&node.style, &var, out, &indent);
+        }
+        NodeKind::ReactAot => {
+            out.push_str(&format!(
+                "{indent}let {var} = w3cos_runtime::dom::create_element(\"div\");\n"
             ));
             gen_dom_style_calls(&node.style, &var, out, &indent);
         }

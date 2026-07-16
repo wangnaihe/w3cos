@@ -19,8 +19,8 @@ impl Color {
 
     pub fn from_hex(hex: &str) -> Self {
         let bare_hex = hex.trim_start_matches('#');
-        let is_hex = matches!(bare_hex.len(), 3 | 6 | 8)
-            && bare_hex.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex =
+            matches!(bare_hex.len(), 3 | 6 | 8) && bare_hex.chars().all(|c| c.is_ascii_hexdigit());
         if !is_hex {
             return Self::from_named(hex).unwrap_or(Self::BLACK);
         }

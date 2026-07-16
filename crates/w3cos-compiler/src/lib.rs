@@ -36,6 +36,9 @@ pub use codegen::CompileOptions;
 pub fn collect_watch_paths(source_path: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     let ts_source = std::fs::read_to_string(source_path)
         .with_context(|| format!("Could not read {}", source_path.display()))?;
+    if !is_ui_dsl(&ts_source) {
+        return Ok(vec![source_path.to_path_buf()]);
+    }
     let source_dir = source_path.parent();
     let tree = parser::parse(&ts_source)?;
     let mut paths = vec![source_path.to_path_buf()];
@@ -58,6 +61,7 @@ pub struct CompileFlags {
     pub needs_runtime: bool,
     pub needs_dom: bool,
     pub needs_std: bool,
+    pub needs_react_compat: bool,
 }
 
 /// Compile a TypeScript source file into a standalone Rust project.
@@ -103,9 +107,51 @@ pub fn compile_mobile_from_file_with_options(
 ) -> Result<()> {
     let ts_source = std::fs::read_to_string(source_path)
         .with_context(|| format!("Could not read {}", source_path.display()))?;
+    if !is_ui_dsl(&ts_source) {
+        let artifacts = build_esm_artifacts(source_path)?;
+        let bundle = artifacts.bundle_code.ok_or_else(|| {
+            anyhow::anyhow!("React AOT mobile entry did not produce an ESM bundle")
+        })?;
+        return mobile_codegen::write_mobile_react_project(
+            &bundle,
+            output_dir,
+            platform,
+            safe_area,
+            interactive_widget,
+            options,
+        );
+    }
     let source_dir = source_path.parent();
     let tree = parser::parse(&ts_source)?;
     let stylesheet = resolve_css_imports(&tree.css_imports, source_dir)?;
+    let react_sources = react_aot_sources(&tree.root);
+    if react_sources.len() > 1 {
+        anyhow::bail!("a UI DSL entry currently supports one ReactAot source module");
+    }
+    if let Some(react_source) = react_sources.first() {
+        let module_path = source_dir
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(react_source);
+        let artifacts = build_esm_artifacts(&module_path).with_context(|| {
+            format!(
+                "Could not compile ReactAot module {}",
+                module_path.display()
+            )
+        })?;
+        let bundle = artifacts
+            .bundle_code
+            .ok_or_else(|| anyhow::anyhow!("ReactAot module did not produce an ESM bundle"))?;
+        return mobile_codegen::write_mobile_hybrid_project(
+            &tree,
+            &stylesheet,
+            &bundle,
+            output_dir,
+            platform,
+            safe_area,
+            interactive_widget,
+            options,
+        );
+    }
     mobile_codegen::write_mobile_project(
         &tree,
         &stylesheet,
@@ -115,6 +161,19 @@ pub fn compile_mobile_from_file_with_options(
         interactive_widget,
         options,
     )
+}
+
+fn react_aot_sources(node: &parser::Node) -> Vec<String> {
+    let mut sources = Vec::new();
+    if matches!(node.kind, parser::NodeKind::ReactAot) {
+        if let Some(source) = node.src.as_ref() {
+            sources.push(source.clone());
+        }
+    }
+    for child in &node.children {
+        sources.extend(react_aot_sources(child));
+    }
+    sources
 }
 
 /// Compile the same TSX UI app to static HTML/CSS/JS for browser preview.
@@ -184,16 +243,25 @@ fn compile_with_source_dir(
         } else {
             (String::new(), None)
         };
+        let esm_needs_core = esm_bundle_code
+            .as_ref()
+            .is_some_and(|code| code.contains("w3cos_core::"));
+        let esm_has_entry = esm_bundle_code
+            .as_ref()
+            .is_some_and(|code| code.contains("run_entry() -> w3cos_core::Value { m"));
         let flags = CompileFlags {
             needs_hashmap: output.needs_hashmap,
             needs_async: output.needs_async,
             needs_rc: output.needs_rc,
-            needs_core: output.needs_core,
+            needs_core: output.needs_core || esm_needs_core,
             needs_fetch: output.needs_fetch,
             needs_history: output.needs_history,
-            needs_runtime: output.code.contains("use w3cos_runtime"),
+            needs_runtime: output.code.contains("use w3cos_runtime") || esm_has_entry,
             needs_dom: output.code.contains("use w3cos_dom"),
-            needs_std: output.code.contains("use w3cos_std"),
+            needs_std: output.code.contains("use w3cos_std") || esm_has_entry,
+            needs_react_compat: esm_bundle_code
+                .as_ref()
+                .is_some_and(|code| code.contains("w3cos_react_compat::")),
         };
         let cargo_toml = generate_standalone_cargo_toml(&flags);
         std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
@@ -202,7 +270,19 @@ fn compile_with_source_dir(
         if esm_bundle_code.is_some() {
             main_rs.push_str("mod esm_bundle;\n\n");
         }
-        main_rs.push_str(&output.code);
+        let has_esm_entry = esm_bundle_code
+            .as_ref()
+            .is_some_and(|code| code.contains("run_entry() -> w3cos_core::Value { m"));
+        if !has_esm_entry {
+            main_rs.push_str(&output.code);
+        }
+        if has_esm_entry || !output.code.contains("fn main(") {
+            if has_esm_entry {
+                main_rs.push_str("\nfn build_ui() -> w3cos_std::Component { w3cos_react_compat::aot::render_to_component(esm_bundle::run_entry()) }\nfn main() { if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() { if let Err(error) = w3cos_runtime::run_app(build_ui) { eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\"); } } else { let rendered = build_ui(); println!(\"W3COS_AOT_RENDER_OK nodes={}\", w3cos_react_compat::aot::component_count(&rendered)); } }\n");
+            } else {
+                main_rs.push_str("\nfn main() {}\n");
+            }
+        }
         std::fs::write(output_dir.join("src/main.rs"), main_rs)?;
 
         if let Some(bundle_code) = esm_bundle_code {
@@ -454,20 +534,36 @@ edition = "2024"
 "#,
     );
 
+    let workspace_root = codegen::find_workspace_root().ok();
+    let dependency = |name: &str| {
+        workspace_root
+            .as_ref()
+            .map(|root| {
+                format!(
+                    "{name} = {{ path = {:?} }}\n",
+                    root.join(format!("crates/{name}"))
+                )
+            })
+            .unwrap_or_else(|| format!("{name} = {{ path = \"../../crates/{name}\" }}\n"))
+    };
+
     if flags.needs_core {
-        toml.push_str("w3cos-core = { path = \"../../crates/w3cos-core\" }\n");
+        toml.push_str(&dependency("w3cos-core"));
     }
     if flags.needs_async {
         toml.push_str("tokio = { version = \"1\", features = [\"full\"] }\n");
     }
     if flags.needs_fetch || flags.needs_history || flags.needs_runtime {
-        toml.push_str("w3cos-runtime = { path = \"../../crates/w3cos-runtime\" }\n");
+        toml.push_str(&dependency("w3cos-runtime"));
     }
     if flags.needs_dom {
-        toml.push_str("w3cos-dom = { path = \"../../crates/w3cos-dom\" }\n");
+        toml.push_str(&dependency("w3cos-dom"));
     }
     if flags.needs_std {
-        toml.push_str("w3cos-std = { path = \"../../crates/w3cos-std\" }\n");
+        toml.push_str(&dependency("w3cos-std"));
+    }
+    if flags.needs_react_compat {
+        toml.push_str(&dependency("w3cos-react-compat"));
     }
 
     toml
@@ -519,6 +615,15 @@ mod tests {
         )
         .unwrap();
         assert!(rust.contains("scroll_initial_target: ScrollInitialTarget::Nearest"));
+    }
+
+    #[test]
+    fn compile_to_rust_overscroll_behavior() {
+        let rust = compile_to_rust(
+            r#"<Column style={{ overscrollBehavior: "none" }}><Text>feed</Text></Column>"#,
+        )
+        .unwrap();
+        assert!(rust.contains("overscroll_behavior: OverscrollBehavior::None"));
     }
 
     #[test]
@@ -637,6 +742,7 @@ console.log("Done!");
             needs_runtime: false,
             needs_dom: false,
             needs_std: false,
+            needs_react_compat: false,
         };
         let toml = generate_standalone_cargo_toml(&flags);
         assert!(!toml.contains("tokio"), "should not include tokio: {toml}");
@@ -654,6 +760,7 @@ console.log("Done!");
             needs_runtime: false,
             needs_dom: false,
             needs_std: false,
+            needs_react_compat: false,
         };
         let toml = generate_standalone_cargo_toml(&flags);
         assert!(toml.contains("tokio"), "should include tokio: {toml}");

@@ -28,6 +28,24 @@ pub enum EventAction {
         status_signal: usize,
         bytes_signal: usize,
     },
+    /// Start a Web Speech API-compatible recognition session.
+    SpeechRecognitionStart {
+        transcript_signal: usize,
+        final_signal: usize,
+        confidence_signal: usize,
+        status_signal: usize,
+        lang: String,
+        process_locally: bool,
+        continuous: bool,
+        interim_results: bool,
+    },
+    /// Stop the active speech recognition session and finalize buffered audio.
+    SpeechRecognitionStop {
+        after_signal: Option<usize>,
+        after_value: i64,
+    },
+    /// Opaque callback registered by the React AOT host for a scroll container.
+    NativeScroll(u64),
 }
 
 impl EventAction {

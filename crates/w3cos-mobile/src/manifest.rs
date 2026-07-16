@@ -33,6 +33,9 @@ pub struct MobileAppManifest {
     pub interactive_widget: String,
     #[serde(default)]
     pub ai_bridge_port: Option<u16>,
+    /// Web capability names that require native platform declarations.
+    #[serde(default)]
+    pub permissions: Vec<String>,
     #[serde(default)]
     pub shell: MobileShellConfig,
 }

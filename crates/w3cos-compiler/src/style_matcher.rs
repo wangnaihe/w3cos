@@ -21,7 +21,7 @@ impl Default for ResolveViewport {
 /// DOM tag name — the standard HTML element name for this node.
 pub fn dom_tag(node: &Node) -> &'static str {
     match &node.kind {
-        NodeKind::Column | NodeKind::Row | NodeKind::Box => "div",
+        NodeKind::Column | NodeKind::Row | NodeKind::Box | NodeKind::ReactAot => "div",
         NodeKind::Text(_) => "span",
         NodeKind::Button(_) => "button",
         NodeKind::Image(_) => "img",
@@ -39,6 +39,7 @@ fn component_name(node: &Node) -> &'static str {
         NodeKind::Box => "Box",
         NodeKind::Image(_) => "Image",
         NodeKind::TextInput => "TextInput",
+        NodeKind::ReactAot => "ReactAot",
     }
 }
 
@@ -182,6 +183,7 @@ pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
         left,
         z_index,
         overflow,
+        overscroll_behavior,
         scroll_initial_target,
         display,
         opacity,
