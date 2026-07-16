@@ -124,34 +124,6 @@ pub fn compile_mobile_from_file_with_options(
     let source_dir = source_path.parent();
     let tree = parser::parse(&ts_source)?;
     let stylesheet = resolve_css_imports(&tree.css_imports, source_dir)?;
-    let react_sources = react_aot_sources(&tree.root);
-    if react_sources.len() > 1 {
-        anyhow::bail!("a UI DSL entry currently supports one ReactAot source module");
-    }
-    if let Some(react_source) = react_sources.first() {
-        let module_path = source_dir
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join(react_source);
-        let artifacts = build_esm_artifacts(&module_path).with_context(|| {
-            format!(
-                "Could not compile ReactAot module {}",
-                module_path.display()
-            )
-        })?;
-        let bundle = artifacts
-            .bundle_code
-            .ok_or_else(|| anyhow::anyhow!("ReactAot module did not produce an ESM bundle"))?;
-        return mobile_codegen::write_mobile_hybrid_project(
-            &tree,
-            &stylesheet,
-            &bundle,
-            output_dir,
-            platform,
-            safe_area,
-            interactive_widget,
-            options,
-        );
-    }
     mobile_codegen::write_mobile_project(
         &tree,
         &stylesheet,
@@ -161,19 +133,6 @@ pub fn compile_mobile_from_file_with_options(
         interactive_widget,
         options,
     )
-}
-
-fn react_aot_sources(node: &parser::Node) -> Vec<String> {
-    let mut sources = Vec::new();
-    if matches!(node.kind, parser::NodeKind::ReactAot) {
-        if let Some(source) = node.src.as_ref() {
-            sources.push(source.clone());
-        }
-    }
-    for child in &node.children {
-        sources.extend(react_aot_sources(child));
-    }
-    sources
 }
 
 /// Compile the same TSX UI app to static HTML/CSS/JS for browser preview.

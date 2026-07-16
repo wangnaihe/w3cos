@@ -46,6 +46,8 @@ pub enum EventAction {
     },
     /// Opaque callback registered by the React AOT host for a scroll container.
     NativeScroll(u64),
+    /// Opaque callback registered by the React AOT host for a click target.
+    NativeClick(u64),
 }
 
 impl EventAction {

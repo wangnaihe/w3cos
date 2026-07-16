@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use swc_common::{FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
-use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
+use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 
 /// Generate a Rust module skeleton from a fully built ESM bundle.
 pub fn generate_skeleton(bundle: &EsmBundle) -> String {
@@ -363,11 +363,16 @@ fn parse_module_functions(path: &Path) -> Vec<TopLevelItem> {
 
     let cm: Lrc<SourceMap> = Default::default();
     let fm = cm.new_source_file(Lrc::new(FileName::Real(path.to_path_buf())), source);
-    let syntax = if path.extension().map_or(false, |e| e == "ts" || e == "tsx") {
-        Syntax::Typescript(Default::default())
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    let syntax = if matches!(extension, Some("ts" | "tsx")) {
+        Syntax::Typescript(TsSyntax {
+            tsx: extension == Some("tsx"),
+            ..Default::default()
+        })
     } else {
         Syntax::Es(EsSyntax {
             decorators: true,
+            jsx: extension == Some("jsx"),
             ..Default::default()
         })
     };

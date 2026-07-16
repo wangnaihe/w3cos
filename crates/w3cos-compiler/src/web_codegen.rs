@@ -223,10 +223,6 @@ fn gen_html_node(
             let ph = node.placeholder.as_deref().unwrap_or("Enter text");
             format!(r#"<input type="text" placeholder="{ph}"{class_attr}{style_attr} />"#)
         }
-        NodeKind::ReactAot => format!(
-            r#"<div data-w3cos-react-aot="{}"{class_attr}{style_attr}></div>"#,
-            node.src.as_deref().unwrap_or_default()
-        ),
         NodeKind::Column | NodeKind::Row | NodeKind::Box => {
             let mut extra = String::new();
             if matches!(node.kind, NodeKind::Column) {

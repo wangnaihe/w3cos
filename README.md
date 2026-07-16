@@ -56,35 +56,28 @@ See [docs/MOBILE.md](docs/MOBILE.md).
 
 ## Example
 
-### TSX Syntax (recommended)
+### React TSX (recommended)
 
 ```tsx
-// app.tsx — a native application written in TSX
-import { Column, Text, Button } from "@w3cos/std"
+import { useState } from "react"
 
-export default
-<Column style={{ gap: 20, padding: 48, alignItems: "center", background: "#0f0f1a" }}>
-  <Text style={{ fontSize: 42, color: "#e94560" }}>W3C OS</Text>
-  <Text style={{ fontSize: 20, color: "#a0a0b0" }}>Native binary from TSX.</Text>
-  <Button style={{ background: "#e94560", borderRadius: 8 }}>Get Started</Button>
-</Column>
+function App() {
+  const [count, setCount] = useState(0)
+  return (
+    <div style={{ gap: 20, padding: 48, alignItems: "center", backgroundColor: "#0f0f1a" }}>
+      <span style={{ fontSize: 42, color: "#e94560" }}>W3C OS</span>
+      <span style={{ fontSize: 20, color: "#a0a0b0" }}>Native React TSX, compiled AOT.</span>
+      <button onClick={() => setCount(count + 1)}>Count: {count}</button>
+    </div>
+  )
+}
+
+export function main() {
+  return <App />
+}
 ```
 
-### Function Syntax
-
-```typescript
-// app.ts — alternative function-call syntax
-import { Column, Text, Button } from "@w3cos/std"
-
-export default Column({
-  style: { gap: 20, padding: 48, alignItems: "center", background: "#0f0f1a" },
-  children: [
-    Text("W3C OS", { style: { fontSize: 42, color: "#e94560" } }),
-    Text("Native binary from TypeScript.", { style: { fontSize: 20, color: "#a0a0b0" } }),
-    Button("Get Started", { style: { background: "#e94560", borderRadius: 8 } }),
-  ]
-})
-```
+The compiler lowers standard JSX, React hooks, and npm ESM dependencies directly to Rust. No JS interpreter or `<ReactAot src="…">` bridge is used.
 
 ```bash
 $ w3cos build app.tsx -o myapp --release

@@ -242,9 +242,6 @@ fn gen_node_inner(
             let placeholder = node.placeholder.as_deref().unwrap_or("Enter text");
             format!("{indent}Component::text_input(\"\", {placeholder:?}, {style_code})")
         }
-        NodeKind::ReactAot => format!(
-            "{indent}w3cos_react_compat::aot::render_to_component(crate::esm_bundle::run_entry())"
-        ),
         NodeKind::Column | NodeKind::Row | NodeKind::Box => {
             let constructor = match &node.kind {
                 NodeKind::Column => "Component::column",
@@ -1140,12 +1137,6 @@ fn gen_dom_node(
             ));
             out.push_str(&format!(
                 "{indent}w3cos_runtime::dom::set_attribute({var}, \"placeholder\", {placeholder:?});\n"
-            ));
-            gen_dom_style_calls(&node.style, &var, out, &indent);
-        }
-        NodeKind::ReactAot => {
-            out.push_str(&format!(
-                "{indent}let {var} = w3cos_runtime::dom::create_element(\"div\");\n"
             ));
             gen_dom_style_calls(&node.style, &var, out, &indent);
         }

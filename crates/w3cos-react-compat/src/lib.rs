@@ -60,8 +60,10 @@ pub mod aot {
     use w3cos_std::color::Color;
     use w3cos_std::component::Component;
     use w3cos_std::style::{
-        AlignItems, Dimension, Edges, FlexDirection, JustifyContent, Overflow, Position, Style,
-        Transform2D,
+        AlignContent, AlignItems, AlignSelf, BoxShadow, Cursor, Dimension, Display, Easing, Edges,
+        FlexDirection, FlexWrap, FontStyle, JustifyContent, OutlineStyle, Overflow, PointerEvents,
+        Position, Spacing, Style, TextAlign, TextOverflow, Transform2D, Transition,
+        TransitionProperty, UserSelect, Visibility, WhiteSpace, WillChange, WordBreak,
     };
 
     thread_local! {
@@ -69,6 +71,7 @@ pub mod aot {
         static NEXT_HOST_ELEMENT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
         static HOST_ELEMENTS: std::cell::RefCell<std::collections::HashMap<u64, Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
         static SCROLL_LISTENERS: std::cell::RefCell<std::collections::HashMap<u64, Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
+        static CLICK_LISTENERS: std::cell::RefCell<std::collections::HashMap<u64, Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
     }
 
     fn deps(value: &Value) -> Vec<u64> {
@@ -125,8 +128,22 @@ pub mod aot {
         }
     }
 
+    pub fn dispatch_click(host_id: u64) {
+        let listener = CLICK_LISTENERS.with(|listeners| listeners.borrow().get(&host_id).cloned());
+        if let Some(listener) = listener {
+            listener.call(
+                Value::Undefined,
+                vec![Value::object(std::collections::HashMap::new())],
+            );
+        }
+    }
+
     pub fn has_pending_render() -> bool {
-        !super::take_dirty().is_empty()
+        super::has_dirty()
+    }
+
+    pub fn clear_pending_render() {
+        let _ = super::take_dirty();
     }
 
     pub fn component_count(component: &Component) -> usize {
@@ -209,9 +226,34 @@ pub mod aot {
                             .collect::<String>();
                         Component::text(text, style_from_props(&props))
                     }
-                    "button" => Component::button("", Style::default()),
+                    "button" => {
+                        let label = children
+                            .iter()
+                            .filter_map(|child| match &child.kind {
+                                w3cos_std::component::ComponentKind::Text { content } => {
+                                    Some(content.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        Component::button(label, style_from_props(&props))
+                    }
+                    "input" | "textarea" => Component::text_input(
+                        props.get_property("value").to_js_string(),
+                        props.get_property("placeholder").to_js_string(),
+                        style_from_props(&props),
+                    ),
                     _ => Component::boxed(style_from_props(&props), children),
                 };
+                let on_click = props.get_property("onClick");
+                if on_click.is_function() {
+                    CLICK_LISTENERS.with(|listeners| {
+                        listeners.borrow_mut().insert(host_id, on_click);
+                    });
+                    component.on_click = w3cos_std::EventAction::NativeClick(host_id);
+                } else {
+                    CLICK_LISTENERS.with(|listeners| listeners.borrow_mut().remove(&host_id));
+                }
                 if SCROLL_LISTENERS.with(|listeners| listeners.borrow().contains_key(&host_id)) {
                     component.on_click = w3cos_std::EventAction::NativeScroll(host_id);
                 }
@@ -271,10 +313,27 @@ pub mod aot {
     fn style_from_props(props: &Value) -> Style {
         let source = props.get_property("style");
         let mut style = Style::default();
+        // Intrinsic HTML elements participate in normal flow unless their
+        // parent explicitly establishes flex layout. The native host uses a
+        // column flex box as its block-flow approximation, so allowing the
+        // Taffy flex-item default (`flex-shrink: 1`) would collapse explicit
+        // block heights. In particular, react-window's total-size spacer must
+        // retain rowCount * rowHeight to define the scroll range.
+        style.flex_shrink = 0.0;
         style.width = dimension(&source.get_property("width"));
         style.height = dimension(&source.get_property("height"));
         style.max_width = dimension(&source.get_property("maxWidth"));
         style.max_height = dimension(&source.get_property("maxHeight"));
+        style.min_width = dimension(&source.get_property("minWidth"));
+        style.min_height = dimension(&source.get_property("minHeight"));
+        style.top = dimension(&source.get_property("top"));
+        style.right = dimension(&source.get_property("right"));
+        style.bottom = dimension(&source.get_property("bottom"));
+        style.left = dimension(&source.get_property("left"));
+        let z_index = source.get_property("zIndex").to_number();
+        if z_index.is_finite() {
+            style.z_index = z_index as i32;
+        }
         style.flex_grow = source.get_property("flexGrow").to_number().max(0.0) as f32;
         let flex_shrink = source.get_property("flexShrink").to_number();
         if flex_shrink.is_finite() {
@@ -286,7 +345,38 @@ pub mod aot {
             "column-reverse" => FlexDirection::ColumnReverse,
             _ => FlexDirection::Column,
         };
-        style.justify_content = match source.get_property("justifyContent").to_js_string().as_str() {
+        style.flex_wrap = match source.get_property("flexWrap").to_js_string().as_str() {
+            "wrap" => FlexWrap::Wrap,
+            "wrap-reverse" => FlexWrap::WrapReverse,
+            _ => FlexWrap::NoWrap,
+        };
+        style.align_self = match source.get_property("alignSelf").to_js_string().as_str() {
+            "stretch" => AlignSelf::Stretch,
+            "center" => AlignSelf::Center,
+            "flex-start" => AlignSelf::FlexStart,
+            "flex-end" => AlignSelf::FlexEnd,
+            "baseline" => AlignSelf::Baseline,
+            _ => AlignSelf::Auto,
+        };
+        style.align_content = match source.get_property("alignContent").to_js_string().as_str() {
+            "flex-start" => AlignContent::FlexStart,
+            "flex-end" => AlignContent::FlexEnd,
+            "center" => AlignContent::Center,
+            "space-between" => AlignContent::SpaceBetween,
+            "space-around" => AlignContent::SpaceAround,
+            "space-evenly" => AlignContent::SpaceEvenly,
+            _ => AlignContent::Stretch,
+        };
+        style.flex_basis = dimension(&source.get_property("flexBasis"));
+        let order = source.get_property("order").to_number();
+        if order.is_finite() {
+            style.order = order as i32;
+        }
+        style.justify_content = match source
+            .get_property("justifyContent")
+            .to_js_string()
+            .as_str()
+        {
             "center" => JustifyContent::Center,
             "flex-end" => JustifyContent::FlexEnd,
             "space-between" => JustifyContent::SpaceBetween,
@@ -302,9 +392,35 @@ pub mod aot {
             _ => AlignItems::Stretch,
         };
         style.gap = source.get_property("gap").to_number().max(0.0) as f32;
-        let padding = source.get_property("padding").to_number();
-        if padding.is_finite() {
-            style.padding = Edges::all(padding as f32);
+        if let Some(padding) = plain_spacing(&source.get_property("padding")) {
+            style.padding = Edges::all(padding);
+        }
+        if let Some(value) = spacing(&source.get_property("paddingTop"), "top") {
+            style.padding.top = value;
+        }
+        if let Some(value) = spacing(&source.get_property("paddingRight"), "right") {
+            style.padding.right = value;
+        }
+        if let Some(value) = spacing(&source.get_property("paddingBottom"), "bottom") {
+            style.padding.bottom = value;
+        }
+        if let Some(value) = spacing(&source.get_property("paddingLeft"), "left") {
+            style.padding.left = value;
+        }
+        if let Some(margin) = plain_spacing(&source.get_property("margin")) {
+            style.margin = Edges::all(margin);
+        }
+        if let Some(value) = spacing(&source.get_property("marginTop"), "top") {
+            style.margin.top = value;
+        }
+        if let Some(value) = spacing(&source.get_property("marginRight"), "right") {
+            style.margin.right = value;
+        }
+        if let Some(value) = spacing(&source.get_property("marginBottom"), "bottom") {
+            style.margin.bottom = value;
+        }
+        if let Some(value) = spacing(&source.get_property("marginLeft"), "left") {
+            style.margin.left = value;
         }
         style.font_size = source
             .get_property("fontSize")
@@ -316,6 +432,51 @@ pub mod aot {
         if font_weight.is_finite() {
             style.font_weight = font_weight.max(1.0) as u16;
         }
+        let line_height = source.get_property("lineHeight");
+        let line_height_number = line_height.to_number();
+        if line_height_number.is_finite() {
+            style.line_height = line_height_number.max(0.0) as f32;
+        } else if let Some(px) = line_height
+            .to_js_string()
+            .strip_suffix("px")
+            .and_then(|value| value.parse::<f32>().ok())
+        {
+            style.line_height = (px / style.font_size.max(1.0)).max(0.0);
+        }
+        if let Some(letter_spacing) = plain_spacing(&source.get_property("letterSpacing")) {
+            style.letter_spacing = letter_spacing;
+        }
+        style.text_align = match source.get_property("textAlign").to_js_string().as_str() {
+            "center" => TextAlign::Center,
+            "right" | "end" => TextAlign::Right,
+            _ => TextAlign::Left,
+        };
+        style.white_space = match source.get_property("whiteSpace").to_js_string().as_str() {
+            "nowrap" => WhiteSpace::NoWrap,
+            "pre" => WhiteSpace::Pre,
+            "pre-wrap" => WhiteSpace::PreWrap,
+            _ => WhiteSpace::Normal,
+        };
+        style.text_overflow = if source.get_property("textOverflow").to_js_string() == "ellipsis" {
+            TextOverflow::Ellipsis
+        } else {
+            TextOverflow::Clip
+        };
+        style.font_family = match source.get_property("fontFamily").to_js_string().as_str() {
+            "" | "undefined" => None,
+            family => Some(family.to_string()),
+        };
+        style.font_style = match source.get_property("fontStyle").to_js_string().as_str() {
+            "italic" => FontStyle::Italic,
+            "oblique" => FontStyle::Oblique,
+            _ => FontStyle::Normal,
+        };
+        style.word_break = match source.get_property("wordBreak").to_js_string().as_str() {
+            "break-all" => WordBreak::BreakAll,
+            "break-word" => WordBreak::BreakWord,
+            "keep-all" => WordBreak::KeepAll,
+            _ => WordBreak::Normal,
+        };
         if let Some(color) = css_color(&source.get_property("color")) {
             style.color = color;
         }
@@ -335,11 +496,24 @@ pub mod aot {
         if let Some(border_color) = css_color(&source.get_property("borderColor")) {
             style.border_color = border_color;
         }
+        style.box_shadow = box_shadow(&source.get_property("boxShadow"));
         style.position = match source.get_property("position").to_js_string().as_str() {
             "absolute" => Position::Absolute,
             "fixed" => Position::Fixed,
             "sticky" => Position::Sticky,
             _ => Position::Relative,
+        };
+        style.display = match source.get_property("display").to_js_string().as_str() {
+            "none" => Display::None,
+            "block" => Display::Block,
+            "inline" => Display::Inline,
+            "inline-block" => Display::InlineBlock,
+            "grid" => Display::Grid,
+            "flex" => Display::Flex,
+            // Keep the established column-flow fallback until the native
+            // retained painter supports block formatting contexts end to end.
+            // Explicit `display: block` still uses the standards path.
+            _ => Display::Flex,
         };
         style.overflow = match source.get_property("overflowY").to_js_string().as_str() {
             "auto" => Overflow::Auto,
@@ -347,13 +521,67 @@ pub mod aot {
             "hidden" => Overflow::Hidden,
             _ => Overflow::Visible,
         };
+        if matches!(style.overflow, Overflow::Visible) {
+            style.overflow = match source.get_property("overflow").to_js_string().as_str() {
+                "auto" => Overflow::Auto,
+                "scroll" => Overflow::Scroll,
+                "hidden" => Overflow::Hidden,
+                _ => Overflow::Visible,
+            };
+        }
+        let opacity = source.get_property("opacity").to_number();
+        if opacity.is_finite() {
+            style.opacity = opacity.clamp(0.0, 1.0) as f32;
+        }
+        style.pointer_events = if source.get_property("pointerEvents").to_js_string() == "none" {
+            PointerEvents::None
+        } else {
+            PointerEvents::Auto
+        };
+        style.visibility = match source.get_property("visibility").to_js_string().as_str() {
+            "hidden" => Visibility::Hidden,
+            "collapse" => Visibility::Collapse,
+            _ => Visibility::Visible,
+        };
+        style.user_select = match source.get_property("userSelect").to_js_string().as_str() {
+            "none" => UserSelect::None,
+            "text" => UserSelect::Text,
+            "all" => UserSelect::All,
+            _ => UserSelect::Auto,
+        };
+        style.cursor = match source.get_property("cursor").to_js_string().as_str() {
+            "pointer" => Cursor::Pointer,
+            "text" => Cursor::Text,
+            "move" => Cursor::Move,
+            "grab" => Cursor::Grab,
+            "grabbing" => Cursor::Grabbing,
+            "not-allowed" => Cursor::NotAllowed,
+            "none" => Cursor::None,
+            _ => Cursor::Default,
+        };
+        if let Some(width) = plain_spacing(&source.get_property("outlineWidth")) {
+            style.outline_width = width.max(0.0);
+        }
+        if let Some(color) = css_color(&source.get_property("outlineColor")) {
+            style.outline_color = color;
+        }
+        style.outline_style = match source.get_property("outlineStyle").to_js_string().as_str() {
+            "solid" => OutlineStyle::Solid,
+            "dashed" => OutlineStyle::Dashed,
+            "dotted" => OutlineStyle::Dotted,
+            "double" => OutlineStyle::Double,
+            _ => OutlineStyle::None,
+        };
+        style.will_change = WillChange::from_css(&source.get_property("willChange").to_js_string());
+        style.transition = transition(&source);
         let transform = source.get_property("transform").to_js_string();
         if let Some(value) = transform
             .strip_prefix("translateY(")
             .and_then(|value| value.strip_suffix("px)"))
         {
             let translate_y = value.parse().unwrap_or(0.0);
-            if matches!(style.position, Position::Absolute) {
+            if matches!(style.position, Position::Absolute) && matches!(style.top, Dimension::Auto)
+            {
                 // react-window positions rows with an absolute box plus
                 // translateY. The native layout tree paints descendants as
                 // independent nodes, so keeping this as a paint-only transform
@@ -366,13 +594,215 @@ pub mod aot {
                     ..Transform2D::IDENTITY
                 };
             }
+        } else if let Some(value) = transform
+            .strip_prefix("translateX(")
+            .and_then(|value| value.strip_suffix("px)"))
+        {
+            style.transform.translate_x = value.parse().unwrap_or(0.0);
+        } else if transform != "undefined" && transform != "none" {
+            style.transform = transform_list(&transform);
         }
         style
+    }
+
+    fn transform_list(css: &str) -> Transform2D {
+        let mut transform = Transform2D::IDENTITY;
+        for item in css.split(')') {
+            let item = item.trim();
+            let Some((name, raw_args)) = item.split_once('(') else {
+                continue;
+            };
+            let args: Vec<f32> = raw_args
+                .split(',')
+                .filter_map(|value| {
+                    value
+                        .trim()
+                        .trim_end_matches("px")
+                        .trim_end_matches("deg")
+                        .parse()
+                        .ok()
+                })
+                .collect();
+            match (name.trim(), args.as_slice()) {
+                ("translate", [x, y, ..]) => {
+                    transform.translate_x = *x;
+                    transform.translate_y = *y;
+                }
+                ("translate", [x]) | ("translateX", [x]) => transform.translate_x = *x,
+                ("translateY", [y]) => transform.translate_y = *y,
+                ("scale", [xy]) => {
+                    transform.scale_x = *xy;
+                    transform.scale_y = *xy;
+                }
+                ("scale", [x, y, ..]) => {
+                    transform.scale_x = *x;
+                    transform.scale_y = *y;
+                }
+                ("scaleX", [x]) => transform.scale_x = *x,
+                ("scaleY", [y]) => transform.scale_y = *y,
+                ("rotate", [degrees]) => transform.rotate_deg = *degrees,
+                _ => {}
+            }
+        }
+        transform
+    }
+
+    fn transition(source: &Value) -> Option<Transition> {
+        let shorthand = source.get_property("transition").to_js_string();
+        let mut property = source.get_property("transitionProperty").to_js_string();
+        let mut duration = source.get_property("transitionDuration").to_js_string();
+        let mut delay = source.get_property("transitionDelay").to_js_string();
+        let mut easing = source
+            .get_property("transitionTimingFunction")
+            .to_js_string();
+        if !shorthand.is_empty() && shorthand != "undefined" {
+            let mut saw_duration = false;
+            for part in shorthand.split_whitespace() {
+                if part.ends_with("ms") || part.ends_with('s') {
+                    if saw_duration {
+                        delay = part.to_string();
+                    } else {
+                        duration = part.to_string();
+                        saw_duration = true;
+                    }
+                } else if matches!(
+                    part,
+                    "ease" | "linear" | "ease-in" | "ease-out" | "ease-in-out"
+                ) {
+                    easing = part.to_string();
+                } else {
+                    property = part.to_string();
+                }
+            }
+        }
+        let duration_ms = if let Some(value) = duration.strip_suffix("ms") {
+            value.parse().ok()
+        } else if let Some(value) = duration.strip_suffix('s') {
+            value
+                .parse::<f32>()
+                .ok()
+                .map(|seconds| (seconds * 1000.0) as u32)
+        } else {
+            let value = source.get_property("transitionDuration").to_number();
+            value.is_finite().then_some(value.max(0.0) as u32)
+        }?;
+        let parse_time = |value: &str| {
+            if let Some(value) = value.strip_suffix("ms") {
+                value.parse::<f32>().ok().map(|value| value.max(0.0) as u32)
+            } else if let Some(value) = value.strip_suffix('s') {
+                value
+                    .parse::<f32>()
+                    .ok()
+                    .map(|seconds| (seconds.max(0.0) * 1000.0) as u32)
+            } else {
+                None
+            }
+        };
+        Some(Transition {
+            property: match property.as_str() {
+                "opacity" => TransitionProperty::Opacity,
+                "transform" => TransitionProperty::Transform,
+                "background" | "background-color" => TransitionProperty::Background,
+                "color" => TransitionProperty::Color,
+                "" | "undefined" | "all" => TransitionProperty::All,
+                custom => TransitionProperty::Custom(custom.to_string()),
+            },
+            duration_ms,
+            easing: match easing.as_str() {
+                "linear" => Easing::Linear,
+                "ease-in" => Easing::EaseIn,
+                "ease-out" => Easing::EaseOut,
+                "ease-in-out" => Easing::EaseInOut,
+                _ => Easing::Ease,
+            },
+            delay_ms: parse_time(&delay).unwrap_or(0),
+        })
     }
 
     fn css_color(value: &Value) -> Option<Color> {
         let value = value.to_js_string();
         (value.starts_with('#') || value == "transparent").then(|| Color::from_hex(&value))
+    }
+
+    fn box_shadow(value: &Value) -> Option<BoxShadow> {
+        let css = value.to_js_string();
+        if css.is_empty() || css == "undefined" || css == "none" {
+            return None;
+        }
+        let mut lengths = Vec::new();
+        let mut color = None;
+        let mut inset = false;
+        for token in css.split_whitespace() {
+            if token == "inset" {
+                inset = true;
+            } else if token.starts_with('#') {
+                color = Some(Color::from_hex(token));
+            } else if let Some(value) = token.strip_suffix("px") {
+                lengths.push(value.parse::<f32>().ok()?);
+            } else if let Ok(value) = token.parse::<f32>() {
+                lengths.push(value);
+            }
+        }
+        if lengths.len() < 2 {
+            return None;
+        }
+        Some(BoxShadow {
+            offset_x: lengths[0],
+            offset_y: lengths[1],
+            blur_radius: lengths.get(2).copied().unwrap_or(0.0).max(0.0),
+            spread_radius: lengths.get(3).copied().unwrap_or(0.0),
+            color: color.unwrap_or(Color::rgba(0, 0, 0, 64)),
+            inset,
+        })
+    }
+
+    fn plain_spacing(value: &Value) -> Option<f32> {
+        let number = value.to_number();
+        if number.is_finite() {
+            return Some(number as f32);
+        }
+        value
+            .to_js_string()
+            .strip_suffix("px")
+            .and_then(|value| value.trim().parse().ok())
+    }
+
+    fn spacing(value: &Value, edge: &str) -> Option<Spacing> {
+        let number = value.to_number();
+        if number.is_finite() {
+            return Some(Spacing::Px(number as f32));
+        }
+        let css = value.to_js_string();
+        let safe_area = match edge {
+            "top" => w3cos_std::safe_area::SafeAreaEdge::Top,
+            "right" => w3cos_std::safe_area::SafeAreaEdge::Right,
+            "bottom" => w3cos_std::safe_area::SafeAreaEdge::Bottom,
+            "left" => w3cos_std::safe_area::SafeAreaEdge::Left,
+            _ => return None,
+        };
+        if css == format!("env(safe-area-inset-{edge})") {
+            return Some(Spacing::SafeAreaInset(safe_area));
+        }
+        let env = format!("env(safe-area-inset-{edge})");
+        if let Some(inner) = css
+            .strip_prefix("calc(")
+            .and_then(|css| css.strip_suffix(')'))
+            && let Some(px) = inner
+                .replace(&env, "")
+                .replace('+', "")
+                .trim()
+                .strip_suffix("px")
+                .and_then(|value| value.trim().parse().ok())
+        {
+            return Some(Spacing::Composite {
+                px,
+                safe_area: Some(safe_area),
+                keyboard_inset: false,
+            });
+        }
+        css.strip_suffix("px")
+            .and_then(|value| value.parse().ok())
+            .map(Spacing::Px)
     }
 
     fn dimension(value: &Value) -> Dimension {
@@ -385,6 +815,22 @@ pub mod aot {
             Value::String(value) if value.ends_with("px") => value[..value.len() - 2]
                 .parse()
                 .map(Dimension::Px)
+                .unwrap_or(Dimension::Auto),
+            Value::String(value) if value.ends_with("rem") => value[..value.len() - 3]
+                .parse()
+                .map(Dimension::Rem)
+                .unwrap_or(Dimension::Auto),
+            Value::String(value) if value.ends_with("em") => value[..value.len() - 2]
+                .parse()
+                .map(Dimension::Em)
+                .unwrap_or(Dimension::Auto),
+            Value::String(value) if value.ends_with("vw") => value[..value.len() - 2]
+                .parse()
+                .map(Dimension::Vw)
+                .unwrap_or(Dimension::Auto),
+            Value::String(value) if value.ends_with("vh") => value[..value.len() - 2]
+                .parse()
+                .map(Dimension::Vh)
                 .unwrap_or(Dimension::Auto),
             _ => Dimension::Auto,
         }
@@ -504,6 +950,10 @@ pub mod aot {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use w3cos_std::EventAction;
+        use w3cos_std::component::ComponentKind;
 
         #[test]
         fn absolute_translate_y_positions_the_entire_host_subtree() {
@@ -511,12 +961,187 @@ pub mod aot {
             style.set_property("position", Value::from("absolute"));
             style.set_property("transform", Value::from("translateY(76px)"));
             let props = Value::object(std::collections::HashMap::new());
-            props.set_property("style", style);
+            props.set_property("style", style.clone());
 
             let native = style_from_props(&props);
             assert!(matches!(native.position, Position::Absolute));
             assert!(matches!(native.top, Dimension::Px(value) if value == 76.0));
             assert!(native.transform.is_identity());
+        }
+
+        #[test]
+        fn positioned_overlay_keeps_transitioned_transform() {
+            let style = Value::object(std::collections::HashMap::new());
+            style.set_property("position", Value::from("absolute"));
+            style.set_property("top", Value::Number(0.0));
+            style.set_property("transform", Value::from("translateY(900px)"));
+            style.set_property("transition", Value::from("all 300ms ease-out"));
+            let props = Value::object(std::collections::HashMap::new());
+            props.set_property("style", style);
+
+            let native = style_from_props(&props);
+            assert!(matches!(native.top, Dimension::Px(0.0)));
+            assert_eq!(native.transform.translate_y, 900.0);
+            let transition = native.transition.expect("transition should be mapped");
+            assert_eq!(transition.duration_ms, 300);
+            assert!(matches!(transition.property, TransitionProperty::All));
+            assert!(matches!(transition.easing, Easing::EaseOut));
+        }
+
+        #[test]
+        fn safe_area_environment_padding_is_resolved_by_the_host() {
+            w3cos_std::safe_area::set_enabled(true);
+            w3cos_std::safe_area::set_insets(w3cos_std::safe_area::SafeAreaInsets {
+                top: 59.0,
+                ..Default::default()
+            });
+            let style = Value::object(std::collections::HashMap::new());
+            style.set_property("paddingTop", Value::from("env(safe-area-inset-top)"));
+            let props = Value::object(std::collections::HashMap::new());
+            props.set_property("style", style.clone());
+
+            let native = style_from_props(&props);
+            assert!(matches!(
+                native.padding.top,
+                Spacing::SafeAreaInset(w3cos_std::safe_area::SafeAreaEdge::Top)
+            ));
+
+            style.set_property(
+                "paddingTop",
+                Value::from("calc(18px + env(safe-area-inset-top))"),
+            );
+            let native = style_from_props(&props);
+            assert!(matches!(
+                native.padding.top,
+                Spacing::Composite {
+                    px: 18.0,
+                    safe_area: Some(w3cos_std::safe_area::SafeAreaEdge::Top),
+                    keyboard_inset: false,
+                }
+            ));
+            w3cos_std::safe_area::set_enabled(false);
+        }
+
+        #[test]
+        fn native_button_keeps_label_style_and_click_callback() {
+            let clicks = Rc::new(Cell::new(0));
+            let callback_clicks = Rc::clone(&clicks);
+            let props = Value::object(std::collections::HashMap::new());
+            props.set_property(
+                "onClick",
+                Value::function(move |_, _| {
+                    callback_clicks.set(callback_clicks.get() + 1);
+                    Value::Undefined
+                }),
+            );
+            let style = Value::object(std::collections::HashMap::new());
+            style.set_property("height", Value::Number(42.0));
+            props.set_property("style", style);
+
+            let element = createElement(vec![Value::from("button"), props, Value::from("打开")]);
+            let component = render_to_component(element);
+
+            assert!(matches!(
+                component.kind,
+                ComponentKind::Button { ref label } if label == "打开"
+            ));
+            assert!(matches!(component.style.height, Dimension::Px(42.0)));
+            let EventAction::NativeClick(host_id) = component.on_click else {
+                panic!("button did not register its native click callback");
+            };
+            dispatch_click(host_id);
+            assert_eq!(clicks.get(), 1);
+        }
+
+        #[test]
+        fn explicit_height_host_node_does_not_shrink_like_a_flex_item() {
+            let style = Value::object(std::collections::HashMap::new());
+            style.set_property("height", Value::Number(84_000.0));
+            let props = Value::object(std::collections::HashMap::new());
+            props.set_property("style", style);
+
+            let native = style_from_props(&props);
+            assert!(matches!(native.height, Dimension::Px(value) if value == 84_000.0));
+            assert_eq!(native.flex_shrink, 0.0);
+        }
+
+        #[test]
+        fn intrinsic_host_maps_common_box_text_styles() {
+            let style = Value::object(std::collections::HashMap::new());
+            style.set_property("marginTop", Value::from("12px"));
+            style.set_property("lineHeight", Value::from("24px"));
+            style.set_property("fontSize", Value::Number(16.0));
+            style.set_property("letterSpacing", Value::Number(0.5));
+            style.set_property("textAlign", Value::from("center"));
+            style.set_property("whiteSpace", Value::from("nowrap"));
+            style.set_property("boxShadow", Value::from("0px 3px 8px #cdd9e8"));
+            let props = Value::object(std::collections::HashMap::new());
+            props.set_property("style", style.clone());
+
+            let native = style_from_props(&props);
+            assert!(matches!(native.display, Display::Flex));
+            assert!(matches!(native.margin.top, Spacing::Px(12.0)));
+            assert_eq!(native.line_height, 1.5);
+            assert_eq!(native.letter_spacing, 0.5);
+            assert!(matches!(native.text_align, TextAlign::Center));
+            assert!(matches!(native.white_space, WhiteSpace::NoWrap));
+            let shadow = native.box_shadow.expect("box shadow should be mapped");
+            assert_eq!(shadow.offset_y, 3.0);
+            assert_eq!(shadow.blur_radius, 8.0);
+
+            style.set_property("display", Value::from("flex"));
+            assert!(matches!(style_from_props(&props).display, Display::Flex));
+        }
+
+        #[test]
+        fn extended_css_host_styles_and_transform_list_are_mapped() {
+            let style = Value::object(std::collections::HashMap::new());
+            style.set_property("flexBasis", Value::from("25%"));
+            style.set_property("alignContent", Value::from("space-between"));
+            style.set_property("textOverflow", Value::from("ellipsis"));
+            style.set_property("fontStyle", Value::from("italic"));
+            style.set_property("wordBreak", Value::from("break-all"));
+            style.set_property("visibility", Value::from("hidden"));
+            style.set_property("userSelect", Value::from("none"));
+            style.set_property("outlineWidth", Value::from("2px"));
+            style.set_property("outlineStyle", Value::from("solid"));
+            style.set_property(
+                "transform",
+                Value::from("translate(8px, 12px) scale(1.2) rotate(5deg)"),
+            );
+            style.set_property("transition", Value::from("transform 280ms ease-out 40ms"));
+            let props = Value::object(std::collections::HashMap::new());
+            props.set_property("style", style);
+
+            let native = style_from_props(&props);
+            assert!(matches!(native.flex_basis, Dimension::Percent(25.0)));
+            assert!(matches!(native.align_content, AlignContent::SpaceBetween));
+            assert!(matches!(native.text_overflow, TextOverflow::Ellipsis));
+            assert!(matches!(native.font_style, FontStyle::Italic));
+            assert!(matches!(native.word_break, WordBreak::BreakAll));
+            assert!(matches!(native.visibility, Visibility::Hidden));
+            assert!(matches!(native.user_select, UserSelect::None));
+            assert_eq!(native.outline_width, 2.0);
+            assert_eq!(native.transform.translate_x, 8.0);
+            assert_eq!(native.transform.translate_y, 12.0);
+            assert_eq!(native.transform.scale_x, 1.2);
+            assert_eq!(native.transform.rotate_deg, 5.0);
+            assert_eq!(native.transition.expect("transition").delay_ms, 40);
+        }
+
+        #[test]
+        fn native_input_preserves_value_and_placeholder() {
+            let props = Value::object(std::collections::HashMap::new());
+            props.set_property("value", Value::from("上海"));
+            props.set_property("placeholder", Value::from("请输入目的地"));
+
+            let component = render_to_component(createElement(vec![Value::from("input"), props]));
+
+            assert!(matches!(
+                component.kind,
+                ComponentKind::TextInput { ref value, ref placeholder }
+                    if value == "上海" && placeholder == "请输入目的地"
+            ));
         }
     }
 }
@@ -616,6 +1241,11 @@ pub fn mark_dirty(id: ComponentId) {
             host.dirty.push(id);
         }
     });
+}
+
+/// Whether React has queued a component render, without consuming the queue.
+pub fn has_dirty() -> bool {
+    with_host(|host| !host.dirty.is_empty())
 }
 
 /// Drain components flagged for re-render. Intended for the runtime's
@@ -1204,6 +1834,21 @@ mod tests {
         s.set(10);
         let dirty = take_dirty();
         assert!(dirty.contains(&id));
+    }
+
+    #[test]
+    fn checking_dirty_does_not_consume_pending_render() {
+        let _g = fresh();
+        let id = ComponentId(22);
+        begin_render(id);
+        let state = use_state::<i32>(|| 0);
+        end_render(id);
+        let _ = take_dirty();
+
+        state.set(1);
+        assert!(has_dirty());
+        assert!(has_dirty(), "polling dirty state must be non-destructive");
+        assert_eq!(take_dirty(), vec![id]);
     }
 
     #[test]

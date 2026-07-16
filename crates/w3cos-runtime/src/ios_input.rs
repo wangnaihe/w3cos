@@ -16,6 +16,23 @@ fn view(window: &Window) -> Option<&AnyObject> {
     Some(unsafe { &*handle.ui_view.as_ptr().cast() })
 }
 
+/// Current UIKit safe-area insets in logical/CSS pixels.
+///
+/// Querying the UIView is more reliable than deriving these values from
+/// winit's inner/outer geometry: recent winit versions expose a full-screen
+/// content view on iOS, so both rectangles can have the same origin.
+pub fn safe_area_insets(window: &Window) -> Option<w3cos_std::safe_area::SafeAreaInsets> {
+    let root = view(window)?;
+    let _: () = unsafe { objc2::msg_send![root, layoutIfNeeded] };
+    let insets: UIEdgeInsets = unsafe { objc2::msg_send![root, safeAreaInsets] };
+    Some(w3cos_std::safe_area::SafeAreaInsets {
+        top: insets.top as f32,
+        right: insets.right as f32,
+        bottom: insets.bottom as f32,
+        left: insets.left as f32,
+    })
+}
+
 type CGFloat = f64;
 const IME_TEXT_FIELD_TAG: isize = 0x5733_494d;
 static KEYBOARD_OBSERVER_ONCE: Once = Once::new();

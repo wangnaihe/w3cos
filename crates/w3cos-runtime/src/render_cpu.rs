@@ -338,7 +338,12 @@ fn node_scroll_damage(
     scroll_ancestor: &[Option<usize>],
 ) -> Option<LayoutRect> {
     scroll_damages.iter().find_map(|&(scroll_idx, damage)| {
-        is_within_scroll_container(idx, scroll_idx, scroll_ancestor).then_some(damage)
+        // The damage path has already cleared the scrollport with its opaque
+        // background. Painting the container again is both redundant and
+        // expensive for a viewport-sized box; only descendants can add new
+        // pixels after scrolling or a virtual-window swap.
+        (idx != scroll_idx && is_within_scroll_container(idx, scroll_idx, scroll_ancestor))
+            .then_some(damage)
     })
 }
 

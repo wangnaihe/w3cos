@@ -296,6 +296,9 @@ pub fn execute_action(action: &w3cos_std::EventAction) {
             }
         }
         w3cos_std::EventAction::NativeScroll(_) => {}
+        w3cos_std::EventAction::NativeClick(host_id) => {
+            w3cos_react_compat::aot::dispatch_click(*host_id);
+        }
     }
 }
 

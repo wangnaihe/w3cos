@@ -13,76 +13,21 @@ pub fn write_mobile_project(
     interactive_widget: &str,
     options: &CompileOptions,
 ) -> Result<()> {
-    write_mobile_project_with_react(
-        tree,
-        stylesheet,
-        output_dir,
-        platform,
-        safe_area,
-        interactive_widget,
-        options,
-        None,
-    )
-}
-
-pub fn write_mobile_hybrid_project(
-    tree: &AppTree,
-    stylesheet: &Stylesheet,
-    react_bundle: &str,
-    output_dir: &Path,
-    platform: &str,
-    safe_area: bool,
-    interactive_widget: &str,
-    options: &CompileOptions,
-) -> Result<()> {
-    write_mobile_project_with_react(
-        tree,
-        stylesheet,
-        output_dir,
-        platform,
-        safe_area,
-        interactive_widget,
-        options,
-        Some(react_bundle),
-    )
-}
-
-fn write_mobile_project_with_react(
-    tree: &AppTree,
-    stylesheet: &Stylesheet,
-    output_dir: &Path,
-    platform: &str,
-    safe_area: bool,
-    interactive_widget: &str,
-    options: &CompileOptions,
-    react_bundle: Option<&str>,
-) -> Result<()> {
     std::fs::create_dir_all(output_dir.join("src"))?;
     let body = generate_app_body(tree, stylesheet)?;
-    if let Some(bundle) = react_bundle {
-        std::fs::write(output_dir.join("src/esm_bundle.rs"), bundle)?;
-    }
     if platform == "ios" {
         std::fs::write(output_dir.join("src/app_ui.rs"), &body)?;
         std::fs::write(
             output_dir.join("src/layout_export.rs"),
-            generate_layout_export(tree, safe_area, react_bundle.is_some())?,
+            generate_layout_export(tree, safe_area)?,
         )?;
-        let mut main = generate_ios_main(safe_area, interactive_widget)?;
-        if react_bundle.is_some() {
-            main = main.replacen("mod app_ui;", "mod esm_bundle;\nmod app_ui;", 1);
-        }
+        let main = generate_ios_main(safe_area, interactive_widget)?;
         std::fs::write(output_dir.join("src/main.rs"), main)?;
         std::fs::write(
             output_dir.join("Cargo.toml"),
             generate_ios_cargo_toml(options)?,
         )?;
     } else {
-        let body = if react_bundle.is_some() {
-            format!("mod esm_bundle;\n{body}")
-        } else {
-            body
-        };
         std::fs::write(
             output_dir.join("src/lib.rs"),
             generate_android_lib(&body, interactive_widget)?,
@@ -207,7 +152,7 @@ fn main() {{
     ))
 }
 
-fn generate_layout_export(tree: &AppTree, safe_area: bool, react_bundle: bool) -> Result<String> {
+fn generate_layout_export(tree: &AppTree, safe_area: bool) -> Result<String> {
     let signal_inits = gen_signal_inits(&tree.signals);
     let safe_init = if safe_area {
         r#"    w3cos_std::safe_area::set_enabled(true);
@@ -221,14 +166,9 @@ fn generate_layout_export(tree: &AppTree, safe_area: bool, react_bundle: bool) -
     } else {
         ""
     };
-    let modules = if react_bundle {
-        "mod esm_bundle;\nmod app_ui;"
-    } else {
-        "mod app_ui;"
-    };
     Ok(format!(
         r#"//! Auto-generated layout metrics export — do not edit.
-{modules}
+mod app_ui;
 use app_ui::build_ui;
 
 fn main() {{
@@ -264,7 +204,6 @@ fn main() {{
 "#,
         signal_inits = signal_inits,
         safe_init = safe_init,
-        modules = modules,
     ))
 }
 

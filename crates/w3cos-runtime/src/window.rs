@@ -76,6 +76,10 @@ fn update_safe_area_from_window(window: &Window, scale: f32) {
     if !w3cos_std::safe_area::is_enabled() {
         return;
     }
+    if let Some(insets) = crate::ios_input::safe_area_insets(window) {
+        w3cos_std::safe_area::set_insets(insets);
+        return;
+    }
     let outer = window.outer_size();
     let inner = window.inner_size();
     let pos = window
@@ -270,9 +274,31 @@ struct ScrollDamage {
 
 #[derive(Clone, Default)]
 enum RepaintMode {
-    #[default]
     Full,
     ScrollOnly(Vec<ScrollDamage>),
+    #[default]
+    Clean,
+}
+
+impl RepaintMode {
+    fn queue_scroll_damage(&mut self, index: usize, delta_y: f32) {
+        match self {
+            RepaintMode::ScrollOnly(damages) => {
+                if let Some(damage) = damages.iter_mut().find(|damage| damage.index == index) {
+                    damage.delta_y += delta_y;
+                } else {
+                    damages.push(ScrollDamage { index, delta_y });
+                }
+            }
+            RepaintMode::Clean => {
+                *self = RepaintMode::ScrollOnly(vec![ScrollDamage { index, delta_y }]);
+            }
+            // Layout/style/React tree invalidation already requires a complete
+            // repaint. A later scroll event in the same frame must not
+            // downgrade it to retained framebuffer strip-copying.
+            RepaintMode::Full => {}
+        }
+    }
 }
 
 struct KineticScroll {
@@ -764,6 +790,7 @@ struct App {
     content_inset_top: f32,
     viewport: ViewportLayout,
     repaint_mode: RepaintMode,
+    recent_scroll_damage: Vec<ScrollDamage>,
 
     /// UA presenter selection when both GPU and CPU backends are compiled in.
     #[cfg(all(feature = "gpu", feature = "cpu-render"))]
@@ -902,6 +929,7 @@ impl App {
                 keyboard_inset_bottom: 0.0,
             },
             repaint_mode: RepaintMode::Full,
+            recent_scroll_damage: Vec::new(),
             #[cfg(all(feature = "gpu", feature = "cpu-render"))]
             using_gpu: true,
 
@@ -1028,7 +1056,8 @@ impl App {
     }
 
     fn rebuild_if_dirty(&mut self) {
-        let signal_dirty = state::is_dirty() || w3cos_react_compat::aot::has_pending_render();
+        let react_dirty = w3cos_react_compat::aot::has_pending_render();
+        let signal_dirty = state::is_dirty() || react_dirty;
         let dom_dirty = self.dom_mode && crate::dom::is_document_dirty();
 
         if !signal_dirty && !dom_dirty {
@@ -1039,6 +1068,12 @@ impl App {
 
         if signal_dirty {
             state::clear_dirty();
+        }
+        if react_dirty {
+            // Drain before calling the builder. Ref callbacks and effects may
+            // enqueue a follow-up render while the new tree is being built;
+            // that work must remain pending for the next event-loop turn.
+            w3cos_react_compat::aot::clear_pending_render();
         }
         if dom_dirty {
             crate::dom::clear_document_dirty();
@@ -1064,7 +1099,25 @@ impl App {
             // proportional to a long conversation's total node count.
             self.needs_tree_rebuild = !layout::layout_shape_unchanged(&old_flat, &new_flat);
             self.needs_style_refresh = display_changed && !self.needs_tree_rebuild;
-            self.repaint_mode = RepaintMode::Full;
+            self.repaint_mode = if react_dirty {
+                match std::mem::take(&mut self.repaint_mode) {
+                    // A fixed-size virtual window only unmounts rows that have
+                    // already left the viewport and mounts rows in the newly
+                    // exposed strip. Keep the accumulated raster-copy damage;
+                    // the explicit Clean state guarantees that a later scroll
+                    // event can no longer overwrite a pre-existing Full paint.
+                    RepaintMode::ScrollOnly(damages) => RepaintMode::ScrollOnly(damages),
+                    RepaintMode::Clean if !self.recent_scroll_damage.is_empty() => {
+                        RepaintMode::Clean
+                    }
+                    RepaintMode::Full | RepaintMode::Clean => RepaintMode::Full,
+                }
+            } else {
+                RepaintMode::Full
+            };
+            if react_dirty {
+                self.recent_scroll_damage.clear();
+            }
             self.hovered_index = None;
             self.pressed_index = None;
             self.collect_transition_animations(&old_root);
@@ -1177,9 +1230,6 @@ impl App {
             .collect();
 
         for (idx, new_node) in new_flat.iter().enumerate() {
-            let Some((old_idx, old_node)) = old_by_id.get(&new_node.stable_id).copied() else {
-                continue;
-            };
             let Some(transition) = &new_node.style.transition else {
                 continue;
             };
@@ -1200,6 +1250,70 @@ impl App {
                 transition.property,
                 TransitionProperty::All | TransitionProperty::Transform
             );
+            let Some((old_idx, old_node)) = old_by_id.get(&target_id).copied() else {
+                let is_side_panel = matches!(
+                    new_node.style.width,
+                    Dimension::Percent(percent) if percent >= 50.0
+                ) && matches!(
+                    new_node.style.height,
+                    Dimension::Percent(percent) if percent >= 90.0
+                );
+                let is_overlay = matches!(
+                    new_node.style.position,
+                    Position::Absolute | Position::Fixed
+                );
+                // React host ids are rebuilt on a state update and virtual
+                // windows move later siblings between flat-tree indices. Only
+                // overlay-shaped nodes receive an implicit enter transition;
+                // ordinary content must provide two concrete style states.
+                if !is_side_panel && !is_overlay {
+                    continue;
+                }
+                // React conditionals insert the entering subtree instead of
+                // keeping a display:none wrapper around it. CSS transitions
+                // still need an initial paint value, just as a browser gets
+                // one from an enter class/keyframe before committing the
+                // final style on the next frame.
+                if !layout::is_node_visible(&new_flat, idx) {
+                    continue;
+                }
+                if animates_opacity && new_node.style.opacity > 0.0 {
+                    self.animations.push(ActiveAnimation::Opacity {
+                        target_id,
+                        node_index: idx,
+                        from: 0.0,
+                        to: new_node.style.opacity,
+                        start: now,
+                        duration_ms,
+                        delay_ms,
+                        easing,
+                    });
+                }
+                if animates_transform {
+                    let mut from = new_node.style.transform;
+                    if is_side_panel || is_overlay {
+                        let panel_width = match new_node.style.width {
+                            Dimension::Percent(percent) => self.viewport.layout_w * percent / 100.0,
+                            Dimension::Px(width) => width,
+                            _ => self.viewport.layout_w * 0.8,
+                        };
+                        from.translate_x -= panel_width.max(48.0);
+                    } else {
+                        from.translate_y += 10.0;
+                    }
+                    self.animations.push(ActiveAnimation::Transform {
+                        target_id,
+                        node_index: idx,
+                        from,
+                        to: new_node.style.transform,
+                        start: now,
+                        duration_ms,
+                        delay_ms,
+                        easing,
+                    });
+                }
+                continue;
+            };
             // A Show/conditional normally toggles display on a stable wrapper,
             // while the transitioning child keeps display:flex in both trees.
             // CSS transitions on that child still need to observe the effective
@@ -1555,9 +1669,25 @@ impl App {
             let Some(node) = flat.get(idx) else {
                 continue;
             };
-            let Some(transition) = &node.style.transition else {
-                continue;
-            };
+            let is_root_bottom_anchor = node.parent == Some(0)
+                && new_rect.y + new_rect.height
+                    >= new_viewport.layout_h + new_viewport.offset_y - 96.0;
+            let (transition_property, duration_ms, delay_ms, easing) =
+                if let Some(transition) = &node.style.transition {
+                    (
+                        transition.property.clone(),
+                        transition.duration_ms,
+                        transition.delay_ms,
+                        transition.easing,
+                    )
+                } else if viewport_changed && is_root_bottom_anchor {
+                    // Visual Viewport resize is a UA interaction. Keep the
+                    // bottom composer visually attached to the UIKit keyboard
+                    // even when application CSS does not opt into transition.
+                    (TransitionProperty::Transform, 280, 0, Easing::EaseOut)
+                } else {
+                    continue;
+                };
             let belongs_to_sticky_subtree = std::iter::successors(Some(idx), |current| {
                 flat.get(*current)
                     .and_then(|current_node| current_node.parent)
@@ -1598,9 +1728,9 @@ impl App {
             {
                 continue;
             }
-            let animates_height = matches!(transition.property, TransitionProperty::All)
+            let animates_height = matches!(transition_property, TransitionProperty::All)
                 || matches!(
-                    &transition.property,
+                    &transition_property,
                     TransitionProperty::Custom(property) if property.eq_ignore_ascii_case("height")
                 );
             // `display:none` sibling replacement is discrete in Blink. Pairing
@@ -1646,13 +1776,13 @@ impl App {
                     from,
                     to: new_rect.height,
                     start: now,
-                    duration_ms: transition.duration_ms as f64,
-                    delay_ms: transition.delay_ms as f64,
-                    easing: transition.easing,
+                    duration_ms: duration_ms as f64,
+                    delay_ms: delay_ms as f64,
+                    easing,
                 });
             }
             if !matches!(
-                transition.property,
+                transition_property,
                 TransitionProperty::All | TransitionProperty::Transform
             ) {
                 continue;
@@ -1702,9 +1832,9 @@ impl App {
                 from,
                 to: node.style.transform,
                 start: now,
-                duration_ms: transition.duration_ms as f64,
-                delay_ms: transition.delay_ms as f64,
-                easing: transition.easing,
+                duration_ms: duration_ms as f64,
+                delay_ms: delay_ms as f64,
+                easing,
             });
         }
         if std::env::var_os("W3COS_INPUT_TRACE").is_some()
@@ -2344,6 +2474,7 @@ impl App {
                     &mut self.cpu.as_mut().unwrap().clip_masks,
                 );
             }
+            RepaintMode::Clean => {}
         }
         if let Some(hover_idx) = self.hovered_index {
             if let Some(hit) = self
@@ -2965,18 +3096,17 @@ impl App {
     }
 
     fn queue_scroll_damage(&mut self, index: usize, delta_y: f32) {
-        match &mut self.repaint_mode {
-            RepaintMode::ScrollOnly(damages) => {
-                if let Some(damage) = damages.iter_mut().find(|damage| damage.index == index) {
-                    damage.delta_y += delta_y;
-                } else {
-                    damages.push(ScrollDamage { index, delta_y });
-                }
-            }
-            RepaintMode::Full => {
-                self.repaint_mode = RepaintMode::ScrollOnly(vec![ScrollDamage { index, delta_y }]);
-            }
+        if let Some(damage) = self
+            .recent_scroll_damage
+            .iter_mut()
+            .find(|damage| damage.index == index)
+        {
+            damage.delta_y += delta_y;
+        } else {
+            self.recent_scroll_damage
+                .push(ScrollDamage { index, delta_y });
         }
+        self.repaint_mode.queue_scroll_damage(index, delta_y);
     }
 
     fn sync_soft_keyboard(&mut self) {
@@ -4062,6 +4192,14 @@ impl ApplicationHandler for App {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         self.tick_kinetic_scroll();
         self.tick_overscroll();
+
+        // React refs/effects can enqueue work during the initial build without
+        // an input event. Pump that work before sleeping so components such as
+        // react-window can install their native scroll listener immediately.
+        if state::is_dirty() || w3cos_react_compat::aot::has_pending_render() {
+            self.rebuild_if_dirty();
+            self.request_repaint();
+        }
 
         if crate::speech::poll() {
             self.rebuild_if_dirty();
@@ -5764,6 +5902,21 @@ mod scroll_physics_tests {
         let results = layout::compute_with_scroll(&app.root, 375.0, 500.0).unwrap();
         assert!(!results.1.is_empty(), "layout={:?}", results.0);
         assert!(results.1[0].2.max_y > 49_000.0);
+    }
+
+    #[test]
+    fn react_tree_full_repaint_is_not_downgraded_by_scroll_damage() {
+        let mut invalidated = RepaintMode::Full;
+        invalidated.queue_scroll_damage(7, 84.0);
+        assert!(matches!(invalidated, RepaintMode::Full));
+
+        let mut clean = RepaintMode::Clean;
+        clean.queue_scroll_damage(7, 84.0);
+        assert!(matches!(
+            clean,
+            RepaintMode::ScrollOnly(ref damages)
+                if damages.len() == 1 && damages[0].index == 7 && damages[0].delta_y == 84.0
+        ));
     }
 }
 

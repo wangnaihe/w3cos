@@ -947,7 +947,124 @@ impl LowerCtx {
                 let quasi = self.lower_expr(&Expr::Tpl(*tagged.tpl.clone()));
                 format!("{tag}({quasi})")
             }
+            Expr::JSXElement(element) => self.lower_jsx_element(element),
+            Expr::JSXFragment(fragment) => self.lower_jsx_children(&fragment.children),
             _ => format!("todo!(\"lower: {:?}\")", expr_kind_name(expr)),
+        }
+    }
+
+    fn lower_jsx_element(&self, element: &JSXElement) -> String {
+        let element_type = self.lower_jsx_name(&element.opening.name);
+        let props = self.lower_jsx_props(&element.opening.attrs);
+        let children = element
+            .children
+            .iter()
+            .filter_map(|child| self.lower_jsx_child(child))
+            .collect::<Vec<_>>();
+        let children = if children.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", children.join(", "))
+        };
+        format!("w3cos_react_compat::aot::createElement(vec![{element_type}, {props}{children}])")
+    }
+
+    fn lower_jsx_children(&self, children: &[JSXElementChild]) -> String {
+        let children = children
+            .iter()
+            .filter_map(|child| self.lower_jsx_child(child))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("w3cos_core::Value::array(vec![{children}])")
+    }
+
+    fn lower_jsx_name(&self, name: &JSXElementName) -> String {
+        match name {
+            JSXElementName::Ident(identifier) => {
+                let name = atom_str(&identifier.sym);
+                if name.chars().next().is_some_and(char::is_lowercase) {
+                    format!("w3cos_core::Value::from({name:?})")
+                } else {
+                    self.resolve_value(&name)
+                }
+            }
+            JSXElementName::JSXMemberExpr(member) => self.lower_jsx_member_name(member),
+            JSXElementName::JSXNamespacedName(name) => format!(
+                "w3cos_core::Value::from({:?})",
+                format!("{}:{}", name.ns.sym, name.name.sym)
+            ),
+        }
+    }
+
+    fn lower_jsx_member_name(&self, member: &JSXMemberExpr) -> String {
+        let object = match &member.obj {
+            JSXObject::Ident(identifier) => self.resolve_value(&atom_str(&identifier.sym)),
+            JSXObject::JSXMemberExpr(member) => self.lower_jsx_member_name(member),
+        };
+        format!("{object}.get_property({:?})", atom_str(&member.prop.sym))
+    }
+
+    fn lower_jsx_props(&self, attributes: &[JSXAttrOrSpread]) -> String {
+        if attributes.is_empty() {
+            return "w3cos_core::js_object! {}".to_string();
+        }
+        let parts = attributes
+            .iter()
+            .filter_map(|attribute| match attribute {
+                JSXAttrOrSpread::SpreadElement(spread) => Some(self.lower_expr(&spread.expr)),
+                JSXAttrOrSpread::JSXAttr(attribute) => {
+                    let key = match &attribute.name {
+                        JSXAttrName::Ident(identifier) => atom_str(&identifier.sym),
+                        JSXAttrName::JSXNamespacedName(name) => {
+                            format!("{}:{}", name.ns.sym, name.name.sym)
+                        }
+                    };
+                    let value = match attribute.value.as_ref() {
+                        None => "w3cos_core::Value::Bool(true)".to_string(),
+                        Some(JSXAttrValue::Str(value)) => {
+                            format!(
+                                "w3cos_core::Value::from({:?})",
+                                wtf8_to_string(&value.value)
+                            )
+                        }
+                        Some(JSXAttrValue::JSXExprContainer(container)) => match &container.expr {
+                            JSXExpr::Expr(expression) => self.lower_expr(expression),
+                            JSXExpr::JSXEmptyExpr(_) => "w3cos_core::Value::Undefined".to_string(),
+                        },
+                        Some(JSXAttrValue::JSXElement(element)) => self.lower_jsx_element(element),
+                        Some(JSXAttrValue::JSXFragment(fragment)) => {
+                            self.lower_jsx_children(&fragment.children)
+                        }
+                    };
+                    Some(format!("w3cos_core::js_object! {{ {key:?} => {value} }}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        if parts.len() == 1 {
+            parts[0].clone()
+        } else {
+            format!(
+                "w3cos_core::Value::object_from_parts(vec![{}])",
+                parts.join(", ")
+            )
+        }
+    }
+
+    fn lower_jsx_child(&self, child: &JSXElementChild) -> Option<String> {
+        match child {
+            JSXElementChild::JSXText(text) => {
+                let value = text.value.split_whitespace().collect::<Vec<_>>().join(" ");
+                (!value.is_empty()).then(|| format!("w3cos_core::Value::from({value:?})"))
+            }
+            JSXElementChild::JSXExprContainer(container) => match &container.expr {
+                JSXExpr::Expr(expression) => Some(self.lower_expr(expression)),
+                JSXExpr::JSXEmptyExpr(_) => None,
+            },
+            JSXElementChild::JSXSpreadChild(spread) => Some(self.lower_expr(&spread.expr)),
+            JSXElementChild::JSXElement(element) => Some(self.lower_jsx_element(element)),
+            JSXElementChild::JSXFragment(fragment) => {
+                Some(self.lower_jsx_children(&fragment.children))
+            }
         }
     }
 
@@ -1561,6 +1678,48 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn parse_tsx_stmts(code: &str) -> Vec<Stmt> {
+        let cm: Lrc<SourceMap> = Default::default();
+        let fm = cm.new_source_file(Lrc::new(FileName::Anon), code.to_string());
+        let lexer = Lexer::new(
+            Syntax::Typescript(TsSyntax {
+                tsx: true,
+                ..Default::default()
+            }),
+            Default::default(),
+            StringInput::from(&*fm),
+            None,
+        );
+        let mut parser = Parser::new_from(lexer);
+        let module = parser.parse_module().expect("parse failed");
+        module
+            .body
+            .into_iter()
+            .filter_map(|item| match item {
+                ModuleItem::Stmt(statement) => Some(statement),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lowers_standard_tsx_elements_to_react_host_calls() {
+        let statements = parse_tsx_stmts(
+            r#"const view = <List rowCount={1000} {...props}><span onClick={open}>你好</span></List>;"#,
+        );
+        let mut context = LowerCtx::new_dynamic(vec![]);
+        let code = context.lower_stmts(&statements);
+
+        assert!(code.contains("aot::createElement"), "tsx host call: {code}");
+        assert!(
+            code.contains("Value::from(\"span\")"),
+            "intrinsic tag: {code}"
+        );
+        assert!(code.contains("rowCount"), "component prop: {code}");
+        assert!(code.contains("object_from_parts"), "spread props: {code}");
+        assert!(code.contains("你好"), "text child: {code}");
     }
 
     #[test]

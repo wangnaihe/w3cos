@@ -77,8 +77,6 @@ pub struct Node {
 pub enum NodeKind {
     Column,
     Row,
-    /// A real React AOT subtree compiled from the module in `src`.
-    ReactAot,
     #[serde(alias = "text")]
     Text(#[serde(default)] String),
     #[serde(alias = "button")]
@@ -385,7 +383,6 @@ fn parse_tsx_element(s: &str) -> Option<(Node, &str)> {
             | "TextInput"
             | "Show"
             | "VirtualList"
-            | "ReactAot"
     ) {
         return None;
     }
@@ -784,20 +781,6 @@ fn build_tsx_node(
                 sticky_counter: None,
             }
         }
-        "ReactAot" => Node {
-            kind: NodeKind::ReactAot,
-            style,
-            children: vec![],
-            text: None,
-            label: None,
-            on_click: None,
-            src,
-            placeholder: None,
-            class_name,
-            show_when: None,
-            repeat: None,
-            sticky_counter: None,
-        },
         "Row" => Node {
             kind: NodeKind::Row,
             style,
