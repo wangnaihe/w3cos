@@ -276,6 +276,7 @@ struct ScrollDamage {
 enum RepaintMode {
     Full,
     ScrollOnly(Vec<ScrollDamage>),
+    ScrollContentChanged(Vec<ScrollDamage>),
     #[default]
     Clean,
 }
@@ -283,7 +284,7 @@ enum RepaintMode {
 impl RepaintMode {
     fn queue_scroll_damage(&mut self, index: usize, delta_y: f32) {
         match self {
-            RepaintMode::ScrollOnly(damages) => {
+            RepaintMode::ScrollOnly(damages) | RepaintMode::ScrollContentChanged(damages) => {
                 if let Some(damage) = damages.iter_mut().find(|damage| damage.index == index) {
                     damage.delta_y += delta_y;
                 } else {
@@ -298,6 +299,115 @@ impl RepaintMode {
             // downgrade it to retained framebuffer strip-copying.
             RepaintMode::Full => {}
         }
+    }
+}
+
+fn repaint_after_react_rebuild(
+    current: RepaintMode,
+    has_recent_scroll_damage: bool,
+) -> RepaintMode {
+    match current {
+        RepaintMode::ScrollOnly(damages) => RepaintMode::ScrollOnly(damages),
+        RepaintMode::ScrollContentChanged(damages) => RepaintMode::ScrollContentChanged(damages),
+        RepaintMode::Clean if has_recent_scroll_damage => RepaintMode::Clean,
+        RepaintMode::Full | RepaintMode::Clean => RepaintMode::Full,
+    }
+}
+
+fn repaint_after_react_content_change(
+    current: RepaintMode,
+    recent_scroll_damage: &[ScrollDamage],
+) -> RepaintMode {
+    match current {
+        RepaintMode::ScrollOnly(damages) | RepaintMode::ScrollContentChanged(damages)
+            if !damages.is_empty() =>
+        {
+            RepaintMode::ScrollContentChanged(damages)
+        }
+        RepaintMode::Clean if !recent_scroll_damage.is_empty() => {
+            RepaintMode::ScrollContentChanged(recent_scroll_damage.to_vec())
+        }
+        RepaintMode::Full
+        | RepaintMode::Clean
+        | RepaintMode::ScrollOnly(_)
+        | RepaintMode::ScrollContentChanged(_) => RepaintMode::Full,
+    }
+}
+
+fn react_rebuild_changes_painted_content(
+    old_flat: &[layout::FlatNodeInfo<'_>],
+    new_flat: &[layout::FlatNodeInfo<'_>],
+) -> bool {
+    if old_flat.len() != new_flat.len() {
+        return true;
+    }
+
+    old_flat.iter().zip(new_flat).any(|(old, new)| {
+        if old.stable_id != new.stable_id {
+            return true;
+        }
+
+        match (old.kind, new.kind) {
+            (ComponentKind::Root, ComponentKind::Root)
+            | (ComponentKind::Column, ComponentKind::Column)
+            | (ComponentKind::Row, ComponentKind::Row)
+            | (ComponentKind::Box, ComponentKind::Box) => false,
+            (ComponentKind::Text { content: old }, ComponentKind::Text { content: new }) => {
+                old != new
+            }
+            (ComponentKind::Button { label: old }, ComponentKind::Button { label: new }) => {
+                old != new
+            }
+            (ComponentKind::Image { src: old }, ComponentKind::Image { src: new }) => old != new,
+            (
+                ComponentKind::TextInput {
+                    value: old_value,
+                    placeholder: old_placeholder,
+                },
+                ComponentKind::TextInput {
+                    value: new_value,
+                    placeholder: new_placeholder,
+                },
+            ) => old_value != new_value || old_placeholder != new_placeholder,
+            (
+                ComponentKind::Canvas {
+                    width: old_width,
+                    height: old_height,
+                },
+                ComponentKind::Canvas {
+                    width: new_width,
+                    height: new_height,
+                },
+            ) => old_width != new_width || old_height != new_height,
+            (
+                ComponentKind::VirtualList {
+                    item_count: old_count,
+                    estimated_item_height: old_height,
+                    overscan: old_overscan,
+                    total_extent: old_extent,
+                },
+                ComponentKind::VirtualList {
+                    item_count: new_count,
+                    estimated_item_height: new_height,
+                    overscan: new_overscan,
+                    total_extent: new_extent,
+                },
+            ) => {
+                old_count != new_count
+                    || old_height != new_height
+                    || old_overscan != new_overscan
+                    || old_extent != new_extent
+            }
+            _ => true,
+        }
+    })
+}
+
+fn repaint_for_present(current: RepaintMode, has_active_animations: bool) -> RepaintMode {
+    if has_active_animations {
+        RepaintMode::Full
+    } else {
+        current
     }
 }
 
@@ -1091,6 +1201,21 @@ impl App {
             let old_flat = layout::pre_flatten(&old_root);
             self.root = builder();
             let new_flat = layout::pre_flatten(&self.root);
+            let painted_content_changed =
+                react_dirty && react_rebuild_changes_painted_content(&old_flat, &new_flat);
+            let stable_index_remap = build_stable_index_remap(&old_flat, &new_flat);
+            remap_indexed_map(&mut self.scroll_offsets, &stable_index_remap);
+            remap_indexed_map(&mut self.overscroll_states, &stable_index_remap);
+            remap_indexed_set(&mut self.initialized_scroll_targets, &stable_index_remap);
+            remap_indexed_set(&mut self.user_scrolled_nodes, &stable_index_remap);
+            remap_indexed_set(&mut self.pending_sticky_scrolls, &stable_index_remap);
+            if let Some(kinetic) = &mut self.kinetic_scroll {
+                if let Some(&new_index) = stable_index_remap.get(&kinetic.index) {
+                    kinetic.index = new_index;
+                } else {
+                    self.kinetic_scroll = None;
+                }
+            }
             let display_changed = !layout::layout_display_unchanged(&old_flat, &new_flat);
             self.needs_layout = true;
             // Stable Show slots already exist in the persistent Taffy tree.
@@ -1099,20 +1224,26 @@ impl App {
             // proportional to a long conversation's total node count.
             self.needs_tree_rebuild = !layout::layout_shape_unchanged(&old_flat, &new_flat);
             self.needs_style_refresh = display_changed && !self.needs_tree_rebuild;
-            self.repaint_mode = if react_dirty {
-                match std::mem::take(&mut self.repaint_mode) {
-                    // A fixed-size virtual window only unmounts rows that have
-                    // already left the viewport and mounts rows in the newly
-                    // exposed strip. Keep the accumulated raster-copy damage;
-                    // the explicit Clean state guarantees that a later scroll
-                    // event can no longer overwrite a pre-existing Full paint.
-                    RepaintMode::ScrollOnly(damages) => RepaintMode::ScrollOnly(damages),
-                    RepaintMode::Clean if !self.recent_scroll_damage.is_empty() => {
-                        RepaintMode::Clean
-                    }
-                    RepaintMode::Full | RepaintMode::Clean => RepaintMode::Full,
-                }
+            self.repaint_mode = if painted_content_changed {
+                // A standard React virtualizer reuses the same host slots for
+                // different rows. Once their text/image/input payload changes,
+                // framebuffer strip-copying would move pixels rendered for the
+                // previous rows and can leave duplicates or blank islands.
+                repaint_after_react_content_change(
+                    std::mem::take(&mut self.repaint_mode),
+                    &self.recent_scroll_damage,
+                )
+            } else if react_dirty {
+                // A fixed-size virtual window only unmounts rows that have
+                // already left the viewport. When the retained host slots keep
+                // the same paint payload, preserve accumulated scroll damage.
+                repaint_after_react_rebuild(
+                    std::mem::take(&mut self.repaint_mode),
+                    !self.recent_scroll_damage.is_empty(),
+                )
             } else {
+                // Non-React signal/DOM work is never a deferred virtual-window
+                // swap and therefore invalidates the complete frame.
                 RepaintMode::Full
             };
             if react_dirty {
@@ -1176,7 +1307,14 @@ impl App {
             host.engine.offset_of(anchor_index) - scroll_offset,
         );
         let window = host.engine.visible_window(scroll_offset, viewport_extent);
-        if host.window == window
+        // A React state update rebuilds `self.root`, so this node may be a
+        // fresh VirtualList containing only its row template even when the
+        // retained host's visible range and offset did not change. In that
+        // case we must re-inject the mounted rows and both spacers instead of
+        // taking the unchanged-window fast path.
+        let node_has_materialized_window = node.children.len() == host.engine.mounted_len() + 2;
+        if node_has_materialized_window
+            && host.window == window
             && (host.scroll_offset - scroll_offset).abs() <= 0.01
             && (host.engine.total_extent() - total_extent).abs() <= 0.01
         {
@@ -1547,6 +1685,18 @@ impl App {
                 virtual_ordinal += 1;
             }
         }
+        // React state changes can insert/remove siblings before a virtual
+        // list (for example a sticky card switching between expanded and
+        // compact branches). Flat node indices then move, while the retained
+        // virtual-list host still owns the authoritative scroll offset. Do
+        // not let the new scroll node inherit 0 (or an unrelated stale index
+        // entry), otherwise its leading spacer is painted without the
+        // matching scroll translation and appears as a large blank block.
+        sync_virtual_scroll_offsets(
+            &self.virtual_scroll_indices,
+            &self.virtual_lists,
+            &mut self.scroll_offsets,
+        );
         offset_layout_y(
             layout_offset_y,
             &mut self.layout_cache,
@@ -2418,7 +2568,11 @@ impl App {
                 )
             })
             .collect();
-        match std::mem::take(&mut self.repaint_mode) {
+        let repaint_mode = repaint_for_present(
+            std::mem::take(&mut self.repaint_mode),
+            !self.animations.is_empty(),
+        );
+        match repaint_mode {
             RepaintMode::ScrollOnly(damages) => {
                 let scaled_damages: Vec<(usize, f32)> = damages
                     .iter()
@@ -2462,6 +2616,22 @@ impl App {
                         &mut self.cpu.as_mut().unwrap().clip_masks,
                     );
                 }
+            }
+            RepaintMode::ScrollContentChanged(damages) => {
+                let scroll_indices: Vec<usize> =
+                    damages.iter().map(|damage| damage.index).collect();
+                render_cpu::render_scroll_content_change(
+                    &mut pixmap,
+                    &render_nodes,
+                    &self.font,
+                    &scroll_info,
+                    &self.text_input_values,
+                    self.focused_index,
+                    &scroll_indices,
+                    &scaled_scrollable,
+                    &self.scroll_ancestor,
+                    &mut self.cpu.as_mut().unwrap().clip_masks,
+                );
             }
             RepaintMode::Full => {
                 render_cpu::render_frame(
@@ -3270,6 +3440,7 @@ impl App {
     }
 
     fn repaint_after_interaction(&mut self) {
+        self.repaint_mode = RepaintMode::Full;
         self.request_repaint();
     }
 
@@ -3564,6 +3735,63 @@ fn virtual_spacer(height: f32) -> Component {
     style.height = Dimension::Px(height.max(0.0));
     style.flex_shrink = 0.0;
     Component::boxed(style, vec![])
+}
+
+fn build_stable_index_remap(
+    old_flat: &[layout::FlatNodeInfo<'_>],
+    new_flat: &[layout::FlatNodeInfo<'_>],
+) -> HashMap<usize, usize> {
+    let new_indices: HashMap<u64, usize> = new_flat
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.stable_id, index))
+        .collect();
+    old_flat
+        .iter()
+        .enumerate()
+        .filter_map(|(old_index, node)| {
+            new_indices
+                .get(&node.stable_id)
+                .copied()
+                .map(|new_index| (old_index, new_index))
+        })
+        .collect()
+}
+
+fn remap_indexed_map<T>(values: &mut HashMap<usize, T>, remap: &HashMap<usize, usize>) {
+    *values = std::mem::take(values)
+        .into_iter()
+        .filter_map(|(old_index, value)| {
+            remap
+                .get(&old_index)
+                .copied()
+                .map(|new_index| (new_index, value))
+        })
+        .collect();
+}
+
+fn remap_indexed_set(values: &mut HashSet<usize>, remap: &HashMap<usize, usize>) {
+    *values = std::mem::take(values)
+        .into_iter()
+        .filter_map(|old_index| remap.get(&old_index).copied())
+        .collect();
+}
+
+fn sync_virtual_scroll_offsets(
+    virtual_scroll_indices: &HashMap<usize, usize>,
+    virtual_lists: &HashMap<usize, ComponentVirtualList>,
+    scroll_offsets: &mut HashMap<usize, (f32, f32)>,
+) {
+    for (&scroll_index, &ordinal) in virtual_scroll_indices {
+        let Some(host) = virtual_lists.get(&ordinal) else {
+            continue;
+        };
+        let x = scroll_offsets
+            .get(&scroll_index)
+            .map(|(x, _)| *x)
+            .unwrap_or(0.0);
+        scroll_offsets.insert(scroll_index, (x, host.scroll_offset));
+    }
 }
 
 fn virtual_item_from_template(template: &Component, index: usize) -> Component {
@@ -4645,6 +4873,7 @@ impl ApplicationHandler for App {
                                         let mut chars: Vec<char> = current.chars().collect();
                                         chars.pop();
                                         *current = chars.into_iter().collect();
+                                        self.repaint_mode = RepaintMode::Full;
                                         self.request_repaint();
                                     }
                                     return;
@@ -4661,6 +4890,7 @@ impl ApplicationHandler for App {
                                             .entry(focus_idx)
                                             .or_insert_with(|| value.clone());
                                         current.push_str(text);
+                                        self.repaint_mode = RepaintMode::Full;
                                         self.request_repaint();
                                         return;
                                     }
@@ -4678,6 +4908,7 @@ impl ApplicationHandler for App {
                                             self.rebuild_if_dirty();
                                         }
                                     }
+                                    self.repaint_mode = RepaintMode::Full;
                                     self.request_repaint();
                                     return;
                                 }
@@ -4709,6 +4940,7 @@ impl ApplicationHandler for App {
                                         .entry(focus_idx)
                                         .or_insert_with(|| value);
                                     current.push_str(&commit);
+                                    self.repaint_mode = RepaintMode::Full;
                                     self.request_repaint();
                                 }
                                 _ => {}
@@ -4818,6 +5050,35 @@ fn initial_scroll_target_offset(target_y: f32, scrollport_y: f32, max_y: f32) ->
 #[cfg(test)]
 mod scroll_physics_tests {
     use super::*;
+
+    #[test]
+    fn react_virtual_window_content_change_requires_full_repaint() {
+        let old_root = Component::root(vec![Component::text(
+            "row-56",
+            w3cos_std::style::Style::default(),
+        )]);
+        let new_root = Component::root(vec![Component::text(
+            "row-57",
+            w3cos_std::style::Style::default(),
+        )]);
+
+        let old_flat = layout::pre_flatten(&old_root);
+        let new_flat = layout::pre_flatten(&new_root);
+        assert!(react_rebuild_changes_painted_content(&old_flat, &new_flat));
+    }
+
+    #[test]
+    fn unchanged_react_host_content_keeps_scroll_damage_path() {
+        let old_root = Component::root(vec![Component::text(
+            "row-56",
+            w3cos_std::style::Style::default(),
+        )]);
+        let new_root = old_root.clone();
+
+        let old_flat = layout::pre_flatten(&old_root);
+        let new_flat = layout::pre_flatten(&new_root);
+        assert!(!react_rebuild_changes_painted_content(&old_flat, &new_flat));
+    }
 
     #[test]
     fn touch_velocity_uses_recent_motion_window_instead_of_last_delta() {
@@ -5905,6 +6166,86 @@ mod scroll_physics_tests {
     }
 
     #[test]
+    fn virtual_list_keeps_scroll_offset_when_react_flat_index_moves() {
+        let mut list_style = w3cos_std::style::Style::default();
+        list_style.height = Dimension::Px(500.0);
+        list_style.overflow = w3cos_std::style::Overflow::Scroll;
+        let virtual_list = Component::virtual_list(
+            1_000,
+            50.0,
+            100.0,
+            list_style,
+            Component::text("row-{index}", w3cos_std::style::Style::default()),
+        );
+        let mut app = App::new_static(Component::root(vec![virtual_list]));
+        assert!(app.materialize_virtual_list(0, 500.0, 2_400.0));
+
+        let indices = HashMap::from([(42, 0)]);
+        let mut offsets = HashMap::from([(42, (0.0, 0.0))]);
+        sync_virtual_scroll_offsets(&indices, &app.virtual_lists, &mut offsets);
+
+        assert_eq!(offsets.get(&42), Some(&(0.0, 2_400.0)));
+    }
+
+    #[test]
+    fn react_rebuild_reinjects_unchanged_virtual_window_into_fresh_node() {
+        let make_list = || {
+            let mut style = w3cos_std::style::Style::default();
+            style.height = Dimension::Px(500.0);
+            style.overflow = w3cos_std::style::Overflow::Scroll;
+            Component::virtual_list(
+                1_000,
+                50.0,
+                100.0,
+                style,
+                Component::text("row-{index}", w3cos_std::style::Style::default()),
+            )
+        };
+        let mut app = App::new_static(Component::root(vec![make_list()]));
+        assert!(app.materialize_virtual_list(0, 500.0, 2_400.0));
+
+        app.root = Component::root(vec![make_list()]);
+        assert!(
+            app.materialize_virtual_list(0, 500.0, 2_400.0),
+            "a fresh React node must not take the retained host's unchanged-window fast path"
+        );
+        let flat = layout::pre_flatten(&app.root);
+        assert!(flat.iter().any(|node| matches!(
+            node.kind,
+            ComponentKind::Text { content } if content == "row-46"
+        )));
+    }
+
+    #[test]
+    fn react_rebuild_remaps_scroll_state_by_stable_tree_identity() {
+        let style = w3cos_std::style::Style::default();
+        let old_root = Component::root(vec![
+            Component::boxed(style.clone(), vec![]),
+            Component::boxed(style.clone(), vec![]),
+        ]);
+        let new_root = Component::root(vec![
+            Component::boxed(
+                style.clone(),
+                vec![
+                    Component::boxed(style.clone(), vec![]),
+                    Component::boxed(style.clone(), vec![]),
+                ],
+            ),
+            Component::boxed(style, vec![]),
+        ]);
+        let old_flat = layout::pre_flatten(&old_root);
+        let new_flat = layout::pre_flatten(&new_root);
+        let remap = build_stable_index_remap(&old_flat, &new_flat);
+        let mut offsets = HashMap::from([(2, (0.0, 888.0))]);
+
+        remap_indexed_map(&mut offsets, &remap);
+
+        assert_eq!(remap.get(&2), Some(&4));
+        assert_eq!(offsets.get(&4), Some(&(0.0, 888.0)));
+        assert!(!offsets.contains_key(&2));
+    }
+
+    #[test]
     fn react_tree_full_repaint_is_not_downgraded_by_scroll_damage() {
         let mut invalidated = RepaintMode::Full;
         invalidated.queue_scroll_damage(7, 84.0);
@@ -5916,6 +6257,18 @@ mod scroll_physics_tests {
             clean,
             RepaintMode::ScrollOnly(ref damages)
                 if damages.len() == 1 && damages[0].index == 7 && damages[0].delta_y == 84.0
+        ));
+    }
+
+    #[test]
+    fn active_cpu_animation_repaints_every_presented_frame() {
+        assert!(matches!(
+            repaint_for_present(RepaintMode::Clean, true),
+            RepaintMode::Full
+        ));
+        assert!(matches!(
+            repaint_for_present(RepaintMode::Clean, false),
+            RepaintMode::Clean
         ));
     }
 }

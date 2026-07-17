@@ -213,6 +213,76 @@ pub fn render_scroll_damage(
     }
 }
 
+/// Repaint a scrollport after a virtualizer replaces the paint payload of its
+/// retained host rows. This avoids both stale raster-copy pixels and the cost
+/// of repainting fixed page chrome outside the affected scroll container.
+pub fn render_scroll_content_change(
+    pixmap: &mut Pixmap,
+    nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
+    font: &fontdue::Font,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    text_input_values: &HashMap<usize, String>,
+    focused_index: Option<usize>,
+    scroll_indices: &[usize],
+    scrollable: &[(usize, LayoutRect, crate::layout::ScrollExtent)],
+    scroll_ancestor: &[Option<usize>],
+    clip_masks: &mut ClipMaskCache,
+) {
+    let mut paint_damages = Vec::with_capacity(scroll_indices.len());
+    for &scroll_idx in scroll_indices {
+        if paint_damages
+            .iter()
+            .any(|(existing, _)| *existing == scroll_idx)
+        {
+            continue;
+        }
+        let Some((_, rect, _)) = scrollable.iter().find(|(idx, _, _)| *idx == scroll_idx) else {
+            render_frame(
+                pixmap,
+                nodes,
+                font,
+                scroll_info,
+                text_input_values,
+                focused_index,
+                clip_masks,
+            );
+            return;
+        };
+        let style = nodes
+            .iter()
+            .find(|(idx, _, _, _)| *idx == scroll_idx)
+            .map(|(_, _, _, style)| *style);
+        if !style.is_some_and(|style| style.background.a == 255 && style.opacity >= 0.999) {
+            render_frame(
+                pixmap,
+                nodes,
+                font,
+                scroll_info,
+                text_input_values,
+                focused_index,
+                clip_masks,
+            );
+            return;
+        }
+        clear_rect_with_color(pixmap, *rect, style.unwrap().background);
+        paint_damages.push((scroll_idx, *rect));
+    }
+
+    for damage in &paint_damages {
+        paint_nodes(
+            pixmap,
+            nodes,
+            font,
+            scroll_info,
+            text_input_values,
+            focused_index,
+            Some(std::slice::from_ref(damage)),
+            Some(scroll_ancestor),
+            clip_masks,
+        );
+    }
+}
+
 fn is_within_scroll_container(
     idx: usize,
     scroll_idx: usize,

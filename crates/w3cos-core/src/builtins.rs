@@ -33,6 +33,11 @@ impl BuiltinObject {
                 .into_iter()
                 .max_by(|left, right| left.to_number().total_cmp(&right.to_number()))
                 .unwrap_or(Value::Number(f64::NEG_INFINITY)),
+            (BuiltinKind::Math, "floor") => unary_number(arguments, f64::floor),
+            (BuiltinKind::Math, "ceil") => unary_number(arguments, f64::ceil),
+            (BuiltinKind::Math, "round") => unary_number(arguments, f64::round),
+            (BuiltinKind::Math, "trunc") => unary_number(arguments, f64::trunc),
+            (BuiltinKind::Math, "abs") => unary_number(arguments, f64::abs),
             (BuiltinKind::Object, "is") => Value::Bool(
                 arguments
                     .first()
@@ -63,6 +68,12 @@ impl BuiltinObject {
             _ => Value::Undefined,
         }
     }
+}
+
+fn unary_number(arguments: Vec<Value>, operation: fn(f64) -> f64) -> Value {
+    Value::Number(operation(
+        arguments.first().map(Value::to_number).unwrap_or(f64::NAN),
+    ))
 }
 
 fn object_keys(value: &Value) -> Value {
@@ -226,5 +237,25 @@ pub const ResizeObserver: Value = Value::Undefined;
 impl ResizeObserver {
     pub fn new(_arguments: Vec<Value>) -> Value {
         dom_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn math_floor_matches_javascript_number_semantics() {
+        assert_eq!(
+            Math.call_method("floor", vec![Value::Number(2.75)])
+                .to_number(),
+            2.0
+        );
+        assert_eq!(
+            Math.call_method("floor", vec![Value::Number(-2.25)])
+                .to_number(),
+            -3.0
+        );
+        assert!(Math.call_method("floor", vec![]).to_number().is_nan());
     }
 }

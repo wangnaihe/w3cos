@@ -71,6 +71,7 @@ pub mod aot {
         static NEXT_HOST_ELEMENT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
         static HOST_ELEMENTS: std::cell::RefCell<std::collections::HashMap<u64, Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
         static SCROLL_LISTENERS: std::cell::RefCell<std::collections::HashMap<u64, Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
+        static SCROLL_PROP_LISTENERS: std::cell::RefCell<std::collections::HashMap<u64, Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
         static CLICK_LISTENERS: std::cell::RefCell<std::collections::HashMap<u64, Value>> = std::cell::RefCell::new(std::collections::HashMap::new());
     }
 
@@ -114,17 +115,27 @@ pub mod aot {
     }
 
     pub fn dispatch_scroll(host_id: u64, offset: f32) {
-        HOST_ELEMENTS.with(|elements| {
+        let element = HOST_ELEMENTS.with(|elements| {
             if let Some(element) = elements.borrow().get(&host_id) {
                 element.set_property("scrollTop", Value::Number(offset as f64));
+                Some(element.clone())
+            } else {
+                None
             }
         });
+        let event = Value::object(std::collections::HashMap::new());
+        if let Some(element) = element {
+            event.set_property("target", element.clone());
+            event.set_property("currentTarget", element);
+        }
         let listener = SCROLL_LISTENERS.with(|listeners| listeners.borrow().get(&host_id).cloned());
         if let Some(listener) = listener {
-            listener.call(
-                Value::Undefined,
-                vec![Value::object(std::collections::HashMap::new())],
-            );
+            listener.call(Value::Undefined, vec![event.clone()]);
+        }
+        let prop_listener =
+            SCROLL_PROP_LISTENERS.with(|listeners| listeners.borrow().get(&host_id).cloned());
+        if let Some(listener) = prop_listener {
+            listener.call(Value::Undefined, vec![event]);
         }
     }
 
@@ -254,7 +265,18 @@ pub mod aot {
                 } else {
                     CLICK_LISTENERS.with(|listeners| listeners.borrow_mut().remove(&host_id));
                 }
-                if SCROLL_LISTENERS.with(|listeners| listeners.borrow().contains_key(&host_id)) {
+                let on_scroll = props.get_property("onScroll");
+                if on_scroll.is_function() {
+                    SCROLL_PROP_LISTENERS.with(|listeners| {
+                        listeners.borrow_mut().insert(host_id, on_scroll);
+                    });
+                } else {
+                    SCROLL_PROP_LISTENERS.with(|listeners| listeners.borrow_mut().remove(&host_id));
+                }
+                if SCROLL_LISTENERS.with(|listeners| listeners.borrow().contains_key(&host_id))
+                    || SCROLL_PROP_LISTENERS
+                        .with(|listeners| listeners.borrow().contains_key(&host_id))
+                {
                     component.on_click = w3cos_std::EventAction::NativeScroll(host_id);
                 }
                 component
@@ -1051,6 +1073,36 @@ pub mod aot {
             };
             dispatch_click(host_id);
             assert_eq!(clicks.get(), 1);
+        }
+
+        #[test]
+        fn native_scroll_prop_receives_current_target_offset() {
+            let observed = Rc::new(Cell::new(0.0));
+            let callback_observed = Rc::clone(&observed);
+            let props = Value::object(std::collections::HashMap::new());
+            props.set_property(
+                "onScroll",
+                Value::function(move |_, arguments| {
+                    let offset = arguments
+                        .first()
+                        .cloned()
+                        .unwrap_or(Value::Undefined)
+                        .get_property("currentTarget")
+                        .get_property("scrollTop")
+                        .to_number();
+                    callback_observed.set(offset);
+                    Value::Undefined
+                }),
+            );
+            let element = createElement(vec![Value::from("div"), props]);
+            let component = render_to_component(element);
+            let EventAction::NativeScroll(host_id) = component.on_click else {
+                panic!("scroll host did not register its onScroll callback");
+            };
+
+            dispatch_scroll(host_id, 168.0);
+
+            assert_eq!(observed.get(), 168.0);
         }
 
         #[test]
