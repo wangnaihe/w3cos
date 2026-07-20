@@ -568,6 +568,22 @@ impl LowerCtx {
                 }
             }
             Expr::Unary(unary) => {
+                if self.dynamic_values && unary.op == UnaryOp::TypeOf {
+                    if let Expr::Ident(identifier) = unary.arg.as_ref() {
+                        match atom_str(&identifier.sym).as_str() {
+                            "ResizeObserver" => {
+                                return "w3cos_core::Value::from(\"function\")".to_string();
+                            }
+                            // Native W3COS is a browser host, not an SSR environment.
+                            // Libraries such as react-window select useLayoutEffect
+                            // through `typeof window !== "undefined"`.
+                            "window" => {
+                                return "w3cos_core::Value::from(\"object\")".to_string();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let arg = self.lower_expr(&unary.arg);
                 if self.dynamic_values {
                     match unary.op {
@@ -1345,6 +1361,7 @@ impl LowerCtx {
                 }
             }
             Pat::Object(object) => {
+                let excluded = object_pattern_excluded_keys(object);
                 for property in &object.props {
                     match property {
                         ObjectPatProp::Assign(assign) => {
@@ -1376,7 +1393,8 @@ impl LowerCtx {
                             );
                         }
                         ObjectPatProp::Rest(rest) => {
-                            self.lower_dynamic_local_pattern(&rest.arg, source, lines, indent)
+                            let rest_source = format!("{source}.object_rest(&[{excluded}])");
+                            self.lower_dynamic_local_pattern(&rest.arg, &rest_source, lines, indent)
                         }
                     }
                 }
@@ -1466,6 +1484,7 @@ fn lower_closure_pattern(
             }
         }
         Pat::Object(object) => {
+            let excluded = object_pattern_excluded_keys(object);
             for property in &object.props {
                 match property {
                     ObjectPatProp::Assign(assign) => {
@@ -1502,7 +1521,14 @@ fn lower_closure_pattern(
                         );
                     }
                     ObjectPatProp::Rest(rest) => {
-                        lower_closure_pattern(&rest.arg, source, output, renames, value_bindings)
+                        let rest_source = format!("{source}.object_rest(&[{excluded}])");
+                        lower_closure_pattern(
+                            &rest.arg,
+                            &rest_source,
+                            output,
+                            renames,
+                            value_bindings,
+                        )
                     }
                 }
             }
@@ -1520,6 +1546,25 @@ fn lower_closure_pattern(
         }
         _ => {}
     }
+}
+
+fn object_pattern_excluded_keys(object: &ObjectPat) -> String {
+    object
+        .props
+        .iter()
+        .filter_map(|property| match property {
+            ObjectPatProp::Assign(assign) => Some(assign.key.sym.to_string()),
+            ObjectPatProp::KeyValue(key_value) => match &key_value.key {
+                PropName::Ident(ident) => Some(ident.sym.to_string()),
+                PropName::Str(value) => Some(wtf8_to_string(&value.value)),
+                PropName::Num(value) => Some(value.value.to_string()),
+                _ => None,
+            },
+            ObjectPatProp::Rest(_) => None,
+        })
+        .map(|key| format!("{key:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn atom_str(atom: &impl ToString) -> String {
@@ -1775,8 +1820,9 @@ mod tests {
 
     #[test]
     fn dynamic_lowering_binds_local_destructuring_patterns() {
-        let stmts =
-            parse_stmts("const [value, setValue] = state; const {height: h, width = 10} = size;");
+        let stmts = parse_stmts(
+            "const [value, setValue] = state; const {height: h, width = 10, ...rest} = size;",
+        );
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
@@ -1788,6 +1834,10 @@ mod tests {
             code.contains("let h = __binding1.get_property(\"height\")")
                 && code.contains("let width = { let value = __binding1.get_property(\"width\")"),
             "object destructuring: {code}"
+        );
+        assert!(
+            code.contains("let rest = __binding1.object_rest(&[\"height\", \"width\"]);"),
+            "object rest must exclude prior bindings: {code}"
         );
     }
 
@@ -1804,6 +1854,37 @@ mod tests {
                 && code.contains("set_property(&\"value\"")
                 && code.contains("is_nullish()"),
             "dynamic closure lowering: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_exposes_resize_observer_as_a_constructor() {
+        let stmts = parse_stmts("const supported = typeof ResizeObserver < \"u\";");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("Value::from(\"function\")"),
+            "ResizeObserver typeof: {code}"
+        );
+        assert!(
+            !code.contains("type_of(&ResizeObserver)"),
+            "must not expose the placeholder value: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_identifies_native_runtime_as_a_window_host() {
+        let stmts =
+            parse_stmts("const effect = typeof window < \"u\" ? useLayoutEffect : useEffect;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("Value::from(\"object\")"),
+            "window typeof: {code}"
+        );
+        assert!(
+            !code.contains("type_of(&window)"),
+            "must not lower the native window host as an unresolved value: {code}"
         );
     }
 

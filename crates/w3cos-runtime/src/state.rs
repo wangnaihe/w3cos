@@ -295,9 +295,12 @@ pub fn execute_action(action: &w3cos_std::EventAction) {
                 set_signal(*signal, *after_value);
             }
         }
-        w3cos_std::EventAction::NativeScroll(_) => {}
-        w3cos_std::EventAction::NativeClick(host_id) => {
-            w3cos_react_compat::aot::dispatch_click(*host_id);
+        w3cos_std::EventAction::NativeHost {
+            id: host_id, click, ..
+        } => {
+            if *click {
+                w3cos_react_compat::aot::dispatch_click(*host_id);
+            }
         }
     }
 }

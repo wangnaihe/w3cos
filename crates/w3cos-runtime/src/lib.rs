@@ -33,6 +33,7 @@ pub mod multi_window;
 pub mod notification;
 pub mod observers;
 mod overscroll;
+pub mod paint_artifact;
 pub mod perf;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod process;
@@ -45,6 +46,7 @@ pub mod storage;
 pub mod streams;
 pub mod text_encoding;
 pub mod text_layout;
+pub mod tile_manager;
 pub mod timers;
 pub mod uitest;
 pub mod virtual_list;
@@ -62,6 +64,10 @@ pub mod render_gpu;
 #[cfg(feature = "cpu-render")]
 #[path = "render_cpu.rs"]
 pub mod render_cpu;
+
+#[cfg(feature = "skia")]
+#[path = "render_skia.rs"]
+pub mod render_skia;
 
 #[cfg(all(feature = "gpu", not(feature = "cpu-render")))]
 pub use render_gpu as render;

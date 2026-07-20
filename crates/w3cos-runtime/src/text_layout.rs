@@ -1,6 +1,55 @@
 //! Text measurement and wrapping (layout estimates + font-accurate paint).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use w3cos_std::style::{Style, WhiteSpace};
+
+const TEXT_PAINT_CACHE_CAPACITY: usize = 4096;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TextPaintKey {
+    text: String,
+    max_width: u32,
+    font_size: u32,
+    white_space: u8,
+}
+
+/// Retained shaped text data shared by CPU and GPU painters. Blink keeps the
+/// equivalent data in shaped text fragments/display items so scrolling a
+/// previously prepared interest rect does not repeat line breaking and ink
+/// measurement on the presentation frame.
+pub struct TextPaintLayout {
+    pub lines: Vec<String>,
+    pub ink_bounds: Vec<InkBounds>,
+}
+
+pub struct TextPrepaintRequest {
+    pub text: String,
+    pub width: f32,
+    pub font_size: f32,
+    pub white_space: WhiteSpace,
+}
+
+#[derive(Default)]
+struct TextPaintCache {
+    entries: HashMap<TextPaintKey, Rc<TextPaintLayout>>,
+}
+
+thread_local! {
+    static TEXT_PAINT_CACHE: RefCell<TextPaintCache> = RefCell::new(TextPaintCache::default());
+}
+
+fn white_space_key(value: WhiteSpace) -> u8 {
+    match value {
+        WhiteSpace::Normal => 0,
+        WhiteSpace::NoWrap => 1,
+        WhiteSpace::Pre => 2,
+        WhiteSpace::PreWrap => 3,
+        WhiteSpace::PreLine => 4,
+    }
+}
 
 /// Characters that should not begin a new line (CJK punctuation rules).
 fn may_not_start_line(ch: char) -> bool {
@@ -125,7 +174,7 @@ pub fn estimated_char_width(ch: char, font_size: f32) -> f32 {
 }
 
 pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
-    let advance = font.rasterize(ch, font_size).0.advance_width;
+    let advance = font.metrics(ch, font_size).advance_width;
     if advance > 0.0 {
         advance
     } else {
@@ -265,7 +314,7 @@ pub fn single_line_vertical_metrics(
     let mut top = f32::MAX;
     let mut bottom = f32::MIN;
     for ch in text.chars() {
-        let (m, _) = font.rasterize(ch, font_size);
+        let m = font.metrics(ch, font_size);
         if m.width == 0 && m.height == 0 {
             continue;
         }
@@ -356,7 +405,7 @@ pub fn measure_text_ink_bounds(
     let mut saw_ink = false;
 
     for ch in text.chars() {
-        let (metrics, _) = font.rasterize(ch, font_size);
+        let metrics = font.metrics(ch, font_size);
         let advance = if metrics.advance_width > 0.0 {
             metrics.advance_width
         } else {
@@ -408,9 +457,80 @@ pub fn wrap_text_font(
     lines
 }
 
+pub fn retained_text_paint_layout(
+    text: &str,
+    max_width: f32,
+    font_size: f32,
+    font: &fontdue::Font,
+    white_space: WhiteSpace,
+) -> Rc<TextPaintLayout> {
+    let key = TextPaintKey {
+        text: text.to_owned(),
+        max_width: max_width.to_bits(),
+        font_size: font_size.to_bits(),
+        white_space: white_space_key(white_space),
+    };
+    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
+        return cached;
+    }
+
+    let lines = wrap_text_font(text, max_width, font_size, font, white_space);
+    let ink_bounds = lines
+        .iter()
+        .map(|line| measure_text_ink_bounds(line, font_size, font, 0.0, 0.0))
+        .collect();
+    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
+    TEXT_PAINT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
+            cache.entries.clear();
+        }
+        cache.entries.insert(key, layout.clone());
+    });
+    layout
+}
+
+pub fn prepaint_text_interest_rect(
+    requests: &[TextPrepaintRequest],
+    font: &fontdue::Font,
+    budget: std::time::Duration,
+) -> usize {
+    let started = std::time::Instant::now();
+    let mut prepared = 0;
+    for request in requests {
+        if prepared > 0 && started.elapsed() >= budget {
+            break;
+        }
+        retained_text_paint_layout(
+            &request.text,
+            request.width.max(1.0),
+            request.font_size,
+            font,
+            request.white_space,
+        );
+        prepared += 1;
+    }
+    prepared
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_paint_layout_reuses_shaping_for_same_interest_item() {
+        TEXT_PAINT_CACHE.with(|cache| cache.borrow_mut().entries.clear());
+        let font = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        let first =
+            retained_text_paint_layout("prepared text", 180.0, 16.0, &font, WhiteSpace::Normal);
+        let second =
+            retained_text_paint_layout("prepared text", 180.0, 16.0, &font, WhiteSpace::Normal);
+        assert!(Rc::ptr_eq(&first, &second));
+    }
 
     #[test]
     fn cjk_estimate_uses_chars_not_bytes() {

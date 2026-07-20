@@ -667,10 +667,11 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     }
     if let Some(ref p) = s.position {
         let variant = match p.as_str() {
+            "static" => "Position::Static",
             "absolute" => "Position::Absolute",
             "fixed" => "Position::Fixed",
             "sticky" => "Position::Sticky",
-            _ => "Position::Relative",
+            _ => "Position::Static",
         };
         fields.push(format!("position: {variant}"));
     }

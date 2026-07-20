@@ -510,6 +510,7 @@ pub struct GpuFilterCtx<'a> {
     pub device: &'a wgpu::Device,
     pub queue: &'a wgpu::Queue,
     pub renderer: &'a mut Renderer,
+    pub antialiasing_method: AaConfig,
     pub pipelines: &'a GpuFilterPipelines,
     pub layer_pool: &'a mut Option<GpuLayerTextures>,
     pub output_pool: &'a mut GpuOutputTexturePool,
@@ -541,7 +542,7 @@ impl GpuFilterCtx<'_> {
                     base_color: Color::new([0.0, 0.0, 0.0, 0.0]),
                     width,
                     height,
-                    antialiasing_method: AaConfig::Msaa16,
+                    antialiasing_method: self.antialiasing_method,
                 },
             )
             .ok()?;

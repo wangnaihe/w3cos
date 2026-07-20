@@ -44,15 +44,28 @@ pub enum EventAction {
         after_signal: Option<usize>,
         after_value: i64,
     },
-    /// Opaque callback registered by the React AOT host for a scroll container.
-    NativeScroll(u64),
-    /// Opaque callback registered by the React AOT host for a click target.
-    NativeClick(u64),
+    /// Event capabilities registered for one React AOT intrinsic host.
+    NativeHost {
+        id: u64,
+        click: bool,
+        scroll: bool,
+        input: bool,
+        focus: bool,
+        keyboard: bool,
+        submit: bool,
+        pointer: bool,
+        wheel: bool,
+    },
 }
 
 impl EventAction {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
+    }
+
+    pub fn has_pointer_interaction(&self) -> bool {
+        matches!(self, Self::NativeHost { click: true, .. })
+            || !matches!(self, Self::NativeHost { .. } | Self::None)
     }
 }
 

@@ -1,0 +1,32 @@
+[package]
+name = "vello_encoding"
+version.workspace = true # We mimic Vello's version
+description = "Vello types that represent the data that needs to be rendered."
+categories = ["rendering", "graphics"]
+keywords = ["2d", "vector-graphics"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+# There are no platform specific docs.
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
+
+[features]
+# Enables an optional GPU memory usage estimation utility. This can be used to
+# perform additional computations in order to estimate the minimum required allocations
+# for buffers backing bump-allocated GPU memory.
+bump_estimate = []
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }
+skrifa = { workspace = true, features = ["std"] }
+peniko = { workspace = true, default-features = true }
+guillotiere = { workspace = true, features = ["std"] }
+smallvec = { workspace = true }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skrifa::MetadataProvider;
 use vello::kurbo::{Affine, Rect, RoundedRect, Stroke};
@@ -25,6 +26,28 @@ use crate::layout::LayoutRect;
 
 pub struct GlyphCache {
     entries: HashMap<(char, u32), GlyphEntry>,
+    display_chunks: HashMap<u64, CachedDisplayChunk>,
+    display_chunk_bytes: usize,
+    display_chunk_clock: u64,
+}
+
+struct CachedDisplayChunk {
+    scene: Scene,
+    estimated_bytes: usize,
+    last_used: u64,
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+const DISPLAY_CHUNK_BUDGET_BYTES: usize = 24 * 1024 * 1024;
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+const DISPLAY_CHUNK_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+pub struct DisplayChunkPrepaintRequest {
+    pub kind: ComponentKind,
+    pub style: Style,
+    pub width: f32,
+    pub height: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -37,6 +60,9 @@ impl GlyphCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::with_capacity(256),
+            display_chunks: HashMap::with_capacity(256),
+            display_chunk_bytes: 0,
+            display_chunk_clock: 0,
         }
     }
 
@@ -56,22 +82,183 @@ impl GlyphCache {
         *self.entries.entry(key).or_insert_with(|| {
             if let Some(glyph_id) = charmap.map(ch) {
                 let advance = glyph_metrics.advance_width(glyph_id).unwrap_or_else(|| {
-                    let (metrics, _) = fontdue_font.rasterize(ch, font_size);
-                    metrics.advance_width
+                    fontdue_font.metrics(ch, font_size).advance_width
                 });
                 GlyphEntry {
                     glyph_id: Some(glyph_id.to_u32()),
                     advance,
                 }
             } else {
-                let (metrics, _) = fontdue_font.rasterize(ch, font_size);
                 GlyphEntry {
                     glyph_id: None,
-                    advance: metrics.advance_width,
+                    advance: fontdue_font.metrics(ch, font_size).advance_width,
                 }
             }
         })
     }
+
+    pub fn prepaint_interest_rect(
+        &mut self,
+        requests: &[crate::text_layout::TextPrepaintRequest],
+        font_data: &FontData,
+        fontdue_font: &fontdue::Font,
+        budget: Duration,
+    ) -> usize {
+        let Ok(font_ref) = skrifa::FontRef::from_index(font_data.data.as_ref().as_ref(), 0) else {
+            return 0;
+        };
+        let charmap = font_ref.charmap();
+        let started = Instant::now();
+        let mut prepared = 0;
+        for request in requests {
+            if prepared > 0 && started.elapsed() >= budget {
+                break;
+            }
+            let layout = crate::text_layout::retained_text_paint_layout(
+                &request.text,
+                request.width.max(1.0),
+                request.font_size,
+                fontdue_font,
+                request.white_space,
+            );
+            let glyph_metrics = font_ref.glyph_metrics(
+                skrifa::instance::Size::new(request.font_size),
+                skrifa::instance::LocationRef::default(),
+            );
+            for line in &layout.lines {
+                for ch in line.chars() {
+                    self.lookup_or_insert(
+                        ch,
+                        request.font_size,
+                        &charmap,
+                        &glyph_metrics,
+                        fontdue_font,
+                    );
+                }
+            }
+            prepared += 1;
+        }
+        prepared
+    }
+
+    pub fn prepaint_display_chunks(
+        &mut self,
+        requests: &[DisplayChunkPrepaintRequest],
+        font_data: &FontData,
+        font: &fontdue::Font,
+        budget: Duration,
+    ) -> usize {
+        let started = Instant::now();
+        let mut prepared = 0;
+        for request in requests {
+            if prepared > 0 && started.elapsed() >= budget {
+                break;
+            }
+            let _ = self.ensure_display_chunk(
+                &request.kind,
+                &request.style,
+                request.width,
+                request.height,
+                font_data,
+                font,
+            );
+            prepared += 1;
+        }
+        prepared
+    }
+
+    fn ensure_display_chunk(
+        &mut self,
+        kind: &ComponentKind,
+        style: &Style,
+        width: f32,
+        height: f32,
+        font_data: &FontData,
+        font: &fontdue::Font,
+    ) -> Option<u64> {
+        let key = display_chunk_key(kind, style, width, height)?;
+        self.display_chunk_clock = self.display_chunk_clock.wrapping_add(1);
+        if let Some(chunk) = self.display_chunks.get_mut(&key) {
+            chunk.last_used = self.display_chunk_clock;
+            return Some(key);
+        }
+        let mut chunk = Scene::new();
+        render_node(
+            &mut chunk,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+            },
+            kind,
+            style,
+            font_data,
+            font,
+            None,
+            None,
+            false,
+            self,
+            Affine::IDENTITY,
+            true,
+            #[cfg(feature = "gpu")]
+            None,
+        );
+        let estimated_bytes = (width.max(1.0).ceil() as usize)
+            .saturating_mul(height.max(1.0).ceil() as usize)
+            .saturating_mul(4)
+            .max(256);
+        self.evict_display_chunks(estimated_bytes);
+        self.display_chunk_bytes = self.display_chunk_bytes.saturating_add(estimated_bytes);
+        self.display_chunks.insert(
+            key,
+            CachedDisplayChunk {
+                scene: chunk,
+                estimated_bytes,
+                last_used: self.display_chunk_clock,
+            },
+        );
+        Some(key)
+    }
+
+    fn evict_display_chunks(&mut self, incoming_bytes: usize) {
+        while !self.display_chunks.is_empty()
+            && self.display_chunk_bytes.saturating_add(incoming_bytes)
+                > DISPLAY_CHUNK_BUDGET_BYTES
+        {
+            let Some(victim) = self
+                .display_chunks
+                .iter()
+                .min_by_key(|(_, chunk)| chunk.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            if let Some(removed) = self.display_chunks.remove(&victim) {
+                self.display_chunk_bytes = self
+                    .display_chunk_bytes
+                    .saturating_sub(removed.estimated_bytes);
+            }
+        }
+    }
+}
+
+fn display_chunk_key(kind: &ComponentKind, style: &Style, width: f32, height: f32) -> Option<u64> {
+    if !matches!(
+        kind,
+        ComponentKind::Text { .. } | ComponentKind::Button { .. }
+    ) || style.filter.is_some()
+        || style.box_shadow.is_some()
+        || style.transform != w3cos_std::style::Transform2D::IDENTITY
+    {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    serde_json::to_vec(kind).ok()?.hash(&mut hasher);
+    serde_json::to_vec(style).ok()?.hash(&mut hasher);
+    width.to_bits().hash(&mut hasher);
+    height.to_bits().hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +400,35 @@ pub fn render_frame(
             _ => None,
         };
         let is_focused = focused_index == Some(idx);
+        if !is_focused
+            && let Some(key) = glyph_cache.ensure_display_chunk(
+                kind,
+                style,
+                offset_rect.width,
+                offset_rect.height,
+                font_data,
+                font,
+            )
+            && let Some(chunk) = glyph_cache.display_chunks.get(&key)
+        {
+            if let Some(clip_rect) = clip {
+                let clip_shape = Rect::new(
+                    clip_rect.x as f64,
+                    clip_rect.y as f64,
+                    (clip_rect.x + clip_rect.width) as f64,
+                    (clip_rect.y + clip_rect.height) as f64,
+                );
+                scene.push_clip_layer(Fill::NonZero, dpi, &clip_shape);
+            }
+            scene.append(
+                &chunk.scene,
+                Some(dpi * Affine::translate((offset_rect.x as f64, offset_rect.y as f64))),
+            );
+            if clip.is_some() {
+                scene.pop_layer();
+            }
+            continue;
+        }
         render_node(
             scene,
             offset_rect,
@@ -617,7 +833,7 @@ fn draw_text_centered_in_rect(
 ) {
     let text_w: f32 = text
         .chars()
-        .map(|ch| fontdue_font.rasterize(ch, font_size).0.advance_width)
+        .map(|ch| fontdue_font.metrics(ch, font_size).advance_width)
         .sum();
     let text_h = font_size * 1.2;
     let x = rect.x + (rect.width - text_w).max(0.0) * 0.5;
@@ -747,13 +963,14 @@ fn draw_text_in_rect(
 ) {
     let content = text_paint_box(rect, style);
     let line_h = style.font_size * style.line_height;
-    let lines = crate::text_layout::wrap_text_font(
+    let layout = crate::text_layout::retained_text_paint_layout(
         text,
         content.width,
         style.font_size,
         font,
         style.white_space,
     );
+    let lines = &layout.lines;
     let block_h = if lines.len() == 1 {
         crate::text_layout::single_line_content_height(
             &lines[0],
@@ -767,8 +984,7 @@ fn draw_text_in_rect(
     let block_top = content.y + (content.height - block_h).max(0.0) * 0.5;
 
     for (index, line) in lines.iter().enumerate() {
-        let ink =
-            crate::text_layout::measure_text_ink_bounds(line, style.font_size, font, 0.0, 0.0);
+        let ink = layout.ink_bounds[index];
         let align = single_line_h_align(style, content.width, ink.width);
         let x = match align {
             TextAlign::Right => content.x + content.width - ink.width - ink.left,
@@ -869,4 +1085,27 @@ pub fn draw_focus_ring(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
         (rect.y + rect.height) as f64,
     );
     scene.stroke(&stroke, dpi, color, None, &r);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_chunk_key_tracks_payload_style_and_geometry() {
+        let style = Style::default();
+        let first = ComponentKind::Text {
+            content: "prepared".to_string(),
+        };
+        let second = ComponentKind::Text {
+            content: "changed".to_string(),
+        };
+        let key = display_chunk_key(&first, &style, 180.0, 24.0).unwrap();
+        assert_eq!(key, display_chunk_key(&first, &style, 180.0, 24.0).unwrap());
+        assert_ne!(
+            key,
+            display_chunk_key(&second, &style, 180.0, 24.0).unwrap()
+        );
+        assert_ne!(key, display_chunk_key(&first, &style, 181.0, 24.0).unwrap());
+    }
 }

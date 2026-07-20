@@ -73,6 +73,44 @@ impl Color {
         })
     }
 
+    pub fn from_css(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.starts_with('#') {
+            return Some(Self::from_hex(value));
+        }
+        if let Some(color) = Self::from_named(value) {
+            return Some(color);
+        }
+        if let Some(arguments) = value
+            .strip_prefix("rgb(")
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let channels = parse_css_number_list(arguments)?;
+            return (channels.len() == 3).then(|| {
+                Self::rgb(
+                    css_rgb_channel(channels[0]),
+                    css_rgb_channel(channels[1]),
+                    css_rgb_channel(channels[2]),
+                )
+            });
+        }
+        if let Some(arguments) = value
+            .strip_prefix("rgba(")
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let channels = parse_css_number_list(arguments)?;
+            return (channels.len() == 4).then(|| {
+                Self::rgba(
+                    css_rgb_channel(channels[0]),
+                    css_rgb_channel(channels[1]),
+                    css_rgb_channel(channels[2]),
+                    (channels[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+                )
+            });
+        }
+        None
+    }
+
     pub const WHITE: Self = Self::rgb(255, 255, 255);
     pub const BLACK: Self = Self::rgb(0, 0, 0);
     pub const TRANSPARENT: Self = Self::rgba(0, 0, 0, 0);
@@ -80,4 +118,15 @@ impl Color {
     pub fn to_u32(self) -> u32 {
         (self.a as u32) << 24 | (self.r as u32) << 16 | (self.g as u32) << 8 | self.b as u32
     }
+}
+
+fn parse_css_number_list(value: &str) -> Option<Vec<f32>> {
+    value
+        .split(',')
+        .map(|part| part.trim().parse::<f32>().ok())
+        .collect()
+}
+
+fn css_rgb_channel(value: f32) -> u8 {
+    value.clamp(0.0, 255.0).round() as u8
 }

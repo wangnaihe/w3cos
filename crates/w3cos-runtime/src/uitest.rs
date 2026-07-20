@@ -22,6 +22,8 @@ static NATIVE_FIRST_RESPONDER: AtomicI64 = AtomicI64::new(-1);
 static NATIVE_KEY_WINDOW: AtomicI64 = AtomicI64::new(-1);
 static LAST_SCROLL_INDEX: AtomicI64 = AtomicI64::new(-1);
 static LAST_SCROLL_Y_MILLI: AtomicI64 = AtomicI64::new(0);
+static LAST_SCROLL_SOURCE: AtomicI64 = AtomicI64::new(0);
+static LAST_SCROLL_REQUEST_Y_MILLI: AtomicI64 = AtomicI64::new(i64::MIN);
 static LAST_RELEASE_VELOCITY_MILLI: AtomicI64 = AtomicI64::new(0);
 static KINETIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static KINETIC_TICKS: AtomicI64 = AtomicI64::new(0);
@@ -101,6 +103,15 @@ fn build_snapshot_json() -> String {
                 index => serde_json::json!(index),
             },
             "y": LAST_SCROLL_Y_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
+            "source": match LAST_SCROLL_SOURCE.load(Ordering::SeqCst) {
+                1 => "programmatic",
+                2 => "anchor",
+                _ => "direct",
+            },
+            "requestedY": match LAST_SCROLL_REQUEST_Y_MILLI.load(Ordering::SeqCst) {
+                i64::MIN => serde_json::Value::Null,
+                value => serde_json::json!(value as f64 / 1000.0),
+            },
         },
         "kinetic": {
             "releaseVelocity": LAST_RELEASE_VELOCITY_MILLI.load(Ordering::SeqCst) as f64 / 1000.0,
@@ -174,9 +185,28 @@ pub fn set_native_key_window(value: Option<bool>) {
 }
 
 pub fn set_scroll_offset(index: usize, y: f32) {
+    set_scroll_offset_source(index, y, 0, None);
+}
+
+pub fn set_programmatic_scroll_offset(index: usize, y: f32, requested_y: Option<f32>) {
+    set_scroll_offset_source(index, y, 1, requested_y);
+}
+
+pub fn set_anchor_scroll_offset(index: usize, y: f32) {
+    set_scroll_offset_source(index, y, 2, None);
+}
+
+fn set_scroll_offset_source(index: usize, y: f32, source: i64, requested_y: Option<f32>) {
     if hook_enabled() {
         LAST_SCROLL_INDEX.store(index as i64, Ordering::SeqCst);
         LAST_SCROLL_Y_MILLI.store((y * 1000.0) as i64, Ordering::SeqCst);
+        LAST_SCROLL_SOURCE.store(source, Ordering::SeqCst);
+        LAST_SCROLL_REQUEST_Y_MILLI.store(
+            requested_y
+                .map(|value| (value * 1000.0) as i64)
+                .unwrap_or(i64::MIN),
+            Ordering::SeqCst,
+        );
     }
 }
 

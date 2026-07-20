@@ -44,8 +44,8 @@ taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout",
 parley = "0.7"
 fontdue = "0.9"
 
-# Rendering: Vello (GPU, default) + tiny-skia (CPU fallback)
-vello = "0.8"
+# Rendering: Skia (Blink-aligned primary) + Vello/tiny-skia compatibility backends
+vello = { path = "third_party/vello" }
 skrifa = "0.36"
 pollster = "0.4"
 tiny-skia = "0.11"

@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_skia::{
     Color as SkColor, FillRule, Mask, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
 };
@@ -93,6 +93,37 @@ thread_local! {
     static GLYPH_RASTER_CACHE: RefCell<GlyphRasterCache> = RefCell::new(GlyphRasterCache::default());
 }
 
+pub fn prepaint_text_interest_rect(
+    requests: &[text_layout::TextPrepaintRequest],
+    font: &fontdue::Font,
+    budget: Duration,
+) -> usize {
+    let started = Instant::now();
+    let mut prepared = 0;
+    for request in requests {
+        if prepared > 0 && started.elapsed() >= budget {
+            break;
+        }
+        let layout = text_layout::retained_text_paint_layout(
+            &request.text,
+            request.width.max(1.0),
+            request.font_size,
+            font,
+            request.white_space,
+        );
+        GLYPH_RASTER_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            for line in &layout.lines {
+                for ch in line.chars() {
+                    cache.get_or_rasterize(font, ch, request.font_size);
+                }
+            }
+        });
+        prepared += 1;
+    }
+    prepared
+}
+
 /// Full-frame paint (content dirty or first frame).
 pub fn render_frame(
     pixmap: &mut Pixmap,
@@ -113,6 +144,7 @@ pub fn render_frame(
         focused_index,
         None,
         None,
+        None,
         clip_masks,
     );
 }
@@ -130,7 +162,7 @@ pub fn render_scroll_damage(
     scrollable: &[(usize, LayoutRect, crate::layout::ScrollExtent)],
     scroll_ancestor: &[Option<usize>],
     clip_masks: &mut ClipMaskCache,
-) {
+) -> bool {
     let all_copy_safe = scroll_damages.iter().all(|&(scroll_idx, delta_y)| {
         let rect = scrollable
             .iter()
@@ -153,7 +185,7 @@ pub fn render_scroll_damage(
             focused_index,
             clip_masks,
         );
-        return;
+        return false;
     }
 
     let mut paint_damages = Vec::with_capacity(scroll_damages.len());
@@ -180,7 +212,7 @@ pub fn render_scroll_damage(
                 focused_index,
                 clip_masks,
             );
-            return;
+            return false;
         };
         // The framebuffer is retained independently of the platform drawable,
         // so the same raster copy is safe on iOS. Clear the exposed strip with
@@ -208,14 +240,21 @@ pub fn render_scroll_damage(
             focused_index,
             Some(std::slice::from_ref(damage)),
             Some(scroll_ancestor),
+            None,
             clip_masks,
         );
     }
+    true
 }
 
-/// Repaint a scrollport after a virtualizer replaces the paint payload of its
-/// retained host rows. This avoids both stale raster-copy pixels and the cost
-/// of repainting fixed page chrome outside the affected scroll container.
+/// Scroll a retained virtualized viewport after its offscreen window changes.
+///
+/// React virtualizers replace rows at the overscan edge, outside the visible
+/// viewport. The retained pixels that remain visible therefore have the same
+/// payload and can be shifted exactly like a normal scroll; the newly exposed
+/// strip is the only region that must be painted from the updated tree. A
+/// full-scrollport repaint here makes every kinetic-scroll frame proportional
+/// to the viewport area and defeats virtualization.
 pub fn render_scroll_content_change(
     pixmap: &mut Pixmap,
     nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
@@ -223,52 +262,75 @@ pub fn render_scroll_content_change(
     scroll_info: &[Option<(f32, f32, LayoutRect)>],
     text_input_values: &HashMap<usize, String>,
     focused_index: Option<usize>,
-    scroll_indices: &[usize],
+    scroll_damages: &[(usize, f32)],
     scrollable: &[(usize, LayoutRect, crate::layout::ScrollExtent)],
     scroll_ancestor: &[Option<usize>],
     clip_masks: &mut ClipMaskCache,
-) {
-    let mut paint_damages = Vec::with_capacity(scroll_indices.len());
-    for &scroll_idx in scroll_indices {
-        if paint_damages
-            .iter()
-            .any(|(existing, _)| *existing == scroll_idx)
-        {
-            continue;
-        }
-        let Some((_, rect, _)) = scrollable.iter().find(|(idx, _, _)| *idx == scroll_idx) else {
-            render_frame(
-                pixmap,
-                nodes,
-                font,
-                scroll_info,
-                text_input_values,
-                focused_index,
-                clip_masks,
-            );
-            return;
-        };
-        let style = nodes
-            .iter()
-            .find(|(idx, _, _, _)| *idx == scroll_idx)
-            .map(|(_, _, _, style)| *style);
-        if !style.is_some_and(|style| style.background.a == 255 && style.opacity >= 0.999) {
-            render_frame(
-                pixmap,
-                nodes,
-                font,
-                scroll_info,
-                text_input_values,
-                focused_index,
-                clip_masks,
-            );
-            return;
-        }
-        clear_rect_with_color(pixmap, *rect, style.unwrap().background);
-        paint_damages.push((scroll_idx, *rect));
-    }
+) -> bool {
+    render_scroll_damage(
+        pixmap,
+        nodes,
+        font,
+        scroll_info,
+        text_input_values,
+        focused_index,
+        scroll_damages,
+        scrollable,
+        scroll_ancestor,
+        clip_masks,
+    )
+}
 
-    for damage in &paint_damages {
+/// Reconcile fixed React nodes whose paint payload changed during scrolling.
+///
+/// Virtual rows already repaint through retained scroll damage. Restricting
+/// the gesture-completion pass to exact changed-node rectangles keeps a sticky
+/// counter update from rasterizing the rest of the fixed chrome.
+pub fn render_damage_nodes(
+    pixmap: &mut Pixmap,
+    nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
+    font: &fontdue::Font,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    text_input_values: &HashMap<usize, String>,
+    focused_index: Option<usize>,
+    damage_indices: &[usize],
+    clip_masks: &mut ClipMaskCache,
+) -> bool {
+    if damage_indices.is_empty() {
+        return false;
+    }
+    let full = LayoutRect {
+        x: 0.0,
+        y: 0.0,
+        width: pixmap.width() as f32,
+        height: pixmap.height() as f32,
+    };
+    let mut damages = Vec::new();
+    for (_, rect, _, _) in nodes
+        .iter()
+        .filter(|(index, _, _, _)| damage_indices.contains(index))
+    {
+        let Some(damage) = intersect_rect(expand_rect(*rect, 4.0), full) else {
+            continue;
+        };
+        if let Some(existing) = damages
+            .iter_mut()
+            .find(|existing| rects_intersect(expand_rect(**existing, 2.0), damage))
+        {
+            *existing = union_rect(*existing, damage);
+        } else {
+            damages.push(damage);
+        }
+    }
+    if damages.is_empty() {
+        // The changed host slot can disappear in the final virtual-window
+        // commit. Its scrollport pixels were already reconciled by
+        // `render_scroll_content_change`, so there is no external work left
+        // and a full-frame fallback would only introduce a stop hitch.
+        return true;
+    }
+    for damage in damages {
+        clear_rect_with_sk_color(pixmap, damage, page_bg());
         paint_nodes(
             pixmap,
             nodes,
@@ -276,11 +338,13 @@ pub fn render_scroll_content_change(
             scroll_info,
             text_input_values,
             focused_index,
-            Some(std::slice::from_ref(damage)),
-            Some(scroll_ancestor),
+            None,
+            None,
+            Some(damage),
             clip_masks,
         );
     }
+    true
 }
 
 fn is_within_scroll_container(
@@ -486,11 +550,19 @@ fn shift_scroll_raster(pixmap: &mut Pixmap, rect: LayoutRect, delta_y: f32) -> O
 }
 
 fn clear_rect_with_color(pixmap: &mut Pixmap, rect: LayoutRect, color: Color) {
+    clear_rect_with_sk_color(
+        pixmap,
+        rect,
+        SkColor::from_rgba8(color.r, color.g, color.b, color.a),
+    );
+}
+
+fn clear_rect_with_sk_color(pixmap: &mut Pixmap, rect: LayoutRect, color: SkColor) {
     let Some(sk) = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height) else {
         return;
     };
     let mut paint = Paint::default();
-    paint.set_color(SkColor::from_rgba8(color.r, color.g, color.b, color.a));
+    paint.set_color(color);
     pixmap.fill_rect(sk, &paint, Transform::identity(), None);
 }
 
@@ -505,6 +577,19 @@ fn intersect_rect(a: LayoutRect, b: LayoutRect) -> Option<LayoutRect> {
         width: right - x,
         height: bottom - y,
     })
+}
+
+fn union_rect(a: LayoutRect, b: LayoutRect) -> LayoutRect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = (a.x + a.width).max(b.x + b.width);
+    let bottom = (a.y + a.height).max(b.y + b.height);
+    LayoutRect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    }
 }
 
 fn rects_intersect(a: LayoutRect, b: LayoutRect) -> bool {
@@ -529,16 +614,10 @@ fn paint_nodes(
     focused_index: Option<usize>,
     scroll_damage: Option<&[(usize, LayoutRect)]>,
     scroll_ancestor: Option<&[Option<usize>]>,
+    absolute_damage: Option<LayoutRect>,
     clip_masks: &mut ClipMaskCache,
 ) {
     for &(idx, rect, kind, style) in nodes {
-        let damage_rect = match (scroll_damage, scroll_ancestor) {
-            (Some(damages), Some(ancestor)) => match node_scroll_damage(idx, damages, ancestor) {
-                Some(damage) => Some(damage),
-                None => continue,
-            },
-            _ => None,
-        };
         let (offset_rect, clip) = match scroll_info.get(idx) {
             Some(Some((sx, sy, clip_rect))) => {
                 let offset_rect = LayoutRect {
@@ -550,6 +629,22 @@ fn paint_nodes(
                 (offset_rect, Some(*clip_rect))
             }
             _ => (rect, None),
+        };
+        let damage_rect = if let Some(damage) = absolute_damage {
+            if !rects_intersect(expand_rect(offset_rect, 64.0), damage) {
+                continue;
+            }
+            Some(damage)
+        } else {
+            match (scroll_damage, scroll_ancestor) {
+                (Some(damages), Some(ancestor)) => {
+                    match node_scroll_damage(idx, damages, ancestor) {
+                        Some(damage) => Some(damage),
+                        None => continue,
+                    }
+                }
+                _ => None,
+            }
         };
         if damage_rect
             .is_some_and(|damage| !rects_intersect(expand_rect(offset_rect, 64.0), damage))
@@ -1084,20 +1179,17 @@ fn draw_text_in_rect(
 ) {
     let content = text_paint_box(rect, style);
     let line_h = style.font_size * style.line_height;
-    let lines = text_layout::wrap_text_font(
+    let layout = text_layout::retained_text_paint_layout(
         text,
         content.width,
         style.font_size,
         font,
         style.white_space,
     );
+    let lines = &layout.lines;
 
     if lines.len() == 1 {
-        let align = single_line_h_align(
-            style,
-            content.width,
-            text_layout::measure_text_ink_bounds(&lines[0], style.font_size, font, 0.0, 0.0).width,
-        );
+        let align = single_line_h_align(style, content.width, layout.ink_bounds[0].width);
         draw_text_ink_in_box(
             pixmap,
             content,
@@ -1115,7 +1207,7 @@ fn draw_text_in_rect(
     let block_top = content.y + (content.height - block_h).max(0.0) * 0.5;
 
     for (i, line) in lines.iter().enumerate() {
-        let ink = text_layout::measure_text_ink_bounds(line, style.font_size, font, 0.0, 0.0);
+        let ink = layout.ink_bounds[i];
         let align = single_line_h_align(style, content.width, ink.width);
         let x = match align {
             TextAlign::Right => content.x + content.width - ink.width - ink.left,

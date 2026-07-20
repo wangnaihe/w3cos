@@ -173,8 +173,27 @@ pub fn ErrorValue(arguments: Vec<Value>) -> Value {
 pub struct Map;
 
 impl Map {
-    pub fn new(_arguments: Vec<Value>) -> Value {
-        let values = std::rc::Rc::new(std::cell::RefCell::new(HashMap::<String, Value>::new()));
+    pub fn new(arguments: Vec<Value>) -> Value {
+        let mut initial = HashMap::<String, Value>::new();
+        let iterable = arguments.first().cloned().unwrap_or(Value::Undefined);
+        let entries = iterable.get_property("__w3cosMapEntries");
+        let source = if matches!(entries, Value::Array(_)) {
+            entries
+        } else {
+            iterable
+        };
+        for entry in source.iter() {
+            if let Value::Array(pair) = entry {
+                let pair = pair.borrow();
+                if let Some(key) = pair.first() {
+                    initial.insert(
+                        key.to_js_string(),
+                        pair.get(1).cloned().unwrap_or(Value::Undefined),
+                    );
+                }
+            }
+        }
+        let values = std::rc::Rc::new(std::cell::RefCell::new(initial));
         let map = Value::object(HashMap::new());
         {
             let values = values.clone();
@@ -205,7 +224,7 @@ impl Map {
                         .unwrap_or_default();
                     let value = arguments.get(1).cloned().unwrap_or(Value::Undefined);
                     values.borrow_mut().insert(key, value);
-                    map_reference.set_property("size", Value::Number(values.borrow().len() as f64));
+                    sync_map_iteration_properties(&map_reference, &values.borrow());
                     map_reference.clone()
                 }),
             );
@@ -223,9 +242,36 @@ impl Map {
                 }),
             );
         }
-        map.set_property("size", Value::Number(0.0));
+        {
+            let values = values.clone();
+            map.set_property(
+                "forEach",
+                Value::function(move |_, arguments| {
+                    let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+                    for (key, value) in values.borrow().iter() {
+                        callback.call(
+                            Value::Undefined,
+                            vec![value.clone(), Value::from(key.clone())],
+                        );
+                    }
+                    Value::Undefined
+                }),
+            );
+        }
+        sync_map_iteration_properties(&map, &values.borrow());
         map
     }
+}
+
+fn sync_map_iteration_properties(map: &Value, values: &HashMap<String, Value>) {
+    let entries = values
+        .iter()
+        .map(|(key, value)| Value::array(vec![Value::from(key.clone()), value.clone()]))
+        .collect::<Vec<_>>();
+    let map_values = values.values().cloned().collect::<Vec<_>>();
+    map.set_property("size", Value::Number(values.len() as f64));
+    map.set_property("__w3cosMapEntries", Value::array(entries));
+    map.set_property("__w3cosMapValues", Value::array(map_values));
 }
 
 pub struct ResizeObserver {
@@ -234,10 +280,190 @@ pub struct ResizeObserver {
 
 pub const ResizeObserver: Value = Value::Undefined;
 
+struct ResizeObserverTarget {
+    element: Value,
+    last_size: Option<(f32, f32)>,
+}
+
+struct ResizeObserverState {
+    callback: Value,
+    targets: std::collections::HashMap<u64, ResizeObserverTarget>,
+}
+
+thread_local! {
+    static NEXT_RESIZE_OBSERVER: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    static RESIZE_OBSERVERS: std::cell::RefCell<std::collections::HashMap<u64, ResizeObserverState>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 impl ResizeObserver {
-    pub fn new(_arguments: Vec<Value>) -> Value {
-        dom_element()
+    pub fn new(arguments: Vec<Value>) -> Value {
+        let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+        let observer_id = NEXT_RESIZE_OBSERVER.with(|next| {
+            let id = next.get();
+            next.set(id + 1);
+            id
+        });
+        RESIZE_OBSERVERS.with(|observers| {
+            observers.borrow_mut().insert(
+                observer_id,
+                ResizeObserverState {
+                    callback: callback.clone(),
+                    targets: std::collections::HashMap::new(),
+                },
+            );
+        });
+
+        let observer = dom_element();
+        let observe_callback = callback;
+        observer.set_property(
+            "observe",
+            Value::function(move |_, arguments| {
+                let element = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let host_id = element
+                    .get_property("__w3cosHostId")
+                    .to_js_string()
+                    .parse::<u64>()
+                    .ok();
+                if let Some(host_id) = host_id {
+                    if std::env::var_os("W3COS_RESIZE_TRACE").is_some() {
+                        eprintln!("[W3C OS][RESIZE] observe host={host_id}");
+                    }
+                    RESIZE_OBSERVERS.with(|observers| {
+                        observers
+                            .borrow_mut()
+                            .entry(observer_id)
+                            .or_insert_with(|| ResizeObserverState {
+                                callback: observe_callback.clone(),
+                                targets: std::collections::HashMap::new(),
+                            })
+                            .targets
+                            .insert(
+                                host_id,
+                                ResizeObserverTarget {
+                                    element,
+                                    last_size: None,
+                                },
+                            );
+                    });
+                }
+                Value::Undefined
+            }),
+        );
+        observer.set_property(
+            "unobserve",
+            Value::function(move |_, arguments| {
+                let host_id = arguments
+                    .first()
+                    .map(|element| element.get_property("__w3cosHostId"))
+                    .map(|value| value.to_js_string())
+                    .and_then(|value| value.parse::<u64>().ok());
+                if let Some(host_id) = host_id {
+                    RESIZE_OBSERVERS.with(|observers| {
+                        if let Some(observer) = observers.borrow_mut().get_mut(&observer_id) {
+                            observer.targets.remove(&host_id);
+                        }
+                    });
+                }
+                Value::Undefined
+            }),
+        );
+        observer.set_property(
+            "disconnect",
+            Value::function(move |_, _| {
+                RESIZE_OBSERVERS.with(|observers| {
+                    observers.borrow_mut().remove(&observer_id);
+                });
+                Value::Undefined
+            }),
+        );
+        observer
     }
+}
+
+/// Deliver native border-box measurements to JavaScript `ResizeObserver`
+/// callbacks. Returns `true` when at least one callback was invoked.
+pub fn dispatch_resize_observers(sizes: &[(u64, f32, f32)]) -> bool {
+    dispatch_resize_observers_bounded(sizes, usize::MAX).0
+}
+
+/// Deliver at most `max_entries` changed native border-box measurements.
+///
+/// The second return value is `true` when the entry budget was exhausted.
+/// Callers should schedule another delivery turn in that case; targets which
+/// were not delivered deliberately keep their previous size.
+pub fn dispatch_resize_observers_bounded(
+    sizes: &[(u64, f32, f32)],
+    max_entries: usize,
+) -> (bool, bool) {
+    let sizes: std::collections::HashMap<u64, (f32, f32)> = sizes
+        .iter()
+        .map(|(host_id, width, height)| (*host_id, (*width, *height)))
+        .collect();
+    let mut remaining = max_entries.max(1);
+    let deliveries = RESIZE_OBSERVERS.with(|observers| {
+        let mut observers = observers.borrow_mut();
+        let mut deliveries = Vec::new();
+        for observer in observers.values_mut() {
+            let mut entries = Vec::new();
+            let mut host_ids = observer.targets.keys().copied().collect::<Vec<_>>();
+            host_ids.sort_unstable();
+            for host_id in host_ids {
+                if remaining == 0 {
+                    break;
+                }
+                let Some(target) = observer.targets.get_mut(&host_id) else {
+                    continue;
+                };
+                let Some(&(width, height)) = sizes.get(&host_id) else {
+                    continue;
+                };
+                if target.last_size.is_some_and(|(last_width, last_height)| {
+                    (last_width - width).abs() <= 0.01 && (last_height - height).abs() <= 0.01
+                }) {
+                    continue;
+                }
+                target.last_size = Some((width, height));
+                if std::env::var_os("W3COS_RESIZE_TRACE").is_some() {
+                    eprintln!("[W3C OS][RESIZE] host={host_id} border-box={width:.2}x{height:.2}");
+                }
+
+                let border_box = Value::object(std::collections::HashMap::from([
+                    ("inlineSize".into(), Value::Number(width as f64)),
+                    ("blockSize".into(), Value::Number(height as f64)),
+                ]));
+                let content_rect = Value::object(std::collections::HashMap::from([
+                    ("x".into(), Value::Number(0.0)),
+                    ("y".into(), Value::Number(0.0)),
+                    ("width".into(), Value::Number(width as f64)),
+                    ("height".into(), Value::Number(height as f64)),
+                ]));
+                entries.push(Value::object(std::collections::HashMap::from([
+                    ("target".into(), target.element.clone()),
+                    ("contentRect".into(), content_rect),
+                    (
+                        "borderBoxSize".into(),
+                        Value::array(vec![border_box.clone()]),
+                    ),
+                    ("contentBoxSize".into(), Value::array(vec![border_box])),
+                ])));
+                remaining -= 1;
+            }
+            if !entries.is_empty() && observer.callback.is_function() {
+                deliveries.push((observer.callback.clone(), Value::array(entries)));
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+        deliveries
+    });
+
+    let delivered = !deliveries.is_empty();
+    for (callback, entries) in deliveries {
+        callback.call(Value::Undefined, vec![entries]);
+    }
+    (delivered, remaining == 0)
 }
 
 #[cfg(test)]
@@ -257,5 +483,80 @@ mod tests {
             -3.0
         );
         assert!(Math.call_method("floor", vec![]).to_number().is_nan());
+    }
+
+    #[test]
+    fn map_constructor_copies_entries_and_iterates_values() {
+        let first = Map::new(vec![]);
+        first.call_method("set", vec![Value::from("24"), Value::Number(106.0)]);
+        first.call_method("set", vec![Value::from("25"), Value::Number(82.0)]);
+
+        let copy = Map::new(vec![first]);
+        assert_eq!(
+            copy.call_method("get", vec![Value::from("24")]).to_number(),
+            106.0
+        );
+        assert_eq!(copy.get_property("size").to_number(), 2.0);
+        let mut heights = copy
+            .iter()
+            .map(|value| value.to_number())
+            .collect::<Vec<_>>();
+        heights.sort_by(f64::total_cmp);
+        assert_eq!(heights, vec![82.0, 106.0]);
+    }
+
+    #[test]
+    fn resize_observer_delivers_changed_border_box_sizes_once() {
+        let deliveries = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = deliveries.clone();
+        let observer = ResizeObserver::new(vec![Value::function(move |_, arguments| {
+            let entry = arguments[0].get_property("0");
+            recorded.borrow_mut().push(
+                entry
+                    .get_property("borderBoxSize")
+                    .get_property("0")
+                    .get_property("blockSize")
+                    .to_number(),
+            );
+            Value::Undefined
+        })]);
+        let target = dom_element();
+        target.set_property("__w3cosHostId", Value::from("42"));
+        observer.call_method("observe", vec![target.clone()]);
+
+        assert!(dispatch_resize_observers(&[(42, 320.0, 84.0)]));
+        assert!(!dispatch_resize_observers(&[(42, 320.0, 84.0)]));
+        assert!(dispatch_resize_observers(&[(42, 320.0, 112.0)]));
+        observer.call_method("disconnect", vec![]);
+        assert!(!dispatch_resize_observers(&[(42, 320.0, 128.0)]));
+        observer.call_method("observe", vec![target]);
+        assert!(dispatch_resize_observers(&[(42, 320.0, 128.0)]));
+        assert_eq!(&*deliveries.borrow(), &[84.0, 112.0, 128.0]);
+    }
+
+    #[test]
+    fn resize_observer_defers_entries_beyond_delivery_budget() {
+        let deliveries = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = deliveries.clone();
+        let observer = ResizeObserver::new(vec![Value::function(move |_, arguments| {
+            recorded
+                .borrow_mut()
+                .push(arguments[0].get_property("length").to_number() as usize);
+            Value::Undefined
+        })]);
+        for host_id in 100..106 {
+            let target = dom_element();
+            target.set_property("__w3cosHostId", Value::from(host_id.to_string()));
+            observer.call_method("observe", vec![target]);
+        }
+        let sizes = (100..106)
+            .map(|host_id| (host_id, 320.0, 80.0 + host_id as f32))
+            .collect::<Vec<_>>();
+
+        assert_eq!(dispatch_resize_observers_bounded(&sizes, 4), (true, true));
+        assert_eq!(dispatch_resize_observers_bounded(&sizes, 4), (true, false));
+        assert_eq!(dispatch_resize_observers_bounded(&sizes, 4), (false, false));
+        assert_eq!(&*deliveries.borrow(), &[4, 2]);
+        observer.call_method("disconnect", vec![]);
     }
 }

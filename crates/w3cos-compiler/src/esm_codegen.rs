@@ -486,7 +486,12 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
                             && matches!(condition.cons.as_ref(), Expr::Ident(_))
                             && matches!(condition.alt.as_ref(), Expr::Ident(_)) =>
                     {
-                        let Expr::Ident(target) = condition.alt.as_ref() else {
+                        // A native W3COS application owns a real window and
+                        // therefore follows the browser branch. Selecting the
+                        // fallback branch here gave browser libraries SSR
+                        // lifecycle timing (notably react-window used
+                        // useEffect instead of useLayoutEffect).
+                        let Expr::Ident(target) = condition.cons.as_ref() else {
                             unreachable!()
                         };
                         items.push(TopLevelItem::Alias {
@@ -597,6 +602,24 @@ fn lower_dynamic_pattern(
             ));
         }
         Pat::Object(object) => {
+            let excluded = object
+                .props
+                .iter()
+                .filter_map(|property| match property {
+                    ObjectPatProp::Assign(assign) => Some(assign.key.sym.to_string()),
+                    ObjectPatProp::KeyValue(key_value) => match &key_value.key {
+                        PropName::Ident(ident) => Some(ident.sym.to_string()),
+                        PropName::Str(value) => {
+                            Some(format!("{:?}", value.value).trim_matches('"').to_string())
+                        }
+                        PropName::Num(value) => Some(value.value.to_string()),
+                        _ => None,
+                    },
+                    ObjectPatProp::Rest(_) => None,
+                })
+                .map(|key| format!("{key:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             for property in &object.props {
                 match property {
                     ObjectPatProp::Assign(assign) => {
@@ -626,7 +649,8 @@ fn lower_dynamic_pattern(
                         lower_dynamic_pattern(&key_value.value, &nested, output, renames, indent);
                     }
                     ObjectPatProp::Rest(rest) => {
-                        lower_dynamic_pattern(&rest.arg, source, output, renames, indent);
+                        let rest_source = format!("{source}.object_rest(&[{excluded}])");
+                        lower_dynamic_pattern(&rest.arg, &rest_source, output, renames, indent);
                     }
                 }
             }
@@ -751,6 +775,37 @@ export function keymap() {}"#,
             "cross-module bindings should re-export: {code}"
         );
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn typeof_window_alias_selects_browser_branch() {
+        let root = fixture_root("w3cos_esm_codegen_window_branch");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"function browser() {}
+function fallback() {}
+const effect = typeof window < "u" ? browser : fallback;
+export function main() { return effect; }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+
+        assert!(
+            code.contains("pub use self::browser as m0_effect"),
+            "native window host must select the browser branch: {code}"
+        );
+        assert!(
+            !code.contains("pub use self::fallback as m0_effect"),
+            "native window host must not select the SSR fallback: {code}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

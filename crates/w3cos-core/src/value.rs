@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 /// JavaScript-compatible dynamic value type.
@@ -49,6 +51,10 @@ impl JsFunction {
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         (self.inner)(this, args)
     }
+
+    fn identity(&self) -> usize {
+        Rc::as_ptr(&self.inner) as *const () as usize
+    }
 }
 
 impl fmt::Debug for JsFunction {
@@ -60,6 +66,47 @@ impl fmt::Debug for JsFunction {
 // ── Type coercion ──────────────────────────────────────────────────────
 
 impl Value {
+    /// Stable identity hash with ECMAScript `Object.is` semantics.
+    ///
+    /// Heap values use reference identity, while primitives use their value.
+    /// This is suitable for React-style hook dependency comparison.
+    pub fn identity_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        match self {
+            Value::Undefined => 0_u8.hash(&mut hasher),
+            Value::Null => 1_u8.hash(&mut hasher),
+            Value::Bool(value) => {
+                2_u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Number(value) => {
+                3_u8.hash(&mut hasher);
+                if value.is_nan() {
+                    u64::MAX.hash(&mut hasher);
+                } else {
+                    value.to_bits().hash(&mut hasher);
+                }
+            }
+            Value::String(value) => {
+                4_u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Array(value) => {
+                5_u8.hash(&mut hasher);
+                (Rc::as_ptr(value) as usize).hash(&mut hasher);
+            }
+            Value::Object(value) => {
+                6_u8.hash(&mut hasher);
+                (Rc::as_ptr(value) as usize).hash(&mut hasher);
+            }
+            Value::Function(value) => {
+                7_u8.hash(&mut hasher);
+                value.identity().hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     /// ECMAScript `typeof` operator.
     pub fn type_of(&self) -> &'static str {
         match self {
@@ -200,7 +247,7 @@ impl Value {
         match self {
             Value::Object(o) => {
                 let value = o.borrow().get(key, self).clone();
-                if !value.is_undefined() {
+                if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
                     value
                 } else {
                     let getter = o
@@ -233,6 +280,27 @@ impl Value {
             }
             _ => Value::Undefined,
         }
+    }
+
+    /// ECMAScript object-rest copy used by `{ picked, ...rest }`.
+    ///
+    /// Only own enumerable string properties are copied; the prototype and
+    /// excluded bindings are not carried into the result.
+    pub fn object_rest(&self, excluded: &[&str]) -> Value {
+        let Value::Object(object) = self else {
+            return Value::object(HashMap::new());
+        };
+        let object = object.borrow();
+        let properties = object
+            .keys()
+            .into_iter()
+            .filter(|key| !excluded.contains(&key.as_str()))
+            .map(|key| {
+                let value = object.get_direct(&key);
+                (key, value)
+            })
+            .collect();
+        Value::object(properties)
     }
 
     /// Property assignment: `obj[key] = value`.
@@ -351,6 +419,13 @@ impl Value {
     pub fn iter(&self) -> std::vec::IntoIter<Value> {
         match self {
             Value::Array(values) => values.borrow().clone().into_iter(),
+            // The AOT lowering turns common `Map#forEach(value => ...)`
+            // loops into this iterator path. Map exposes a live values
+            // snapshot so the lowered loop retains JavaScript semantics.
+            Value::Object(object) => match object.borrow().get_direct("__w3cosMapValues") {
+                Value::Array(values) => values.borrow().clone().into_iter(),
+                _ => Vec::new().into_iter(),
+            },
             _ => Vec::new().into_iter(),
         }
     }
@@ -522,19 +597,31 @@ impl Value {
     }
 
     pub fn js_lt(&self, other: &Value) -> bool {
-        self.to_number() < other.to_number()
+        match (self, other) {
+            (Value::String(left), Value::String(right)) => left < right,
+            _ => self.to_number() < other.to_number(),
+        }
     }
 
     pub fn js_gt(&self, other: &Value) -> bool {
-        self.to_number() > other.to_number()
+        match (self, other) {
+            (Value::String(left), Value::String(right)) => left > right,
+            _ => self.to_number() > other.to_number(),
+        }
     }
 
     pub fn js_le(&self, other: &Value) -> bool {
-        self.to_number() <= other.to_number()
+        match (self, other) {
+            (Value::String(left), Value::String(right)) => left <= right,
+            _ => self.to_number() <= other.to_number(),
+        }
     }
 
     pub fn js_ge(&self, other: &Value) -> bool {
-        self.to_number() >= other.to_number()
+        match (self, other) {
+            (Value::String(left), Value::String(right)) => left >= right,
+            _ => self.to_number() >= other.to_number(),
+        }
     }
 
     pub fn js_not(&self) -> Value {
@@ -619,10 +706,45 @@ mod tests {
     }
 
     #[test]
+    fn identity_hash_tracks_heap_identity_and_object_is_numbers() {
+        let function = Value::function(|_, _| Value::Undefined);
+        assert_eq!(function.identity_hash(), function.clone().identity_hash());
+        assert_ne!(
+            function.identity_hash(),
+            Value::function(|_, _| Value::Undefined).identity_hash()
+        );
+
+        let object = Value::object(HashMap::new());
+        assert_eq!(object.identity_hash(), object.clone().identity_hash());
+        assert_ne!(
+            object.identity_hash(),
+            Value::object(HashMap::new()).identity_hash()
+        );
+
+        assert_eq!(
+            Value::Number(f64::NAN).identity_hash(),
+            Value::Number(-f64::NAN).identity_hash()
+        );
+        assert_ne!(
+            Value::Number(0.0).identity_hash(),
+            Value::Number(-0.0).identity_hash()
+        );
+    }
+
+    #[test]
     fn abstract_equality() {
         assert!(Value::Null.abstract_eq(&Value::Undefined));
         assert!(Value::Number(1.0).abstract_eq(&Value::String("1".into())));
         assert!(Value::Bool(true).abstract_eq(&Value::Number(1.0)));
+    }
+
+    #[test]
+    fn relational_comparison_is_lexicographic_for_two_strings() {
+        assert!(Value::from("function").js_lt(&Value::from("u")));
+        assert!(Value::from("10").js_lt(&Value::from("2")));
+        assert!(Value::from("u").js_ge(&Value::from("u")));
+        assert!(!Value::from("z").js_le(&Value::from("a")));
+        assert!(Value::from("10").js_gt(&Value::Number(2.0)));
     }
 
     #[test]
@@ -716,6 +838,33 @@ mod tests {
         let s = Value::String("hello".into());
         assert_eq!(s.get_property("length").to_number(), 5.0);
         assert_eq!(s.get_property("0").to_js_string(), "h");
+    }
+
+    #[test]
+    fn encoded_getters_remain_visible_after_plain_object_fast_path() {
+        let object = Value::object(HashMap::new());
+        object.set_property(
+            "__w3cos_getter_label",
+            Value::function(|_, _| Value::from("computed")),
+        );
+
+        assert_eq!(object.get_property("label").to_js_string(), "computed");
+        assert!(object.get_property("missing").is_undefined());
+    }
+
+    #[test]
+    fn object_rest_excludes_destructured_own_properties() {
+        let object = Value::object(HashMap::from([
+            ("ariaAttributes".into(), Value::from("aria")),
+            ("style".into(), Value::from("style")),
+            ("index".into(), Value::Number(7.0)),
+        ]));
+
+        let rest = object.object_rest(&["ariaAttributes", "style"]);
+
+        assert!(rest.get_property("ariaAttributes").is_undefined());
+        assert!(rest.get_property("style").is_undefined());
+        assert_eq!(rest.get_property("index").to_number(), 7.0);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::safe_area::{SafeAreaEdge, SafeAreaInsets};
 
 /// CSS Modern Subset — Flexbox, Grid, Block, Inline, and positioning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Style {
     // Layout mode
     pub display: Display,
@@ -46,6 +46,9 @@ pub struct Style {
     /// CSS Scroll Snap Level 2 `scroll-initial-target`.
     #[serde(default)]
     pub scroll_initial_target: ScrollInitialTarget,
+    /// CSS `overflow-anchor`; `false` excludes this subtree from UA scroll anchoring.
+    #[serde(default = "default_overflow_anchor")]
+    pub overflow_anchor: bool,
 
     // Visual
     pub background: Color,
@@ -116,7 +119,7 @@ impl Default for Style {
     fn default() -> Self {
         Self {
             display: Display::Flex,
-            position: Position::Relative,
+            position: Position::Static,
             flex_direction: FlexDirection::Column,
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
@@ -140,6 +143,7 @@ impl Default for Style {
             overflow: Overflow::Visible,
             overscroll_behavior: OverscrollBehavior::Auto,
             scroll_initial_target: ScrollInitialTarget::None,
+            overflow_anchor: true,
             background: Color::TRANSPARENT,
             color: Color::WHITE,
             font_size: 16.0,
@@ -180,6 +184,10 @@ impl Default for Style {
     }
 }
 
+const fn default_overflow_anchor() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Display {
     Block,
@@ -191,16 +199,17 @@ pub enum Display {
     None,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Position {
     #[default]
+    Static,
     Relative,
     Absolute,
     Fixed,
     Sticky,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Overflow {
     #[default]
     Visible,
@@ -224,7 +233,7 @@ pub enum ScrollInitialTarget {
     Nearest,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum FlexDirection {
     Row,
     #[default]
@@ -233,7 +242,7 @@ pub enum FlexDirection {
     ColumnReverse,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum JustifyContent {
     #[default]
     FlexStart,
@@ -244,7 +253,7 @@ pub enum JustifyContent {
     SpaceEvenly,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum AlignItems {
     FlexStart,
     FlexEnd,
@@ -254,7 +263,7 @@ pub enum AlignItems {
     Baseline,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum FlexWrap {
     #[default]
     NoWrap,
@@ -262,7 +271,7 @@ pub enum FlexWrap {
     WrapReverse,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub enum Dimension {
     #[default]
     Auto,
@@ -396,7 +405,7 @@ impl Default for Edges {
 /// CSS `contain` property — creates layout isolation boundaries.
 /// Enables incremental layout: changes inside a contained subtree
 /// cannot affect layout outside it.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Contain {
     #[default]
     None,
@@ -470,7 +479,7 @@ impl Contain {
 
 // --- CSS Text (#31) ---
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum TextAlign {
     #[default]
     Left,
@@ -479,7 +488,7 @@ pub enum TextAlign {
     Justify,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum WhiteSpace {
     #[default]
     Normal,
@@ -489,7 +498,7 @@ pub enum WhiteSpace {
     PreLine,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum TextDecoration {
     #[default]
     None,
@@ -498,14 +507,14 @@ pub enum TextDecoration {
     Overline,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum TextOverflow {
     #[default]
     Clip,
     Ellipsis,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum FontStyle {
     #[default]
     Normal,
@@ -513,7 +522,7 @@ pub enum FontStyle {
     Oblique,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum WordBreak {
     #[default]
     Normal,
@@ -524,7 +533,7 @@ pub enum WordBreak {
 
 // --- CSS Animation (#11) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Animation {
     pub name: String,
     pub duration_ms: u32,
@@ -535,7 +544,7 @@ pub struct Animation {
     pub fill_mode: AnimationFillMode,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum AnimationIterationCount {
     #[default]
     Once,
@@ -543,7 +552,7 @@ pub enum AnimationIterationCount {
     Infinite,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum AnimationDirection {
     #[default]
     Normal,
@@ -552,7 +561,7 @@ pub enum AnimationDirection {
     AlternateReverse,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum AnimationFillMode {
     #[default]
     None,
@@ -577,7 +586,7 @@ pub struct KeyframeStyle {
 
 // --- Box Shadow ---
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BoxShadow {
     pub offset_x: f32,
     pub offset_y: f32,
@@ -637,7 +646,7 @@ impl Default for Transform2D {
 
 // --- Transition ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transition {
     pub property: TransitionProperty,
     pub duration_ms: u32,
@@ -645,7 +654,7 @@ pub struct Transition {
     pub delay_ms: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransitionProperty {
     All,
     Opacity,
@@ -655,7 +664,7 @@ pub enum TransitionProperty {
     Custom(String),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Easing {
     #[default]
     Ease,
@@ -732,7 +741,7 @@ mod easing_tests {
 
 // --- New enums for Phase 3 ---
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum AlignSelf {
     #[default]
     Auto,
@@ -743,7 +752,7 @@ pub enum AlignSelf {
     Stretch,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum AlignContent {
     FlexStart,
     FlexEnd,
@@ -755,7 +764,7 @@ pub enum AlignContent {
     Stretch,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Cursor {
     #[default]
     Default,
@@ -778,14 +787,14 @@ pub enum Cursor {
     None,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum PointerEvents {
     #[default]
     Auto,
     None,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum UserSelect {
     #[default]
     Auto,
@@ -794,7 +803,7 @@ pub enum UserSelect {
     All,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Visibility {
     #[default]
     Visible,
@@ -802,7 +811,7 @@ pub enum Visibility {
     Collapse,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum OutlineStyle {
     #[default]
     None,

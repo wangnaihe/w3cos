@@ -2,6 +2,10 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::paint_artifact::{PaintArtifact, PaintNode};
+use crate::text_layout;
+use crate::tile_manager::{TileManager, TileRequest};
+
 #[cfg(feature = "cpu-render")]
 use std::rc::Rc;
 
@@ -14,7 +18,7 @@ use winit::event::{
     ElementState, MouseButton, MouseScrollDelta, StartCause, TouchPhase, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 /// Desktop startup size. Mobile windows must use the platform's native
@@ -34,6 +38,20 @@ fn default_window_attributes() -> WindowAttributes {
     {
         attributes.with_inner_size(default_logical_size())
     }
+}
+
+#[cfg(feature = "skia")]
+fn skia_backend_requested() -> bool {
+    let requested = std::env::var("W3COS_RENDERER").ok();
+    if requested.as_deref() == Some("skia") {
+        return true;
+    }
+    #[cfg(target_os = "ios")]
+    {
+        return !matches!(requested.as_deref(), Some("gpu" | "cpu"));
+    }
+    #[cfg(not(target_os = "ios"))]
+    false
 }
 
 /// Physical backing-store size for the platform view.
@@ -120,6 +138,22 @@ struct ViewportLayout {
 /// Estimated soft-keyboard height when the platform does not shrink `content_rect`
 /// (common with `NativeActivity` + pan). ~260 CSS px ≈ typical Android IME.
 const ANDROID_IME_FALLBACK_INSET: f32 = 260.0;
+const REACT_SCROLL_ANCHOR_SUPPRESSION: Duration = Duration::from_secs(2);
+
+/// Maximum compositor-only travel before a deferred React virtualizer update
+/// is committed. Blink similarly keeps scrolling on the compositor while
+/// main-thread prepaint advances often enough that the interest rect cannot
+/// be exhausted by a fast fling.
+fn deferred_scroll_checkpoint_distance(viewport_extent: f32) -> f32 {
+    (viewport_extent * 0.5).max(160.0)
+}
+
+fn should_restore_react_scroll_anchor(
+    programmatic_scroll_applied: bool,
+    direct_scroll_active: bool,
+) -> bool {
+    !programmatic_scroll_applied && !direct_scroll_active
+}
 
 impl ViewportLayout {
     fn from_window(window: &Window, scale: f32, inset_top: f32, _ime_open: bool) -> Self {
@@ -254,6 +288,53 @@ const SCROLL_CHAIN_EPSILON: f32 = 0.05;
 const KINETIC_SCROLL_MAX_VELOCITY: f32 = 6_000.0;
 const KINETIC_VELOCITY_WINDOW: Duration = Duration::from_millis(150);
 
+fn web_key(key: &Key) -> String {
+    match key {
+        Key::Character(value) => value.to_string(),
+        Key::Named(named) => match named {
+            NamedKey::Space => " ".to_string(),
+            _ => format!("{named:?}"),
+        },
+        Key::Dead(value) => value.map_or_else(|| "Dead".to_string(), |value| value.to_string()),
+        Key::Unidentified(_) => "Unidentified".to_string(),
+    }
+}
+
+fn web_code(key: PhysicalKey) -> String {
+    match key {
+        PhysicalKey::Code(code) => match code {
+            KeyCode::Space => "Space".to_string(),
+            _ => format!("{code:?}"),
+        },
+        PhysicalKey::Unidentified(_) => "Unidentified".to_string(),
+    }
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn text_input_delta(previous: &str, next: &str) -> (String, &'static str) {
+    let previous_chars = previous.chars().collect::<Vec<_>>();
+    let next_chars = next.chars().collect::<Vec<_>>();
+    let prefix = previous_chars
+        .iter()
+        .zip(&next_chars)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = previous_chars[prefix..]
+        .iter()
+        .rev()
+        .zip(next_chars[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let inserted_end = next_chars.len().saturating_sub(suffix).max(prefix);
+    let data = next_chars[prefix..inserted_end].iter().collect::<String>();
+    let input_type = if data.is_empty() && previous_chars.len() > next_chars.len() {
+        "deleteContentBackward"
+    } else {
+        "insertText"
+    };
+    (data, input_type)
+}
+
 // ---------------------------------------------------------------------------
 // HitNode — interactive region for click/focus
 // ---------------------------------------------------------------------------
@@ -262,6 +343,7 @@ struct HitNode {
     rect: LayoutRect,
     index: usize,
     is_interactive: bool,
+    is_host_target: bool,
     is_focusable: bool,
     on_click: EventAction,
 }
@@ -277,6 +359,10 @@ enum RepaintMode {
     Full,
     ScrollOnly(Vec<ScrollDamage>),
     ScrollContentChanged(Vec<ScrollDamage>),
+    ExternalAfterScroll {
+        scroll_indices: Vec<usize>,
+        damage_indices: Vec<usize>,
+    },
     #[default]
     Clean,
 }
@@ -294,6 +380,9 @@ impl RepaintMode {
             RepaintMode::Clean => {
                 *self = RepaintMode::ScrollOnly(vec![ScrollDamage { index, delta_y }]);
             }
+            RepaintMode::ExternalAfterScroll { .. } => {
+                *self = RepaintMode::ScrollOnly(vec![ScrollDamage { index, delta_y }]);
+            }
             // Layout/style/React tree invalidation already requires a complete
             // repaint. A later scroll event in the same frame must not
             // downgrade it to retained framebuffer strip-copying.
@@ -302,15 +391,19 @@ impl RepaintMode {
     }
 }
 
-fn repaint_after_react_rebuild(
-    current: RepaintMode,
-    has_recent_scroll_damage: bool,
-) -> RepaintMode {
+fn repaint_after_react_rebuild(current: RepaintMode) -> RepaintMode {
     match current {
         RepaintMode::ScrollOnly(damages) => RepaintMode::ScrollOnly(damages),
         RepaintMode::ScrollContentChanged(damages) => RepaintMode::ScrollContentChanged(damages),
-        RepaintMode::Clean if has_recent_scroll_damage => RepaintMode::Clean,
-        RepaintMode::Full | RepaintMode::Clean => RepaintMode::Full,
+        RepaintMode::ExternalAfterScroll {
+            scroll_indices,
+            damage_indices,
+        } => RepaintMode::ExternalAfterScroll {
+            scroll_indices,
+            damage_indices,
+        },
+        RepaintMode::Clean => RepaintMode::Clean,
+        RepaintMode::Full => RepaintMode::Full,
     }
 }
 
@@ -327,6 +420,13 @@ fn repaint_after_react_content_change(
         RepaintMode::Clean if !recent_scroll_damage.is_empty() => {
             RepaintMode::ScrollContentChanged(recent_scroll_damage.to_vec())
         }
+        RepaintMode::ExternalAfterScroll {
+            scroll_indices,
+            damage_indices,
+        } => RepaintMode::ExternalAfterScroll {
+            scroll_indices,
+            damage_indices,
+        },
         RepaintMode::Full
         | RepaintMode::Clean
         | RepaintMode::ScrollOnly(_)
@@ -342,12 +442,10 @@ fn react_rebuild_changes_painted_content(
         return true;
     }
 
-    old_flat.iter().zip(new_flat).any(|(old, new)| {
-        if old.stable_id != new.stable_id {
-            return true;
-        }
-
-        match (old.kind, new.kind) {
+    old_flat
+        .iter()
+        .zip(new_flat)
+        .any(|(old, new)| match (old.kind, new.kind) {
             (ComponentKind::Root, ComponentKind::Root)
             | (ComponentKind::Column, ComponentKind::Column)
             | (ComponentKind::Row, ComponentKind::Row)
@@ -384,23 +482,49 @@ fn react_rebuild_changes_painted_content(
                     item_count: old_count,
                     estimated_item_height: old_height,
                     overscan: old_overscan,
-                    total_extent: old_extent,
+                    total_extent: _,
                 },
                 ComponentKind::VirtualList {
                     item_count: new_count,
                     estimated_item_height: new_height,
                     overscan: new_overscan,
-                    total_extent: new_extent,
+                    total_extent: _,
                 },
-            ) => {
-                old_count != new_count
-                    || old_height != new_height
-                    || old_overscan != new_overscan
-                    || old_extent != new_extent
-            }
+            ) => old_count != new_count || old_height != new_height || old_overscan != new_overscan,
             _ => true,
+        })
+}
+
+fn react_rebuild_changes_visual_output(
+    old_flat: &[layout::FlatNodeInfo<'_>],
+    new_flat: &[layout::FlatNodeInfo<'_>],
+) -> bool {
+    old_flat.len() != new_flat.len()
+        || old_flat
+            .iter()
+            .zip(new_flat)
+            .any(|(old, new)| react_node_changes_visual_output(old, new))
+}
+
+fn react_node_changes_visual_output(
+    old: &layout::FlatNodeInfo<'_>,
+    new: &layout::FlatNodeInfo<'_>,
+) -> bool {
+    old.style != new.style
+        || react_rebuild_changes_painted_content(
+            std::slice::from_ref(old),
+            std::slice::from_ref(new),
+        )
+}
+
+fn node_is_descendant_of(mut index: usize, ancestor: usize, parents: &[Option<usize>]) -> bool {
+    while let Some(parent) = parents.get(index).copied().flatten() {
+        if parent == ancestor {
+            return true;
         }
-    })
+        index = parent;
+    }
+    false
 }
 
 fn repaint_for_present(current: RepaintMode, has_active_animations: bool) -> RepaintMode {
@@ -494,7 +618,7 @@ impl SpatialGrid {
         let mut cells = vec![Vec::new(); cols * rows];
 
         for (i, hit) in hit_nodes.iter().enumerate() {
-            if !hit.is_interactive {
+            if !hit.is_host_target {
                 continue;
             }
             let x0 = (hit.rect.x / cell_size).floor().max(0.0) as usize;
@@ -550,7 +674,7 @@ impl SpatialGrid {
                 let mut cur = Some(hit.index);
                 while let Some(idx) = cur {
                     if let Some(h) = hit_nodes.iter().find(|h| h.index == idx) {
-                        if h.is_interactive {
+                        if h.is_host_target {
                             return Some(idx);
                         }
                     }
@@ -829,6 +953,10 @@ struct CpuPresenter {
     context: softbuffer::Context<winit::event_loop::OwnedDisplayHandle>,
     surface: softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Rc<Window>>,
     framebuffer: Option<Pixmap>,
+    #[cfg(feature = "skia")]
+    skia: Option<crate::render_skia::SkiaRasterizer>,
+    #[cfg(all(feature = "skia", target_os = "ios"))]
+    skia_metal: Option<crate::render_skia::SkiaMetalPresenter>,
     clip_masks: render_cpu::ClipMaskCache,
     buffer_size: (u32, u32),
 }
@@ -840,14 +968,17 @@ struct ComponentVirtualList {
     scroll_offset: f32,
 }
 
-/// Retained PrePaint data. Blink keeps this information beside the layout
-/// tree and only rebuilds it after layout/style invalidation; scroll frames
-/// then consume it without walking the component tree again.
-#[derive(Clone)]
-struct RetainedPaintNode {
-    kind: ComponentKind,
-    style: w3cos_std::style::Style,
-    parent: Option<usize>,
+struct TextCompositionState {
+    index: usize,
+    base_value: String,
+    data: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReactScrollAnchor {
+    scroll_host_id: u64,
+    anchor_host_id: u64,
+    visual_top: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -864,12 +995,15 @@ struct App {
     scale_factor: f64,
     hovered_index: Option<usize>,
     pressed_index: Option<usize>,
+    pointer_down_default_prevented: bool,
+    touch_pointer_target: Option<usize>,
     focused_index: Option<usize>,
     #[cfg(target_os = "ios")]
     ios_ime_retry: Option<IosImeRetry>,
     #[cfg(target_os = "ios")]
     ios_ime_viewport_poll: Option<IosImeRetry>,
     text_input_values: HashMap<usize, String>,
+    text_composition: Option<TextCompositionState>,
     hit_nodes: Vec<HitNode>,
     focusable_indices: Vec<usize>,
     layout_cache: Vec<(LayoutRect, usize)>,
@@ -901,6 +1035,22 @@ struct App {
     viewport: ViewportLayout,
     repaint_mode: RepaintMode,
     recent_scroll_damage: Vec<ScrollDamage>,
+    recent_external_damage_indices: Vec<usize>,
+    /// Blink-style compositor-first scrolling: present the retained scroll
+    /// frame before committing React work scheduled by the scroll event.
+    deferred_react_scroll_commit: bool,
+    /// Compositor-only distance travelled per scroll host since the last
+    /// React virtual-window commit.
+    deferred_react_scroll_distance: HashMap<usize, f32>,
+    /// Blink-style scroll-anchor suppression window. ResizeObserver work can
+    /// land immediately after touch end, when `touch_scroll_active` is already
+    /// false but the user's just-written scroll offset is still authoritative.
+    react_scroll_anchor_suppressed_until: Option<Instant>,
+    /// Layout generation most recently delivered to ResizeObserver. Blink
+    /// only enters the observer delivery loop after layout invalidation;
+    /// polling every event-loop turn makes scrolling proportional to the
+    /// mounted DOM size even when geometry is unchanged.
+    resize_observer_layout_generation: Option<u64>,
 
     /// UA presenter selection when both GPU and CPU backends are compiled in.
     #[cfg(all(feature = "gpu", feature = "cpu-render"))]
@@ -911,15 +1061,14 @@ struct App {
     // Performance: scroll ancestor map (avoids O(n*depth) parent walk)
     scroll_ancestor: Vec<Option<usize>>,
     flat_parents: Vec<Option<usize>>,
-    retained_paint_nodes: Vec<RetainedPaintNode>,
-    retained_paint_z: Vec<i32>,
-    retained_sticky_owner: Vec<Option<usize>>,
-    retained_rect_by_index: Vec<Option<LayoutRect>>,
+    paint_artifact: PaintArtifact,
+    tile_manager: TileManager,
     // Performance: spatial grid for O(1) hit testing
     spatial_grid: SpatialGrid,
     // Performance: dirty frame detection
     paint_generation: u64,
     layout_generation: u64,
+    first_frame_presented: bool,
 
     // DevTools integration (Chrome DevTools Protocol)
     #[cfg(feature = "devtools")]
@@ -994,12 +1143,15 @@ impl App {
             scale_factor: 1.0,
             hovered_index: None,
             pressed_index: None,
+            pointer_down_default_prevented: false,
+            touch_pointer_target: None,
             focused_index: None,
             #[cfg(target_os = "ios")]
             ios_ime_retry: None,
             #[cfg(target_os = "ios")]
             ios_ime_viewport_poll: None,
             text_input_values: HashMap::new(),
+            text_composition: None,
             hit_nodes: Vec::new(),
             focusable_indices: Vec::new(),
             layout_cache: Vec::new(),
@@ -1040,19 +1192,23 @@ impl App {
             },
             repaint_mode: RepaintMode::Full,
             recent_scroll_damage: Vec::new(),
+            recent_external_damage_indices: Vec::new(),
+            deferred_react_scroll_commit: false,
+            deferred_react_scroll_distance: HashMap::new(),
+            react_scroll_anchor_suppressed_until: None,
+            resize_observer_layout_generation: None,
             #[cfg(all(feature = "gpu", feature = "cpu-render"))]
             using_gpu: true,
 
             layout_engine: LayoutEngine::new(),
             scroll_ancestor: Vec::new(),
             flat_parents: Vec::new(),
-            retained_paint_nodes: Vec::new(),
-            retained_paint_z: Vec::new(),
-            retained_sticky_owner: Vec::new(),
-            retained_rect_by_index: Vec::new(),
+            paint_artifact: PaintArtifact::default(),
+            tile_manager: TileManager::default(),
             spatial_grid: SpatialGrid::empty(),
             paint_generation: 0,
             layout_generation: 0,
+            first_frame_presented: false,
 
             #[cfg(feature = "devtools")]
             devtools_handle: None,
@@ -1105,6 +1261,214 @@ impl App {
         crate::uitest::write_snapshot();
     }
 
+    fn prepare_compositor_tiles(&mut self) -> (Vec<TileRequest>, HashSet<usize>) {
+        let velocity_y = self
+            .recent_scroll_damage
+            .last()
+            .map(|damage| damage.delta_y * 60.0)
+            .unwrap_or_default();
+        let candidates: Vec<_> = self
+            .paint_artifact
+            .display_items
+            .iter()
+            .map(|item| {
+                let mut visual = item.visual_rect;
+                if let Some(scroll_index) = self
+                    .scroll_ancestor
+                    .get(item.client_index)
+                    .copied()
+                    .flatten()
+                    && let Some((scroll_x, scroll_y)) = self.scroll_offsets.get(&scroll_index)
+                {
+                    visual.x -= scroll_x;
+                    visual.y -= scroll_y;
+                }
+                (item.client_index, visual)
+            })
+            .collect();
+        let requests = self.tile_manager.prepare_frame(
+            self.paint_artifact.generation,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: self.viewport.layout_w,
+                height: self.viewport.layout_h,
+            },
+            velocity_y,
+            self.scale_factor as f32,
+            candidates,
+        );
+        let clients = requests
+            .iter()
+            .flat_map(|request| self.tile_manager.clients_for(request.id))
+            .collect();
+        (requests, clients)
+    }
+
+    fn complete_compositor_tiles(&mut self, requests: &[TileRequest]) {
+        for request in requests {
+            self.tile_manager.mark_ready(request.id, request.generation);
+        }
+    }
+
+    fn collect_scroll_interest_text(
+        &self,
+        scale: f32,
+        tile_clients: &HashSet<usize>,
+    ) -> Vec<text_layout::TextPrepaintRequest> {
+        let Some(damage) = self.recent_scroll_damage.last().copied() else {
+            return Vec::new();
+        };
+        let Some((_, scrollport, _)) = self
+            .scrollable_nodes
+            .iter()
+            .find(|(index, _, _)| *index == damage.index)
+        else {
+            return Vec::new();
+        };
+        let scroll_y = self
+            .scroll_offsets
+            .get(&damage.index)
+            .map(|(_, y)| *y)
+            .unwrap_or_default();
+        let direction = damage.delta_y.signum();
+        if direction == 0.0 {
+            return Vec::new();
+        }
+        let lookahead = (scrollport.height * 1.5 + damage.delta_y.abs() * 4.0)
+            .clamp(scrollport.height, scrollport.height * 3.0);
+        let flat = self.paint_artifact.nodes.as_slice();
+        let mut requests = Vec::new();
+        for &(rect, index) in &self.layout_cache {
+            if index == damage.index
+                || (!tile_clients.is_empty() && !tile_clients.contains(&index))
+                || !node_is_descendant_of(index, damage.index, &self.flat_parents)
+            {
+                continue;
+            }
+            let visual_top = rect.y - scroll_y;
+            let visual_bottom = visual_top + rect.height;
+            // Include the current viewport as well as the directional
+            // lookahead. A fast fling can replace the virtual window between
+            // frames; those newly mounted, already-visible rows did not exist
+            // during the previous prepaint pass.
+            let in_interest = if direction > 0.0 {
+                visual_bottom > scrollport.y - 32.0
+                    && visual_top < scrollport.y + scrollport.height + lookahead
+            } else {
+                visual_top < scrollport.y + scrollport.height + 32.0
+                    && visual_bottom > scrollport.y - lookahead
+            };
+            if !in_interest {
+                continue;
+            }
+            let Some(node) = flat.get(index) else {
+                continue;
+            };
+            let text = match &node.kind {
+                ComponentKind::Text { content } => content,
+                ComponentKind::Button { label } => label,
+                ComponentKind::TextInput { value, placeholder } => {
+                    if value.is_empty() {
+                        placeholder
+                    } else {
+                        value
+                    }
+                }
+                _ => continue,
+            };
+            let padding = node.style.padding_lengths();
+            let horizontal_inset = if node.style.background.a > 0 {
+                node.style.border_width * 2.0
+            } else {
+                padding.left + padding.right + node.style.border_width * 2.0
+            };
+            requests.push(text_layout::TextPrepaintRequest {
+                text: text.clone(),
+                width: ((rect.width - horizontal_inset).max(1.0)) * scale,
+                font_size: node.style.font_size * scale,
+                white_space: node.style.white_space,
+            });
+            if requests.len() >= 128 {
+                break;
+            }
+        }
+        requests
+    }
+
+    #[cfg(feature = "gpu")]
+    fn collect_scroll_interest_display_chunks(
+        &self,
+        tile_clients: &HashSet<usize>,
+    ) -> Vec<render_gpu::DisplayChunkPrepaintRequest> {
+        let Some(damage) = self.recent_scroll_damage.last().copied() else {
+            return Vec::new();
+        };
+        let Some((_, scrollport, _)) = self
+            .scrollable_nodes
+            .iter()
+            .find(|(index, _, _)| *index == damage.index)
+        else {
+            return Vec::new();
+        };
+        let scroll_y = self
+            .scroll_offsets
+            .get(&damage.index)
+            .map(|(_, y)| *y)
+            .unwrap_or_default();
+        let direction = damage.delta_y.signum();
+        if direction == 0.0 {
+            return Vec::new();
+        }
+        let lookahead = (scrollport.height * 1.5 + damage.delta_y.abs() * 4.0)
+            .clamp(scrollport.height, scrollport.height * 3.0);
+        let flat = layout::pre_flatten(&self.root);
+        let mut requests = Vec::new();
+        for &(rect, index) in &self.layout_cache {
+            if index == damage.index
+                || (!tile_clients.is_empty() && !tile_clients.contains(&index))
+                || !node_is_descendant_of(index, damage.index, &self.flat_parents)
+            {
+                continue;
+            }
+            let visual_top = rect.y - scroll_y;
+            let visual_bottom = visual_top + rect.height;
+            // Prepaint newly mounted visible chunks too. Limiting this to the
+            // offscreen lookahead makes their first frame pay synchronous text
+            // layout/display-list construction, which presents as a flash
+            // when the virtualizer swaps windows during a fast fling.
+            let in_interest = if direction > 0.0 {
+                visual_bottom > scrollport.y - 32.0
+                    && visual_top < scrollport.y + scrollport.height + lookahead
+            } else {
+                visual_top < scrollport.y + scrollport.height + 32.0
+                    && visual_bottom > scrollport.y - lookahead
+            };
+            if !in_interest {
+                continue;
+            }
+            let Some(node) = flat.get(index) else {
+                continue;
+            };
+            if !matches!(
+                node.kind,
+                ComponentKind::Text { .. } | ComponentKind::Button { .. }
+            ) {
+                continue;
+            }
+            requests.push(render_gpu::DisplayChunkPrepaintRequest {
+                kind: node.kind.clone(),
+                style: node.style.clone(),
+                width: rect.width,
+                height: rect.height,
+            });
+            if requests.len() >= 128 {
+                break;
+            }
+        }
+        requests
+    }
+
     fn get_window_gpu(&self) -> Option<&Window> {
         #[cfg(feature = "gpu")]
         {
@@ -1154,11 +1518,17 @@ impl App {
             .expect("softbuffer context");
         let surface =
             softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
+        #[cfg(all(feature = "skia", target_os = "ios"))]
+        let skia_metal = crate::render_skia::SkiaMetalPresenter::new(&window, EMBEDDED_FONT);
         self.cpu = Some(CpuPresenter {
             window,
             context,
             surface,
             framebuffer: None,
+            #[cfg(feature = "skia")]
+            skia: crate::render_skia::SkiaRasterizer::new(EMBEDDED_FONT),
+            #[cfg(all(feature = "skia", target_os = "ios"))]
+            skia_metal,
             clip_masks: render_cpu::ClipMaskCache::default(),
             buffer_size: (0, 0),
         });
@@ -1174,7 +1544,15 @@ impl App {
             return;
         }
 
-        let old_root = self.root.clone();
+        // A React commit replaces the component tree. Move the old tree out
+        // instead of deep-cloning every mounted row before building its
+        // replacement; the old tree remains available for diffing, stable
+        // index remapping and transition discovery below.
+        let old_root = if self.dom_mode || self.builder.is_some() {
+            std::mem::replace(&mut self.root, Component::root(Vec::new()))
+        } else {
+            self.root.clone()
+        };
 
         if signal_dirty {
             state::clear_dirty();
@@ -1199,16 +1577,46 @@ impl App {
             self.collect_transition_animations(&old_root);
         } else if let Some(builder) = self.builder {
             let old_flat = layout::pre_flatten(&old_root);
+            let builder_started = Instant::now();
             self.root = builder();
+            crate::perf::record_react_builder(builder_started.elapsed());
+            let reconcile_started = Instant::now();
             let new_flat = layout::pre_flatten(&self.root);
-            let painted_content_changed =
-                react_dirty && react_rebuild_changes_painted_content(&old_flat, &new_flat);
+            let visual_output_changed =
+                react_dirty && react_rebuild_changes_visual_output(&old_flat, &new_flat);
             let stable_index_remap = build_stable_index_remap(&old_flat, &new_flat);
+            let external_damage_indices = react_dirty.then(|| {
+                old_flat
+                    .iter()
+                    .zip(&new_flat)
+                    .enumerate()
+                    .filter_map(|(old_index, (old, new))| {
+                        let inside_active_scroll = self.recent_scroll_damage.iter().any(|damage| {
+                            old_index == damage.index
+                                || node_is_descendant_of(
+                                    old_index,
+                                    damage.index,
+                                    &self.flat_parents,
+                                )
+                        });
+                        (!inside_active_scroll && react_node_changes_visual_output(old, new))
+                            .then(|| stable_index_remap.get(&old_index).copied())
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>()
+            });
             remap_indexed_map(&mut self.scroll_offsets, &stable_index_remap);
             remap_indexed_map(&mut self.overscroll_states, &stable_index_remap);
             remap_indexed_set(&mut self.initialized_scroll_targets, &stable_index_remap);
             remap_indexed_set(&mut self.user_scrolled_nodes, &stable_index_remap);
             remap_indexed_set(&mut self.pending_sticky_scrolls, &stable_index_remap);
+            remap_indexed_map(
+                &mut self.deferred_react_scroll_distance,
+                &stable_index_remap,
+            );
+            if let Some(index) = self.touch_scroll_index {
+                self.touch_scroll_index = stable_index_remap.get(&index).copied();
+            }
             if let Some(kinetic) = &mut self.kinetic_scroll {
                 if let Some(&new_index) = stable_index_remap.get(&kinetic.index) {
                     kinetic.index = new_index;
@@ -1217,14 +1625,17 @@ impl App {
                 }
             }
             let display_changed = !layout::layout_display_unchanged(&old_flat, &new_flat);
+            let other_style_changed =
+                !layout::layout_styles_unchanged_except_display(&old_flat, &new_flat);
             self.needs_layout = true;
             // Stable Show slots already exist in the persistent Taffy tree.
             // Patch their display styles and let Taffy dirty only affected
             // ancestors; rebuilding the entire tree makes a local card toggle
             // proportional to a long conversation's total node count.
-            self.needs_tree_rebuild = !layout::layout_shape_unchanged(&old_flat, &new_flat);
+            self.needs_tree_rebuild =
+                !layout::layout_shape_unchanged(&old_flat, &new_flat) || other_style_changed;
             self.needs_style_refresh = display_changed && !self.needs_tree_rebuild;
-            self.repaint_mode = if painted_content_changed {
+            self.repaint_mode = if visual_output_changed {
                 // A standard React virtualizer reuses the same host slots for
                 // different rows. Once their text/image/input payload changes,
                 // framebuffer strip-copying would move pixels rendered for the
@@ -1237,22 +1648,88 @@ impl App {
                 // A fixed-size virtual window only unmounts rows that have
                 // already left the viewport. When the retained host slots keep
                 // the same paint payload, preserve accumulated scroll damage.
-                repaint_after_react_rebuild(
-                    std::mem::take(&mut self.repaint_mode),
-                    !self.recent_scroll_damage.is_empty(),
-                )
+                repaint_after_react_rebuild(std::mem::take(&mut self.repaint_mode))
             } else {
                 // Non-React signal/DOM work is never a deferred virtual-window
                 // swap and therefore invalidates the complete frame.
                 RepaintMode::Full
             };
-            if react_dirty {
-                self.recent_scroll_damage.clear();
+            if let Some(indices) = external_damage_indices {
+                for index in indices {
+                    if !self.recent_external_damage_indices.contains(&index) {
+                        self.recent_external_damage_indices.push(index);
+                    }
+                    if let RepaintMode::ExternalAfterScroll { damage_indices, .. } =
+                        &mut self.repaint_mode
+                        && !damage_indices.contains(&index)
+                    {
+                        damage_indices.push(index);
+                    }
+                }
             }
             self.hovered_index = None;
             self.pressed_index = None;
             self.collect_transition_animations(&old_root);
+            crate::perf::record_react_reconcile(reconcile_started.elapsed());
         }
+        let drop_started = Instant::now();
+        drop(old_root);
+        crate::perf::record_react_drop(drop_started.elapsed());
+    }
+
+    fn active_deferred_scroll_checkpoint_due(&self) -> bool {
+        if !self.deferred_react_scroll_commit
+            || (!self.touch_scroll_active && self.kinetic_scroll.is_none())
+        {
+            return false;
+        }
+        self.deferred_react_scroll_distance
+            .iter()
+            .any(|(index, distance)| {
+                let viewport_extent = self
+                    .scrollable_nodes
+                    .iter()
+                    .find(|(scroll_index, _, _)| scroll_index == index)
+                    .map(|(_, rect, _)| rect.height)
+                    .unwrap_or(self.viewport.layout_h);
+                *distance >= deferred_scroll_checkpoint_distance(viewport_extent)
+            })
+    }
+
+    fn react_scroll_anchor_suppressed(&self) -> bool {
+        self.touch_scroll_active
+            || self.kinetic_scroll.is_some()
+            || self
+                .react_scroll_anchor_suppressed_until
+                .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    fn flush_deferred_scroll_commit(&mut self, allow_active_checkpoint: bool) {
+        // Keep direct manipulation on the retained compositor path for the
+        // drag/fling, but advance the virtualizer's prepaint window before a
+        // fast gesture can outrun its retained overscan. Multiple scroll
+        // events are still coalesced into the latest React update.
+        let active = self.touch_scroll_active || self.kinetic_scroll.is_some();
+        if active && (!allow_active_checkpoint || !self.active_deferred_scroll_checkpoint_due()) {
+            return;
+        }
+        if !std::mem::take(&mut self.deferred_react_scroll_commit) {
+            return;
+        }
+        if !w3cos_react_compat::aot::has_pending_render() {
+            self.deferred_react_scroll_distance.clear();
+            return;
+        }
+
+        // Commit one coalesced React virtual-window update. The normal path
+        // calls this from the scroll event once the retained interest window
+        // has travelled far enough; RedrawRequested remains a fallback when
+        // the platform delivers paint before the next input sample.
+        let commit_started = Instant::now();
+        self.rebuild_if_dirty();
+        crate::perf::record_react_commit(commit_started.elapsed());
+        self.deferred_react_scroll_distance.clear();
+        self.request_repaint();
     }
 
     fn materialize_virtual_list(
@@ -1331,7 +1808,6 @@ impl App {
         );
         host.window = window;
         host.scroll_offset = scroll_offset;
-
         let mut children = Vec::with_capacity(host.engine.mounted_len() + 2);
         children.push(virtual_spacer(window.before_extent));
         children.extend(host.engine.mounted().map(|item| item.node.clone()));
@@ -1586,6 +2062,10 @@ impl App {
     }
 
     fn ensure_layout(&mut self) {
+        self.ensure_layout_pass(0);
+    }
+
+    fn ensure_layout_pass(&mut self, measurement_pass: u8) {
         let window = match self.get_window() {
             Some(w) => w,
             None => return,
@@ -1662,8 +2142,17 @@ impl App {
         self.scrollable_nodes = results.scrollable_nodes;
         for (idx, _, extent) in &self.scrollable_nodes {
             if let Some((x, y)) = self.scroll_offsets.get_mut(idx) {
+                let before = (*x, *y);
                 *x = (*x).clamp(0.0, extent.max_x);
                 *y = (*y).clamp(0.0, extent.max_y);
+                if std::env::var_os("W3COS_AOT_TRACE").is_some()
+                    && (before.0 != *x || before.1 != *y)
+                {
+                    eprintln!(
+                        "[w3cos-aot] clamp scroll index={idx} from={before:?} to=({x}, {y}) extent=({}, {})",
+                        extent.max_x, extent.max_y
+                    );
+                }
             }
         }
         self.overscroll_states.retain(|idx, _| {
@@ -1732,7 +2221,9 @@ impl App {
                 }
                 let is_interactive = matches!(node.kind, ComponentKind::Button { .. })
                     || matches!(node.kind, ComponentKind::TextInput { .. })
-                    || !node.on_click.is_none();
+                    || node.on_click.has_pointer_interaction();
+                let is_host_target =
+                    is_interactive || matches!(node.on_click, EventAction::NativeHost { .. });
                 let is_focusable = matches!(node.kind, ComponentKind::Button { .. })
                     || matches!(node.kind, ComponentKind::TextInput { .. });
                 if is_focusable {
@@ -1742,6 +2233,7 @@ impl App {
                     rect,
                     index: idx,
                     is_interactive,
+                    is_host_target,
                     is_focusable,
                     on_click: node.on_click.clone(),
                 });
@@ -1768,23 +2260,42 @@ impl App {
                 .collect(),
         );
 
-        let virtual_heights_changed = measure_virtual_list_rows(
+        let (virtual_heights_changed, virtual_anchor_corrections) = measure_virtual_list_rows(
             &flat,
             &self.layout_cache,
             &self.virtual_scroll_indices,
             &mut self.virtual_lists,
             &mut self.scroll_offsets,
         );
-        let (paint_nodes, paint_z, sticky_owner, rect_by_index) =
-            build_retained_prepaint(&flat, &self.layout_cache);
-        self.retained_paint_nodes = paint_nodes;
-        self.retained_paint_z = paint_z;
-        self.retained_sticky_owner = sticky_owner;
-        self.retained_rect_by_index = rect_by_index;
+        if virtual_heights_changed && measurement_pass < 2 {
+            // Dynamic rows are first laid out with react-window's estimate.
+            // Re-materialize spacers and recompute layout before presenting
+            // this frame so a newly encountered tall/short row never exposes
+            // the intermediate estimated geometry for one refresh interval.
+            drop(flat);
+            for (scroll_index, correction) in virtual_anchor_corrections {
+                self.queue_scroll_damage(scroll_index, correction);
+            }
+            self.needs_layout = true;
+            self.needs_tree_rebuild = true;
+            self.ensure_layout_pass(measurement_pass + 1);
+            return;
+        }
+        self.paint_artifact = PaintArtifact::build(
+            flat.iter().map(|node| PaintNode {
+                kind: node.kind.clone(),
+                style: node.style.clone(),
+                parent: node.parent,
+            }),
+            &self.layout_cache,
+            self.layout_generation + 1,
+        );
+        for (scroll_index, correction) in virtual_anchor_corrections {
+            self.queue_scroll_damage(scroll_index, correction);
+        }
         self.needs_layout = virtual_heights_changed;
         if virtual_heights_changed {
             self.needs_tree_rebuild = true;
-            self.repaint_mode = RepaintMode::Full;
             self.request_repaint();
         }
         self.layout_generation += 1;
@@ -2105,14 +2616,66 @@ impl App {
         let Some(state) = state else {
             return false;
         };
-        let current = self
+        let fallback_value = match self.get_kind_at(focus_idx) {
+            Some(ComponentKind::TextInput { value, .. }) => value.clone(),
+            _ => String::new(),
+        };
+        let previous = self
             .text_input_values
             .entry(focus_idx)
-            .or_insert_with(String::new);
-        if *current == state.text {
-            return false;
+            .or_insert(fallback_value)
+            .clone();
+        let was_composing = self
+            .text_composition
+            .as_ref()
+            .is_some_and(|composition| composition.index == focus_idx);
+        let (data, default_input_type) = text_input_delta(&previous, &state.text);
+        let mut event_data = data.clone();
+        if state.is_composing && !was_composing {
+            self.text_composition = Some(TextCompositionState {
+                index: focus_idx,
+                base_value: previous.clone(),
+                data: data.clone(),
+            });
+            self.dispatch_native_composition(focus_idx, "start", "");
         }
-        *current = state.text;
+        if state.is_composing {
+            if let Some(composition) = self.text_composition.as_mut() {
+                event_data = text_input_delta(&composition.base_value, &state.text).0;
+                composition.data = event_data.clone();
+            }
+            self.dispatch_native_composition(focus_idx, "update", &event_data);
+        } else if was_composing {
+            let previous_composition_data = self
+                .text_composition
+                .take()
+                .map(|composition| composition.data)
+                .unwrap_or_default();
+            if event_data.is_empty() {
+                event_data = previous_composition_data;
+            }
+            self.dispatch_native_composition(focus_idx, "end", &event_data);
+        }
+        let changed = previous != state.text;
+        let applied = !changed
+            || self.apply_native_text_input(
+                focus_idx,
+                state.text,
+                &event_data,
+                if state.is_composing {
+                    "insertCompositionText"
+                } else if was_composing {
+                    "insertFromComposition"
+                } else {
+                    default_input_type
+                },
+                state.is_composing,
+            );
+        if !applied {
+            if let Some(window) = self.get_window() {
+                crate::ios_input::set_text_input_value(window, &previous);
+            }
+        }
         if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
             eprintln!(
                 "[W3C OS][IME] native text changed composing={}",
@@ -2123,7 +2686,7 @@ impl App {
         // visible while UIKit still owns candidate selection. DOM input/
         // composition events remain separated at the adapter boundary.
         self.request_repaint();
-        true
+        changed || was_composing != state.is_composing
     }
 
     // -----------------------------------------------------------------------
@@ -2147,10 +2710,11 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
+        let (tile_requests, tile_clients) = self.prepare_compositor_tiles();
 
         let now = Instant::now();
 
-        let flat = self.retained_paint_nodes.as_slice();
+        let flat = self.paint_artifact.nodes.as_slice();
         // CSS canvas background propagation: the platform surface continues
         // behind translucent system UI such as the rounded iOS keyboard. Use
         // the root (or its document-element child) instead of exposing the
@@ -2201,7 +2765,10 @@ impl App {
             &self.overscroll_states,
             layout_cache,
             flat,
-            Some((&self.retained_sticky_owner, &self.retained_rect_by_index)),
+            Some((
+                &self.paint_artifact.sticky_owner,
+                &self.paint_artifact.rect_by_index,
+            )),
             self.viewport.layout_w,
             self.viewport.layout_h,
         );
@@ -2227,10 +2794,22 @@ impl App {
                     Some((idx, rect, &node.kind, style))
                 })
                 .collect();
-        let paint_z = &self.retained_paint_z;
+        let paint_z = &self.paint_artifact.z_order;
         render_nodes.sort_by_key(|(idx, _, _, _)| paint_z[*idx]);
 
         let scale = self.scale_factor as f32;
+        // Blink performs interest-rect prepaint before raster/submit. Do the
+        // same here so a virtual-window swap cannot make the first visible
+        // frame synchronously build every new text display chunk.
+        let display_chunks = self.collect_scroll_interest_display_chunks(&tile_clients);
+        if !display_chunks.is_empty() {
+            self.glyph_cache.prepaint_display_chunks(
+                &display_chunks,
+                &self.font_data,
+                &self.font,
+                Duration::from_micros(1_500),
+            );
+        }
 
         let device_handle = &self.render_cx.devices[dev_id];
         if self.gpu_filter_pipelines.is_none() {
@@ -2253,6 +2832,7 @@ impl App {
                 device: &device_handle.device,
                 queue: &device_handle.queue,
                 renderer,
+                antialiasing_method: gpu_aa_config(),
                 pipelines,
                 layer_pool,
                 output_pool,
@@ -2320,6 +2900,7 @@ impl App {
         };
 
         let device_handle = &self.render_cx.devices[dev_id];
+        let mut presented = false;
         if let Some(renderer) = self.renderers.get_mut(dev_id).and_then(|r| r.as_mut()) {
             let render_result = renderer.render_to_texture(
                 &device_handle.device,
@@ -2369,7 +2950,15 @@ impl App {
             );
             device_handle.queue.submit([encoder.finish()]);
             surface_texture.present();
+            presented = true;
+            if !self.first_frame_presented {
+                self.first_frame_presented = true;
+                eprintln!("[W3C OS] first frame presented");
+            }
             let _ = device_handle.device.poll(wgpu::PollType::Poll);
+        }
+        if presented {
+            self.complete_compositor_tiles(&tile_requests);
         }
         crate::perf::record_paint(paint_started.elapsed());
     }
@@ -2425,6 +3014,16 @@ impl App {
         if w == 0 || h == 0 {
             return;
         }
+        let (tile_requests, tile_clients) = self.prepare_compositor_tiles();
+        let has_active_animations = !self.animations.is_empty();
+        let queued_repaint_mode = std::mem::take(&mut self.repaint_mode);
+        let animation_forced_full =
+            has_active_animations && !matches!(queued_repaint_mode, RepaintMode::Full);
+        let repaint_mode = repaint_for_present(queued_repaint_mode, has_active_animations);
+        if matches!(repaint_mode, RepaintMode::Clean) {
+            crate::perf::record_paint(paint_started.elapsed());
+            return;
+        }
 
         let mut pixmap = match self.cpu.as_mut().unwrap().framebuffer.take() {
             Some(existing) if existing.width() == w && existing.height() == h => existing,
@@ -2435,9 +3034,9 @@ impl App {
         };
 
         let now = Instant::now();
-        let flat = layout::pre_flatten(&self.root);
+        let flat = self.paint_artifact.nodes.as_slice();
 
-        let mut style_overrides = animated_style_overrides(&flat, &self.animations, now);
+        let mut style_overrides = animated_style_overrides(flat, &self.animations, now);
         if let Some(hover_idx) = self.hovered_index {
             if hover_idx < flat.len() {
                 let entry = style_overrides
@@ -2469,8 +3068,11 @@ impl App {
             &self.scroll_offsets,
             &self.overscroll_states,
             layout_cache,
-            &flat,
-            None,
+            flat,
+            Some((
+                &self.paint_artifact.sticky_owner,
+                &self.paint_artifact.rect_by_index,
+            )),
             self.viewport.layout_w,
             self.viewport.layout_h,
         );
@@ -2499,7 +3101,7 @@ impl App {
             .iter()
             .filter_map(|&(_, idx)| {
                 let node = flat.get(idx)?;
-                let base = style_overrides.get(&idx).unwrap_or(node.style);
+                let base = style_overrides.get(&idx).unwrap_or(&node.style);
                 let mut s = base.clone();
                 s.font_size *= scale;
                 s.border_radius *= scale;
@@ -2520,18 +3122,10 @@ impl App {
                         width: rect.width * scale,
                         height: rect.height * scale,
                     };
-                    Some((idx, scaled_rect, node.kind, scaled_styles.get(i)?))
+                    Some((idx, scaled_rect, &node.kind, scaled_styles.get(i)?))
                 })
                 .collect();
-        let mut paint_z = vec![0; flat.len()];
-        for (idx, node) in flat.iter().enumerate() {
-            let inherited = node.parent.map(|parent| paint_z[parent]).unwrap_or(0);
-            paint_z[idx] = if node.style.z_index == 0 {
-                inherited
-            } else {
-                node.style.z_index
-            };
-        }
+        let paint_z = &self.paint_artifact.z_order;
         render_nodes.sort_by_key(|(idx, _, _, _)| paint_z[*idx]);
 
         let scroll_info: Vec<Option<(f32, f32, LayoutRect)>> = scroll_info_raw
@@ -2568,11 +3162,56 @@ impl App {
                 )
             })
             .collect();
-        let repaint_mode = repaint_for_present(
-            std::mem::take(&mut self.repaint_mode),
-            !self.animations.is_empty(),
-        );
-        match repaint_mode {
+        #[cfg(all(feature = "skia", target_os = "ios"))]
+        let painted_with_skia_metal = skia_backend_requested()
+            && self
+                .cpu
+                .as_mut()
+                .and_then(|cpu| cpu.skia_metal.as_mut())
+                .is_some_and(|skia| {
+                    skia.render_frame(
+                        w,
+                        h,
+                        &render_nodes,
+                        &self.font,
+                        &scroll_info,
+                        &self.text_input_values,
+                        self.focused_index,
+                    )
+                });
+        #[cfg(not(all(feature = "skia", target_os = "ios")))]
+        let painted_with_skia_metal = false;
+
+        #[cfg(feature = "skia")]
+        let painted_with_skia_raster = !painted_with_skia_metal
+            && skia_backend_requested()
+            && self
+                .cpu
+                .as_mut()
+                .and_then(|cpu| cpu.skia.as_mut())
+                .and_then(|skia| {
+                    skia.render_frame(
+                        w,
+                        h,
+                        &render_nodes,
+                        &self.font,
+                        &scroll_info,
+                        &self.text_input_values,
+                        self.focused_index,
+                    )
+                })
+                .is_some_and(|rgba| {
+                    pixmap.data_mut().copy_from_slice(rgba);
+                    true
+                });
+        #[cfg(not(feature = "skia"))]
+        let painted_with_skia_raster = false;
+        let painted_with_skia = painted_with_skia_metal || painted_with_skia_raster;
+
+        if painted_with_skia {
+            crate::perf::record_paint_path("skia-full");
+        } else {
+            match repaint_mode {
             RepaintMode::ScrollOnly(damages) => {
                 let scaled_damages: Vec<(usize, f32)> = damages
                     .iter()
@@ -2602,8 +3241,9 @@ impl App {
                         self.focused_index,
                         &mut self.cpu.as_mut().unwrap().clip_masks,
                     );
+                    crate::perf::record_paint_path("full-stacking");
                 } else {
-                    render_cpu::render_scroll_damage(
+                    let retained = render_cpu::render_scroll_damage(
                         &mut pixmap,
                         &render_nodes,
                         &self.font,
@@ -2615,23 +3255,65 @@ impl App {
                         &self.scroll_ancestor,
                         &mut self.cpu.as_mut().unwrap().clip_masks,
                     );
+                    crate::perf::record_paint_path(if retained {
+                        "retained-scroll"
+                    } else {
+                        "full-scroll-fallback"
+                    });
                 }
             }
             RepaintMode::ScrollContentChanged(damages) => {
-                let scroll_indices: Vec<usize> =
-                    damages.iter().map(|damage| damage.index).collect();
-                render_cpu::render_scroll_content_change(
+                let scaled_damages: Vec<(usize, f32)> = damages
+                    .iter()
+                    .map(|damage| (damage.index, damage.delta_y * scale))
+                    .collect();
+                let retained = render_cpu::render_scroll_content_change(
                     &mut pixmap,
                     &render_nodes,
                     &self.font,
                     &scroll_info,
                     &self.text_input_values,
                     self.focused_index,
-                    &scroll_indices,
+                    &scaled_damages,
                     &scaled_scrollable,
                     &self.scroll_ancestor,
                     &mut self.cpu.as_mut().unwrap().clip_masks,
                 );
+                crate::perf::record_paint_path(if retained {
+                    "retained-content-change"
+                } else {
+                    "full-content-fallback"
+                });
+            }
+            RepaintMode::ExternalAfterScroll {
+                scroll_indices,
+                damage_indices,
+            } => {
+                let retained = scroll_indices.len() == 1
+                    && render_cpu::render_damage_nodes(
+                        &mut pixmap,
+                        &render_nodes,
+                        &self.font,
+                        &scroll_info,
+                        &self.text_input_values,
+                        self.focused_index,
+                        &damage_indices,
+                        &mut self.cpu.as_mut().unwrap().clip_masks,
+                    );
+                if retained {
+                    crate::perf::record_paint_path("external-after-scroll");
+                } else {
+                    render_cpu::render_frame(
+                        &mut pixmap,
+                        &render_nodes,
+                        &self.font,
+                        &scroll_info,
+                        &self.text_input_values,
+                        self.focused_index,
+                        &mut self.cpu.as_mut().unwrap().clip_masks,
+                    );
+                    crate::perf::record_paint_path("full-external-fallback");
+                }
             }
             RepaintMode::Full => {
                 render_cpu::render_frame(
@@ -2643,8 +3325,14 @@ impl App {
                     self.focused_index,
                     &mut self.cpu.as_mut().unwrap().clip_masks,
                 );
+                crate::perf::record_paint_path(if animation_forced_full {
+                    "full-animation"
+                } else {
+                    "full"
+                });
             }
-            RepaintMode::Clean => {}
+                RepaintMode::Clean => unreachable!("clean frames return before raster preparation"),
+            }
         }
         if let Some(hover_idx) = self.hovered_index {
             if let Some(hit) = self
@@ -2673,7 +3361,6 @@ impl App {
 
         drop(render_nodes);
         drop(style_overrides);
-        drop(flat);
 
         self.animations.retain(|a| !a.is_complete(now));
         self.last_frame_time = Some(now);
@@ -2687,14 +3374,31 @@ impl App {
         }
 
         if let Some(cpu) = self.cpu.as_mut() {
-            cpu.present(&pixmap, w, h);
+            if !painted_with_skia_metal {
+                cpu.present(&pixmap, w, h);
+            }
             cpu.framebuffer = Some(pixmap);
+            if !self.first_frame_presented {
+                self.first_frame_presented = true;
+                eprintln!("[W3C OS] first frame presented");
+            }
         }
-
+        self.complete_compositor_tiles(&tile_requests);
         if needs_anim_repaint {
             self.request_repaint();
         }
+        let interest_requests = self.collect_scroll_interest_text(scale, &tile_clients);
+        if !self.touch_scroll_active && self.kinetic_scroll.is_none() {
+            self.recent_scroll_damage.clear();
+        }
         crate::perf::record_paint(paint_started.elapsed());
+        if !interest_requests.is_empty() {
+            render_cpu::prepaint_text_interest_rect(
+                &interest_requests,
+                &self.font,
+                Duration::from_micros(1_500),
+            );
+        }
     }
 
     fn set_pointer_logical(&mut self, physical_x: f64, physical_y: f64) {
@@ -2720,9 +3424,22 @@ impl App {
             self.ensure_layout();
             let new_hover = self.hit_test(self.mouse_x, self.mouse_y);
             if new_hover != self.hovered_index {
+                if let Some(previous) = self.hovered_index {
+                    self.dispatch_native_pointer(previous, "leave", 1, "mouse", -1, 0, 0.0);
+                }
+                if let Some(current) = new_hover {
+                    self.dispatch_native_pointer(current, "enter", 1, "mouse", -1, 0, 0.0);
+                }
+                self.rebuild_if_dirty();
                 self.hovered_index = new_hover;
                 if let Some(window) = self.get_window() {
-                    if new_hover.is_some() {
+                    let pointer_cursor = new_hover.is_some_and(|idx| {
+                        self.hit_nodes
+                            .iter()
+                            .find(|hit| hit.index == idx)
+                            .is_some_and(|hit| hit.is_interactive)
+                    });
+                    if pointer_cursor {
                         window.set_cursor(winit::window::Cursor::Icon(
                             winit::window::CursorIcon::Pointer,
                         ));
@@ -2737,7 +3454,7 @@ impl App {
         }
     }
 
-    fn pointer_pressed(&mut self) {
+    fn pointer_pressed(&mut self, pointer_type: &str, pointer_id: i64) {
         self.ensure_layout();
         let hit = self.hit_test(self.mouse_x, self.mouse_y);
         if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
@@ -2748,9 +3465,14 @@ impl App {
         }
         crate::uitest::set_pointer_hit(self.mouse_x, self.mouse_y, hit);
         if let Some(idx) = hit {
+            let prevented =
+                self.dispatch_native_pointer(idx, "down", pointer_id, pointer_type, 0, 1, 0.5);
+            self.rebuild_if_dirty();
+            self.pointer_down_default_prevented = prevented;
             self.pressed_index = Some(idx);
             #[cfg(target_os = "ios")]
-            if matches!(self.get_kind_at(idx), Some(ComponentKind::TextInput { .. })) {
+            if !prevented && matches!(self.get_kind_at(idx), Some(ComponentKind::TextInput { .. }))
+            {
                 // Keep keyboard activation inside the native touch-down user
                 // gesture. Small real-finger movement can promote the gesture
                 // to scrolling before touch-up and would otherwise drop focus.
@@ -2759,16 +3481,14 @@ impl App {
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             self.request_repaint();
         } else {
-            self.focused_index = None;
-            crate::uitest::set_focused_index(self.focused_index);
-            #[cfg(any(target_os = "ios", target_os = "android"))]
-            self.sync_soft_keyboard();
+            self.pointer_down_default_prevented = false;
+            self.set_focused_index(None);
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             self.request_repaint();
         }
     }
 
-    fn pointer_released(&mut self) {
+    fn pointer_released(&mut self, pointer_type: &str, pointer_id: i64) {
         if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
             eprintln!(
                 "[W3C OS][TOUCH] up x={:.1} y={:.1} pressed={:?} scrolled={}",
@@ -2776,6 +3496,8 @@ impl App {
             );
         }
         if let Some(pressed_idx) = self.pressed_index.take() {
+            self.dispatch_native_pointer(pressed_idx, "up", pointer_id, pointer_type, 0, 0, 0.0);
+            self.rebuild_if_dirty();
             #[cfg(any(target_os = "ios", target_os = "android"))]
             {
                 // Mobile touch end coordinates can be rounded or shifted by the
@@ -2790,10 +3512,46 @@ impl App {
                 if current_hover == Some(pressed_idx) {
                     self.handle_click(pressed_idx);
                 } else {
+                    self.pointer_down_default_prevented = false;
                     self.repaint_after_interaction();
                 }
             }
+        } else {
+            self.pointer_down_default_prevented = false;
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_native_pointer(
+        &self,
+        idx: usize,
+        phase: &str,
+        pointer_id: i64,
+        pointer_type: &str,
+        button: i16,
+        buttons: u16,
+        pressure: f32,
+    ) -> bool {
+        let mut chain = self.native_host_chain(idx);
+        if matches!(phase, "enter" | "leave") {
+            chain.truncate(1);
+        }
+        w3cos_react_compat::aot::dispatch_pointer_chain(
+            &chain,
+            phase,
+            self.mouse_x,
+            self.mouse_y,
+            pointer_id,
+            pointer_type,
+            button,
+            buttons,
+            pressure,
+            true,
+            self.modifiers.alt_key(),
+            self.modifiers.control_key(),
+            self.modifiers.super_key(),
+            self.modifiers.shift_key(),
+        )
     }
 
     fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
@@ -2858,7 +3616,7 @@ impl App {
                             .hit_nodes
                             .iter()
                             .find(|candidate| candidate.index == idx)
-                            .is_some_and(|candidate| candidate.is_interactive)
+                            .is_some_and(|candidate| candidate.is_host_target)
                         {
                             return Some(idx);
                         }
@@ -2983,6 +3741,240 @@ impl App {
         self.flush_pending_sticky_counters();
     }
 
+    fn apply_programmatic_scroll_requests(&mut self) -> bool {
+        if self.get_window().is_none() {
+            return false;
+        }
+        let requests = w3cos_react_compat::aot::take_scroll_requests();
+        if requests.is_empty() {
+            return false;
+        }
+        self.ensure_layout();
+        let host_indices: HashMap<u64, usize> = layout::pre_flatten(&self.root)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match node.on_click {
+                EventAction::NativeHost { id, .. } => Some((*id, index)),
+                _ => None,
+            })
+            .collect();
+        let mut changed = false;
+        for (host_id, requested_x, requested_y) in requests {
+            let Some(index) = host_indices.get(&host_id).copied() else {
+                continue;
+            };
+            let Some((_, viewport, extent)) = self
+                .scrollable_nodes
+                .iter()
+                .find(|(scroll_index, _, _)| *scroll_index == index)
+                .copied()
+            else {
+                continue;
+            };
+            let (current_x, current_y) =
+                self.scroll_offsets.get(&index).copied().unwrap_or_default();
+            let next_x = requested_x.unwrap_or(current_x).clamp(0.0, extent.max_x);
+            let next_y = requested_y.unwrap_or(current_y).clamp(0.0, extent.max_y);
+            if std::env::var_os("W3COS_AOT_TRACE").is_some()
+                || std::env::var_os("W3COS_SCROLL_TRACE").is_some()
+            {
+                eprintln!(
+                    "[w3cos-aot] apply scroll host={host_id} index={index} requested=({requested_x:?}, {requested_y:?}) current=({current_x}, {current_y}) next=({next_x}, {next_y}) extent=({}, {})",
+                    extent.max_x, extent.max_y
+                );
+            }
+            if (next_x - current_x).abs() <= 0.001 && (next_y - current_y).abs() <= 0.001 {
+                continue;
+            }
+            self.scroll_offsets.insert(index, (next_x, next_y));
+            crate::uitest::set_programmatic_scroll_offset(index, next_y, requested_y);
+            w3cos_react_compat::aot::dispatch_scroll(host_id, next_y);
+            if let Some(ordinal) = self.virtual_scroll_indices.get(&index).copied() {
+                self.materialize_virtual_list(ordinal, viewport.height, next_y);
+                self.needs_tree_rebuild = true;
+            }
+            changed = true;
+        }
+        if changed {
+            self.rebuild_if_dirty();
+            self.needs_layout = true;
+            self.repaint_mode = RepaintMode::Full;
+            self.request_repaint();
+        }
+        changed
+    }
+
+    fn dispatch_react_resize_observers(&self, max_entries: usize) -> (bool, bool) {
+        let flat = layout::pre_flatten(&self.root);
+        let rects: HashMap<usize, LayoutRect> = self
+            .layout_cache
+            .iter()
+            .map(|&(rect, index)| (index, rect))
+            .collect();
+        let sizes = flat
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                let EventAction::NativeHost { id, .. } = node.on_click else {
+                    return None;
+                };
+                let rect = rects.get(&index)?;
+                Some((*id, rect.width, rect.height))
+            })
+            .collect::<Vec<_>>();
+        w3cos_core::dispatch_resize_observers_bounded(&sizes, max_entries)
+    }
+
+    fn capture_react_scroll_anchors(&self) -> Vec<ReactScrollAnchor> {
+        let flat = layout::pre_flatten(&self.root);
+        let rects: HashMap<usize, LayoutRect> = self
+            .layout_cache
+            .iter()
+            .map(|&(rect, index)| (index, rect))
+            .collect();
+        self.scrollable_nodes
+            .iter()
+            .filter_map(|(scroll_index, viewport, _)| {
+                let (_, scroll_y) = self
+                    .scroll_offsets
+                    .get(scroll_index)
+                    .copied()
+                    .unwrap_or_default();
+                if scroll_y <= 0.01 {
+                    return None;
+                }
+                let EventAction::NativeHost {
+                    id: scroll_host_id, ..
+                } = flat.get(*scroll_index)?.on_click
+                else {
+                    return None;
+                };
+                // Blink searches in preorder: a partially visible containing
+                // block constrains the search to its descendants, while the
+                // first fully visible box wins. This avoids selecting a huge
+                // scroll spacer merely because its block-start is far above
+                // the viewport.
+                let mut constrained = None;
+                let anchor = flat
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, node)| {
+                        if self.scroll_ancestor.get(index).copied().flatten() != Some(*scroll_index)
+                        {
+                            return None;
+                        }
+                        let EventAction::NativeHost {
+                            id: anchor_host_id, ..
+                        } = node.on_click
+                        else {
+                            return None;
+                        };
+                        if matches!(
+                            node.style.position,
+                            w3cos_std::style::Position::Fixed | w3cos_std::style::Position::Sticky
+                        ) || !node.style.overflow_anchor
+                        {
+                            return None;
+                        }
+                        let mut ancestor = self.flat_parents.get(index).copied().flatten();
+                        while let Some(parent) = ancestor {
+                            if parent == *scroll_index {
+                                break;
+                            }
+                            if !flat.get(parent)?.style.overflow_anchor {
+                                return None;
+                            }
+                            ancestor = self.flat_parents.get(parent).copied().flatten();
+                        }
+                        let rect = *rects.get(&index)?;
+                        let visual_top = rect.y - scroll_y;
+                        let visual_bottom = visual_top + rect.height;
+                        let viewport_bottom = viewport.y + viewport.height;
+                        (rect.width > 1.0
+                            && rect.height > 1.0
+                            && visual_bottom > viewport.y
+                            && visual_top < viewport_bottom)
+                            .then_some((
+                                *anchor_host_id,
+                                visual_top,
+                                visual_top >= viewport.y && visual_bottom <= viewport_bottom,
+                            ))
+                    })
+                    .find_map(|candidate| {
+                        if candidate.2 {
+                            Some(candidate)
+                        } else {
+                            constrained = Some(candidate);
+                            None
+                        }
+                    })
+                    .or(constrained)?;
+                Some(ReactScrollAnchor {
+                    scroll_host_id: *scroll_host_id,
+                    anchor_host_id: anchor.0,
+                    visual_top: anchor.1,
+                })
+            })
+            .collect()
+    }
+
+    fn restore_react_scroll_anchors(&mut self, anchors: &[ReactScrollAnchor]) {
+        if anchors.is_empty() {
+            return;
+        }
+        let flat = layout::pre_flatten(&self.root);
+        let host_indices: HashMap<u64, usize> = flat
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match node.on_click {
+                EventAction::NativeHost { id, .. } => Some((*id, index)),
+                _ => None,
+            })
+            .collect();
+        let rects: HashMap<usize, LayoutRect> = self
+            .layout_cache
+            .iter()
+            .map(|&(rect, index)| (index, rect))
+            .collect();
+        for anchor in anchors {
+            let Some(scroll_index) = host_indices.get(&anchor.scroll_host_id).copied() else {
+                continue;
+            };
+            let Some(anchor_index) = host_indices.get(&anchor.anchor_host_id).copied() else {
+                continue;
+            };
+            let Some(anchor_rect) = rects.get(&anchor_index) else {
+                continue;
+            };
+            let Some((_, _, extent)) = self
+                .scrollable_nodes
+                .iter()
+                .find(|(index, _, _)| *index == scroll_index)
+            else {
+                continue;
+            };
+            let (scroll_x, old_scroll_y) = self
+                .scroll_offsets
+                .get(&scroll_index)
+                .copied()
+                .unwrap_or_default();
+            let new_scroll_y = (anchor_rect.y - anchor.visual_top).clamp(0.0, extent.max_y);
+            if std::env::var_os("W3COS_SCROLL_TRACE").is_some() {
+                eprintln!(
+                    "[W3C OS][ANCHOR] host={} current={old_scroll_y:.3} restored={new_scroll_y:.3} visualTop={:.3} rectY={:.3} extent={:.3}",
+                    anchor.anchor_host_id, anchor.visual_top, anchor_rect.y, extent.max_y,
+                );
+            }
+            if (new_scroll_y - old_scroll_y).abs() <= 0.01 {
+                continue;
+            }
+            self.scroll_offsets
+                .insert(scroll_index, (scroll_x, new_scroll_y));
+            crate::uitest::set_anchor_scroll_offset(scroll_index, new_scroll_y);
+            w3cos_react_compat::aot::dispatch_scroll(anchor.scroll_host_id, new_scroll_y);
+        }
+    }
+
     fn scroll_node_by(&mut self, idx: usize, dy: f32) -> f32 {
         let Some(max_y) = self
             .scrollable_nodes
@@ -3000,32 +3992,47 @@ impl App {
         }
         if applied.abs() > 0.001 {
             self.user_scrolled_nodes.insert(idx);
+            self.react_scroll_anchor_suppressed_until =
+                Some(Instant::now() + REACT_SCROLL_ANCHOR_SUPPRESSION);
             self.scroll_offsets.insert(idx, (ox, new_oy));
             crate::uitest::set_scroll_offset(idx, new_oy);
+            let virtual_ordinal = self.virtual_scroll_indices.get(&idx).copied();
+            // Queue retained framebuffer damage before any renderer commit so
+            // a subsequent host-window swap can upgrade ScrollOnly to
+            // ScrollContentChanged instead of repainting the full viewport.
+            self.queue_scroll_damage(idx, applied);
             let native_scroll =
                 layout::pre_flatten(&self.root)
                     .get(idx)
                     .and_then(|node| match node.on_click {
-                        EventAction::NativeScroll(id) => Some(*id),
+                        EventAction::NativeHost {
+                            id, scroll: true, ..
+                        } => Some(*id),
                         _ => None,
                     });
             if let Some(host_id) = native_scroll {
                 w3cos_react_compat::aot::dispatch_scroll(host_id, new_oy);
-                self.rebuild_if_dirty();
+                let pending_render = w3cos_react_compat::aot::has_pending_render();
+                self.deferred_react_scroll_commit |= pending_render;
+                if pending_render {
+                    *self.deferred_react_scroll_distance.entry(idx).or_default() += applied.abs();
+                }
             }
-            if let Some(ordinal) = self.virtual_scroll_indices.get(&idx).copied() {
+            if let Some(ordinal) = virtual_ordinal {
                 let viewport_extent = self
                     .scrollable_nodes
                     .iter()
                     .find(|(index, _, _)| *index == idx)
                     .map(|(_, rect, _)| rect.height)
                     .unwrap_or(self.viewport.layout_h);
-                self.materialize_virtual_list(ordinal, viewport_extent, new_oy);
-                self.needs_layout = true;
-                self.needs_tree_rebuild = true;
-                self.repaint_mode = RepaintMode::Full;
-            } else {
-                self.queue_scroll_damage(idx, applied);
+                if self.materialize_virtual_list(ordinal, viewport_extent, new_oy) {
+                    self.needs_layout = true;
+                    self.needs_tree_rebuild = true;
+                    self.repaint_mode = repaint_after_react_content_change(
+                        std::mem::take(&mut self.repaint_mode),
+                        &self.recent_scroll_damage,
+                    );
+                }
             }
             if self.sticky_marker_index.contains_key(&idx) {
                 self.pending_sticky_scrolls.insert(idx);
@@ -3036,7 +4043,8 @@ impl App {
     }
 
     fn overscroll_behavior(&self, idx: usize) -> OverscrollBehavior {
-        self.retained_paint_nodes
+        self.paint_artifact
+            .nodes
             .get(idx)
             .map(|node| node.style.overscroll_behavior)
             .unwrap_or_default()
@@ -3260,8 +4268,43 @@ impl App {
         );
         if remains_active {
             self.kinetic_scroll = Some(kinetic);
+            // Kinetic samples can arrive in a burst before RedrawRequested.
+            // Store the active gesture first so a React tree replacement can
+            // remap its scroll-host index, then advance the interest window.
+            if self.active_deferred_scroll_checkpoint_due() {
+                self.flush_deferred_scroll_commit(true);
+            }
         } else {
             self.flush_pending_sticky_counters();
+            self.finish_scroll_gesture();
+        }
+    }
+
+    fn finish_scroll_gesture(&mut self) {
+        if self.recent_scroll_damage.is_empty() {
+            return;
+        }
+        let mut scroll_indices = self
+            .recent_scroll_damage
+            .iter()
+            .map(|damage| damage.index)
+            .collect::<Vec<_>>();
+        scroll_indices.sort_unstable();
+        scroll_indices.dedup();
+        self.recent_scroll_damage.clear();
+        // React virtualizers can schedule a final commit after the last
+        // scroll callback. During the gesture those commits reuse retained
+        // strip damage; reconcile only fixed pixels outside the already
+        // current scrollport (for example an external visible-row counter).
+        let damage_indices = std::mem::take(&mut self.recent_external_damage_indices);
+        if damage_indices.is_empty() {
+            self.repaint_mode = RepaintMode::Clean;
+        } else {
+            self.repaint_mode = RepaintMode::ExternalAfterScroll {
+                scroll_indices,
+                damage_indices,
+            };
+            self.request_repaint();
         }
     }
 
@@ -3271,7 +4314,12 @@ impl App {
             .iter_mut()
             .find(|damage| damage.index == index)
         {
-            damage.delta_y += delta_y;
+            // This vector is fallback context for a React commit that lands
+            // after the current retained frame was presented. Keep the most
+            // recent physical movement, not the whole gesture distance,
+            // otherwise a long fling eventually exceeds the viewport and
+            // forces a full-raster fallback.
+            damage.delta_y = delta_y;
         } else {
             self.recent_scroll_damage
                 .push(ScrollDamage { index, delta_y });
@@ -3384,9 +4432,7 @@ impl App {
         if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
             eprintln!("[W3C OS][IME] TextInput focus index={idx}");
         }
-        self.focused_index = Some(idx);
-        crate::uitest::set_focused_index(self.focused_index);
-        self.sync_soft_keyboard();
+        self.set_focused_index(Some(idx));
         #[cfg(target_os = "ios")]
         {
             self.ios_ime_viewport_poll = Some(IosImeRetry {
@@ -3399,7 +4445,48 @@ impl App {
         self.repaint_after_interaction();
     }
 
+    fn apply_native_text_input(
+        &mut self,
+        idx: usize,
+        value: String,
+        data: &str,
+        input_type: &str,
+        is_composing: bool,
+    ) -> bool {
+        let chain = self.native_host_chain(idx);
+        if w3cos_react_compat::aot::dispatch_before_input_chain(
+            &chain,
+            data,
+            input_type,
+            is_composing,
+        ) {
+            self.rebuild_if_dirty();
+            return false;
+        }
+        self.text_input_values.insert(idx, value.clone());
+        w3cos_react_compat::aot::dispatch_input_chain(
+            &chain,
+            value,
+            data,
+            input_type,
+            is_composing,
+        );
+        self.rebuild_if_dirty();
+        true
+    }
+
+    fn dispatch_native_composition(&mut self, idx: usize, phase: &str, data: &str) {
+        w3cos_react_compat::aot::dispatch_composition_chain(
+            &self.native_host_chain(idx),
+            phase,
+            data,
+        );
+        self.rebuild_if_dirty();
+    }
+
     fn handle_click(&mut self, idx: usize) {
+        let allow_default_focus = !self.pointer_down_default_prevented;
+        self.pointer_down_default_prevented = false;
         if let Some(hit) = self.hit_nodes.iter().find(|h| h.index == idx) {
             let kind_is_text_input =
                 matches!(self.get_kind_at(idx), Some(ComponentKind::TextInput { .. }));
@@ -3407,36 +4494,98 @@ impl App {
                 matches!(self.get_kind_at(idx), Some(ComponentKind::Button { .. }));
 
             if kind_is_text_input {
-                self.focus_text_input(idx);
+                if allow_default_focus {
+                    self.focus_text_input(idx);
+                }
+                if self.dispatch_native_click_bubble(idx) {
+                    self.rebuild_if_dirty();
+                }
                 return;
             }
             if kind_is_button {
                 let action = hit.on_click.clone();
-                if self.focused_index.take().is_some() {
-                    crate::uitest::set_focused_index(self.focused_index);
-                    self.sync_soft_keyboard();
-                    self.needs_layout = true;
+                if allow_default_focus {
+                    self.set_focused_index(Some(idx));
                 }
-                if !action.is_none() {
+                let dispatched_native = self.dispatch_native_click_bubble(idx);
+                if !action.is_none() && !matches!(action, EventAction::NativeHost { .. }) {
                     state::execute_action(&action);
-                    self.rebuild_if_dirty();
                 } else {
-                    eprintln!("[W3C OS] Click → Button (no action)");
+                    if !dispatched_native {
+                        eprintln!("[W3C OS] Click → Button (no action)");
+                    }
                 }
+                self.rebuild_if_dirty();
                 self.repaint_after_interaction();
                 return;
             }
-            if !hit.on_click.is_none() {
-                state::execute_action(&hit.on_click);
+            let action = hit.on_click.clone();
+            self.set_focused_index(None);
+            let dispatched_native = self.dispatch_native_click_bubble(idx);
+            let has_legacy_action =
+                !action.is_none() && !matches!(action, EventAction::NativeHost { .. });
+            if has_legacy_action {
+                state::execute_action(&action);
+            }
+            if dispatched_native || has_legacy_action {
                 self.rebuild_if_dirty();
                 self.repaint_after_interaction();
                 return;
             }
         }
-        self.focused_index = None;
-        crate::uitest::set_focused_index(self.focused_index);
-        self.sync_soft_keyboard();
+        self.set_focused_index(None);
         self.repaint_after_interaction();
+    }
+
+    fn dispatch_native_click_bubble(&self, idx: usize) -> bool {
+        w3cos_react_compat::aot::dispatch_click_chain(&self.native_host_chain(idx))
+    }
+
+    fn native_host_chain(&self, idx: usize) -> Vec<u64> {
+        let flat = layout::pre_flatten(&self.root);
+        let mut current = Some(idx);
+        let mut host_ids = Vec::new();
+        while let Some(index) = current {
+            let Some(node) = flat.get(index) else {
+                break;
+            };
+            if let EventAction::NativeHost { id, .. } = node.on_click {
+                host_ids.push(*id);
+            }
+            current = node.parent;
+        }
+        host_ids
+    }
+
+    fn set_focused_index(&mut self, next: Option<usize>) {
+        if self.focused_index == next {
+            return;
+        }
+        if let Some(previous) = self.focused_index {
+            if self
+                .text_composition
+                .as_ref()
+                .is_some_and(|composition| composition.index == previous)
+            {
+                let data = self
+                    .text_composition
+                    .take()
+                    .map(|composition| composition.data)
+                    .unwrap_or_default();
+                self.dispatch_native_composition(previous, "end", &data);
+            }
+            let chain = self.native_host_chain(previous);
+            w3cos_react_compat::aot::dispatch_focus_chain(&chain, false);
+        }
+        self.focused_index = next;
+        crate::uitest::set_focused_index(next);
+        self.sync_soft_keyboard();
+        if let Some(current) = next {
+            let chain = self.native_host_chain(current);
+            w3cos_react_compat::aot::dispatch_focus_chain(&chain, true);
+        }
+        self.rebuild_if_dirty();
+        self.needs_layout = true;
     }
 
     fn repaint_after_interaction(&mut self) {
@@ -3480,9 +4629,7 @@ impl App {
             }
         };
         if let Some(pos) = next_pos {
-            self.focused_index = Some(self.focusable_indices[pos]);
-            crate::uitest::set_focused_index(self.focused_index);
-            self.sync_soft_keyboard();
+            self.set_focused_index(Some(self.focusable_indices[pos]));
         }
     }
 
@@ -3669,7 +4816,13 @@ impl App {
                 return false;
             }
             let init_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Renderer::new(&dev.device, RendererOptions::default())
+                Renderer::new(
+                    &dev.device,
+                    RendererOptions {
+                        antialiasing_support: [gpu_aa_config()].into_iter().collect(),
+                        ..RendererOptions::default()
+                    },
+                )
             }));
             match init_result {
                 Ok(Ok(renderer)) => self.renderers[surface.dev_id] = Some(renderer),
@@ -3806,12 +4959,13 @@ fn measure_virtual_list_rows(
     virtual_scroll_indices: &HashMap<usize, usize>,
     virtual_lists: &mut HashMap<usize, ComponentVirtualList>,
     scroll_offsets: &mut HashMap<usize, (f32, f32)>,
-) -> bool {
+) -> (bool, Vec<(usize, f32)>) {
     let rects: HashMap<usize, LayoutRect> = layout_cache
         .iter()
         .map(|(rect, index)| (*index, *rect))
         .collect();
     let mut changed = false;
+    let mut anchor_corrections = Vec::new();
     for (&root_index, &ordinal) in virtual_scroll_indices {
         let Some(host) = virtual_lists.get_mut(&ordinal) else {
             continue;
@@ -3843,9 +4997,10 @@ fn measure_virtual_list_rows(
                 .copied()
                 .unwrap_or((0.0, 0.0));
             scroll_offsets.insert(root_index, (x, (y + anchor_correction).max(0.0)));
+            anchor_corrections.push((root_index, anchor_correction));
         }
     }
-    changed
+    (changed, anchor_corrections)
 }
 
 fn replace_virtual_index(component: &mut Component, index: usize) {
@@ -3884,7 +5039,7 @@ impl PaintNodeView for layout::FlatNodeInfo<'_> {
     }
 }
 
-impl PaintNodeView for RetainedPaintNode {
+impl PaintNodeView for PaintNode {
     fn paint_style(&self) -> &w3cos_std::style::Style {
         &self.style
     }
@@ -4137,48 +5292,6 @@ fn direct_scroll_chain_parent(
         .then_some(parent)
 }
 
-fn build_retained_prepaint(
-    flat: &[layout::FlatNodeInfo<'_>],
-    layout_cache: &[(LayoutRect, usize)],
-) -> (
-    Vec<RetainedPaintNode>,
-    Vec<i32>,
-    Vec<Option<usize>>,
-    Vec<Option<LayoutRect>>,
-) {
-    let mut paint_z = vec![0; flat.len()];
-    let mut sticky_owner = vec![None; flat.len()];
-    let paint_nodes = flat
-        .iter()
-        .enumerate()
-        .map(|(idx, node)| {
-            let inherited_z = node.parent.map(|parent| paint_z[parent]).unwrap_or(0);
-            paint_z[idx] = if node.style.z_index == 0 {
-                inherited_z
-            } else {
-                node.style.z_index
-            };
-            sticky_owner[idx] = if matches!(node.style.position, Position::Sticky) {
-                Some(idx)
-            } else {
-                node.parent.and_then(|parent| sticky_owner[parent])
-            };
-            RetainedPaintNode {
-                kind: node.kind.clone(),
-                style: node.style.clone(),
-                parent: node.parent,
-            }
-        })
-        .collect();
-    let mut rect_by_index = vec![None; flat.len()];
-    for &(rect, idx) in layout_cache {
-        if idx < rect_by_index.len() {
-            rect_by_index[idx] = Some(rect);
-        }
-    }
-    (paint_nodes, paint_z, sticky_owner, rect_by_index)
-}
-
 /// Build scroll info using pre-computed scroll ancestors and optionally the
 /// retained PrePaint ownership/geometry produced by the last layout pass.
 /// O(n) instead of O(n * tree_depth), with no tree walk on compositor scroll.
@@ -4421,11 +5534,69 @@ impl ApplicationHandler for App {
         self.tick_kinetic_scroll();
         self.tick_overscroll();
 
-        // React refs/effects can enqueue work during the initial build without
-        // an input event. Pump that work before sleeping so components such as
-        // react-window can install their native scroll listener immediately.
-        if state::is_dirty() || w3cos_react_compat::aot::has_pending_render() {
+        // React refs/effects can enqueue follow-up work while committing. Pump
+        // bounded synchronous renders to a stable tree before consuming DOM
+        // requests such as element.scrollTo(); otherwise a request from an
+        // intermediate react-window render can be clamped against stale layout.
+        let mut rebuilt = false;
+        if !self.deferred_react_scroll_commit {
+            for _ in 0..8 {
+                if !state::is_dirty() && !w3cos_react_compat::aot::has_pending_render() {
+                    break;
+                }
+                self.rebuild_if_dirty();
+                rebuilt = true;
+            }
+        }
+        if rebuilt {
+            self.request_repaint();
+        }
+        self.apply_programmatic_scroll_requests();
+        // ResizeObserver delivery is layout-driven, not an event-loop poll.
+        // Deliver all currently mounted rows as one callback and coalesce their
+        // state changes into one React commit. Do not synchronously chase a
+        // resize/render feedback loop: newly mounted targets are measured on
+        // the next event-loop turn.
+        let observer_pass_limit = 1;
+        let observer_entry_budget = 128;
+        for _ in 0..observer_pass_limit {
+            self.ensure_layout();
+            if self.resize_observer_layout_generation == Some(self.layout_generation) {
+                break;
+            }
+            let anchors = self.capture_react_scroll_anchors();
+            let observed_generation = self.layout_generation;
+            let observer_started = Instant::now();
+            let (delivered, pending) = self.dispatch_react_resize_observers(observer_entry_budget);
+            crate::perf::record_observer_delivery(observer_started.elapsed());
+            self.resize_observer_layout_generation = (!pending).then_some(observed_generation);
+            if !delivered {
+                break;
+            }
+            rebuilt = true;
+            // A ResizeObserver callback can dirty React again. Commit the
+            // batched measurements once; follow-up work remains dirty and is
+            // picked up by the next repaint turn.
+            let commit_started = Instant::now();
             self.rebuild_if_dirty();
+            crate::perf::record_react_commit(commit_started.elapsed());
+            let programmatic_scroll_applied = self.apply_programmatic_scroll_requests();
+            self.ensure_layout();
+            // Blink suppresses UA anchoring while direct manipulation is
+            // active as well as when script explicitly changes scrollTop.
+            // Otherwise ResizeObserver delivery can restore an older visual
+            // anchor over the user's latest touch/fling offset.
+            if should_restore_react_scroll_anchor(
+                programmatic_scroll_applied,
+                self.react_scroll_anchor_suppressed(),
+            ) {
+                self.restore_react_scroll_anchors(&anchors);
+            }
+            if pending {
+                self.request_repaint();
+            }
+        }
+        if rebuilt {
             self.request_repaint();
         }
 
@@ -4500,6 +5671,18 @@ impl ApplicationHandler for App {
         {
             let _ = self.poll_viewport_inset();
             event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        }
+
+        // UIKit may swallow the first redraw requested from `resumed` while
+        // the CAMetalLayer is still joining the foreground scene. Keep the
+        // lifecycle active until a frame has actually been submitted.
+        #[cfg(target_os = "ios")]
+        if !self.first_frame_presented {
+            self.request_repaint();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + std::time::Duration::from_millis(16),
+            ));
             return;
         }
 
@@ -4587,6 +5770,8 @@ impl ApplicationHandler for App {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.first_frame_presented = false;
+
         #[cfg(target_os = "ios")]
         crate::uitest::maybe_start_server();
 
@@ -4600,13 +5785,45 @@ impl ApplicationHandler for App {
                 crate::perf::set_backend("cpu");
             }
             #[cfg(not(target_os = "android"))]
-            if self.try_init_gpu(event_loop) {
+            #[cfg(feature = "skia")]
+            let prefer_gpu = !skia_backend_requested()
+                && std::env::var("W3COS_RENDERER").ok().as_deref() != Some("cpu");
+            #[cfg(not(feature = "skia"))]
+            let prefer_gpu = std::env::var("W3COS_RENDERER").ok().as_deref() != Some("cpu");
+            if prefer_gpu
+                && self.try_init_gpu(event_loop)
+            {
                 self.using_gpu = true;
                 crate::perf::set_backend("gpu");
+                eprintln!("[W3C OS] renderer backend=gpu");
             } else {
                 self.ensure_cpu_presenter(event_loop);
                 self.using_gpu = false;
-                crate::perf::set_backend("cpu");
+                #[cfg(feature = "skia")]
+                let backend = if skia_backend_requested() {
+                    #[cfg(target_os = "ios")]
+                    {
+                        if self
+                            .cpu
+                            .as_ref()
+                            .is_some_and(|cpu| cpu.skia_metal.is_some())
+                        {
+                            "skia-metal"
+                        } else {
+                            "skia-raster"
+                        }
+                    }
+                    #[cfg(not(target_os = "ios"))]
+                    {
+                        "skia-raster"
+                    }
+                } else {
+                    "cpu"
+                };
+                #[cfg(not(feature = "skia"))]
+                let backend = "cpu";
+                crate::perf::set_backend(backend);
+                eprintln!("[W3C OS] renderer backend={backend}");
             }
         }
 
@@ -4653,11 +5870,14 @@ impl ApplicationHandler for App {
             }
         }
 
-        #[cfg(target_os = "android")]
+        // Mobile platforms do not consistently emit an initial resize event
+        // after the surface becomes active. Always schedule the first frame.
         self.request_repaint();
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.first_frame_presented = false;
+
         #[cfg(feature = "gpu")]
         {
             if let GpuState::Active { window, .. } =
@@ -4683,7 +5903,14 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                // Advance the virtualizer interest window before presenting.
+                // Doing this after paint permits one blank frame when a fling
+                // crosses the retained overscan boundary.
+                if self.active_deferred_scroll_checkpoint_due() {
+                    self.flush_deferred_scroll_commit(true);
+                }
                 self.paint();
+                self.flush_deferred_scroll_commit(false);
             }
 
             WindowEvent::Resized(_size) => {
@@ -4727,6 +5954,23 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 // winit gives physical pixels; convert to logical for hit testing
                 self.set_pointer_logical(position.x, position.y);
+                self.ensure_layout();
+                if let Some(idx) = self.hit_test(self.mouse_x, self.mouse_y) {
+                    self.dispatch_native_pointer(
+                        idx,
+                        "move",
+                        1,
+                        "mouse",
+                        -1,
+                        u16::from(self.pressed_index.is_some()),
+                        if self.pressed_index.is_some() {
+                            0.5
+                        } else {
+                            0.0
+                        },
+                    );
+                    self.rebuild_if_dirty();
+                }
                 self.update_hover_at_pointer();
             }
 
@@ -4743,9 +5987,28 @@ impl ApplicationHandler for App {
                         self.touch_drag_y = 0.0;
                         self.touch_scroll_active = false;
                         self.touch_scroll_index = self.hit_test_scroll(self.mouse_x, self.mouse_y);
-                        self.pointer_pressed();
+                        self.pointer_pressed("touch", touch.id as i64);
+                        self.touch_pointer_target = self.pressed_index;
                     }
                     TouchPhase::Moved => {
+                        let pointer_target = if self.touch_scroll_active {
+                            None
+                        } else {
+                            self.touch_pointer_target
+                                .or_else(|| self.hit_test(self.mouse_x, self.mouse_y))
+                        };
+                        if let Some(idx) = pointer_target {
+                            self.dispatch_native_pointer(
+                                idx,
+                                "move",
+                                touch.id as i64,
+                                "touch",
+                                -1,
+                                1,
+                                0.5,
+                            );
+                        }
+                        self.rebuild_if_dirty();
                         if let Some(last_y) = self.last_touch_y {
                             let now = Instant::now();
                             let dy = last_y - self.mouse_y;
@@ -4762,12 +6025,36 @@ impl ApplicationHandler for App {
                                 && self.touch_scroll_index.is_some()
                             {
                                 self.touch_scroll_active = true;
+                                if let Some(idx) = self.touch_pointer_target.take() {
+                                    self.dispatch_native_pointer(
+                                        idx,
+                                        "cancel",
+                                        touch.id as i64,
+                                        "touch",
+                                        -1,
+                                        0,
+                                        0.0,
+                                    );
+                                    self.rebuild_if_dirty();
+                                }
                                 self.pressed_index = None;
+                                self.pointer_down_default_prevented = false;
                             }
+                            // Pointer-event cancellation does not disable a browser's
+                            // direct-manipulation pan. That policy belongs to CSS
+                            // touch-action; coupling it to preventDefault here also
+                            // disabled the terminal overscroll affordance.
                             if self.touch_scroll_active {
                                 if let Some(index) = self.touch_scroll_index {
                                     self.touch_scroll_index =
                                         Some(self.apply_touch_scroll(index, dy));
+                                    // Touch-move events can arrive in a burst
+                                    // before winit delivers RedrawRequested.
+                                    // Commit after saving the current scroll
+                                    // host so the React rebuild can remap it.
+                                    if self.active_deferred_scroll_checkpoint_due() {
+                                        self.flush_deferred_scroll_commit(true);
+                                    }
                                 }
                             } else {
                                 self.update_hover_at_pointer();
@@ -4818,17 +6105,31 @@ impl ApplicationHandler for App {
                         if self.touch_scroll_active {
                             self.touch_scroll_active = false;
                         } else {
-                            self.pointer_released();
+                            self.pointer_released("touch", touch.id as i64);
                         }
+                        self.touch_pointer_target = None;
                         // A sticky-counter commit can rebuild the flattened
                         // tree and invalidate the scroll-node index captured by
                         // the fling. Treat drag + inertia as one gesture and
                         // defer that rebuild until kinetic scrolling settles.
                         if !started_kinetic {
                             self.flush_pending_sticky_counters();
+                            self.finish_scroll_gesture();
                         }
                     }
                     TouchPhase::Cancelled => {
+                        if let Some(idx) = self.touch_pointer_target.take() {
+                            self.dispatch_native_pointer(
+                                idx,
+                                "cancel",
+                                touch.id as i64,
+                                "touch",
+                                -1,
+                                0,
+                                0.0,
+                            );
+                            self.rebuild_if_dirty();
+                        }
                         self.release_active_overscroll(0.0);
                         self.last_touch_y = None;
                         self.touch_samples.clear();
@@ -4836,6 +6137,7 @@ impl ApplicationHandler for App {
                         self.touch_scroll_active = false;
                         self.touch_scroll_index = None;
                         self.pressed_index = None;
+                        self.pointer_down_default_prevented = false;
                         self.flush_pending_sticky_counters();
                         self.request_repaint();
                     }
@@ -4847,8 +6149,8 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => match state {
-                ElementState::Pressed => self.pointer_pressed(),
-                ElementState::Released => self.pointer_released(),
+                ElementState::Pressed => self.pointer_pressed("mouse", 1),
+                ElementState::Released => self.pointer_released("mouse", 1),
             },
 
             WindowEvent::KeyboardInput {
@@ -4856,6 +6158,24 @@ impl ApplicationHandler for App {
                 is_synthetic: false,
                 ..
             } => {
+                if let Some(focus_idx) = self.focused_index {
+                    let chain = self.native_host_chain(focus_idx);
+                    let default_prevented = w3cos_react_compat::aot::dispatch_key_chain(
+                        &chain,
+                        &web_key(&event.logical_key),
+                        &web_code(event.physical_key),
+                        event.repeat,
+                        self.modifiers.alt_key(),
+                        self.modifiers.control_key(),
+                        self.modifiers.super_key(),
+                        self.modifiers.shift_key(),
+                        event.state == ElementState::Pressed,
+                    );
+                    self.rebuild_if_dirty();
+                    if default_prevented {
+                        return;
+                    }
+                }
                 if event.state != ElementState::Pressed {
                     return;
                 }
@@ -4864,15 +6184,30 @@ impl ApplicationHandler for App {
                         match kind {
                             ComponentKind::TextInput { value, .. } => {
                                 let value = value.clone();
+                                if self
+                                    .text_composition
+                                    .as_ref()
+                                    .is_some_and(|composition| composition.index == focus_idx)
+                                {
+                                    return;
+                                }
                                 if let Key::Named(NamedKey::Backspace) = event.logical_key {
                                     let current = self
                                         .text_input_values
                                         .entry(focus_idx)
-                                        .or_insert_with(|| value.clone());
+                                        .or_insert_with(|| value.clone())
+                                        .clone();
                                     if !current.is_empty() {
                                         let mut chars: Vec<char> = current.chars().collect();
                                         chars.pop();
-                                        *current = chars.into_iter().collect();
+                                        let next = chars.into_iter().collect();
+                                        self.apply_native_text_input(
+                                            focus_idx,
+                                            next,
+                                            "",
+                                            "deleteContentBackward",
+                                            false,
+                                        );
                                         self.repaint_mode = RepaintMode::Full;
                                         self.request_repaint();
                                     }
@@ -4883,13 +6218,53 @@ impl ApplicationHandler for App {
                                     self.request_repaint();
                                     return;
                                 }
-                                if let Some(ref text) = event.text {
-                                    if !text.is_empty() && !text.chars().all(|c| c.is_control()) {
-                                        let current = self
+                                if let Key::Named(NamedKey::Enter) = event.logical_key {
+                                    let chain = self.native_host_chain(focus_idx);
+                                    if w3cos_react_compat::aot::dispatch_submit_chain(&chain)
+                                        .is_some()
+                                    {
+                                        self.rebuild_if_dirty();
+                                        self.repaint_after_interaction();
+                                        return;
+                                    }
+                                    let is_textarea = chain.first().is_some_and(|host_id| {
+                                        w3cos_react_compat::aot::host_local_name(*host_id)
+                                            .is_some_and(|name| name == "textarea")
+                                    });
+                                    if is_textarea {
+                                        let mut next = self
                                             .text_input_values
                                             .entry(focus_idx)
-                                            .or_insert_with(|| value.clone());
-                                        current.push_str(text);
+                                            .or_insert_with(|| value.clone())
+                                            .clone();
+                                        next.push('\n');
+                                        self.apply_native_text_input(
+                                            focus_idx,
+                                            next,
+                                            "\n",
+                                            "insertLineBreak",
+                                            false,
+                                        );
+                                    }
+                                    self.rebuild_if_dirty();
+                                    self.repaint_after_interaction();
+                                    return;
+                                }
+                                if let Some(ref text) = event.text {
+                                    if !text.is_empty() && !text.chars().all(|c| c.is_control()) {
+                                        let mut next = self
+                                            .text_input_values
+                                            .entry(focus_idx)
+                                            .or_insert_with(|| value.clone())
+                                            .clone();
+                                        next.push_str(text);
+                                        self.apply_native_text_input(
+                                            focus_idx,
+                                            next,
+                                            text,
+                                            "insertText",
+                                            false,
+                                        );
                                         self.repaint_mode = RepaintMode::Full;
                                         self.request_repaint();
                                         return;
@@ -4900,16 +6275,7 @@ impl ApplicationHandler for App {
                                 if let Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) =
                                     event.logical_key
                                 {
-                                    if let Some(hit) =
-                                        self.hit_nodes.iter().find(|h| h.index == focus_idx)
-                                    {
-                                        if !hit.on_click.is_none() {
-                                            state::execute_action(&hit.on_click);
-                                            self.rebuild_if_dirty();
-                                        }
-                                    }
-                                    self.repaint_mode = RepaintMode::Full;
-                                    self.request_repaint();
+                                    self.handle_click(focus_idx);
                                     return;
                                 }
                                 if let Key::Named(NamedKey::Tab) = event.logical_key {
@@ -4930,20 +6296,85 @@ impl ApplicationHandler for App {
 
             WindowEvent::Ime(ime) => {
                 if let Some(focus_idx) = self.focused_index {
-                    if let Some(kind) = self.get_kind_at(focus_idx) {
-                        if let ComponentKind::TextInput { value, .. } = kind {
-                            let value = value.clone();
-                            match ime {
-                                winit::event::Ime::Commit(commit) => {
-                                    let current = self
-                                        .text_input_values
-                                        .entry(focus_idx)
-                                        .or_insert_with(|| value);
-                                    current.push_str(&commit);
-                                    self.repaint_mode = RepaintMode::Full;
-                                    self.request_repaint();
-                                }
-                                _ => {}
+                    let Some(ComponentKind::TextInput { value, .. }) = self.get_kind_at(focus_idx)
+                    else {
+                        return;
+                    };
+                    let fallback_value = value.clone();
+                    match ime {
+                        winit::event::Ime::Enabled => {
+                            if self.text_composition.is_none() {
+                                let base_value = self
+                                    .text_input_values
+                                    .get(&focus_idx)
+                                    .cloned()
+                                    .unwrap_or(fallback_value);
+                                self.text_composition = Some(TextCompositionState {
+                                    index: focus_idx,
+                                    base_value,
+                                    data: String::new(),
+                                });
+                                self.dispatch_native_composition(focus_idx, "start", "");
+                            }
+                        }
+                        winit::event::Ime::Preedit(preedit, _) => {
+                            if self.text_composition.is_none() {
+                                let base_value = self
+                                    .text_input_values
+                                    .get(&focus_idx)
+                                    .cloned()
+                                    .unwrap_or(fallback_value);
+                                self.text_composition = Some(TextCompositionState {
+                                    index: focus_idx,
+                                    base_value,
+                                    data: String::new(),
+                                });
+                                self.dispatch_native_composition(focus_idx, "start", "");
+                            }
+                            let Some(composition) = self.text_composition.as_mut() else {
+                                return;
+                            };
+                            composition.data = preedit.clone();
+                            let mut next = composition.base_value.clone();
+                            next.push_str(&preedit);
+                            self.dispatch_native_composition(focus_idx, "update", &preedit);
+                            self.apply_native_text_input(
+                                focus_idx,
+                                next,
+                                &preedit,
+                                "insertCompositionText",
+                                true,
+                            );
+                            self.repaint_mode = RepaintMode::Full;
+                            self.request_repaint();
+                        }
+                        winit::event::Ime::Commit(commit) => {
+                            let base_value = self
+                                .text_composition
+                                .take()
+                                .map(|composition| composition.base_value)
+                                .or_else(|| self.text_input_values.get(&focus_idx).cloned())
+                                .unwrap_or(fallback_value);
+                            self.dispatch_native_composition(focus_idx, "end", &commit);
+                            let mut next = base_value;
+                            next.push_str(&commit);
+                            self.apply_native_text_input(
+                                focus_idx,
+                                next,
+                                &commit,
+                                "insertFromComposition",
+                                false,
+                            );
+                            self.repaint_mode = RepaintMode::Full;
+                            self.request_repaint();
+                        }
+                        winit::event::Ime::Disabled => {
+                            if let Some(composition) = self.text_composition.take() {
+                                self.dispatch_native_composition(
+                                    focus_idx,
+                                    "end",
+                                    &composition.data,
+                                );
                             }
                         }
                     }
@@ -4951,11 +6382,33 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
-                    MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
+                let (delta_x, delta_y, delta_mode, scroll_y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (-x, -y, 1, -y * 24.0),
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        (-pos.x as f32, -pos.y as f32, 0, -pos.y as f32)
+                    }
                 };
-                self.scroll_at_pointer(dy);
+                self.ensure_layout();
+                let prevented = self
+                    .hit_test(self.mouse_x, self.mouse_y)
+                    .is_some_and(|idx| {
+                        w3cos_react_compat::aot::dispatch_wheel_chain(
+                            &self.native_host_chain(idx),
+                            self.mouse_x,
+                            self.mouse_y,
+                            delta_x,
+                            delta_y,
+                            delta_mode,
+                            self.modifiers.alt_key(),
+                            self.modifiers.control_key(),
+                            self.modifiers.super_key(),
+                            self.modifiers.shift_key(),
+                        )
+                    });
+                self.rebuild_if_dirty();
+                if !prevented {
+                    self.scroll_at_pointer(scroll_y);
+                }
             }
 
             _ => {}
@@ -5052,6 +6505,35 @@ mod scroll_physics_tests {
     use super::*;
 
     #[test]
+    fn deferred_virtualizer_checkpoint_advances_before_one_viewport() {
+        assert_eq!(deferred_scroll_checkpoint_distance(400.0), 200.0);
+        assert_eq!(deferred_scroll_checkpoint_distance(200.0), 160.0);
+        assert!(
+            deferred_scroll_checkpoint_distance(812.0) < 812.0,
+            "a fast fling must refresh the React interest window before it can expose a blank viewport"
+        );
+    }
+
+    #[test]
+    fn direct_scroll_suppresses_resize_observer_anchor_restore() {
+        assert!(should_restore_react_scroll_anchor(false, false));
+        assert!(!should_restore_react_scroll_anchor(true, false));
+        assert!(!should_restore_react_scroll_anchor(false, true));
+    }
+
+    #[test]
+    fn text_input_delta_handles_unicode_insert_and_delete() {
+        assert_eq!(
+            text_input_delta("上海", "上中海"),
+            ("中".to_string(), "insertText")
+        );
+        assert_eq!(
+            text_input_delta("上海", "上"),
+            ("".to_string(), "deleteContentBackward")
+        );
+    }
+
+    #[test]
     fn react_virtual_window_content_change_requires_full_repaint() {
         let old_root = Component::root(vec![Component::text(
             "row-56",
@@ -5074,6 +6556,22 @@ mod scroll_physics_tests {
             w3cos_std::style::Style::default(),
         )]);
         let new_root = old_root.clone();
+
+        let old_flat = layout::pre_flatten(&old_root);
+        let new_flat = layout::pre_flatten(&new_root);
+        assert!(!react_rebuild_changes_painted_content(&old_flat, &new_flat));
+    }
+
+    #[test]
+    fn remounted_react_host_with_identical_pixels_keeps_scroll_damage_path() {
+        let old_root = Component::root(vec![Component::text(
+            "row-56",
+            w3cos_std::style::Style::default(),
+        )]);
+        let new_root = Component::root(vec![Component::text(
+            "row-56",
+            w3cos_std::style::Style::default(),
+        )]);
 
         let old_flat = layout::pre_flatten(&old_root);
         let new_flat = layout::pre_flatten(&new_root);
@@ -6257,6 +7755,59 @@ mod scroll_physics_tests {
             clean,
             RepaintMode::ScrollOnly(ref damages)
                 if damages.len() == 1 && damages[0].index == 7 && damages[0].delta_y == 84.0
+        ));
+    }
+
+    #[test]
+    fn react_virtual_content_change_preserves_pending_scroll_strip() {
+        let mut pending = RepaintMode::Clean;
+        pending.queue_scroll_damage(7, 84.0);
+
+        let repaint = repaint_after_react_content_change(pending, &[]);
+
+        assert!(matches!(
+            repaint,
+            RepaintMode::ScrollContentChanged(ref damages)
+                if damages.len() == 1 && damages[0].index == 7 && damages[0].delta_y == 84.0
+        ));
+    }
+
+    #[test]
+    fn new_scroll_supersedes_pending_external_reconciliation() {
+        let mut pending = RepaintMode::ExternalAfterScroll {
+            scroll_indices: vec![7],
+            damage_indices: vec![3],
+        };
+
+        pending.queue_scroll_damage(7, -42.0);
+
+        assert!(matches!(
+            pending,
+            RepaintMode::ScrollOnly(ref damages)
+                if damages.len() == 1 && damages[0].index == 7 && damages[0].delta_y == -42.0
+        ));
+    }
+
+    #[test]
+    fn react_visual_diff_detects_style_changes_but_skips_identical_trees() {
+        let base = w3cos_std::style::Style::default();
+        let old_root = Component::root(vec![Component::boxed(base.clone(), vec![])]);
+        let same_root = Component::root(vec![Component::boxed(base.clone(), vec![])]);
+        let mut changed = base;
+        changed.width = Dimension::Px(240.0);
+        let changed_root = Component::root(vec![Component::boxed(changed, vec![])]);
+        let old_flat = layout::pre_flatten(&old_root);
+        let same_flat = layout::pre_flatten(&same_root);
+        let changed_flat = layout::pre_flatten(&changed_root);
+
+        assert!(!react_rebuild_changes_visual_output(&old_flat, &same_flat));
+        assert!(react_rebuild_changes_visual_output(
+            &old_flat,
+            &changed_flat
+        ));
+        assert!(matches!(
+            repaint_after_react_rebuild(RepaintMode::Clean),
+            RepaintMode::Clean
         ));
     }
 

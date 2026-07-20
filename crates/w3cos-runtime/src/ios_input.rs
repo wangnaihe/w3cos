@@ -264,6 +264,16 @@ pub fn text_input_state(window: &Window) -> Option<NativeTextInputState> {
     })
 }
 
+pub fn set_text_input_value(window: &Window, value: &str) {
+    let Some(field) = text_field(window, false) else {
+        return;
+    };
+    let Some(value) = ns_string(value) else {
+        return;
+    };
+    let _: () = unsafe { objc2::msg_send![field, setText: &*value] };
+}
+
 pub fn resign_text_input(window: &Window) {
     if let Some(field) = text_field(window, false) {
         let _: bool = unsafe { objc2::msg_send![field, resignFirstResponder] };

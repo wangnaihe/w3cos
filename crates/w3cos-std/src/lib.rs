@@ -125,6 +125,20 @@ mod tests {
     }
 
     #[test]
+    fn color_from_css_rgb_and_rgba() {
+        assert_eq!(
+            Color::from_css("rgb(12, 34, 56)"),
+            Some(Color::rgb(12, 34, 56))
+        );
+        assert_eq!(
+            Color::from_css("rgba(12, 34, 56, 0.5)"),
+            Some(Color::rgba(12, 34, 56, 128))
+        );
+        assert_eq!(Color::from_css("orange"), Some(Color::rgb(255, 165, 0)));
+        assert_eq!(Color::from_css("not-a-color"), None);
+    }
+
+    #[test]
     fn css_named_color_through_codegen_parser() {
         assert_eq!(Color::from_hex("transparent"), Color::TRANSPARENT);
         assert_eq!(Color::from_hex("white"), Color::WHITE);
@@ -150,7 +164,7 @@ mod tests {
     fn style_default() {
         let style = Style::default();
         assert!(matches!(style.display, crate::style::Display::Flex));
-        assert!(matches!(style.position, crate::style::Position::Relative));
+        assert!(matches!(style.position, crate::style::Position::Static));
         assert!(matches!(
             style.flex_direction,
             crate::style::FlexDirection::Column

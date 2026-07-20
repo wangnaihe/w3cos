@@ -330,6 +330,27 @@ pub fn layout_display_unchanged(old: &[FlatNodeInfo<'_>], new: &[FlatNodeInfo<'_
         .all(|(o, n)| o.style.display == n.style.display)
 }
 
+/// Returns true when styles are unchanged apart from `display`.
+///
+/// `display` has a dedicated incremental patch path. Other changes may affect
+/// Taffy geometry (for example react-window reusing a row slot with a new
+/// absolute `top`) and therefore require rebuilding the persistent tree.
+pub fn layout_styles_unchanged_except_display(
+    old: &[FlatNodeInfo<'_>],
+    new: &[FlatNodeInfo<'_>],
+) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    old.iter().zip(new.iter()).all(|(old, new)| {
+        let mut old_style = old.style.clone();
+        let mut new_style = new.style.clone();
+        old_style.display = WDisplay::Flex;
+        new_style.display = WDisplay::Flex;
+        old_style == new_style
+    })
+}
+
 /// Walk ancestors — false when any `display: none` (Show stable slots).
 pub fn is_node_visible(flat: &[FlatNodeInfo<'_>], idx: usize) -> bool {
     let mut cur = Some(idx);
@@ -380,6 +401,7 @@ pub struct LayoutEngine {
     tree: TaffyTree<usize>,
     root_node: Option<taffy::NodeId>,
     tree_valid: bool,
+    viewport: Option<(f32, f32)>,
 }
 
 pub struct LayoutResults {
@@ -406,6 +428,7 @@ impl LayoutEngine {
             tree: TaffyTree::new(),
             root_node: None,
             tree_valid: false,
+            viewport: None,
         }
     }
 
@@ -433,10 +456,21 @@ impl LayoutEngine {
         viewport_w: f32,
         viewport_h: f32,
     ) -> Result<LayoutResults> {
+        if self.viewport != Some((viewport_w, viewport_h)) {
+            self.tree_valid = false;
+            self.viewport = Some((viewport_w, viewport_h));
+        }
         if !self.tree_valid {
             self.tree.clear();
             let mut idx = 0;
-            self.root_node = Some(build_taffy_tree(&mut self.tree, root, &mut idx, None)?);
+            self.root_node = Some(build_taffy_tree(
+                &mut self.tree,
+                root,
+                &mut idx,
+                None,
+                viewport_w,
+                viewport_h,
+            )?);
             self.tree_valid = true;
         }
 
@@ -509,7 +543,14 @@ pub fn compute_with_scroll(
     let mut tree: TaffyTree<usize> = TaffyTree::new();
     let mut node_index: usize = 0;
 
-    let root_node = build_taffy_tree(&mut tree, root, &mut node_index, None)?;
+    let root_node = build_taffy_tree(
+        &mut tree,
+        root,
+        &mut node_index,
+        None,
+        viewport_w,
+        viewport_h,
+    )?;
     tree.compute_layout(
         root_node,
         Size {
@@ -561,11 +602,13 @@ fn build_taffy_tree(
     comp: &Component,
     idx: &mut usize,
     parent_direction: Option<WDir>,
+    viewport_w: f32,
+    viewport_h: f32,
 ) -> Result<NodeId, taffy::TaffyError> {
     let my_idx = *idx;
     *idx += 1;
 
-    let style = to_taffy_style(&comp.style);
+    let style = to_taffy_style(&comp.style, viewport_w, viewport_h);
 
     if comp.children.is_empty() {
         let size = leaf_taffy_size(&comp.kind, &comp.style, &style);
@@ -636,7 +679,16 @@ fn build_taffy_tree(
         let child_nodes: Vec<NodeId> = comp
             .children
             .iter()
-            .map(|c| build_taffy_tree(tree, c, idx, Some(comp.style.flex_direction)))
+            .map(|c| {
+                build_taffy_tree(
+                    tree,
+                    c,
+                    idx,
+                    Some(comp.style.flex_direction),
+                    viewport_w,
+                    viewport_h,
+                )
+            })
             .collect::<Result<_, _>>()?;
         let node = tree.new_with_children(style, &child_nodes)?;
         tree.set_node_context(node, Some(my_idx))?;
@@ -857,7 +909,7 @@ fn compute_fixed_rect(
 // Style conversion helpers
 // ---------------------------------------------------------------------------
 
-fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
+fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32) -> Style {
     let pad = s.padding_lengths();
     let mar = s.margin_lengths();
     let (display, flex_grow, flex_shrink, size) = match s.display {
@@ -866,8 +918,8 @@ fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
             s.flex_grow,
             s.flex_shrink,
             Size {
-                width: to_taffy_dim(s.width),
-                height: to_taffy_dim(s.height),
+                width: to_taffy_dim(s.width, s.font_size, viewport_w, viewport_h),
+                height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
             },
         ),
         WDisplay::Grid => (
@@ -875,8 +927,8 @@ fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
             s.flex_grow,
             s.flex_shrink,
             Size {
-                width: to_taffy_dim(s.width),
-                height: to_taffy_dim(s.height),
+                width: to_taffy_dim(s.width, s.font_size, viewport_w, viewport_h),
+                height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
             },
         ),
         WDisplay::Block => (
@@ -884,14 +936,14 @@ fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
             s.flex_grow,
             s.flex_shrink,
             Size {
-                width: to_taffy_dim(s.width),
-                height: to_taffy_dim(s.height),
+                width: to_taffy_dim(s.width, s.font_size, viewport_w, viewport_h),
+                height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
             },
         ),
         WDisplay::Inline => (
             taffy::Display::Flex,
-            0.0,
-            1.0,
+            s.flex_grow,
+            s.flex_shrink,
             Size {
                 width: Dimension::auto(),
                 height: Dimension::auto(),
@@ -899,11 +951,11 @@ fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
         ),
         WDisplay::InlineBlock => (
             taffy::Display::Flex,
-            0.0,
-            0.0,
+            s.flex_grow,
+            s.flex_shrink,
             Size {
-                width: to_taffy_dim(s.width),
-                height: to_taffy_dim(s.height),
+                width: to_taffy_dim(s.width, s.font_size, viewport_w, viewport_h),
+                height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
             },
         ),
         WDisplay::None => (
@@ -911,8 +963,8 @@ fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
             s.flex_grow,
             s.flex_shrink,
             Size {
-                width: to_taffy_dim(s.width),
-                height: to_taffy_dim(s.height),
+                width: to_taffy_dim(s.width, s.font_size, viewport_w, viewport_h),
+                height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
             },
         ),
     };
@@ -920,7 +972,7 @@ fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
     Style {
         display,
         position: match s.position {
-            WPos::Relative | WPos::Sticky => taffy::Position::Relative,
+            WPos::Static | WPos::Relative | WPos::Sticky => taffy::Position::Relative,
             WPos::Absolute | WPos::Fixed => taffy::Position::Absolute,
         },
         flex_direction: match s.flex_direction {
@@ -952,10 +1004,10 @@ fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
         flex_grow,
         flex_shrink,
         inset: Rect {
-            top: to_taffy_auto(s.top),
-            right: to_taffy_auto(s.right),
-            bottom: to_taffy_auto(s.bottom),
-            left: to_taffy_auto(s.left),
+            top: to_taffy_auto(s.top, s.font_size, viewport_w, viewport_h),
+            right: to_taffy_auto(s.right, s.font_size, viewport_w, viewport_h),
+            bottom: to_taffy_auto(s.bottom, s.font_size, viewport_w, viewport_h),
+            left: to_taffy_auto(s.left, s.font_size, viewport_w, viewport_h),
         },
         gap: Size {
             width: LengthPercentage::length(s.gap),
@@ -979,38 +1031,43 @@ fn to_taffy_style(s: &w3cos_std::style::Style) -> Style {
         },
         size,
         min_size: Size {
-            width: to_taffy_dim(s.min_width),
-            height: to_taffy_dim(s.min_height),
+            width: to_taffy_dim(s.min_width, s.font_size, viewport_w, viewport_h),
+            height: to_taffy_dim(s.min_height, s.font_size, viewport_w, viewport_h),
         },
         max_size: Size {
-            width: to_taffy_dim(s.max_width),
-            height: to_taffy_dim(s.max_height),
+            width: to_taffy_dim(s.max_width, s.font_size, viewport_w, viewport_h),
+            height: to_taffy_dim(s.max_height, s.font_size, viewport_w, viewport_h),
         },
         ..Style::DEFAULT
     }
 }
 
-fn to_taffy_dim(d: WDim) -> Dimension {
+fn to_taffy_dim(d: WDim, local_font_size: f32, viewport_w: f32, viewport_h: f32) -> Dimension {
     match d {
         WDim::Auto => Dimension::auto(),
         WDim::Px(v) => Dimension::length(v),
         WDim::Percent(v) => Dimension::percent(v / 100.0),
         WDim::Rem(v) => Dimension::length(v * 16.0),
-        WDim::Em(v) => Dimension::length(v * 16.0),
-        WDim::Vw(v) => Dimension::percent(v / 100.0),
-        WDim::Vh(v) => Dimension::percent(v / 100.0),
+        WDim::Em(v) => Dimension::length(v * local_font_size),
+        WDim::Vw(v) => Dimension::length(v * viewport_w / 100.0),
+        WDim::Vh(v) => Dimension::length(v * viewport_h / 100.0),
     }
 }
 
-fn to_taffy_auto(d: WDim) -> LengthPercentageAuto {
+fn to_taffy_auto(
+    d: WDim,
+    local_font_size: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> LengthPercentageAuto {
     match d {
         WDim::Auto => LengthPercentageAuto::auto(),
         WDim::Px(v) => LengthPercentageAuto::length(v),
         WDim::Percent(v) => LengthPercentageAuto::percent(v / 100.0),
         WDim::Rem(v) => LengthPercentageAuto::length(v * 16.0),
-        WDim::Em(v) => LengthPercentageAuto::length(v * 16.0),
-        WDim::Vw(v) => LengthPercentageAuto::percent(v / 100.0),
-        WDim::Vh(v) => LengthPercentageAuto::percent(v / 100.0),
+        WDim::Em(v) => LengthPercentageAuto::length(v * local_font_size),
+        WDim::Vw(v) => LengthPercentageAuto::length(v * viewport_w / 100.0),
+        WDim::Vh(v) => LengthPercentageAuto::length(v * viewport_h / 100.0),
     }
 }
 
@@ -1028,7 +1085,9 @@ mod tests {
     use super::*;
     use w3cos_std::color::Color;
     use w3cos_std::component::Component;
-    use w3cos_std::style::{Dimension as WDim, Display as WDisp, FlexDirection as WDir, Style};
+    use w3cos_std::style::{
+        Dimension as WDim, Display as WDisp, FlexDirection as WDir, Position as WPos, Style,
+    };
 
     fn s() -> Style {
         Style::default()
@@ -1062,6 +1121,47 @@ mod tests {
         let l = compute(&Component::text("Hi", s()), 800.0, 600.0).unwrap();
         assert_eq!(l.len(), 1);
         assert!(l[0].0.width > 0.0);
+    }
+
+    #[test]
+    fn viewport_and_font_relative_units_use_web_reference_sizes() {
+        let component = Component::boxed(
+            Style {
+                width: WDim::Vw(50.0),
+                height: WDim::Vh(25.0),
+                min_width: WDim::Em(10.0),
+                font_size: 20.0,
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+
+        let layout = compute(&component, 800.0, 600.0).unwrap();
+
+        assert_eq!(layout[0].0.width, 400.0);
+        assert_eq!(layout[0].0.height, 150.0);
+    }
+
+    #[test]
+    fn persistent_layout_rebuilds_viewport_units_after_resize() {
+        let component = Component::boxed(
+            Style {
+                width: WDim::Vw(50.0),
+                height: WDim::Vh(50.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let mut engine = LayoutEngine::new();
+        let flat = pre_flatten(&component);
+
+        let initial = engine.compute(&component, &flat, 800.0, 600.0).unwrap();
+        let resized = engine.compute(&component, &flat, 400.0, 300.0).unwrap();
+
+        assert_eq!(initial.layout_cache[0].0.width, 400.0);
+        assert_eq!(initial.layout_cache[0].0.height, 300.0);
+        assert_eq!(resized.layout_cache[0].0.width, 200.0);
+        assert_eq!(resized.layout_cache[0].0.height, 150.0);
     }
 
     #[test]
@@ -1353,6 +1453,69 @@ mod tests {
     }
 
     #[test]
+    fn inline_block_flex_item_honors_flex_grow() {
+        let layout = compute(
+            &Component::row(
+                Style {
+                    display: WDisp::Flex,
+                    width: WDim::Px(375.0),
+                    height: WDim::Px(64.0),
+                    gap: 7.0,
+                    padding: w3cos_std::style::Edges::all(8.0),
+                    ..Style::default()
+                },
+                vec![
+                    Component::button(
+                        "图",
+                        Style {
+                            display: WDisp::InlineBlock,
+                            width: WDim::Px(34.0),
+                            height: WDim::Px(42.0),
+                            flex_shrink: 0.0,
+                            ..Style::default()
+                        },
+                    ),
+                    Component::text_input(
+                        "",
+                        "问 通用对话，或继续补充上下文…",
+                        Style {
+                            display: WDisp::InlineBlock,
+                            height: WDim::Px(42.0),
+                            min_width: WDim::Px(0.0),
+                            flex_grow: 1.0,
+                            ..Style::default()
+                        },
+                    ),
+                    Component::button(
+                        "发",
+                        Style {
+                            display: WDisp::InlineBlock,
+                            width: WDim::Px(42.0),
+                            height: WDim::Px(42.0),
+                            flex_shrink: 0.0,
+                            ..Style::default()
+                        },
+                    ),
+                ],
+            ),
+            375.0,
+            812.0,
+        )
+        .unwrap();
+
+        let input = layout
+            .iter()
+            .find(|(_, index)| *index == 2)
+            .map(|(rect, _)| rect)
+            .expect("input layout");
+        assert!(
+            input.width > 200.0,
+            "flex-grow input should consume the remaining row width, got {}",
+            input.width
+        );
+    }
+
+    #[test]
     fn wrapping_text_shrinks_to_column_content_width() {
         let text = "SH12345 预计 15:42 到达，等待费申诉缺 1 项材料。";
         let l = compute(
@@ -1386,6 +1549,77 @@ mod tests {
         assert!(
             text_rect.height > 21.0,
             "text should wrap to multiple lines"
+        );
+    }
+
+    #[test]
+    fn absolute_auto_height_row_contains_taller_card() {
+        let react_style = || Style {
+            flex_shrink: 0.0,
+            ..Style::default()
+        };
+        let text = |content: &str, font_size: f32| {
+            Component::text(
+                content,
+                Style {
+                    flex_shrink: 0.0,
+                    font_size,
+                    ..Style::default()
+                },
+            )
+        };
+        let header = Component::row(
+            Style {
+                flex_direction: WDir::Row,
+                justify_content: WJustify::SpaceBetween,
+                align_items: WAlign::Center,
+                flex_shrink: 0.0,
+                ..Style::default()
+            },
+            vec![
+                text("待处理 · 会话 950", 11.0),
+                text("每 25 条分布 1 项", 11.0),
+            ],
+        );
+        let card = Component::column(
+            Style {
+                flex_direction: WDir::Column,
+                flex_shrink: 0.0,
+                min_height: WDim::Px(94.0),
+                padding: w3cos_std::style::Edges::all(10.0),
+                border_width: 1.0,
+                gap: 6.0,
+                ..Style::default()
+            },
+            vec![
+                header,
+                text("SH12345 上海 → 杭州 · 等待确认到达并补充 POD", 13.0),
+                text("需上传签收凭证并确认异常责任方", 11.0),
+            ],
+        );
+        let row = Component::boxed(
+            Style {
+                position: WPos::Absolute,
+                top: WDim::Px(0.0),
+                width: WDim::Percent(100.0),
+                padding: w3cos_std::style::Edges::all(6.0),
+                ..react_style()
+            },
+            vec![card],
+        );
+
+        let layout = compute(&row, 393.0, 852.0).unwrap();
+        let row_rect = layout.iter().find(|(_, idx)| *idx == 0).unwrap().0;
+        let descendant_bottom = layout
+            .iter()
+            .filter(|(_, idx)| *idx != 0)
+            .map(|(rect, _)| rect.y + rect.height)
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            row_rect.y + row_rect.height + 0.01 >= descendant_bottom + 6.0,
+            "auto-height row {:?} does not contain descendants ending at {descendant_bottom}",
+            row_rect
         );
     }
 
@@ -1591,6 +1825,31 @@ mod tests {
             &pre_flatten(&b)
         ));
         assert!(layout_shape_unchanged(&pre_flatten(&a), &pre_flatten(&b)));
+        assert!(layout_styles_unchanged_except_display(
+            &pre_flatten(&a),
+            &pre_flatten(&b)
+        ));
+    }
+
+    #[test]
+    fn layout_style_detects_reused_absolute_slot_movement() {
+        let first = Style {
+            position: WPos::Absolute,
+            top: WDim::Px(84.0),
+            ..Style::default()
+        };
+        let moved = Style {
+            top: WDim::Px(83_916.0),
+            ..first.clone()
+        };
+        let a = Component::boxed(first, vec![Component::text("row", Style::default())]);
+        let b = Component::boxed(moved, vec![Component::text("row", Style::default())]);
+
+        assert!(layout_shape_unchanged(&pre_flatten(&a), &pre_flatten(&b)));
+        assert!(!layout_styles_unchanged_except_display(
+            &pre_flatten(&a),
+            &pre_flatten(&b)
+        ));
     }
 
     #[test]

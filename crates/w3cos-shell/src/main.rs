@@ -1244,10 +1244,10 @@ fn build_editor_app() -> Component {
                                     width: Dimension::Px(48.0),
                                     background: Color::from_hex("#1a1a2e"),
                                     padding: Edges {
-                                        top: 8.0,
-                                        right: 8.0,
-                                        bottom: 8.0,
-                                        left: 0.0,
+                                        top: 8.0.into(),
+                                        right: 8.0.into(),
+                                        bottom: 8.0.into(),
+                                        left: 0.0.into(),
                                     },
                                     align_items: AlignItems::FlexEnd,
                                     gap: 0.0,
@@ -1462,10 +1462,10 @@ fn explorer_item(name: &str, indent: u8, is_dir: bool) -> Component {
     Component::row(
         Style {
             padding: Edges {
-                top: 3.0,
-                right: 8.0,
-                bottom: 3.0,
-                left: pad_left,
+                top: 3.0.into(),
+                right: 8.0.into(),
+                bottom: 3.0.into(),
+                left: pad_left.into(),
             },
             gap: 4.0,
             align_items: AlignItems::Center,

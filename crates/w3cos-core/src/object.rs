@@ -16,6 +16,7 @@ pub struct JsObject {
     pub(crate) properties: HashMap<String, Value>,
     pub(crate) prototype: Option<Rc<RefCell<JsObject>>>,
     pub(crate) proxy_handler: Option<ProxyHandler>,
+    has_getter_properties: bool,
 }
 
 impl JsObject {
@@ -24,23 +25,30 @@ impl JsObject {
             properties: HashMap::new(),
             prototype: None,
             proxy_handler: None,
+            has_getter_properties: false,
         }
     }
 
     pub fn from_map(map: HashMap<String, Value>) -> Self {
+        let has_getter_properties = map.keys().any(|key| key.starts_with("__w3cos_getter_"));
         Self {
             properties: map,
             prototype: None,
             proxy_handler: None,
+            has_getter_properties,
         }
     }
 
     /// Create a proxied object: `new Proxy(target_props, handler)`.
     pub fn with_proxy(properties: HashMap<String, Value>, handler: ProxyHandler) -> Self {
+        let has_getter_properties = properties
+            .keys()
+            .any(|key| key.starts_with("__w3cos_getter_"));
         Self {
             properties,
             prototype: None,
             proxy_handler: Some(handler),
+            has_getter_properties,
         }
     }
 
@@ -81,7 +89,18 @@ impl JsObject {
     }
 
     pub fn set_direct(&mut self, key: &str, value: Value) {
+        if key.starts_with("__w3cos_getter_") {
+            self.has_getter_properties = true;
+        }
         self.properties.insert(key.to_string(), value);
+    }
+
+    pub fn may_have_getter_properties(&self) -> bool {
+        self.has_getter_properties
+            || self
+                .prototype
+                .as_ref()
+                .is_some_and(|prototype| prototype.borrow().may_have_getter_properties())
     }
 
     /// `[[Has]]` — the `in` operator.
@@ -113,7 +132,14 @@ impl JsObject {
                 return trap(&target, key);
             }
         }
-        self.properties.remove(key).is_some()
+        let removed = self.properties.remove(key).is_some();
+        if removed && key.starts_with("__w3cos_getter_") {
+            self.has_getter_properties = self
+                .properties
+                .keys()
+                .any(|key| key.starts_with("__w3cos_getter_"));
+        }
+        removed
     }
 
     /// `[[OwnKeys]]` — `Object.keys()` / `Reflect.ownKeys()`.
@@ -250,6 +276,7 @@ impl JsObject {
             properties: self.properties.clone(),
             prototype: self.prototype.clone(),
             proxy_handler: None,
+            has_getter_properties: self.has_getter_properties,
         };
         Value::Object(Rc::new(RefCell::new(clone)))
     }

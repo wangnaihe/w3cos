@@ -336,11 +336,12 @@ fn parse_display(value: &str) -> Display {
 
 fn parse_position(value: &str) -> Position {
     match value.trim() {
+        "static" => Position::Static,
         "relative" => Position::Relative,
         "absolute" => Position::Absolute,
         "fixed" => Position::Fixed,
         "sticky" => Position::Sticky,
-        _ => Position::Relative,
+        _ => Position::Static,
     }
 }
 
