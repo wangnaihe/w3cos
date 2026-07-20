@@ -174,6 +174,9 @@ pub fn estimated_char_width(ch: char, font_size: f32) -> f32 {
 }
 
 pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
+    if !font.chars().contains_key(&ch) {
+        return estimated_char_width(ch, font_size);
+    }
     let advance = font.metrics(ch, font_size).advance_width;
     if advance > 0.0 {
         advance
@@ -314,6 +317,11 @@ pub fn single_line_vertical_metrics(
     let mut top = f32::MAX;
     let mut bottom = f32::MIN;
     for ch in text.chars() {
+        if !font.chars().contains_key(&ch) {
+            top = top.min(-font_size * 0.88);
+            bottom = bottom.max(font_size * 0.12);
+            continue;
+        }
         let m = font.metrics(ch, font_size);
         if m.width == 0 && m.height == 0 {
             continue;
@@ -405,6 +413,16 @@ pub fn measure_text_ink_bounds(
     let mut saw_ink = false;
 
     for ch in text.chars() {
+        if !font.chars().contains_key(&ch) {
+            let advance = estimated_char_width(ch, font_size);
+            saw_ink = true;
+            left = left.min(cursor_x);
+            top = top.min(origin_y);
+            right = right.max(cursor_x + advance);
+            bottom = bottom.max(origin_y + font_size);
+            cursor_x += advance;
+            continue;
+        }
         let metrics = font.metrics(ch, font_size);
         let advance = if metrics.advance_width > 0.0 {
             metrics.advance_width
@@ -513,6 +531,10 @@ pub fn prepaint_text_interest_rect(
     prepared
 }
 
+pub fn clear_paint_cache() {
+    TEXT_PAINT_CACHE.with(|cache| cache.borrow_mut().entries.clear());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +560,20 @@ mod tests {
         let w = measure_text_width_estimate("中文", 12.0);
         assert!(w < w_byte_guess);
         assert!((w - 24.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn compact_metrics_face_uses_one_em_for_missing_cjk() {
+        let font = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        assert!(!font.chars().contains_key(&'中'));
+        assert!((char_advance('中', 16.0, &font) - 16.0).abs() < 0.1);
+        let ink = measure_text_ink_bounds("中", 16.0, &font, 0.0, 0.0);
+        assert!((ink.width - 16.0).abs() < 0.1);
+        assert!((ink.height - 16.0).abs() < 0.1);
     }
 
     #[test]

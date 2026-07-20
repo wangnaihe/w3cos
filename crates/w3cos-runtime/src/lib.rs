@@ -69,6 +69,9 @@ pub mod render_cpu;
 #[path = "render_skia.rs"]
 pub mod render_skia;
 
+#[cfg(all(feature = "skia", target_os = "android"))]
+mod render_skia_vulkan;
+
 #[cfg(all(feature = "gpu", not(feature = "cpu-render")))]
 pub use render_gpu as render;
 

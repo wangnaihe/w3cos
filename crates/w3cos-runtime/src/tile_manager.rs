@@ -34,8 +34,12 @@ pub enum TilePriority {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileState {
     Missing,
-    Pending { generation: u64 },
-    Ready { generation: u64 },
+    Pending {
+        generation: u64,
+    },
+    Ready {
+        generation: u64,
+    },
     Stale {
         ready_generation: u64,
         pending_generation: u64,
@@ -136,11 +140,7 @@ impl TileManager {
             let max_y = ((visible.y + visible.height) / tile_size).ceil() as i32 - 1;
             for y in min_y..=max_y {
                 for x in min_x..=max_x {
-                    let id = TileId {
-                        x,
-                        y,
-                        scale_bucket,
-                    };
+                    let id = TileId { x, y, scale_bucket };
                     let tile_rect = LayoutRect {
                         x: x as f32 * tile_size,
                         y: y as f32 * tile_size,
@@ -164,12 +164,12 @@ impl TileManager {
                     entry.clients.insert(client);
                     entry.bytes = tile_bytes;
                     entry.state = match entry.state {
-                        TileState::Ready {
-                            generation: ready,
-                        } if ready != generation => TileState::Stale {
-                            ready_generation: ready,
-                            pending_generation: generation,
-                        },
+                        TileState::Ready { generation: ready } if ready != generation => {
+                            TileState::Stale {
+                                ready_generation: ready,
+                                pending_generation: generation,
+                            }
+                        }
                         TileState::Stale {
                             ready_generation,
                             pending_generation,
@@ -214,9 +214,8 @@ impl TileManager {
             .collect();
         requests.sort_by(|a, b| {
             a.priority.cmp(&b.priority).then_with(|| {
-                distance_to_viewport(a.id, viewport, self.tile_size).total_cmp(
-                    &distance_to_viewport(b.id, viewport, self.tile_size),
-                )
+                distance_to_viewport(a.id, viewport, self.tile_size)
+                    .total_cmp(&distance_to_viewport(b.id, viewport, self.tile_size))
             })
         });
         requests
@@ -309,10 +308,7 @@ fn distance_to_viewport(id: TileId, viewport: LayoutRect, tile_size: u32) -> f32
 }
 
 fn intersects(a: LayoutRect, b: LayoutRect) -> bool {
-    a.x < b.x + b.width
-        && a.x + a.width > b.x
-        && a.y < b.y + b.height
-        && a.y + a.height > b.y
+    a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
 }
 
 fn intersection(a: LayoutRect, b: LayoutRect) -> Option<LayoutRect> {
@@ -344,16 +340,15 @@ mod tests {
     #[test]
     fn viewport_tiles_are_scheduled_before_lookahead() {
         let mut manager = TileManager::new(128, 8 * 1024 * 1024);
-        let requests = manager.prepare_frame(
-            1,
-            rect(256.0, 256.0),
-            1200.0,
-            1.0,
-            [(0, rect(0.0, 1024.0))],
-        );
+        let requests =
+            manager.prepare_frame(1, rect(256.0, 256.0), 1200.0, 1.0, [(0, rect(0.0, 1024.0))]);
         assert!(!requests.is_empty());
         assert_eq!(requests[0].priority, TilePriority::Now);
-        assert!(requests.iter().any(|request| request.priority == TilePriority::Soon));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.priority == TilePriority::Soon)
+        );
     }
 
     #[test]
@@ -380,21 +375,9 @@ mod tests {
         };
         let first = manager.prepare_frame(1, narrow(0.0), 0.0, 1.0, [(0, narrow(0.0))]);
         manager.mark_ready(first[0].id, 1);
-        let second = manager.prepare_frame(
-            2,
-            narrow(256.0),
-            0.0,
-            1.0,
-            [(1, narrow(256.0))],
-        );
+        let second = manager.prepare_frame(2, narrow(256.0), 0.0, 1.0, [(1, narrow(256.0))]);
         manager.mark_ready(second[0].id, 2);
-        let third = manager.prepare_frame(
-            3,
-            narrow(512.0),
-            0.0,
-            1.0,
-            [(2, narrow(512.0))],
-        );
+        let third = manager.prepare_frame(3, narrow(512.0), 0.0, 1.0, [(2, narrow(512.0))]);
         manager.mark_ready(third[0].id, 3);
 
         let stats = manager.stats();

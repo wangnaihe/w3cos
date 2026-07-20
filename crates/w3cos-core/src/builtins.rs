@@ -176,8 +176,11 @@ impl Map {
     pub fn new(arguments: Vec<Value>) -> Value {
         let mut initial = HashMap::<String, Value>::new();
         let iterable = arguments.first().cloned().unwrap_or(Value::Undefined);
+        let entries_snapshot = iterable.get_property("__w3cosMapEntriesSnapshot");
         let entries = iterable.get_property("__w3cosMapEntries");
-        let source = if matches!(entries, Value::Array(_)) {
+        let source = if entries_snapshot.is_function() {
+            entries_snapshot.call(iterable.clone(), vec![])
+        } else if matches!(entries, Value::Array(_)) {
             entries
         } else {
             iterable
@@ -214,18 +217,17 @@ impl Map {
         }
         {
             let values = values.clone();
-            let map_reference = map.clone();
             map.set_property(
                 "set",
-                Value::function(move |_, arguments| {
+                Value::function(move |map, arguments| {
                     let key = arguments
                         .first()
                         .map(Value::to_js_string)
                         .unwrap_or_default();
                     let value = arguments.get(1).cloned().unwrap_or(Value::Undefined);
                     values.borrow_mut().insert(key, value);
-                    sync_map_iteration_properties(&map_reference, &values.borrow());
-                    map_reference.clone()
+                    sync_map_size(&map, values.borrow().len());
+                    map
                 }),
             );
         }
@@ -258,20 +260,40 @@ impl Map {
                 }),
             );
         }
-        sync_map_iteration_properties(&map, &values.borrow());
+        {
+            let values = values.clone();
+            map.set_property(
+                "__w3cosMapEntriesSnapshot",
+                Value::function(move |_, _| map_entries_snapshot(&values.borrow())),
+            );
+        }
+        {
+            let values = values.clone();
+            map.set_property(
+                "__w3cosMapValuesSnapshot",
+                Value::function(move |_, _| map_values_snapshot(&values.borrow())),
+            );
+        }
+        sync_map_size(&map, values.borrow().len());
         map
     }
 }
 
-fn sync_map_iteration_properties(map: &Value, values: &HashMap<String, Value>) {
-    let entries = values
-        .iter()
-        .map(|(key, value)| Value::array(vec![Value::from(key.clone()), value.clone()]))
-        .collect::<Vec<_>>();
-    let map_values = values.values().cloned().collect::<Vec<_>>();
-    map.set_property("size", Value::Number(values.len() as f64));
-    map.set_property("__w3cosMapEntries", Value::array(entries));
-    map.set_property("__w3cosMapValues", Value::array(map_values));
+fn map_entries_snapshot(values: &HashMap<String, Value>) -> Value {
+    Value::array(
+        values
+            .iter()
+            .map(|(key, value)| Value::array(vec![Value::from(key.clone()), value.clone()]))
+            .collect(),
+    )
+}
+
+fn map_values_snapshot(values: &HashMap<String, Value>) -> Value {
+    Value::array(values.values().cloned().collect())
+}
+
+fn sync_map_size(map: &Value, len: usize) {
+    map.set_property("size", Value::Number(len as f64));
 }
 
 pub struct ResizeObserver {
@@ -503,6 +525,20 @@ mod tests {
             .collect::<Vec<_>>();
         heights.sort_by(f64::total_cmp);
         assert_eq!(heights, vec![82.0, 106.0]);
+    }
+
+    #[test]
+    fn map_methods_do_not_retain_their_own_receiver() {
+        let map = Map::new(vec![]);
+        let Value::Object(object) = map else {
+            panic!("Map constructor did not return an object");
+        };
+
+        assert_eq!(
+            std::rc::Rc::strong_count(&object),
+            1,
+            "a method stored on the Map must use its call receiver instead of creating an Rc cycle"
+        );
     }
 
     #[test]

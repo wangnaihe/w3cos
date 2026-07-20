@@ -19,7 +19,48 @@
 //! let pixels = ctx.get_image_data(0, 0, 800, 600);
 //! ```
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+
+/// Immutable canvas pixels consumed by retained paint backends.
+#[derive(Clone)]
+pub struct CanvasSnapshot {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<Vec<u8>>,
+    pub revision: u64,
+}
+
+thread_local! {
+    static SURFACES: RefCell<HashMap<usize, CanvasSnapshot>> = RefCell::new(HashMap::new());
+}
+
+/// Publish the latest pixels for a retained canvas display client.
+///
+/// The client id is the retained `PaintArtifact` display client (the stable
+/// flattened node index), keeping Canvas 2D state independent from a
+/// particular raster backend.
+pub fn publish_surface(client_id: usize, snapshot: CanvasSnapshot) {
+    SURFACES.with(|surfaces| {
+        surfaces.borrow_mut().insert(client_id, snapshot);
+    });
+}
+
+pub fn surface_snapshot(client_id: usize) -> Option<CanvasSnapshot> {
+    SURFACES.with(|surfaces| surfaces.borrow().get(&client_id).cloned())
+}
+
+pub fn remove_surface(client_id: usize) {
+    SURFACES.with(|surfaces| {
+        surfaces.borrow_mut().remove(&client_id);
+    });
+}
+
+/// Drop retained canvas snapshots under OS memory pressure.
+pub fn clear_surfaces() {
+    SURFACES.with(|surfaces| surfaces.borrow_mut().clear());
+}
 
 // ── Color / Style ──────────────────────────────────────────────────────────
 
@@ -355,6 +396,7 @@ pub struct CanvasRenderingContext2D {
     current_path: Path2D,
     pub state: ContextState,
     state_stack: VecDeque<ContextState>,
+    revision: u64,
 }
 
 impl CanvasRenderingContext2D {
@@ -367,7 +409,22 @@ impl CanvasRenderingContext2D {
             current_path: Path2D::new(),
             state: ContextState::default(),
             state_stack: VecDeque::new(),
+            revision: 0,
         }
+    }
+
+    /// Snapshot this context into the retained canvas resource registry.
+    pub fn publish_to_surface(&mut self, client_id: usize) {
+        self.revision = self.revision.wrapping_add(1);
+        publish_surface(
+            client_id,
+            CanvasSnapshot {
+                width: self.width,
+                height: self.height,
+                pixels: Arc::new(self.pixels.clone()),
+                revision: self.revision,
+            },
+        );
     }
 
     // ── State ──────────────────────────────────────────────────────────────

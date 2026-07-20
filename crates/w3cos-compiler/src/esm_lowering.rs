@@ -633,22 +633,18 @@ impl LowerCtx {
                     let bindings =
                         lower_closure_params(&arrow.params, &self.renames, &self.value_bindings);
                     let parameter_names = pattern_names(&arrow.params);
-                    let captures = self
+                    let capture_candidates = self
                         .known_values
                         .difference(&parameter_names)
                         .cloned()
                         .collect::<Vec<_>>();
-                    let capture_bindings = captures
-                        .iter()
-                        .map(|name| format!("let mut {name} = {name}.clone(); "))
-                        .collect::<String>();
                     let body = match arrow.body.as_ref() {
                         BlockStmtOrExpr::Expr(expression) => {
                             let mut ctx = LowerCtx::new_dynamic_with_bindings(
                                 self.renames.clone(),
                                 self.value_bindings.clone(),
                             );
-                            ctx.known_values.extend(captures.iter().cloned());
+                            ctx.known_values.extend(capture_candidates.iter().cloned());
                             ctx.bind_patterns(&arrow.params);
                             format!("return {};", ctx.lower_expr(expression))
                         }
@@ -657,12 +653,17 @@ impl LowerCtx {
                                 self.renames.clone(),
                                 self.value_bindings.clone(),
                             );
-                            ctx.known_values.extend(captures.iter().cloned());
+                            ctx.known_values.extend(capture_candidates.iter().cloned());
                             ctx.bind_patterns(&arrow.params);
                             ctx.indent = self.indent + 4;
                             ctx.lower_stmts(&block.stmts)
                         }
                     };
+                    let captures = referenced_captures(capture_candidates, &body);
+                    let capture_bindings = captures
+                        .iter()
+                        .map(|name| format!("let mut {name} = {name}.clone(); "))
+                        .collect::<String>();
                     return format!(
                         "{{ {capture_bindings} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
                     );
@@ -910,15 +911,11 @@ impl LowerCtx {
                     let bindings =
                         lower_closure_params(&params, &self.renames, &self.value_bindings);
                     let parameter_names = pattern_names(&params);
-                    let captures = self
+                    let capture_candidates = self
                         .known_values
                         .difference(&parameter_names)
                         .cloned()
                         .collect::<Vec<_>>();
-                    let capture_bindings = captures
-                        .iter()
-                        .map(|name| format!("let mut {name} = {name}.clone(); "))
-                        .collect::<String>();
                     let body = fn_expr
                         .function
                         .body
@@ -928,12 +925,17 @@ impl LowerCtx {
                                 self.renames.clone(),
                                 self.value_bindings.clone(),
                             );
-                            ctx.known_values.extend(captures.iter().cloned());
+                            ctx.known_values.extend(capture_candidates.iter().cloned());
                             ctx.bind_patterns(&params);
                             ctx.indent = self.indent + 4;
                             ctx.lower_stmts(&block.stmts)
                         })
                         .unwrap_or_default();
+                    let captures = referenced_captures(capture_candidates, &body);
+                    let capture_bindings = captures
+                        .iter()
+                        .map(|name| format!("let mut {name} = {name}.clone(); "))
+                        .collect::<String>();
                     return format!(
                         "{{ {capture_bindings} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
                     );
@@ -1320,20 +1322,21 @@ impl LowerCtx {
     fn lower_dynamic_function_value(&self, params: &[Pat], body: &[Stmt]) -> String {
         let bindings = lower_closure_params(params, &self.renames, &self.value_bindings);
         let parameter_names = pattern_names(params);
-        let captures = self
+        let capture_candidates = self
             .known_values
             .difference(&parameter_names)
             .cloned()
             .collect::<Vec<_>>();
+        let mut ctx =
+            LowerCtx::new_dynamic_with_bindings(self.renames.clone(), self.value_bindings.clone());
+        ctx.known_values.extend(capture_candidates.iter().cloned());
+        ctx.bind_patterns(params);
+        let body = ctx.lower_stmts(body);
+        let captures = referenced_captures(capture_candidates, &body);
         let capture_bindings = captures
             .iter()
             .map(|name| format!("let mut {name} = {name}.clone(); "))
             .collect::<String>();
-        let mut ctx =
-            LowerCtx::new_dynamic_with_bindings(self.renames.clone(), self.value_bindings.clone());
-        ctx.known_values.extend(captures.iter().cloned());
-        ctx.bind_patterns(params);
-        let body = ctx.lower_stmts(body);
         format!(
             "{{ {capture_bindings} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
         )
@@ -1410,6 +1413,28 @@ impl LowerCtx {
             _ => {}
         }
     }
+}
+
+/// The dynamic lowerer used to clone every value visible in the surrounding
+/// function into every generated Rust closure. JavaScript engines trace only
+/// actual lexical captures; reproducing the all-values behavior with `Rc`
+/// both bloats callback environments and can create otherwise-unreachable
+/// cycles. The body is lowered with all candidates in scope first, then the
+/// emitted Rust identifiers provide an exact conservative capture filter.
+fn referenced_captures(mut candidates: Vec<String>, body: &str) -> Vec<String> {
+    candidates.retain(|candidate| contains_rust_identifier(body, candidate));
+    candidates.sort_unstable();
+    candidates
+}
+
+fn contains_rust_identifier(source: &str, identifier: &str) -> bool {
+    source.match_indices(identifier).any(|(start, _)| {
+        let end = start + identifier.len();
+        let before = source[..start].chars().next_back();
+        let after = source[end..].chars().next();
+        !before.is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            && !after.is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    })
 }
 
 fn lower_closure_params(
@@ -1854,6 +1879,23 @@ mod tests {
                 && code.contains("set_property(&\"value\"")
                 && code.contains("is_nullish()"),
             "dynamic closure lowering: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_closures_capture_only_referenced_values() {
+        let stmts =
+            parse_stmts("const used = 1; const unused = 2; const callback = () => used + 1;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains("let mut used = used.clone();"),
+            "referenced capture missing: {code}"
+        );
+        assert!(
+            !code.contains("let mut unused = unused.clone();"),
+            "unreferenced capture retained: {code}"
         );
     }
 

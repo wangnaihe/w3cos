@@ -44,6 +44,7 @@ softbuffer = { workspace = true, optional = true }
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { workspace = true, features = ["android-native-activity"] }
 skia-safe = { version = "=0.93.1", optional = true, features = ["vulkan"] }
+ash = "0.38"
 
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 winit = { workspace = true }

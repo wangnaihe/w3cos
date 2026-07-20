@@ -26,6 +26,11 @@ pub fn get_or_load(src: &str) -> Option<DecodedImage> {
     })
 }
 
+/// Drop decoded images that can be recreated from their source.
+pub fn clear_cache() {
+    CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 fn load_from_source(src: &str) -> Option<DecodedImage> {
     let bytes = if src.starts_with("http://") || src.starts_with("https://") {
         let resp = match ureq::get(src).call() {

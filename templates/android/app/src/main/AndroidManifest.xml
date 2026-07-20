@@ -2,6 +2,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-feature
+        android:name="android.hardware.vulkan.version"
+        android:version="0x00400000"
+        android:required="true" />
 
     <application
         android:allowBackup="true"

@@ -422,10 +422,18 @@ impl Value {
             // The AOT lowering turns common `Map#forEach(value => ...)`
             // loops into this iterator path. Map exposes a live values
             // snapshot so the lowered loop retains JavaScript semantics.
-            Value::Object(object) => match object.borrow().get_direct("__w3cosMapValues") {
-                Value::Array(values) => values.borrow().clone().into_iter(),
-                _ => Vec::new().into_iter(),
-            },
+            Value::Object(object) => {
+                let snapshot = object.borrow().get_direct("__w3cosMapValuesSnapshot");
+                let values = if snapshot.is_function() {
+                    snapshot.call(self.clone(), vec![])
+                } else {
+                    object.borrow().get_direct("__w3cosMapValues")
+                };
+                match values {
+                    Value::Array(values) => values.borrow().clone().into_iter(),
+                    _ => Vec::new().into_iter(),
+                }
+            }
             _ => Vec::new().into_iter(),
         }
     }

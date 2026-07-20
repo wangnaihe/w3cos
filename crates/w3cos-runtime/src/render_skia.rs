@@ -6,15 +6,29 @@
 
 use std::collections::HashMap;
 
+use skia_safe::canvas::SaveLayerRec;
 use skia_safe::{
-    AlphaType, BlurStyle, Canvas, Color, ColorType, Font, FontMgr, ImageInfo, MaskFilter, Paint,
-    Rect, Surface, Typeface, paint,
+    AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, ImageFilter,
+    ImageInfo, MaskFilter, Paint, Rect, Surface, Typeface, color_filters, image_filters, images,
+    paint,
 };
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::{Style, TextAlign};
 
+use crate::filter::{FilterChain, FilterOp, parse_css_filter};
 use crate::layout::LayoutRect;
+use crate::paint_artifact::PaintArtifact;
 use crate::text_layout;
+
+pub(crate) struct ReplayFrame<'a> {
+    pub nodes: &'a [(usize, LayoutRect, &'a ComponentKind, &'a Style)],
+    pub metrics_font: &'a fontdue::Font,
+    pub scroll_info: &'a [Option<(f32, f32, LayoutRect)>],
+    pub text_input_values: &'a HashMap<usize, String>,
+    pub focused_index: Option<usize>,
+    pub background: w3cos_std::color::Color,
+    pub artifact: Option<&'a PaintArtifact>,
+}
 
 pub struct SkiaRasterizer {
     surface: Option<Surface>,
@@ -44,17 +58,23 @@ impl SkiaRasterizer {
         scroll_info: &[Option<(f32, f32, LayoutRect)>],
         text_input_values: &HashMap<usize, String>,
         focused_index: Option<usize>,
+        background: w3cos_std::color::Color,
+        artifact: Option<&PaintArtifact>,
     ) -> Option<&[u8]> {
         self.ensure_surface(width, height)?;
         let surface = self.surface.as_mut()?;
         replay_frame(
             surface.canvas(),
-            nodes,
             &self.typeface,
-            metrics_font,
-            scroll_info,
-            text_input_values,
-            focused_index,
+            ReplayFrame {
+                nodes,
+                metrics_font,
+                scroll_info,
+                text_input_values,
+                focused_index,
+                background,
+                artifact,
+            },
         );
         let expected = width as usize * height as usize * 4;
         self.rgba.resize(expected, 0);
@@ -82,21 +102,44 @@ impl SkiaRasterizer {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn replay_frame(
-    canvas: &Canvas,
-    nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
-    typeface: &Typeface,
-    metrics_font: &fontdue::Font,
-    scroll_info: &[Option<(f32, f32, LayoutRect)>],
-    text_input_values: &HashMap<usize, String>,
-    focused_index: Option<usize>,
-) {
-    canvas.clear(Color::from_argb(255, 11, 18, 32));
-    for &(idx, rect, kind, style) in nodes {
+pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, frame: ReplayFrame<'_>) {
+    canvas.clear(to_skia_color(frame.background, 1.0));
+    let mut active_filters = Vec::new();
+    for &(idx, rect, kind, style) in frame.nodes {
+        let filter_path = effect_path(frame.artifact, idx);
+        let common = active_filters
+            .iter()
+            .zip(&filter_path)
+            .take_while(|(left, right)| left == right)
+            .count();
+        for _ in common..active_filters.len() {
+            canvas.restore();
+        }
+        active_filters.truncate(common);
+        for &effect_id in &filter_path[common..] {
+            let Some(effect) = frame
+                .artifact
+                .and_then(|artifact| artifact.properties.effects.get(effect_id))
+            else {
+                continue;
+            };
+            let mut paint = Paint::default();
+            paint.set_alpha_f(effect.opacity.clamp(0.0, 1.0));
+            if let Some(filter) = effect
+                .filter
+                .as_deref()
+                .and_then(parse_css_filter)
+                .and_then(|chain| skia_filter_chain(&chain))
+            {
+                paint.set_image_filter(filter);
+            }
+            canvas.save_layer(&SaveLayerRec::default().paint(&paint));
+            active_filters.push(effect_id);
+        }
         if style.opacity <= 0.0 {
             continue;
         }
-        let (rect, clip) = match scroll_info.get(idx).copied().flatten() {
+        let (rect, clip) = match frame.scroll_info.get(idx).copied().flatten() {
             Some((sx, sy, clip)) => (
                 LayoutRect {
                     x: rect.x - sx,
@@ -112,17 +155,47 @@ fn replay_frame(
         if let Some(clip) = clip {
             canvas.clip_rect(to_rect(clip), None, Some(false));
         }
+        let local_filter = frame.artifact.is_none().then(|| {
+            style
+                .filter
+                .as_deref()
+                .and_then(parse_css_filter)
+                .and_then(|chain| skia_filter_chain(&chain))
+                .map(|filter| {
+                    let mut paint = Paint::default();
+                    paint.set_image_filter(filter);
+                    paint
+                })
+        });
+        if let Some(Some(paint)) = local_filter.as_ref() {
+            canvas.save_layer(&SaveLayerRec::default().paint(paint));
+        }
+        // With a PaintArtifact, opacity belongs to the Effect tree and must be
+        // applied once to the whole subtree. Avoid multiplying it into this
+        // display item a second time.
+        let normalized_style = (frame.artifact.is_some() && style.opacity < 0.999).then(|| {
+            let mut normalized = style.clone();
+            normalized.opacity = 1.0;
+            normalized
+        });
         render_node(
             canvas,
+            idx,
             rect,
             kind,
-            style,
+            normalized_style.as_ref().unwrap_or(style),
             typeface,
-            metrics_font,
-            text_input_values.get(&idx).map(String::as_str),
-            focused_index == Some(idx),
+            frame.metrics_font,
+            frame.text_input_values.get(&idx).map(String::as_str),
+            frame.focused_index == Some(idx),
         );
+        if matches!(local_filter, Some(Some(_))) {
+            canvas.restore();
+        }
         canvas.restore_to_count(save);
+    }
+    for _ in 0..active_filters.len() {
+        canvas.restore();
     }
 }
 
@@ -189,6 +262,8 @@ impl SkiaMetalPresenter {
         scroll_info: &[Option<(f32, f32, LayoutRect)>],
         text_input_values: &HashMap<usize, String>,
         focused_index: Option<usize>,
+        background: w3cos_std::color::Color,
+        artifact: Option<&PaintArtifact>,
     ) -> bool {
         use objc2_06::rc::Retained;
         use objc2_06::runtime::ProtocolObject;
@@ -220,12 +295,16 @@ impl SkiaMetalPresenter {
             };
             replay_frame(
                 surface.canvas(),
-                nodes,
                 &self.typeface,
-                metrics_font,
-                scroll_info,
-                text_input_values,
-                focused_index,
+                ReplayFrame {
+                    nodes,
+                    metrics_font,
+                    scroll_info,
+                    text_input_values,
+                    focused_index,
+                    background,
+                    artifact,
+                },
             );
             self.context.flush_and_submit();
             drop(surface);
@@ -245,6 +324,7 @@ impl SkiaMetalPresenter {
 #[allow(clippy::too_many_arguments)]
 fn render_node(
     canvas: &Canvas,
+    client_index: usize,
     rect: LayoutRect,
     kind: &ComponentKind,
     style: &Style,
@@ -370,13 +450,267 @@ fn render_node(
                 typeface,
             );
         }
-        ComponentKind::Image { .. }
-        | ComponentKind::Root
+        ComponentKind::Image { src } => draw_image(canvas, rect, src, style.opacity),
+        ComponentKind::Canvas { .. } => draw_canvas(canvas, client_index, rect, style.opacity),
+        ComponentKind::Root
         | ComponentKind::Column
         | ComponentKind::Row
         | ComponentKind::Box
-        | ComponentKind::Canvas { .. }
         | ComponentKind::VirtualList { .. } => {}
+    }
+}
+
+fn effect_path(artifact: Option<&PaintArtifact>, client_index: usize) -> Vec<usize> {
+    let Some(artifact) = artifact else {
+        return Vec::new();
+    };
+    let mut current = artifact
+        .node_properties
+        .get(client_index)
+        .map(|properties| properties.effect)
+        .unwrap_or_default();
+    let mut path = Vec::new();
+    while current != 0 {
+        let Some(effect) = artifact.properties.effects.get(current) else {
+            break;
+        };
+        if effect.opacity < 0.999 || effect.filter.is_some() {
+            path.push(current);
+        }
+        if effect.parent == current {
+            break;
+        }
+        current = effect.parent;
+    }
+    path.reverse();
+    path
+}
+
+fn draw_image(canvas: &Canvas, rect: LayoutRect, src: &str, opacity: f32) {
+    let Some(decoded) = crate::image_loader::get_or_load(src) else {
+        return;
+    };
+    draw_rgba_pixels(
+        canvas,
+        rect,
+        decoded.width,
+        decoded.height,
+        decoded.data.as_slice(),
+        opacity,
+    );
+}
+
+fn draw_canvas(canvas: &Canvas, client_index: usize, rect: LayoutRect, opacity: f32) {
+    let Some(snapshot) = crate::canvas2d::surface_snapshot(client_index) else {
+        return;
+    };
+    draw_rgba_pixels(
+        canvas,
+        rect,
+        snapshot.width,
+        snapshot.height,
+        snapshot.pixels.as_slice(),
+        opacity,
+    );
+}
+
+fn draw_rgba_pixels(
+    canvas: &Canvas,
+    rect: LayoutRect,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    opacity: f32,
+) {
+    if width == 0 || height == 0 || pixels.len() != width as usize * height as usize * 4 {
+        return;
+    }
+    let info = ImageInfo::new(
+        (width as i32, height as i32),
+        ColorType::RGBA8888,
+        AlphaType::Unpremul,
+        None,
+    );
+    let Some(image) = images::raster_from_data(&info, Data::new_copy(pixels), width as usize * 4)
+    else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_alpha_f(opacity.clamp(0.0, 1.0));
+    canvas.draw_image_rect(image, None, to_rect(rect), &paint);
+}
+
+fn skia_filter_chain(chain: &FilterChain) -> Option<ImageFilter> {
+    let mut input = None;
+    for op in &chain.ops {
+        input = match op {
+            FilterOp::Blur(radius) => image_filters::blur(
+                (*radius, *radius),
+                None,
+                input,
+                image_filters::CropRect::NO_CROP_RECT,
+            ),
+            FilterOp::DropShadow(shadow) => image_filters::drop_shadow(
+                (shadow.offset_x, shadow.offset_y),
+                (shadow.blur_radius * 0.5, shadow.blur_radius * 0.5),
+                Color4f::new(
+                    shadow.color.r as f32 / 255.0,
+                    shadow.color.g as f32 / 255.0,
+                    shadow.color.b as f32 / 255.0,
+                    shadow.color.a as f32 / 255.0,
+                ),
+                None,
+                input,
+                image_filters::CropRect::NO_CROP_RECT,
+            ),
+            color_op => {
+                let matrix = css_color_matrix(color_op)?;
+                image_filters::color_filter(
+                    color_filters::matrix_row_major(&matrix, None),
+                    input,
+                    image_filters::CropRect::NO_CROP_RECT,
+                )
+            }
+        };
+    }
+    input
+}
+
+fn css_color_matrix(op: &FilterOp) -> Option<[f32; 20]> {
+    let identity = || {
+        [
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+        ]
+    };
+    match *op {
+        FilterOp::Brightness(value) => Some([
+            value, 0.0, 0.0, 0.0, 0.0, 0.0, value, 0.0, 0.0, 0.0, 0.0, 0.0, value, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ]),
+        FilterOp::Contrast(value) => {
+            // Skia's high-level color-filter matrix operates on normalized
+            // color components, so CSS's midpoint is 0.5 rather than 127.5.
+            let offset = 0.5 * (1.0 - value);
+            Some([
+                value, 0.0, 0.0, 0.0, offset, 0.0, value, 0.0, 0.0, offset, 0.0, 0.0, value, 0.0,
+                offset, 0.0, 0.0, 0.0, 1.0, 0.0,
+            ])
+        }
+        FilterOp::Grayscale(amount) => {
+            let t = amount.clamp(0.0, 1.0);
+            Some([
+                1.0 - 0.787 * t,
+                0.715 * t,
+                0.072 * t,
+                0.0,
+                0.0,
+                0.213 * t,
+                1.0 - 0.285 * t,
+                0.072 * t,
+                0.0,
+                0.0,
+                0.213 * t,
+                0.715 * t,
+                1.0 - 0.928 * t,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+            ])
+        }
+        FilterOp::Sepia(amount) => {
+            let t = amount.clamp(0.0, 1.0);
+            Some([
+                1.0 - 0.607 * t,
+                0.769 * t,
+                0.189 * t,
+                0.0,
+                0.0,
+                0.349 * t,
+                1.0 - 0.314 * t,
+                0.168 * t,
+                0.0,
+                0.0,
+                0.272 * t,
+                0.534 * t,
+                1.0 - 0.869 * t,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+            ])
+        }
+        FilterOp::Invert(amount) => {
+            let scale = 1.0 - 2.0 * amount;
+            let offset = amount;
+            Some([
+                scale, 0.0, 0.0, 0.0, offset, 0.0, scale, 0.0, 0.0, offset, 0.0, 0.0, scale, 0.0,
+                offset, 0.0, 0.0, 0.0, 1.0, 0.0,
+            ])
+        }
+        FilterOp::Saturate(amount) => Some([
+            0.213 + 0.787 * amount,
+            0.715 - 0.715 * amount,
+            0.072 - 0.072 * amount,
+            0.0,
+            0.0,
+            0.213 - 0.213 * amount,
+            0.715 + 0.285 * amount,
+            0.072 - 0.072 * amount,
+            0.0,
+            0.0,
+            0.213 - 0.213 * amount,
+            0.715 - 0.715 * amount,
+            0.072 + 0.928 * amount,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+        ]),
+        FilterOp::HueRotate(degrees) => {
+            let radians = degrees.to_radians();
+            let cosine = radians.cos();
+            let sine = radians.sin();
+            Some([
+                0.213 + cosine * 0.787 - sine * 0.213,
+                0.715 - cosine * 0.715 - sine * 0.715,
+                0.072 - cosine * 0.072 + sine * 0.928,
+                0.0,
+                0.0,
+                0.213 - cosine * 0.213 + sine * 0.143,
+                0.715 + cosine * 0.285 + sine * 0.140,
+                0.072 - cosine * 0.072 - sine * 0.283,
+                0.0,
+                0.0,
+                0.213 - cosine * 0.213 - sine * 0.787,
+                0.715 - cosine * 0.715 + sine * 0.715,
+                0.072 + cosine * 0.928 + sine * 0.072,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+            ])
+        }
+        FilterOp::Opacity(amount) => {
+            let mut matrix = identity();
+            matrix[18] = amount.clamp(0.0, 1.0);
+            Some(matrix)
+        }
+        FilterOp::Blur(_) | FilterOp::DropShadow(_) => None,
     }
 }
 
@@ -541,4 +875,240 @@ fn color_paint(color: w3cos_std::color::Color, opacity: f32) -> Paint {
         color.b,
     ));
     paint
+}
+
+fn to_skia_color(color: w3cos_std::color::Color, opacity: f32) -> Color {
+    Color::from_argb(
+        (color.a as f32 * opacity.clamp(0.0, 1.0)).round() as u8,
+        color.r,
+        color.g,
+        color.b,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
+
+    fn test_font() -> fontdue::Font {
+        fontdue::Font::from_bytes(TEST_FONT, fontdue::FontSettings::default()).unwrap()
+    }
+
+    #[test]
+    fn css_filter_matrix_matches_web_invert_and_opacity() {
+        let invert = css_color_matrix(&FilterOp::Invert(1.0)).unwrap();
+        assert_eq!(invert[0], -1.0);
+        assert_eq!(invert[4], 1.0);
+        assert_eq!(invert[6], -1.0);
+        assert_eq!(invert[9], 1.0);
+
+        let opacity = css_color_matrix(&FilterOp::Opacity(0.25)).unwrap();
+        assert_eq!(opacity[0], 1.0);
+        assert_eq!(opacity[18], 0.25);
+    }
+
+    #[test]
+    fn replay_uploads_canvas_pixels_and_applies_filter_chain() {
+        let mut context = crate::canvas2d::CanvasRenderingContext2D::new(8, 8);
+        context.set_fill_style("#ff0000");
+        context.fill_rect(0.0, 0.0, 8.0, 8.0);
+        context.publish_to_surface(7);
+        assert_eq!(
+            &crate::canvas2d::surface_snapshot(7).unwrap().pixels[..4],
+            &[255, 0, 0, 255]
+        );
+
+        let kind = ComponentKind::Canvas {
+            width: 8,
+            height: 8,
+        };
+        let style = Style::default();
+        let nodes = [(
+            7,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 8.0,
+            },
+            &kind,
+            &style,
+        )];
+        let font = test_font();
+        let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+        let plain = rasterizer
+            .render_frame(
+                8,
+                8,
+                &nodes,
+                &font,
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::color::Color::WHITE,
+                None,
+            )
+            .unwrap();
+        let center = (4 * 8 + 4) * 4;
+        assert_eq!(&plain[center..center + 4], &[255, 0, 0, 255]);
+
+        let mut filtered_style = style.clone();
+        filtered_style.filter = Some("invert(1)".into());
+        let filtered_nodes = [(
+            7,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 8.0,
+            },
+            &kind,
+            &filtered_style,
+        )];
+        let pixels = rasterizer
+            .render_frame(
+                8,
+                8,
+                &filtered_nodes,
+                &font,
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::color::Color::WHITE,
+                None,
+            )
+            .unwrap();
+        let pixel = &pixels[center..center + 4];
+        assert!(pixel[0] < 8, "red should be inverted: {pixel:?}");
+        assert!(pixel[1] > 247, "green should be inverted: {pixel:?}");
+        assert!(pixel[2] > 247, "blue should be inverted: {pixel:?}");
+        assert_eq!(pixel[3], 255);
+        crate::canvas2d::remove_surface(7);
+    }
+
+    #[test]
+    fn replay_applies_ancestor_effect_to_the_whole_subtree() {
+        use crate::paint_artifact::PaintNode;
+
+        let mut parent_style = Style::default();
+        parent_style.filter = Some("invert(1)".into());
+        let mut red_style = Style::default();
+        red_style.background = w3cos_std::color::Color::rgb(255, 0, 0);
+        let mut blue_style = Style::default();
+        blue_style.background = w3cos_std::color::Color::rgb(0, 0, 255);
+        let parent_kind = ComponentKind::Box;
+        let red_kind = ComponentKind::Box;
+        let blue_kind = ComponentKind::Box;
+        let rects = [
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 4.0,
+            },
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 4.0,
+                height: 4.0,
+            },
+            LayoutRect {
+                x: 4.0,
+                y: 0.0,
+                width: 4.0,
+                height: 4.0,
+            },
+        ];
+        let artifact = PaintArtifact::build(
+            [
+                PaintNode {
+                    kind: parent_kind.clone(),
+                    style: parent_style.clone(),
+                    parent: None,
+                },
+                PaintNode {
+                    kind: red_kind.clone(),
+                    style: red_style.clone(),
+                    parent: Some(0),
+                },
+                PaintNode {
+                    kind: blue_kind.clone(),
+                    style: blue_style.clone(),
+                    parent: Some(0),
+                },
+            ],
+            &[(rects[0], 0), (rects[1], 1), (rects[2], 2)],
+            1,
+        );
+        let nodes = [
+            (0, rects[0], &parent_kind, &parent_style),
+            (1, rects[1], &red_kind, &red_style),
+            (2, rects[2], &blue_kind, &blue_style),
+        ];
+        let font = test_font();
+        let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+        let pixels = rasterizer
+            .render_frame(
+                8,
+                4,
+                &nodes,
+                &font,
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::color::Color::WHITE,
+                Some(&artifact),
+            )
+            .unwrap();
+        let left = &pixels[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 4];
+        let right = &pixels[(2 * 8 + 6) * 4..(2 * 8 + 6) * 4 + 4];
+        assert_eq!(left, &[0, 255, 255, 255]);
+        assert_eq!(right, &[255, 255, 0, 255]);
+    }
+
+    #[test]
+    fn replay_decodes_and_draws_image_resources() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 240, 255]));
+        image
+            .save_with_format(file.path(), image::ImageFormat::Png)
+            .unwrap();
+
+        let kind = ComponentKind::Image {
+            src: file.path().to_string_lossy().into_owned(),
+        };
+        let style = Style::default();
+        let nodes = [(
+            3,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            },
+            &kind,
+            &style,
+        )];
+        let font = test_font();
+        let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+        let pixels = rasterizer
+            .render_frame(
+                2,
+                2,
+                &nodes,
+                &font,
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::color::Color::WHITE,
+                None,
+            )
+            .unwrap();
+        assert!((pixels[0] as i16 - 10).abs() <= 2);
+        assert!((pixels[1] as i16 - 20).abs() <= 2);
+        assert!(pixels[2] >= 238);
+        assert_eq!(pixels[3], 255);
+    }
 }

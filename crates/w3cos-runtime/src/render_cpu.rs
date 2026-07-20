@@ -93,6 +93,10 @@ thread_local! {
     static GLYPH_RASTER_CACHE: RefCell<GlyphRasterCache> = RefCell::new(GlyphRasterCache::default());
 }
 
+pub fn clear_glyph_cache() {
+    GLYPH_RASTER_CACHE.with(|cache| cache.borrow_mut().glyphs.clear());
+}
+
 pub fn prepaint_text_interest_rect(
     requests: &[text_layout::TextPrepaintRequest],
     font: &fontdue::Font,

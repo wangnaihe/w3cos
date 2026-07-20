@@ -45,6 +45,12 @@ pub fn has_frame() -> bool {
     cache().lock().map(|f| !f.rgba.is_empty()).unwrap_or(false)
 }
 
+pub fn clear() {
+    if let Ok(mut frame) = cache().lock() {
+        *frame = Frame::default();
+    }
+}
+
 /// Snapshot the cached buffer (`width`, `height`, RGBA bytes, generation).
 pub fn snapshot() -> Option<(u32, u32, Vec<u8>, u64)> {
     let frame = cache().lock().ok()?;

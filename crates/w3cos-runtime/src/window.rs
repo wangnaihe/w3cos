@@ -46,11 +46,11 @@ fn skia_backend_requested() -> bool {
     if requested.as_deref() == Some("skia") {
         return true;
     }
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "ios", target_os = "android"))]
     {
         return !matches!(requested.as_deref(), Some("gpu" | "cpu"));
     }
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     false
 }
 
@@ -138,6 +138,12 @@ struct ViewportLayout {
 /// Estimated soft-keyboard height when the platform does not shrink `content_rect`
 /// (common with `NativeActivity` + pan). ~260 CSS px ≈ typical Android IME.
 const ANDROID_IME_FALLBACK_INSET: f32 = 260.0;
+/// NativeActivity normally wakes the winit Looper for touch and window input.
+/// Keep only a low-frequency watchdog while an editable control owns the IME;
+/// this catches OEM content-rect updates that arrive without a resize event
+/// without turning the entire Android event loop into a busy poll.
+#[cfg(target_os = "android")]
+const ANDROID_VIEWPORT_WATCHDOG_INTERVAL_MS: u64 = 250;
 const REACT_SCROLL_ANCHOR_SUPPRESSION: Duration = Duration::from_secs(2);
 
 /// Maximum compositor-only travel before a deferred React virtualizer update
@@ -265,6 +271,51 @@ static EMBEDDED_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
 const ANIMATION_FRAME_INTERVAL_MS: u64 = 16;
 const TOUCH_SCROLL_SLOP: f32 = 8.0;
 const KINETIC_SCROLL_MIN_VELOCITY: f32 = 80.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventLoopSchedule {
+    Poll,
+    Wait,
+    WaitUntil(Instant),
+}
+
+fn event_loop_schedule(
+    now: Instant,
+    has_pending_frame_work: bool,
+    has_animations: bool,
+    animation_deadline: Option<Instant>,
+    timer_deadline: Option<Instant>,
+    has_devtools: bool,
+) -> EventLoopSchedule {
+    if has_pending_frame_work {
+        return EventLoopSchedule::Poll;
+    }
+    if animation_deadline.is_some_and(|deadline| deadline <= now) {
+        return EventLoopSchedule::Poll;
+    }
+    match (has_animations, timer_deadline) {
+        (false, None) => {
+            if has_devtools {
+                EventLoopSchedule::WaitUntil(now + Duration::from_millis(100))
+            } else {
+                EventLoopSchedule::Wait
+            }
+        }
+        (true, None) => EventLoopSchedule::WaitUntil(
+            animation_deadline.expect("active animation has a deadline"),
+        ),
+        (false, Some(deadline)) => {
+            if has_devtools {
+                EventLoopSchedule::WaitUntil(deadline.min(now + Duration::from_millis(100)))
+            } else {
+                EventLoopSchedule::WaitUntil(deadline)
+            }
+        }
+        (true, Some(deadline)) => EventLoopSchedule::WaitUntil(
+            deadline.min(animation_deadline.expect("active animation has a deadline")),
+        ),
+    }
+}
 
 #[cfg(target_os = "ios")]
 const IOS_IME_RETRY_INTERVAL_MS: u64 = 16;
@@ -950,13 +1001,15 @@ impl w3cos_ai_bridge::server::ScreenshotProvider for FrameCacheScreenshot {
 #[cfg(feature = "cpu-render")]
 struct CpuPresenter {
     window: Rc<Window>,
-    context: softbuffer::Context<winit::event_loop::OwnedDisplayHandle>,
-    surface: softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Rc<Window>>,
+    _context: Option<softbuffer::Context<winit::event_loop::OwnedDisplayHandle>>,
+    surface: Option<softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Rc<Window>>>,
     framebuffer: Option<Pixmap>,
     #[cfg(feature = "skia")]
     skia: Option<crate::render_skia::SkiaRasterizer>,
     #[cfg(all(feature = "skia", target_os = "ios"))]
     skia_metal: Option<crate::render_skia::SkiaMetalPresenter>,
+    #[cfg(all(feature = "skia", target_os = "android"))]
+    skia_vulkan: Option<crate::render_skia_vulkan::SkiaVulkanPresenter>,
     clip_masks: render_cpu::ClipMaskCache,
     buffer_size: (u32, u32),
 }
@@ -989,7 +1042,7 @@ struct App {
     dom_setup: Option<fn()>,
     dom_mode: bool,
     root: Component,
-    font: fontdue::Font,
+    font: &'static fontdue::Font,
     mouse_x: f32,
     mouse_y: f32,
     scale_factor: f64,
@@ -1129,8 +1182,10 @@ impl App {
         dom_mode: bool,
         root: Component,
     ) -> Self {
-        let font = fontdue::Font::from_bytes(EMBEDDED_FONT, fontdue::FontSettings::default())
-            .expect("failed to load embedded font");
+        // Share the compact metrics face with layout. Mobile Skia still owns
+        // EMBEDDED_FONT (the CJK render face), avoiding fontdue's eager
+        // expansion of the same 10 MiB CJK font once per subsystem.
+        let font = layout::layout_font();
 
         Self {
             builder,
@@ -1514,21 +1569,49 @@ impl App {
         let attrs = default_window_attributes();
         let window = Rc::new(event_loop.create_window(attrs).unwrap());
         self.scale_factor = window.scale_factor();
-        let context = softbuffer::Context::new(event_loop.owned_display_handle())
-            .expect("softbuffer context");
-        let surface =
-            softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
         #[cfg(all(feature = "skia", target_os = "ios"))]
-        let skia_metal = crate::render_skia::SkiaMetalPresenter::new(&window, EMBEDDED_FONT);
+        let skia_metal = skia_backend_requested()
+            .then(|| crate::render_skia::SkiaMetalPresenter::new(&window, EMBEDDED_FONT))
+            .flatten();
+        #[cfg(all(feature = "skia", target_os = "android"))]
+        let skia_vulkan = skia_backend_requested()
+            .then(|| crate::render_skia_vulkan::SkiaVulkanPresenter::new(&window, EMBEDDED_FONT))
+            .flatten();
+        #[cfg(all(feature = "skia", target_os = "android"))]
+        if skia_backend_requested() && skia_vulkan.is_none() {
+            eprintln!("[W3C OS] Skia Vulkan unavailable; falling back to Skia raster");
+        }
+        #[cfg(all(feature = "skia", target_os = "ios"))]
+        let direct_skia = skia_metal.is_some();
+        #[cfg(all(feature = "skia", target_os = "android"))]
+        let direct_skia = skia_vulkan.is_some();
+        #[cfg(not(all(feature = "skia", any(target_os = "ios", target_os = "android"))))]
+        let direct_skia = false;
+        // Chromium keeps software and accelerated raster modes mutually
+        // exclusive. A direct Skia presenter owns the native window, so do
+        // not also create softbuffer's backing store and a CPU raster surface.
+        let (context, surface) = if direct_skia {
+            (None, None)
+        } else {
+            let context = softbuffer::Context::new(event_loop.owned_display_handle())
+                .expect("softbuffer context");
+            let surface =
+                softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
+            (Some(context), Some(surface))
+        };
         self.cpu = Some(CpuPresenter {
             window,
-            context,
+            _context: context,
             surface,
             framebuffer: None,
             #[cfg(feature = "skia")]
-            skia: crate::render_skia::SkiaRasterizer::new(EMBEDDED_FONT),
+            skia: (!direct_skia)
+                .then(|| crate::render_skia::SkiaRasterizer::new(EMBEDDED_FONT))
+                .flatten(),
             #[cfg(all(feature = "skia", target_os = "ios"))]
             skia_metal,
+            #[cfg(all(feature = "skia", target_os = "android"))]
+            skia_vulkan,
             clip_masks: render_cpu::ClipMaskCache::default(),
             buffer_size: (0, 0),
         });
@@ -3014,6 +3097,12 @@ impl App {
         if w == 0 || h == 0 {
             return;
         }
+        #[cfg(all(feature = "skia", target_os = "ios"))]
+        let direct_skia_present = skia_backend_requested() && cpu_ref.skia_metal.is_some();
+        #[cfg(all(feature = "skia", target_os = "android"))]
+        let direct_skia_present = skia_backend_requested() && cpu_ref.skia_vulkan.is_some();
+        #[cfg(not(all(feature = "skia", any(target_os = "ios", target_os = "android"))))]
+        let direct_skia_present = false;
         let (tile_requests, tile_clients) = self.prepare_compositor_tiles();
         let has_active_animations = !self.animations.is_empty();
         let queued_repaint_mode = std::mem::take(&mut self.repaint_mode);
@@ -3025,9 +3114,19 @@ impl App {
             return;
         }
 
+        // Direct Metal/Vulkan frames never consume the CPU framebuffer. Keep a
+        // one-pixel scratch value for the shared control flow instead of
+        // retaining a full RGBA screen beside the swapchain.
         let mut pixmap = match self.cpu.as_mut().unwrap().framebuffer.take() {
-            Some(existing) if existing.width() == w && existing.height() == h => existing,
-            _ => match Pixmap::new(w, h) {
+            Some(existing)
+                if !direct_skia_present && existing.width() == w && existing.height() == h =>
+            {
+                existing
+            }
+            _ => match Pixmap::new(
+                if direct_skia_present { 1 } else { w },
+                if direct_skia_present { 1 } else { h },
+            ) {
                 Some(p) => p,
                 None => return,
             },
@@ -3035,9 +3134,18 @@ impl App {
 
         let now = Instant::now();
         let flat = self.paint_artifact.nodes.as_slice();
+        let canvas_background = flat
+            .first()
+            .filter(|node| node.style.background.a > 0)
+            .or_else(|| {
+                flat.iter()
+                    .find(|node| node.parent == Some(0) && node.style.background.a > 0)
+            })
+            .map(|node| node.style.background)
+            .unwrap_or(Color::WHITE);
 
         let mut style_overrides = animated_style_overrides(flat, &self.animations, now);
-        if let Some(hover_idx) = self.hovered_index {
+        if !direct_skia_present && let Some(hover_idx) = self.hovered_index {
             if hover_idx < flat.len() {
                 let entry = style_overrides
                     .entry(hover_idx)
@@ -3177,13 +3285,40 @@ impl App {
                         &scroll_info,
                         &self.text_input_values,
                         self.focused_index,
+                        canvas_background,
+                        Some(&self.paint_artifact),
                     )
                 });
         #[cfg(not(all(feature = "skia", target_os = "ios")))]
         let painted_with_skia_metal = false;
 
+        #[cfg(all(feature = "skia", target_os = "android"))]
+        let painted_with_skia_vulkan = skia_backend_requested()
+            && self
+                .cpu
+                .as_mut()
+                .and_then(|cpu| cpu.skia_vulkan.as_mut())
+                .is_some_and(|skia| {
+                    skia.render_frame(
+                        w,
+                        h,
+                        crate::render_skia::ReplayFrame {
+                            nodes: &render_nodes,
+                            metrics_font: &self.font,
+                            scroll_info: &scroll_info,
+                            text_input_values: &self.text_input_values,
+                            focused_index: self.focused_index,
+                            background: canvas_background,
+                            artifact: Some(&self.paint_artifact),
+                        },
+                    )
+                });
+        #[cfg(not(all(feature = "skia", target_os = "android")))]
+        let painted_with_skia_vulkan = false;
+
         #[cfg(feature = "skia")]
         let painted_with_skia_raster = !painted_with_skia_metal
+            && !painted_with_skia_vulkan
             && skia_backend_requested()
             && self
                 .cpu
@@ -3198,6 +3333,8 @@ impl App {
                         &scroll_info,
                         &self.text_input_values,
                         self.focused_index,
+                        canvas_background,
+                        Some(&self.paint_artifact),
                     )
                 })
                 .is_some_and(|rgba| {
@@ -3206,44 +3343,69 @@ impl App {
                 });
         #[cfg(not(feature = "skia"))]
         let painted_with_skia_raster = false;
-        let painted_with_skia = painted_with_skia_metal || painted_with_skia_raster;
+        let painted_with_skia =
+            painted_with_skia_metal || painted_with_skia_vulkan || painted_with_skia_raster;
 
         if painted_with_skia {
             crate::perf::record_paint_path("skia-full");
         } else {
             match repaint_mode {
-            RepaintMode::ScrollOnly(damages) => {
-                let scaled_damages: Vec<(usize, f32)> = damages
-                    .iter()
-                    .map(|damage| (damage.index, damage.delta_y * scale))
-                    .collect();
-                let painted_rects: Vec<(usize, LayoutRect)> = render_nodes
-                    .iter()
-                    .map(|(idx, rect, _, _)| (*idx, *rect))
-                    .collect();
-                if scroll_damage_crosses_stacking_context(
-                    &damages,
-                    &paint_z,
-                    &scaled_scrollable,
-                    &painted_rects,
-                ) {
-                    // Raster-copying moves already-composited pixels. Inside
-                    // an overlay stacking context this can copy the page below
-                    // through translucent list gaps. CPU layers do not yet own
-                    // independent backing stores, so repaint the composed
-                    // overlay frame for correctness.
-                    render_cpu::render_frame(
-                        &mut pixmap,
-                        &render_nodes,
-                        &self.font,
-                        &scroll_info,
-                        &self.text_input_values,
-                        self.focused_index,
-                        &mut self.cpu.as_mut().unwrap().clip_masks,
-                    );
-                    crate::perf::record_paint_path("full-stacking");
-                } else {
-                    let retained = render_cpu::render_scroll_damage(
+                RepaintMode::ScrollOnly(damages) => {
+                    let scaled_damages: Vec<(usize, f32)> = damages
+                        .iter()
+                        .map(|damage| (damage.index, damage.delta_y * scale))
+                        .collect();
+                    let painted_rects: Vec<(usize, LayoutRect)> = render_nodes
+                        .iter()
+                        .map(|(idx, rect, _, _)| (*idx, *rect))
+                        .collect();
+                    if scroll_damage_crosses_stacking_context(
+                        &damages,
+                        &paint_z,
+                        &scaled_scrollable,
+                        &painted_rects,
+                    ) {
+                        // Raster-copying moves already-composited pixels. Inside
+                        // an overlay stacking context this can copy the page below
+                        // through translucent list gaps. CPU layers do not yet own
+                        // independent backing stores, so repaint the composed
+                        // overlay frame for correctness.
+                        render_cpu::render_frame(
+                            &mut pixmap,
+                            &render_nodes,
+                            &self.font,
+                            &scroll_info,
+                            &self.text_input_values,
+                            self.focused_index,
+                            &mut self.cpu.as_mut().unwrap().clip_masks,
+                        );
+                        crate::perf::record_paint_path("full-stacking");
+                    } else {
+                        let retained = render_cpu::render_scroll_damage(
+                            &mut pixmap,
+                            &render_nodes,
+                            &self.font,
+                            &scroll_info,
+                            &self.text_input_values,
+                            self.focused_index,
+                            &scaled_damages,
+                            &scaled_scrollable,
+                            &self.scroll_ancestor,
+                            &mut self.cpu.as_mut().unwrap().clip_masks,
+                        );
+                        crate::perf::record_paint_path(if retained {
+                            "retained-scroll"
+                        } else {
+                            "full-scroll-fallback"
+                        });
+                    }
+                }
+                RepaintMode::ScrollContentChanged(damages) => {
+                    let scaled_damages: Vec<(usize, f32)> = damages
+                        .iter()
+                        .map(|damage| (damage.index, damage.delta_y * scale))
+                        .collect();
+                    let retained = render_cpu::render_scroll_content_change(
                         &mut pixmap,
                         &render_nodes,
                         &self.font,
@@ -3256,53 +3418,42 @@ impl App {
                         &mut self.cpu.as_mut().unwrap().clip_masks,
                     );
                     crate::perf::record_paint_path(if retained {
-                        "retained-scroll"
+                        "retained-content-change"
                     } else {
-                        "full-scroll-fallback"
+                        "full-content-fallback"
                     });
                 }
-            }
-            RepaintMode::ScrollContentChanged(damages) => {
-                let scaled_damages: Vec<(usize, f32)> = damages
-                    .iter()
-                    .map(|damage| (damage.index, damage.delta_y * scale))
-                    .collect();
-                let retained = render_cpu::render_scroll_content_change(
-                    &mut pixmap,
-                    &render_nodes,
-                    &self.font,
-                    &scroll_info,
-                    &self.text_input_values,
-                    self.focused_index,
-                    &scaled_damages,
-                    &scaled_scrollable,
-                    &self.scroll_ancestor,
-                    &mut self.cpu.as_mut().unwrap().clip_masks,
-                );
-                crate::perf::record_paint_path(if retained {
-                    "retained-content-change"
-                } else {
-                    "full-content-fallback"
-                });
-            }
-            RepaintMode::ExternalAfterScroll {
-                scroll_indices,
-                damage_indices,
-            } => {
-                let retained = scroll_indices.len() == 1
-                    && render_cpu::render_damage_nodes(
-                        &mut pixmap,
-                        &render_nodes,
-                        &self.font,
-                        &scroll_info,
-                        &self.text_input_values,
-                        self.focused_index,
-                        &damage_indices,
-                        &mut self.cpu.as_mut().unwrap().clip_masks,
-                    );
-                if retained {
-                    crate::perf::record_paint_path("external-after-scroll");
-                } else {
+                RepaintMode::ExternalAfterScroll {
+                    scroll_indices,
+                    damage_indices,
+                } => {
+                    let retained = scroll_indices.len() == 1
+                        && render_cpu::render_damage_nodes(
+                            &mut pixmap,
+                            &render_nodes,
+                            &self.font,
+                            &scroll_info,
+                            &self.text_input_values,
+                            self.focused_index,
+                            &damage_indices,
+                            &mut self.cpu.as_mut().unwrap().clip_masks,
+                        );
+                    if retained {
+                        crate::perf::record_paint_path("external-after-scroll");
+                    } else {
+                        render_cpu::render_frame(
+                            &mut pixmap,
+                            &render_nodes,
+                            &self.font,
+                            &scroll_info,
+                            &self.text_input_values,
+                            self.focused_index,
+                            &mut self.cpu.as_mut().unwrap().clip_masks,
+                        );
+                        crate::perf::record_paint_path("full-external-fallback");
+                    }
+                }
+                RepaintMode::Full => {
                     render_cpu::render_frame(
                         &mut pixmap,
                         &render_nodes,
@@ -3312,25 +3463,12 @@ impl App {
                         self.focused_index,
                         &mut self.cpu.as_mut().unwrap().clip_masks,
                     );
-                    crate::perf::record_paint_path("full-external-fallback");
+                    crate::perf::record_paint_path(if animation_forced_full {
+                        "full-animation"
+                    } else {
+                        "full"
+                    });
                 }
-            }
-            RepaintMode::Full => {
-                render_cpu::render_frame(
-                    &mut pixmap,
-                    &render_nodes,
-                    &self.font,
-                    &scroll_info,
-                    &self.text_input_values,
-                    self.focused_index,
-                    &mut self.cpu.as_mut().unwrap().clip_masks,
-                );
-                crate::perf::record_paint_path(if animation_forced_full {
-                    "full-animation"
-                } else {
-                    "full"
-                });
-            }
                 RepaintMode::Clean => unreachable!("clean frames return before raster preparation"),
             }
         }
@@ -3343,7 +3481,7 @@ impl App {
                 draw_hover_outline_cpu(&mut pixmap, hit.rect);
             }
         }
-        if let Some(focus_idx) = self.focused_index {
+        if !direct_skia_present && let Some(focus_idx) = self.focused_index {
             if self.hovered_index != Some(focus_idx) {
                 if let Some(node) = flat.get(focus_idx) {
                     if matches!(node.kind, ComponentKind::Button { .. }) {
@@ -3370,14 +3508,16 @@ impl App {
 
         #[cfg(any(feature = "devtools", feature = "ai-bridge"))]
         {
-            crate::frame_cache::store(w, h, pixmap.data().to_vec());
+            if !direct_skia_present {
+                crate::frame_cache::store(w, h, pixmap.data().to_vec());
+            }
         }
 
         if let Some(cpu) = self.cpu.as_mut() {
-            if !painted_with_skia_metal {
+            if !painted_with_skia_metal && !painted_with_skia_vulkan {
                 cpu.present(&pixmap, w, h);
             }
-            cpu.framebuffer = Some(pixmap);
+            cpu.framebuffer = (!direct_skia_present).then_some(pixmap);
             if !self.first_frame_presented {
                 self.first_frame_presented = true;
                 eprintln!("[W3C OS] first frame presented");
@@ -4281,31 +4421,26 @@ impl App {
     }
 
     fn finish_scroll_gesture(&mut self) {
+        // End the compositor-first phase with an explicit main-thread commit.
+        // Android may coalesce all redraw requests from a short injected or
+        // high-velocity gesture into one event delivered after Touch::Ended.
+        // Flushing here ensures that final event paints the current React
+        // interest window instead of the previous overscan window.
+        self.flush_deferred_scroll_commit(false);
         if self.recent_scroll_damage.is_empty() {
             return;
         }
-        let mut scroll_indices = self
-            .recent_scroll_damage
-            .iter()
-            .map(|damage| damage.index)
-            .collect::<Vec<_>>();
-        scroll_indices.sort_unstable();
-        scroll_indices.dedup();
         self.recent_scroll_damage.clear();
-        // React virtualizers can schedule a final commit after the last
-        // scroll callback. During the gesture those commits reuse retained
-        // strip damage; reconcile only fixed pixels outside the already
-        // current scrollport (for example an external visible-row counter).
-        let damage_indices = std::mem::take(&mut self.recent_external_damage_indices);
-        if damage_indices.is_empty() {
-            self.repaint_mode = RepaintMode::Clean;
-        } else {
-            self.repaint_mode = RepaintMode::ExternalAfterScroll {
-                scroll_indices,
-                damage_indices,
-            };
-            self.request_repaint();
-        }
+        self.recent_external_damage_indices.clear();
+        // Direct manipulation uses retained compositor damage, but the
+        // gesture boundary is a main-thread lifecycle checkpoint. Rebuild the
+        // currently mounted virtual window once so variable-height geometry,
+        // child layout and observer measurements cannot leak an intermediate
+        // gesture tree into the settled frame.
+        self.needs_layout = true;
+        self.needs_tree_rebuild = true;
+        self.repaint_mode = RepaintMode::Full;
+        self.request_repaint();
     }
 
     fn queue_scroll_damage(&mut self, index: usize, delta_y: f32) {
@@ -5466,13 +5601,16 @@ fn clamp_sticky_scroll_offset(
 #[cfg(feature = "cpu-render")]
 impl CpuPresenter {
     fn present(&mut self, pixmap: &Pixmap, w: u32, h: u32) {
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
         if self.buffer_size != (w, h) {
             if let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(w), NonZeroU32::new(h)) {
-                let _ = self.surface.resize(w_nz, h_nz);
+                let _ = surface.resize(w_nz, h_nz);
                 self.buffer_size = (w, h);
             }
         }
-        let mut buffer = match self.surface.buffer_mut() {
+        let mut buffer = match surface.buffer_mut() {
             Ok(b) => b,
             Err(_) => return,
         };
@@ -5666,13 +5804,12 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // winit on Android can drop touch wakeups under Wait; keep polling input.
+        // android-activity registers NativeActivity input/window sources with
+        // ALooper, so Wait remains immediately interruptible by touch, resize,
+        // lifecycle and request_redraw wakeups. The old unconditional Poll
+        // path kept android_main at 100% of one core even on a static screen.
         #[cfg(target_os = "android")]
-        {
-            let _ = self.poll_viewport_inset();
-            event_loop.set_control_flow(ControlFlow::Poll);
-            return;
-        }
+        let _ = self.poll_viewport_inset();
 
         // UIKit may swallow the first redraw requested from `resumed` while
         // the CAMetalLayer is still joining the foreground scene. Keep the
@@ -5689,23 +5826,39 @@ impl ApplicationHandler for App {
         let has_animations = !self.animations.is_empty()
             || self.kinetic_scroll.is_some()
             || !self.overscroll_states.is_empty();
+        // Android can coalesce request_redraw() with the redraw currently
+        // being delivered. Keep one immediate turn alive while the renderer
+        // or React still has frame work; after it drains, static screens block
+        // in ALooper again.
+        let has_pending_frame_work = self.get_window().is_some()
+            && (self.deferred_react_scroll_commit
+                || state::is_dirty()
+                || w3cos_react_compat::aot::has_pending_render()
+                || self.needs_layout
+                || !matches!(self.repaint_mode, RepaintMode::Clean));
         let now = Instant::now();
         let animation_deadline = has_animations.then(|| {
             self.last_frame_time.unwrap_or(now)
                 + std::time::Duration::from_millis(ANIMATION_FRAME_INTERVAL_MS)
         });
 
-        // Keep animation cadence anchored to the previous frame start. Using
-        // `now + 16ms` here adds layout/paint time to every interval and can
-        // turn a 60 Hz transition into a visibly uneven 15–30 Hz sequence.
-        // An overdue frame is requested once, then the next paint advances
-        // `last_frame_time`, so Poll cannot become an idle busy loop.
-        if animation_deadline.is_some_and(|deadline| deadline <= now) {
-            self.request_repaint();
-            event_loop.set_control_flow(ControlFlow::Poll);
-            return;
-        }
         let mut timer_deadline = crate::timers::next_deadline();
+        #[cfg(target_os = "android")]
+        if self.focused_index.is_some_and(|index| {
+            matches!(
+                self.get_kind_at(index),
+                Some(ComponentKind::TextInput { .. })
+            )
+        }) || self.viewport.keyboard_inset_bottom > 0.0
+        {
+            let viewport_deadline =
+                now + std::time::Duration::from_millis(ANDROID_VIEWPORT_WATCHDOG_INTERVAL_MS);
+            timer_deadline = Some(
+                timer_deadline
+                    .map(|deadline| deadline.min(viewport_deadline))
+                    .unwrap_or(viewport_deadline),
+            );
+        }
         #[cfg(target_os = "ios")]
         if let Some(retry) = self.ios_ime_retry {
             timer_deadline = Some(
@@ -5738,61 +5891,51 @@ impl ApplicationHandler for App {
         #[cfg(feature = "ai-bridge")]
         let has_devtools = has_devtools || self.ai_bridge_handle.is_some();
 
-        match (has_animations, timer_deadline) {
-            (false, None) => {
-                if has_devtools {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(
-                        Instant::now() + std::time::Duration::from_millis(100),
-                    ));
-                } else {
-                    event_loop.set_control_flow(ControlFlow::Wait);
-                }
+        // Keep animation cadence anchored to the previous frame start. Using
+        // `now + 16ms` here adds layout/paint time to every interval and can
+        // turn a 60 Hz transition into a visibly uneven 15–30 Hz sequence.
+        // An overdue frame requests one immediate turn; static Android frames
+        // now block in ALooper instead of spinning.
+        match event_loop_schedule(
+            now,
+            has_pending_frame_work,
+            has_animations,
+            animation_deadline,
+            timer_deadline,
+            has_devtools,
+        ) {
+            EventLoopSchedule::Poll => {
+                self.request_repaint();
+                event_loop.set_control_flow(ControlFlow::Poll);
             }
-            (true, None) => {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    animation_deadline.expect("active animation has a deadline"),
-                ));
-            }
-            (false, Some(deadline)) => {
-                if has_devtools {
-                    let devtools_deadline = Instant::now() + std::time::Duration::from_millis(100);
-                    event_loop
-                        .set_control_flow(ControlFlow::WaitUntil(deadline.min(devtools_deadline)));
-                } else {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-                }
-            }
-            (true, Some(deadline)) => {
-                let anim_deadline = animation_deadline.expect("active animation has a deadline");
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline.min(anim_deadline)));
+            EventLoopSchedule::Wait => event_loop.set_control_flow(ControlFlow::Wait),
+            EventLoopSchedule::WaitUntil(deadline) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             }
         }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.first_frame_presented = false;
+        // The platform may preserve the Rust application while replacing or
+        // discarding the mobile backing surface. A redraw request alone is
+        // insufficient when the retained document is otherwise clean:
+        // `paint_cpu` returns before replay and the fresh swapchain can expose
+        // undefined/partially preserved pixels. Treat every resume as surface
+        // damage and replay the complete PaintArtifact once.
+        self.repaint_mode = RepaintMode::Full;
 
         #[cfg(target_os = "ios")]
         crate::uitest::maybe_start_server();
 
         #[cfg(all(feature = "gpu", feature = "cpu-render"))]
         {
-            // Android NativeActivity main thread must stay responsive — defer GPU probe.
-            #[cfg(target_os = "android")]
-            {
-                self.ensure_cpu_presenter(event_loop);
-                self.using_gpu = false;
-                crate::perf::set_backend("cpu");
-            }
-            #[cfg(not(target_os = "android"))]
             #[cfg(feature = "skia")]
             let prefer_gpu = !skia_backend_requested()
                 && std::env::var("W3COS_RENDERER").ok().as_deref() != Some("cpu");
             #[cfg(not(feature = "skia"))]
             let prefer_gpu = std::env::var("W3COS_RENDERER").ok().as_deref() != Some("cpu");
-            if prefer_gpu
-                && self.try_init_gpu(event_loop)
-            {
+            if prefer_gpu && self.try_init_gpu(event_loop) {
                 self.using_gpu = true;
                 crate::perf::set_backend("gpu");
                 eprintln!("[W3C OS] renderer backend=gpu");
@@ -5813,7 +5956,19 @@ impl ApplicationHandler for App {
                             "skia-raster"
                         }
                     }
-                    #[cfg(not(target_os = "ios"))]
+                    #[cfg(target_os = "android")]
+                    {
+                        if self
+                            .cpu
+                            .as_ref()
+                            .is_some_and(|cpu| cpu.skia_vulkan.is_some())
+                        {
+                            "skia-vulkan"
+                        } else {
+                            "skia-raster"
+                        }
+                    }
+                    #[cfg(not(any(target_os = "ios", target_os = "android")))]
                     {
                         "skia-raster"
                     }
@@ -5878,6 +6033,22 @@ impl ApplicationHandler for App {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.first_frame_presented = false;
 
+        #[cfg(all(feature = "cpu-render", target_os = "android"))]
+        {
+            // NativeActivity may replace its ANativeWindow after backgrounding.
+            // Drop the Vulkan surface/device with the old window and rebuild
+            // from the fresh raw handle on the next `resumed` callback.
+            self.cpu = None;
+            #[cfg(feature = "skia")]
+            {
+                // Skia owns process-global font/glyph/resource caches in
+                // addition to the per-DirectContext cache. Once the Android
+                // Vulkan context is gone, retaining those entries can make a
+                // later context reuse atlas state backed by the old device.
+                skia_safe::graphics::purge_all_caches();
+            }
+        }
+
         #[cfg(feature = "gpu")]
         {
             if let GpuState::Active { window, .. } =
@@ -5886,6 +6057,30 @@ impl ApplicationHandler for App {
                 self.gpu_state = GpuState::Suspended(Some(window));
             }
         }
+    }
+
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        crate::image_loader::clear_cache();
+        crate::canvas2d::clear_surfaces();
+        crate::text_layout::clear_paint_cache();
+        render_cpu::clear_glyph_cache();
+        #[cfg(any(feature = "devtools", feature = "ai-bridge"))]
+        crate::frame_cache::clear();
+
+        #[cfg(feature = "cpu-render")]
+        if let Some(cpu) = self.cpu.as_mut() {
+            cpu.framebuffer = None;
+            cpu.clip_masks = render_cpu::ClipMaskCache::default();
+            #[cfg(all(feature = "skia", target_os = "android"))]
+            if let Some(vulkan) = cpu.skia_vulkan.as_mut() {
+                vulkan.purge_cached_resources();
+            }
+            #[cfg(feature = "skia")]
+            skia_safe::graphics::purge_all_caches();
+        }
+        eprintln!("[W3C OS] released recreatable resources after memory warning");
+        self.repaint_mode = RepaintMode::Full;
+        self.request_repaint();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -5914,6 +6109,10 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Resized(_size) => {
+                #[cfg(all(feature = "skia", feature = "cpu-render", target_os = "android"))]
+                if let Some(vulkan) = self.cpu.as_mut().and_then(|cpu| cpu.skia_vulkan.as_mut()) {
+                    vulkan.invalidate_swapchain();
+                }
                 #[cfg(feature = "gpu")]
                 {
                     let resize_gpu = {
@@ -5978,7 +6177,15 @@ impl ApplicationHandler for App {
                 self.set_pointer_logical(touch.location.x, touch.location.y);
                 match touch.phase {
                     TouchPhase::Started => {
-                        self.kinetic_scroll = None;
+                        // A new finger interrupts the previous fling. Commit
+                        // its latest scroll offset and React interest window
+                        // before starting the next gesture; dropping the
+                        // kinetic state directly can strand the viewport
+                        // beyond the last mounted overscan window.
+                        if self.kinetic_scroll.take().is_some() {
+                            self.flush_pending_sticky_counters();
+                            self.finish_scroll_gesture();
+                        }
                         self.last_overscroll_tick = None;
                         let now = Instant::now();
                         self.last_touch_y = Some(self.mouse_y);
@@ -6503,6 +6710,49 @@ fn initial_scroll_target_offset(target_y: f32, scrollport_y: f32, max_y: f32) ->
 #[cfg(test)]
 mod scroll_physics_tests {
     use super::*;
+
+    #[test]
+    fn static_event_loop_blocks_without_background_services() {
+        let now = Instant::now();
+        assert_eq!(
+            event_loop_schedule(now, false, false, None, None, false),
+            EventLoopSchedule::Wait
+        );
+    }
+
+    #[test]
+    fn active_animation_uses_deadline_and_only_polls_when_overdue() {
+        let now = Instant::now();
+        let future = now + Duration::from_millis(16);
+        assert_eq!(
+            event_loop_schedule(now, false, true, Some(future), None, false),
+            EventLoopSchedule::WaitUntil(future)
+        );
+        assert_eq!(
+            event_loop_schedule(now, false, true, Some(now), None, false),
+            EventLoopSchedule::Poll
+        );
+    }
+
+    #[test]
+    fn timer_wakeup_preempts_animation_deadline() {
+        let now = Instant::now();
+        let timer = now + Duration::from_millis(5);
+        let animation = now + Duration::from_millis(16);
+        assert_eq!(
+            event_loop_schedule(now, false, true, Some(animation), Some(timer), false),
+            EventLoopSchedule::WaitUntil(timer)
+        );
+    }
+
+    #[test]
+    fn pending_frame_work_keeps_one_immediate_turn_alive() {
+        let now = Instant::now();
+        assert_eq!(
+            event_loop_schedule(now, true, false, None, None, false),
+            EventLoopSchedule::Poll
+        );
+    }
 
     #[test]
     fn deferred_virtualizer_checkpoint_advances_before_one_viewport() {

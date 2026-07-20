@@ -81,9 +81,9 @@ impl GlyphCache {
         let key = (ch, Self::quantize(font_size));
         *self.entries.entry(key).or_insert_with(|| {
             if let Some(glyph_id) = charmap.map(ch) {
-                let advance = glyph_metrics.advance_width(glyph_id).unwrap_or_else(|| {
-                    fontdue_font.metrics(ch, font_size).advance_width
-                });
+                let advance = glyph_metrics
+                    .advance_width(glyph_id)
+                    .unwrap_or_else(|| fontdue_font.metrics(ch, font_size).advance_width);
                 GlyphEntry {
                     glyph_id: Some(glyph_id.to_u32()),
                     advance,
@@ -223,8 +223,7 @@ impl GlyphCache {
 
     fn evict_display_chunks(&mut self, incoming_bytes: usize) {
         while !self.display_chunks.is_empty()
-            && self.display_chunk_bytes.saturating_add(incoming_bytes)
-                > DISPLAY_CHUNK_BUDGET_BYTES
+            && self.display_chunk_bytes.saturating_add(incoming_bytes) > DISPLAY_CHUNK_BUDGET_BYTES
         {
             let Some(victim) = self
                 .display_chunks

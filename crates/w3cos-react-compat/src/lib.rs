@@ -69,13 +69,16 @@ pub mod aot {
 
     thread_local! {
         static NEXT_AOT_COMPONENT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-        static NEXT_HOST_ELEMENT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+        static NEXT_HOST_ORDINALS: std::cell::RefCell<HashMap<u64, u64>> = std::cell::RefCell::new(HashMap::new());
         static AOT_COMPONENT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static CURRENT_AOT_COMPONENT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
         static DIRTY_AOT_COMPONENTS: std::cell::RefCell<HashSet<u64>> = std::cell::RefCell::new(HashSet::new());
         static DIRTY_AOT_ANCESTORS: std::cell::RefCell<HashSet<u64>> = std::cell::RefCell::new(HashSet::new());
+        static ACTIVE_AOT_COMPONENTS: std::cell::RefCell<HashSet<u64>> = std::cell::RefCell::new(HashSet::new());
+        static LAST_AOT_COMPONENTS: std::cell::RefCell<HashSet<u64>> = std::cell::RefCell::new(HashSet::new());
         static COMPONENT_PARENTS: std::cell::RefCell<HashMap<u64, Option<u64>>> = std::cell::RefCell::new(HashMap::new());
         static MEMO_BAILOUT_COMPONENTS: std::cell::RefCell<HashSet<u64>> = std::cell::RefCell::new(HashSet::new());
+        static MEMO_INSTANCES: std::cell::RefCell<HashMap<u64, (Value, Value)>> = std::cell::RefCell::new(HashMap::new());
         static COMPONENT_INPUT_CACHE: std::cell::RefCell<HashMap<u64, Value>> = std::cell::RefCell::new(HashMap::new());
         static COMPONENT_VALUE_CACHE: std::cell::RefCell<HashMap<u64, Value>> = std::cell::RefCell::new(HashMap::new());
         static COMPONENT_OUTPUT_CACHE: std::cell::RefCell<HashMap<u64, (Option<Style>, Vec<Component>)>> = std::cell::RefCell::new(HashMap::new());
@@ -139,15 +142,112 @@ pub mod aot {
 
     pub fn render_to_component(value: Value) -> Component {
         NEXT_AOT_COMPONENT.with(|next| next.set(1));
-        NEXT_HOST_ELEMENT.with(|next| next.set(1));
+        NEXT_HOST_ORDINALS.with(|ordinals| ordinals.borrow_mut().clear());
         MEMO_BAILOUT_COMPONENTS.with(|components| components.borrow_mut().clear());
+        ACTIVE_AOT_COMPONENTS.with(|components| components.borrow_mut().clear());
         let mut rendered = render_children(value, None, 0xcbf2_9ce4_8422_2325, 0, false, None);
         DIRTY_AOT_COMPONENTS.with(|components| components.borrow_mut().clear());
-        flush_pending_effects();
-        if rendered.len() == 1 {
+        let component = if rendered.len() == 1 {
             rendered.pop().unwrap()
         } else {
             Component::root(rendered)
+        };
+        prune_unmounted(&component);
+        flush_pending_effects();
+        component
+    }
+
+    fn prune_unmounted(root: &Component) {
+        let active_components =
+            ACTIVE_AOT_COMPONENTS.with(|components| components.borrow().clone());
+        let previous_components = LAST_AOT_COMPONENTS.with(|components| {
+            std::mem::replace(&mut *components.borrow_mut(), active_components.clone())
+        });
+        for component_id in previous_components.difference(&active_components).copied() {
+            super::unmount(super::ComponentId(component_id));
+        }
+        COMPONENT_PARENTS.with(|parents| {
+            parents
+                .borrow_mut()
+                .retain(|component_id, _| active_components.contains(component_id));
+        });
+        for cache in [&COMPONENT_INPUT_CACHE, &COMPONENT_VALUE_CACHE] {
+            cache.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .retain(|component_id, _| active_components.contains(component_id));
+            });
+        }
+        COMPONENT_OUTPUT_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .retain(|component_id, _| active_components.contains(component_id));
+        });
+        MEMO_INSTANCES.with(|instances| {
+            instances
+                .borrow_mut()
+                .retain(|component_id, _| active_components.contains(component_id));
+        });
+
+        let mut active_hosts = HashSet::new();
+        collect_host_ids(root, &mut active_hosts);
+        HOST_ELEMENTS.with(|elements| {
+            elements
+                .borrow_mut()
+                .retain(|host_id, _| active_hosts.contains(host_id));
+        });
+        HOST_STYLE_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .retain(|host_id, _| active_hosts.contains(host_id));
+        });
+        SCROLL_REQUESTS.with(|requests| {
+            requests
+                .borrow_mut()
+                .retain(|host_id, _| active_hosts.contains(host_id));
+        });
+        for listeners in [
+            &SCROLL_LISTENERS,
+            &SCROLL_PROP_LISTENERS,
+            &CLICK_LISTENERS,
+            &INPUT_LISTENERS,
+            &CHANGE_LISTENERS,
+            &BEFORE_INPUT_LISTENERS,
+            &COMPOSITION_START_LISTENERS,
+            &COMPOSITION_UPDATE_LISTENERS,
+            &COMPOSITION_END_LISTENERS,
+            &FOCUS_LISTENERS,
+            &BLUR_LISTENERS,
+            &KEYDOWN_LISTENERS,
+            &KEYUP_LISTENERS,
+            &SUBMIT_LISTENERS,
+            &POINTER_DOWN_LISTENERS,
+            &POINTER_UP_LISTENERS,
+            &POINTER_MOVE_LISTENERS,
+            &POINTER_ENTER_LISTENERS,
+            &POINTER_LEAVE_LISTENERS,
+            &POINTER_CANCEL_LISTENERS,
+            &MOUSE_DOWN_LISTENERS,
+            &MOUSE_UP_LISTENERS,
+            &MOUSE_MOVE_LISTENERS,
+            &MOUSE_ENTER_LISTENERS,
+            &MOUSE_LEAVE_LISTENERS,
+            &WHEEL_LISTENERS,
+        ] {
+            listeners.with(|listeners| {
+                listeners
+                    .borrow_mut()
+                    .retain(|host_id, _| active_hosts.contains(host_id));
+            });
+        }
+    }
+
+    fn collect_host_ids(component: &Component, host_ids: &mut HashSet<u64>) {
+        if let w3cos_std::EventAction::NativeHost { id, .. } = component.on_click {
+            host_ids.insert(id);
+        }
+        for child in &component.children {
+            collect_host_ids(child, host_ids);
         }
     }
 
@@ -715,6 +815,7 @@ pub mod aot {
                         })
                     });
                     let id = super::ComponentId(id);
+                    ACTIVE_AOT_COMPONENTS.with(|components| components.borrow_mut().insert(id.0));
                     COMPONENT_PARENTS
                         .with(|parents| parents.borrow_mut().insert(id.0, owner_component));
                     let dirty =
@@ -735,6 +836,7 @@ pub mod aot {
                             COMPONENT_OUTPUT_CACHE.with(|cache| cache.borrow().get(&id.0).cloned())
                         && cached_inherited.as_ref() == inherited
                     {
+                        preserve_cached_component_subtree(id.0);
                         return cached;
                     }
                     let cached = (!ancestor_rendered && !dirty && inputs_unchanged)
@@ -773,6 +875,7 @@ pub mod aot {
                             COMPONENT_OUTPUT_CACHE.with(|cache| cache.borrow().get(&id.0).cloned())
                         && cached_inherited.as_ref() == inherited
                     {
+                        preserve_cached_component_subtree(id.0);
                         return cached;
                     }
                     let components = render_children(
@@ -802,13 +905,7 @@ pub mod aot {
                 }
                 let element_type_string = element_type.to_js_string();
                 let host_id = stable_keyed_id(scope_id, &element_type_string, &props)
-                    .unwrap_or_else(|| {
-                        NEXT_HOST_ELEMENT.with(|next| {
-                            let id = next.get();
-                            next.set(id + 1);
-                            id
-                        })
-                    });
+                    .unwrap_or_else(|| next_scoped_host_id(scope_id, &element_type_string));
                 let cached_style = (!ancestor_rendered)
                     .then(|| {
                         HOST_STYLE_CACHE.with(|cache| {
@@ -1098,6 +1195,24 @@ pub mod aot {
         }
     }
 
+    fn preserve_cached_component_subtree(root_id: u64) {
+        let parents = COMPONENT_PARENTS.with(|parents| parents.borrow().clone());
+        let previous = LAST_AOT_COMPONENTS.with(|components| components.borrow().clone());
+        ACTIVE_AOT_COMPONENTS.with(|active| {
+            let mut active = active.borrow_mut();
+            for component_id in previous {
+                let mut current = Some(component_id);
+                while let Some(id) = current {
+                    if id == root_id {
+                        active.insert(component_id);
+                        break;
+                    }
+                    current = parents.get(&id).copied().flatten();
+                }
+            }
+        });
+    }
+
     fn stable_keyed_id(scope_id: u64, element_type: &str, props: &Value) -> Option<u64> {
         let key = props.get_property("key");
         (!key.is_nullish()).then(|| {
@@ -1107,6 +1222,26 @@ pub mod aot {
             key.to_js_string().hash(&mut hasher);
             hasher.finish()
         })
+    }
+
+    fn next_scoped_host_id(scope_id: u64, element_type: &str) -> u64 {
+        let ordinal = NEXT_HOST_ORDINALS.with(|ordinals| {
+            let mut ordinals = ordinals.borrow_mut();
+            let ordinal = ordinals.entry(scope_id).or_default();
+            let current = *ordinal;
+            *ordinal += 1;
+            current
+        });
+        let mut hasher = DefaultHasher::new();
+        // Keep unkeyed Host identity local to its owning component/Host scope,
+        // matching React's positional reconciliation. A global preorder id
+        // lets a removed virtual row donate its DOM identity (and observers)
+        // to an unrelated spacer that later occupies the same traversal slot.
+        0x5743_4f53_484f_5354_u64.hash(&mut hasher);
+        scope_id.hash(&mut hasher);
+        element_type.hash(&mut hasher);
+        ordinal.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn value_shape(value: &Value) -> String {
@@ -2080,9 +2215,6 @@ pub mod aot {
     }
 
     pub fn memo(component: Value, compare: Value) -> Value {
-        let instances = Rc::new(std::cell::RefCell::new(
-            HashMap::<u64, (Value, Value)>::new(),
-        ));
         Value::function(move |_, arguments| {
             let props = arguments.first().cloned().unwrap_or_else(crate::aot_object);
             let component_id = CURRENT_AOT_COMPONENT.with(std::cell::Cell::get);
@@ -2092,7 +2224,7 @@ pub mod aot {
             if let Some(component_id) = component_id
                 && !dirty
                 && let Some((previous_props, previous_output)) =
-                    instances.borrow().get(&component_id).cloned()
+                    MEMO_INSTANCES.with(|instances| instances.borrow().get(&component_id).cloned())
             {
                 let equal = if compare.is_function() {
                     compare
@@ -2114,9 +2246,11 @@ pub mod aot {
             if let Some(component_id) = component_id {
                 MEMO_BAILOUT_COMPONENTS
                     .with(|components| components.borrow_mut().remove(&component_id));
-                instances
-                    .borrow_mut()
-                    .insert(component_id, (props, output.clone()));
+                MEMO_INSTANCES.with(|instances| {
+                    instances
+                        .borrow_mut()
+                        .insert(component_id, (props, output.clone()));
+                });
             }
             output
         })
@@ -2996,6 +3130,67 @@ pub mod aot {
 
             assert_eq!(host_id(&first.children[0]), host_id(&second.children[1]));
             assert_eq!(host_id(&first.children[1]), host_id(&second.children[0]));
+        }
+
+        #[test]
+        fn unkeyed_host_inside_keyed_component_keeps_owner_identity() {
+            let row = Value::function(|_, arguments| {
+                let props = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let host_props = crate::aot_object();
+                host_props.set_property("children", props.get_property("label"));
+                createElement(vec![Value::from("div"), host_props])
+            });
+            let keyed_row = |key: &str, label: &str| {
+                let props = crate::aot_object();
+                props.set_property("label", Value::from(label));
+                call_host(
+                    "react/jsx-runtime::jsx",
+                    vec![row.clone(), props, Value::from(key)],
+                )
+            };
+            let first =
+                render_to_component(Value::array(vec![keyed_row("a", "A"), keyed_row("b", "B")]));
+            let second =
+                render_to_component(Value::array(vec![keyed_row("b", "B"), keyed_row("a", "A")]));
+            let host_id = |component: &Component| match component.on_click {
+                EventAction::NativeHost { id, .. } => id,
+                _ => panic!("component did not render a native Host"),
+            };
+
+            assert_eq!(host_id(&first.children[0]), host_id(&second.children[1]));
+            assert_eq!(host_id(&first.children[1]), host_id(&second.children[0]));
+            assert_ne!(host_id(&first.children[0]), host_id(&first.children[1]));
+        }
+
+        #[test]
+        fn unmounted_keyed_subtrees_are_pruned_from_host_and_hook_caches() {
+            let row = Value::function(|_, arguments| {
+                let props = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let _state = useState(Value::Number(0.0));
+                createElement(vec![
+                    Value::from("div"),
+                    crate::aot_object(),
+                    props.get_property("label"),
+                ])
+            });
+            let keyed_row = |key: &str| {
+                let props = crate::aot_object();
+                props.set_property("label", Value::from(key));
+                call_host(
+                    "react/jsx-runtime::jsx",
+                    vec![row.clone(), props, Value::from(key)],
+                )
+            };
+
+            for index in 0..100 {
+                render_to_component(keyed_row(&format!("row-{index}")));
+                assert_eq!(HOST_ELEMENTS.with(|elements| elements.borrow().len()), 1);
+                assert_eq!(super::super::mounted_count(), 1);
+            }
+
+            render_to_component(Value::Null);
+            assert_eq!(HOST_ELEMENTS.with(|elements| elements.borrow().len()), 0);
+            assert_eq!(super::super::mounted_count(), 0);
         }
 
         #[test]
