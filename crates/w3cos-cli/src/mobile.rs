@@ -117,8 +117,8 @@ pub fn mobile_build(
     }
 
     let build_dir = project_dir.join(".w3cos/mobile-build");
-    if build_dir.exists() {
-        fs::remove_dir_all(&build_dir)?;
+    if build_dir.join("src").exists() {
+        fs::remove_dir_all(build_dir.join("src"))?;
     }
     fs::create_dir_all(&build_dir)?;
 
@@ -135,6 +135,9 @@ pub fn mobile_build(
         &interactive_widget,
         &CompileOptions { devtools },
     )?;
+    if platform == "ios" {
+        apply_native_extensions(project_dir, &build_dir)?;
+    }
 
     match platform {
         "android" => build_android(project_dir, &build_dir, release)?,
@@ -458,6 +461,151 @@ fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, Strin
     )
 }
 
+fn manifest_json(project_dir: &Path) -> Option<serde_json::Value> {
+    fs::read_to_string(project_dir.join("w3cos.app.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
+fn safe_cargo_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn safe_rust_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+}
+
+/// Adds application-owned Rust adapters after generic UI code generation.
+/// W3COS only validates and wires the declared dependency + initializer.
+fn apply_native_extensions(project_dir: &Path, build_dir: &Path) -> Result<()> {
+    let Some(manifest) = manifest_json(project_dir) else {
+        return Ok(());
+    };
+    let Some(extensions) = manifest
+        .get("native_extensions")
+        .and_then(|value| value.as_array())
+    else {
+        return Ok(());
+    };
+    let mut dependencies = String::new();
+    let mut registrations = String::new();
+    for extension in extensions {
+        let package = extension
+            .get("package")
+            .and_then(|value| value.as_str())
+            .context("native_extensions[].package must be a string")?;
+        let path = extension
+            .get("path")
+            .and_then(|value| value.as_str())
+            .context("native_extensions[].path must be a string")?;
+        let register = extension
+            .get("register")
+            .and_then(|value| value.as_str())
+            .context("native_extensions[].register must be a Rust function path")?;
+        if !safe_cargo_name(package) || !safe_rust_path(register) {
+            bail!("invalid native extension package or register path");
+        }
+        let dependency_path = project_dir
+            .join(path)
+            .canonicalize()
+            .with_context(|| format!("locate native extension {path}"))?;
+        let features = extension
+            .get("features")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        let feature = value
+                            .as_str()
+                            .context("native extension feature must be a string")?;
+                        if !safe_cargo_name(feature) {
+                            bail!("invalid native extension feature: {feature}");
+                        }
+                        Ok(format!("\"{feature}\""))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        dependencies.push_str(&format!(
+            "\n{package} = {{ path = {:?}, features = [{}] }}",
+            dependency_path,
+            features.join(", ")
+        ));
+        registrations.push_str(&format!("    {register}();\n"));
+    }
+    if dependencies.is_empty() {
+        return Ok(());
+    }
+    let cargo_path = build_dir.join("Cargo.toml");
+    let mut cargo = fs::read_to_string(&cargo_path)?;
+    cargo.push_str(&dependencies);
+    cargo.push('\n');
+    fs::write(cargo_path, cargo)?;
+
+    let main_path = build_dir.join("src/main.rs");
+    let main = fs::read_to_string(&main_path)?;
+    let marker = "fn main() {\n";
+    if !main.contains(marker) {
+        bail!("generated iOS main has no registration point");
+    }
+    fs::write(
+        main_path,
+        main.replacen(marker, &format!("{marker}{registrations}"), 1),
+    )?;
+    Ok(())
+}
+
+fn copy_manifest_resources(project_dir: &Path, app_bundle: &Path) -> Result<()> {
+    let Some(manifest) = manifest_json(project_dir) else {
+        return Ok(());
+    };
+    let Some(resources) = manifest.get("resources").and_then(|value| value.as_array()) else {
+        return Ok(());
+    };
+    for resource in resources {
+        let source = resource
+            .get("source")
+            .and_then(|value| value.as_str())
+            .context("resources[].source must be a string")?;
+        let destination = resource
+            .get("destination")
+            .and_then(|value| value.as_str())
+            .context("resources[].destination must be a string")?;
+        if destination.is_empty()
+            || Path::new(destination).is_absolute()
+            || Path::new(destination)
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("resource destination must stay inside the app bundle");
+        }
+        let source = project_dir.join(source);
+        if source.is_dir() {
+            copy_dir_recursive(&source, &app_bundle.join(destination))?;
+        } else if source.is_file() {
+            let destination = app_bundle.join(destination);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source, destination)?;
+        } else {
+            bail!("missing manifest resource: {}", source.display());
+        }
+    }
+    Ok(())
+}
+
 fn write_ios_plist(
     path: &Path,
     display_name: &str,
@@ -576,6 +724,7 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         &bundle_id,
         &permissions,
     )?;
+    copy_manifest_resources(project_dir, &app_bundle)?;
     println!(
         "✅ iOS app bundle: {} ({})",
         app_bundle.display(),

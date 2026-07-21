@@ -268,12 +268,13 @@ impl Value {
             }
             Value::String(s) => {
                 if let Ok(idx) = key.parse::<usize>() {
-                    s.chars()
+                    s.encode_utf16()
                         .nth(idx)
-                        .map(|c| Value::String(c.to_string()))
+                        .and_then(|unit| String::from_utf16(&[unit]).ok())
+                        .map(Value::String)
                         .unwrap_or(Value::Undefined)
                 } else if key == "length" {
-                    Value::Number(s.len() as f64)
+                    Value::Number(s.encode_utf16().count() as f64)
                 } else {
                     Value::Undefined
                 }
@@ -377,6 +378,25 @@ impl Value {
                     args.first()
                         .is_some_and(|suffix| value.ends_with(&suffix.to_js_string())),
                 );
+            }
+            (Value::String(value), "slice") => {
+                let units = value.encode_utf16().collect::<Vec<_>>();
+                let length = units.len() as i64;
+                let normalize = |argument: Option<&Value>, fallback: i64| {
+                    let raw = argument
+                        .map(Value::to_number)
+                        .filter(|number| number.is_finite())
+                        .map(|number| number.trunc() as i64)
+                        .unwrap_or(fallback);
+                    if raw < 0 {
+                        (length + raw).max(0) as usize
+                    } else {
+                        raw.min(length) as usize
+                    }
+                };
+                let start = normalize(args.first(), 0);
+                let end = normalize(args.get(1), length).max(start);
+                return Value::String(String::from_utf16_lossy(&units[start..end]));
             }
             (Value::Array(values), "filter") => {
                 let predicate = args.first().cloned().unwrap_or(Value::Undefined);
@@ -846,6 +866,21 @@ mod tests {
         let s = Value::String("hello".into());
         assert_eq!(s.get_property("length").to_number(), 5.0);
         assert_eq!(s.get_property("0").to_js_string(), "h");
+
+        let chinese = Value::String("请提前到达，卸货前联系我".into());
+        assert_eq!(chinese.get_property("length").to_number(), 12.0);
+        assert_eq!(
+            chinese
+                .call_method("slice", vec![Value::Number(0.0), Value::Number(6.0)])
+                .to_js_string(),
+            "请提前到达，",
+        );
+        assert_eq!(
+            chinese
+                .call_method("slice", vec![Value::Number(-6.0)])
+                .to_js_string(),
+            "卸货前联系我",
+        );
     }
 
     #[test]

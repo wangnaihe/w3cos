@@ -123,6 +123,9 @@ pub mod aot {
     }
 
     pub fn call_host(path: &str, arguments: Vec<Value>) -> Value {
+        if path == "w3cos_core::host::invoke" {
+            return w3cos_core::host::invoke(arguments);
+        }
         let argument = |index| arguments.get(index).cloned().unwrap_or(Value::Undefined);
         match path.rsplit("::").next().unwrap_or(path) {
             "useState" => useState(argument(0)),

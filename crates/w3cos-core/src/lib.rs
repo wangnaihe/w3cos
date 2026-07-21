@@ -1,4 +1,5 @@
 mod builtins;
+pub mod host;
 mod object;
 mod proxy;
 mod reactive;

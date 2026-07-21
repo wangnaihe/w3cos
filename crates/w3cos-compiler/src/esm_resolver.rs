@@ -448,6 +448,7 @@ fn host_import_path(source: &str, imported: &str) -> Option<&'static str> {
         ("react/jsx-runtime", "jsx") => Some("w3cos_react_compat::aot::jsx"),
         ("react/jsx-runtime", "jsxs") => Some("w3cos_react_compat::aot::jsxs"),
         ("react/jsx-runtime", "Fragment") => Some("w3cos_react_compat::aot::Fragment"),
+        ("w3cos/native", "invoke") => Some("w3cos_core::host::invoke"),
         _ => None,
     }
 }
@@ -597,7 +598,7 @@ impl EsmResolver {
 
         for import in imports {
             // CSS and other non-code assets are part of the asset pipeline, not this JS graph.
-            if is_asset_import(&import) {
+            if is_asset_import(&import) || is_host_module(&import) {
                 continue;
             }
             let resolved = self.resolve(&import, from_dir)?;
@@ -706,6 +707,10 @@ impl EsmResolver {
 
         Err(anyhow!("Could not resolve path {}", candidate.display()))
     }
+}
+
+fn is_host_module(specifier: &str) -> bool {
+    matches!(specifier, "react" | "react/jsx-runtime" | "w3cos/native")
 }
 
 fn resolve_exports_root(exports: &Value) -> Option<String> {
@@ -1034,6 +1039,30 @@ export { EditorState } from '@codemirror/state';
             imports,
             vec!["@codemirror/view", "./theme.css", "@codemirror/state"]
         );
+    }
+
+    #[test]
+    fn resolves_native_invoke_as_a_host_import_without_an_npm_package() {
+        let root = fixture_root("w3cos_esm_native_host_import");
+        let entry = root.join("app.ts");
+        std::fs::write(
+            &entry,
+            r#"import { invoke } from "w3cos/native";
+export function main() { return invoke("example", "ping"); }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        assert_eq!(bundle.modules.len(), 1);
+        assert_eq!(
+            bundle.modules[0].host_imports,
+            vec![("invoke".into(), "w3cos_core::host::invoke".into())]
+        );
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
