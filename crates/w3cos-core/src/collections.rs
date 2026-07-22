@@ -32,7 +32,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::Value;
 
@@ -481,10 +481,10 @@ pub fn weak_set_class() -> Value {
 pub fn typed_array_class() -> Value {
     Value::callable(HashMap::new(), |_this, args| {
         let Some(first) = args.first() else {
-            return Value::array(Vec::new());
+            return typed_array_value(Vec::new());
         };
         if first.is_number() {
-            return Value::array(vec![
+            return typed_array_value(vec![
                 Value::Number(0.0);
                 first.to_number().max(0.0) as usize
             ]);
@@ -496,7 +496,33 @@ pub fn typed_array_class() -> Value {
             .map(Value::to_number)
             .map(|len| len.max(0.0) as usize)
             .unwrap_or_else(|| values.len().saturating_sub(start));
-        Value::array(values.into_iter().skip(start).take(len).collect())
+        typed_array_value(values.into_iter().skip(start).take(len).collect())
+    })
+}
+
+thread_local! {
+    static TYPED_ARRAYS: RefCell<Vec<Weak<RefCell<Vec<Value>>>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn typed_array_value(values: Vec<Value>) -> Value {
+    let value = Value::array(values);
+    if let Value::Array(storage) = &value {
+        TYPED_ARRAYS.with(|arrays| arrays.borrow_mut().push(Rc::downgrade(storage)));
+    }
+    value
+}
+
+pub fn is_typed_array(value: &Value) -> bool {
+    let Value::Array(candidate) = value else {
+        return false;
+    };
+    TYPED_ARRAYS.with(|arrays| {
+        let mut arrays = arrays.borrow_mut();
+        arrays.retain(|array| array.strong_count() > 0);
+        arrays
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|array| Rc::ptr_eq(&array, candidate))
     })
 }
 

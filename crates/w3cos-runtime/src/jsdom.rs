@@ -3594,6 +3594,14 @@ fn build_window_value() -> Value {
     props.insert("crypto".to_string(), crypto_value());
     props.insert("localStorage".to_string(), storage_value(true));
     props.insert("sessionStorage".to_string(), storage_value(false));
+    props.insert(
+        "indexedDB".to_string(),
+        crate::indexed_db_web::factory_value(),
+    );
+    props.insert(
+        "IDBKeyRange".to_string(),
+        crate::indexed_db_web::key_range_constructor_value(),
+    );
     props.insert("closed".to_string(), Value::Bool(false));
     props.insert("isSecureContext".to_string(), Value::Bool(true));
     props.insert("crossOriginIsolated".to_string(), Value::Bool(false));

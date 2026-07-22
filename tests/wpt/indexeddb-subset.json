@@ -1,0 +1,19 @@
+{
+  "upstream": "https://github.com/web-platform-tests/wpt",
+  "revision": "f64f3e13f0c456553639fd5c30a438204cc5dfe3",
+  "mode": "adapted-assertions",
+  "tests": [
+    { "path": "IndexedDB/idbfactory_open.any.js", "rust_test": "standard_open_upgrade_put_and_get_are_request_driven", "status": "covered" },
+    { "path": "IndexedDB/idbfactory_cmp.any.js", "rust_test": "compound_paths_dates_clone_values_and_schema_mutation_follow_the_web_surface", "status": "covered" },
+    { "path": "IndexedDB/get-databases.any.js", "rust_test": "compound_paths_dates_clone_values_and_schema_mutation_follow_the_web_surface", "status": "covered" },
+    { "path": "IndexedDB/idbdatabase_createObjectStore.any.js", "rust_test": "compound_paths_dates_clone_values_and_schema_mutation_follow_the_web_surface", "status": "covered" },
+    { "path": "IndexedDB/idbdatabase_deleteObjectStore.any.js", "rust_test": "compound_paths_dates_clone_values_and_schema_mutation_follow_the_web_surface", "status": "covered" },
+    { "path": "IndexedDB/idbindex-multientry.any.js", "rust_test": "indexes_support_options_queries_and_unique_cursors", "status": "covered" },
+    { "path": "IndexedDB/idbcursor-reused.any.js", "rust_test": "cursor_reuses_its_request_across_continue_and_advance", "status": "covered" },
+    { "path": "IndexedDB/idbcursor-direction-index.any.js", "rust_test": "indexes_support_options_queries_and_unique_cursors", "status": "covered" },
+    { "path": "IndexedDB/delete-range.any.js", "rust_test": "key_ranges_filter_count_limit_and_delete", "status": "covered" },
+    { "path": "IndexedDB/error-attributes.any.js", "rust_test": "request_errors_reach_transaction_and_database_before_abort", "status": "covered" },
+    { "path": "IndexedDB/event-dispatch-active-flag.any.js", "rust_test": "preventing_a_request_error_keeps_the_transaction_alive", "status": "covered" },
+    { "path": "IndexedDB/abort-in-initial-upgradeneeded.any.js", "rust_test": "aborting_the_initial_versionchange_leaves_no_partial_schema", "status": "covered" }
+  ]
+}

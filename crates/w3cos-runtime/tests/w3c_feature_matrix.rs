@@ -77,7 +77,7 @@ fn indexed_db_put_get_delete() {
         .unwrap();
     let store = tx.object_store("items").unwrap();
     let key = store.put(json!({"id": 1, "label": "hello"})).unwrap();
-    assert_eq!(key, "1");
+    assert_eq!(key, json!(1));
 
     let got = store.get(&json!(1)).unwrap().unwrap();
     assert_eq!(got["label"], "hello");

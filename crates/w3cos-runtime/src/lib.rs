@@ -20,6 +20,8 @@ pub mod gpu_filter;
 pub mod history;
 pub mod image_loader;
 pub mod indexed_db;
+mod indexed_db_sqlite;
+pub mod indexed_db_web;
 #[cfg(target_os = "ios")]
 mod ios_input;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]

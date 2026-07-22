@@ -2606,7 +2606,29 @@ export function timerFire() {
   queueMicrotask(() => { firedLog += "M"; });
   return "armed";
 }
-export function getFired() { return firedLog; }"#,
+export function getFired() { return firedLog; }
+export function idbShape() { return typeof indexedDB + ":" + typeof indexedDB.open; }
+export function keyRangeShape() { return typeof IDBKeyRange + ":" + typeof IDBKeyRange.bound; }
+let idbLog = "";
+export function startIdb() {
+  const request = indexedDB.open("compiler-smoke", 1);
+  request.onupgradeneeded = () => {
+    request.result.createObjectStore("items", { keyPath: "id" });
+    idbLog += "U";
+  };
+  request.onsuccess = () => {
+    idbLog += "S";
+    const write = request.result.transaction("items", "readwrite");
+    const put = write.objectStore("items").put({ id: "one", text: "offline" });
+    put.onsuccess = () => {
+      const read = request.result.transaction("items", "readonly");
+      const get = read.objectStore("items").get("one");
+      get.onsuccess = () => { idbLog += get.result.text; };
+    };
+  };
+  return request.readyState;
+}
+export function getIdbLog() { return idbLog; }"#,
         )
         .unwrap();
 
@@ -2647,6 +2669,25 @@ fn main() {
         matches!(&r, w3cos_core::Value::String(s) if s == "object:object:object"),
         "document/window/self: {r:?}"
     );
+    let r = m0::m0_idbShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "object:function"),
+        "indexedDB global: {r:?}"
+    );
+    let r = m0::m0_keyRangeShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "object:function"),
+        "IDBKeyRange global: {r:?}"
+    );
+    let idb_dir = std::env::temp_dir().join(format!("w3cos-generated-idb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&idb_dir);
+    std::fs::create_dir_all(&idb_dir).unwrap();
+    w3cos_runtime::indexed_db::set_base_dir(idb_dir);
+    let r = m0::m0_startIdb(vec![]);
+    assert!(matches!(&r, w3cos_core::Value::String(s) if s == "pending"), "IDB request starts pending: {r:?}");
+    w3cos_runtime::jsdom::drain_microtasks();
+    let r = m0::m0_getIdbLog(vec![]);
+    assert!(matches!(&r, w3cos_core::Value::String(s) if s == "USoffline"), "IDB upgrade/CRUD events: {r:?}");
     let r = m0::m0_timerFire(vec![]);
     assert!(matches!(&r, w3cos_core::Value::String(s) if s == "armed"), "timerFire: {r:?}");
     // Microtasks drain before timers tick.

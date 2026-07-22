@@ -61,6 +61,52 @@ pub fn text_decoder_class() -> Value {
     })
 }
 
+/// Compact `Date` constructor used by the native JavaScript runtime. Date
+/// instances keep their epoch milliseconds in a non-standard internal slot;
+/// Web APIs such as IndexedDB recognize the slot while applications interact
+/// through standard Date methods.
+pub fn date_class() -> Value {
+    Value::callable(
+        HashMap::from([(
+            "now".into(),
+            Value::function(|_, _| {
+                Value::Number(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_secs_f64() * 1000.0)
+                        .unwrap_or(f64::NAN),
+                )
+            }),
+        )]),
+        |_this, args| {
+            let milliseconds = args.first().map(Value::to_number).unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs_f64() * 1000.0)
+                    .unwrap_or(f64::NAN)
+            });
+            date_value(milliseconds)
+        },
+    )
+}
+
+pub fn date_value(milliseconds: f64) -> Value {
+    Value::object(HashMap::from([
+        (
+            "__w3cos_date_milliseconds".into(),
+            Value::Number(milliseconds),
+        ),
+        (
+            "getTime".into(),
+            Value::function(move |_, _| Value::Number(milliseconds)),
+        ),
+        (
+            "valueOf".into(),
+            Value::function(move |_, _| Value::Number(milliseconds)),
+        ),
+    ]))
+}
+
 /// `atob(data)` — base64 → binary string (one Latin-1 char per byte).
 pub fn atob(args: Vec<Value>) -> Value {
     let input = args

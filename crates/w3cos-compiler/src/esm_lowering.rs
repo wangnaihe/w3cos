@@ -4141,7 +4141,7 @@ fn global_value_expr(name: &str) -> Option<String> {
             "w3cos_runtime::jsdom::window_value()".to_string()
         }
         // Property globals: read off the jsdom window singleton.
-        "navigator" | "localStorage" | "sessionStorage" | "performance" | "location"
+        "navigator" | "localStorage" | "sessionStorage" | "indexedDB" | "IDBKeyRange" | "performance" | "location"
         | "screen" => format!("w3cos_runtime::jsdom::window_value().get_property({name:?})"),
         // Scheduling/utility globals: the jsdom window holds them as function
         // values, so a bare reference is just the property read (calling it
@@ -4193,6 +4193,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         // Dynamic Proxy constructor backed by w3cos-core's proxy traps.
         "Proxy" => "w3cos_core::proxy_class()".to_string(),
         "TextDecoder" => "w3cos_core::web::text_decoder_class()".to_string(),
+        "Date" => "w3cos_core::web::date_class()".to_string(),
         "Uint8Array" | "Uint8ClampedArray" | "Int8Array" | "Uint16Array" | "Int16Array"
         | "Uint32Array" | "Int32Array" | "Float32Array" | "Float64Array" | "BigInt64Array"
         | "BigUint64Array" => "w3cos_core::collections::typed_array_class()".to_string(),
@@ -4208,8 +4209,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         // Unimplemented builtin globals: harmless empty-object stubs keep
         // references total (`new X()` yields Undefined via construct on a
         // non-callable; `X.y` yields Undefined).
-        "Date" | "BigInt"
-        | "ArrayBuffer" | "SharedArrayBuffer" | "DataView"
+        "BigInt" | "ArrayBuffer" | "SharedArrayBuffer" | "DataView"
         | "WeakRef" | "FinalizationRegistry" | "Atomics" | "eval"
         | "encodeURI" | "encodeURIComponent" | "decodeURI" | "decodeURIComponent" | "escape"
         | "unescape" | "TextEncoder" | "fetch" | "Request" | "Response"
@@ -5068,6 +5068,7 @@ const g = globalThis.location;
 const s = self.closed;
 const ua = navigator.userAgent;
 const saved = localStorage.getItem("k");
+const openRequest = indexedDB.open("app", 1);
 const now = performance.now();
 const scr = screen.width;"#,
         );
@@ -5100,6 +5101,12 @@ const scr = screen.width;"#,
                 "w3cos_runtime::jsdom::window_value().get_property(\"localStorage\").call_method(\"getItem\""
             ),
             "localStorage.getItem: {code}"
+        );
+        assert!(
+            code.contains(
+                "w3cos_runtime::jsdom::window_value().get_property(\"indexedDB\").call_method(\"open\""
+            ),
+            "indexedDB.open: {code}"
         );
         assert!(
             code.contains(
