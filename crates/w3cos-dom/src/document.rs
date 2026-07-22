@@ -7,6 +7,7 @@ use crate::element::Element;
 use crate::events::EventRegistry;
 use crate::node::{DomNode, NodeId, NodeType};
 use crate::selection::{Range, Selection};
+use crate::stylesheet;
 
 /// W3C Document — the root of the DOM tree.
 ///
@@ -516,12 +517,69 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub fn to_component_tree(&self) -> w3cos_std::Component {
-        self.node_to_component(self.body_id)
+        let mut ancestors = Vec::new();
+        self.node_to_component(self.body_id, &mut ancestors)
     }
 
-    fn node_to_component(&self, id: NodeId) -> w3cos_std::Component {
+    /// Selector context for stylesheet matching: tag, `id` attribute, classes.
+    fn selector_context(&self, id: NodeId) -> stylesheet::SelectorContext {
         let node = self.get_node(id);
-        let style = self.styles[id.0 as usize].to_style();
+        let id_attr = node
+            .attributes
+            .iter()
+            .find(|(k, _)| k.as_str() == "id")
+            .map(|(_, v)| v.as_str());
+        let classes: Vec<String> = node.class_list.iter().map(|c| c.as_str()).collect();
+        let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        stylesheet::SelectorContext::new(&node.tag.as_str(), id_attr, &class_refs)
+    }
+
+    /// Computed style for a node: stylesheet-matched declarations first
+    /// (ascending specificity, then registration order), inline style on top.
+    /// Falls back to the raw inline style when no stylesheet rules apply.
+    fn computed_style(
+        &self,
+        id: NodeId,
+        ancestors: &[stylesheet::SelectorContext],
+    ) -> w3cos_std::style::Style {
+        let inline = &self.styles[id.0 as usize];
+        if !stylesheet::has_rules() {
+            return inline.to_style();
+        }
+        let node = self.get_node(id);
+        if node.node_type != NodeType::Element {
+            return inline.to_style();
+        }
+        let id_attr = node
+            .attributes
+            .iter()
+            .find(|(k, _)| k.as_str() == "id")
+            .map(|(_, v)| v.as_str());
+        let classes: Vec<String> = node.class_list.iter().map(|c| c.as_str()).collect();
+        let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        let matched =
+            stylesheet::matching_declarations(&node.tag.as_str(), id_attr, &class_refs, ancestors);
+        if matched.is_empty() {
+            return inline.to_style();
+        }
+        let mut merged = CSSStyleDeclaration::new();
+        for (prop, value, _specificity) in &matched {
+            merged.set_property(prop, value);
+        }
+        // Inline wins: re-apply the node's own `set_property` history on top.
+        for (prop, value) in &inline.inline_declarations {
+            merged.set_property(prop, value);
+        }
+        merged.to_style()
+    }
+
+    fn node_to_component(
+        &self,
+        id: NodeId,
+        ancestors: &mut Vec<stylesheet::SelectorContext>,
+    ) -> w3cos_std::Component {
+        let node = self.get_node(id);
+        let style = self.computed_style(id, ancestors);
         let tag = node.tag.as_str();
 
         match node.node_type {
@@ -533,11 +591,68 @@ impl Document {
                 return w3cos_std::Component::column(style, vec![]);
             }
             NodeType::Element | NodeType::Document | NodeType::DocumentFragment => {
+                // HTML parsers create real text-node children. Preserve the
+                // inline element's own computed typography when lowering a
+                // simple `<span>text</span>` instead of wrapping the text in
+                // a zero-width container with an unrelated default style.
+                let child_ids = self.children_ids(id);
+                if matches!(
+                    tag.as_str(),
+                    "span" | "label" | "em" | "strong" | "code" | "small"
+                ) && child_ids.len() == 1
+                {
+                    let child = self.get_node(child_ids[0]);
+                    if child.node_type == NodeType::Text {
+                        return w3cos_std::Component::text(
+                            child.text_content.as_deref().unwrap_or(""),
+                            style,
+                        );
+                    }
+
+                    // Browser inline formatting does not map directly onto
+                    // Taffy's flex layout. In particular, Monaco emits each
+                    // line as `span[absolute] > span.mtkN > #text`; keeping
+                    // the outer span as an absolutely-positioned flex
+                    // container gives it zero width and makes the otherwise
+                    // valid Text component invisible. Collapse a transparent
+                    // one-child inline wrapper and use the innermost
+                    // element's computed typography.
+                    let child_tag = child.tag.as_str();
+                    if child.node_type == NodeType::Element
+                        && matches!(
+                            child_tag.as_str(),
+                            "span" | "label" | "em" | "strong" | "code" | "small"
+                        )
+                    {
+                        let grandchild_ids = self.children_ids(child_ids[0]);
+                        if grandchild_ids.len() == 1 {
+                            let grandchild = self.get_node(grandchild_ids[0]);
+                            if grandchild.node_type == NodeType::Text {
+                                ancestors.push(self.selector_context(id));
+                                let child_style = self.computed_style(child_ids[0], ancestors);
+                                ancestors.pop();
+                                return w3cos_std::Component::text(
+                                    grandchild.text_content.as_deref().unwrap_or(""),
+                                    child_style,
+                                );
+                            }
+                        }
+                    }
+                }
+                let pushed = if node.node_type == NodeType::Element {
+                    ancestors.push(self.selector_context(id));
+                    true
+                } else {
+                    false
+                };
                 let children: Vec<w3cos_std::Component> = self
                     .children_ids(id)
                     .iter()
-                    .map(|&child_id| self.node_to_component(child_id))
+                    .map(|&child_id| self.node_to_component(child_id, ancestors))
                     .collect();
+                if pushed {
+                    ancestors.pop();
+                }
 
                 if let Some(text) = &node.text_content {
                     if children.is_empty() {
@@ -554,7 +669,7 @@ impl Document {
                         | w3cos_std::style::FlexDirection::RowReverse
                 );
 
-                match tag.as_str() {
+                let mut component = match tag.as_str() {
                     "body" | "div" | "section" | "main" | "article" | "nav" | "header"
                     | "footer" | "aside" | "form" | "fieldset" | "ul" | "ol" | "dl" => {
                         if is_row {
@@ -618,15 +733,34 @@ impl Document {
                             .unwrap_or("");
                         w3cos_std::Component::image(src, style)
                     }
-                    "input" => {
+                    "input" | "textarea" => {
                         let placeholder = node
                             .attributes
                             .iter()
                             .find(|(k, _)| k.as_str() == "placeholder")
                             .map(|(_, v)| v.as_str())
                             .unwrap_or("");
-                        let value = node.text_content.as_deref().unwrap_or("");
-                        w3cos_std::Component::text_input(value, placeholder, style)
+                        let value = node
+                            .attributes
+                            .iter()
+                            .find(|(k, _)| k.as_str() == "value")
+                            .map(|(_, v)| v.as_str())
+                            .or(node.text_content.as_deref())
+                            .unwrap_or("");
+                        let mut component =
+                            w3cos_std::Component::text_input(value, placeholder, style);
+                        component.on_click = w3cos_std::EventAction::NativeHost {
+                            id: id.as_u32() as u64,
+                            click: true,
+                            scroll: false,
+                            input: true,
+                            focus: true,
+                            keyboard: true,
+                            submit: false,
+                            pointer: true,
+                            wheel: false,
+                        };
+                        component
                     }
                     "canvas" => {
                         let width = node
@@ -650,7 +784,31 @@ impl Document {
                             w3cos_std::Component::column(style, children)
                         }
                     }
+                };
+                // Keep the originating DOM node on every rendered element,
+                // not only form controls. Browser editors attach their mouse
+                // handlers to container divs and focus a hidden textarea from
+                // those handlers; without a native host id the runtime cannot
+                // target or bubble pointer events through that DOM ancestry.
+                if node.node_type == NodeType::Element
+                    && !matches!(
+                        component.on_click,
+                        w3cos_std::EventAction::NativeHost { .. }
+                    )
+                {
+                    component.on_click = w3cos_std::EventAction::NativeHost {
+                        id: id.as_u32() as u64,
+                        click: false,
+                        scroll: false,
+                        input: false,
+                        focus: false,
+                        keyboard: false,
+                        submit: false,
+                        pointer: true,
+                        wheel: false,
+                    };
                 }
+                component
             }
         }
     }

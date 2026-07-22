@@ -1,0 +1,6 @@
+/* Monaco normally injects its token color map through a runtime <style>
+ * element. The native stylesheet registry currently consumes ESM CSS at
+ * compile time, so provide the plaintext token foreground explicitly. */
+.monaco-editor.vs-dark .mtk1 {
+    color: #d4d4d4;
+}

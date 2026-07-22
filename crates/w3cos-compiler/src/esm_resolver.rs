@@ -7,7 +7,8 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
@@ -74,6 +75,9 @@ pub struct ExportBinding {
 #[derive(Debug, Clone, Default)]
 pub struct ParsedModuleInfo {
     pub path: PathBuf,
+    /// Every static import source, including bare side-effect imports whose
+    /// declarations have no local bindings.
+    pub dependency_sources: Vec<String>,
     pub imports: Vec<ImportBinding>,
     pub exports: Vec<ExportBinding>,
     pub top_level_classes: Vec<String>,
@@ -84,6 +88,9 @@ pub struct ParsedModuleInfo {
 #[derive(Debug, Clone, Default)]
 pub struct ParsedModuleGraph {
     pub modules: Vec<ParsedModuleInfo>,
+    /// Lazily built path → index map so `find_module` is O(1) on large graphs
+    /// (Monaco-scale graphs have hundreds of modules and thousands of lookups).
+    path_index: RefCell<HashMap<PathBuf, usize>>,
 }
 
 impl ParsedModuleGraph {
@@ -108,7 +115,15 @@ impl ParsedModuleGraph {
     }
 
     pub fn find_module(&self, path: &Path) -> Option<&ParsedModuleInfo> {
-        self.modules.iter().find(|m| m.path == path)
+        if self.path_index.borrow().len() != self.modules.len() {
+            let mut index = self.path_index.borrow_mut();
+            index.clear();
+            for (i, module) in self.modules.iter().enumerate() {
+                index.insert(module.path.clone(), i);
+            }
+        }
+        let i = *self.path_index.borrow().get(path)?;
+        self.modules.get(i)
     }
 
     pub fn resolve_binding(
@@ -236,6 +251,26 @@ impl ParsedModuleGraph {
             });
         }
 
+        // No direct export matched — forward through `export * from` chains
+        // in declaration order (direct exports shadow star exports, checked
+        // above; first star hit wins, matching ESM ambiguity-tolerant usage).
+        for export in &module_info.exports {
+            if export.exported != "*" {
+                continue;
+            }
+            let Some(source) = &export.source else {
+                continue;
+            };
+            let from_dir = module_path.parent().unwrap_or_else(|| Path::new("."));
+            let Ok(resolved) = resolver.resolve(source, from_dir) else {
+                continue;
+            };
+            match self.resolve_export_from(&resolved.path, export_name, resolver, visited) {
+                SymbolResolution::Unresolved { .. } => continue,
+                other => return other,
+            }
+        }
+
         SymbolResolution::Unresolved {
             name: export_name.to_string(),
             reason: format!(
@@ -244,6 +279,45 @@ impl ParsedModuleGraph {
                 module_path.display()
             ),
         }
+    }
+
+    /// Enumerate every export a module exposes, following `export * from`
+    /// chains. Used to build `import * as ns` namespace objects: each name is
+    /// resolved through the normal precedence rules (direct exports shadow
+    /// star exports).
+    pub fn all_exports(&self, module_path: &Path, resolver: &EsmResolver) -> Vec<ResolvedSymbol> {
+        let mut names: Vec<String> = Vec::new();
+        let mut queue: Vec<PathBuf> = vec![module_path.to_path_buf()];
+        let mut seen_modules: HashSet<PathBuf> = HashSet::new();
+        while let Some(path) = queue.pop() {
+            if !seen_modules.insert(path.clone()) {
+                continue;
+            }
+            let Some(info) = self.find_module(&path) else {
+                continue;
+            };
+            for export in &info.exports {
+                if export.exported == "*" {
+                    if let Some(source) = &export.source {
+                        let from_dir = path.parent().unwrap_or_else(|| Path::new("."));
+                        if let Ok(resolved) = resolver.resolve(source, from_dir) {
+                            queue.push(resolved.path);
+                        }
+                    }
+                } else if !names.contains(&export.exported) {
+                    names.push(export.exported.clone());
+                }
+            }
+        }
+        let mut symbols = Vec::new();
+        for name in names {
+            if let SymbolResolution::Resolved(sym) =
+                self.resolve_export_from(module_path, &name, resolver, &mut HashSet::new())
+            {
+                symbols.push(sym);
+            }
+        }
+        symbols
     }
 }
 
@@ -280,6 +354,21 @@ pub struct BundledSymbol {
     pub kind: SymbolKind,
 }
 
+/// An `import * as ns from "..."` binding, resolved at bundle-build time.
+///
+/// The namespace object is materialized by codegen as a lazily built
+/// `Value::object` whose properties are the target module's exports (star
+/// re-export chains followed by `ParsedModuleGraph::all_exports`).
+#[derive(Debug, Clone)]
+pub struct NamespaceImport {
+    /// Local identifier as written in the importing module (e.g. `monaco`).
+    pub local: String,
+    /// Module the namespace object is built from.
+    pub target: PathBuf,
+    /// Exports of the target module, resolved to their defining symbols.
+    pub exports: Vec<ResolvedSymbol>,
+}
+
 /// A module after flattening: dependency order + per-module namespace.
 #[derive(Debug, Clone)]
 pub struct BundledModule {
@@ -293,6 +382,9 @@ pub struct BundledModule {
     /// Imports implemented by a native AOT host ABI rather than another ESM
     /// source module (for example React hooks and JSX runtime entry points).
     pub host_imports: Vec<(String, String)>,
+    /// `import * as ns` bindings: the local name evaluates to a lazily built
+    /// namespace object exposing the target module's exports.
+    pub namespace_imports: Vec<NamespaceImport>,
 }
 
 impl BundledModule {
@@ -364,10 +456,20 @@ impl EsmBundle {
                 namespace,
                 local_to_bundled,
                 host_imports: Vec::new(),
+                namespace_imports: Vec::new(),
             });
         }
 
         // Pass 2: resolve each module's imports to the defining symbol's bundled name.
+        // Pre-index symbols by (module, original name) — a linear scan per import
+        // is O(imports × symbols) and dominates on Monaco-scale graphs.
+        let mut symbol_lookup: HashMap<(PathBuf, String), String> = HashMap::new();
+        for sym in &bundle.symbols {
+            symbol_lookup.insert(
+                (sym.module.clone(), sym.original_name.clone()),
+                sym.bundled_name.clone(),
+            );
+        }
         for module_index in 0..bundle.modules.len() {
             let path = bundle.modules[module_index].path.clone();
             let info = match parsed.find_module(&path) {
@@ -382,11 +484,38 @@ impl EsmBundle {
                         .push((import.local.clone(), host_path.to_string()));
                     continue;
                 }
+                // `import * as ns from "..."` — not a symbol binding; the local
+                // name denotes the target module's namespace object, built by
+                // codegen from the target's full export list.
+                if import.imported == "*" {
+                    let from_dir = path.parent().unwrap_or_else(|| Path::new("."));
+                    match resolver.resolve(&import.source, from_dir) {
+                        Ok(resolved) => {
+                            let exports = parsed.all_exports(&resolved.path, resolver);
+                            bundle.modules[module_index]
+                                .namespace_imports
+                                .push(NamespaceImport {
+                                    local: import.local.clone(),
+                                    target: resolved.path,
+                                    exports,
+                                });
+                        }
+                        Err(e) => {
+                            bundle.unresolved.push(format!(
+                                "{}: `{name}` -> could not resolve namespace source `{}`: {e}",
+                                path.display(),
+                                import.source,
+                                name = import.local
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 match parsed.resolve_binding(&path, &import.local, resolver) {
                     SymbolResolution::Resolved(sym) => {
-                        let bundled = bundle
-                            .bundled_name_for(&sym.defining_module, &sym.local_name)
-                            .map(str::to_string);
+                        let bundled = symbol_lookup
+                            .get(&(sym.defining_module.clone(), sym.local_name.clone()))
+                            .cloned();
                         if let Some(bundled) = bundled {
                             bundle.modules[module_index]
                                 .local_to_bundled
@@ -416,13 +545,6 @@ impl EsmBundle {
         }
 
         bundle
-    }
-
-    fn bundled_name_for(&self, module: &Path, original: &str) -> Option<&str> {
-        self.symbols
-            .iter()
-            .find(|sym| sym.module == module && sym.original_name == original)
-            .map(|sym| sym.bundled_name.as_str())
     }
 
     pub fn symbol_count(&self) -> usize {
@@ -479,13 +601,16 @@ fn visit_module(
     }
     if let Some(info) = parsed.find_module(path) {
         let from_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut sources: Vec<String> = info.imports.iter().map(|i| i.source.clone()).collect();
+        let mut sources = info.dependency_sources.clone();
         for export in &info.exports {
             if let Some(source) = &export.source {
                 sources.push(source.clone());
             }
         }
         for source in sources {
+            if is_asset_import(&source) {
+                continue;
+            }
             if let Ok(resolved) = resolver.resolve(&source, from_dir) {
                 visit_module(&resolved.path, parsed, resolver, visited, order);
             }
@@ -509,12 +634,17 @@ struct PackageJson {
 #[derive(Debug, Clone)]
 pub struct EsmResolver {
     project_root: PathBuf,
+    /// Memoizes `resolve(specifier, from_dir)` — Monaco-scale graphs re-resolve
+    /// the same specifier thousands of times through re-export chains, and each
+    /// uncached call costs filesystem syscalls.
+    resolve_cache: RefCell<HashMap<(String, PathBuf), ResolvedModule>>,
 }
 
 impl EsmResolver {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
             project_root: project_root.into(),
+            resolve_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -529,6 +659,19 @@ impl EsmResolver {
     }
 
     pub fn resolve(&self, specifier: &str, from_dir: &Path) -> Result<ResolvedModule> {
+        let from_dir = normalize_path(from_dir);
+        let key = (specifier.to_string(), from_dir.clone());
+        if let Some(hit) = self.resolve_cache.borrow().get(&key) {
+            return Ok(hit.clone());
+        }
+        let resolved = self.resolve_uncached(specifier, &from_dir)?;
+        self.resolve_cache
+            .borrow_mut()
+            .insert(key, resolved.clone());
+        Ok(resolved)
+    }
+
+    fn resolve_uncached(&self, specifier: &str, from_dir: &Path) -> Result<ResolvedModule> {
         if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
         {
             let candidate = if specifier.starts_with('/') {
@@ -678,15 +821,21 @@ impl EsmResolver {
 
     fn resolve_path_like(&self, candidate: &Path) -> Result<PathBuf> {
         if candidate.is_file() {
-            return Ok(candidate.to_path_buf());
+            return Ok(normalize_path(candidate));
         }
 
-        if candidate.extension().is_none() {
-            for ext in ["ts", "tsx", "js", "mjs", "jsx"] {
-                let with_ext = candidate.with_extension(ext);
-                if with_ext.is_file() {
-                    return Ok(with_ext);
-                }
+        // Probe source extensions by *appending* to the file name. This must
+        // also run when `candidate` already has an extension: dotted basenames
+        // like `editor.api` are common (monaco-editor), and the real file is
+        // `editor.api.js` — `Path::extension` would wrongly treat `.api` as
+        // the source extension and skip probing.
+        for ext in ["ts", "tsx", "js", "mjs", "jsx"] {
+            let mut appended = candidate.as_os_str().to_owned();
+            appended.push(".");
+            appended.push(ext);
+            let with_ext = PathBuf::from(appended);
+            if with_ext.is_file() {
+                return Ok(normalize_path(&with_ext));
             }
         }
 
@@ -700,7 +849,7 @@ impl EsmResolver {
             ] {
                 let index = candidate.join(name);
                 if index.is_file() {
-                    return Ok(index);
+                    return Ok(normalize_path(&index));
                 }
             }
         }
@@ -711,6 +860,29 @@ impl EsmResolver {
 
 fn is_host_module(specifier: &str) -> bool {
     matches!(specifier, "react" | "react/jsx-runtime" | "w3cos/native")
+}
+
+/// Lexically normalize a path: fold `.` and `..` components without touching
+/// the filesystem. Critical for module-graph dedup — `a/b/../c.js` and
+/// `a/c.js` must be the SAME graph node, otherwise Monaco-scale graphs
+/// explode (each `../..` spelling chain duplicates the whole subtree).
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn resolve_exports_root(exports: &Value) -> Option<String> {
@@ -797,7 +969,10 @@ fn extract_quoted_specifier(input: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn is_asset_import(specifier: &str) -> bool {
+/// Whether an import specifier points at a non-code asset (css, images, ...).
+/// Asset imports stay in the module graph's import lists but are not recursed
+/// into as JS modules; `.css` assets feed the stylesheet pipeline instead.
+pub fn is_asset_import(specifier: &str) -> bool {
     matches!(
         Path::new(specifier).extension().and_then(|e| e.to_str()),
         Some("css" | "scss" | "sass" | "less" | "json" | "wasm" | "png" | "jpg" | "jpeg" | "svg")
@@ -836,6 +1011,9 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
                 let source = atom_to_string(&import.src.value);
+                if !info.dependency_sources.contains(&source) {
+                    info.dependency_sources.push(source.clone());
+                }
                 for spec in &import.specifiers {
                     match spec {
                         ImportSpecifier::Named(named) => {
@@ -904,6 +1082,15 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
                     }
                 }
             }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportAll(export_all)) => {
+                // `export * from "./x.js"` — recorded as a star re-export;
+                // resolve_export_from forwards lookups through it.
+                info.exports.push(ExportBinding {
+                    exported: "*".to_string(),
+                    local: None,
+                    source: Some(atom_to_string(&export_all.src.value)),
+                });
+            }
             ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(default_decl)) => {
                 match &default_decl.decl {
                     DefaultDecl::Class(class) => {
@@ -942,6 +1129,20 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
                     }
                 }
             }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(default_expr)) => {
+                // `export default <expr>;` — anonymous default export. When the
+                // expression is a plain identifier we can point at the local
+                // binding; otherwise codegen treats it as an anonymous value.
+                let local = match &*default_expr.expr {
+                    Expr::Ident(ident) => Some(ident.sym.to_string()),
+                    _ => None,
+                };
+                info.exports.push(ExportBinding {
+                    exported: "default".to_string(),
+                    local,
+                    source: None,
+                });
+            }
             ModuleItem::Stmt(Stmt::Decl(decl)) => collect_top_level_decl(decl, &mut info),
             _ => {}
         }
@@ -972,8 +1173,12 @@ fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
         }
         Decl::Var(var) => {
             for decl in &var.decls {
-                if let Pat::Ident(binding) = &decl.name {
-                    let name = binding.id.sym.to_string();
+                // Handles plain `const x = ...` AND destructured exports like
+                // `export const { getWindowId, ... } = (function(){...})()`
+                // (monaco's base/browser/dom.js pattern).
+                let mut names = Vec::new();
+                collect_pat_names(&decl.name, &mut names);
+                for name in names {
                     info.top_level_variables.push(name.clone());
                     info.exports.push(ExportBinding {
                         exported: name.clone(),
@@ -987,6 +1192,30 @@ fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
     }
 }
 
+/// Recursively collect binding identifiers from a destructuring pattern.
+fn collect_pat_names(pat: &Pat, names: &mut Vec<String>) {
+    match pat {
+        Pat::Ident(binding) => names.push(binding.id.sym.to_string()),
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::KeyValue(kv) => collect_pat_names(&kv.value, names),
+                    ObjectPatProp::Assign(assign) => names.push(assign.key.id.sym.to_string()),
+                    ObjectPatProp::Rest(rest) => collect_pat_names(&rest.arg, names),
+                }
+            }
+        }
+        Pat::Array(array) => {
+            for elem in array.elems.iter().flatten() {
+                collect_pat_names(elem, names);
+            }
+        }
+        Pat::Assign(assign) => collect_pat_names(&assign.left, names),
+        Pat::Rest(rest) => collect_pat_names(&rest.arg, names),
+        _ => {}
+    }
+}
+
 fn collect_top_level_decl(decl: &Decl, info: &mut ParsedModuleInfo) {
     match decl {
         Decl::Class(class) => info.top_level_classes.push(class.ident.sym.to_string()),
@@ -995,9 +1224,7 @@ fn collect_top_level_decl(decl: &Decl, info: &mut ParsedModuleInfo) {
             .push(function.ident.sym.to_string()),
         Decl::Var(var) => {
             for declaration in &var.decls {
-                if let Pat::Ident(binding) = &declaration.name {
-                    info.top_level_variables.push(binding.id.sym.to_string());
-                }
+                collect_pat_names(&declaration.name, &mut info.top_level_variables);
             }
         }
         _ => {}
@@ -1085,6 +1312,193 @@ export function main() { return invoke("example", "ping"); }"#,
                 .path
                 .ends_with("node_modules/@codemirror/view/dist/index.js")
         );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolves_package_subpath_with_dotted_basename() {
+        // monaco-editor style: `monaco-editor/esm/vs/editor/editor.api` where
+        // the real file is `editor.api.js` — `.api` is NOT the source extension.
+        let root = fixture_root("w3cos_esm_resolver_dotted_basename");
+        let pkg = root.join("node_modules/monaco-editor");
+        std::fs::create_dir_all(pkg.join("esm/vs/editor")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"module":"./esm/vs/editor/editor.main.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("esm/vs/editor/editor.api.js"),
+            "export const api = true;",
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let resolved = resolver
+            .resolve("monaco-editor/esm/vs/editor/editor.api", &root)
+            .unwrap();
+        assert!(
+            resolved
+                .path
+                .ends_with("node_modules/monaco-editor/esm/vs/editor/editor.api.js"),
+            "resolved to {}",
+            resolved.path.display()
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn normalizes_parent_dir_components() {
+        assert_eq!(
+            normalize_path(Path::new("a/b/../c.js")),
+            PathBuf::from("a/c.js")
+        );
+        assert_eq!(normalize_path(Path::new("a/./b")), PathBuf::from("a/b"));
+        assert_eq!(
+            normalize_path(Path::new("../a/../b")),
+            PathBuf::from("../b")
+        );
+        assert_eq!(
+            normalize_path(Path::new("a/../../b")),
+            PathBuf::from("../b")
+        );
+        assert_eq!(normalize_path(Path::new("/a/b/..")), PathBuf::from("/a"));
+        assert_eq!(
+            normalize_path(Path::new("/a/../b")),
+            PathBuf::from("/b"),
+            "parent of root stays at root"
+        );
+    }
+
+    #[test]
+    fn graph_dedupes_parent_dir_path_spellings() {
+        // a/one.js and b/two.js both import ../shared.js — shared must appear
+        // exactly once in the graph despite `..` in the resolved path.
+        let root = fixture_root("w3cos_esm_resolver_normalize_graph");
+        std::fs::create_dir_all(root.join("src/a")).unwrap();
+        std::fs::create_dir_all(root.join("src/b")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            "import \"./a/one.js\";\nimport \"./b/two.js\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/a/one.js"),
+            r#"import { s } from "../shared.js"; export const one = s;"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/b/two.js"),
+            r#"import { s } from "../shared.js"; export const two = s;"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/shared.js"), r#"export const s = 1;"#).unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let graph = resolver
+            .build_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        assert_eq!(graph.nodes.len(), 4, "entry + one + two + shared (deduped)");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn export_star_forwards_to_source_module() {
+        let root = fixture_root("w3cos_esm_resolver_export_star");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"import { foo } from "./barrel.js"; foo();"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/barrel.js"), r#"export * from "./impl.js";"#).unwrap();
+        std::fs::write(root.join("src/impl.js"), r#"export function foo() {}"#).unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let impl_path = normalize_path(&root.join("src/impl.js"));
+        match parsed.resolve_binding(&normalize_path(&root.join("src/app.ts")), "foo", &resolver) {
+            SymbolResolution::Resolved(sym) => {
+                assert_eq!(sym.defining_module, impl_path);
+                assert_eq!(sym.local_name, "foo");
+                assert_eq!(sym.kind, SymbolKind::Function);
+            }
+            other => panic!("expected resolution through export *, got {other:?}"),
+        }
+
+        // all_exports (namespace objects) also follows the star chain.
+        let exports = parsed.all_exports(&normalize_path(&root.join("src/barrel.js")), &resolver);
+        assert!(
+            exports
+                .iter()
+                .any(|s| s.exported_name == "foo" && s.defining_module == impl_path)
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn collects_destructured_exports() {
+        let root = fixture_root("w3cos_esm_resolver_destructured_exports");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            "import { getWindowId, registerWindow } from \"./dom.js\";\ngetWindowId(registerWindow);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/dom.js"),
+            "export const { registerWindow, getWindowId } = (function () { return {}; })();\n",
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        for name in ["getWindowId", "registerWindow"] {
+            match parsed.resolve_binding(&normalize_path(&root.join("src/app.ts")), name, &resolver)
+            {
+                SymbolResolution::Resolved(sym) => {
+                    assert_eq!(sym.kind, SymbolKind::Variable, "{name} is a variable")
+                }
+                other => panic!("expected {name} to resolve, got {other:?}"),
+            }
+        }
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bare_imports_participate_in_bundle_dependency_order() {
+        let root = fixture_root("w3cos_esm_resolver_bare_import_order");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            "import './register.js';\nexport function main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/register.js"),
+            "import './foundation.js';\nglobalThis.registered = true;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/foundation.js"), "globalThis.ready = true;\n").unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let entry = normalize_path(&root.join("src/app.js"));
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        let paths: Vec<_> = bundle.modules.iter().map(|module| &module.path).collect();
+
+        assert_eq!(paths[0], &normalize_path(&root.join("src/foundation.js")));
+        assert_eq!(paths[1], &normalize_path(&root.join("src/register.js")));
+        assert_eq!(paths[2], &entry);
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -1484,6 +1898,62 @@ export function keymap() {}"#,
         assert!(
             bundle.is_fully_resolved(),
             "unresolved: {:?}",
+            bundle.unresolved
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bundles_namespace_import() {
+        let root = fixture_root("w3cos_esm_bundler_namespace");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"import * as ns from "./nsmod.js";
+export function main() { return ns; }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/nsmod.js"),
+            r#"export class Widget {}
+export function make() {}
+export const version = "1.0";
+export * from "./extra.js";"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/extra.js"), r#"export const extra = 1;"#).unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+
+        let app_module = bundle
+            .modules
+            .iter()
+            .find(|m| m.path.to_string_lossy().contains("src/app.ts"))
+            .unwrap();
+        assert_eq!(
+            app_module.namespace_imports.len(),
+            1,
+            "namespace import should be recorded"
+        );
+        let ns = &app_module.namespace_imports[0];
+        assert_eq!(ns.local, "ns");
+        assert!(ns.target.ends_with("nsmod.js"));
+        // Star re-export chain is followed into extra.js.
+        for name in ["Widget", "make", "version", "extra"] {
+            assert!(
+                ns.exports.iter().any(|s| s.exported_name == name),
+                "namespace exports should include {name}: {:?}",
+                ns.exports
+            );
+        }
+        assert!(
+            bundle.is_fully_resolved(),
+            "namespace import must not land in unresolved: {:?}",
             bundle.unresolved
         );
 

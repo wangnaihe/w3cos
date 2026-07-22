@@ -195,7 +195,11 @@ fn handle_connection(
         return Ok(());
     }
     let method = parts[0];
-    let path = parts[1];
+    let target = parts[1];
+    let (path, query) = target
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((target, None));
 
     let request = match (method, path) {
         ("GET", "/a11y") => Some(AiBridgeRequest::GetA11yTree),
@@ -233,9 +237,7 @@ fn handle_connection(
             Some(AiBridgeRequest::Type { selector, text })
         }
         ("GET", "/query") => {
-            let selector = path
-                .split('?')
-                .nth(1)
+            let selector = query
                 .and_then(|qs| {
                     qs.split('&').find_map(|param| {
                         let mut parts = param.splitn(2, '=');

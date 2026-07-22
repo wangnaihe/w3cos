@@ -16,6 +16,7 @@ ai-bridge = ["dep:w3cos-ai-bridge"]
 [dependencies]
 w3cos-std = { workspace = true }
 w3cos-dom = { workspace = true }
+w3cos-core = { workspace = true }
 w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
 parley = { workspace = true }
@@ -29,7 +30,6 @@ tempfile = { workspace = true }
 glob = { workspace = true }
 w3cos-ffi = { path = "../w3cos-ffi" }
 w3cos-react-compat = { workspace = true }
-w3cos-core = { workspace = true }
 
 # GPU rendering (default)
 vello = { workspace = true, optional = true }

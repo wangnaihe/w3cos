@@ -9,20 +9,30 @@ use w3cos_std::style::{
 #[derive(Debug, Clone)]
 pub struct CSSStyleDeclaration {
     pub inner: Style,
+    /// Raw `(property, value)` pairs applied through `set_property`, in order.
+    /// `Document::to_component_tree` re-applies these above stylesheet-matched
+    /// rules so that inline style wins the cascade.
+    pub inline_declarations: Vec<(String, String)>,
 }
 
 impl CSSStyleDeclaration {
     pub fn new() -> Self {
         Self {
             inner: Style::default(),
+            inline_declarations: Vec::new(),
         }
     }
 
     pub fn from_style(style: Style) -> Self {
-        Self { inner: style }
+        Self {
+            inner: style,
+            inline_declarations: Vec::new(),
+        }
     }
 
     pub fn set_property(&mut self, name: &str, value: &str) {
+        self.inline_declarations
+            .push((name.to_string(), value.to_string()));
         match name {
             "display" => self.inner.display = parse_display(value),
             "position" => self.inner.position = parse_position(value),

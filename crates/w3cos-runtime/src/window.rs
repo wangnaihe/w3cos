@@ -3607,6 +3607,9 @@ impl App {
         if let Some(idx) = hit {
             let prevented =
                 self.dispatch_native_pointer(idx, "down", pointer_id, pointer_type, 0, 1, 0.5);
+            if !self.adopt_dom_active_text_input() {
+                self.focus_dom_text_input_within_hit(idx);
+            }
             self.rebuild_if_dirty();
             self.pointer_down_default_prevented = prevented;
             self.pressed_index = Some(idx);
@@ -3675,6 +3678,26 @@ impl App {
         let mut chain = self.native_host_chain(idx);
         if matches!(phase, "enter" | "leave") {
             chain.truncate(1);
+        }
+        if self.dom_mode {
+            return chain.first().is_some_and(|target| {
+                crate::jsdom::dispatch_native_pointer(
+                    *target as u32,
+                    phase,
+                    self.mouse_x,
+                    self.mouse_y,
+                    pointer_id,
+                    pointer_type,
+                    button,
+                    buttons,
+                    pressure,
+                    true,
+                    self.modifiers.alt_key(),
+                    self.modifiers.control_key(),
+                    self.modifiers.super_key(),
+                    self.modifiers.shift_key(),
+                )
+            });
         }
         w3cos_react_compat::aot::dispatch_pointer_chain(
             &chain,
@@ -4580,6 +4603,74 @@ impl App {
         self.repaint_after_interaction();
     }
 
+    fn adopt_dom_active_text_input(&mut self) -> bool {
+        if !self.dom_mode {
+            return false;
+        }
+        let Some(active_id) = crate::jsdom::active_element_id() else {
+            return false;
+        };
+        let flat = layout::pre_flatten(&self.root);
+        let Some(index) = flat.iter().enumerate().find_map(|(index, node)| {
+            (matches!(node.kind, ComponentKind::TextInput { .. })
+                && matches!(
+                    node.on_click,
+                    EventAction::NativeHost { id, .. } if *id == active_id as u64
+                ))
+            .then_some(index)
+        }) else {
+            return false;
+        };
+        if self.focused_index == Some(index) {
+            return true;
+        }
+        if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+            eprintln!(
+                "[W3C OS][IME] adopting DOM active textarea target={active_id} index={index}"
+            );
+        }
+        self.focused_index = Some(index);
+        crate::uitest::set_focused_index(Some(index));
+        self.sync_soft_keyboard();
+        self.needs_layout = true;
+        true
+    }
+
+    fn focus_dom_text_input_within_hit(&mut self, hit_index: usize) {
+        if !self.dom_mode {
+            return;
+        }
+        let host_chain = self.native_host_chain(hit_index);
+        let flat = layout::pre_flatten(&self.root);
+        let candidate = flat.iter().enumerate().find_map(|(index, node)| {
+            let EventAction::NativeHost { id, .. } = node.on_click else {
+                return None;
+            };
+            if !matches!(node.kind, ComponentKind::TextInput { .. }) {
+                return None;
+            }
+            let mut parent = crate::dom::parent_node(*id as u32);
+            while let Some(parent_id) = parent {
+                if host_chain.contains(&(parent_id as u64))
+                    && !matches!(crate::dom::tag_name(parent_id).as_str(), "body" | "html")
+                {
+                    return Some(index);
+                }
+                parent = crate::dom::parent_node(parent_id);
+            }
+            None
+        });
+        drop(flat);
+        if let Some(index) = candidate {
+            if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                eprintln!(
+                    "[W3C OS][IME] focusing descendant DOM textarea index={index} from hit={hit_index}"
+                );
+            }
+            self.focus_text_input(index);
+        }
+    }
+
     fn apply_native_text_input(
         &mut self,
         idx: usize,
@@ -4589,6 +4680,19 @@ impl App {
         is_composing: bool,
     ) -> bool {
         let chain = self.native_host_chain(idx);
+        if self.dom_mode
+            && let Some(target) = chain.first().copied()
+        {
+            let target = target as u32;
+            if crate::jsdom::dispatch_native_before_input(target, data, input_type, is_composing) {
+                self.rebuild_if_dirty();
+                return false;
+            }
+            self.text_input_values.insert(idx, value.clone());
+            crate::jsdom::dispatch_native_input(target, &value, data, input_type, is_composing);
+            self.rebuild_if_dirty();
+            return true;
+        }
         if w3cos_react_compat::aot::dispatch_before_input_chain(
             &chain,
             data,
@@ -4655,8 +4759,16 @@ impl App {
                 return;
             }
             let action = hit.on_click.clone();
-            self.set_focused_index(None);
+            if !self.dom_mode {
+                self.set_focused_index(None);
+            }
             let dispatched_native = self.dispatch_native_click_bubble(idx);
+            self.adopt_dom_active_text_input();
+            if self.dom_mode {
+                self.rebuild_if_dirty();
+                self.repaint_after_interaction();
+                return;
+            }
             let has_legacy_action =
                 !action.is_none() && !matches!(action, EventAction::NativeHost { .. });
             if has_legacy_action {
@@ -4673,7 +4785,14 @@ impl App {
     }
 
     fn dispatch_native_click_bubble(&self, idx: usize) -> bool {
-        w3cos_react_compat::aot::dispatch_click_chain(&self.native_host_chain(idx))
+        let chain = self.native_host_chain(idx);
+        if self.dom_mode {
+            chain
+                .first()
+                .is_some_and(|target| crate::jsdom::dispatch_native_click(*target as u32))
+        } else {
+            w3cos_react_compat::aot::dispatch_click_chain(&chain)
+        }
     }
 
     fn native_host_chain(&self, idx: usize) -> Vec<u64> {
@@ -4710,14 +4829,26 @@ impl App {
                 self.dispatch_native_composition(previous, "end", &data);
             }
             let chain = self.native_host_chain(previous);
-            w3cos_react_compat::aot::dispatch_focus_chain(&chain, false);
+            if self.dom_mode {
+                if let Some(target) = chain.first() {
+                    crate::jsdom::dispatch_native_focus(*target as u32, false);
+                }
+            } else {
+                w3cos_react_compat::aot::dispatch_focus_chain(&chain, false);
+            }
         }
         self.focused_index = next;
         crate::uitest::set_focused_index(next);
         self.sync_soft_keyboard();
         if let Some(current) = next {
             let chain = self.native_host_chain(current);
-            w3cos_react_compat::aot::dispatch_focus_chain(&chain, true);
+            if self.dom_mode {
+                if let Some(target) = chain.first() {
+                    crate::jsdom::dispatch_native_focus(*target as u32, true);
+                }
+            } else {
+                w3cos_react_compat::aot::dispatch_focus_chain(&chain, true);
+            }
         }
         self.rebuild_if_dirty();
         self.needs_layout = true;
@@ -5787,11 +5918,14 @@ impl ApplicationHandler for App {
             for action in &timer_actions {
                 state::execute_action(action);
             }
-            if !timer_actions.is_empty() {
+            // Drive the compiled-JS bridge: setTimeout/setInterval/rAF fire
+            // here, then microtasks + deferred native events are delivered.
+            let js_ran = crate::jsdom::tick_timers() + crate::jsdom::drain_microtasks();
+            if !timer_actions.is_empty() || js_ran > 0 {
                 self.rebuild_if_dirty();
             }
 
-            if !self.animations.is_empty() || !timer_actions.is_empty() {
+            if !self.animations.is_empty() || !timer_actions.is_empty() || js_ran > 0 {
                 self.request_repaint();
             }
         }
@@ -5843,6 +5977,13 @@ impl ApplicationHandler for App {
         });
 
         let mut timer_deadline = crate::timers::next_deadline();
+        if let Some(js_deadline) = crate::jsdom::next_timer_deadline() {
+            timer_deadline = Some(
+                timer_deadline
+                    .map(|deadline| deadline.min(js_deadline))
+                    .unwrap_or(js_deadline),
+            );
+        }
         #[cfg(target_os = "android")]
         if self.focused_index.is_some_and(|index| {
             matches!(
@@ -5916,6 +6057,12 @@ impl ApplicationHandler for App {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+            eprintln!(
+                "[W3C OS][WINDOW] resumed ai_port={:?}",
+                std::env::var("W3COS_AI_PORT").ok()
+            );
+        }
         self.first_frame_presented = false;
         // The platform may preserve the Rust application while replacing or
         // discarding the mobile backing surface. A redraw request alone is
@@ -6020,6 +6167,9 @@ impl ApplicationHandler for App {
                         > = std::sync::Arc::new(FrameCacheScreenshot);
                         self.ai_bridge_handle =
                             Some(w3cos_ai_bridge::server::start_with_provider(port, provider));
+                        if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                            eprintln!("[W3C OS][WINDOW] AI Bridge requested on port {port}");
+                        }
                     }
                 }
             }
@@ -6063,6 +6213,7 @@ impl ApplicationHandler for App {
         crate::image_loader::clear_cache();
         crate::canvas2d::clear_surfaces();
         crate::text_layout::clear_paint_cache();
+        #[cfg(feature = "cpu-render")]
         render_cpu::clear_glyph_cache();
         #[cfg(any(feature = "devtools", feature = "ai-bridge"))]
         crate::frame_cache::clear();
@@ -6367,17 +6518,35 @@ impl ApplicationHandler for App {
             } => {
                 if let Some(focus_idx) = self.focused_index {
                     let chain = self.native_host_chain(focus_idx);
-                    let default_prevented = w3cos_react_compat::aot::dispatch_key_chain(
-                        &chain,
-                        &web_key(&event.logical_key),
-                        &web_code(event.physical_key),
-                        event.repeat,
-                        self.modifiers.alt_key(),
-                        self.modifiers.control_key(),
-                        self.modifiers.super_key(),
-                        self.modifiers.shift_key(),
-                        event.state == ElementState::Pressed,
-                    );
+                    let key = web_key(&event.logical_key);
+                    let code = web_code(event.physical_key);
+                    let default_prevented = if self.dom_mode {
+                        chain.first().is_some_and(|target| {
+                            crate::jsdom::dispatch_native_key(
+                                *target as u32,
+                                &key,
+                                &code,
+                                event.repeat,
+                                self.modifiers.alt_key(),
+                                self.modifiers.control_key(),
+                                self.modifiers.super_key(),
+                                self.modifiers.shift_key(),
+                                event.state == ElementState::Pressed,
+                            )
+                        })
+                    } else {
+                        w3cos_react_compat::aot::dispatch_key_chain(
+                            &chain,
+                            &key,
+                            &code,
+                            event.repeat,
+                            self.modifiers.alt_key(),
+                            self.modifiers.control_key(),
+                            self.modifiers.super_key(),
+                            self.modifiers.shift_key(),
+                            event.state == ElementState::Pressed,
+                        )
+                    };
                     self.rebuild_if_dirty();
                     if default_prevented {
                         return;
@@ -6399,15 +6568,28 @@ impl ApplicationHandler for App {
                                     return;
                                 }
                                 if let Key::Named(NamedKey::Backspace) = event.logical_key {
-                                    let current = self
-                                        .text_input_values
-                                        .entry(focus_idx)
-                                        .or_insert_with(|| value.clone())
-                                        .clone();
-                                    if !current.is_empty() {
+                                    let next = if self.dom_mode {
+                                        self.native_host_chain(focus_idx)
+                                            .first()
+                                            .map(|target| {
+                                                crate::jsdom::text_control_value_after_edit(
+                                                    *target as u32,
+                                                    "",
+                                                    "deleteContentBackward",
+                                                )
+                                            })
+                                            .unwrap_or_else(|| value.clone())
+                                    } else {
+                                        let current = self
+                                            .text_input_values
+                                            .entry(focus_idx)
+                                            .or_insert_with(|| value.clone())
+                                            .clone();
                                         let mut chars: Vec<char> = current.chars().collect();
                                         chars.pop();
-                                        let next = chars.into_iter().collect();
+                                        chars.into_iter().collect()
+                                    };
+                                    if next != value {
                                         self.apply_native_text_input(
                                             focus_idx,
                                             next,
@@ -6427,24 +6609,35 @@ impl ApplicationHandler for App {
                                 }
                                 if let Key::Named(NamedKey::Enter) = event.logical_key {
                                     let chain = self.native_host_chain(focus_idx);
-                                    if w3cos_react_compat::aot::dispatch_submit_chain(&chain)
-                                        .is_some()
-                                    {
-                                        self.rebuild_if_dirty();
-                                        self.repaint_after_interaction();
-                                        return;
-                                    }
                                     let is_textarea = chain.first().is_some_and(|host_id| {
-                                        w3cos_react_compat::aot::host_local_name(*host_id)
-                                            .is_some_and(|name| name == "textarea")
+                                        if self.dom_mode {
+                                            crate::dom::tag_name(*host_id as u32) == "textarea"
+                                        } else {
+                                            w3cos_react_compat::aot::host_local_name(*host_id)
+                                                .is_some_and(|name| name == "textarea")
+                                        }
                                     });
                                     if is_textarea {
-                                        let mut next = self
-                                            .text_input_values
-                                            .entry(focus_idx)
-                                            .or_insert_with(|| value.clone())
-                                            .clone();
-                                        next.push('\n');
+                                        let next = if self.dom_mode {
+                                            chain
+                                                .first()
+                                                .map(|target| {
+                                                    crate::jsdom::text_control_value_after_edit(
+                                                        *target as u32,
+                                                        "\n",
+                                                        "insertLineBreak",
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| value.clone())
+                                        } else {
+                                            let mut next = self
+                                                .text_input_values
+                                                .entry(focus_idx)
+                                                .or_insert_with(|| value.clone())
+                                                .clone();
+                                            next.push('\n');
+                                            next
+                                        };
                                         self.apply_native_text_input(
                                             focus_idx,
                                             next,
@@ -6452,6 +6645,12 @@ impl ApplicationHandler for App {
                                             "insertLineBreak",
                                             false,
                                         );
+                                    } else if w3cos_react_compat::aot::dispatch_submit_chain(&chain)
+                                        .is_some()
+                                    {
+                                        self.rebuild_if_dirty();
+                                        self.repaint_after_interaction();
+                                        return;
                                     }
                                     self.rebuild_if_dirty();
                                     self.repaint_after_interaction();
@@ -6459,12 +6658,30 @@ impl ApplicationHandler for App {
                                 }
                                 if let Some(ref text) = event.text {
                                     if !text.is_empty() && !text.chars().all(|c| c.is_control()) {
-                                        let mut next = self
-                                            .text_input_values
-                                            .entry(focus_idx)
-                                            .or_insert_with(|| value.clone())
-                                            .clone();
-                                        next.push_str(text);
+                                        let next = if self.dom_mode {
+                                            self.native_host_chain(focus_idx)
+                                                .first()
+                                                .map(|target| {
+                                                    crate::jsdom::text_control_value_after_edit(
+                                                        *target as u32,
+                                                        text,
+                                                        "insertText",
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    let mut next = value.clone();
+                                                    next.push_str(text);
+                                                    next
+                                                })
+                                        } else {
+                                            let mut next = self
+                                                .text_input_values
+                                                .entry(focus_idx)
+                                                .or_insert_with(|| value.clone())
+                                                .clone();
+                                            next.push_str(text);
+                                            next
+                                        };
                                         self.apply_native_text_input(
                                             focus_idx,
                                             next,
@@ -6563,8 +6780,26 @@ impl ApplicationHandler for App {
                                 .or_else(|| self.text_input_values.get(&focus_idx).cloned())
                                 .unwrap_or(fallback_value);
                             self.dispatch_native_composition(focus_idx, "end", &commit);
-                            let mut next = base_value;
-                            next.push_str(&commit);
+                            let next = if self.dom_mode {
+                                self.native_host_chain(focus_idx)
+                                    .first()
+                                    .map(|target| {
+                                        crate::jsdom::text_control_value_after_edit(
+                                            *target as u32,
+                                            &commit,
+                                            "insertFromComposition",
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        let mut next = base_value;
+                                        next.push_str(&commit);
+                                        next
+                                    })
+                            } else {
+                                let mut next = base_value;
+                                next.push_str(&commit);
+                                next
+                            };
                             self.apply_native_text_input(
                                 focus_idx,
                                 next,

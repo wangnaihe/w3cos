@@ -293,6 +293,85 @@ pub fn outer_html(node: u32) -> String {
     })
 }
 
+// ── jsdom bridge helpers ──
+// Small additive wrappers used by `crate::jsdom` (Value-level DOM bridge).
+// They follow the same conventions as the wrappers above: u32 node ids and
+// DOM_DIRTY marking for mutations.
+
+/// Force the DOM dirty flag on. Used by the jsdom bridge when it mutates the
+/// document through `with_document_mut` on paths that have no wrapper here.
+pub fn touch_document() {
+    mark_dom_dirty();
+}
+
+pub fn remove_attribute(node: u32, name: &str) {
+    with_document_mut(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.remove_attribute(doc, name);
+    });
+    mark_dom_dirty();
+}
+
+pub fn has_attribute(node: u32, name: &str) -> bool {
+    with_document(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.get_attribute(doc, name).is_some()
+    })
+}
+
+pub fn class_name(node: u32) -> String {
+    with_document(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.class_name(doc)
+    })
+}
+
+pub fn set_class_name(node: u32, name: &str) {
+    with_document_mut(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.set_class_name(doc, name);
+    });
+    mark_dom_dirty();
+}
+
+pub fn class_list_contains(node: u32, class: &str) -> bool {
+    with_document(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.class_list_contains(doc, class)
+    })
+}
+
+/// W3C `Node.nodeName` — uppercase tag for elements, `#text`/`#comment`/...
+pub fn node_name(node: u32) -> String {
+    with_document(|doc| doc.get_node(NodeId::from_u32(node)).node_name())
+}
+
+/// W3C `Node.isConnected` — true when the node is attached to the document tree.
+pub fn is_connected(node: u32) -> bool {
+    with_document(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.is_connected(doc)
+    })
+}
+
+/// Scroll offset `(scroll_left, scroll_top)` for a node.
+pub fn get_scroll_offset(node: u32) -> (f32, f32) {
+    with_document(|doc| doc.get_scroll(NodeId::from_u32(node)))
+}
+
+/// Set scroll offsets; pass `None` to leave an axis unchanged.
+pub fn set_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
+    with_document_mut(|doc| doc.set_scroll(NodeId::from_u32(node), left, top));
+}
+
+/// W3C `Element.getBoundingClientRect` — zeros until the layout engine runs.
+pub fn bounding_rect(node: u32) -> w3cos_dom::DOMRect {
+    with_document(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.get_bounding_client_rect(doc)
+    })
+}
+
 /// Build Component tree from the current DOM state (for rendering).
 pub fn to_component_tree() -> w3cos_std::Component {
     with_document(|doc| doc.to_component_tree())

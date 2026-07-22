@@ -135,6 +135,21 @@ impl Element {
         }
     }
 
+    /// Like [`Element::add_event_listener`], but takes an already-resolved
+    /// [`EventType`] and returns the listener id.
+    ///
+    /// Needed by the jsdom bridge: `EventType::from_str` mints a *fresh*
+    /// `Custom(id)` on every call for unknown event names, so the bridge
+    /// memoizes name → `EventType` itself and registers by the stable value.
+    pub fn add_event_listener_typed(
+        &self,
+        doc: &mut Document,
+        event_type: EventType,
+        handler: EventHandler,
+    ) -> u32 {
+        doc.events.add(self.id, event_type, handler)
+    }
+
     pub fn remove_event_listeners(&self, doc: &mut Document) {
         doc.events.remove_all(self.id);
     }

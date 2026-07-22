@@ -9,6 +9,7 @@ pub mod history;
 pub mod location;
 pub mod node;
 pub mod selection;
+pub mod stylesheet;
 pub mod window;
 
 pub use document::Document;
@@ -25,9 +26,11 @@ pub use window::Window;
 
 #[cfg(test)]
 mod tests {
+    use crate::atom::Atom;
     use crate::css_style::CSSStyleDeclaration;
     use crate::document::Document;
     use crate::events::{Event, EventType};
+    use crate::stylesheet;
     use w3cos_std::style::Dimension;
 
     // --- Document tests ---
@@ -148,6 +151,33 @@ mod tests {
         assert_eq!(el.text_content(&doc), Some("Initial"));
         el.set_text_content(&mut doc, "Updated");
         assert_eq!(el.text_content(&doc), Some("Updated"));
+    }
+
+    #[test]
+    fn inline_element_with_text_node_lowers_to_text_component() {
+        use w3cos_std::ComponentKind;
+
+        let mut doc = Document::new();
+        let span = doc.create_element("span");
+        doc.get_node_mut(span.id)
+            .class_list
+            .push(Atom::intern("token"));
+        let text = doc.create_text_node("hello");
+        doc.append_child(span.id, text.id);
+        doc.append_child(doc.body().id, span.id);
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule(".token", &[("color", "#d4d4d4")]);
+        let tree = doc.to_component_tree();
+        assert!(matches!(
+            &tree.children[0].kind,
+            ComponentKind::Text { content } if content == "hello"
+        ));
+        assert_eq!(
+            tree.children[0].style.color,
+            w3cos_std::Color::rgb(212, 212, 212)
+        );
+        stylesheet::clear_rules();
     }
 
     #[test]
@@ -281,6 +311,189 @@ mod tests {
         doc.body().append_child(&mut doc, el);
         el.add_event_listener(&mut doc, "nonexistent", Box::new(|_| {}));
         // Should not panic; invalid events are silently ignored
+    }
+
+    // --- Stylesheet registry integration (to_component_tree) ---
+
+    #[test]
+    fn test_stylesheet_class_rule_applies_in_component_tree() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".title", &[("font-size", "24px"), ("color", "#ff0000")]);
+
+        let mut doc = Document::new();
+        let el = doc.create_element("div");
+        el.class_list_add(&mut doc, "title");
+        el.set_text_content(&mut doc, "hello");
+        doc.body().append_child(&mut doc, el);
+
+        let tree = doc.to_component_tree();
+        let child = &tree.children[0];
+        assert_eq!(child.style.font_size, 24.0);
+        assert_eq!(child.style.color.r, 255);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_stylesheet_inline_style_wins() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".title", &[("color", "#ff0000"), ("width", "42px")]);
+
+        let mut doc = Document::new();
+        let el = doc.create_element("div");
+        el.class_list_add(&mut doc, "title");
+        el.style_mut(&mut doc).set_property("color", "#0000ff");
+        doc.body().append_child(&mut doc, el);
+
+        let tree = doc.to_component_tree();
+        let style = &tree.children[0].style;
+        // Inline color overrides the matched rule...
+        assert_eq!(style.color.b, 255);
+        assert_eq!(style.color.r, 0);
+        // ...while the untouched width still comes from the stylesheet.
+        assert!(matches!(style.width, Dimension::Px(42.0)));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_stylesheet_descendant_selector_uses_dom_ancestors() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".monaco-editor .find-widget",
+            &[("position", "absolute")],
+        );
+
+        let mut doc = Document::new();
+        let outer = doc.create_element("div");
+        outer.class_list_add(&mut doc, "monaco-editor");
+        let inner = doc.create_element("div");
+        inner.class_list_add(&mut doc, "find-widget");
+        doc.body().append_child(&mut doc, outer);
+        outer.append_child(&mut doc, inner);
+
+        let tree = doc.to_component_tree();
+        let inner_component = &tree.children[0].children[0];
+        assert!(matches!(
+            inner_component.style.position,
+            w3cos_std::style::Position::Absolute
+        ));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_monaco_nested_inline_span_collapses_to_styled_text() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".monaco-editor.vs-dark .mtk1", &[("color", "#d4d4d4")]);
+        crate::stylesheet::register_rule(
+            ".monaco-editor .view-line > span",
+            &[("position", "absolute")],
+        );
+
+        let mut doc = Document::new();
+        let editor = doc.create_element("div");
+        editor.class_list_add(&mut doc, "monaco-editor");
+        editor.class_list_add(&mut doc, "vs-dark");
+        let line = doc.create_element("div");
+        line.class_list_add(&mut doc, "view-line");
+        let outer = doc.create_element("span");
+        let token = doc.create_element("span");
+        token.class_list_add(&mut doc, "mtk1");
+        let text = doc.create_text_node("function hello() {");
+
+        doc.body().append_child(&mut doc, editor);
+        editor.append_child(&mut doc, line);
+        line.append_child(&mut doc, outer);
+        outer.append_child(&mut doc, token);
+        doc.append_child(token.id, text.id);
+
+        let tree = doc.to_component_tree();
+        let rendered_line = &tree.children[0].children[0];
+        assert_eq!(rendered_line.children.len(), 1);
+        let rendered_text = &rendered_line.children[0];
+        assert!(matches!(
+            &rendered_text.kind,
+            w3cos_std::ComponentKind::Text { content } if content == "function hello() {"
+        ));
+        assert_eq!(rendered_text.style.color.r, 0xd4);
+        assert_eq!(rendered_text.style.color.g, 0xd4);
+        assert_eq!(rendered_text.style.color.b, 0xd4);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_textarea_becomes_focusable_native_text_input() {
+        let mut doc = Document::new();
+        let textarea = doc.create_element("textarea");
+        textarea.set_attribute(&mut doc, "value", "hello");
+        doc.body().append_child(&mut doc, textarea);
+
+        let tree = doc.to_component_tree();
+        let component = &tree.children[0];
+        assert!(matches!(
+            &component.kind,
+            w3cos_std::ComponentKind::TextInput { value, .. } if value == "hello"
+        ));
+        assert!(matches!(
+            component.on_click,
+            w3cos_std::EventAction::NativeHost {
+                id,
+                input: true,
+                focus: true,
+                keyboard: true,
+                ..
+            } if id == textarea.id.as_u32() as u64
+        ));
+    }
+
+    #[test]
+    fn test_dom_container_keeps_native_host_for_pointer_dispatch() {
+        let mut doc = Document::new();
+        let editor = doc.create_element("div");
+        let line = doc.create_element("div");
+        editor.append_child(&mut doc, line);
+        doc.body().append_child(&mut doc, editor);
+
+        let tree = doc.to_component_tree();
+        let component = &tree.children[0];
+        assert!(matches!(
+            component.on_click,
+            w3cos_std::EventAction::NativeHost {
+                id,
+                pointer: true,
+                ..
+            } if id == editor.id.as_u32() as u64
+        ));
+    }
+
+    #[test]
+    fn test_stylesheet_specificity_id_beats_class() {
+        crate::stylesheet::clear_rules();
+        // Class registered after id on purpose — specificity must win over order.
+        crate::stylesheet::register_rule("#main", &[("color", "#ff0000")]);
+        crate::stylesheet::register_rule(".box", &[("color", "#0000ff")]);
+
+        let mut doc = Document::new();
+        let el = doc.create_element("div");
+        el.set_attribute(&mut doc, "id", "main");
+        el.class_list_add(&mut doc, "box");
+        doc.body().append_child(&mut doc, el);
+
+        let tree = doc.to_component_tree();
+        let style = &tree.children[0].style;
+        assert_eq!(style.color.r, 255);
+        assert_eq!(style.color.b, 0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_no_rules_registered_preserves_inline_only() {
+        crate::stylesheet::clear_rules();
+        let mut doc = Document::new();
+        let el = doc.create_element("div");
+        el.style_mut(&mut doc).set_property("width", "33px");
+        doc.body().append_child(&mut doc, el);
+
+        let tree = doc.to_component_tree();
+        assert!(matches!(tree.children[0].style.width, Dimension::Px(33.0)));
     }
 
     // --- CSSStyleDeclaration tests ---

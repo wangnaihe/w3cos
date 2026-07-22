@@ -197,6 +197,21 @@
 - [ ] RegExp (full JS spec)
 - [x] TextEncoder / TextDecoder (UTF-8, UTF-16LE/BE, ASCII, BOM handling)
 
+### Monaco Editor Milestone ✅ (see docs/monaco-gap-report.md for the compatibility ledger)
+- [x] ESM resolver at Monaco scale: dotted-basename subpaths (`editor.api` → `editor.api.js`), lexical path normalization (graph dedup), resolve/symbol caches (528-module scan in 0.65s)
+- [x] `export * from` collection + forwarding, destructured exports (`export const { a, b } = ...`), `export default <expr>`
+- [x] JS class system (ESM path): extends / super() / super.method / instanceof / static members + static blocks / getters+setters / #private fields / class expressions — lowered to w3cos-core prototype-chain objects with call slots
+- [x] jsdom Value-level DOM bridge (`w3cos_runtime::jsdom`): real Document backing for compiled JS (elements, style proxy, classList, events, canvas 2D, selection, storage, timers, microtasks, matchMedia) + frame-loop integration
+- [x] `import * as ns` namespace objects (211 bindings)
+- [x] try/catch/finally/throw real semantics
+- [x] Promise objects + microtask queue
+- [x] JS globals: setTimeout/JSON/queueMicrotask/URL/atob/structuredClone
+- [x] CSS imports from ESM (Monaco has 110)
+- [x] Monaco editor.api end-to-end compile + render + input smoke test
+  - [x] Headless DOM materialization (`.monaco-editor`, 135 nodes, model/editor line count 5)
+  - [x] Window rendering smoke test (line numbers and source text visible in CPU-rendered native window)
+  - [x] Keyboard input changes model content (`X// Monaco...` verified in both native window and AI Bridge model probe)
+
 ## Phase 3 — Compatibility & Migration
 - [x] React Native API mapping (`w3cos-rn-compat`: View/Text/TouchableOpacity/Pressable/ScrollView/Image/TextInput/SafeAreaView/FlatList/Switch/Button/StatusBar + StyleSheet.create + use_state)
 - [x] React hooks compatibility (`w3cos-react-compat`: useState/useEffect/useMemo/useCallback/useRef/useReducer/useContext + provideContext + flushSync, slot-table model on top of `w3cos-core` signals)

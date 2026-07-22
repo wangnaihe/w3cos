@@ -24,6 +24,7 @@ pub mod indexed_db;
 mod ios_input;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod ipc;
+pub mod jsdom;
 pub mod layout;
 pub mod manifest;
 pub mod media;
@@ -56,6 +57,9 @@ pub mod worker;
 
 // Native capability extensions
 pub use w3cos_ffi as ffi;
+
+// Runtime stylesheet registry (ESM CSS imports baked into the bundle).
+pub use w3cos_dom::stylesheet;
 
 #[cfg(feature = "gpu")]
 #[path = "render_gpu.rs"]
@@ -116,4 +120,28 @@ pub fn run_app_on_android(
 /// DOM mutations and signal changes trigger automatic re-rendering.
 pub fn run_app_dom(setup: fn()) -> Result<()> {
     window::run_dom(setup)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stylesheet_registry_is_reexported_for_generated_bundles() {
+        // Generated esm_bundle.rs calls w3cos_runtime::stylesheet::register_rule.
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".monaco-editor .find-widget",
+            &[("position", "absolute")],
+        );
+        let ancestors = [crate::stylesheet::SelectorContext::new(
+            "div",
+            None,
+            &["monaco-editor"],
+        )];
+        let matched =
+            crate::stylesheet::matching_declarations("div", None, &["find-widget"], &ancestors);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].0, "position");
+        assert_eq!(matched[0].1, "absolute");
+        crate::stylesheet::clear_rules();
+    }
 }

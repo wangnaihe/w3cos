@@ -44,66 +44,67 @@ These are capabilities the **platform** must implement. They are not VS Code-spe
 
 | Standard | API | Current Status | Priority | Notes |
 |----------|-----|----------------|----------|-------|
-| DOM Core | document.createElement, appendChild, removeChild, replaceChild, cloneNode, insertBefore | Partial (w3cos-dom) | P0 | Foundation for everything |
-| DOM Core | querySelector, querySelectorAll, getElementById, getElementsByClassName | Partial | P0 | VS Code uses extensively |
-| DOM Core | textContent, innerHTML (read-only), parentNode, childNodes, nextSibling | Partial | P0 | Tree traversal |
-| DOM Core | setAttribute, getAttribute, removeAttribute, dataset | Partial | P0 | |
+| DOM Core | document.createElement, appendChild, removeChild, replaceChild, cloneNode, insertBefore | Done (w3cos-dom) | P0 | Foundation for everything |
+| DOM Core | querySelector, querySelectorAll, getElementById, getElementsByClassName | Partial | P0 | Runtime queries support #id/.class/tag only; no compound/pseudo |
+| DOM Core | textContent, innerHTML (read-only), parentNode, childNodes, nextSibling | Partial | P0 | innerHTML read missing (outer_html exists) |
+| DOM Core | setAttribute, getAttribute, removeAttribute, dataset | Done | P0 | |
 | DOM Core | classList (add, remove, toggle, contains) | Have | Done | |
-| DOM Events | addEventListener, removeEventListener, dispatchEvent | Partial | P0 | |
-| DOM Events | MouseEvent, KeyboardEvent, FocusEvent, InputEvent, WheelEvent, PointerEvent | Partial | P0 | PointerEvent needed for Monaco |
-| DOM Events | CompositionEvent (IME input) | Partial (winit IME) | P1 | CJK input support |
-| DOM Events | CustomEvent | None | P1 | VS Code internal events |
-| CSSOM | element.style read/write, getComputedStyle() | Partial | P0 | |
+| DOM Events | addEventListener, removeEventListener, dispatchEvent | Done | P0 | 3-phase capture/target/bubble |
+| DOM Events | MouseEvent, KeyboardEvent, FocusEvent, InputEvent, WheelEvent, PointerEvent | Done | P0 | |
+| DOM Events | CompositionEvent (IME input) | Done (winit IME) | P1 | CJK input support |
+| DOM Events | CustomEvent | Done | P1 | Event::custom with detail |
+| CSSOM | element.style read/write, getComputedStyle() | Partial | P0 | getComputedStyle echoes inline style only; no cascade |
 | CSSOM | CSSStyleSheet, adoptedStyleSheets | None | P2 | Theme system |
 | CSS Flexbox | Full spec | Have (Taffy) | Done | |
 | CSS Grid | Full spec | Have (Taffy) | Done | |
 | CSS Position | relative, absolute, fixed, sticky | Have | Done | |
-| CSS Text | text-align, text-decoration, white-space, word-break, text-overflow, line-height, letter-spacing | Partial | P0 | Code rendering depends on this |
-| CSS Text | font-family, font-weight, font-style, @font-face | Partial | P0 | Monospace font critical for editor |
-| CSS Overflow | overflow: hidden/scroll/auto with native scrollbars | Basic | P1 | Virtual scrolling for large files |
-| CSS Color | rgba(), hsla(), currentColor, CSS variables (var(--x)) | Partial | P1 | VS Code theme system uses CSS vars |
-| CSS Selectors | :hover, :focus, :active, :focus-within, :first-child, :last-child, :nth-child, [attr] selectors | None | P1 | CSS-based hover/focus states |
+| CSS Text | text-align, text-decoration, white-space, word-break, text-overflow, line-height, letter-spacing | Done | P0 | Code rendering depends on this |
+| CSS Text | font-family, font-weight, font-style, @font-face | Done | P0 | FontRegistry with weight/style resolution |
+| CSS Overflow | overflow: hidden/scroll/auto with native scrollbars | Partial | P1 | Scrolling works (kinetic/fling); no visible scrollbar UI |
+| CSS Color | rgba(), hsla(), currentColor, CSS variables (var(--x)) | Partial | P1 | rgba/hsla only in canvas2d; var() compile-time, same-block only |
+| CSS Selectors | :hover, :focus, :active, :focus-within, :first-child, :last-child, :nth-child, [attr] selectors | Partial | P1 | Compile-time stylesheet matching done; no :focus-within; runtime querySelector lacks them |
 | CSS Transitions | transition property | Have | Done | |
-| CSS Animations | @keyframes, animation property | None | P2 | Loading spinners, cursor blink |
-| CSS calc() | calc(100% - 20px) | None | P2 | Layout calculations |
-| CSS Custom Props | var(--color), :root definitions | None | P1 | VS Code theme engine |
+| CSS Animations | @keyframes, animation property | Parsed only | P2 | KeyframeAnimation parsed, never executed |
+| CSS calc() | calc(100% - 20px) | Partial | P2 | px-only evaluator |
+| CSS Custom Props | var(--color), :root definitions | Partial | P1 | Same-block compile-time resolution; no :root runtime cascade |
 | CSS z-index | Stacking context | Have | Done | |
 | CSS box-shadow | Multi-layer | Have | Done | |
-| CSS border | border-width, border-style, border-color (per-side) | Partial | P1 | |
+| CSS border | border-width, border-style, border-color (per-side) | Partial | P1 | Uniform border only; sides collapsed |
 | CSS transform | translate, scale, rotate | Have | Done | |
-| Canvas 2D | CanvasRenderingContext2D (fillRect, strokeRect, drawImage, fillText, measureText) | None | P1 | Monaco minimap, diff decorations |
-| Selection API | window.getSelection(), Range, Selection | None | P0 | Text selection in editor |
-| Clipboard API | navigator.clipboard.readText/writeText | Code exists (arboard) | P1 | Copy/paste |
+| Canvas 2D | CanvasRenderingContext2D (fillRect, strokeRect, drawImage, fillText, measureText) | Done | P1 | Full path API, ImageData, line styles, transforms |
+| Selection API | window.getSelection(), Range, Selection | Done | P0 | 564-line selection.rs |
+| Clipboard API | navigator.clipboard.readText/writeText | Done | P1 | + ClipboardItem MIME roundtrip |
 | Drag and Drop | dragstart, dragover, drop, DataTransfer | None | P2 | File drag, tab reorder |
-| ResizeObserver | Element resize monitoring | None | P1 | Panel/editor resize |
-| MutationObserver | DOM change monitoring | None | P2 | Extension DOM patches |
-| IntersectionObserver | Visibility detection | None | P2 | Virtual list optimization |
-| requestAnimationFrame | Frame-synced callbacks | Implicit (frame loop) | P1 | Needs explicit JS API |
-| matchMedia | Media query matching | None | P3 | Responsive layout |
-| window.scrollTo | Programmatic scrolling | None | P1 | |
+| ResizeObserver | Element resize monitoring | Done | P1 | observers.rs |
+| MutationObserver | DOM change monitoring | Done | P2 | observers.rs |
+| IntersectionObserver | Visibility detection | Done | P2 | observers.rs |
+| requestAnimationFrame | Frame-synced callbacks | Done | P1 | timers.rs + frame loop |
+| matchMedia | Media query matching | Done | P3 | min/max-width, prefers-color-scheme |
+| window.scrollTo | Programmatic scrolling | None | P1 | Element scrollTop/scrollLeft exist |
 
 ### 2.2 JavaScript / TypeScript Runtime (replacing V8)
 
 | Capability | Specifics | Current Status | Priority |
 |------------|-----------|----------------|----------|
-| Primitive types | number, string, boolean, null, undefined, bigint, symbol | AOT compile | Done |
-| Object model | Object, Array, Map, Set, WeakMap, WeakSet, WeakRef | w3cos-core Value | Partial |
-| Proxy / Reflect | All 13 handler traps | w3cos-core Proxy | Done |
-| async/await | async fn, Promise, Promise.all/race/allSettled/any | Compiled to tokio | Done |
-| Error handling | try/catch/finally, Error/TypeError/RangeError | Compiled | Done |
+| Primitive types | number, string, boolean, null, undefined, bigint, symbol | AOT compile (no bigint/symbol) | Partial |
+| Object model | Object, Array, Map, Set, WeakMap, WeakSet, WeakRef | w3cos-core Value | Partial (Map string-keyed stub; no Weak*) |
+| Proxy / Reflect | All 13 handler traps | w3cos-core Proxy | Done (Proxy); Reflect: None |
+| async/await | async fn, Promise, Promise.all/race/allSettled/any | Compiled to tokio | Partial (no Promise objects/.then; all/race only) |
+| Error handling | try/catch/finally, Error/TypeError/RangeError | Broken | P0 (throw → panic!, catch discarded — in progress) |
 | Closures | Captured variables with Rc<RefCell<T>> | Compiled | Done |
-| Module system | import/export (ESM static) | Compile-time | P0 |
+| Class system | extends, super, static, getters/setters, #private | In progress (ESM path) | P0 (see docs/monaco-gap-report.md) |
+| Module system | import/export (ESM static) | Compile-time | Done (incl. export *, namespace imports pending) |
 | Dynamic import | import("./module") | None | P2 |
 | RegExp | Full JS regex spec (named groups, lookbehind, unicode) | None | P1 |
-| Timers | setTimeout, setInterval, clearTimeout, clearInterval | None | P0 |
-| JSON | JSON.parse, JSON.stringify | None (serde at compile) | P0 |
+| Timers | setTimeout, setInterval, clearTimeout, clearInterval | Rust-level done | P0 (JS globals pending) |
+| JSON | JSON.parse, JSON.stringify | None | P0 |
 | console | console.log, console.error, console.warn, console.time | Compiled to println! | Partial |
-| TextEncoder/Decoder | UTF-8/UTF-16 encoding | None | P1 |
+| TextEncoder/Decoder | UTF-8/UTF-16 encoding | Done (Rust level) | P1 (JS global wiring pending) |
 | URL / URLSearchParams | URL parsing and manipulation | None | P2 |
 | Intl | NumberFormat, DateTimeFormat, Collator | None | P3 |
 | structuredClone | Deep clone | None | P3 |
 | queueMicrotask | Microtask scheduling | None | P2 |
-| EventTarget | Base class for event dispatching | None | P1 |
+| EventTarget | Base class for event dispatching | Partial (DOM events only) | P1 |
 | AbortController | Request/operation cancellation | None | P2 |
 
 ### 2.3 System APIs (replacing Node.js + Electron)
@@ -112,15 +113,15 @@ These are capabilities the **platform** must implement. They are not VS Code-spe
 
 | Standard | API | Replaces | Current Status | Priority |
 |----------|-----|----------|----------------|----------|
-| Fetch API | fetch(), Request, Response, Headers | Node.js http/https | None | P0 |
-| File System Access | showOpenFilePicker, FileSystemFileHandle, read/write | Node.js fs | None | P0 |
-| Web Workers | new Worker(), postMessage, SharedWorker | Node.js worker_threads | None | P1 |
-| WebSocket | new WebSocket(), onmessage, send | Node.js ws / net | None | P1 |
-| Storage | localStorage, sessionStorage | Electron Store | None | P1 |
-| IndexedDB | Structured data storage | Node.js sqlite / json files | None | P2 |
+| Fetch API | fetch(), Request, Response, Headers | Node.js http/https | Done (fetch + fetch_async; Request/Headers as classes pending) | P0 |
+| File System Access | showOpenFilePicker, FileSystemFileHandle, read/write | Node.js fs | Partial (file/dir handles exist; picker via w3cos.dialog; w3cos.fs path API done) | P0 |
+| Web Workers | new Worker(), postMessage, SharedWorker | Node.js worker_threads | Done (Rust-closure workers + SharedWorker ports) | P1 |
+| WebSocket | new WebSocket(), onmessage, send | Node.js ws / net | Done (tungstenite RFC 6455) | P1 |
+| Storage | localStorage, sessionStorage | Electron Store | Done localStorage (JSON persistence); sessionStorage: None | P1 |
+| IndexedDB | Structured data storage | Node.js sqlite / json files | Done (stores/indexes/transactions, JSON-file backed) | P2 |
 | Notifications | new Notification() | Electron Notification | Have (notify-rust) | P2 |
-| WHATWG Streams | ReadableStream, WritableStream, TransformStream | Node.js stream | None | P1 |
-| WHATWG Encoding | TextEncoder, TextDecoder | Node.js Buffer | None | P1 |
+| WHATWG Streams | ReadableStream, WritableStream, TransformStream | Node.js stream | Partial (ReadableStream only) | P1 |
+| WHATWG Encoding | TextEncoder, TextDecoder | Node.js Buffer | Done | P1 |
 | WHATWG URL | URL, URLSearchParams | Node.js url | None | P2 |
 
 #### w3cos Platform APIs (non-standard, custom)
@@ -129,25 +130,25 @@ These have no W3C equivalent but are necessary for desktop applications. Designe
 
 | API | Purpose | Replaces | Current Status | Priority |
 |-----|---------|----------|----------------|----------|
-| w3cos.process.spawn() | Launch child processes, pipe stdin/stdout | Node.js child_process | None | P0 |
-| w3cos.process.exec() | Run command and capture output | Node.js child_process.exec | None | P0 |
-| w3cos.pty.create() | Pseudo-terminal for interactive shells | node-pty | None | P0 |
-| w3cos.window.create() | Open new application windows | Electron BrowserWindow | Single window only | P1 |
-| w3cos.window.close() | Close windows programmatically | Electron BrowserWindow.close | None | P1 |
-| w3cos.dialog.showOpen() | Native file open dialog | Electron dialog.showOpenDialog | None | P1 |
-| w3cos.dialog.showSave() | Native file save dialog | Electron dialog.showSaveDialog | None | P1 |
-| w3cos.dialog.showMessage() | Message box | Electron dialog.showMessageBox | None | P2 |
+| w3cos.process.spawn() | Launch child processes, pipe stdin/stdout | Node.js child_process | Done | P0 |
+| w3cos.process.exec() | Run command and capture output | Node.js child_process.exec | Done | P0 |
+| w3cos.pty.create() | Pseudo-terminal for interactive shells | node-pty | Done (Unix) | P0 |
+| w3cos.window.create() | Open new application windows | Electron BrowserWindow | Done (WindowManager model) | P1 |
+| w3cos.window.close() | Close windows programmatically | Electron BrowserWindow.close | Done | P1 |
+| w3cos.dialog.showOpen() | Native file open dialog | Electron dialog.showOpenDialog | Done (rfd) | P1 |
+| w3cos.dialog.showSave() | Native file save dialog | Electron dialog.showSaveDialog | Done (rfd) | P1 |
+| w3cos.dialog.showMessage() | Message box | Electron dialog.showMessageBox | Done (rfd) | P2 |
 | w3cos.shell.openExternal() | Open URL in default browser | Electron shell.openExternal | None | P2 |
 | w3cos.shell.showInFolder() | Reveal file in file manager | Electron shell.showItemInFolder | None | P2 |
-| w3cos.ipc.send() | Inter-process communication | Electron ipcMain/ipcRenderer | None | P1 |
-| w3cos.ipc.on() | IPC event listener | Electron ipcMain.on | None | P1 |
-| w3cos.menu.setApp() | Application menu bar | Electron Menu.setApplicationMenu | None | P2 |
-| w3cos.menu.showContext() | Context menu | Electron Menu.popup | None | P2 |
+| w3cos.ipc.send() | Inter-process communication | Electron ipcMain/ipcRenderer | Done (UDS/TCP JSON bus) | P1 |
+| w3cos.ipc.on() | IPC event listener | Electron ipcMain.on | Done | P1 |
+| w3cos.menu.setApp() | Application menu bar | Electron Menu.setApplicationMenu | Done (self-drawn) | P2 |
+| w3cos.menu.showContext() | Context menu | Electron Menu.popup | Done | P2 |
 | w3cos.tray.create() | System tray icon | Electron Tray | None | P3 |
-| w3cos.env.get() | Environment variables | Node.js process.env | None | P1 |
-| w3cos.path.join() | Path manipulation | Node.js path | None | P1 |
-| w3cos.os.platform() | OS information | Node.js os | None | P2 |
-| w3cos.fs.watch() | File system watcher | Node.js fs.watch / chokidar | None | P1 |
+| w3cos.env.get() | Environment variables | Node.js process.env | Done | P1 |
+| w3cos.path.join() | Path manipulation | Node.js path | Done | P1 |
+| w3cos.os.platform() | OS information | Node.js os | Partial (sysinfo in process.rs) | P2 |
+| w3cos.fs.watch() | File system watcher | Node.js fs.watch / chokidar | Done (notify) | P1 |
 
 ---
 

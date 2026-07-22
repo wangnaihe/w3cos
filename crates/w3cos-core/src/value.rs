@@ -41,19 +41,48 @@ impl PartialEq for Value {
 #[derive(Clone)]
 pub struct JsFunction {
     inner: Rc<dyn Fn(Value, Vec<Value>) -> Value>,
+    /// Properties assigned on the function value. JS functions are objects:
+    /// `id.toString = () => name` (monaco's service decorators), static
+    /// methods installed on constructor functions, etc.
+    props: Rc<RefCell<std::collections::HashMap<String, Value>>>,
 }
 
 impl JsFunction {
     pub fn new(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
-        Self { inner: Rc::new(f) }
+        Self {
+            inner: Rc::new(f),
+            props: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        }
     }
 
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         (self.inner)(this, args)
     }
 
-    fn identity(&self) -> usize {
-        Rc::as_ptr(&self.inner) as *const () as usize
+    /// Read a property of the function object (Undefined when absent).
+    pub fn get_property(&self, key: &str) -> Value {
+        self.props
+            .borrow()
+            .get(key)
+            .cloned()
+            .unwrap_or(Value::Undefined)
+    }
+
+    /// Assign a property on the function object.
+    pub fn set_property(&self, key: &str, value: Value) {
+        self.props.borrow_mut().insert(key.to_string(), value);
+    }
+
+    /// A stable identity address for this function value (clones of the same
+    /// `JsFunction` share it) — used for identity-keyed collections (JS Map).
+    pub fn identity(&self) -> usize {
+        Rc::as_ptr(&self.inner) as *const u8 as usize
+    }
+
+    /// Function identity: two `JsFunction`s are the same function when they
+    /// share the inner closure allocation (clones of one value do).
+    pub fn ptr_eq(&self, other: &JsFunction) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -178,7 +207,15 @@ impl Value {
                 elems.join(",")
             }
             Value::Object(_) => "[object Object]".into(),
-            Value::Function(_) => "function() { [native code] }".into(),
+            Value::Function(function) => {
+                let to_string = function.get_property("toString");
+                if matches!(to_string, Value::Function(_) | Value::Object(_)) {
+                    if let Value::String(value) = to_string.call(self.clone(), vec![]) {
+                        return value;
+                    }
+                }
+                "function() { [native code] }".into()
+            }
         }
     }
 
@@ -262,6 +299,11 @@ impl Value {
                     arr.borrow().get(idx).cloned().unwrap_or(Value::Undefined)
                 } else if key == "length" {
                     Value::Number(arr.borrow().len() as f64)
+                } else if key == "buffer" {
+                    // Typed arrays use the same Rc-backed storage as arrays
+                    // in the compact runtime; exposing it as `buffer` lets a
+                    // new typed-array view reuse/slice those code units.
+                    self.clone()
                 } else {
                     Value::Undefined
                 }
@@ -279,6 +321,8 @@ impl Value {
                     Value::Undefined
                 }
             }
+            // JS functions are objects: read attached properties.
+            Value::Function(f) => f.get_property(key),
             _ => Value::Undefined,
         }
     }
@@ -305,9 +349,25 @@ impl Value {
     }
 
     /// Property assignment: `obj[key] = value`.
+    ///
+    /// Mirrors the `__w3cos_getter_` read convention with a setter one: when
+    /// the object has no own data property `key` but a `__w3cos_setter_{key}`
+    /// function is reachable through the prototype chain, the setter is
+    /// invoked with the object as receiver instead of storing directly.
     pub fn set_property(&self, key: &str, value: Value) {
         match self {
             Value::Object(o) => {
+                let has_own = o.borrow().properties.contains_key(key);
+                if !has_own {
+                    let setter = o
+                        .borrow()
+                        .get(&format!("__w3cos_setter_{key}"), self)
+                        .clone();
+                    if !setter.is_undefined() {
+                        setter.call(self.clone(), vec![value]);
+                        return;
+                    }
+                }
                 o.borrow_mut().set(key, value, &Value::Undefined);
             }
             Value::Array(arr) => {
@@ -319,8 +379,29 @@ impl Value {
                     a[idx] = value;
                 }
             }
+            // JS functions are objects: properties attach to the function
+            // value (decorator ids, constructor statics).
+            Value::Function(f) => f.set_property(key, value),
             _ => {}
         }
+    }
+
+    /// Delete an own property and return the JavaScript-style success value.
+    pub fn delete_property(&self, key: &str) -> Value {
+        let deleted = match self {
+            Value::Object(object) => object.borrow_mut().delete(key),
+            Value::Array(array) => {
+                if let Ok(index) = key.parse::<usize>() {
+                    if let Some(slot) = array.borrow_mut().get_mut(index) {
+                        *slot = Value::Undefined;
+                    }
+                }
+                true
+            }
+            Value::Function(function) => function.props.borrow_mut().remove(key).is_some(),
+            _ => true,
+        };
+        Value::Bool(deleted)
     }
 }
 
@@ -362,17 +443,65 @@ impl Value {
         Value::Function(JsFunction::new(f))
     }
 
+    /// A plain object that is also callable (a JS class / constructor object).
+    pub fn callable(
+        props: HashMap<String, Value>,
+        f: impl Fn(Value, Vec<Value>) -> Value + 'static,
+    ) -> Self {
+        Value::Object(Rc::new(RefCell::new(crate::JsObject::with_call_slot(
+            props,
+            JsFunction::new(f),
+        ))))
+    }
+
     /// Invoke a dynamically lowered JavaScript function value.
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         match self {
             Value::Function(function) => function.call(this, args),
+            Value::Object(object) => {
+                let slot = object.borrow().call_slot().cloned();
+                match slot {
+                    Some(function) => function.call(this, args),
+                    None => Value::Undefined,
+                }
+            }
             _ => Value::Undefined,
         }
     }
 
     /// Invoke a property as a method while preserving the JavaScript receiver.
     pub fn call_method(&self, key: &str, args: Vec<Value>) -> Value {
+        if key == "__w3cos_symbol_iterator" {
+            return iterator_object(self.iter().collect());
+        }
+        if let Value::Array(values) = self
+            && let Some(result) = array_call_method(values, key, args.clone(), self)
+        {
+            return result;
+        }
         match (self, key) {
+            (Value::Function(_), "call") => {
+                let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                return self.call(this_arg, args.into_iter().skip(1).collect());
+            }
+            (Value::Function(_), "apply") => {
+                let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                let applied_args = match args.get(1) {
+                    Some(Value::Array(values)) => values.borrow().clone(),
+                    _ => Vec::new(),
+                };
+                return self.call(this_arg, applied_args);
+            }
+            (Value::Function(_), "bind") => {
+                let target = self.clone();
+                let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                let bound_args: Vec<Value> = args.into_iter().skip(1).collect();
+                return Value::function(move |_, call_args| {
+                    let mut combined = bound_args.clone();
+                    combined.extend(call_args);
+                    target.call(this_arg.clone(), combined)
+                });
+            }
             (Value::String(value), "endsWith") => {
                 return Value::Bool(
                     args.first()
@@ -398,6 +527,151 @@ impl Value {
                 let end = normalize(args.get(1), length).max(start);
                 return Value::String(String::from_utf16_lossy(&units[start..end]));
             }
+            (Value::String(value), "substr") => {
+                let units = value.encode_utf16().collect::<Vec<_>>();
+                let length = units.len() as i64;
+                let raw_start = args
+                    .first()
+                    .map(Value::to_number)
+                    .filter(|number| number.is_finite())
+                    .map(|number| number.trunc() as i64)
+                    .unwrap_or(0);
+                let start = if raw_start < 0 {
+                    (length + raw_start).max(0)
+                } else {
+                    raw_start.min(length)
+                } as usize;
+                let count = args
+                    .get(1)
+                    .map(Value::to_number)
+                    .filter(|number| number.is_finite())
+                    .map(|number| number.trunc().max(0.0) as usize)
+                    .unwrap_or(units.len() - start);
+                let end = start.saturating_add(count).min(units.len());
+                return Value::String(String::from_utf16_lossy(&units[start..end]));
+            }
+            (Value::String(value), "startsWith") => {
+                let needle = args.first().cloned().unwrap_or_default().to_js_string();
+                let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
+                let start = string_index_to_byte(value, start);
+                return Value::Bool(value[start..].starts_with(&needle));
+            }
+            (Value::String(value), "includes") => {
+                let needle = args.first().cloned().unwrap_or_default().to_js_string();
+                let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
+                let start = string_index_to_byte(value, start);
+                return Value::Bool(value[start..].contains(&needle));
+            }
+            (Value::String(value), "indexOf") => {
+                let needle = args.first().cloned().unwrap_or_default().to_js_string();
+                let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
+                let start_byte = string_index_to_byte(value, start);
+                let index = value
+                    .get(start_byte..)
+                    .and_then(|tail| tail.find(&needle).map(|offset| start_byte + offset))
+                    .map(|byte| value[..byte].chars().count() as f64)
+                    .unwrap_or(-1.0);
+                return Value::Number(index);
+            }
+            (Value::String(value), "charCodeAt") => {
+                let index = args.first().map(Value::to_number).unwrap_or(0.0);
+                if !index.is_finite() || index < 0.0 {
+                    return Value::Number(f64::NAN);
+                }
+                return Value::Number(
+                    value
+                        .encode_utf16()
+                        .nth(index as usize)
+                        .map(f64::from)
+                        .unwrap_or(f64::NAN),
+                );
+            }
+            (Value::String(value), "charAt") => {
+                let index = args.first().map(Value::to_number).unwrap_or(0.0);
+                if !index.is_finite() || index < 0.0 {
+                    return Value::String(String::new());
+                }
+                return Value::String(
+                    value
+                        .chars()
+                        .nth(index as usize)
+                        .map(|character| character.to_string())
+                        .unwrap_or_default(),
+                );
+            }
+            (Value::String(value), "substring") => {
+                let len = value.chars().count();
+                let mut start = args.first().map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
+                let mut end = args
+                    .get(1)
+                    .map(Value::to_number)
+                    .unwrap_or(len as f64)
+                    .max(0.0) as usize;
+                start = start.min(len);
+                end = end.min(len);
+                if start > end {
+                    std::mem::swap(&mut start, &mut end);
+                }
+                let start = string_index_to_byte(value, start);
+                let end = string_index_to_byte(value, end);
+                return Value::String(value[start..end].to_string());
+            }
+            (Value::String(value), "toUpperCase") => {
+                return Value::String(value.to_uppercase());
+            }
+            (Value::String(value), "toLowerCase") => {
+                return Value::String(value.to_lowercase());
+            }
+            (Value::String(value), "trim") => {
+                return Value::String(value.trim().to_string());
+            }
+            (Value::String(value), "split") => {
+                let Some(separator) = args.first() else {
+                    return Value::array(vec![Value::String(value.clone())]);
+                };
+                if separator.is_undefined() {
+                    return Value::array(vec![Value::String(value.clone())]);
+                }
+                let separator = separator.to_js_string();
+                let limit = args
+                    .get(1)
+                    .map(|value| value.to_number().max(0.0) as usize)
+                    .unwrap_or(usize::MAX);
+                let parts: Vec<Value> = if separator.is_empty() {
+                    value
+                        .chars()
+                        .take(limit)
+                        .map(|ch| Value::String(ch.to_string()))
+                        .collect()
+                } else {
+                    value
+                        .split(&separator)
+                        .take(limit)
+                        .map(|part| Value::String(part.to_string()))
+                        .collect()
+                };
+                return Value::array(parts);
+            }
+            (Value::String(value), "match") => {
+                let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+                if let Some(result) = crate::regexp::string_match(value, &pattern) {
+                    return result;
+                }
+            }
+            (Value::String(value), "replace") => {
+                let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+                let replacement = args.get(1).cloned().unwrap_or(Value::Undefined);
+                if let Some(result) =
+                    crate::regexp::string_replace(value, &pattern, &replacement.to_js_string())
+                {
+                    return result;
+                }
+                return Value::String(value.replacen(
+                    &pattern.to_js_string(),
+                    &replacement.to_js_string(),
+                    1,
+                ));
+            }
             (Value::Array(values), "filter") => {
                 let predicate = args.first().cloned().unwrap_or(Value::Undefined);
                 let filtered = values
@@ -421,6 +695,22 @@ impl Value {
                 values.extend(args);
                 return Value::Number(values.len() as f64);
             }
+            (Value::Array(values), "set") => {
+                let source: Vec<Value> = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Undefined)
+                    .iter()
+                    .collect();
+                let offset = array_index(args.get(1), values.borrow().len(), 0);
+                let mut target = values.borrow_mut();
+                for (index, value) in source.into_iter().enumerate() {
+                    if let Some(slot) = target.get_mut(offset + index) {
+                        *slot = value;
+                    }
+                }
+                return Value::Undefined;
+            }
             (Value::Array(values), "forEach") => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 for (index, value) in values.borrow().iter().cloned().enumerate() {
@@ -439,10 +729,38 @@ impl Value {
     pub fn iter(&self) -> std::vec::IntoIter<Value> {
         match self {
             Value::Array(values) => values.borrow().clone().into_iter(),
-            // The AOT lowering turns common `Map#forEach(value => ...)`
-            // loops into this iterator path. Map exposes a live values
-            // snapshot so the lowered loop retains JavaScript semantics.
+            // First use the standards-oriented Map/Set registry. Retain the
+            // host runtime's snapshot hook as a fallback for its lightweight
+            // built-in Map used by compiled React/native paths.
             Value::Object(object) => {
+                if let Some(values) = crate::collections::iter_collection(self) {
+                    return values.into_iter();
+                }
+                // Monaco's command registry stores commands in its own
+                // LinkedList implementation. Generator lowering is still a
+                // best-effort path, so expose that conventional `_first` /
+                // `next` node chain through the runtime iterator bridge.
+                let first = self.get_property("_first");
+                if first.is_object() {
+                    let mut values = Vec::new();
+                    let mut node = first;
+                    while node.is_object() {
+                        let element = node.get_property("element");
+                        if element.is_undefined() {
+                            break;
+                        }
+                        values.push(element);
+                        let next = node.get_property("next");
+                        if next.strict_eq(&node) {
+                            break;
+                        }
+                        node = next;
+                    }
+                    return values.into_iter();
+                }
+                // The AOT lowering turns common `Map#forEach(value => ...)`
+                // loops into this iterator path. Map exposes a live values
+                // snapshot so the lowered loop retains JavaScript semantics.
                 let snapshot = object.borrow().get_direct("__w3cosMapValuesSnapshot");
                 let values = if snapshot.is_function() {
                     snapshot.call(self.clone(), vec![])
@@ -457,6 +775,321 @@ impl Value {
             _ => Vec::new().into_iter(),
         }
     }
+}
+
+fn iterator_object(values: Vec<Value>) -> Value {
+    let values = Rc::new(values);
+    let index = Rc::new(RefCell::new(0usize));
+    let next_values = values.clone();
+    let next_index = index.clone();
+    let next = Value::function(move |_, _| {
+        let mut index = next_index.borrow_mut();
+        if let Some(value) = next_values.get(*index).cloned() {
+            *index += 1;
+            crate::js_object! {
+                "value" => value,
+                "done" => Value::Bool(false),
+            }
+        } else {
+            crate::js_object! {
+                "value" => Value::Undefined,
+                "done" => Value::Bool(true),
+            }
+        }
+    });
+    crate::js_object! { "next" => next }
+}
+
+/// Normalize a JS array index argument (`undefined` → `default`; negatives
+/// wrap from the end; clamped to `len`).
+fn array_index(value: Option<&Value>, len: usize, default: usize) -> usize {
+    let Some(value) = value else {
+        return default.min(len);
+    };
+    if value.is_undefined() {
+        return default.min(len);
+    }
+    let n = value.to_number();
+    if n.is_nan() {
+        0
+    } else if n < 0.0 {
+        (len as f64 + n).max(0.0) as usize
+    } else {
+        (n as usize).min(len)
+    }
+}
+
+fn string_index_to_byte(value: &str, index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(value.len())
+}
+
+/// The JS `Array.prototype` method set for [`Value::Array`]. Returns `None`
+/// for names the dedicated match arms in [`Value::call_method`] implement
+/// (`filter`/`push`/`forEach`) or don't cover at all.
+fn array_call_method(
+    values: &Rc<RefCell<Vec<Value>>>,
+    key: &str,
+    args: Vec<Value>,
+    this: &Value,
+) -> Option<Value> {
+    let arg = |index: usize| args.get(index).cloned().unwrap_or(Value::Undefined);
+    let callback_args = |value: &Value, index: usize| {
+        vec![value.clone(), Value::Number(index as f64), this.clone()]
+    };
+    Some(match key {
+        "filter" | "push" | "forEach" | "set" => return None, // handled by dedicated arms
+        "pop" => values.borrow_mut().pop().unwrap_or(Value::Undefined),
+        "shift" => {
+            if values.borrow().is_empty() {
+                Value::Undefined
+            } else {
+                values.borrow_mut().remove(0)
+            }
+        }
+        "unshift" => {
+            let mut values = values.borrow_mut();
+            for (offset, item) in args.iter().enumerate() {
+                values.insert(offset, item.clone());
+            }
+            Value::Number(values.len() as f64)
+        }
+        "slice" => {
+            let values = values.borrow();
+            let start = array_index(args.first(), values.len(), 0);
+            let end = array_index(args.get(1), values.len(), values.len());
+            Value::array(values[start.min(end)..end].to_vec())
+        }
+        "splice" => {
+            let mut values = values.borrow_mut();
+            let start = array_index(args.first(), values.len(), 0);
+            let delete_count = match args.get(1) {
+                None => values.len() - start,
+                Some(v) if v.is_undefined() => values.len() - start,
+                Some(v) => (v.to_number().max(0.0) as usize).min(values.len() - start),
+            };
+            let mut tail = values.split_off(start);
+            let removed: Vec<Value> = tail.drain(..delete_count.min(tail.len())).collect();
+            for (offset, item) in args.iter().skip(2).enumerate() {
+                tail.insert(offset, item.clone());
+            }
+            values.extend(tail);
+            Value::array(removed)
+        }
+        "map" => {
+            let f = arg(0);
+            let mapped = values
+                .borrow()
+                .iter()
+                .enumerate()
+                .map(|(index, value)| f.call(Value::Undefined, callback_args(value, index)))
+                .collect();
+            Value::array(mapped)
+        }
+        "find" => {
+            let f = arg(0);
+            values
+                .borrow()
+                .iter()
+                .enumerate()
+                .find(|(index, value)| {
+                    f.call(Value::Undefined, callback_args(value, *index))
+                        .to_bool()
+                })
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Value::Undefined)
+        }
+        "findIndex" => {
+            let f = arg(0);
+            let index = values
+                .borrow()
+                .iter()
+                .enumerate()
+                .find(|(index, value)| {
+                    f.call(Value::Undefined, callback_args(value, *index))
+                        .to_bool()
+                })
+                .map(|(index, _)| index as f64)
+                .unwrap_or(-1.0);
+            Value::Number(index)
+        }
+        "some" => {
+            let f = arg(0);
+            let hit = values.borrow().iter().enumerate().any(|(index, value)| {
+                f.call(Value::Undefined, callback_args(value, index))
+                    .to_bool()
+            });
+            Value::Bool(hit)
+        }
+        "every" => {
+            let f = arg(0);
+            let all = values.borrow().iter().enumerate().all(|(index, value)| {
+                f.call(Value::Undefined, callback_args(value, index))
+                    .to_bool()
+            });
+            Value::Bool(all)
+        }
+        "includes" => {
+            let needle = arg(0);
+            let hit = values.borrow().iter().any(|value| value.strict_eq(&needle));
+            Value::Bool(hit)
+        }
+        "indexOf" => {
+            let needle = arg(0);
+            let index = values
+                .borrow()
+                .iter()
+                .position(|value| value.strict_eq(&needle))
+                .map(|index| index as f64)
+                .unwrap_or(-1.0);
+            Value::Number(index)
+        }
+        "lastIndexOf" => {
+            let needle = arg(0);
+            let index = values
+                .borrow()
+                .iter()
+                .rposition(|value| value.strict_eq(&needle))
+                .map(|index| index as f64)
+                .unwrap_or(-1.0);
+            Value::Number(index)
+        }
+        "join" => {
+            let separator = match args.first() {
+                None => ",".to_string(),
+                Some(v) if v.is_undefined() => ",".to_string(),
+                Some(v) => v.to_js_string(),
+            };
+            Value::from(
+                values
+                    .borrow()
+                    .iter()
+                    .map(|value| {
+                        if value.is_nullish() {
+                            String::new()
+                        } else {
+                            value.to_js_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(&separator),
+            )
+        }
+        "concat" => {
+            let mut out = values.borrow().clone();
+            for item in &args {
+                match item {
+                    Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
+                    other => out.push(other.clone()),
+                }
+            }
+            Value::array(out)
+        }
+        "reduce" => {
+            let f = arg(0);
+            let values = values.borrow();
+            let (mut acc, start) = match args.get(1) {
+                Some(init) => (init.clone(), 0),
+                None => match values.first() {
+                    Some(first) => (first.clone(), 1),
+                    None => return Some(Value::Undefined),
+                },
+            };
+            for (index, value) in values.iter().enumerate().skip(start) {
+                acc = f.call(
+                    Value::Undefined,
+                    vec![
+                        acc,
+                        value.clone(),
+                        Value::Number(index as f64),
+                        this.clone(),
+                    ],
+                );
+            }
+            acc
+        }
+        "reduceRight" => {
+            let f = arg(0);
+            let values = values.borrow();
+            let (mut acc, start) = match args.get(1) {
+                Some(init) => (init.clone(), values.len()),
+                None => match values.last() {
+                    Some(last) => (last.clone(), values.len().saturating_sub(1)),
+                    None => return Some(Value::Undefined),
+                },
+            };
+            for index in (0..start).rev() {
+                acc = f.call(
+                    Value::Undefined,
+                    vec![
+                        acc,
+                        values[index].clone(),
+                        Value::Number(index as f64),
+                        this.clone(),
+                    ],
+                );
+            }
+            acc
+        }
+        "sort" => {
+            let comparator = args.first().cloned();
+            let mut sorted = values.borrow().clone();
+            sorted.sort_by(|left, right| match &comparator {
+                Some(f) if !f.is_undefined() => {
+                    let order = f
+                        .call(Value::Undefined, vec![left.clone(), right.clone()])
+                        .to_number();
+                    order.total_cmp(&0.0)
+                }
+                _ => left.to_js_string().cmp(&right.to_js_string()),
+            });
+            *values.borrow_mut() = sorted;
+            this.clone()
+        }
+        "reverse" => {
+            values.borrow_mut().reverse();
+            this.clone()
+        }
+        "flat" => {
+            let depth = args
+                .first()
+                .map(|v| v.to_number().max(0.0) as usize)
+                .unwrap_or(1);
+            fn flatten(into: &mut Vec<Value>, items: &[Value], depth: usize) {
+                for item in items {
+                    match item {
+                        Value::Array(inner) if depth > 0 => {
+                            flatten(into, &inner.borrow(), depth - 1)
+                        }
+                        other => into.push(other.clone()),
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            flatten(&mut out, &values.borrow(), depth);
+            Value::array(out)
+        }
+        "flatMap" => {
+            let f = arg(0);
+            let mut out = Vec::new();
+            for (index, value) in values.borrow().iter().enumerate() {
+                match f.call(Value::Undefined, callback_args(value, index)) {
+                    Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
+                    other => out.push(other),
+                }
+            }
+            Value::array(out)
+        }
+        "at" => {
+            let values = values.borrow();
+            let index = array_index(args.first(), values.len(), values.len());
+            values.get(index).cloned().unwrap_or(Value::Undefined)
+        }
+        _ => return None,
+    })
 }
 
 impl From<&str> for Value {
@@ -601,6 +1234,28 @@ impl Value {
                 }
             }
             (Value::String(a), Value::String(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
+            _ => false,
+        }
+    }
+
+    /// ECMAScript SameValueZero (Map/Set key equality): strict equality for
+    /// primitives except NaN equals NaN and -0 equals +0; Array/Object keys
+    /// compare by reference identity (`Rc` pointer), Function keys by shared
+    /// closure identity (clones of one function value are the same key).
+    pub fn same_value_zero(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            // f64 `==` already identifies -0.0 with +0.0 (SameValueZero
+            // agrees); NaN needs the explicit special-case.
+            (Value::Number(a), Value::Number(b)) => a == b || (a.is_nan() && b.is_nan()),
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
             _ => false,
         }
     }
@@ -685,6 +1340,49 @@ pub fn type_of(val: &Value) -> Value {
     Value::String(val.type_of().to_string())
 }
 
+/// An Error-shaped object (`{ message }`) for runtime failures. Compiled JS
+/// raises exceptions via `std::panic::panic_any`; builtins that need to
+/// signal a JS exception (invalid JSON, circular structures, bad URLs)
+/// build one of these and [`throw_value`] it so compiled `try/catch` sees
+/// a JS-style error value.
+pub(crate) fn js_error(message: &str) -> Value {
+    let mut properties = HashMap::new();
+    properties.insert("message".to_string(), Value::String(message.to_string()));
+    Value::object(properties)
+}
+
+/// Panic payload for JS exceptions.
+///
+/// `std::panic::panic_any` requires a `Send` payload and `Value` is not
+/// `Send` (it holds `Rc`s), so JS `throw` cannot panic with a bare
+/// `Value`. This newtype wraps it; the `Send` impl is sound here because
+/// the runtime is single-threaded — the payload only ever travels from a
+/// `throw_value` call site to a `catch_unwind` on the same thread.
+pub struct PanicValue(pub Value);
+
+// SAFETY: w3cos values are single-threaded by design (Rc/RefCell
+// everywhere); the wrapper never crosses an actual thread boundary.
+unsafe impl Send for PanicValue {}
+
+/// Raise a JS exception: `throw value` in compiled code and in builtins.
+/// Unwinds until a `catch_unwind` (compiled `try/catch`, or the promise
+/// reaction runner, which turns it into a rejection).
+pub fn throw_value(value: Value) -> ! {
+    // Debug channel: W3COS_JS_CONSOLE=1 prints thrown values (incl. Error
+    // objects with message/stack props) before unwinding — without it an
+    // uncaught JS throw only shows Rust's opaque "Box<dyn Any>".
+    if std::env::var_os("W3COS_JS_CONSOLE").is_some() {
+        let message = value.get_property("message");
+        let detail = if message.is_undefined() {
+            value.to_js_string()
+        } else {
+            message.to_js_string()
+        };
+        eprintln!("[js.throw] {detail}");
+    }
+    std::panic::panic_any(PanicValue(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,11 +1424,78 @@ mod tests {
     }
 
     #[test]
+    fn string_methods_cover_token_parsing() {
+        let token = Value::String("source.ts".into());
+        assert_eq!(
+            token
+                .call_method("indexOf", vec![Value::from(".")])
+                .to_number(),
+            6.0
+        );
+        assert_eq!(
+            token
+                .call_method("substring", vec![Value::Number(7.0)])
+                .to_js_string(),
+            "ts"
+        );
+        assert_eq!(
+            Value::from("a😀c")
+                .call_method("substr", vec![Value::Number(1.0), Value::Number(2.0)])
+                .to_js_string(),
+            "😀"
+        );
+        assert_eq!(
+            token
+                .call_method("substr", vec![Value::Number(-2.0)])
+                .to_js_string(),
+            "ts"
+        );
+        assert_eq!(
+            Value::from("abc")
+                .call_method("toUpperCase", vec![])
+                .to_js_string(),
+            "ABC"
+        );
+        assert_eq!(
+            Value::from("a b")
+                .call_method("split", vec![Value::from(" ")])
+                .get_property("1")
+                .to_js_string(),
+            "b"
+        );
+        assert_eq!(
+            Value::from("a\n").call_method("charCodeAt", vec![Value::Number(1.0)]),
+            Value::Number(10.0)
+        );
+        assert!(
+            Value::from("a")
+                .call_method("charCodeAt", vec![Value::Number(2.0)])
+                .to_number()
+                .is_nan()
+        );
+    }
+
+    #[test]
     fn strict_equality() {
         assert!(Value::Number(1.0).strict_eq(&Value::Number(1.0)));
         assert!(!Value::Number(f64::NAN).strict_eq(&Value::Number(f64::NAN)));
         assert!(Value::String("a".into()).strict_eq(&Value::String("a".into())));
         assert!(!Value::Number(1.0).strict_eq(&Value::String("1".into())));
+
+        let array = Value::array(vec![]);
+        let other_array = Value::array(vec![]);
+        assert!(array.strict_eq(&array.clone()));
+        assert!(!array.strict_eq(&other_array));
+
+        let object = Value::object(HashMap::new());
+        let other_object = Value::object(HashMap::new());
+        assert!(object.strict_eq(&object.clone()));
+        assert!(!object.strict_eq(&other_object));
+
+        let function = Value::function(|_, _| Value::Undefined);
+        let other_function = Value::function(|_, _| Value::Undefined);
+        assert!(function.strict_eq(&function.clone()));
+        assert!(!function.strict_eq(&other_function));
     }
 
     #[test]
@@ -782,6 +1547,19 @@ mod tests {
         assert_eq!(Value::Number(42.0).to_js_string(), "42");
         assert_eq!(Value::Number(3.14).to_js_string(), "3.14");
         assert_eq!(Value::Bool(true).to_js_string(), "true");
+
+        let named_function = Value::function(|_, _| Value::Undefined);
+        named_function.set_property(
+            "toString",
+            Value::function(|_, _| Value::String("modelService".into())),
+        );
+        assert_eq!(named_function.to_js_string(), "modelService");
+
+        let plain_function = Value::function(|_, _| Value::Undefined);
+        assert_eq!(
+            plain_function.to_js_string(),
+            "function() { [native code] }"
+        );
     }
 
     #[test]
@@ -804,6 +1582,46 @@ mod tests {
         assert_eq!(
             Value::Number(9.0).js_pow(&Value::Number(0.5)).to_number(),
             3.0
+        );
+    }
+
+    #[test]
+    fn function_call_apply_and_bind_preserve_receiver_and_arguments() {
+        let function = Value::function(|this, args| {
+            Value::Number(
+                this.get_property("base").to_number()
+                    + args.iter().map(Value::to_number).sum::<f64>(),
+            )
+        });
+        let receiver = Value::object(HashMap::from([("base".to_string(), Value::Number(10.0))]));
+
+        assert_eq!(
+            function
+                .call_method(
+                    "call",
+                    vec![receiver.clone(), Value::Number(2.0), Value::Number(3.0)],
+                )
+                .to_number(),
+            15.0
+        );
+        assert_eq!(
+            function
+                .call_method(
+                    "apply",
+                    vec![
+                        receiver.clone(),
+                        Value::array(vec![Value::Number(4.0), Value::Number(5.0)]),
+                    ],
+                )
+                .to_number(),
+            19.0
+        );
+        let bound = function.call_method("bind", vec![receiver, Value::Number(6.0)]);
+        assert_eq!(
+            bound
+                .call(Value::Undefined, vec![Value::Number(7.0)])
+                .to_number(),
+            23.0
         );
     }
 
@@ -849,6 +1667,30 @@ mod tests {
             Value::function(|this, _| this.get_property("value")),
         );
         assert_eq!(receiver.call_method("read", vec![]).to_number(), 42.0);
+    }
+
+    #[test]
+    fn symbol_iterator_walks_linked_list_style_objects() {
+        let sentinel = crate::js_object! { "element" => Value::Undefined };
+        let second = crate::js_object! {
+            "element" => "second",
+            "next" => sentinel,
+        };
+        let first = crate::js_object! {
+            "element" => "first",
+            "next" => second,
+        };
+        let list = crate::js_object! { "_first" => first };
+
+        let iterator = list.call_method("__w3cos_symbol_iterator", vec![]);
+        let first_result = iterator.call_method("next", vec![]);
+        let second_result = iterator.call_method("next", vec![]);
+        let done_result = iterator.call_method("next", vec![]);
+
+        assert_eq!(first_result.get_property("value").to_js_string(), "first");
+        assert!(!first_result.get_property("done").to_bool());
+        assert_eq!(second_result.get_property("value").to_js_string(), "second");
+        assert!(done_result.get_property("done").to_bool());
     }
 
     #[test]
@@ -915,5 +1757,12 @@ mod tests {
         let obj = Value::object(HashMap::new());
         obj.set_property("key", Value::Number(99.0));
         assert_eq!(obj.get_property("key").to_number(), 99.0);
+    }
+
+    #[test]
+    fn delete_removes_object_property() {
+        let value = Value::object(HashMap::from([("model".into(), Value::Number(1.0))]));
+        assert!(value.delete_property("model").to_bool());
+        assert!(value.get_property("model").is_undefined());
     }
 }

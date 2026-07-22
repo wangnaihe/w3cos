@@ -1,0 +1,9 @@
+{
+  "name": "w3cos-monaco-editor-example",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Monaco Editor (VS Code editor core) compiled to a native W3C OS app",
+  "dependencies": {
+    "monaco-editor": "^0.52.2"
+  }
+}

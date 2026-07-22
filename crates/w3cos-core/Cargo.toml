@@ -6,3 +6,6 @@ license.workspace = true
 description = "W3C OS core — JS value types, Proxy, and reactive primitives"
 
 [dependencies]
+serde_json = { workspace = true }
+base64 = "0.22"
+regex = "1"

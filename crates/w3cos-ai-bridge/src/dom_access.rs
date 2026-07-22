@@ -80,6 +80,8 @@ pub fn query(doc: &Document, selector: &str) -> DomResult {
                     .map(|(k, v)| serde_json::json!({ "name": k, "value": v }))
                     .collect::<Vec<_>>(),
                 "childCount": doc.children_ids(el.id).len(),
+                "innerText": el.inner_text(doc),
+                "outerHTML": el.outer_html(doc),
             });
             DomResult::ok(info)
         }

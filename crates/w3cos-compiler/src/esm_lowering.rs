@@ -7,6 +7,23 @@
 use std::collections::HashSet;
 use swc_ecma_ast::*;
 
+/// Class-body context carried while lowering a single function/method body.
+///
+/// Set when lowering inside a class member (constructor, method, getter,
+/// setter, static block, field initializer) so `this`, `super`, and private
+/// `#name` references lower correctly.
+#[derive(Clone, Debug, Default)]
+pub struct ClassScope {
+    /// Sanitized class name used to mangle private members:
+    /// `__w3cos_priv_{class_name}_{name}`.
+    pub class_name: String,
+    /// Rust expression evaluating to the parent class `Value` (for `extends`).
+    pub parent: Option<String>,
+    /// Whether the current member is static (`super` then reads the parent
+    /// class object instead of its prototype).
+    pub is_static: bool,
+}
+
 /// Context carried while lowering a single function/method body.
 pub struct LowerCtx {
     indent: usize,
@@ -16,6 +33,48 @@ pub struct LowerCtx {
     temp_index: usize,
     value_bindings: HashSet<String>,
     known_values: HashSet<String>,
+    /// Local names that refer to classes (own or imported). References lower
+    /// to a call of the class accessor (`X()`), which yields the class Value.
+    class_names: HashSet<String>,
+    /// Local names bound by `import * as ns from ...`. References lower to a
+    /// call of the namespace accessor (`ns()`), which yields the lazily built
+    /// namespace object Value.
+    namespace_names: HashSet<String>,
+    /// What `this` lowers to in the current scope (`__this` inside classes).
+    this_name: Option<String>,
+    /// Active class-body scope, if any.
+    class_scope: Option<ClassScope>,
+    /// Stack of try-flow enum names for enclosing `try` blocks (innermost
+    /// last). While non-empty, `return` lowers to an early-return variant of
+    /// the innermost try's flow enum so `finally` still runs; the enum value
+    /// is re-thrown/propagated after the finally block. Cleared when entering
+    /// a nested function closure (returns there target the closure itself).
+    try_flow_stack: Vec<String>,
+    /// Function-scoped `var` names hoisted to the top of the fn body being
+    /// lowered (JS var hoisting): pre-declared there as `Undefined`, and
+    /// `var x = ...` lowers to `x = ...` (assignment, not shadowing).
+    hoisted_vars: HashSet<String>,
+    /// Names of nested fn declarations emitted as Rust fn items taking
+    /// `(__args: Vec<Value>)`. Value positions wrap them as
+    /// `Value::function(...)`; call positions invoke them with `vec![args]`.
+    fn_item_names: HashSet<String>,
+    /// Locals lowered as `Rc<RefCell<Value>>` (captured by a closure AND
+    /// assigned somewhere — see `scope_analysis::CaptureInfo::boxed_names`).
+    /// Declarations, reads, and writes of these names all go through the
+    /// cell, so `Fn` closures can mutate captures with JS live-binding
+    /// semantics. Inherited by child (closure) contexts; over-approximated by
+    /// name, which is sound (all uses of a boxed name are consistent).
+    boxed: HashSet<String>,
+    /// Rust labels of enclosing loops (innermost last) for `break`/`continue`
+    /// emission. Cleared when crossing a fn/closure boundary.
+    loop_labels: Vec<String>,
+    /// Rust labels of enclosing breakable constructs (loops and switch
+    /// blocks, innermost last) for `break` emission.
+    break_labels: Vec<String>,
+    /// JS label name → Rust label for labeled statements in scope.
+    named_labels: Vec<(String, String)>,
+    /// A JS label to attach to the next loop lowered (set by Stmt::Labeled).
+    pending_loop_label: Option<String>,
 }
 
 impl LowerCtx {
@@ -27,6 +86,18 @@ impl LowerCtx {
             temp_index: 0,
             value_bindings: HashSet::new(),
             known_values: HashSet::new(),
+            class_names: HashSet::new(),
+            namespace_names: HashSet::new(),
+            this_name: None,
+            class_scope: None,
+            try_flow_stack: Vec::new(),
+            hoisted_vars: HashSet::new(),
+            fn_item_names: HashSet::new(),
+            boxed: HashSet::new(),
+            loop_labels: Vec::new(),
+            break_labels: Vec::new(),
+            named_labels: Vec::new(),
+            pending_loop_label: None,
         }
     }
 
@@ -38,6 +109,18 @@ impl LowerCtx {
             temp_index: 0,
             value_bindings: HashSet::new(),
             known_values: HashSet::new(),
+            class_names: HashSet::new(),
+            namespace_names: HashSet::new(),
+            this_name: None,
+            class_scope: None,
+            try_flow_stack: Vec::new(),
+            hoisted_vars: HashSet::new(),
+            fn_item_names: HashSet::new(),
+            boxed: HashSet::new(),
+            loop_labels: Vec::new(),
+            break_labels: Vec::new(),
+            named_labels: Vec::new(),
+            pending_loop_label: None,
         }
     }
 
@@ -52,14 +135,98 @@ impl LowerCtx {
             temp_index: 0,
             value_bindings,
             known_values: HashSet::new(),
+            class_names: HashSet::new(),
+            namespace_names: HashSet::new(),
+            this_name: None,
+            class_scope: None,
+            try_flow_stack: Vec::new(),
+            hoisted_vars: HashSet::new(),
+            fn_item_names: HashSet::new(),
+            boxed: HashSet::new(),
+            loop_labels: Vec::new(),
+            break_labels: Vec::new(),
+            named_labels: Vec::new(),
+            pending_loop_label: None,
         }
     }
 
+    /// Mark local names that refer to classes (references lower to `X()`).
+    pub fn with_classes(mut self, class_names: HashSet<String>) -> Self {
+        self.class_names = class_names;
+        self
+    }
+
+    /// Mark local names bound by `import * as ns` (references lower to the
+    /// namespace accessor call `ns_fn()`, yielding the namespace object).
+    pub fn with_namespaces(mut self, namespace_names: HashSet<String>) -> Self {
+        self.namespace_names = namespace_names;
+        self
+    }
+
+    /// Enter a class member scope: `this` becomes `__this`, `super` and
+    /// private `#name` references resolve per the given scope.
+    pub fn with_class_scope(mut self, scope: ClassScope) -> Self {
+        self.this_name = Some("__this".to_string());
+        self.class_scope = Some(scope);
+        self
+    }
+
+    /// A dynamic child context inheriting names, class bindings, and class
+    /// scope (used for closures, class-expression members, etc.).
+    fn child_dynamic_ctx(&self) -> Self {
+        let mut ctx =
+            LowerCtx::new_dynamic_with_bindings(self.renames.clone(), self.value_bindings.clone());
+        ctx.class_names = self.class_names.clone();
+        ctx.namespace_names = self.namespace_names.clone();
+        ctx.this_name = self.this_name.clone();
+        ctx.class_scope = self.class_scope.clone();
+        ctx.fn_item_names = self.fn_item_names.clone();
+        // Boxed (Rc<RefCell>) bindings keep their cell-based form across the
+        // closure boundary — the capture prologue clones the Rc, so the
+        // closure shares the same cell as the enclosing scope.
+        ctx.boxed = self.boxed.clone();
+        // break/continue labels do not cross fn/closure boundaries (the child
+        // body is a new Rust closure).
+        ctx
+    }
     fn pad(&self) -> String {
         " ".repeat(self.indent)
     }
 
+    /// Take the pending JS loop label (set by Stmt::Labeled) or mint a fresh
+    /// Rust label for a loop/switch being lowered. Loop labels make
+    /// `break`/`continue` inside labeled blocks (notably `switch`) legal
+    /// Rust and give JS labeled statements a target.
+    fn take_loop_label(&mut self) -> String {
+        if let Some(label) = self.pending_loop_label.take() {
+            return label;
+        }
+        let index = self.temp_index;
+        self.temp_index += 1;
+        format!("__lp{index}")
+    }
+
+    /// Lower a statement as a loop body with the given labels active for
+    /// `break`/`continue` emission. For `for`/`do-while` loops the continue
+    /// target is a labeled block wrapping the body (so `continue` still runs
+    /// the update/test, matching JS); for `while`/`for-in`/`for-of` it is the
+    /// loop's own label.
+    fn lower_loop_body(&mut self, body: &Stmt, break_label: &str, continue_label: &str) -> String {
+        self.break_labels.push(break_label.to_string());
+        self.loop_labels.push(continue_label.to_string());
+        let out = self.lower_stmt(body);
+        self.break_labels.pop();
+        self.loop_labels.pop();
+        out
+    }
+
     fn resolve_name(&self, name: &str) -> String {
+        // A local binding (param/hoisted/local/capture) shadows any import or
+        // module-level mapping with the same name — never route those through
+        // the `{bundled}_get` cell accessor.
+        if self.dynamic_values && self.known_values.contains(name) {
+            return name.to_string();
+        }
         let has_mapping = self.renames.iter().any(|(local, _)| local == name);
         let resolved = self
             .renames
@@ -83,14 +250,116 @@ impl LowerCtx {
     fn resolve_value(&self, name: &str) -> String {
         let resolved = self.resolve_name(name);
         if self.dynamic_values && self.known_values.contains(name) {
-            format!("{resolved}.clone()")
+            if self.boxed.contains(name) {
+                // Rc<RefCell<Value>> local: read through the shared cell.
+                Self::boxed_read(&resolved)
+            } else {
+                format!("{resolved}.clone()")
+            }
+        } else if self.class_names.contains(name) {
+            // Class reference: call the class accessor to get the class Value.
+            format!("{resolved}()")
+        } else if self.namespace_names.contains(name) {
+            // `import * as ns` reference: call the namespace accessor to get
+            // the lazily built namespace object Value.
+            format!("{resolved}()")
+        } else if self.fn_item_names.contains(name) {
+            // Nested fn item (`fn name(__args)`): wrap as a callable Value.
+            format!("w3cos_core::Value::function(move |_this, __args| {name}(__args))")
         } else if self.dynamic_values
             && self.renames.iter().any(|(local, _)| local == name)
             && !self.value_bindings.contains(name)
         {
             format!("w3cos_core::Value::function(move |_this, __args| {resolved}(__args))")
+        } else if self.dynamic_values
+            && !self.renames.iter().any(|(local, _)| local == name)
+            && let Some(global) = global_value_expr(name)
+        {
+            // Unshadowed JS global: jsdom bridge or a core builtin facade.
+            global
         } else {
             resolved
+        }
+    }
+
+    /// True when `name` is bound locally (parameter/local binding) or via an
+    /// import/module-level symbol — i.e. it must NOT resolve to a JS global.
+    fn is_name_shadowed(&self, name: &str) -> bool {
+        self.known_values.contains(name) || self.renames.iter().any(|(local, _)| local == name)
+    }
+
+    /// Lower a bare identifier reference (used by codegen for alias targets
+    /// that are not module-local bindings, e.g. globals).
+    pub fn lower_ident(&self, name: &str) -> String {
+        self.resolve_value(&sanitize_ident(name))
+    }
+
+    /// Mangle a private `#name` into its property key for a class.
+    pub(crate) fn mangle_private(class_name: &str, name: &PrivateName) -> String {
+        format!("__w3cos_priv_{class_name}_{}", atom_str(&name.name))
+    }
+
+    /// The property key for a private `#name` in the current class scope.
+    fn private_key(&self, name: &PrivateName) -> String {
+        match &self.class_scope {
+            Some(scope) => Self::mangle_private(&scope.class_name, name),
+            None => atom_str(&name.name),
+        }
+    }
+
+    /// The literal form of a property key, when statically known.
+    pub(crate) fn key_literal(&self, key: &PropName) -> Option<String> {
+        match key {
+            PropName::Ident(ident) => Some(ident.sym.to_string()),
+            PropName::Str(value) => Some(wtf8_to_string(&value.value)),
+            PropName::Num(value) => Some(value.value.to_string()),
+            PropName::BigInt(value) => Some(value.value.to_string()),
+            PropName::Computed(_) => None,
+        }
+    }
+
+    /// A `&str`-compatible key argument for `get_property`/`set_property`,
+    /// with an optional convention prefix (`__w3cos_getter_` etc.).
+    pub(crate) fn key_arg(&self, prefix: &str, key: &PropName) -> String {
+        match self.key_literal(key) {
+            Some(name) => format!("{:?}", format!("{prefix}{name}")),
+            None => {
+                let PropName::Computed(computed) = key else {
+                    unreachable!("key_literal covers all non-computed keys")
+                };
+                let expr = self.lower_expr(&computed.expr);
+                if prefix.is_empty() {
+                    format!("&{expr}.to_js_string()")
+                } else {
+                    format!("&format!(\"{prefix}{{}}\", {expr}.to_js_string())")
+                }
+            }
+        }
+    }
+
+    /// The Rust expression `this` lowers to in the current scope.
+    fn this_expr(&self) -> String {
+        self.this_name
+            .clone()
+            .unwrap_or_else(|| "w3cos_core::Value::Undefined".to_string())
+    }
+
+    /// True when a nested closure emitted here must also capture `__parent`:
+    /// we're inside a class-expression member (`__parent` is a captured
+    /// local there) and the closure may call `super.*`/`super(...)`.
+    fn needs_parent_capture(&self) -> bool {
+        self.known_values.contains("__parent")
+            && matches!(
+                self.class_scope.as_ref().and_then(|s| s.parent.as_deref()),
+                Some("__parent")
+            )
+    }
+
+    /// Append `__parent` to a closure capture list when [`Self::needs_parent_capture`].
+    fn push_parent_capture(&self, captures: &mut Vec<String>) {
+        if self.needs_parent_capture() && !captures.iter().any(|name| name == "__parent") {
+            captures.push("__parent".to_string());
+            captures.sort();
         }
     }
 
@@ -98,6 +367,135 @@ impl LowerCtx {
         for pattern in patterns {
             collect_pattern_names(pattern, &mut self.known_values);
         }
+    }
+
+    /// Enter a function-body scope: compute which of the body's locals are
+    /// captured by a closure AND assigned (see `scope_analysis`) and union
+    /// them into `self.boxed`. Returns the previous set — pass it to
+    /// [`Self::leave_fn_scope`] when the body is lowered on `self` directly
+    /// (nested fn-item form); child-context users can ignore it.
+    pub fn enter_fn_scope(&mut self, params: &[Pat], body: &[Stmt]) -> HashSet<String> {
+        let info = crate::scope_analysis::analyze_fn_body(params, body);
+        // The analysis reports raw JS names; the lowering tracks sanitized
+        // Rust identifiers (e.g. `x$1` → `x_d1`) — align before storing.
+        let own: HashSet<String> = info
+            .boxed_names()
+            .into_iter()
+            .map(|name| sanitize_ident(&name))
+            .collect();
+        let union: HashSet<String> = self.boxed.union(&own).cloned().collect();
+        std::mem::replace(&mut self.boxed, union)
+    }
+
+    /// Restore the boxed set saved by [`Self::enter_fn_scope`].
+    pub fn leave_fn_scope(&mut self, saved: HashSet<String>) {
+        self.boxed = saved;
+    }
+
+    /// True when `name` is lowered as `Rc<RefCell<Value>>` in this scope.
+    fn is_boxed(&self, name: &str) -> bool {
+        self.dynamic_values && self.boxed.contains(name)
+    }
+
+    /// Read a boxed local (`Rc<RefCell<Value>>`) as a `Value`.
+    pub(crate) fn boxed_read(name: &str) -> String {
+        format!("(*{name}.borrow()).clone()")
+    }
+
+    /// Write a boxed local through its cell.
+    pub(crate) fn boxed_write(name: &str, value: &str) -> String {
+        format!("*{name}.borrow_mut() = {value};")
+    }
+
+    /// `let` binding text for a (possibly boxed) local: plain locals get
+    /// `let mut` (JS bindings are all reassignable); boxed ones get the
+    /// `Rc<RefCell<Value>>` cell shared with capturing closures.
+    fn bind_local(&self, name: &str, value: &str) -> String {
+        if self.is_boxed(name) {
+            format!("let {name} = std::rc::Rc::new(std::cell::RefCell::new({value}));")
+        } else {
+            format!("let mut {name} = {value};")
+        }
+    }
+
+    /// The `x.is_undefined()` test for default-value fixups — reads through
+    /// the cell for boxed (Rc<RefCell>) names.
+    fn undefined_check(&self, name: &str) -> String {
+        if self.is_boxed(name) {
+            format!("{name}.borrow().is_undefined()")
+        } else {
+            format!("{name}.is_undefined()")
+        }
+    }
+
+    /// Statement assigning an already-declared local — writes through the
+    /// cell for boxed (Rc<RefCell>) names.
+    fn assign_local(&self, name: &str, source: &str) -> String {
+        if self.is_boxed(name) {
+            Self::boxed_write(name, source)
+        } else {
+            format!("{name} = {source};")
+        }
+    }
+
+    /// Pre-declare function-scoped `var` bindings at the top of a fn body
+    /// (JS var hoisting) and return the prologue code. Every `var` name found
+    /// anywhere in the body (including nested blocks/loops/try bodies, but
+    /// not nested fns) becomes `let mut name = Undefined;` here, and the
+    /// actual `var x = ...` statements then lower to assignments, so closures
+    /// created before the declaration line capture the same binding.
+    pub fn hoist_fn_body_vars(&mut self, body: &[Stmt]) -> String {
+        if !self.dynamic_values {
+            return String::new();
+        }
+        let mut names = HashSet::new();
+        collect_hoisted_var_names(body, &mut names);
+        // Fn declarations that will take the Rust fn-item form (self-
+        // recursive but capture-free) must NOT be shadowed by a predeclared
+        // local — the fn item is already visible throughout the block.
+        for stmt in body {
+            if let Stmt::Decl(Decl::Fn(f)) = stmt {
+                let name = sanitize_ident(&f.ident.sym.to_string());
+                let fbody: &[Stmt] = f
+                    .function
+                    .body
+                    .as_ref()
+                    .map(|b| b.stmts.as_slice())
+                    .unwrap_or_default();
+                let pats: Vec<Pat> = f.function.params.iter().map(|p| p.pat.clone()).collect();
+                let param_names = pattern_names(&pats);
+                let outer: HashSet<String> = self
+                    .known_values
+                    .difference(&param_names)
+                    .cloned()
+                    .collect();
+                if stmts_reference_ident(fbody, &name)
+                    && !stmts_reference_any_ident(fbody, &outer)
+                    && !stmts_reference_ident(fbody, "arguments")
+                {
+                    names.remove(&name);
+                }
+            }
+        }
+        let mut names: Vec<String> = names.into_iter().collect();
+        names.sort();
+        let mut prologue = String::new();
+        for name in names {
+            // Params and already-bound locals are not re-declared.
+            if self.known_values.contains(&name) {
+                continue;
+            }
+            if self.is_boxed(&name) {
+                prologue.push_str(&format!(
+                    "let {name} = std::rc::Rc::new(std::cell::RefCell::new(w3cos_core::Value::Undefined)); "
+                ));
+            } else {
+                prologue.push_str(&format!("let mut {name} = w3cos_core::Value::Undefined; "));
+            }
+            self.known_values.insert(name.clone());
+            self.hoisted_vars.insert(name);
+        }
+        prologue
     }
 
     pub fn lower_stmts(&mut self, stmts: &[Stmt]) -> String {
@@ -115,8 +513,29 @@ impl LowerCtx {
                 format!("{}{};", self.pad(), e)
             }
             Stmt::Return(ret) => match &ret.arg {
-                Some(expr) => format!("{}return {};", self.pad(), self.lower_expr(expr)),
+                Some(expr) => {
+                    if self.dynamic_values
+                        && let Some(flow) = self.try_flow_stack.last()
+                    {
+                        // Early return inside a `try`: wrap in the try's flow
+                        // enum so the finally block runs before propagating.
+                        return format!(
+                            "{}return {}::Return({});",
+                            self.pad(),
+                            flow,
+                            self.lower_expr(expr)
+                        );
+                    }
+                    format!("{}return {};", self.pad(), self.lower_expr(expr))
+                }
                 None if self.dynamic_values => {
+                    if let Some(flow) = self.try_flow_stack.last() {
+                        return format!(
+                            "{}return {}::Return(w3cos_core::Value::Undefined);",
+                            self.pad(),
+                            flow
+                        );
+                    }
                     format!("{}return w3cos_core::Value::Undefined;", self.pad())
                 }
                 None => format!("{}return;", self.pad()),
@@ -139,14 +558,28 @@ impl LowerCtx {
             Stmt::For(for_stmt) => self.lower_for(for_stmt),
             Stmt::While(while_stmt) => {
                 let test = self.lower_expr(&while_stmt.test);
-                let body = self.lower_stmt(&while_stmt.body);
+                let label = if self.dynamic_values {
+                    self.take_loop_label()
+                } else {
+                    String::new()
+                };
+                let body = if self.dynamic_values {
+                    self.lower_loop_body(&while_stmt.body, &label.clone(), &label.clone())
+                } else {
+                    self.lower_stmt(&while_stmt.body)
+                };
                 let test = if self.dynamic_values {
                     format!("{test}.to_bool()")
                 } else {
                     test
                 };
+                let prefix = if label.is_empty() {
+                    label
+                } else {
+                    format!("'{label}: ")
+                };
                 format!(
-                    "{}while {} {{\n{}\n{}}}",
+                    "{}{prefix}while {} {{\n{}\n{}}}",
                     self.pad(),
                     test,
                     body,
@@ -157,41 +590,155 @@ impl LowerCtx {
             Stmt::Try(try_stmt) => self.lower_try(try_stmt),
             Stmt::Throw(throw_stmt) => {
                 let arg = self.lower_expr(&throw_stmt.arg);
-                format!("{}panic!(\"{{}}\", {});", self.pad(), arg)
+                if self.dynamic_values {
+                    // Thrown JS values travel as panic payloads via the shared
+                    // `PanicValue` wrapper (Value is not Send); catch_unwind in
+                    // compiled try/catch and in the promise reaction runner
+                    // both recover it.
+                    format!("{}w3cos_core::throw_value({});", self.pad(), arg)
+                } else {
+                    format!("{}panic!(\"{{}}\", {});", self.pad(), arg)
+                }
             }
             Stmt::Switch(switch) => self.lower_switch(switch),
-            Stmt::Break(_) => format!("{}break;", self.pad()),
-            Stmt::Continue(_) => format!("{}continue;", self.pad()),
+            Stmt::Break(break_stmt) => {
+                if !self.dynamic_values {
+                    return format!("{}break;", self.pad());
+                }
+                match &break_stmt.label {
+                    Some(label) => {
+                        let js = atom_str(&label.sym);
+                        let rust = self
+                            .named_labels
+                            .iter()
+                            .rev()
+                            .find(|(name, _)| name == &js)
+                            .map(|(_, rust)| rust.clone());
+                        match rust {
+                            Some(rust) => format!("{}break '{rust};", self.pad()),
+                            None => format!("{}break; /* unresolved label {js} */", self.pad()),
+                        }
+                    }
+                    None => match self.break_labels.last() {
+                        Some(rust) => format!("{}break '{rust};", self.pad()),
+                        None => format!("{}break;", self.pad()),
+                    },
+                }
+            }
+            Stmt::Continue(continue_stmt) => {
+                if !self.dynamic_values {
+                    return format!("{}continue;", self.pad());
+                }
+                match &continue_stmt.label {
+                    Some(label) => {
+                        let js = atom_str(&label.sym);
+                        let rust = self
+                            .named_labels
+                            .iter()
+                            .rev()
+                            .find(|(name, _)| name == &js)
+                            .map(|(_, rust)| rust.clone());
+                        match rust {
+                            Some(rust) => format!("{}continue '{rust};", self.pad()),
+                            None => {
+                                format!("{}continue; /* unresolved label {js} */", self.pad())
+                            }
+                        }
+                    }
+                    None => match self.loop_labels.last() {
+                        Some(rust) => format!("{}continue '{rust};", self.pad()),
+                        None => format!("{}continue;", self.pad()),
+                    },
+                }
+            }
             Stmt::DoWhile(do_while) => {
+                let label = if self.dynamic_values {
+                    self.take_loop_label()
+                } else {
+                    String::new()
+                };
                 self.indent += 4;
-                let body = self.lower_stmt(&do_while.body);
+                let body = if self.dynamic_values {
+                    self.lower_loop_body(&do_while.body, &label.clone(), &label.clone())
+                } else {
+                    self.lower_stmt(&do_while.body)
+                };
                 self.indent -= 4;
                 let test = self.lower_expr(&do_while.test);
-                format!(
-                    "{}loop {{\n{}\n{}if !({}) {{ break; }}\n{}}}",
-                    self.pad(),
-                    body,
-                    " ".repeat(self.indent + 4),
-                    test,
-                    self.pad()
-                )
+                let test = if self.dynamic_values {
+                    format!("{test}.to_bool()")
+                } else {
+                    test
+                };
+                let (prefix, break_) = if label.is_empty() {
+                    (String::new(), "break;".to_string())
+                } else {
+                    (format!("'{label}: "), format!("break '{label};"))
+                };
+                if self.dynamic_values {
+                    // `continue` in a do-while must run the test: the test
+                    // lives at the loop head, guarded so the first iteration
+                    // always runs the body (JS do-while semantics).
+                    let inner_pad = " ".repeat(self.indent + 4);
+                    format!(
+                        "{}let mut __w3cos_first = true;\n{}{prefix}loop {{\n{inner_pad}if !__w3cos_first {{ if !({test}) {{ {break_} }} }}\n{inner_pad}__w3cos_first = false;\n{}\n{}}}",
+                        self.pad(),
+                        self.pad(),
+                        body,
+                        self.pad()
+                    )
+                } else {
+                    format!(
+                        "{}{prefix}loop {{\n{}\n{}if !({}) {{ {} }}\n{}}}",
+                        self.pad(),
+                        body,
+                        " ".repeat(self.indent + 4),
+                        test,
+                        break_,
+                        self.pad()
+                    )
+                }
             }
             Stmt::ForIn(for_in) => {
                 let right = self.lower_expr(&for_in.right);
-                let left = match &for_in.left {
-                    ForHead::VarDecl(vd) => vd
-                        .decls
-                        .first()
-                        .map(|d| self.lower_pat(&d.name))
-                        .unwrap_or_else(|| "_".to_string()),
-                    ForHead::Pat(p) => self.lower_pat(p),
-                    _ => "_".to_string(),
+                let label = if self.dynamic_values {
+                    self.take_loop_label()
+                } else {
+                    String::new()
                 };
+                let (left, prelude) = self.lower_for_head(&for_in.left);
+                // Register the loop variable(s) so the body (and closures
+                // capturing them) can reference them.
+                let saved_known = self.known_values.clone();
+                match &for_in.left {
+                    ForHead::VarDecl(vd) => {
+                        if let Some(d) = vd.decls.first() {
+                            collect_pattern_names(&d.name, &mut self.known_values);
+                        }
+                    }
+                    ForHead::Pat(p) => collect_pattern_names(p, &mut self.known_values),
+                    _ => {}
+                }
                 self.indent += 4;
-                let body = self.lower_stmt(&for_in.body);
+                let body = if self.dynamic_values {
+                    self.lower_loop_body(&for_in.body, &label.clone(), &label.clone())
+                } else {
+                    self.lower_stmt(&for_in.body)
+                };
                 self.indent -= 4;
+                self.known_values = saved_known;
+                let body = if prelude.is_empty() {
+                    body
+                } else {
+                    format!("{prelude}\n{body}")
+                };
+                let prefix = if label.is_empty() {
+                    label
+                } else {
+                    format!("'{label}: ")
+                };
                 format!(
-                    "{}for {left} in Object.call_method(\"keys\", vec![{right}]).iter() {{\n{}\n{}}}",
+                    "{}{prefix}for {left} in Object.call_method(\"keys\", vec![{right}]).iter() {{\n{}\n{}}}",
                     self.pad(),
                     body,
                     self.pad()
@@ -199,20 +746,42 @@ impl LowerCtx {
             }
             Stmt::ForOf(for_of) => {
                 let right = self.lower_expr(&for_of.right);
-                let left = match &for_of.left {
-                    ForHead::VarDecl(vd) => vd
-                        .decls
-                        .first()
-                        .map(|d| self.lower_pat(&d.name))
-                        .unwrap_or_else(|| "_".to_string()),
-                    ForHead::Pat(p) => self.lower_pat(p),
-                    _ => "_".to_string(),
+                let label = if self.dynamic_values {
+                    self.take_loop_label()
+                } else {
+                    String::new()
                 };
+                let (left, prelude) = self.lower_for_head(&for_of.left);
+                let saved_known = self.known_values.clone();
+                match &for_of.left {
+                    ForHead::VarDecl(vd) => {
+                        if let Some(d) = vd.decls.first() {
+                            collect_pattern_names(&d.name, &mut self.known_values);
+                        }
+                    }
+                    ForHead::Pat(p) => collect_pattern_names(p, &mut self.known_values),
+                    _ => {}
+                }
                 self.indent += 4;
-                let body = self.lower_stmt(&for_of.body);
+                let body = if self.dynamic_values {
+                    self.lower_loop_body(&for_of.body, &label.clone(), &label.clone())
+                } else {
+                    self.lower_stmt(&for_of.body)
+                };
                 self.indent -= 4;
+                self.known_values = saved_known;
+                let body = if prelude.is_empty() {
+                    body
+                } else {
+                    format!("{prelude}\n{body}")
+                };
+                let prefix = if label.is_empty() {
+                    label
+                } else {
+                    format!("'{label}: ")
+                };
                 format!(
-                    "{}for {left} in {right}.iter() {{\n{}\n{}}}",
+                    "{}{prefix}for {left} in {right}.iter() {{\n{}\n{}}}",
                     self.pad(),
                     body,
                     self.pad()
@@ -220,8 +789,36 @@ impl LowerCtx {
             }
             Stmt::Labeled(labeled) => {
                 let label = atom_str(&labeled.label.sym);
-                let body = self.lower_stmt(&labeled.body);
-                format!("{}// label: {label}\n{body}", self.pad())
+                if !self.dynamic_values {
+                    let body = self.lower_stmt(&labeled.body);
+                    return format!("{}// label: {label}\n{body}", self.pad());
+                }
+                let rust = format!("__js_{label}");
+                match labeled.body.as_ref() {
+                    // Labeled loop: attach the label to the loop itself so
+                    // `break lbl` / `continue lbl` both work.
+                    Stmt::For(_)
+                    | Stmt::ForIn(_)
+                    | Stmt::ForOf(_)
+                    | Stmt::While(_)
+                    | Stmt::DoWhile(_) => {
+                        self.named_labels.push((label, rust.clone()));
+                        self.pending_loop_label = Some(rust);
+                        let out = self.lower_stmt(&labeled.body);
+                        self.named_labels.pop();
+                        out
+                    }
+                    // Labeled block (or any other statement): wrap in a Rust
+                    // labeled block so `break lbl` targets it.
+                    _ => {
+                        self.named_labels.push((label, rust.clone()));
+                        self.break_labels.push(rust.clone());
+                        let body = self.lower_stmt(&labeled.body);
+                        self.break_labels.pop();
+                        self.named_labels.pop();
+                        format!("{}'{rust}: {{\n{}\n{}}}", self.pad(), body, self.pad())
+                    }
+                }
             }
             Stmt::Empty(_) => String::new(),
             _ => format!("{}/* unsupported stmt */", self.pad()),
@@ -258,18 +855,120 @@ impl LowerCtx {
                         continue;
                     }
                     let name = self.lower_pat(&d.name);
-                    let kw = if var_decl.kind == VarDeclKind::Const {
-                        "let"
+                    if self.dynamic_values
+                        && matches!(&d.name, Pat::Ident(_))
+                        && self.hoisted_vars.contains(&name)
+                    {
+                        // Hoisted binding: assign into the slot pre-declared
+                        // at the fn body's top (see hoist_fn_body_vars).
+                        if self.is_boxed(&name) {
+                            lines.push(format!("{}{}", self.pad(), Self::boxed_write(&name, &val)));
+                        } else {
+                            lines.push(format!("{}{name} = {val};", self.pad()));
+                        }
+                        continue;
+                    }
+                    let binding = if self.dynamic_values {
+                        // JS bindings are all reassignable → `let mut`; boxed
+                        // (captured+assigned) ones get the shared cell.
+                        self.bind_local(&name, &val)
                     } else {
-                        "let mut"
+                        let kw = if var_decl.kind == VarDeclKind::Const {
+                            "let"
+                        } else {
+                            "let mut"
+                        };
+                        format!("{kw} {name} = {val};")
                     };
-                    lines.push(format!("{}{kw} {name} = {val};", self.pad()));
+                    lines.push(format!("{}{binding}", self.pad()));
                     collect_pattern_names(&d.name, &mut self.known_values);
                 }
                 lines.join("\n")
             }
             Decl::Fn(fn_decl) => {
                 let name = atom_str(&fn_decl.ident.sym);
+                let body_stmts: &[Stmt] = fn_decl
+                    .function
+                    .body
+                    .as_ref()
+                    .map(|b| b.stmts.as_slice())
+                    .unwrap_or_default();
+                if self.dynamic_values {
+                    let self_refs = stmts_reference_ident(body_stmts, &name);
+                    let pats: Vec<Pat> = fn_decl
+                        .function
+                        .params
+                        .iter()
+                        .map(|p| p.pat.clone())
+                        .collect();
+                    let param_names = pattern_names(&pats);
+                    let outer_candidates: HashSet<String> = self
+                        .known_values
+                        .difference(&param_names)
+                        .cloned()
+                        .collect();
+                    let needs_capture = stmts_reference_any_ident(body_stmts, &outer_candidates);
+                    if !self_refs {
+                        // Nested fn declaration → a closure value so it can
+                        // capture enclosing locals (Rust fn items cannot).
+                        let value = self.lower_dynamic_function_value(&pats, body_stmts);
+                        if self.hoisted_vars.contains(&name) {
+                            // Fn declarations hoist: assign the hoisted slot.
+                            if self.is_boxed(&name) {
+                                return format!(
+                                    "{}{}",
+                                    self.pad(),
+                                    Self::boxed_write(&name, &value)
+                                );
+                            }
+                            return format!("{}{name} = {value};", self.pad());
+                        }
+                        self.known_values.insert(name.clone());
+                        return format!("{}{}", self.pad(), self.bind_local(&name, &value));
+                    }
+                    if needs_capture || stmts_reference_ident(body_stmts, "arguments") {
+                        // Self-recursive AND capturing: the binding is
+                        // pre-declared (hoisted) so the closure can capture
+                        // it; the recursive reference sees the value captured
+                        // at creation time (the pre-declared Undefined), so
+                        // recursion degrades — recorded limitation.
+                        // (`arguments` also forces the closure form: fn items
+                        // have no `__args` in scope.)
+                        self.known_values.insert(name.clone());
+                        let value = self.lower_dynamic_function_value(&pats, body_stmts);
+                        if self.hoisted_vars.contains(&name) {
+                            if self.is_boxed(&name) {
+                                return format!(
+                                    "{}{}",
+                                    self.pad(),
+                                    Self::boxed_write(&name, &value)
+                                );
+                            }
+                            return format!("{}{name} = {value};", self.pad());
+                        }
+                        if self.is_boxed(&name) {
+                            // Boxed (captured+assigned): the cell is shared
+                            // with the closure, so recursion stays live.
+                            return format!(
+                                "{}let {name} = std::rc::Rc::new(std::cell::RefCell::new(w3cos_core::Value::Undefined));\n{}{}",
+                                self.pad(),
+                                self.pad(),
+                                Self::boxed_write(&name, &value)
+                            );
+                        }
+                        return format!(
+                            "{}let mut {name} = w3cos_core::Value::Undefined;\n{}{name} = {value};",
+                            self.pad(),
+                            self.pad()
+                        );
+                    }
+                    // Self-recursive but capture-free: keep the fn-item form
+                    // below (its name is in scope there).
+                    // Register the name BEFORE lowering the body — recursive
+                    // calls inside must already resolve to the direct
+                    // fn-item call form `name(vec![...])`.
+                    self.fn_item_names.insert(name.clone());
+                }
                 let params = fn_decl
                     .function
                     .params
@@ -284,16 +983,57 @@ impl LowerCtx {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+                // A nested fn has its own return type; try-flow wrapping from
+                // an enclosing try block must not leak into its body.
+                let saved_flow = std::mem::take(&mut self.try_flow_stack);
+                // Bind the params for the body (and restore afterwards so
+                // they don't leak into the enclosing scope).
+                let saved_known = self.known_values.clone();
+                // break/continue labels do not cross the fn boundary.
+                let saved_loop_labels = std::mem::take(&mut self.loop_labels);
+                let saved_break_labels = std::mem::take(&mut self.break_labels);
+                let saved_named_labels = std::mem::take(&mut self.named_labels);
+                let pats: Vec<Pat> = fn_decl
+                    .function
+                    .params
+                    .iter()
+                    .map(|p| p.pat.clone())
+                    .collect();
+                self.bind_patterns(&pats);
+                let saved_boxed = self.enter_fn_scope(&pats, body_stmts);
+                // Param bindings are part of the fn scope: they must see the
+                // same boxed set as the body (a param captured by a nested
+                // closure and assigned is emitted as a cell).
+                let bindings = if self.dynamic_values {
+                    Some(self.lower_closure_params(&pats))
+                } else {
+                    None
+                };
                 let body = fn_decl
                     .function
                     .body
                     .as_ref()
-                    .map(|b| self.lower_stmts(&b.stmts))
+                    .map(|b| {
+                        let prologue = self.hoist_fn_body_vars(&b.stmts);
+                        format!("{prologue}{}", self.lower_stmts(&b.stmts))
+                    })
                     .unwrap_or_default();
+                self.try_flow_stack = saved_flow;
+                self.known_values = saved_known;
+                self.loop_labels = saved_loop_labels;
+                self.break_labels = saved_break_labels;
+                self.named_labels = saved_named_labels;
+                self.leave_fn_scope(saved_boxed);
                 if self.dynamic_values {
+                    // Nested fn items use the bundle-wide `(__args)` calling
+                    // convention so they can be wrapped as Values and called
+                    // uniformly (see fn_item_names).
+                    self.fn_item_names.insert(name.clone());
+                    let bindings = bindings.unwrap_or_default();
                     format!(
-                        "{}fn {name}({params}) -> w3cos_core::Value {{\n{body}\n{}w3cos_core::Value::Undefined\n{}}}",
+                        "{}fn {name}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}  {bindings}{body}\n{}w3cos_core::Value::Undefined\n{}}}",
                         self.pad(),
+                        " ".repeat(self.indent + 4),
                         " ".repeat(self.indent + 4),
                         self.pad()
                     )
@@ -305,7 +1045,132 @@ impl LowerCtx {
                     )
                 }
             }
+            Decl::Class(class_decl) => {
+                if self.dynamic_values {
+                    // Nested class declaration → local binding holding the
+                    // eagerly-built class value.
+                    let name = atom_str(&class_decl.ident.sym);
+                    self.known_values.insert(name.clone());
+                    let class_expr = ClassExpr {
+                        ident: Some(class_decl.ident.clone()),
+                        class: class_decl.class.clone(),
+                    };
+                    let value = self.lower_class_value(&class_expr);
+                    if self.hoisted_vars.contains(&name) {
+                        // Hoisted class: assign the pre-declared slot so
+                        // forward references and method self-references see
+                        // the live binding (boxed when captured).
+                        if self.is_boxed(&name) {
+                            return format!("{}{}", self.pad(), Self::boxed_write(&name, &value));
+                        }
+                        return format!("{}{name} = {value};", self.pad());
+                    }
+                    format!("{}{}", self.pad(), self.bind_local(&name, &value))
+                } else {
+                    format!("{}/* unsupported decl */", self.pad())
+                }
+            }
             _ => format!("{}/* unsupported decl */", self.pad()),
+        }
+    }
+
+    /// The `for`-loop pattern plus a destructuring prelude for a
+    /// for-in/for-of head: plain idents bind directly in the loop pattern;
+    /// destructuring heads bind `__item` and destructure inside the body.
+    /// Dynamic mode handles JS scoping faithfully: `var` heads write through
+    /// to the hoisted fn-scope slot, `let`/`const` heads get a fresh
+    /// per-iteration binding (boxed as a cell when captured+assigned), and
+    /// declaration-free heads write through to the existing binding.
+    fn lower_for_head(&self, head: &ForHead) -> (String, String) {
+        let pat = match head {
+            ForHead::VarDecl(vd) => vd.decls.first().map(|d| &d.name),
+            ForHead::Pat(p) => Some(p.as_ref()),
+            _ => None,
+        };
+        if !self.dynamic_values {
+            return match pat {
+                Some(Pat::Ident(_)) | None => {
+                    let name = pat
+                        .map(|p| self.lower_pat(p))
+                        .unwrap_or_else(|| "_".to_string());
+                    (name, String::new())
+                }
+                Some(p) => {
+                    let mut lines = Vec::new();
+                    self.lower_dynamic_local_pattern(p, "__item", &mut lines, self.indent + 4);
+                    ("__item".to_string(), lines.join("\n"))
+                }
+            };
+        }
+        let pad = " ".repeat(self.indent + 4);
+        match head {
+            ForHead::VarDecl(vd) => {
+                let Some(declarator) = vd.decls.first() else {
+                    return ("_".to_string(), String::new());
+                };
+                match &declarator.name {
+                    Pat::Ident(ident) => {
+                        let name = sanitize_ident(&ident.id.sym.to_string());
+                        let fn_scoped =
+                            vd.kind == VarDeclKind::Var || self.hoisted_vars.contains(&name);
+                        if fn_scoped {
+                            // `var` loop heads share one fn-scope binding:
+                            // write through to the hoisted slot.
+                            let write = if self.is_boxed(&name) {
+                                Self::boxed_write(&name, "__it")
+                            } else {
+                                format!("{name} = __it;")
+                            };
+                            ("__it".to_string(), format!("{pad}{write}"))
+                        } else if self.is_boxed(&name) {
+                            // Captured+assigned loop variable: per-iteration
+                            // cell shared with closures created in the body.
+                            (
+                                "__it".to_string(),
+                                format!(
+                                    "{pad}let {name} = std::rc::Rc::new(std::cell::RefCell::new(__it));"
+                                ),
+                            )
+                        } else {
+                            // Fresh per-iteration binding; `mut` because JS
+                            // loop variables are reassignable in the body.
+                            (format!("mut {name}"), String::new())
+                        }
+                    }
+                    pattern => {
+                        let mut lines = Vec::new();
+                        self.lower_dynamic_local_pattern(
+                            pattern,
+                            "__item",
+                            &mut lines,
+                            self.indent + 4,
+                        );
+                        ("__item".to_string(), lines.join("\n"))
+                    }
+                }
+            }
+            ForHead::Pat(p) => match p.as_ref() {
+                Pat::Ident(ident) => {
+                    let name = sanitize_ident(&ident.id.sym.to_string());
+                    let write = if self.is_boxed(&name) {
+                        Self::boxed_write(&name, "__it")
+                    } else {
+                        format!("{name} = __it;")
+                    };
+                    ("__it".to_string(), format!("{pad}{write}"))
+                }
+                pattern => {
+                    let mut lines = Vec::new();
+                    self.lower_dynamic_assign_pattern(pattern, "__item", &mut lines);
+                    let prelude = lines
+                        .iter()
+                        .map(|line| format!("{pad}{line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ("__item".to_string(), prelude)
+                }
+            },
+            _ => ("_".to_string(), String::new()),
         }
     }
 
@@ -349,8 +1214,17 @@ impl LowerCtx {
             .as_ref()
             .map(|e| self.lower_expr(e))
             .unwrap_or_default();
+        let label = if self.dynamic_values {
+            self.take_loop_label()
+        } else {
+            String::new()
+        };
         self.indent += 4;
-        let body = self.lower_stmt(&for_stmt.body);
+        let body = if self.dynamic_values {
+            self.lower_loop_body(&for_stmt.body, &label.clone(), &label.clone())
+        } else {
+            self.lower_stmt(&for_stmt.body)
+        };
         self.indent -= 4;
 
         let inner_pad = " ".repeat(self.indent + 4);
@@ -359,7 +1233,25 @@ impl LowerCtx {
         if !init.is_empty() {
             out.push_str(&format!("{}{}\n", self.pad(), init));
         }
-        out.push_str(&format!("{}loop {{\n", self.pad()));
+        let (prefix, break_) = if label.is_empty() {
+            (String::new(), "break;".to_string())
+        } else {
+            (format!("'{label}: "), format!("break '{label};"))
+        };
+        // JS `continue` must run the update before re-testing. Rust
+        // `continue` jumps to the loop head, so the update lives at the head
+        // guarded by a first-iteration flag (emitted only when there IS an
+        // update; otherwise plain `continue` is already correct).
+        let first_flag = self.dynamic_values && !update.is_empty();
+        if first_flag {
+            out.push_str(&format!("{}let mut __w3cos_first = true;\n", self.pad()));
+        }
+        out.push_str(&format!("{}{prefix}loop {{\n", self.pad()));
+        if first_flag {
+            out.push_str(&format!(
+                "{inner_pad}if !__w3cos_first {{ {update}; }}\n{inner_pad}__w3cos_first = false;\n"
+            ));
+        }
         // Emit break condition
         if test != "true" {
             let condition = if self.dynamic_values {
@@ -367,12 +1259,12 @@ impl LowerCtx {
             } else {
                 test
             };
-            out.push_str(&format!("{inner_pad}if !({condition}) {{ break; }}\n"));
+            out.push_str(&format!("{inner_pad}if !({condition}) {{ {break_} }}\n"));
         }
         out.push_str(&body);
         out.push('\n');
-        // Emit update
-        if !update.is_empty() {
+        // Emit update at the tail when there is no continue-flag to run it.
+        if !first_flag && !update.is_empty() {
             out.push_str(&format!("{inner_pad}{update};\n"));
         }
         out.push_str(&format!("{}}}", self.pad()));
@@ -380,8 +1272,147 @@ impl LowerCtx {
     }
 
     fn lower_try(&mut self, try_stmt: &TryStmt) -> String {
-        // JS try/catch → Rust closure returning Result, then handle Err.
-        // Simplified: emit the try block inline with a comment, then catch as fallback.
+        if !self.dynamic_values {
+            return self.lower_try_static(try_stmt);
+        }
+        // JS try/catch/finally on top of panic unwinding:
+        //
+        // ```text
+        // enum __FlowN { Done, Return(Value), Throw(Box<dyn Any + Send>) }
+        // let __flowN = (|| -> __FlowN {
+        //     match catch_unwind(|| { <try body>; __FlowN::Done }) {
+        //         Ok(flow) => flow,
+        //         Err(payload) => { bind catch param; catch body as flow }
+        //     }
+        // })();
+        // <finally body>                        // always runs
+        // match __flowN { Done => {}, Return(v) => propagate, Throw(p) => resume_unwind(p) }
+        // ```
+        //
+        // `return` inside try/catch lowers to `return __FlowN::Return(v)` from
+        // the flow closure (see Stmt::Return), so finally runs on every path;
+        // the epilogue then propagates the early return (or re-throws, which
+        // an enclosing try catches as its own payload — nested try works).
+        let index = self.temp_index;
+        self.temp_index += 1;
+        let flow = format!("__Flow{index}");
+        let pad0 = self.pad();
+        let pad1 = " ".repeat(self.indent + 4);
+        let pad2 = " ".repeat(self.indent + 8);
+        let pad3 = " ".repeat(self.indent + 12);
+        let pad4 = " ".repeat(self.indent + 16);
+
+        let mut out = String::new();
+        if try_has_await(try_stmt) {
+            // AssertUnwindSafe across .await is unsound (a future may be held
+            // across the unwind boundary); sync try/catch is sound.
+            out.push_str(&format!(
+                "{pad0}// compile_warning: try/catch around `await` is best-effort only\n"
+            ));
+        }
+        out.push_str(&format!(
+            "{pad0}{{\n{pad1}enum {flow} {{ Done, Return(w3cos_core::Value), Throw(std::boxed::Box<dyn std::any::Any + Send>) }}\n{pad1}let __flow{index}: {flow} = (|| -> {flow} {{\n{pad2}let __caught{index} = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> {flow} {{\n"
+        ));
+
+        self.try_flow_stack.push(flow.clone());
+        self.indent += 12;
+        // The try body runs inside the flow closure: break/continue labels
+        // from enclosing loops do not cross the closure boundary.
+        let saved_loop_labels = std::mem::take(&mut self.loop_labels);
+        let saved_break_labels = std::mem::take(&mut self.break_labels);
+        let saved_named_labels = std::mem::take(&mut self.named_labels);
+        let try_body = self.lower_stmts(&try_stmt.block.stmts);
+        self.loop_labels = saved_loop_labels;
+        self.break_labels = saved_break_labels;
+        self.named_labels = saved_named_labels;
+        self.indent -= 12;
+        out.push_str(&try_body);
+        out.push_str(&format!(
+            "\n{pad3}{flow}::Done\n{pad2}}}));\n{pad2}match __caught{index} {{\n{pad3}Ok(flow) => flow,\n{pad3}Err(__payload{index}) => {{\n"
+        ));
+
+        if let Some(handler) = &try_stmt.handler {
+            // Mirror w3cos_core's payload_to_value: JS exceptions thrown by
+            // compiled code or builtins arrive as PanicValue; native Rust
+            // panics degrade to a string value.
+            let payload_value = format!(
+                "{{ if let Some(__v) = __payload{index}.downcast_ref::<w3cos_core::Value>() {{ __v.clone() }} else if let Some(__w) = __payload{index}.downcast_ref::<w3cos_core::PanicValue>() {{ __w.0.clone() }} else if let Some(__s) = __payload{index}.downcast_ref::<&'static str>() {{ w3cos_core::Value::from(*__s) }} else if let Some(__s) = __payload{index}.downcast_ref::<String>() {{ w3cos_core::Value::from(__s.clone()) }} else {{ w3cos_core::Value::from(\"native panic\") }} }}"
+            );
+            let saved_known = self.known_values.clone();
+            match &handler.param {
+                Some(Pat::Ident(ident)) => {
+                    let name = sanitize_ident(&ident.id.sym.to_string());
+                    out.push_str(&format!(
+                        "{pad4}{}\n",
+                        self.bind_local(&name, &payload_value)
+                    ));
+                    self.known_values.insert(name);
+                }
+                Some(pattern) => {
+                    let err = format!("__err{index}");
+                    out.push_str(&format!("{pad4}let {err} = {payload_value};\n"));
+                    let mut lines = Vec::new();
+                    self.lower_dynamic_local_pattern(pattern, &err, &mut lines, self.indent + 16);
+                    for line in lines {
+                        out.push_str(&line);
+                        out.push('\n');
+                    }
+                    collect_pattern_names(pattern, &mut self.known_values);
+                }
+                None => {}
+            }
+            out.push_str(&format!(
+                "{pad4}let __caught2{index} = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> {flow} {{\n"
+            ));
+            self.indent += 20;
+            // The catch body also runs inside a flow closure.
+            let saved_loop_labels = std::mem::take(&mut self.loop_labels);
+            let saved_break_labels = std::mem::take(&mut self.break_labels);
+            let saved_named_labels = std::mem::take(&mut self.named_labels);
+            let catch_body = self.lower_stmts(&handler.body.stmts);
+            self.loop_labels = saved_loop_labels;
+            self.break_labels = saved_break_labels;
+            self.named_labels = saved_named_labels;
+            self.indent -= 20;
+            self.known_values = saved_known;
+            out.push_str(&catch_body);
+            out.push_str(&format!(
+                "\n{}__Flow{}::Done\n{pad4}}}));\n{pad4}match __caught2{index} {{\n{}Ok(flow) => flow,\n{}Err(__rethrown{index}) => {flow}::Throw(__rethrown{index}),\n{pad4}}}\n",
+                " ".repeat(self.indent + 20),
+                index,
+                " ".repeat(self.indent + 20),
+                " ".repeat(self.indent + 20),
+            ));
+        } else {
+            // No catch: finally runs, then the panic resumes.
+            out.push_str(&format!("{pad4}{flow}::Throw(__payload{index})\n"));
+        }
+        out.push_str(&format!("{pad3}}}\n{pad2}}}\n{pad1}}})();\n"));
+        self.try_flow_stack.pop();
+
+        // Finally runs on every path (its own `return`/throw wins naturally:
+        // it is emitted outside the flow closure).
+        if let Some(finalizer) = &try_stmt.finalizer {
+            self.indent += 4;
+            let finally_body = self.lower_stmts(&finalizer.stmts);
+            self.indent -= 4;
+            out.push_str(&finally_body);
+            out.push('\n');
+        }
+
+        let propagate = match self.try_flow_stack.last() {
+            Some(outer) => format!("return {outer}::Return(v);"),
+            None => "return v;".to_string(),
+        };
+        out.push_str(&format!(
+            "{pad1}match __flow{index} {{\n{pad2}{flow}::Done => {{}}\n{pad2}{flow}::Return(v) => {{ {propagate} }}\n{pad2}{flow}::Throw(p) => {{ std::panic::resume_unwind(p); }}\n{pad1}}}\n{pad0}}}"
+        ));
+        out
+    }
+
+    /// Static (non-dynamic-Value) fallback: try/catch has no Rust equivalent
+    /// in that mode; emit the bodies inline with markers.
+    fn lower_try_static(&mut self, try_stmt: &TryStmt) -> String {
         self.indent += 4;
         let try_body = self.lower_stmts(&try_stmt.block.stmts);
         self.indent -= 4;
@@ -427,18 +1458,22 @@ impl LowerCtx {
     fn lower_switch(&mut self, switch: &SwitchStmt) -> String {
         let disc = self.lower_expr(&switch.discriminant);
         if self.dynamic_values {
+            let index = self.temp_index;
+            self.temp_index += 1;
+            let sw = format!("__sw{index}");
             let pad = self.pad();
-            let mut out = format!("{pad}'__switch: {{\n{pad}    let __disc = {disc};\n");
+            let mut out = format!("{pad}'{sw}: {{\n{pad}    let __disc = {disc};\n");
             let mut default_body = None;
             self.indent += 4;
+            // A `break` inside a case targets the switch; a `continue`
+            // targets the enclosing loop (its label stays on the loop stack).
+            self.break_labels.push(sw.clone());
             for case in &switch.cases {
-                let body = self
-                    .lower_stmts(&case.cons)
-                    .replace("break;", "break '__switch;");
+                let body = self.lower_stmts(&case.cons);
                 if let Some(test) = &case.test {
                     let test = self.lower_expr(test);
                     out.push_str(&format!(
-                        "{}if __disc.strict_eq(&{test}) {{\n{body}\n{}    break '__switch;\n{}}}\n",
+                        "{}if __disc.strict_eq(&{test}) {{\n{body}\n{}    break '{sw};\n{}}}\n",
                         self.pad(),
                         self.pad(),
                         self.pad()
@@ -447,6 +1482,7 @@ impl LowerCtx {
                     default_body = Some(body);
                 }
             }
+            self.break_labels.pop();
             if let Some(body) = default_body {
                 out.push_str(&body);
                 out.push('\n');
@@ -478,13 +1514,20 @@ impl LowerCtx {
 
     pub fn lower_expr(&self, expr: &Expr) -> String {
         match expr {
-            Expr::Ident(ident) => self.resolve_value(&atom_str(&ident.sym)),
+            Expr::Ident(ident) => {
+                // `self` sanitizes to `self_` (Rust keyword), so the globals
+                // table in resolve_value would miss it; resolve the raw name.
+                if self.dynamic_values
+                    && ident.sym == *"self"
+                    && !self.is_name_shadowed("self")
+                    && !self.is_name_shadowed("self_")
+                {
+                    return "w3cos_runtime::jsdom::window_value()".to_string();
+                }
+                self.resolve_value(&atom_str(&ident.sym))
+            }
             Expr::Lit(lit) => self.lower_lit(lit),
             Expr::New(new_expr) => {
-                let callee = match new_expr.callee.as_ref() {
-                    Expr::Ident(identifier) => self.resolve_name(&atom_str(&identifier.sym)),
-                    expression => self.lower_expr(expression),
-                };
                 let args = new_expr
                     .args
                     .as_ref()
@@ -496,12 +1539,67 @@ impl LowerCtx {
                     })
                     .unwrap_or_default();
                 if self.dynamic_values {
-                    if matches!(callee.as_str(), "Error" | "Map" | "ResizeObserver") {
-                        format!("{callee}::new(vec![{args}])")
-                    } else {
-                        format!("{callee}::new()")
+                    let callee_name = match new_expr.callee.as_ref() {
+                        Expr::Ident(identifier) => Some(atom_str(&identifier.sym)),
+                        _ => None,
+                    };
+                    // Keep builtin special-cases (native Rust constructors).
+                    if let Some(name) = &callee_name {
+                        let resolved = self.resolve_name(name);
+                        // Map/Set/WeakMap/WeakSet are NOT special-cased: when
+                        // unshadowed they resolve (below) to the
+                        // w3cos_core::collections class values and go through
+                        // class::construct like any other class.
+                        if matches!(resolved.as_str(), "Error" | "ResizeObserver") {
+                            // `Error::new` returns the struct — unwrap the Value.
+                            let unwrap = if resolved == "Error" { ".0" } else { "" };
+                            return format!("{resolved}::new(vec![{args}]){unwrap}");
+                        }
+                        // Unshadowed globals with dedicated core constructors.
+                        if !self.is_name_shadowed(name) {
+                            match name.as_str() {
+                                "Promise" => {
+                                    return format!("w3cos_core::promise::new(vec![{args}])");
+                                }
+                                // `new Array(n)` (length) vs `new Array(a,b)`
+                                // (elements) per JS semantics.
+                                "Array" => {
+                                    return format!(
+                                        "{{ let __args: Vec<w3cos_core::Value> = vec![{args}]; if __args.len() == 1 && __args[0].is_number() {{ let n = __args[0].to_number() as usize; w3cos_core::Value::array(vec![w3cos_core::Value::Undefined; n]) }} else {{ w3cos_core::Value::array(__args) }} }}"
+                                    );
+                                }
+                                "URL" => {
+                                    return format!("w3cos_core::web::url_new(vec![{args}])");
+                                }
+                                "URLSearchParams" => {
+                                    return format!(
+                                        "w3cos_core::web::url_search_params_new(vec![{args}])"
+                                    );
+                                }
+                                // Error family maps onto the Error builtin
+                                // (type tags are not modeled); `Error::new`
+                                // returns the struct, so unwrap the Value.
+                                "TypeError" | "SyntaxError" | "ReferenceError" | "EvalError"
+                                | "URIError" | "AggregateError" => {
+                                    return format!("Error::new(vec![{args}]).0");
+                                }
+                                _ => {}
+                            }
+                        }
                     }
+                    // Everything else — classes (own or cross-module), class
+                    // expressions, constructor functions — goes through the
+                    // class runtime's construct().
+                    let callee_value = match &callee_name {
+                        Some(name) => self.resolve_value(name),
+                        None => self.lower_expr(&new_expr.callee),
+                    };
+                    format!("w3cos_core::class::construct(&{callee_value}, vec![{args}])")
                 } else {
+                    let callee = match new_expr.callee.as_ref() {
+                        Expr::Ident(identifier) => self.resolve_name(&atom_str(&identifier.sym)),
+                        expression => self.lower_expr(expression),
+                    };
                     format!("{callee}::new({args})")
                 }
             }
@@ -513,17 +1611,22 @@ impl LowerCtx {
                 {
                     let object = self.lower_expr(&member.obj);
                     let key = match &member.prop {
-                        MemberProp::Ident(ident) => format!("{:?}", atom_str(&ident.sym)),
+                        MemberProp::Ident(ident) => format!("{:?}", ident.sym.to_string()),
                         MemberProp::Computed(computed) => {
                             format!("{}.to_js_string()", self.lower_expr(&computed.expr))
                         }
                         MemberProp::PrivateName(name) => {
-                            format!("{:?}", atom_str(&name.name))
+                            format!("{:?}", self.private_key(name))
                         }
                     };
                     let right = self.lower_expr(&assign.right);
+                    if let Some(method) = compound_assign_op(assign.op) {
+                        return format!(
+                            "{{ let __obj = {object}; let __w3cos_av = __obj.get_property(&{key}).{method}(&{right}); __obj.set_property(&{key}, __w3cos_av.clone()); __w3cos_av }}"
+                        );
+                    }
                     return format!(
-                        "{{ let value = {right}; {object}.set_property(&{key}, value.clone()); value }}"
+                        "{{ let __w3cos_av = {right}; {object}.set_property(&{key}, __w3cos_av.clone()); __w3cos_av }}"
                     );
                 }
                 if self.dynamic_values
@@ -531,7 +1634,7 @@ impl LowerCtx {
                         &assign.left
                 {
                     let local = atom_str(&identifier.id.sym);
-                    if self.value_bindings.contains(&local) {
+                    if self.value_bindings.contains(&local) && !self.known_values.contains(&local) {
                         let bundled = self
                             .renames
                             .iter()
@@ -539,20 +1642,98 @@ impl LowerCtx {
                             .map(|(_, bundled)| bundled.as_str())
                             .unwrap_or(&local);
                         let right = self.lower_expr(&assign.right);
+                        if let Some(method) = compound_assign_op(assign.op) {
+                            return format!("{bundled}_set({bundled}_get().{method}(&{right}))");
+                        }
                         return format!("{bundled}_set({right})");
                     }
+                    if self.is_boxed(&local) && self.known_values.contains(&local) {
+                        // Rc<RefCell> local: write through the shared cell.
+                        let target = self.resolve_name(&local);
+                        let right = self.lower_expr(&assign.right);
+                        if let Some(method) = compound_assign_op(assign.op) {
+                            return format!(
+                                "{{ let __w3cos_av = (*{target}.borrow()).{method}(&{right}); *{target}.borrow_mut() = __w3cos_av.clone(); __w3cos_av }}"
+                            );
+                        }
+                        return format!(
+                            "{{ let __w3cos_av = {right}; *{target}.borrow_mut() = __w3cos_av.clone(); __w3cos_av }}"
+                        );
+                    }
+                    if !self.known_values.contains(&local) {
+                        // Assignment to a non-local, non-cell binding: a
+                        // module-level fn/class/namespace accessor (not
+                        // assignable in Rust), an import (read-only), or an
+                        // implicit global (sloppy-mode UMD guards). Evaluate
+                        // the RHS (and the current value for compound ops)
+                        // and drop the write — documented degradation that
+                        // keeps emission total.
+                        let right = self.lower_expr(&assign.right);
+                        if let Some(method) = compound_assign_op(assign.op) {
+                            let target = self.resolve_value(&local);
+                            return format!(
+                                "{{ let __w3cos_av = {target}.{method}(&{right}); __w3cos_av }} /* write dropped: non-assignable binding */"
+                            );
+                        }
+                        return format!(
+                            "{{ let __w3cos_av = {right}; __w3cos_av }} /* write dropped: non-assignable binding */"
+                        );
+                    }
+                    if let Some(method) = compound_assign_op(assign.op) {
+                        let target = self.resolve_name(&local);
+                        let right = self.lower_expr(&assign.right);
+                        return format!(
+                            "{{ let __w3cos_av = {target}.{method}(&{right}); {target} = __w3cos_av.clone(); __w3cos_av }}"
+                        );
+                    }
+                }
+                // `super.x = v` — define on the parent prototype chain is not
+                // meaningful here; keep total by evaluating both sides.
+                if self.dynamic_values
+                    && let AssignTarget::Simple(SimpleAssignTarget::SuperProp(_)) = &assign.left
+                {
+                    let right = self.lower_expr(&assign.right);
+                    return format!("{{ let value = {right}; value }} /* super.x = unsupported */");
                 }
                 let left = match &assign.left {
                     AssignTarget::Simple(simple) => match simple {
                         SimpleAssignTarget::Ident(i) => self.resolve_name(&atom_str(&i.id.sym)),
                         SimpleAssignTarget::Member(m) => self.lower_member(m),
-                        _ => "/* assign target */".to_string(),
+                        _ => {
+                            if self.dynamic_values {
+                                let right = self.lower_expr(&assign.right);
+                                return format!(
+                                    "{{ let value = {right}; value }} /* unsupported assign target */"
+                                );
+                            }
+                            "/* assign target */".to_string()
+                        }
                     },
-                    AssignTarget::Pat(_) => "/* pattern assign */".to_string(),
+                    AssignTarget::Pat(_) => {
+                        if self.dynamic_values {
+                            // Destructuring reassignment (`[a, b] = arr`):
+                            // evaluate the rhs once, then assign each element
+                            // to its (already declared) binding.
+                            let right = self.lower_expr(&assign.right);
+                            let mut lines = Vec::new();
+                            self.lower_dynamic_assign_target(
+                                &assign.left,
+                                "__assign_value",
+                                &mut lines,
+                            );
+                            return format!(
+                                "{{ let __assign_value = {right}; {} __assign_value }}",
+                                lines.join(" ")
+                            );
+                        }
+                        "/* pattern assign */".to_string()
+                    }
                 };
                 let right = self.lower_expr(&assign.right);
                 if self.dynamic_values {
-                    format!("{{ let value = {right}; {left} = value.clone(); value }}")
+                    format!(
+                        "{{ let __w3cos_av = {right}; {left} = __w3cos_av.clone(); __w3cos_av }}"
+                    )
                 } else {
                     format!("{left} = {right}")
                 }
@@ -584,8 +1765,26 @@ impl LowerCtx {
                         }
                     }
                 }
-                let arg = self.lower_expr(&unary.arg);
                 if self.dynamic_values {
+                    if unary.op == UnaryOp::Delete {
+                        if let Expr::Member(member) = unary.arg.as_ref() {
+                            let object = self.lower_expr(&member.obj);
+                            let key = match &member.prop {
+                                MemberProp::Ident(ident) => {
+                                    format!("{:?}", ident.sym.to_string())
+                                }
+                                MemberProp::Computed(computed) => {
+                                    format!("{}.to_js_string()", self.lower_expr(&computed.expr))
+                                }
+                                MemberProp::PrivateName(name) => {
+                                    format!("{:?}", self.private_key(name))
+                                }
+                            };
+                            return format!("{object}.delete_property(&{key})");
+                        }
+                        return "w3cos_core::Value::Bool(true)".to_string();
+                    }
+                    let arg = self.lower_expr(&unary.arg);
                     match unary.op {
                         UnaryOp::Bang => format!("{arg}.js_not()"),
                         UnaryOp::Minus => format!("{arg}.js_neg()"),
@@ -594,29 +1793,68 @@ impl LowerCtx {
                         _ => format!("{arg}"),
                     }
                 } else {
+                    let arg = self.lower_expr(&unary.arg);
                     let op = lower_unary_op(unary.op);
                     format!("{op}{arg}")
                 }
             }
             Expr::Update(update) => {
-                let arg = if self.dynamic_values {
-                    match update.arg.as_ref() {
-                        Expr::Ident(identifier) => self.resolve_name(&atom_str(&identifier.sym)),
-                        expression => self.lower_expr(expression),
-                    }
-                } else {
-                    self.lower_expr(&update.arg)
-                };
                 if self.dynamic_values {
                     let delta = if update.op == UpdateOp::PlusPlus {
                         "js_add"
                     } else {
                         "js_sub"
                     };
+                    if let Expr::Member(member) = update.arg.as_ref() {
+                        let object = self.lower_expr(&member.obj);
+                        let key = match &member.prop {
+                            MemberProp::Ident(ident) => format!("{:?}", ident.sym.to_string()),
+                            MemberProp::Computed(computed) => {
+                                format!("{}.to_js_string()", self.lower_expr(&computed.expr))
+                            }
+                            MemberProp::PrivateName(name) => {
+                                format!("{:?}", self.private_key(name))
+                            }
+                        };
+                        return format!(
+                            "{{ let __obj = {object}; let __w3cos_prev = __obj.get_property(&{key}); __obj.set_property(&{key}, __w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0))); __w3cos_prev }}"
+                        );
+                    }
+                    let arg = match update.arg.as_ref() {
+                        Expr::Ident(identifier) => {
+                            let local = atom_str(&identifier.sym);
+                            if self.value_bindings.contains(&local)
+                                && !self.known_values.contains(&local)
+                            {
+                                // x++ on an imported/module-level variable:
+                                // go through the `{bundled}_get`/`_set`
+                                // accessors (can't assign to a call result).
+                                let bundled = self
+                                    .renames
+                                    .iter()
+                                    .find(|(name, _)| name == &local)
+                                    .map(|(_, bundled)| bundled.as_str())
+                                    .unwrap_or(&local);
+                                return format!(
+                                    "{{ let __w3cos_prev = {bundled}_get(); {bundled}_set(__w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0))); __w3cos_prev }}"
+                                );
+                            }
+                            if self.is_boxed(&local) && self.known_values.contains(&local) {
+                                // Rc<RefCell> local: read/write through the cell.
+                                let target = self.resolve_name(&local);
+                                return format!(
+                                    "{{ let __w3cos_prev = (*{target}.borrow()).clone(); *{target}.borrow_mut() = __w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
+                                );
+                            }
+                            self.resolve_name(&local)
+                        }
+                        expression => self.lower_expr(expression),
+                    };
                     return format!(
-                        "{{ let previous = {arg}.clone(); {arg} = {arg}.{delta}(&w3cos_core::Value::Number(1.0)); previous }}"
+                        "{{ let __w3cos_prev = {arg}.clone(); {arg} = {arg}.{delta}(&w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
                     );
                 }
+                let arg = self.lower_expr(&update.arg);
                 let op = if update.op == UpdateOp::PlusPlus {
                     "+= 1"
                 } else {
@@ -630,42 +1868,56 @@ impl LowerCtx {
             }
             Expr::Arrow(arrow) => {
                 if self.dynamic_values {
-                    let bindings =
-                        lower_closure_params(&arrow.params, &self.renames, &self.value_bindings);
                     let parameter_names = pattern_names(&arrow.params);
-                    let capture_candidates = self
-                        .known_values
-                        .difference(&parameter_names)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let body = match arrow.body.as_ref() {
-                        BlockStmtOrExpr::Expr(expression) => {
-                            let mut ctx = LowerCtx::new_dynamic_with_bindings(
-                                self.renames.clone(),
-                                self.value_bindings.clone(),
-                            );
-                            ctx.known_values.extend(capture_candidates.iter().cloned());
-                            ctx.bind_patterns(&arrow.params);
-                            format!("return {};", ctx.lower_expr(expression))
-                        }
-                        BlockStmtOrExpr::BlockStmt(block) => {
-                            let mut ctx = LowerCtx::new_dynamic_with_bindings(
-                                self.renames.clone(),
-                                self.value_bindings.clone(),
-                            );
-                            ctx.known_values.extend(capture_candidates.iter().cloned());
-                            ctx.bind_patterns(&arrow.params);
-                            ctx.indent = self.indent + 4;
-                            ctx.lower_stmts(&block.stmts)
-                        }
+                    let referenced = match arrow.body.as_ref() {
+                        BlockStmtOrExpr::Expr(expression) => expr_referenced_names(expression),
+                        BlockStmtOrExpr::BlockStmt(block) => stmts_referenced_names(&block.stmts),
                     };
-                    let captures = referenced_captures(capture_candidates, &body);
+                    let mut captures =
+                        capture_names(&self.known_values, &parameter_names, &referenced);
+                    self.push_parent_capture(&mut captures);
                     let capture_bindings = captures
                         .iter()
                         .map(|name| format!("let mut {name} = {name}.clone(); "))
                         .collect::<String>();
+                    let (bindings, body) = match arrow.body.as_ref() {
+                        BlockStmtOrExpr::Expr(expression) => {
+                            let mut ctx = self.child_dynamic_ctx();
+                            ctx.known_values.extend(captures.iter().cloned());
+                            ctx.bind_patterns(&arrow.params);
+                            // Analyze the expression body so params captured
+                            // by a nested closure and assigned get boxed.
+                            let analysis_body = [Stmt::Return(ReturnStmt {
+                                span: arrow.span,
+                                arg: Some(expression.clone()),
+                            })];
+                            ctx.enter_fn_scope(&arrow.params, &analysis_body);
+                            let bindings = ctx.lower_closure_params(&arrow.params);
+                            (bindings, format!("return {};", ctx.lower_expr(expression)))
+                        }
+                        BlockStmtOrExpr::BlockStmt(block) => {
+                            let mut ctx = self.child_dynamic_ctx();
+                            ctx.known_values.extend(captures.iter().cloned());
+                            ctx.bind_patterns(&arrow.params);
+                            ctx.indent = self.indent + 4;
+                            ctx.enter_fn_scope(&arrow.params, &block.stmts);
+                            let bindings = ctx.lower_closure_params(&arrow.params);
+                            let prologue = ctx.hoist_fn_body_vars(&block.stmts);
+                            (
+                                bindings,
+                                format!("{prologue}{}", ctx.lower_stmts(&block.stmts)),
+                            )
+                        }
+                    };
+                    // Arrows capture the lexical `this` of the enclosing class
+                    // member when (and only when) the body references it.
+                    let this_capture = if self.this_name.is_some() && body.contains("__this") {
+                        "let mut __this = __this.clone(); "
+                    } else {
+                        ""
+                    };
                     return format!(
-                        "{{ {capture_bindings} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
+                        "{{ {capture_bindings}{this_capture} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
                     );
                 }
                 let params = arrow
@@ -708,7 +1960,7 @@ impl LowerCtx {
                                     let name = atom_str(&identifier.sym);
                                     Some(format!(
                                         "w3cos_core::js_object! {{ {name:?} => {} }}",
-                                        self.resolve_name(&name)
+                                        self.resolve_value(&name)
                                     ))
                                 }
                                 _ => None,
@@ -730,7 +1982,7 @@ impl LowerCtx {
                             }
                             Prop::Shorthand(ident) => {
                                 let name = atom_str(&ident.sym);
-                                Some(format!("{name:?} => {}", self.resolve_name(&name)))
+                                Some(format!("{name:?} => {}", self.resolve_value(&name)))
                             }
                             Prop::Method(method) => {
                                 let key = self.lower_object_key(&method.key);
@@ -780,6 +2032,38 @@ impl LowerCtx {
                 format!("w3cos_core::js_object! {{ {fields} }}")
             }
             Expr::Array(arr) => {
+                if arr
+                    .elems
+                    .iter()
+                    .flatten()
+                    .any(|element| element.spread.is_some())
+                {
+                    let mut statements = Vec::new();
+                    for element in arr.elems.iter().flatten() {
+                        let value = self.lower_expr(&element.expr);
+                        if element.spread.is_some() {
+                            if self.dynamic_values {
+                                statements
+                                    .push(format!("__w3cos_array_items.extend(({value}).iter());"));
+                            } else {
+                                statements.push(format!(
+                                    "__w3cos_array_items.extend(({value}).into_iter());"
+                                ));
+                            }
+                        } else {
+                            statements.push(format!("__w3cos_array_items.push({value});"));
+                        }
+                    }
+                    let finish = if self.dynamic_values {
+                        "w3cos_core::Value::array(__w3cos_array_items)"
+                    } else {
+                        "__w3cos_array_items"
+                    };
+                    return format!(
+                        "{{ let mut __w3cos_array_items = Vec::new(); {} {finish} }}",
+                        statements.join(" ")
+                    );
+                }
                 let items = arr
                     .elems
                     .iter()
@@ -809,7 +2093,64 @@ impl LowerCtx {
                     format!("{value}.to_js_string()")
                 }
             }
-            Expr::This(_) => "self".to_string(),
+            Expr::This(_) => {
+                if self.this_name.is_none() && self.dynamic_values {
+                    // Top-level/module-scope `this` (undefined in ESM).
+                    "w3cos_core::Value::Undefined".to_string()
+                } else if self.dynamic_values {
+                    // Value position: clone (`__this` is frequently a captured
+                    // variable in an `Fn` closure, where moving out is an
+                    // error; Value is Rc-cheap to clone).
+                    format!(
+                        "{}.clone()",
+                        self.this_name.clone().unwrap_or_else(|| "self".to_string())
+                    )
+                } else {
+                    self.this_name.clone().unwrap_or_else(|| "self".to_string())
+                }
+            }
+            Expr::SuperProp(super_prop) => {
+                if self.dynamic_values {
+                    let this = self.this_expr();
+                    return match (&self.class_scope, &super_prop.prop) {
+                        (Some(scope), _) if scope.parent.is_none() => {
+                            "w3cos_core::Value::Undefined /* super without parent */".to_string()
+                        }
+                        (Some(scope), SuperProp::Ident(ident)) => {
+                            let parent = scope.parent.clone().unwrap_or_default();
+                            let key = atom_str(&ident.sym);
+                            if scope.is_static {
+                                // `super.x` in a static member: parent class object.
+                                format!("{parent}.get_property({key:?})")
+                            } else {
+                                format!("w3cos_core::class::super_get(&{this}, &{parent}, {key:?})")
+                            }
+                        }
+                        (Some(scope), SuperProp::Computed(computed)) => {
+                            let parent = scope.parent.clone().unwrap_or_default();
+                            let key =
+                                format!("&{}.to_js_string()", self.lower_expr(&computed.expr));
+                            if scope.is_static {
+                                format!("{parent}.get_property({key})")
+                            } else {
+                                format!("w3cos_core::class::super_get(&{this}, &{parent}, {key})")
+                            }
+                        }
+                        (None, _) => {
+                            "w3cos_core::Value::Undefined /* super outside class */".to_string()
+                        }
+                    };
+                }
+                "/* super.prop */".to_string()
+            }
+            Expr::PrivateName(name) => {
+                // `#x in obj` — the private brand as a (mangled) string key.
+                if self.dynamic_values {
+                    format!("w3cos_core::Value::from({:?})", self.private_key(name))
+                } else {
+                    format!("{:?}", self.private_key(name))
+                }
+            }
             Expr::Cond(cond) => {
                 let mut test = self.lower_expr(&cond.test);
                 if self.dynamic_values {
@@ -821,7 +2162,14 @@ impl LowerCtx {
             }
             Expr::Await(await_expr) => {
                 let arg = self.lower_expr(&await_expr.arg);
-                format!("{arg}.await")
+                if self.dynamic_values {
+                    // Generated code is synchronous: `await` degrades to the
+                    // operand itself (the promise value flows through; its
+                    // resolution is not awaited — recorded limitation).
+                    format!("{arg} /* await */")
+                } else {
+                    format!("{arg}.await")
+                }
             }
             Expr::Seq(seq) => {
                 let exprs: Vec<String> = seq.exprs.iter().map(|e| self.lower_expr(e)).collect();
@@ -850,12 +2198,12 @@ impl LowerCtx {
                     let obj = self.lower_expr(&member.obj);
                     if self.dynamic_values {
                         let property = match &member.prop {
-                            MemberProp::Ident(id) => format!("{:?}", atom_str(&id.sym)),
+                            MemberProp::Ident(id) => format!("{:?}", id.sym.to_string()),
                             MemberProp::Computed(computed) => {
                                 format!("&{}.to_js_string()", self.lower_expr(&computed.expr))
                             }
                             MemberProp::PrivateName(name) => {
-                                format!("{:?}", atom_str(&name.name))
+                                format!("{:?}", self.private_key(name))
                             }
                         };
                         return if property.starts_with('&') {
@@ -876,18 +2224,44 @@ impl LowerCtx {
                     format!("{obj}.as_ref().map(|v| v{prop})")
                 }
                 OptChainBase::Call(call) => {
-                    let callee = self.lower_expr(&call.callee);
                     let args = call
                         .args
                         .iter()
-                        .map(|a| self.lower_expr(&a.expr))
+                        .map(|a| self.lower_argument(&a.expr))
                         .collect::<Vec<_>>()
                         .join(", ");
                     if self.dynamic_values {
+                        // Optional calls on a member must retain the base as
+                        // the JavaScript receiver. Lowering `obj?.method()` as
+                        // `method.call(undefined, ...)` loses `this` (and in
+                        // Monaco breaks BracketPairsTree methods). Cache the
+                        // receiver so chained getters are also evaluated once.
+                        if let Some(member) = optional_call_member(&call.callee) {
+                            let receiver = self.lower_expr(&member.obj);
+                            let method = match &member.prop {
+                                MemberProp::Ident(id) => format!(
+                                    "__w3cos_receiver.get_property({:?})",
+                                    id.sym.to_string()
+                                ),
+                                MemberProp::Computed(computed) => format!(
+                                    "{{ let __w3cos_key = {}.to_js_string(); __w3cos_receiver.get_property(&__w3cos_key) }}",
+                                    self.lower_expr(&computed.expr)
+                                ),
+                                MemberProp::PrivateName(name) => format!(
+                                    "__w3cos_receiver.get_property({:?})",
+                                    self.private_key(name)
+                                ),
+                            };
+                            return format!(
+                                "{{ let __w3cos_receiver = {receiver}; if __w3cos_receiver.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ let __w3cos_method = {method}; if __w3cos_method.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ __w3cos_method.call(__w3cos_receiver.clone(), vec![{args}]) }} }} }}"
+                            );
+                        }
+                        let callee = self.lower_expr(&call.callee);
                         format!(
                             "if {callee}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ {callee}.call(w3cos_core::Value::Undefined, vec![{args}]) }}"
                         )
                     } else {
+                        let callee = self.lower_expr(&call.callee);
                         format!("{callee}.map(|f| f({args}))")
                     }
                 }
@@ -908,36 +2282,43 @@ impl LowerCtx {
                         .iter()
                         .map(|param| param.pat.clone())
                         .collect::<Vec<_>>();
-                    let bindings =
-                        lower_closure_params(&params, &self.renames, &self.value_bindings);
                     let parameter_names = pattern_names(&params);
-                    let capture_candidates = self
-                        .known_values
-                        .difference(&parameter_names)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let body = fn_expr
+                    let referenced = fn_expr
                         .function
                         .body
                         .as_ref()
-                        .map(|block| {
-                            let mut ctx = LowerCtx::new_dynamic_with_bindings(
-                                self.renames.clone(),
-                                self.value_bindings.clone(),
-                            );
-                            ctx.known_values.extend(capture_candidates.iter().cloned());
-                            ctx.bind_patterns(&params);
-                            ctx.indent = self.indent + 4;
-                            ctx.lower_stmts(&block.stmts)
-                        })
+                        .map(|block| stmts_referenced_names(&block.stmts))
                         .unwrap_or_default();
-                    let captures = referenced_captures(capture_candidates, &body);
+                    let mut captures =
+                        capture_names(&self.known_values, &parameter_names, &referenced);
+                    self.push_parent_capture(&mut captures);
                     let capture_bindings = captures
                         .iter()
                         .map(|name| format!("let mut {name} = {name}.clone(); "))
                         .collect::<String>();
+                    let (bindings, body) = fn_expr
+                        .function
+                        .body
+                        .as_ref()
+                        .map(|block| {
+                            let mut ctx = self.child_dynamic_ctx();
+                            // A function expression has its own dynamic `this`:
+                            // rebind it to the closure's receiver parameter.
+                            ctx.this_name = Some("__this".to_string());
+                            ctx.known_values.extend(captures.iter().cloned());
+                            ctx.bind_patterns(&params);
+                            ctx.indent = self.indent + 4;
+                            ctx.enter_fn_scope(&params, &block.stmts);
+                            let bindings = ctx.lower_closure_params(&params);
+                            let prologue = ctx.hoist_fn_body_vars(&block.stmts);
+                            (
+                                bindings,
+                                format!("{prologue}{}", ctx.lower_stmts(&block.stmts)),
+                            )
+                        })
+                        .unwrap_or_default();
                     return format!(
-                        "{{ {capture_bindings} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
+                        "{{ {capture_bindings} w3cos_core::Value::function(move |__this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
                     );
                 }
                 let params = fn_expr
@@ -959,7 +2340,13 @@ impl LowerCtx {
                     .unwrap_or_default();
                 format!("|{params}| {{ {body} }}")
             }
-            Expr::Class(_) => "/* class expr */ Default::default()".to_string(),
+            Expr::Class(class_expr) => {
+                if self.dynamic_values {
+                    self.lower_class_value(class_expr)
+                } else {
+                    "/* class expr */ Default::default()".to_string()
+                }
+            }
             Expr::TaggedTpl(tagged) => {
                 let tag = self.lower_expr(&tagged.tag);
                 let quasi = self.lower_expr(&Expr::Tpl(*tagged.tpl.clone()));
@@ -1087,6 +2474,37 @@ impl LowerCtx {
     }
 
     fn lower_call(&self, call: &CallExpr) -> String {
+        // `super(...)` — parent constructor call inside a derived ctor.
+        if self.dynamic_values && matches!(call.callee, Callee::Super(_)) {
+            let args = call
+                .args
+                .iter()
+                .map(|arg| self.lower_argument(&arg.expr))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let this = self.this_expr();
+            return match self.class_scope.as_ref().and_then(|s| s.parent.clone()) {
+                Some(parent) => {
+                    format!("w3cos_core::class::super_ctor(&{this}, &{parent}, vec![{args}])")
+                }
+                None => {
+                    "w3cos_core::Value::Undefined /* super() outside derived ctor */".to_string()
+                }
+            };
+        }
+        // `super.method(...)` — parent prototype (or class object) dispatch.
+        if self.dynamic_values
+            && let Callee::Expr(callee) = &call.callee
+            && let Expr::SuperProp(super_prop) = callee.as_ref()
+        {
+            let args = call
+                .args
+                .iter()
+                .map(|arg| self.lower_argument(&arg.expr))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return self.lower_super_call(super_prop, &args);
+        }
         if self.dynamic_values
             && let Callee::Expr(callee) = &call.callee
             && let Expr::Member(member) = callee.as_ref()
@@ -1095,30 +2513,44 @@ impl LowerCtx {
             && let Expr::Arrow(arrow) = first.expr.as_ref()
         {
             let object = self.lower_expr(&member.obj);
-            let mut ctx = LowerCtx::new_dynamic_with_bindings(
-                self.renames.clone(),
-                self.value_bindings.clone(),
-            );
+            let mut ctx = self.child_dynamic_ctx();
             ctx.known_values = self.known_values.clone();
             ctx.bind_patterns(&arrow.params);
+            let analysis_body: Vec<Stmt> = match arrow.body.as_ref() {
+                BlockStmtOrExpr::Expr(expression) => vec![Stmt::Return(ReturnStmt {
+                    span: arrow.span,
+                    arg: Some(expression.clone()),
+                })],
+                BlockStmtOrExpr::BlockStmt(block) => block.stmts.clone(),
+            };
+            ctx.enter_fn_scope(&arrow.params, &analysis_body);
             let mut bindings = String::new();
-            if let Some(pattern) = arrow.params.first() {
-                lower_closure_pattern(
-                    pattern,
-                    "__item",
-                    &mut bindings,
-                    &self.renames,
-                    &self.value_bindings,
-                );
+            let mut fixups = Vec::new();
+            // forEach callbacks receive (item, index, array); the loop drives
+            // the first two, anything further is Undefined.
+            for (index, pattern) in arrow.params.iter().enumerate() {
+                let source = match index {
+                    0 => "__item".to_string(),
+                    1 => "w3cos_core::Value::Number(__index as f64)".to_string(),
+                    _ => "w3cos_core::Value::Undefined".to_string(),
+                };
+                ctx.lower_closure_pattern(pattern, &source, &mut bindings, &mut fixups);
+            }
+            for fixup in fixups {
+                bindings.push_str(&fixup);
+                bindings.push(' ');
             }
             let body = match arrow.body.as_ref() {
                 BlockStmtOrExpr::Expr(expression) => {
                     format!("{};", ctx.lower_expr(expression))
                 }
-                BlockStmtOrExpr::BlockStmt(block) => ctx.lower_stmts(&block.stmts),
+                BlockStmtOrExpr::BlockStmt(block) => {
+                    let prologue = ctx.hoist_fn_body_vars(&block.stmts);
+                    format!("{prologue}{}", ctx.lower_stmts(&block.stmts))
+                }
             };
             return format!(
-                "{{ for __item in {object}.iter() {{ {bindings}{body} }} w3cos_core::Value::Undefined }}"
+                "{{ for (__index, __item) in {object}.iter().enumerate() {{ {bindings}{body} }} w3cos_core::Value::Undefined }}"
             );
         }
         if self.dynamic_values
@@ -1127,22 +2559,30 @@ impl LowerCtx {
         {
             let object = self.lower_expr(&member.obj);
             let key = match &member.prop {
-                MemberProp::Ident(id) => format!("{:?}", atom_str(&id.sym)),
+                MemberProp::Ident(id) => format!("{:?}", id.sym.to_string()),
                 MemberProp::Computed(computed) => {
                     format!("&{}.to_js_string()", self.lower_expr(&computed.expr))
                 }
-                MemberProp::PrivateName(name) => format!("{:?}", atom_str(&name.name)),
+                MemberProp::PrivateName(name) => format!("{:?}", self.private_key(name)),
             };
-            let args = call
-                .args
-                .iter()
-                .map(|arg| self.lower_argument(&arg.expr))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return format!("{object}.call_method({key}, vec![{args}])");
+            let args = self.lower_dynamic_argument_vec(&call.args);
+            return format!("{object}.call_method({key}, {args})");
         }
         let callee = match &call.callee {
             Callee::Expr(e) => self.lower_expr(e),
+            Callee::Import(_) if self.dynamic_values => {
+                // Dynamic import(): all modules are statically bundled, so
+                // degrade to a resolved promise of Undefined (the namespace
+                // object cannot be recovered from a dynamic specifier).
+                let spec = call
+                    .args
+                    .first()
+                    .map(|a| self.lower_expr(&a.expr))
+                    .unwrap_or_else(|| "w3cos_core::Value::Undefined".to_string());
+                return format!(
+                    "{{ let _ = {spec}; w3cos_core::promise::resolve(vec![w3cos_core::Value::Undefined]) }} /* dynamic import */"
+                );
+            }
             _ => "/* super/import call */".to_string(),
         };
         let args = call
@@ -1151,18 +2591,49 @@ impl LowerCtx {
             .map(|arg| self.lower_argument(&arg.expr))
             .collect::<Vec<_>>()
             .join(", ");
+        let dynamic_args = self
+            .dynamic_values
+            .then(|| self.lower_dynamic_argument_vec(&call.args));
         if self.dynamic_values
             && let Callee::Expr(expression) = &call.callee
             && let Expr::Ident(identifier) = expression.as_ref()
         {
             let name = atom_str(&identifier.sym);
-            let is_static = self.renames.iter().any(|(local, _)| local == &name)
-                || matches!(
-                    name.as_str(),
-                    "parseInt" | "parseFloat" | "RangeError" | "Error"
+            if self.class_names.contains(&name) && !self.known_values.contains(&name) {
+                // Calling a class without `new` (a TypeError in JS) —
+                // approximate via construct() to stay total.
+                return format!(
+                    "w3cos_core::class::construct(&{}, {})",
+                    self.resolve_value(&name),
+                    dynamic_args.as_ref().expect("dynamic argument vector")
                 );
+            }
+            if self.value_bindings.contains(&name) {
+                // Function-valued variable: call the Value, not a Rust fn.
+                let callee = self.resolve_value(&name);
+                return format!(
+                    "{callee}.call(w3cos_core::Value::Undefined, {})",
+                    dynamic_args.as_ref().expect("dynamic argument vector")
+                );
+            }
+            if self.fn_item_names.contains(&name) {
+                // Nested fn item: direct Rust call with the args vector.
+                return format!(
+                    "{name}({})",
+                    dynamic_args.as_ref().expect("dynamic argument vector")
+                );
+            }
+            let is_static = !self.known_values.contains(&name)
+                && (self.renames.iter().any(|(local, _)| local == &name)
+                    || matches!(
+                        name.as_str(),
+                        "parseInt" | "parseFloat" | "RangeError" | "Error"
+                    ));
             if !is_static {
-                return format!("{callee}.call(w3cos_core::Value::Undefined, vec![{args}])");
+                return format!(
+                    "{callee}.call(w3cos_core::Value::Undefined, {})",
+                    dynamic_args.as_ref().expect("dynamic argument vector")
+                );
             }
         }
         if self.dynamic_values {
@@ -1176,11 +2647,21 @@ impl LowerCtx {
                             self.resolve_name(&name)
                         }
                     }
-                    _ => callee,
+                    // Non-identifier callees (IIFEs, parenthesized fns) are
+                    // Value expressions: invoke through Value::call.
+                    _ => {
+                        return format!(
+                            "{callee}.call(w3cos_core::Value::Undefined, {})",
+                            dynamic_args.as_ref().expect("dynamic argument vector")
+                        );
+                    }
                 },
                 _ => callee,
             };
-            format!("{callee}(vec![{args}])")
+            format!(
+                "{callee}({})",
+                dynamic_args.as_ref().expect("dynamic argument vector")
+            )
         } else {
             format!("{callee}({args})")
         }
@@ -1191,14 +2672,14 @@ impl LowerCtx {
         if self.dynamic_values {
             return match &member.prop {
                 MemberProp::Ident(id) => {
-                    format!("{obj}.get_property({:?})", atom_str(&id.sym))
+                    format!("{obj}.get_property({:?})", id.sym.to_string())
                 }
                 MemberProp::Computed(computed) => format!(
                     "{obj}.get_property(&{}.to_js_string())",
                     self.lower_expr(&computed.expr)
                 ),
                 MemberProp::PrivateName(name) => {
-                    format!("{obj}.get_property({:?})", atom_str(&name.name))
+                    format!("{obj}.get_property({:?})", self.private_key(name))
                 }
             };
         }
@@ -1219,6 +2700,31 @@ impl LowerCtx {
         }
     }
 
+    fn lower_dynamic_argument_vec(&self, arguments: &[ExprOrSpread]) -> String {
+        if !arguments.iter().any(|argument| argument.spread.is_some()) {
+            let arguments = arguments
+                .iter()
+                .map(|argument| self.lower_argument(&argument.expr))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("vec![{arguments}]");
+        }
+
+        let statements = arguments
+            .iter()
+            .map(|argument| {
+                let value = self.lower_expr(&argument.expr);
+                if argument.spread.is_some() {
+                    format!("__w3cos_call_args.extend(({value}).iter());")
+                } else {
+                    format!("__w3cos_call_args.push({value}.clone());")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{{ let mut __w3cos_call_args = Vec::new(); {statements} __w3cos_call_args }}")
+    }
+
     fn lower_lit(&self, lit: &Lit) -> String {
         if self.dynamic_values {
             return match lit {
@@ -1231,6 +2737,11 @@ impl LowerCtx {
                 }
                 Lit::Bool(value) => format!("w3cos_core::Value::Bool({})", value.value),
                 Lit::Null(_) => "w3cos_core::Value::Null".to_string(),
+                Lit::Regex(value) => format!(
+                    "w3cos_core::regexp::create({:?}, {:?})",
+                    wtf8_to_string(&value.exp),
+                    wtf8_to_string(&value.flags)
+                ),
                 _ => "w3cos_core::Value::Undefined".to_string(),
             };
         }
@@ -1294,6 +2805,116 @@ impl LowerCtx {
         }
     }
 
+    /// Bind fn/closure parameters from `__args` at the top of a lowered body.
+    /// Default values lower with the CURRENT ctx (enclosing locals, classes,
+    /// namespaces, and boxed cells all resolve correctly); params whose name
+    /// is boxed get the shared `Rc<RefCell<Value>>` cell.
+    ///
+    /// Binding is two-phase: all params are bound from their raw `__args`
+    /// source first, then defaults are applied as `if x.is_undefined()`
+    /// fixups in declaration order. A default value may reference (or close
+    /// over) a LATER parameter — deferring application keeps that legal.
+    pub(crate) fn lower_closure_params(&self, params: &[Pat]) -> String {
+        let mut output = String::new();
+        let mut fixups = Vec::new();
+        for (index, pattern) in params.iter().enumerate() {
+            let source = if matches!(pattern, Pat::Rest(_)) {
+                format!("w3cos_core::Value::array(__args.iter().skip({index}).cloned().collect())")
+            } else {
+                format!("__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined)")
+            };
+            self.lower_closure_pattern(pattern, &source, &mut output, &mut fixups);
+        }
+        for fixup in fixups {
+            output.push_str(&fixup);
+            output.push(' ');
+        }
+        output
+    }
+
+    fn lower_closure_pattern(
+        &self,
+        pattern: &Pat,
+        source: &str,
+        output: &mut String,
+        fixups: &mut Vec<String>,
+    ) {
+        match pattern {
+            Pat::Ident(ident) => {
+                let name = sanitize_ident(&ident.id.sym.to_string());
+                output.push_str(&self.bind_local(&name, source));
+                output.push(' ');
+            }
+            Pat::Array(array) => {
+                for (index, element) in array.elems.iter().enumerate() {
+                    if let Some(element) = element {
+                        let nested = format!("{source}.get_property({:?})", index.to_string());
+                        self.lower_closure_pattern(element, &nested, output, fixups);
+                    }
+                }
+            }
+            Pat::Object(object) => {
+                for property in &object.props {
+                    match property {
+                        ObjectPatProp::Assign(assign) => {
+                            let name = sanitize_ident(&assign.key.sym.to_string());
+                            let value =
+                                format!("{source}.get_property({:?})", assign.key.sym.to_string());
+                            output.push_str(&self.bind_local(&name, &value));
+                            output.push(' ');
+                            if let Some(default) = &assign.value {
+                                let fallback = self.lower_expr(default);
+                                let check = self.undefined_check(&name);
+                                fixups.push(format!(
+                                    "if {check} {{ {} }}",
+                                    self.assign_local(&name, &fallback)
+                                ));
+                            }
+                        }
+                        ObjectPatProp::KeyValue(key_value) => {
+                            let key = match &key_value.key {
+                                PropName::Ident(ident) => ident.sym.to_string(),
+                                PropName::Str(value) => wtf8_to_string(&value.value),
+                                PropName::Num(value) => value.value.to_string(),
+                                _ => continue,
+                            };
+                            let nested = format!("{source}.get_property({key:?})");
+                            self.lower_closure_pattern(&key_value.value, &nested, output, fixups);
+                        }
+                        ObjectPatProp::Rest(rest) => {
+                            self.lower_closure_pattern(&rest.arg, source, output, fixups)
+                        }
+                    }
+                }
+            }
+            Pat::Assign(assign) => match assign.left.as_ref() {
+                Pat::Ident(ident) => {
+                    // Defer the default to the fixup phase (see above).
+                    let name = sanitize_ident(&ident.id.sym.to_string());
+                    output.push_str(&self.bind_local(&name, source));
+                    output.push(' ');
+                    let fallback = self.lower_expr(&assign.right);
+                    let check = self.undefined_check(&name);
+                    fixups.push(format!(
+                        "if {check} {{ {} }}",
+                        self.assign_local(&name, &fallback)
+                    ));
+                }
+                left => {
+                    // Whole-pattern default (`[a, b] = x ?? []`): the default
+                    // selects the source as a whole — keep the inline form.
+                    let fallback = self.lower_expr(&assign.right);
+                    let nested = format!(
+                        "{{ let value = {source}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}"
+                    );
+                    self.lower_closure_pattern(left, &nested, output, fixups);
+                }
+            },
+            Pat::Rest(rest) => self.lower_closure_pattern(&rest.arg, source, output, fixups),
+            _ => {}
+        }
+    }
+
     fn lower_prop_name(&self, name: &PropName) -> String {
         match name {
             PropName::Ident(id) => atom_str(&id.sym),
@@ -1309,7 +2930,7 @@ impl LowerCtx {
 
     fn lower_object_key(&self, name: &PropName) -> String {
         match name {
-            PropName::Ident(id) => format!("{:?}", atom_str(&id.sym)),
+            PropName::Ident(id) => format!("{:?}", id.sym.to_string()),
             PropName::Str(value) => format!("{:?}", wtf8_to_string(&value.value)),
             PropName::Num(value) => format!("{:?}", value.value.to_string()),
             PropName::Computed(value) => {
@@ -1320,30 +2941,427 @@ impl LowerCtx {
     }
 
     fn lower_dynamic_function_value(&self, params: &[Pat], body: &[Stmt]) -> String {
-        let bindings = lower_closure_params(params, &self.renames, &self.value_bindings);
         let parameter_names = pattern_names(params);
-        let capture_candidates = self
-            .known_values
-            .difference(&parameter_names)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut ctx =
-            LowerCtx::new_dynamic_with_bindings(self.renames.clone(), self.value_bindings.clone());
-        ctx.known_values.extend(capture_candidates.iter().cloned());
-        ctx.bind_patterns(params);
-        let body = ctx.lower_stmts(body);
-        let captures = referenced_captures(capture_candidates, &body);
+        let referenced = stmts_referenced_names(body);
+        let mut captures = capture_names(&self.known_values, &parameter_names, &referenced);
+        self.push_parent_capture(&mut captures);
         let capture_bindings = captures
             .iter()
             .map(|name| format!("let mut {name} = {name}.clone(); "))
             .collect::<String>();
+        let mut ctx = self.child_dynamic_ctx();
+        // Object-literal methods have their own dynamic `this` (the receiver).
+        ctx.this_name = Some("__this".to_string());
+        ctx.known_values.extend(captures.iter().cloned());
+        ctx.bind_patterns(params);
+        ctx.enter_fn_scope(params, body);
+        let bindings = ctx.lower_closure_params(params);
+        let prologue = ctx.hoist_fn_body_vars(body);
+        let body = format!("{prologue}{}", ctx.lower_stmts(body));
         format!(
-            "{{ {capture_bindings} w3cos_core::Value::function(move |_this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
+            "{{ {capture_bindings} w3cos_core::Value::function(move |__this, __args| {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
+        )
+    }
+
+    /// `super.method(args)` — instance: parent prototype chain dispatch with
+    /// the current receiver; static: parent class object access (best effort).
+    fn lower_super_call(&self, super_prop: &SuperPropExpr, args: &str) -> String {
+        let this = self.this_expr();
+        match (&self.class_scope, &super_prop.prop) {
+            (Some(scope), _) if scope.parent.is_none() => {
+                "w3cos_core::Value::Undefined /* super without parent */".to_string()
+            }
+            (Some(scope), SuperProp::Ident(ident)) => {
+                let parent = scope.parent.clone().unwrap_or_default();
+                let key = atom_str(&ident.sym);
+                if scope.is_static {
+                    format!(
+                        "{{ let __super_fn = {parent}.get_property({key:?}); __super_fn.call({this}.clone(), vec![{args}]) }}"
+                    )
+                } else {
+                    format!(
+                        "w3cos_core::class::super_method(&{this}, &{parent}, {key:?}, vec![{args}])"
+                    )
+                }
+            }
+            (Some(scope), SuperProp::Computed(computed)) => {
+                let parent = scope.parent.clone().unwrap_or_default();
+                let key = format!("&{}.to_js_string()", self.lower_expr(&computed.expr));
+                if scope.is_static {
+                    format!(
+                        "{{ let __super_fn = {parent}.get_property({key}); __super_fn.call({this}.clone(), vec![{args}]) }}"
+                    )
+                } else {
+                    format!(
+                        "w3cos_core::class::super_method(&{this}, &{parent}, {key}, vec![{args}])"
+                    )
+                }
+            }
+            (None, _) => "w3cos_core::Value::Undefined /* super outside class */".to_string(),
+        }
+    }
+
+    /// Lower a class *expression* (named or anonymous, optionally with
+    /// `extends <expr>`) to a block expression that eagerly builds the class
+    /// object. Method/ctor bodies become inline closures so they can capture
+    /// surrounding locals (unlike top-level class declarations, which emit
+    /// free functions — see `esm_codegen::emit_class`).
+    fn lower_class_value(&self, class_expr: &ClassExpr) -> String {
+        let class = &class_expr.class;
+        let class_name = class_expr
+            .ident
+            .as_ref()
+            .map(|ident| sanitize_ident(&ident.sym.to_string()))
+            .unwrap_or_else(|| format!("anon{}", class.span.lo.0));
+        // The parent expression is evaluated once, in the enclosing scope.
+        let parent = class.super_class.as_ref().map(|expr| self.lower_expr(expr));
+        let parent_ref = parent.as_ref().map(|_| "__parent".to_string());
+        let instance_scope = ClassScope {
+            class_name: class_name.clone(),
+            parent: parent_ref.clone(),
+            is_static: false,
+        };
+        let static_scope = ClassScope {
+            class_name: class_name.clone(),
+            parent: parent_ref,
+            is_static: true,
+        };
+
+        let mut ctor: Option<(Vec<Pat>, Vec<Stmt>)> = None;
+        let mut proto_installs: Vec<String> = Vec::new();
+        let mut static_installs: Vec<String> = Vec::new();
+        let mut static_inits: Vec<String> = Vec::new();
+        let mut field_inits: Vec<String> = Vec::new();
+        // Names referenced by instance-field initializers (they inline into
+        // the ctor closure, which must capture them).
+        let mut field_refs: HashSet<String> = HashSet::new();
+
+        for member in &class.body {
+            match member {
+                ClassMember::Constructor(constructor) => {
+                    let params = constructor
+                        .params
+                        .iter()
+                        .filter_map(|param| match param {
+                            ParamOrTsParamProp::Param(param) => Some(param.pat.clone()),
+                            ParamOrTsParamProp::TsParamProp(_) => None,
+                        })
+                        .collect();
+                    let body = constructor
+                        .body
+                        .as_ref()
+                        .map(|block| block.stmts.clone())
+                        .unwrap_or_default();
+                    ctor = Some((params, body));
+                }
+                ClassMember::Method(method) => {
+                    let params = method
+                        .function
+                        .params
+                        .iter()
+                        .map(|param| param.pat.clone())
+                        .collect::<Vec<_>>();
+                    let body = method
+                        .function
+                        .body
+                        .as_ref()
+                        .map(|block| block.stmts.clone())
+                        .unwrap_or_default();
+                    let scope = if method.is_static {
+                        &static_scope
+                    } else {
+                        &instance_scope
+                    };
+                    let closure = self.lower_method_closure(&params, &body, scope);
+                    let (target, installs) = if method.is_static {
+                        ("__class", &mut static_installs)
+                    } else {
+                        ("__proto", &mut proto_installs)
+                    };
+                    let prefix = match method.kind {
+                        MethodKind::Method => "",
+                        MethodKind::Getter => "__w3cos_getter_",
+                        MethodKind::Setter => "__w3cos_setter_",
+                    };
+                    let key = self.key_arg(prefix, &method.key);
+                    installs.push(format!("{target}.set_property({key}, {closure});"));
+                }
+                ClassMember::PrivateMethod(method) => {
+                    let params = method
+                        .function
+                        .params
+                        .iter()
+                        .map(|param| param.pat.clone())
+                        .collect::<Vec<_>>();
+                    let body = method
+                        .function
+                        .body
+                        .as_ref()
+                        .map(|block| block.stmts.clone())
+                        .unwrap_or_default();
+                    let scope = if method.is_static {
+                        &static_scope
+                    } else {
+                        &instance_scope
+                    };
+                    let closure = self.lower_method_closure(&params, &body, scope);
+                    let (target, installs) = if method.is_static {
+                        ("__class", &mut static_installs)
+                    } else {
+                        ("__proto", &mut proto_installs)
+                    };
+                    let mangled = Self::mangle_private(&class_name, &method.key);
+                    let key = match method.kind {
+                        MethodKind::Method => mangled,
+                        MethodKind::Getter => format!("__w3cos_getter_{mangled}"),
+                        MethodKind::Setter => format!("__w3cos_setter_{mangled}"),
+                    };
+                    installs.push(format!("{target}.set_property({key:?}, {closure});"));
+                }
+                ClassMember::ClassProp(prop) => {
+                    let scope = if prop.is_static {
+                        &static_scope
+                    } else {
+                        &instance_scope
+                    };
+                    if let Some(value) = &prop.value {
+                        field_refs.extend(expr_referenced_names(value));
+                    }
+                    let init = self.lower_field_value(prop.value.as_deref(), scope);
+                    let key = self.key_arg("", &prop.key);
+                    if prop.is_static {
+                        static_inits.push(format!(
+                            "w3cos_core::class::define_field(&__this, {key}, {init});"
+                        ));
+                    } else {
+                        field_inits.push(format!(
+                            "w3cos_core::class::define_field(&__this, {key}, {init});"
+                        ));
+                    }
+                }
+                ClassMember::PrivateProp(prop) => {
+                    let scope = if prop.is_static {
+                        &static_scope
+                    } else {
+                        &instance_scope
+                    };
+                    if let Some(value) = &prop.value {
+                        field_refs.extend(expr_referenced_names(value));
+                    }
+                    let init = self.lower_field_value(prop.value.as_deref(), scope);
+                    let key = format!("{:?}", Self::mangle_private(&class_name, &prop.key));
+                    if prop.is_static {
+                        static_inits.push(format!(
+                            "w3cos_core::class::define_field(&__this, {key}, {init});"
+                        ));
+                    } else {
+                        field_inits.push(format!(
+                            "w3cos_core::class::define_field(&__this, {key}, {init});"
+                        ));
+                    }
+                }
+                ClassMember::StaticBlock(block) => {
+                    let mut ctx = self.child_dynamic_ctx();
+                    ctx.class_scope = Some(static_scope.clone());
+                    ctx.this_name = Some("__this".to_string());
+                    // Static blocks run inline in the class-value block:
+                    // enclosing locals stay visible here.
+                    ctx.known_values = self.known_values.clone();
+                    ctx.enter_fn_scope(&[], &block.body.stmts);
+                    let body = ctx.lower_stmts(&block.body.stmts);
+                    static_inits.push(format!("{{ {body} }}"));
+                }
+                // Index signatures, empty members, accessors: not lowered.
+                _ => {}
+            }
+        }
+
+        let derived = parent.is_some();
+        let ctor_closure = match &ctor {
+            Some((params, body)) => self.lower_ctor_closure(
+                params,
+                body,
+                &field_inits,
+                &instance_scope,
+                derived,
+                &field_refs,
+            ),
+            None if derived => {
+                // Derived class without a ctor: forward all args to super.
+                let mut captures = capture_names(&self.known_values, &HashSet::new(), &field_refs);
+                if !captures.iter().any(|name| name == "__parent") {
+                    captures.push("__parent".to_string());
+                }
+                captures.sort();
+                let capture_bindings = captures
+                    .iter()
+                    .map(|name| format!("let mut {name} = {name}.clone(); "))
+                    .collect::<String>();
+                let fields = field_inits.join(" ");
+                format!(
+                    "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ w3cos_core::class::super_ctor(&__this, &__parent, __args); {fields} __this }}) }}"
+                )
+            }
+            None => {
+                let captures = capture_names(&self.known_values, &HashSet::new(), &field_refs);
+                let capture_bindings = captures
+                    .iter()
+                    .map(|name| format!("let mut {name} = {name}.clone(); "))
+                    .collect::<String>();
+                let fields = field_inits.join(" ");
+                format!(
+                    "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ let _ = &__args; {fields} __this }}) }}"
+                )
+            }
+        };
+
+        let mut out = String::from("{ ");
+        if let Some(parent_expr) = &parent {
+            out.push_str(&format!("let __parent = {parent_expr}; "));
+        }
+        out.push_str("let __proto = w3cos_core::Value::object(std::collections::HashMap::new()); ");
+        for install in &proto_installs {
+            out.push_str(install);
+            out.push(' ');
+        }
+        if derived {
+            out.push_str(
+                "w3cos_core::class::set_prototype_of(&__proto, &__parent.get_property(\"prototype\")); ",
+            );
+        }
+        out.push_str(&format!("let __ctor = {ctor_closure}; "));
+        out.push_str("let __ctor_c = __ctor.clone(); ");
+        out.push_str("let __proto_c = __proto.clone(); ");
+        out.push_str(
+            "let __class = w3cos_core::Value::callable(std::collections::HashMap::new(), move |_this, __args| { let __instance = w3cos_core::Value::object(std::collections::HashMap::new()); w3cos_core::class::set_prototype_of(&__instance, &__proto_c); let __ret = __ctor_c.call(__instance.clone(), __args); if __ret.is_object() { __ret } else { __instance } }); ",
+        );
+        out.push_str("__proto.set_property(\"constructor\", __class.clone()); ");
+        out.push_str("__class.set_property(\"prototype\", __proto); ");
+        out.push_str("__class.set_property(\"__w3cos_ctor\", __ctor); ");
+        for install in &static_installs {
+            out.push_str(install);
+            out.push(' ');
+        }
+        if derived {
+            out.push_str("w3cos_core::class::set_prototype_of(&__class, &__parent); ");
+        }
+        if !static_inits.is_empty() {
+            out.push_str("{ let __this = __class.clone(); ");
+            for init in &static_inits {
+                out.push_str(init);
+                out.push(' ');
+            }
+            out.push_str("} ");
+        }
+        out.push_str("__class }");
+        out
+    }
+
+    /// Lower a field initializer expression with the given class scope
+    /// (`this` is available: the instance, or the class object when static).
+    /// Field initializers run inside the ctor/init closures, so enclosing
+    /// locals stay visible (and captured) here.
+    fn lower_field_value(&self, value: Option<&Expr>, scope: &ClassScope) -> String {
+        let Some(value) = value else {
+            return "w3cos_core::Value::Undefined".to_string();
+        };
+        let mut ctx = self.child_dynamic_ctx();
+        ctx.class_scope = Some(scope.clone());
+        ctx.this_name = Some("__this".to_string());
+        ctx.known_values = self.known_values.clone();
+        ctx.lower_expr(value)
+    }
+
+    /// Lower a class-expression method/getter/setter body to an inline
+    /// closure value. Captures surrounding locals (cloned) and `__parent`
+    /// when the class extends something.
+    fn lower_method_closure(&self, params: &[Pat], body: &[Stmt], scope: &ClassScope) -> String {
+        let parameter_names = pattern_names(params);
+        let referenced = stmts_referenced_names(body);
+        let mut captures = capture_names(&self.known_values, &parameter_names, &referenced);
+        if scope.parent.is_some() && !captures.iter().any(|name| name == "__parent") {
+            captures.push("__parent".to_string());
+        }
+        captures.sort();
+        let capture_bindings = captures
+            .iter()
+            .map(|name| format!("let mut {name} = {name}.clone(); "))
+            .collect::<String>();
+        let mut ctx = self.child_dynamic_ctx();
+        ctx.class_scope = Some(scope.clone());
+        ctx.this_name = Some("__this".to_string());
+        ctx.known_values.extend(captures.iter().cloned());
+        ctx.bind_patterns(params);
+        ctx.enter_fn_scope(params, body);
+        let bindings = ctx.lower_closure_params(params);
+        let prologue = ctx.hoist_fn_body_vars(body);
+        let body = format!("{prologue}{}", ctx.lower_stmts(body));
+        format!(
+            "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ {bindings}{body} w3cos_core::Value::Undefined }}) }}"
+        )
+    }
+
+    /// Lower a class-expression constructor. Field initializers run at the
+    /// top for base classes and immediately after the top-level `super(...)`
+    /// call for derived classes (at the end when no such call exists).
+    /// `field_refs` carries the names field initializers reference (they
+    /// inline into the ctor closure and must be captured).
+    fn lower_ctor_closure(
+        &self,
+        params: &[Pat],
+        body: &[Stmt],
+        field_inits: &[String],
+        scope: &ClassScope,
+        derived: bool,
+        field_refs: &HashSet<String>,
+    ) -> String {
+        let parameter_names = pattern_names(params);
+        let mut referenced = stmts_referenced_names(body);
+        referenced.extend(field_refs.iter().cloned());
+        let mut captures = capture_names(&self.known_values, &parameter_names, &referenced);
+        if scope.parent.is_some() && !captures.iter().any(|name| name == "__parent") {
+            captures.push("__parent".to_string());
+        }
+        captures.sort();
+        let capture_bindings = captures
+            .iter()
+            .map(|name| format!("let mut {name} = {name}.clone(); "))
+            .collect::<String>();
+        let mut ctx = self.child_dynamic_ctx();
+        ctx.class_scope = Some(scope.clone());
+        ctx.this_name = Some("__this".to_string());
+        ctx.known_values.extend(captures.iter().cloned());
+        ctx.bind_patterns(params);
+        ctx.enter_fn_scope(params, body);
+        let bindings = ctx.lower_closure_params(params);
+        let prologue = ctx.hoist_fn_body_vars(body);
+        let fields = field_inits.join(" ");
+        let body_code = if derived {
+            let mut code = String::new();
+            let mut injected = false;
+            for stmt in body {
+                code.push_str(&ctx.lower_stmt(stmt));
+                code.push(' ');
+                if !injected && is_super_call_stmt(stmt) {
+                    code.push_str(&fields);
+                    code.push(' ');
+                    injected = true;
+                }
+            }
+            if !injected {
+                code.push_str(&fields);
+            }
+            code
+        } else {
+            format!("{fields} {}", ctx.lower_stmts(body))
+        };
+        format!(
+            "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ {bindings}{prologue}{body_code} __this }}) }}"
         )
     }
 
     fn lower_dynamic_local_pattern(
-        &mut self,
+        &self,
         pattern: &Pat,
         source: &str,
         lines: &mut Vec<String>,
@@ -1351,10 +3369,10 @@ impl LowerCtx {
     ) {
         let pad = " ".repeat(indent);
         match pattern {
-            Pat::Ident(ident) => lines.push(format!(
-                "{pad}let {} = {source};",
-                sanitize_ident(&ident.id.sym.to_string())
-            )),
+            Pat::Ident(ident) => {
+                let name = sanitize_ident(&ident.id.sym.to_string());
+                lines.push(format!("{pad}{}", self.bind_local(&name, source)));
+            }
             Pat::Array(array) => {
                 for (index, element) in array.elems.iter().enumerate() {
                     if let Some(element) = element {
@@ -1371,14 +3389,15 @@ impl LowerCtx {
                             let name = sanitize_ident(&assign.key.sym.to_string());
                             let value =
                                 format!("{source}.get_property({:?})", assign.key.sym.to_string());
-                            if let Some(default) = &assign.value {
+                            let bound = if let Some(default) = &assign.value {
                                 let fallback = self.lower_expr(default);
-                                lines.push(format!(
-                                    "{pad}let {name} = {{ let value = {value}; if value.is_undefined() {{ {fallback} }} else {{ value }} }};"
-                                ));
+                                format!(
+                                    "{{ let value = {value}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}"
+                                )
                             } else {
-                                lines.push(format!("{pad}let {name} = {value};"));
-                            }
+                                value
+                            };
+                            lines.push(format!("{pad}{}", self.bind_local(&name, &bound)));
                         }
                         ObjectPatProp::KeyValue(key_value) => {
                             let key = match &key_value.key {
@@ -1410,6 +3429,144 @@ impl LowerCtx {
                 self.lower_dynamic_local_pattern(&assign.left, &value, lines, indent);
             }
             Pat::Rest(rest) => self.lower_dynamic_local_pattern(&rest.arg, source, lines, indent),
+            _ => {}
+        }
+    }
+
+    /// Assignment-form destructuring for `[a, b] = arr` / `({x, y} = obj)`
+    /// (no `let`: the bindings already exist in the enclosing scope).
+    fn lower_dynamic_assign_target(
+        &self,
+        target: &AssignTarget,
+        source: &str,
+        lines: &mut Vec<String>,
+    ) {
+        match target {
+            AssignTarget::Simple(simple) => match simple {
+                SimpleAssignTarget::Ident(ident) => {
+                    let name = sanitize_ident(&ident.id.sym.to_string());
+                    lines.push(self.assign_local(&name, source));
+                }
+                SimpleAssignTarget::Member(member) => {
+                    let object = self.lower_expr(&member.obj);
+                    let key = match &member.prop {
+                        MemberProp::Ident(ident) => format!("{:?}", ident.sym.to_string()),
+                        MemberProp::Computed(computed) => {
+                            format!("{}.to_js_string()", self.lower_expr(&computed.expr))
+                        }
+                        MemberProp::PrivateName(name) => {
+                            format!("{:?}", self.private_key(name))
+                        }
+                    };
+                    lines.push(format!("{object}.set_property(&{key}, {source});"));
+                }
+                _ => {}
+            },
+            AssignTarget::Pat(pat) => match pat {
+                AssignTargetPat::Array(array) => {
+                    for (index, element) in array.elems.iter().enumerate() {
+                        if let Some(element) = element {
+                            let nested = format!("{source}.get_property({:?})", index.to_string());
+                            self.lower_dynamic_assign_pattern(element, &nested, lines);
+                        }
+                    }
+                }
+                AssignTargetPat::Object(object) => {
+                    for property in &object.props {
+                        match property {
+                            ObjectPatProp::Assign(assign) => {
+                                let name = sanitize_ident(&assign.key.sym.to_string());
+                                let value = format!(
+                                    "{source}.get_property({:?})",
+                                    assign.key.sym.to_string()
+                                );
+                                let assigned = if let Some(default) = &assign.value {
+                                    let fallback = self.lower_expr(default);
+                                    format!(
+                                        "{{ let value = {value}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}"
+                                    )
+                                } else {
+                                    value
+                                };
+                                lines.push(self.assign_local(&name, &assigned));
+                            }
+                            ObjectPatProp::KeyValue(key_value) => {
+                                let key = match &key_value.key {
+                                    PropName::Ident(ident) => ident.sym.to_string(),
+                                    PropName::Str(value) => wtf8_to_string(&value.value),
+                                    PropName::Num(value) => value.value.to_string(),
+                                    _ => continue,
+                                };
+                                let nested = format!("{source}.get_property({key:?})");
+                                self.lower_dynamic_assign_pattern(&key_value.value, &nested, lines);
+                            }
+                            ObjectPatProp::Rest(rest) => {
+                                self.lower_dynamic_assign_pattern(&rest.arg, source, lines)
+                            }
+                        }
+                    }
+                }
+                AssignTargetPat::Invalid(_) => {}
+            },
+        }
+    }
+
+    /// The `Pat`-based recursion backing [`Self::lower_dynamic_assign_target`].
+    fn lower_dynamic_assign_pattern(&self, pattern: &Pat, source: &str, lines: &mut Vec<String>) {
+        match pattern {
+            Pat::Ident(ident) => {
+                let name = sanitize_ident(&ident.id.sym.to_string());
+                lines.push(self.assign_local(&name, source));
+            }
+            Pat::Array(array) => {
+                for (index, element) in array.elems.iter().enumerate() {
+                    if let Some(element) = element {
+                        let nested = format!("{source}.get_property({:?})", index.to_string());
+                        self.lower_dynamic_assign_pattern(element, &nested, lines);
+                    }
+                }
+            }
+            Pat::Object(object) => {
+                for property in &object.props {
+                    match property {
+                        ObjectPatProp::Assign(assign) => {
+                            let name = sanitize_ident(&assign.key.sym.to_string());
+                            let value =
+                                format!("{source}.get_property({:?})", assign.key.sym.to_string());
+                            let assigned = if let Some(default) = &assign.value {
+                                let fallback = self.lower_expr(default);
+                                format!(
+                                    "{{ let value = {value}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}"
+                                )
+                            } else {
+                                value
+                            };
+                            lines.push(self.assign_local(&name, &assigned));
+                        }
+                        ObjectPatProp::KeyValue(key_value) => {
+                            let key = match &key_value.key {
+                                PropName::Ident(ident) => ident.sym.to_string(),
+                                PropName::Str(value) => wtf8_to_string(&value.value),
+                                PropName::Num(value) => value.value.to_string(),
+                                _ => continue,
+                            };
+                            let nested = format!("{source}.get_property({key:?})");
+                            self.lower_dynamic_assign_pattern(&key_value.value, &nested, lines);
+                        }
+                        ObjectPatProp::Rest(rest) => {
+                            self.lower_dynamic_assign_pattern(&rest.arg, source, lines)
+                        }
+                    }
+                }
+            }
+            Pat::Assign(assign) => {
+                let fallback = self.lower_expr(&assign.right);
+                let value = format!(
+                    "{{ let value = {source}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}"
+                );
+                self.lower_dynamic_assign_pattern(&assign.left, &value, lines);
+            }
+            Pat::Rest(rest) => self.lower_dynamic_assign_pattern(&rest.arg, source, lines),
             _ => {}
         }
     }
@@ -1449,6 +3606,98 @@ fn lower_closure_params(
         lower_closure_pattern(pattern, &source, &mut output, renames, value_bindings);
     }
     output
+}
+
+/// Collect fn-body-level declaration names for hoisting-style
+/// predeclaration: `let`/`const`/`var` declarators AND fn declarations (JS
+/// fn declarations hoist to the enclosing fn body's top). Recurses into
+/// blocks, loops, if/switch/try bodies, but not into nested functions or
+/// classes (a nested fn has its own hoisting scope). Block-scoping shadowing
+/// subtleties are traded for totality (closures may reference a binding
+/// before its declaration line, e.g. `const d = toDisposable(() => d)`).
+fn collect_hoisted_var_names(stmts: &[Stmt], names: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Decl(Decl::Var(var)) => {
+                for declarator in &var.decls {
+                    collect_pattern_names(&declarator.name, names);
+                }
+            }
+            Stmt::Decl(Decl::Fn(f)) => {
+                names.insert(sanitize_ident(&f.ident.sym.to_string()));
+            }
+            Stmt::Decl(Decl::Class(c)) => {
+                // Class declarations hoist too: forward references (a fn
+                // declared before the class but called after it) and class
+                // self-references inside methods resolve through the
+                // pre-declared slot.
+                names.insert(sanitize_ident(&c.ident.sym.to_string()));
+            }
+            Stmt::Block(block) => collect_hoisted_var_names(&block.stmts, names),
+            Stmt::If(s) => {
+                collect_hoisted_var_names(std::slice::from_ref(&s.cons), names);
+                if let Some(alt) = &s.alt {
+                    collect_hoisted_var_names(std::slice::from_ref(alt), names);
+                }
+            }
+            Stmt::For(s) => {
+                if let Some(VarDeclOrExpr::VarDecl(var)) = &s.init {
+                    for declarator in &var.decls {
+                        collect_pattern_names(&declarator.name, names);
+                    }
+                }
+                collect_hoisted_var_names(std::slice::from_ref(&s.body), names);
+            }
+            Stmt::ForIn(s) => {
+                if let ForHead::VarDecl(var) = &s.left {
+                    for declarator in &var.decls {
+                        collect_pattern_names(&declarator.name, names);
+                    }
+                }
+                collect_hoisted_var_names(std::slice::from_ref(&s.body), names);
+            }
+            Stmt::ForOf(s) => {
+                if let ForHead::VarDecl(var) = &s.left {
+                    for declarator in &var.decls {
+                        collect_pattern_names(&declarator.name, names);
+                    }
+                }
+                collect_hoisted_var_names(std::slice::from_ref(&s.body), names);
+            }
+            Stmt::While(s) => collect_hoisted_var_names(std::slice::from_ref(&s.body), names),
+            Stmt::DoWhile(s) => collect_hoisted_var_names(std::slice::from_ref(&s.body), names),
+            Stmt::Switch(s) => {
+                for case in &s.cases {
+                    collect_hoisted_var_names(&case.cons, names);
+                }
+            }
+            Stmt::Try(s) => {
+                collect_hoisted_var_names(&s.block.stmts, names);
+                if let Some(handler) = &s.handler {
+                    collect_hoisted_var_names(&handler.body.stmts, names);
+                }
+                if let Some(finalizer) = &s.finalizer {
+                    collect_hoisted_var_names(&finalizer.stmts, names);
+                }
+            }
+            Stmt::Labeled(s) => collect_hoisted_var_names(std::slice::from_ref(&s.body), names),
+            _ => {}
+        }
+    }
+}
+
+/// Return the member reference that supplies an optional call's receiver.
+/// SWC wraps chained forms such as `a?.b?.method()` in nested OptChain nodes.
+fn optional_call_member(expr: &Expr) -> Option<&MemberExpr> {
+    match expr {
+        Expr::Member(member) => Some(member),
+        Expr::OptChain(chain) => match chain.base.as_ref() {
+            OptChainBase::Member(member) => Some(member),
+            OptChainBase::Call(_) => None,
+        },
+        Expr::Paren(paren) => optional_call_member(&paren.expr),
+        _ => None,
+    }
 }
 
 fn pattern_names(patterns: &[Pat]) -> HashSet<String> {
@@ -1591,14 +3840,55 @@ fn object_pattern_excluded_keys(object: &ObjectPat) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
-
 fn atom_str(atom: &impl ToString) -> String {
     sanitize_ident(&atom.to_string())
 }
 
-/// Wtf8Atom (string literal values) has no Display; recover via Debug + trim.
+/// Is this statement a top-level `super(...)` call (derived-ctor marker)?
+pub(crate) fn is_super_call_stmt(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::Expr(expr_stmt)
+            if matches!(
+                expr_stmt.expr.as_ref(),
+                Expr::Call(call) if matches!(call.callee, Callee::Super(_))
+            )
+    )
+}
+
+/// Map a compound assignment operator (`+=`, `-=`, ...) to the `Value`
+/// method implementing it. Plain `=` and logical-assign ops return `None`.
+fn compound_assign_op(op: AssignOp) -> Option<&'static str> {
+    match op {
+        AssignOp::AddAssign => Some("js_add"),
+        AssignOp::SubAssign => Some("js_sub"),
+        AssignOp::MulAssign => Some("js_mul"),
+        AssignOp::DivAssign => Some("js_div"),
+        AssignOp::ModAssign => Some("js_rem"),
+        AssignOp::ExpAssign => Some("js_pow"),
+        AssignOp::BitAndAssign => Some("js_bitand"),
+        AssignOp::BitOrAssign => Some("js_bitor"),
+        AssignOp::BitXorAssign => Some("js_bitxor"),
+        AssignOp::LShiftAssign => Some("js_shl"),
+        AssignOp::RShiftAssign => Some("js_shr"),
+        AssignOp::ZeroFillRShiftAssign => Some("js_ushr"),
+        _ => None,
+    }
+}
+
+/// Wtf8Atom (string literal values) has no Display. Its Debug form is a
+/// quoted, escaped string, so decode that representation instead of trimming
+/// quotes: `trim_matches` also removed a real trailing `"` from values such
+/// as Monaco's `class="` fragment.
 fn wtf8_to_string(atom: &impl std::fmt::Debug) -> String {
-    format!("{:?}", atom).trim_matches('"').to_string()
+    let debug = format!("{:?}", atom);
+    serde_json::from_str(&debug).unwrap_or_else(|_| {
+        debug
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(&debug)
+            .to_string()
+    })
 }
 
 /// Sanitize a JS identifier to be valid Rust: replace `$` with `_d`, leading
@@ -1626,11 +3916,629 @@ pub fn sanitize_ident(name: &str) -> String {
         | "ref" | "use" | "impl" | "trait" | "struct" | "enum" | "match" | "if" | "else"
         | "for" | "while" | "loop" | "break" | "continue" | "return" | "where" | "as" | "in"
         | "move" | "async" | "await" | "dyn" | "static" | "const" | "unsafe" | "extern"
-        | "true" | "false" => {
+        | "true" | "false" | "override" | "final" | "try" | "yield" | "abstract" | "become"
+        | "box" | "do" | "macro" | "priv" | "typeof" | "unsized" | "virtual" | "gen" => {
             out.push('_');
             out
         }
         _ => out,
+    }
+}
+
+/// Best-effort scan for `await` inside a try statement (any of the three
+/// bodies). Used to flag the unsound `AssertUnwindSafe`-across-await case.
+fn try_has_await(try_stmt: &TryStmt) -> bool {
+    stmts_have_await(&try_stmt.block.stmts)
+        || try_stmt
+            .handler
+            .as_ref()
+            .is_some_and(|handler| stmts_have_await(&handler.body.stmts))
+        || try_stmt
+            .finalizer
+            .as_ref()
+            .is_some_and(|finalizer| stmts_have_await(&finalizer.stmts))
+}
+
+fn stmts_have_await(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_has_await)
+}
+
+fn stmt_has_await(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Expr(s) => expr_has_await(&s.expr),
+        Stmt::Return(s) => s.arg.as_deref().is_some_and(expr_has_await),
+        Stmt::Throw(s) => expr_has_await(&s.arg),
+        Stmt::Decl(decl) => decl_has_await(decl),
+        Stmt::Block(b) => stmts_have_await(&b.stmts),
+        Stmt::If(s) => {
+            expr_has_await(&s.test)
+                || stmt_has_await(&s.cons)
+                || s.alt.as_deref().is_some_and(stmt_has_await)
+        }
+        Stmt::For(s) => {
+            s.init.as_ref().is_some_and(|init| match init {
+                VarDeclOrExpr::VarDecl(decl) => decl
+                    .decls
+                    .iter()
+                    .any(|d| d.init.as_deref().is_some_and(expr_has_await)),
+                VarDeclOrExpr::Expr(expr) => expr_has_await(expr),
+            }) || s.test.as_deref().is_some_and(expr_has_await)
+                || s.update.as_deref().is_some_and(expr_has_await)
+                || stmt_has_await(&s.body)
+        }
+        Stmt::While(s) => expr_has_await(&s.test) || stmt_has_await(&s.body),
+        Stmt::DoWhile(s) => stmt_has_await(&s.body) || expr_has_await(&s.test),
+        Stmt::ForIn(s) => expr_has_await(&s.right) || stmt_has_await(&s.body),
+        Stmt::ForOf(s) => expr_has_await(&s.right) || stmt_has_await(&s.body),
+        Stmt::Switch(s) => {
+            expr_has_await(&s.discriminant)
+                || s.cases.iter().any(|case| {
+                    case.test.as_deref().is_some_and(expr_has_await) || stmts_have_await(&case.cons)
+                })
+        }
+        Stmt::Try(s) => try_has_await(s),
+        Stmt::Labeled(s) => stmt_has_await(&s.body),
+        _ => false,
+    }
+}
+
+fn decl_has_await(decl: &Decl) -> bool {
+    match decl {
+        Decl::Var(var) => var
+            .decls
+            .iter()
+            .any(|d| d.init.as_deref().is_some_and(expr_has_await)),
+        Decl::Fn(f) => f
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|b| stmts_have_await(&b.stmts)),
+        Decl::Class(c) => class_has_await(&c.class),
+        _ => false,
+    }
+}
+
+fn class_has_await(class: &Class) -> bool {
+    class.body.iter().any(|member| match member {
+        ClassMember::Constructor(c) => c.body.as_ref().is_some_and(|b| stmts_have_await(&b.stmts)),
+        ClassMember::Method(m) => m
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|b| stmts_have_await(&b.stmts)),
+        ClassMember::PrivateMethod(m) => m
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|b| stmts_have_await(&b.stmts)),
+        ClassMember::ClassProp(p) => p.value.as_deref().is_some_and(expr_has_await),
+        ClassMember::PrivateProp(p) => p.value.as_deref().is_some_and(expr_has_await),
+        ClassMember::StaticBlock(b) => stmts_have_await(&b.body.stmts),
+        _ => false,
+    })
+}
+
+fn expr_has_await(expr: &Expr) -> bool {
+    match expr {
+        Expr::Await(_) => true,
+        Expr::Call(call) => {
+            call.args.iter().any(|arg| expr_has_await(&arg.expr))
+                || matches!(&call.callee, Callee::Expr(callee) if expr_has_await(callee))
+        }
+        Expr::New(new_expr) => {
+            expr_has_await(&new_expr.callee)
+                || new_expr
+                    .args
+                    .as_ref()
+                    .is_some_and(|args| args.iter().any(|arg| expr_has_await(&arg.expr)))
+        }
+        Expr::Member(member) => expr_has_await(&member.obj),
+        Expr::Bin(bin) => expr_has_await(&bin.left) || expr_has_await(&bin.right),
+        Expr::Unary(unary) => expr_has_await(&unary.arg),
+        Expr::Update(update) => expr_has_await(&update.arg),
+        Expr::Assign(assign) => expr_has_await(&assign.right),
+        Expr::Cond(cond) => {
+            expr_has_await(&cond.test) || expr_has_await(&cond.cons) || expr_has_await(&cond.alt)
+        }
+        Expr::Paren(paren) => expr_has_await(&paren.expr),
+        Expr::Seq(seq) => seq.exprs.iter().any(|e| expr_has_await(e)),
+        Expr::Tpl(tpl) => tpl.exprs.iter().any(|e| expr_has_await(e)),
+        Expr::Arrow(arrow) => match arrow.body.as_ref() {
+            BlockStmtOrExpr::BlockStmt(block) => stmts_have_await(&block.stmts),
+            BlockStmtOrExpr::Expr(expr) => expr_has_await(expr),
+        },
+        Expr::Fn(f) => f
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|b| stmts_have_await(&b.stmts)),
+        Expr::Object(obj) => obj.props.iter().any(|prop| match prop {
+            PropOrSpread::Spread(spread) => expr_has_await(&spread.expr),
+            PropOrSpread::Prop(prop) => match prop.as_ref() {
+                Prop::KeyValue(kv) => expr_has_await(&kv.value),
+                Prop::Method(method) => method
+                    .function
+                    .body
+                    .as_ref()
+                    .is_some_and(|b| stmts_have_await(&b.stmts)),
+                Prop::Getter(getter) => getter
+                    .body
+                    .as_ref()
+                    .is_some_and(|b| stmts_have_await(&b.stmts)),
+                Prop::Setter(setter) => setter
+                    .body
+                    .as_ref()
+                    .is_some_and(|b| stmts_have_await(&b.stmts)),
+                _ => false,
+            },
+        }),
+        Expr::Array(arr) => arr
+            .elems
+            .iter()
+            .flatten()
+            .any(|elem| expr_has_await(&elem.expr)),
+        Expr::OptChain(opt) => match opt.base.as_ref() {
+            OptChainBase::Member(member) => expr_has_await(&member.obj),
+            OptChainBase::Call(call) => {
+                expr_has_await(&call.callee)
+                    || call.args.iter().any(|arg| expr_has_await(&arg.expr))
+            }
+        },
+        Expr::TaggedTpl(tagged) => {
+            expr_has_await(&tagged.tag) || tagged.tpl.exprs.iter().any(|e| expr_has_await(e))
+        }
+        Expr::Class(class_expr) => class_has_await(&class_expr.class),
+        Expr::Yield(yield_expr) => yield_expr.arg.as_deref().is_some_and(expr_has_await),
+        _ => false,
+    }
+}
+
+/// Map an unshadowed bare JS identifier to the Rust expression producing its
+/// global value in generated ESM modules. `document`/`window` and friends go
+/// to the real jsdom bridge (the fake `w3cos_core::builtins::document` is not
+/// used in ESM modules); Promise/JSON/atob and friends map to w3cos-core
+/// builtin facades.
+fn global_value_expr(name: &str) -> Option<String> {
+    let expr = match name {
+        "undefined" => "w3cos_core::Value::Undefined".to_string(),
+        "NaN" => "w3cos_core::Value::Number(f64::NAN)".to_string(),
+        "Infinity" => "w3cos_core::Value::Number(f64::INFINITY)".to_string(),
+        // `Error` as a value (`class X extends Error`, `e instanceof Error` —
+        // instanceof degrades to false): a constructor function value wrapping
+        // the builtin. `new Error(...)` and `Error(...)` are special-cased
+        // elsewhere and unaffected.
+        "Error" => {
+            "w3cos_core::Value::function(|_this, __args| w3cos_core::Error::new(__args).0)"
+                .to_string()
+        }
+        "RangeError" => {
+            "w3cos_core::Value::function(|_this, __args| w3cos_core::RangeError(__args))"
+                .to_string()
+        }
+        // `Map` as a value: the real ES6 Map class (SameValueZero identity
+        // keys, insertion order, prototype-linked instances so
+        // `x instanceof Map` works). `new Map(...)` resolves to the same
+        // class value and goes through class::construct.
+        "Map" => "w3cos_core::collections::map_class()".to_string(),
+        "RegExp" => "w3cos_core::regexp::regexp_class()".to_string(),
+        // `Array` as a value: callable facade — calling it mirrors the
+        // `new Array` semantics (single numeric arg = length); the statics
+        // implemented by the core builtin (currently `from`) are installed as
+        // properties so `Array.from(x)` keeps working.
+        "Array" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"from\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Array.call_method(\"from\", __args))), (\"isArray\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(matches!(__args.first(), Some(w3cos_core::Value::Array(_))))))]), |_this, __args| { if __args.len() == 1 && __args[0].is_number() { let n = __args[0].to_number() as usize; w3cos_core::Value::array(vec![w3cos_core::Value::Undefined; n]) } else { w3cos_core::Value::array(__args) } })"
+            .to_string(),
+        // `Object` as a value (`x.constructor === Object`, `Object(x)`):
+        // callable facade with the core builtin's statics as properties, so
+        // `Object.keys(x)` / `Object.values(x)` / `Object.is(a, b)` keep
+        // working through plain member calls. `create` ignores the prototype
+        // argument (fresh empty object); `assign` merges own enumerable
+        // properties; `entries`/`getOwnPropertyNames` mirror `keys`;
+        // `freeze` is a pass-through.
+        "Object" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"keys\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"keys\", __args))), (\"values\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"values\", __args))), (\"is\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"is\", __args))), (\"create\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::object(::std::collections::HashMap::new()))), (\"getPrototypeOf\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::class::get_prototype_of(&__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))), (\"getOwnPropertyDescriptor\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let key = __args.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); w3cos_core::class::get_own_property_descriptor(&obj, &key) })), (\"defineProperty\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let key = __args.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let descriptor = __args.get(2).cloned().unwrap_or(w3cos_core::Value::Undefined); w3cos_core::class::define_property(&obj, &key, &descriptor) })), (\"freeze\".to_string(), w3cos_core::Value::function(|_this, __args| __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined))), (\"getOwnPropertyNames\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"keys\", __args))), (\"assign\".to_string(), w3cos_core::Value::function(|_this, __args| { let target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); for source in __args.iter().skip(1) { for key in w3cos_core::Object.call_method(\"keys\", vec![source.clone()]).iter() { let k = key.to_js_string(); let v = source.get_property(&k); target.set_property(&k, v); } } target })), (\"entries\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let mut out = Vec::new(); for key in w3cos_core::Object.call_method(\"keys\", vec![obj.clone()]).iter() { let k = key.to_js_string(); out.push(w3cos_core::Value::array(vec![w3cos_core::Value::from(k.clone()), obj.get_property(&k)])); } w3cos_core::Value::array(out) }))]), |_this, __args| __args.first().cloned().unwrap_or_else(|| w3cos_core::Value::object(::std::collections::HashMap::new())))"
+            .to_string(),
+        "document" => "w3cos_runtime::jsdom::document_value()".to_string(),
+        "window" | "self" | "globalThis" => {
+            "w3cos_runtime::jsdom::window_value()".to_string()
+        }
+        // Property globals: read off the jsdom window singleton.
+        "navigator" | "localStorage" | "sessionStorage" | "performance" | "location"
+        | "screen" => format!("w3cos_runtime::jsdom::window_value().get_property({name:?})"),
+        // Scheduling/utility globals: the jsdom window holds them as function
+        // values, so a bare reference is just the property read (calling it
+        // goes through the normal `Value::call` path).
+        "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
+        | "requestAnimationFrame" | "cancelAnimationFrame" | "queueMicrotask"
+        | "matchMedia" | "getComputedStyle" | "getSelection" => {
+            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+        }
+        "atob" => {
+            "w3cos_core::Value::function(|_this, __args| w3cos_core::web::atob(__args))"
+                .to_string()
+        }
+        "btoa" => {
+            "w3cos_core::Value::function(|_this, __args| w3cos_core::web::btoa(__args))"
+                .to_string()
+        }
+        "structuredClone" => {
+            "w3cos_core::Value::function(|_this, __args| w3cos_core::web::structured_clone(__args))"
+                .to_string()
+        }
+        // Facade objects exposing the builtin entry points as properties, so
+        // `Promise.resolve(x)` / `JSON.parse(s)` work through plain member
+        // calls (and the facades can be passed around as values).
+        "Promise" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"resolve\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::resolve(__args))), (\"reject\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::reject(__args))), (\"all\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::all(__args))), (\"race\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::race(__args)))]))".to_string(),
+        "JSON" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"parse\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::json::parse(__args))), (\"stringify\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::json::stringify(__args)))]))".to_string(),
+        // Intl is not implemented; a harmless empty object keeps references
+        // total (member access yields Undefined).
+        "Intl" => "w3cos_core::Value::object(::std::collections::HashMap::new()) /* Intl stub */"
+            .to_string(),
+        // `arguments` — the current fn's argument list as an array value.
+        // Only valid where `__args` is in scope (lowered fns/closures).
+        "arguments" => "w3cos_core::Value::array(__args.clone())".to_string(),
+        // Conversion globals as function values: `String(x)`/`Number(x)`/
+        // `Boolean(x)`/`isNaN(x)`/`isFinite(x)` work through the normal call
+        // path; static members (e.g. `String.fromCharCode`) degrade to
+        // Undefined via property access on the function value.
+        "String" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::from(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string()))".to_string(),
+        "Number" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Number(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number()))".to_string(),
+        "Boolean" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_bool()))".to_string(),
+        "isNaN" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number().is_nan()))".to_string(),
+        "isFinite" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number().is_finite()))".to_string(),
+        // `Set` as a value: the real ES6 Set class (see Map above);
+        // `new Set(...)` routes through class::construct on this class value.
+        "Set" => "w3cos_core::collections::set_class()".to_string(),
+        // Weak collections: no weak semantics in v1 — they alias Map/Set.
+        "WeakMap" => "w3cos_core::collections::weak_map_class()".to_string(),
+        "WeakSet" => "w3cos_core::collections::weak_set_class()".to_string(),
+        // Dynamic Proxy constructor backed by w3cos-core's proxy traps.
+        "Proxy" => "w3cos_core::proxy_class()".to_string(),
+        "TextDecoder" => "w3cos_core::web::text_decoder_class()".to_string(),
+        "Uint8Array" | "Uint8ClampedArray" | "Int8Array" | "Uint16Array" | "Int16Array"
+        | "Uint32Array" | "Int32Array" | "Float32Array" | "Float64Array" | "BigInt64Array"
+        | "BigUint64Array" => "w3cos_core::collections::typed_array_class()".to_string(),
+        // `Reflect` facade: `Reflect.construct(target, args)` routes through
+        // the class runtime (Monaco's InstantiationService._createInstance
+        // builds every service through it). The optional newTarget argument
+        // is ignored; all other Reflect members degrade to Undefined.
+        "Reflect" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"construct\".to_string(), w3cos_core::Value::function(|_this, __args| { let __target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let __ctor_args: Vec<w3cos_core::Value> = __args.get(1).map(|__a| __a.iter().collect()).unwrap_or_default(); w3cos_core::class::construct(&__target, __ctor_args) }))]))".to_string(),
+        // Well-known iterator symbol. Symbols are represented by collision-
+        // resistant string keys in the compact runtime; Value::call_method
+        // recognizes this key and returns a standards-shaped `next()` object.
+        "Symbol" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"iterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_iterator\"))]))".to_string(),
+        // Unimplemented builtin globals: harmless empty-object stubs keep
+        // references total (`new X()` yields Undefined via construct on a
+        // non-callable; `X.y` yields Undefined).
+        "Date" | "BigInt"
+        | "ArrayBuffer" | "SharedArrayBuffer" | "DataView"
+        | "WeakRef" | "FinalizationRegistry" | "Atomics" | "eval"
+        | "encodeURI" | "encodeURIComponent" | "decodeURI" | "decodeURIComponent" | "escape"
+        | "unescape" | "TextEncoder" | "fetch" | "Request" | "Response"
+        | "Headers" | "FormData" | "AbortController" | "AbortSignal" | "Event"
+        | "EventTarget" | "CustomEvent" | "MessageChannel" | "MessagePort" | "Worker"
+        | "ImageData" | "OffscreenCanvas" | "Path2D" | "DOMRect" | "DOMPoint" | "DOMMatrix"
+        | "MutationObserver" | "IntersectionObserver" | "PerformanceObserver" | "Report"
+        // DOM constructors / event types (instanceof degrades to false).
+        | "Function" | "Node" | "Element" | "HTMLElement" | "HTMLAnchorElement"
+        | "HTMLDivElement" | "HTMLSpanElement" | "HTMLButtonElement" | "HTMLInputElement"
+        | "HTMLTextAreaElement" | "HTMLSelectElement" | "HTMLFormElement" | "HTMLImageElement"
+        | "HTMLVideoElement" | "HTMLCanvasElement" | "SVGElement" | "DocumentFragment"
+        | "ShadowRoot" | "NodeList" | "CSSStyleDeclaration" | "MouseEvent" | "KeyboardEvent"
+        | "PointerEvent" | "WheelEvent" | "FocusEvent" | "InputEvent" | "ClipboardEvent"
+        | "DragEvent" | "TouchEvent" | "AnimationEvent" | "TransitionEvent" | "ErrorEvent"
+        | "EventSource" | "WebSocket" | "XMLHttpRequest" | "Blob" | "File" | "FileReader"
+        | "ClipboardItem" | "DataTransfer" | "DOMException" | "Range" | "Selection"
+        | "DOMParser" | "XMLSerializer" | "CSS" | "CSSStyleSheet"
+        // URL constructors are handled at `new` sites; bare values are stubs.
+        | "URL" | "URLSearchParams"
+        // CommonJS/Node artifacts that appear in UMD-wrapped sources.
+        | "require" | "module" | "exports" | "process" | "global" | "Buffer" | "__dirname"
+        | "__filename"
+        // AMD (`define`/`define.amd`) and Worker (`importScripts`) globals:
+        // object stubs make `typeof define === "function"` guards take the
+        // false branch (the correct non-AMD/non-Worker path).
+        | "define" | "importScripts" => {
+            "w3cos_core::Value::object(::std::collections::HashMap::new()) /* builtin stub */"
+                .to_string()
+        }
+        // Error family as bare values (`instanceof` etc. evaluates to false).
+        "TypeError" | "SyntaxError" | "ReferenceError" | "EvalError" | "URIError"
+        | "AggregateError" => {
+            "w3cos_core::Value::object(::std::collections::HashMap::new()) /* error stub */"
+                .to_string()
+        }
+        _ => return None,
+    };
+    Some(expr)
+}
+
+/// Does any statement reference the given identifier (free or bound)? Used to
+/// detect self-recursion in nested fn declarations.
+fn stmts_reference_ident(stmts: &[Stmt], name: &str) -> bool {
+    stmts_reference_matching(stmts, &|n| n == name)
+}
+
+/// Does any statement reference any identifier in the set?
+fn stmts_reference_any_ident(stmts: &[Stmt], names: &HashSet<String>) -> bool {
+    !names.is_empty() && stmts_reference_matching(stmts, &|n| names.contains(n))
+}
+
+fn stmts_reference_matching(stmts: &[Stmt], matches: &dyn Fn(&str) -> bool) -> bool {
+    stmts.iter().any(|s| stmt_references_ident(s, matches))
+}
+
+/// Collect every identifier name referenced in the statements (sanitized).
+/// Used to restrict closure capture lists to names the body actually uses:
+/// the coarse `known_values − params` set breaks inside nested Rust fn items
+/// (which cannot capture) and wastes clones elsewhere.
+fn stmts_referenced_names(stmts: &[Stmt]) -> HashSet<String> {
+    let names = std::cell::RefCell::new(HashSet::new());
+    stmts_reference_matching(stmts, &|name| {
+        names.borrow_mut().insert(sanitize_ident(name));
+        false
+    });
+    names.into_inner()
+}
+
+/// The [`stmts_referenced_names`] equivalent for a single expression.
+fn expr_referenced_names(expr: &Expr) -> HashSet<String> {
+    let names = std::cell::RefCell::new(HashSet::new());
+    let _ = expr_references_ident(expr, &|name| {
+        names.borrow_mut().insert(sanitize_ident(name));
+        false
+    });
+    names.into_inner()
+}
+
+/// Capture list for a closure body: in-scope names the body references.
+fn capture_names(
+    known_values: &HashSet<String>,
+    parameter_names: &HashSet<String>,
+    referenced: &HashSet<String>,
+) -> Vec<String> {
+    let mut captures = known_values
+        .difference(parameter_names)
+        .filter(|name| referenced.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    captures.sort();
+    captures
+}
+
+fn stmt_references_ident(stmt: &Stmt, matches: &dyn Fn(&str) -> bool) -> bool {
+    match stmt {
+        Stmt::Expr(s) => expr_references_ident(&s.expr, matches),
+        Stmt::Return(s) => s
+            .arg
+            .as_deref()
+            .is_some_and(|e| expr_references_ident(e, matches)),
+        Stmt::Throw(s) => expr_references_ident(&s.arg, matches),
+        Stmt::Decl(decl) => match decl {
+            Decl::Var(var) => var.decls.iter().any(|d| {
+                d.init
+                    .as_deref()
+                    .is_some_and(|e| expr_references_ident(e, matches))
+            }),
+            Decl::Fn(f) => f
+                .function
+                .body
+                .as_ref()
+                .is_some_and(|b| stmts_reference_matching(&b.stmts, matches)),
+            Decl::Class(c) => class_references_ident(&c.class, matches),
+            _ => false,
+        },
+        Stmt::Block(b) => stmts_reference_matching(&b.stmts, matches),
+        Stmt::If(s) => {
+            expr_references_ident(&s.test, matches)
+                || stmt_references_ident(&s.cons, matches)
+                || s.alt
+                    .as_deref()
+                    .is_some_and(|a| stmt_references_ident(a, matches))
+        }
+        Stmt::For(s) => {
+            s.init.as_ref().is_some_and(|init| match init {
+                VarDeclOrExpr::VarDecl(decl) => decl.decls.iter().any(|d| {
+                    d.init
+                        .as_deref()
+                        .is_some_and(|e| expr_references_ident(e, matches))
+                }),
+                VarDeclOrExpr::Expr(expr) => expr_references_ident(expr, matches),
+            }) || s
+                .test
+                .as_deref()
+                .is_some_and(|e| expr_references_ident(e, matches))
+                || s.update
+                    .as_deref()
+                    .is_some_and(|e| expr_references_ident(e, matches))
+                || stmt_references_ident(&s.body, matches)
+        }
+        Stmt::While(s) => {
+            expr_references_ident(&s.test, matches) || stmt_references_ident(&s.body, matches)
+        }
+        Stmt::DoWhile(s) => {
+            stmt_references_ident(&s.body, matches) || expr_references_ident(&s.test, matches)
+        }
+        Stmt::ForIn(s) => {
+            expr_references_ident(&s.right, matches) || stmt_references_ident(&s.body, matches)
+        }
+        Stmt::ForOf(s) => {
+            expr_references_ident(&s.right, matches) || stmt_references_ident(&s.body, matches)
+        }
+        Stmt::Switch(s) => {
+            expr_references_ident(&s.discriminant, matches)
+                || s.cases.iter().any(|case| {
+                    case.test
+                        .as_deref()
+                        .is_some_and(|e| expr_references_ident(e, matches))
+                        || stmts_reference_matching(&case.cons, matches)
+                })
+        }
+        Stmt::Try(s) => {
+            stmts_reference_matching(&s.block.stmts, matches)
+                || s.handler
+                    .as_ref()
+                    .is_some_and(|h| stmts_reference_matching(&h.body.stmts, matches))
+                || s.finalizer
+                    .as_ref()
+                    .is_some_and(|f| stmts_reference_matching(&f.stmts, matches))
+        }
+        Stmt::Labeled(s) => stmt_references_ident(&s.body, matches),
+        _ => false,
+    }
+}
+
+fn class_references_ident(class: &Class, matches: &dyn Fn(&str) -> bool) -> bool {
+    class.body.iter().any(|member| match member {
+        ClassMember::Constructor(c) => c
+            .body
+            .as_ref()
+            .is_some_and(|b| stmts_reference_matching(&b.stmts, matches)),
+        ClassMember::Method(m) => m
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|b| stmts_reference_matching(&b.stmts, matches)),
+        ClassMember::PrivateMethod(m) => m
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|b| stmts_reference_matching(&b.stmts, matches)),
+        ClassMember::ClassProp(p) => p
+            .value
+            .as_deref()
+            .is_some_and(|e| expr_references_ident(e, matches)),
+        ClassMember::PrivateProp(p) => p
+            .value
+            .as_deref()
+            .is_some_and(|e| expr_references_ident(e, matches)),
+        ClassMember::StaticBlock(b) => stmts_reference_matching(&b.body.stmts, matches),
+        _ => false,
+    })
+}
+
+fn expr_references_ident(expr: &Expr, matches: &dyn Fn(&str) -> bool) -> bool {
+    match expr {
+        Expr::Ident(ident) => matches(&ident.sym),
+        Expr::Call(call) => {
+            call.args
+                .iter()
+                .any(|arg| expr_references_ident(&arg.expr, matches))
+                || matches!(&call.callee, Callee::Expr(callee) if expr_references_ident(callee, matches))
+        }
+        Expr::New(new_expr) => {
+            expr_references_ident(&new_expr.callee, matches)
+                || new_expr.args.as_ref().is_some_and(|args| {
+                    args.iter()
+                        .any(|arg| expr_references_ident(&arg.expr, matches))
+                })
+        }
+        Expr::Member(member) => {
+            expr_references_ident(&member.obj, matches)
+                || match &member.prop {
+                    MemberProp::Computed(computed) => {
+                        expr_references_ident(&computed.expr, matches)
+                    }
+                    _ => false,
+                }
+        }
+        Expr::Bin(bin) => {
+            expr_references_ident(&bin.left, matches) || expr_references_ident(&bin.right, matches)
+        }
+        Expr::Unary(unary) => expr_references_ident(&unary.arg, matches),
+        Expr::Update(update) => expr_references_ident(&update.arg, matches),
+        Expr::Assign(assign) => {
+            expr_references_ident(&assign.right, matches)
+                || match &assign.left {
+                    AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
+                        matches(&ident.id.sym)
+                    }
+                    AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
+                        expr_references_ident(&member.obj, matches)
+                            || match &member.prop {
+                                MemberProp::Computed(computed) => {
+                                    expr_references_ident(&computed.expr, matches)
+                                }
+                                _ => false,
+                            }
+                    }
+                    _ => false,
+                }
+        }
+        Expr::Cond(cond) => {
+            expr_references_ident(&cond.test, matches)
+                || expr_references_ident(&cond.cons, matches)
+                || expr_references_ident(&cond.alt, matches)
+        }
+        Expr::Paren(paren) => expr_references_ident(&paren.expr, matches),
+        Expr::Seq(seq) => seq.exprs.iter().any(|e| expr_references_ident(e, matches)),
+        Expr::Tpl(tpl) => tpl.exprs.iter().any(|e| expr_references_ident(e, matches)),
+        Expr::Arrow(arrow) => match arrow.body.as_ref() {
+            BlockStmtOrExpr::BlockStmt(block) => stmts_reference_matching(&block.stmts, matches),
+            BlockStmtOrExpr::Expr(expr) => expr_references_ident(expr, matches),
+        },
+        Expr::Fn(f) => f
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|b| stmts_reference_matching(&b.stmts, matches)),
+        Expr::Object(obj) => obj.props.iter().any(|prop| match prop {
+            PropOrSpread::Spread(spread) => expr_references_ident(&spread.expr, matches),
+            PropOrSpread::Prop(prop) => match prop.as_ref() {
+                Prop::KeyValue(kv) => expr_references_ident(&kv.value, matches),
+                Prop::Shorthand(ident) => matches(&ident.sym),
+                Prop::Method(method) => method
+                    .function
+                    .body
+                    .as_ref()
+                    .is_some_and(|b| stmts_reference_matching(&b.stmts, matches)),
+                Prop::Getter(getter) => getter
+                    .body
+                    .as_ref()
+                    .is_some_and(|b| stmts_reference_matching(&b.stmts, matches)),
+                Prop::Setter(setter) => setter
+                    .body
+                    .as_ref()
+                    .is_some_and(|b| stmts_reference_matching(&b.stmts, matches)),
+                _ => false,
+            },
+        }),
+        Expr::Array(arr) => arr
+            .elems
+            .iter()
+            .flatten()
+            .any(|elem| expr_references_ident(&elem.expr, matches)),
+        Expr::OptChain(opt) => match opt.base.as_ref() {
+            OptChainBase::Member(member) => {
+                expr_references_ident(&member.obj, matches)
+                    || match &member.prop {
+                        MemberProp::Computed(computed) => {
+                            expr_references_ident(&computed.expr, matches)
+                        }
+                        _ => false,
+                    }
+            }
+            OptChainBase::Call(call) => {
+                expr_references_ident(&call.callee, matches)
+                    || call
+                        .args
+                        .iter()
+                        .any(|arg| expr_references_ident(&arg.expr, matches))
+            }
+        },
+        Expr::TaggedTpl(tagged) => {
+            expr_references_ident(&tagged.tag, matches)
+                || tagged
+                    .tpl
+                    .exprs
+                    .iter()
+                    .any(|e| expr_references_ident(e, matches))
+        }
+        Expr::Class(class_expr) => class_references_ident(&class_expr.class, matches),
+        Expr::Await(await_expr) => expr_references_ident(&await_expr.arg, matches),
+        Expr::Yield(yield_expr) => yield_expr
+            .arg
+            .as_deref()
+            .is_some_and(|e| expr_references_ident(e, matches)),
+        _ => false,
     }
 }
 
@@ -1679,13 +4587,16 @@ fn lower_dynamic_bin_op(op: BinaryOp, left: &str, right: &str) -> String {
         BinaryOp::Gt => format!("w3cos_core::Value::Bool({left}.js_gt(&{right}))"),
         BinaryOp::GtEq => format!("w3cos_core::Value::Bool({left}.js_ge(&{right}))"),
         BinaryOp::LogicalAnd => {
-            format!("if {left}.to_bool() {{ {right} }} else {{ {left}.clone() }}")
+            // Bind the left operand once: emitting its text twice (as a naive
+            // `if l { r } else { l }` does) doubles per `&&` in a chain and
+            // blows up exponentially on real-world condition chains.
+            format!("{{ let __l = {left}; if __l.to_bool() {{ {right} }} else {{ __l }} }}")
         }
         BinaryOp::LogicalOr => {
-            format!("if {left}.to_bool() {{ {left}.clone() }} else {{ {right} }}")
+            format!("{{ let __l = {left}; if __l.to_bool() {{ __l }} else {{ {right} }} }}")
         }
         BinaryOp::NullishCoalescing => {
-            format!("if {left}.is_nullish() {{ {right} }} else {{ {left}.clone() }}")
+            format!("{{ let __l = {left}; if __l.is_nullish() {{ {right} }} else {{ __l }} }}")
         }
         BinaryOp::BitAnd => format!("{left}.js_bitand(&{right})"),
         BinaryOp::BitOr => format!("{left}.js_bitor(&{right})"),
@@ -1694,7 +4605,9 @@ fn lower_dynamic_bin_op(op: BinaryOp, left: &str, right: &str) -> String {
         BinaryOp::RShift => format!("{left}.js_shr(&{right})"),
         BinaryOp::ZeroFillRShift => format!("{left}.js_ushr(&{right})"),
         BinaryOp::In => format!("{left}.js_in(&{right})"),
-        BinaryOp::InstanceOf => "w3cos_core::Value::Bool(false)".to_string(),
+        BinaryOp::InstanceOf => {
+            format!("w3cos_core::Value::Bool(w3cos_core::class::instance_of(&{left}, &{right}))")
+        }
     }
 }
 
@@ -1793,6 +4706,51 @@ mod tests {
     }
 
     #[test]
+    fn lowers_dynamic_array_spread_by_flattening_iterables() {
+        let statements = parse_stmts("const result = [first, ...rest, last];");
+        let mut context = LowerCtx::new_dynamic(vec![]);
+        let code = context.lower_stmts(&statements);
+
+        assert!(
+            code.contains("__w3cos_array_items.push(first)"),
+            "leading item: {code}"
+        );
+        assert!(
+            code.contains("__w3cos_array_items.extend((rest).iter())"),
+            "spread item: {code}"
+        );
+        assert!(
+            code.contains("__w3cos_array_items.push(last)"),
+            "trailing item: {code}"
+        );
+        assert!(
+            code.contains("Value::array(__w3cos_array_items)"),
+            "dynamic array result: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_dynamic_call_spread_by_flattening_arguments() {
+        let statements =
+            parse_stmts("const invoke = (fn, accessor, args) => fn(accessor, ...args);");
+        let mut context = LowerCtx::new_dynamic(vec![]);
+        let code = context.lower_stmts(&statements);
+
+        assert!(
+            code.contains("__w3cos_call_args.push(accessor.clone().clone())"),
+            "leading argument: {code}"
+        );
+        assert!(
+            code.contains("__w3cos_call_args.extend((args.clone()).iter())"),
+            "spread arguments: {code}"
+        );
+        assert!(
+            code.contains("fn_.clone().call(w3cos_core::Value::Undefined"),
+            "dynamic function call: {code}"
+        );
+    }
+
+    #[test]
     fn lowers_variable_declarations() {
         let stmts = parse_stmts("const x = 42; let y = \"hello\";");
         let mut ctx = LowerCtx::new(vec![]);
@@ -1851,17 +4809,18 @@ mod tests {
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("let value = __binding0.get_property(\"0\")")
-                && code.contains("let setValue = __binding0.get_property(\"1\")"),
+            code.contains("let mut value = __binding0.get_property(\"0\")")
+                && code.contains("let mut setValue = __binding0.get_property(\"1\")"),
             "array destructuring: {code}"
         );
         assert!(
-            code.contains("let h = __binding1.get_property(\"height\")")
-                && code.contains("let width = { let value = __binding1.get_property(\"width\")"),
+            code.contains("let mut h = __binding1.get_property(\"height\")")
+                && code
+                    .contains("let mut width = { let value = __binding1.get_property(\"width\")"),
             "object destructuring: {code}"
         );
         assert!(
-            code.contains("let rest = __binding1.object_rest(&[\"height\", \"width\"]);"),
+            code.contains("let mut rest = __binding1.object_rest(&[\"height\", \"width\"]);"),
             "object rest must exclude prior bindings: {code}"
         );
     }
@@ -1875,7 +4834,7 @@ mod tests {
         let code = ctx.lower_stmts(&stmts);
         assert!(
             code.contains("Value::function(move |_this, __args|")
-                && code.contains("let current = __args.get(0)")
+                && code.contains("let mut current = __args.get(0)")
                 && code.contains("set_property(&\"value\"")
                 && code.contains("is_nullish()"),
             "dynamic closure lowering: {code}"
@@ -1988,6 +4947,455 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_lowering_throw_panics_with_value_payload() {
+        let stmts = parse_stmts(r#"throw { code: 42 };"#);
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::throw_value("),
+            "dynamic throw → throw_value: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_try_catch_finally_shape() {
+        let stmts = parse_stmts("try { risky(); } catch (e) { report(e); } finally { cleanup(); }");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains("enum __Flow0 { Done, Return(w3cos_core::Value), Throw(std::boxed::Box<dyn std::any::Any + Send>) }"),
+            "flow enum: {code}"
+        );
+        assert!(
+            code.contains("let __caught0 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> __Flow0 {"),
+            "try body wrapped in catch_unwind: {code}"
+        );
+        assert!(
+            code.contains("__payload0.downcast_ref::<w3cos_core::PanicValue>()"),
+            "payload downcast to thrown value: {code}"
+        );
+        assert!(
+            code.contains("__payload0.downcast_ref::<&'static str>()")
+                && code.contains("__payload0.downcast_ref::<String>()"),
+            "string payload fallbacks: {code}"
+        );
+        assert!(code.contains("let mut e = {"), "catch param bound: {code}");
+        assert!(
+            code.contains("let __caught2_0") || code.contains("__caught2"),
+            "catch body itself guarded (catch throwing still runs finally): {code}"
+        );
+        // finally body appears after the flow closure, before the epilogue.
+        let finally_pos = code.find("cleanup").expect("finally body present");
+        let closure_pos = code.find("})();").expect("flow closure ends");
+        let epilogue_pos = code.find("std::panic::resume_unwind(p)").expect("rethrow");
+        assert!(
+            closure_pos < finally_pos && finally_pos < epilogue_pos,
+            "finally runs after try/catch, before propagation: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_try_finally_without_catch_rethrows() {
+        let stmts = parse_stmts("try { risky(); } finally { cleanup(); }");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("__Flow0::Throw(__payload0)"),
+            "no catch → payload deferred until after finally: {code}"
+        );
+        assert!(
+            code.contains("std::panic::resume_unwind(p)"),
+            "finally without catch resumes the panic: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_return_inside_try_wraps_flow_and_finally_runs() {
+        let stmts = parse_stmts("function f() { try { return 1; } finally { mark(); } }");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("return __Flow0::Return("),
+            "return inside try wraps into the flow enum: {code}"
+        );
+        assert!(
+            code.contains("__Flow0::Return(v) => { return v; }"),
+            "epilogue propagates the early return after finally: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_nested_try_propagates_to_outer_flow() {
+        let stmts = parse_stmts(
+            "function f() { try { try { return 1; } catch (e) { return 2; } } finally { mark(); } }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        // Inner try's returns target its own enum; its epilogue re-wraps into
+        // the outer try's enum so the outer finally still runs.
+        assert!(
+            code.contains("return __Flow1::Return("),
+            "inner try return wraps inner flow: {code}"
+        );
+        assert!(
+            code.contains("__Flow1::Return(v) => { return __Flow0::Return(v); }"),
+            "inner epilogue re-wraps into outer flow: {code}"
+        );
+        assert!(
+            code.contains("enum __Flow0") && code.contains("enum __Flow1"),
+            "distinct flow enums per try: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_try_around_await_emits_warning() {
+        let stmts = parse_stmts("async function f() { try { await g(); } catch (e) { h(e); } }");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("// compile_warning: try/catch around `await` is best-effort only"),
+            "await inside try flagged: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_maps_dom_globals_to_jsdom_bridge() {
+        let stmts = parse_stmts(
+            r#"const el = document.getElementById("app");
+const w = window.innerWidth;
+const g = globalThis.location;
+const s = self.closed;
+const ua = navigator.userAgent;
+const saved = localStorage.getItem("k");
+const now = performance.now();
+const scr = screen.width;"#,
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_runtime::jsdom::document_value().call_method(\"getElementById\""),
+            "document.* → jsdom document: {code}"
+        );
+        assert!(
+            code.contains("w3cos_runtime::jsdom::window_value().get_property(\"innerWidth\")"),
+            "window.innerWidth: {code}"
+        );
+        assert!(
+            code.contains("w3cos_runtime::jsdom::window_value().get_property(\"location\")"),
+            "globalThis.location: {code}"
+        );
+        assert!(
+            code.contains("w3cos_runtime::jsdom::window_value().get_property(\"closed\")"),
+            "self.closed: {code}"
+        );
+        assert!(
+            code.contains(
+                "w3cos_runtime::jsdom::window_value().get_property(\"navigator\").get_property(\"userAgent\")"
+            ),
+            "navigator.userAgent: {code}"
+        );
+        assert!(
+            code.contains(
+                "w3cos_runtime::jsdom::window_value().get_property(\"localStorage\").call_method(\"getItem\""
+            ),
+            "localStorage.getItem: {code}"
+        );
+        assert!(
+            code.contains(
+                "w3cos_runtime::jsdom::window_value().get_property(\"performance\").call_method(\"now\""
+            ),
+            "performance.now: {code}"
+        );
+        assert!(
+            code.contains(
+                "w3cos_runtime::jsdom::window_value().get_property(\"screen\").get_property(\"width\")"
+            ),
+            "screen.width: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_maps_timer_globals_to_window_methods() {
+        let stmts = parse_stmts(
+            r#"setTimeout(cb, 10);
+const id = setInterval(cb, 5);
+clearTimeout(id);
+requestAnimationFrame(frame);
+queueMicrotask(job);
+const mq = matchMedia("(min-width: 100px)");
+const cs = getComputedStyle(el);
+const sel = getSelection();"#,
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        for name in [
+            "setTimeout",
+            "setInterval",
+            "clearTimeout",
+            "requestAnimationFrame",
+            "queueMicrotask",
+            "matchMedia",
+            "getComputedStyle",
+            "getSelection",
+        ] {
+            assert!(
+                code.contains(&format!(
+                    "w3cos_runtime::jsdom::window_value().get_property(\"{name}\")"
+                )),
+                "{name} → window function value: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_lowering_maps_promise_json_and_web_globals() {
+        let stmts = parse_stmts(
+            r#"const p = new Promise((resolve) => resolve(1));
+const q = Promise.resolve(2);
+const all = Promise.all([p, q]);
+const obj = JSON.parse("{\"a\":1}");
+const text = JSON.stringify(obj);
+const bin = atob("aGk=");
+const enc = btoa(bin);
+const copy = structuredClone(obj);
+const u = new URL("https://example.com/x");
+const params = new URLSearchParams("a=1");"#,
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::promise::new(vec!["),
+            "new Promise: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::promise::resolve(__args)"),
+            "Promise.resolve facade: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::promise::all(__args)"),
+            "Promise.all facade: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::json::parse(__args)"),
+            "JSON.parse facade: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::json::stringify(__args)"),
+            "JSON.stringify facade: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::web::atob(__args)"),
+            "atob: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::web::btoa(__args)"),
+            "btoa: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::web::structured_clone(__args)"),
+            "structuredClone: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::web::url_new(vec!["),
+            "new URL: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::web::url_search_params_new(vec!["),
+            "new URLSearchParams: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_intl_is_a_harmless_stub() {
+        let stmts = parse_stmts("const nf = Intl.NumberFormat;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains(
+                "w3cos_core::Value::object(::std::collections::HashMap::new()) /* Intl stub */"
+            ),
+            "Intl stub object: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_destructuring_reassignment() {
+        let stmts = parse_stmts("[a, b] = arr; ({x, y: {z}} = obj);");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("let __assign_value = arr")
+                && code.contains("a = __assign_value.get_property(\"0\");")
+                && code.contains("b = __assign_value.get_property(\"1\");"),
+            "array destructuring assignment: {code}"
+        );
+        assert!(
+            code.contains("x = __assign_value.get_property(\"x\");")
+                && code.contains("z = __assign_value.get_property(\"y\").get_property(\"z\");"),
+            "object destructuring assignment: {code}"
+        );
+        assert!(
+            !code.contains("/* pattern assign */"),
+            "no placeholder left: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_hoists_var_declarations_for_closures() {
+        // A closure created before the `var` line must still see the binding:
+        // the var is pre-declared at the fn top and the declaration lowers to
+        // an assignment.
+        let stmts =
+            parse_stmts("function f() { const g = () => result; var result = 42; return g(); }");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        let decl_pos = code
+            .find("let mut result = w3cos_core::Value::Undefined;")
+            .expect("hoisted predecl: {code}");
+        let closure_pos = code
+            .find("let mut result = result.clone();")
+            .expect("capture: {code}");
+        let assign_pos = code
+            .find("result = w3cos_core::Value::Number(42.0);")
+            .expect("var as assignment: {code}");
+        assert!(
+            decl_pos < closure_pos && closure_pos < assign_pos,
+            "predecl → closure capture → assignment: {code}"
+        );
+        // `var` in a nested block hoists to the fn top as well.
+        let stmts = parse_stmts("function f() { if (x) { var y = 1; } return y; }");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("let mut y = w3cos_core::Value::Undefined;"),
+            "block-nested var hoisted: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_boxes_self_referential_initializer() {
+        let stmts = parse_stmts(
+            "function createId() { const id = function () { return id; }; return id; }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains(
+                "let id = std::rc::Rc::new(std::cell::RefCell::new(w3cos_core::Value::Undefined));"
+            ),
+            "self-referential binding gets a shared cell: {code}"
+        );
+        assert!(
+            code.contains("let mut id = id.clone();")
+                && code.contains("return (*id.borrow()).clone();")
+                && code.contains("*id.borrow_mut() ="),
+            "closure captures the cell and initialization writes through it: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_foreach_binds_item_and_index() {
+        let stmts = parse_stmts("items.forEach((value, key) => { seen = key; });");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("for (__index, __item) in items.iter().enumerate()"),
+            "enumerate loop: {code}"
+        );
+        assert!(
+            code.contains("let mut value = __item;")
+                && code.contains("let mut key = w3cos_core::Value::Number(__index as f64);"),
+            "item + index params bound: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_nested_fn_decl_captures_as_closure() {
+        let stmts = parse_stmts(
+            "function outer() { const x = 1; function inner() { return x + 1; } return inner(); }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("let mut inner = w3cos_core::Value::Undefined;"),
+            "nested fn name hoisted: {code}"
+        );
+        assert!(
+            code.contains("inner = {")
+                && code.contains("let mut x = x.clone();")
+                && code.contains("w3cos_core::Value::function(move |__this, __args|"),
+            "nested fn → capturing closure value: {code}"
+        );
+        // Self-recursive nested fns keep the fn-item form (name must be in scope).
+        let stmts = parse_stmts(
+            "function outer() { function fib(n) { if (n < 2) { return n; } return fib(n-1) + fib(n-2); } return fib(10); }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("fn fib(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value"),
+            "self-recursive nested fn keeps fn item: {code}"
+        );
+        assert!(
+            code.contains("fib(vec![n.clone().js_sub(&w3cos_core::Value::Number(1.0)).clone()])")
+                || code.contains("fib(vec![n.js_sub(&w3cos_core::Value::Number(1.0))"),
+            "recursive call uses the direct fn-item form: {code}"
+        );
+        assert!(
+            !code.contains("let mut fib = w3cos_core::Value::Undefined;"),
+            "fn-item names are not hoisted (would shadow the item): {code}"
+        );
+    }
+
+    #[test]
+    fn sanitize_ident_covers_rust_reserved_keywords() {
+        for kw in [
+            "override", "final", "try", "yield", "gen", "typeof", "macro",
+        ] {
+            assert_eq!(sanitize_ident(kw), format!("{kw}_"));
+        }
+    }
+
+    #[test]
+    fn dynamic_lowering_local_bindings_shadow_globals() {
+        let stmts = parse_stmts(
+            r#"const document = { title: "mine" };
+const t = document.title;
+function f(window) { return window.x; }"#,
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            !code.contains("w3cos_runtime::jsdom::document_value()"),
+            "local `document` shadows the global: {code}"
+        );
+        assert!(
+            code.contains("document.clone().get_property(\"title\")"),
+            "shadowed member read: {code}"
+        );
+        assert!(
+            code.contains("return window.get_property(\"x\");")
+                || code.contains("return window.clone().get_property(\"x\");"),
+            "fn param `window` shadows the global: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_collects_rest_parameters() {
+        let stmts =
+            parse_stmts("function createInstance(ctor, ...rest) { return [ctor, rest.length]; }");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains(
+                "let mut rest = w3cos_core::Value::array(__args.iter().skip(1).cloned().collect());"
+            ),
+            "rest parameter collects every remaining argument: {code}"
+        );
+    }
+
+    #[test]
     fn lowers_await() {
         let stmts = parse_stmts("async function f() { const x = await fetchData(); return x; }");
         let mut ctx = LowerCtx::new(vec![]);
@@ -2020,5 +5428,409 @@ mod tests {
         let mut ctx = LowerCtx::new(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(code.contains("as_ref().map("), "optional chain: {code}");
+    }
+
+    fn class_names(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn lowers_new_expr_to_class_construct() {
+        let stmts = parse_stmts("const v = new EditorView({});");
+        let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["EditorView"]));
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::class::construct(&EditorView(), vec!["),
+            "new on a class → construct(&EditorView(), ...): {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_new_expr_for_plain_functions_through_construct() {
+        // Not a class and not a builtin special-case: still routed through
+        // construct() so constructor-functions-as-objects work.
+        let stmts = parse_stmts("const w = new makeWidget(1);");
+        let renames = vec![("makeWidget".to_string(), "m0_makeWidget".to_string())];
+        let mut ctx = LowerCtx::new_dynamic(renames);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::class::construct(&w3cos_core::Value::function"),
+            "new on a function value → construct: {code}"
+        );
+        // The Error special-case stays intact; Map is no longer special-cased
+        // (it routes through construct on the collections class value).
+        let stmts = parse_stmts("const m = new Map([\"a\", 1]); const e = new Error(\"x\");");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains(
+                "w3cos_core::class::construct(&w3cos_core::collections::map_class(), vec!["
+            ),
+            "new Map → construct on the collections class: {code}"
+        );
+        assert!(
+            code.contains("Error::new(vec!["),
+            "Error special-case: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_map_set_globals_to_collection_classes() {
+        let stmts = parse_stmts(
+            "const m = new Map(); const s = new Set([1]); const wm = new WeakMap(); const ws = new WeakSet(); const ok = m instanceof Map; const M = Map; const S = Set;",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        for (ctor, class_fn) in [
+            ("new Map()", "map_class"),
+            ("new Set()", "set_class"),
+            ("new WeakMap()", "weak_map_class"),
+            ("new WeakSet()", "weak_set_class"),
+        ] {
+            assert!(
+                code.contains(&format!(
+                    "w3cos_core::class::construct(&w3cos_core::collections::{class_fn}(), vec!["
+                )),
+                "{ctor} → construct on the collections class: {code}"
+            );
+        }
+        assert!(
+            code.contains(
+                "w3cos_core::class::instance_of(&m.clone(), &w3cos_core::collections::map_class())"
+            ),
+            "instanceof Map → instance_of on the collections class: {code}"
+        );
+        // Bare `Map`/`Set` references resolve to the class singletons.
+        assert!(
+            code.contains("let mut M = w3cos_core::collections::map_class();"),
+            "Map as a value: {code}"
+        );
+        assert!(
+            code.contains("let mut S = w3cos_core::collections::set_class();"),
+            "Set as a value: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_proxy_to_dynamic_runtime_constructor() {
+        let stmts =
+            parse_stmts("const p = new Proxy({}, { get(target, key) { return target[key]; } });");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::class::construct(&w3cos_core::proxy_class(), vec!["),
+            "new Proxy → dynamic proxy runtime: {code}"
+        );
+    }
+
+    #[test]
+    fn array_facade_exposes_is_array() {
+        let stmts = parse_stmts("const result = Array.isArray([]);");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("\"isArray\".to_string()")
+                && code.contains("Some(w3cos_core::Value::Array(_))"),
+            "Array.isArray must inspect the runtime Value variant: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_regexp_literals_to_runtime_values() {
+        let stmts = parse_stmts(
+            "const color = /^#?([0-9A-Fa-f]{6})$/i; const result = value.match(color);",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::regexp::create(\"^#?([0-9A-Fa-f]{6})$\", \"i\")"),
+            "regexp literal → runtime value: {code}"
+        );
+        assert!(
+            code.contains("call_method(\"match\""),
+            "reserved Rust words must remain unchanged as JS property keys: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_delete_removes_member_property() {
+        let stmts = parse_stmts("delete options.model; delete options[key];");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("options.delete_property(&\"model\")")
+                && code.contains("options.delete_property(&key.to_js_string())"),
+            "delete must perform a runtime property mutation: {code}"
+        );
+    }
+
+    #[test]
+    fn typed_array_globals_use_runtime_storage() {
+        let stmts = parse_stmts("const lines = new Uint16Array(4); lines.set([0, 2], 0);");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::collections::typed_array_class()")
+                && code.contains("call_method(\"set\""),
+            "typed arrays need indexed runtime storage: {code}"
+        );
+    }
+
+    #[test]
+    fn class_method_property_keys_keep_js_reserved_words() {
+        let statements = parse_stmts("const Matcher = class { match(value) { return value; } };");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&statements);
+        assert!(
+            code.contains("__proto.set_property(\"match\"")
+                && !code.contains("__proto.set_property(\"match_\""),
+            "Rust identifier sanitization must not alter JS property keys: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_reflect_construct_to_class_runtime() {
+        // Reflect.construct(target, args) → class::construct on the facade
+        // (Monaco's DI instantiates services through it).
+        let stmts = parse_stmts("const o = Reflect.construct(Target, [1, 2]);");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::class::construct(&__target, __ctor_args)"),
+            "Reflect.construct → class::construct facade: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_symbol_iterator_to_runtime_key() {
+        let statements = parse_stmts("const iterator = value[Symbol.iterator]();");
+        let mut context = LowerCtx::new_dynamic(vec![]);
+        let code = context.lower_stmts(&statements);
+
+        assert!(
+            code.contains("__w3cos_symbol_iterator"),
+            "well-known iterator symbol: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_reflect_feature_detection_with_balanced_facade() {
+        // DOMPurify destructures this expression at module scope. Keep the
+        // `&&` value semantics and, importantly, the inline Reflect facade's
+        // HashMap/array delimiters balanced so the generated Rust parses.
+        let stmts =
+            parse_stmts("let { apply, construct } = typeof Reflect !== 'undefined' && Reflect;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("if __l.to_bool()") && code.contains("else { __l }"),
+            "logical-and preserves the selected operand: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::class::construct(&__target, __ctor_args) }))]))"),
+            "Reflect facade closes function, tuple, array, HashMap, and object: {code}"
+        );
+        assert!(
+            !code.contains("w3cos_core::class::construct(&__target, __ctor_args) })))]))"),
+            "Reflect facade must not contain the old extra tuple delimiter: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_instanceof_through_class_runtime() {
+        let stmts = parse_stmts("const ok = dog instanceof Animal;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Animal"]));
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::class::instance_of(&dog, &Animal())"),
+            "instanceof → class::instance_of: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_class_call_without_new_via_construct() {
+        let stmts = parse_stmts("const o = Widget(1);");
+        let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Widget"]));
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::class::construct(&Widget(), vec!["),
+            "class call without new → construct: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_class_expression_with_extends_super_and_privates() {
+        let stmts = parse_stmts(
+            r#"const Dog = class Dog extends Animal {
+  #tag = "dog";
+  constructor(name, bark) { super(name); this.bark = bark; }
+  get label() { return this.name; }
+  set label(v) { this.name = v; }
+  describe() { return super.kind() + super.sound + this.#tag; }
+  static make(name) { return new Animal(name); }
+  static { this.count = 0; }
+};"#,
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Animal"]));
+        let code = ctx.lower_stmts(&stmts);
+
+        // Eagerly built class value with call slot.
+        assert!(
+            code.contains("w3cos_core::Value::callable(std::collections::HashMap::new()"),
+            "class object with call slot: {code}"
+        );
+        // Parent evaluated once, prototype chain wired.
+        assert!(code.contains("let __parent = Animal();"), "parent: {code}");
+        assert!(
+            code.contains(
+                "w3cos_core::class::set_prototype_of(&__proto, &__parent.get_property(\"prototype\"));"
+            ),
+            "proto chain: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::class::set_prototype_of(&__class, &__parent);"),
+            "static inheritance: {code}"
+        );
+        // super(...) in ctor → super_ctor; field init `this.bark` afterwards.
+        assert!(
+            code.contains("w3cos_core::class::super_ctor(&__this, &__parent, vec![name.clone()"),
+            "super ctor: {code}"
+        );
+        assert!(
+            code.contains("__this.clone().set_property(&\"bark\", __w3cos_av.clone())"),
+            "this.bark assignment: {code}"
+        );
+        // Getter/setter conventions on the prototype.
+        assert!(
+            code.contains("__proto.set_property(\"__w3cos_getter_label\""),
+            "getter install: {code}"
+        );
+        assert!(
+            code.contains("__proto.set_property(\"__w3cos_setter_label\""),
+            "setter install: {code}"
+        );
+        // super.method() / super.prop
+        assert!(
+            code.contains("w3cos_core::class::super_method(&__this, &__parent, \"kind\", vec![])"),
+            "super method: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::class::super_get(&__this, &__parent, \"sound\")"),
+            "super get: {code}"
+        );
+        // Private field mangled with the class name.
+        assert!(
+            code.contains("__w3cos_priv_Dog_tag"),
+            "private mangle: {code}"
+        );
+        // Static method installed on the class object; static block runs in place.
+        assert!(
+            code.contains("__class.set_property(\"make\""),
+            "static method: {code}"
+        );
+        assert!(
+            code.contains("__this.clone().set_property(&\"count\""),
+            "static block assignment via this = class object: {code}"
+        );
+        // constructor / prototype / raw-ctor wiring.
+        assert!(
+            code.contains("__class.set_property(\"prototype\", __proto);")
+                && code.contains("__class.set_property(\"__w3cos_ctor\", __ctor);")
+                && code.contains("__proto.set_property(\"constructor\", __class.clone());"),
+            "wiring: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_static_super_via_parent_class_object() {
+        let stmts = parse_stmts(
+            "const S = class extends Base { static go() { return super.run() + super.speed; } };",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Base"]));
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("__parent.get_property(\"run\").call(__this.clone(), vec![])")
+                || code.contains("{ let __super_fn = __parent.get_property(\"run\");"),
+            "static super call → parent class object: {code}"
+        );
+        assert!(
+            code.contains("__parent.get_property(\"speed\")"),
+            "static super read → parent class object: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_private_brand_check_via_js_in() {
+        let stmts = parse_stmts("const P = class P { #x = 1; has(o) { return #x in o; } };");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::Value::from(\"__w3cos_priv_P_x\").js_in(&o.clone())"),
+            "#x in o → mangled js_in: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_nested_class_declaration_statement() {
+        let stmts = parse_stmts(
+            "function f() { class Local { constructor() { this.ok = true; } } return new Local(); }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("let mut Local = w3cos_core::Value::Undefined;")
+                && code.contains("Local = { let __proto = "),
+            "nested class → hoisted local class value: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::class::construct(&Local.clone(), vec![])"),
+            "new on the local class: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_derived_class_expression_without_ctor_forwards_to_super() {
+        let stmts = parse_stmts("const B = class extends A { };");
+        let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["A"]));
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::class::super_ctor(&__this, &__parent, __args)"),
+            "synthesized forwarding ctor: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_this_and_member_compound_assignment_in_class_scope() {
+        let stmts =
+            parse_stmts("const C = class C { bump() { this.x += 2; this.y++; return this.x; } };");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("__obj.get_property(&\"x\").js_add(&w3cos_core::Value::Number(2.0))"),
+            "compound member assign: {code}"
+        );
+        assert!(
+            code.contains("let __w3cos_prev = __obj.get_property(&\"y\");"),
+            "member update: {code}"
+        );
+        assert!(
+            code.contains("return __this.clone().get_property(\"x\");"),
+            "this read: {code}"
+        );
+    }
+
+    #[test]
+    fn preserves_quotes_at_string_literal_boundaries() {
+        let stmts = parse_stmts(r#"const open = 'class="'; const close = '"done';"#);
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains(r#"w3cos_core::Value::from("class=\"")"#),
+            "trailing quote: {code}"
+        );
+        assert!(
+            code.contains(r#"w3cos_core::Value::from("\"done")"#),
+            "leading quote: {code}"
+        );
     }
 }

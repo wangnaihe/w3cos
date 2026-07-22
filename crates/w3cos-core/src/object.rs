@@ -5,18 +5,22 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::proxy::ProxyHandler;
-use crate::value::Value;
+use crate::value::{JsFunction, Value};
 
 /// A JavaScript-like dynamic object with string-keyed properties,
 /// prototype chain, and optional Proxy handler for trap interception.
 ///
 /// When `proxy_handler` is `Some`, property operations are routed through
 /// the corresponding trap. When `None`, direct HashMap access is used.
+///
+/// `call_slot` makes the object callable (like a JS class or function
+/// object): `Value::call` on an object with a call slot invokes it.
 pub struct JsObject {
     pub(crate) properties: HashMap<String, Value>,
     pub(crate) prototype: Option<Rc<RefCell<JsObject>>>,
     pub(crate) proxy_handler: Option<ProxyHandler>,
     has_getter_properties: bool,
+    pub(crate) call_slot: Option<JsFunction>,
 }
 
 impl JsObject {
@@ -26,6 +30,7 @@ impl JsObject {
             prototype: None,
             proxy_handler: None,
             has_getter_properties: false,
+            call_slot: None,
         }
     }
 
@@ -36,6 +41,7 @@ impl JsObject {
             prototype: None,
             proxy_handler: None,
             has_getter_properties,
+            call_slot: None,
         }
     }
 
@@ -49,7 +55,28 @@ impl JsObject {
             prototype: None,
             proxy_handler: Some(handler),
             has_getter_properties,
+            call_slot: None,
         }
+    }
+
+    /// Create a callable object (a JS class / constructor): plain properties
+    /// plus a call slot invoked by `Value::call` / `class::construct`.
+    pub fn with_call_slot(properties: HashMap<String, Value>, call: JsFunction) -> Self {
+        let has_getter_properties = properties
+            .keys()
+            .any(|key| key.starts_with("__w3cos_getter_"));
+        Self {
+            properties,
+            prototype: None,
+            proxy_handler: None,
+            has_getter_properties,
+            call_slot: Some(call),
+        }
+    }
+
+    /// The call slot, if this object is callable.
+    pub fn call_slot(&self) -> Option<&JsFunction> {
+        self.call_slot.as_ref()
     }
 
     // ── Proxy-aware property access ────────────────────────────────────
@@ -174,7 +201,24 @@ impl JsObject {
             desc.insert("configurable".into(), Value::Bool(true));
             Value::object(desc)
         } else {
-            Value::Undefined
+            // Getter/setter convention: a `__w3cos_getter_{key}` /
+            // `__w3cos_setter_{key}` own function is an accessor property
+            // named `key` (see esm_codegen class emission).
+            let getter = self.properties.get(&format!("__w3cos_getter_{key}"));
+            let setter = self.properties.get(&format!("__w3cos_setter_{key}"));
+            if getter.is_none() && setter.is_none() {
+                return Value::Undefined;
+            }
+            let mut desc = HashMap::new();
+            if let Some(getter) = getter {
+                desc.insert("get".into(), getter.clone());
+            }
+            if let Some(setter) = setter {
+                desc.insert("set".into(), setter.clone());
+            }
+            desc.insert("enumerable".into(), Value::Bool(true));
+            desc.insert("configurable".into(), Value::Bool(true));
+            Value::object(desc)
         }
     }
 
@@ -277,6 +321,7 @@ impl JsObject {
             prototype: self.prototype.clone(),
             proxy_handler: None,
             has_getter_properties: self.has_getter_properties,
+            call_slot: self.call_slot.clone(),
         };
         Value::Object(Rc::new(RefCell::new(clone)))
     }

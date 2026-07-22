@@ -35,6 +35,11 @@ pub struct CaptureDetail {
 #[derive(Debug, Default)]
 pub struct CaptureInfo {
     pub captures: HashMap<String, CaptureDetail>,
+    /// Every name that appears as a plain-identifier assignment/update target
+    /// anywhere in the analyzed body (any scope, closure or not). Used to
+    /// decide Rc<RefCell> boxing: a captured binding that is reassigned
+    /// anywhere must be shared, not clone-captured.
+    pub assigned_names: HashSet<String>,
 }
 
 impl CaptureInfo {
@@ -49,11 +54,31 @@ impl CaptureInfo {
             .map(|d| d.is_mutated_in_closure)
             .unwrap_or(false)
     }
+
+    /// Names that must be boxed as `Rc<RefCell<Value>>`: captured by a
+    /// closure AND (mutated inside a closure OR assigned anywhere). Boxing is
+    /// what lets `Fn` closures mutate captures and preserves JS live-binding
+    /// semantics for writes that happen after closure creation.
+    pub fn boxed_names(&self) -> HashSet<String> {
+        self.captures
+            .iter()
+            .filter(|(name, detail)| {
+                detail.is_mutated_in_closure || self.assigned_names.contains(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
 }
 
 struct ScopeBuilder {
     scopes: Vec<Scope>,
     current: ScopeId,
+    /// When true, `Function` scopes count as closure boundaries for capture
+    /// detection. Used by `analyze_fn_body`: a nested fn *declaration*
+    /// inside a fn body is lowered as a capturing closure value, so names
+    /// from the outer body referenced inside it are captures. Module-level
+    /// analysis keeps this off (fn declarations there do not capture).
+    fn_scopes_capture: bool,
 }
 
 impl ScopeBuilder {
@@ -67,6 +92,7 @@ impl ScopeBuilder {
         Self {
             scopes: vec![root],
             current: 0,
+            fn_scopes_capture: false,
         }
     }
 
@@ -112,7 +138,9 @@ impl ScopeBuilder {
     fn is_inside_closure(&self) -> bool {
         let mut scope_id = self.current;
         loop {
-            if self.scopes[scope_id].kind == ScopeKind::Closure {
+            let kind = self.scopes[scope_id].kind;
+            if kind == ScopeKind::Closure || (self.fn_scopes_capture && kind == ScopeKind::Function)
+            {
                 return true;
             }
             match self.scopes[scope_id].parent {
@@ -170,6 +198,24 @@ pub fn analyze(module: &Module) -> CaptureInfo {
     info
 }
 
+/// Analyze a single function body (with its parameters pre-declared in the
+/// root scope) and return capture information. Used by the ESM lowering to
+/// decide which locals of the body need `Rc<RefCell<Value>>` boxing.
+/// Nested fn declarations count as capture boundaries here (they are lowered
+/// as closure values when they reference outer locals).
+pub fn analyze_fn_body(params: &[Pat], body: &[Stmt]) -> CaptureInfo {
+    let mut builder = ScopeBuilder::new();
+    builder.fn_scopes_capture = true;
+    for param in params {
+        declare_pat(param, &mut builder);
+    }
+    let mut info = CaptureInfo::default();
+    for stmt in body {
+        analyze_stmt(stmt, &mut builder, &mut info);
+    }
+    info
+}
+
 fn analyze_module_decl(decl: &ModuleDecl, builder: &mut ScopeBuilder, info: &mut CaptureInfo) {
     match decl {
         ModuleDecl::ExportDecl(export) => analyze_decl(&export.decl, builder, info),
@@ -213,8 +259,10 @@ fn analyze_stmt(stmt: &Stmt, builder: &mut ScopeBuilder, info: &mut CaptureInfo)
         }
         Stmt::ForIn(fi) => {
             builder.push_scope(ScopeKind::Block);
-            if let ForHead::VarDecl(vd) = &fi.left {
-                analyze_var_decl(vd, builder, info);
+            match &fi.left {
+                ForHead::VarDecl(vd) => analyze_var_decl(vd, builder, info),
+                ForHead::Pat(pat) => analyze_assign_pat(pat, builder, info),
+                ForHead::UsingDecl(_) => {}
             }
             analyze_expr(&fi.right, builder, info, false);
             analyze_stmt(&fi.body, builder, info);
@@ -222,8 +270,10 @@ fn analyze_stmt(stmt: &Stmt, builder: &mut ScopeBuilder, info: &mut CaptureInfo)
         }
         Stmt::ForOf(fo) => {
             builder.push_scope(ScopeKind::Block);
-            if let ForHead::VarDecl(vd) = &fo.left {
-                analyze_var_decl(vd, builder, info);
+            match &fo.left {
+                ForHead::VarDecl(vd) => analyze_var_decl(vd, builder, info),
+                ForHead::Pat(pat) => analyze_assign_pat(pat, builder, info),
+                ForHead::UsingDecl(_) => {}
             }
             analyze_expr(&fo.right, builder, info, false);
             analyze_stmt(&fo.body, builder, info);
@@ -233,6 +283,48 @@ fn analyze_stmt(stmt: &Stmt, builder: &mut ScopeBuilder, info: &mut CaptureInfo)
             analyze_expr(&w.test, builder, info, false);
             analyze_stmt(&w.body, builder, info);
         }
+        Stmt::DoWhile(dw) => {
+            analyze_stmt(&dw.body, builder, info);
+            analyze_expr(&dw.test, builder, info, false);
+        }
+        Stmt::Switch(switch) => {
+            analyze_expr(&switch.discriminant, builder, info, false);
+            builder.push_scope(ScopeKind::Block);
+            for case in &switch.cases {
+                if let Some(test) = &case.test {
+                    analyze_expr(test, builder, info, false);
+                }
+                for s in &case.cons {
+                    analyze_stmt(s, builder, info);
+                }
+            }
+            builder.pop_scope();
+        }
+        Stmt::Try(t) => {
+            builder.push_scope(ScopeKind::Block);
+            for s in &t.block.stmts {
+                analyze_stmt(s, builder, info);
+            }
+            builder.pop_scope();
+            if let Some(handler) = &t.handler {
+                builder.push_scope(ScopeKind::Block);
+                if let Some(param) = &handler.param {
+                    declare_pat(param, builder);
+                }
+                for s in &handler.body.stmts {
+                    analyze_stmt(s, builder, info);
+                }
+                builder.pop_scope();
+            }
+            if let Some(finalizer) = &t.finalizer {
+                builder.push_scope(ScopeKind::Block);
+                for s in &finalizer.stmts {
+                    analyze_stmt(s, builder, info);
+                }
+                builder.pop_scope();
+            }
+        }
+        Stmt::Labeled(labeled) => analyze_stmt(&labeled.body, builder, info),
         Stmt::Block(block) => {
             builder.push_scope(ScopeKind::Block);
             for s in &block.stmts {
@@ -260,6 +352,15 @@ fn analyze_decl(decl: &Decl, builder: &mut ScopeBuilder, info: &mut CaptureInfo)
             }
             builder.pop_scope();
         }
+        Decl::Class(class_decl) => {
+            builder.declare(&class_decl.ident.sym);
+            // A nested class declaration lowers to an assignment into the
+            // hoisted slot: record it so a class name captured by its own
+            // methods (or by forward-referencing closures) is boxed and the
+            // binding stays live.
+            info.assigned_names.insert(class_decl.ident.sym.to_string());
+            analyze_class(&class_decl.class, builder, info);
+        }
         _ => {}
     }
 }
@@ -269,7 +370,48 @@ fn analyze_var_decl(var_decl: &VarDecl, builder: &mut ScopeBuilder, info: &mut C
         declare_pat(&decl.name, builder);
         if let Some(init) = &decl.init {
             analyze_expr(init, builder, info, false);
+            // `const id = function () { use(id) }` creates the closure before
+            // the declaration's initialization write completes. A plain
+            // clone capture therefore freezes the pre-declared Undefined
+            // value. Treat a binding captured by its own initializer as
+            // assigned so lowering gives it an Rc<RefCell> live binding.
+            let mut declared = HashSet::new();
+            collect_declared_names(&decl.name, &mut declared);
+            for name in declared {
+                if info.captures.contains_key(&name) {
+                    info.assigned_names.insert(name);
+                }
+            }
         }
+    }
+}
+
+fn collect_declared_names(pat: &Pat, names: &mut HashSet<String>) {
+    match pat {
+        Pat::Ident(ident) => {
+            names.insert(ident.id.sym.to_string());
+        }
+        Pat::Array(array) => {
+            for element in array.elems.iter().flatten() {
+                collect_declared_names(element, names);
+            }
+        }
+        Pat::Object(object) => {
+            for property in &object.props {
+                match property {
+                    ObjectPatProp::Assign(assign) => {
+                        names.insert(assign.key.sym.to_string());
+                    }
+                    ObjectPatProp::KeyValue(key_value) => {
+                        collect_declared_names(&key_value.value, names)
+                    }
+                    ObjectPatProp::Rest(rest) => collect_declared_names(&rest.arg, names),
+                }
+            }
+        }
+        Pat::Assign(assign) => collect_declared_names(&assign.left, names),
+        Pat::Rest(rest) => collect_declared_names(&rest.arg, names),
+        _ => {}
     }
 }
 
@@ -300,6 +442,9 @@ fn analyze_expr(expr: &Expr, builder: &mut ScopeBuilder, info: &mut CaptureInfo,
     match expr {
         Expr::Ident(ident) => {
             let name = ident.sym.to_string();
+            if is_write {
+                info.assigned_names.insert(name.clone());
+            }
             if let Some(decl_scope) = builder.find_declaration(&name) {
                 if builder.is_inside_closure() && builder.is_captured_from_outer(decl_scope) {
                     let closure_id = builder.current_closure_id().unwrap_or(0);
@@ -351,6 +496,9 @@ fn analyze_expr(expr: &Expr, builder: &mut ScopeBuilder, info: &mut CaptureInfo,
             analyze_expr(&assign.right, builder, info, false);
         }
         Expr::Update(update) => {
+            if let Expr::Ident(ident) = update.arg.as_ref() {
+                info.assigned_names.insert(ident.sym.to_string());
+            }
             analyze_expr(&update.arg, builder, info, true);
         }
         Expr::Bin(bin) => {
@@ -381,10 +529,36 @@ fn analyze_expr(expr: &Expr, builder: &mut ScopeBuilder, info: &mut CaptureInfo,
         }
         Expr::Object(obj) => {
             for prop in &obj.props {
-                if let PropOrSpread::Prop(p) = prop {
-                    if let Prop::KeyValue(kv) = &**p {
-                        analyze_expr(&kv.value, builder, info, false);
+                match prop {
+                    PropOrSpread::Spread(spread) => {
+                        analyze_expr(&spread.expr, builder, info, false)
                     }
+                    PropOrSpread::Prop(p) => match p.as_ref() {
+                        Prop::KeyValue(kv) => analyze_expr(&kv.value, builder, info, false),
+                        Prop::Method(method) => {
+                            analyze_function_like(&method.function, builder, info)
+                        }
+                        Prop::Getter(getter) => {
+                            builder.push_scope(ScopeKind::Closure);
+                            if let Some(body) = &getter.body {
+                                for s in &body.stmts {
+                                    analyze_stmt(s, builder, info);
+                                }
+                            }
+                            builder.pop_scope();
+                        }
+                        Prop::Setter(setter) => {
+                            builder.push_scope(ScopeKind::Closure);
+                            declare_pat(&setter.param, builder);
+                            if let Some(body) = &setter.body {
+                                for s in &body.stmts {
+                                    analyze_stmt(s, builder, info);
+                                }
+                            }
+                            builder.pop_scope();
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -415,6 +589,135 @@ fn analyze_expr(expr: &Expr, builder: &mut ScopeBuilder, info: &mut CaptureInfo,
         Expr::Await(await_expr) => {
             analyze_expr(&await_expr.arg, builder, info, false);
         }
+        Expr::OptChain(opt) => match opt.base.as_ref() {
+            OptChainBase::Member(member) => {
+                analyze_expr(&member.obj, builder, info, false);
+                if let MemberProp::Computed(c) = &member.prop {
+                    analyze_expr(&c.expr, builder, info, false);
+                }
+            }
+            OptChainBase::Call(call) => {
+                analyze_expr(&call.callee, builder, info, false);
+                for arg in &call.args {
+                    analyze_expr(&arg.expr, builder, info, false);
+                }
+            }
+        },
+        Expr::TaggedTpl(tagged) => {
+            analyze_expr(&tagged.tag, builder, info, false);
+            for e in &tagged.tpl.exprs {
+                analyze_expr(e, builder, info, false);
+            }
+        }
+        Expr::Class(class_expr) => analyze_class(&class_expr.class, builder, info),
+        _ => {}
+    }
+}
+
+/// Analyze the params + body of a function-like node (method, fn expr) as a
+/// new closure scope.
+fn analyze_function_like(function: &Function, builder: &mut ScopeBuilder, info: &mut CaptureInfo) {
+    builder.push_scope(ScopeKind::Closure);
+    for param in &function.params {
+        declare_pat(&param.pat, builder);
+    }
+    if let Some(body) = &function.body {
+        for s in &body.stmts {
+            analyze_stmt(s, builder, info);
+        }
+    }
+    builder.pop_scope();
+}
+
+/// Analyze class members (ctor, methods, fields, static blocks) for captures.
+fn analyze_class(class: &Class, builder: &mut ScopeBuilder, info: &mut CaptureInfo) {
+    if let Some(super_class) = &class.super_class {
+        analyze_expr(super_class, builder, info, false);
+    }
+    for member in &class.body {
+        match member {
+            ClassMember::Constructor(ctor) => {
+                builder.push_scope(ScopeKind::Closure);
+                for param in &ctor.params {
+                    if let ParamOrTsParamProp::Param(param) = param {
+                        declare_pat(&param.pat, builder);
+                    }
+                }
+                if let Some(body) = &ctor.body {
+                    for s in &body.stmts {
+                        analyze_stmt(s, builder, info);
+                    }
+                }
+                builder.pop_scope();
+            }
+            ClassMember::Method(method) => analyze_function_like(&method.function, builder, info),
+            ClassMember::PrivateMethod(method) => {
+                analyze_function_like(&method.function, builder, info)
+            }
+            ClassMember::ClassProp(prop) => {
+                if let Some(value) = &prop.value {
+                    analyze_expr(value, builder, info, false);
+                }
+            }
+            ClassMember::PrivateProp(prop) => {
+                if let Some(value) = &prop.value {
+                    analyze_expr(value, builder, info, false);
+                }
+            }
+            ClassMember::StaticBlock(block) => {
+                builder.push_scope(ScopeKind::Closure);
+                for s in &block.body.stmts {
+                    analyze_stmt(s, builder, info);
+                }
+                builder.pop_scope();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Record the writes performed by a destructuring assignment pattern
+/// (`[a, {b}] = ...`): every bound identifier is an assignment target.
+fn analyze_assign_pat(pat: &Pat, builder: &mut ScopeBuilder, info: &mut CaptureInfo) {
+    match pat {
+        Pat::Ident(ident) => {
+            let name = ident.id.sym.to_string();
+            info.assigned_names.insert(name.clone());
+            if let Some(decl_scope) = builder.find_declaration(&name) {
+                if builder.is_inside_closure() && builder.is_captured_from_outer(decl_scope) {
+                    let closure_id = builder.current_closure_id().unwrap_or(0);
+                    let detail = info.captures.entry(name).or_insert_with(|| CaptureDetail {
+                        captured_by: Vec::new(),
+                        is_mutated_in_closure: false,
+                    });
+                    if !detail.captured_by.contains(&closure_id) {
+                        detail.captured_by.push(closure_id);
+                    }
+                    detail.is_mutated_in_closure = true;
+                }
+            }
+        }
+        Pat::Array(arr) => {
+            for elem in arr.elems.iter().flatten() {
+                analyze_assign_pat(elem, builder, info);
+            }
+        }
+        Pat::Object(obj) => {
+            for prop in &obj.props {
+                match prop {
+                    ObjectPatProp::Assign(assign) => {
+                        info.assigned_names.insert(assign.key.sym.to_string());
+                    }
+                    ObjectPatProp::KeyValue(kv) => analyze_assign_pat(&kv.value, builder, info),
+                    ObjectPatProp::Rest(rest) => analyze_assign_pat(&rest.arg, builder, info),
+                }
+            }
+        }
+        Pat::Rest(rest) => analyze_assign_pat(&rest.arg, builder, info),
+        Pat::Assign(assign) => {
+            analyze_expr(&assign.right, builder, info, false);
+            analyze_assign_pat(&assign.left, builder, info);
+        }
         _ => {}
     }
 }
@@ -428,6 +731,7 @@ fn analyze_assign_target(
         AssignTarget::Simple(simple) => match simple {
             SimpleAssignTarget::Ident(ident) => {
                 let name = ident.sym.to_string();
+                info.assigned_names.insert(name.clone());
                 if let Some(decl_scope) = builder.find_declaration(&name) {
                     if builder.is_inside_closure() && builder.is_captured_from_outer(decl_scope) {
                         let closure_id = builder.current_closure_id().unwrap_or(0);
@@ -447,7 +751,25 @@ fn analyze_assign_target(
             }
             _ => {}
         },
-        AssignTarget::Pat(_) => {}
+        AssignTarget::Pat(pat) => match pat {
+            AssignTargetPat::Array(arr) => {
+                for elem in arr.elems.iter().flatten() {
+                    analyze_assign_pat(elem, builder, info);
+                }
+            }
+            AssignTargetPat::Object(obj) => {
+                for prop in &obj.props {
+                    match prop {
+                        ObjectPatProp::Assign(assign) => {
+                            info.assigned_names.insert(assign.key.sym.to_string());
+                        }
+                        ObjectPatProp::KeyValue(kv) => analyze_assign_pat(&kv.value, builder, info),
+                        ObjectPatProp::Rest(rest) => analyze_assign_pat(&rest.arg, builder, info),
+                    }
+                }
+            }
+            AssignTargetPat::Invalid(_) => {}
+        },
     }
 }
 
@@ -514,6 +836,23 @@ mod tests {
         assert!(
             !info.captures["name"].is_mutated_in_closure,
             "name is read-only"
+        );
+    }
+
+    #[test]
+    fn self_referential_initializer_uses_live_binding() {
+        let info = parse_and_analyze(
+            r#"
+            function createId() {
+                const id = function () { return id; };
+                return id;
+            }
+            "#,
+        );
+        assert!(info.is_captured("id"), "initializer closure captures id");
+        assert!(
+            info.boxed_names().contains("id"),
+            "the initialization write must be visible inside its own closure"
         );
     }
 

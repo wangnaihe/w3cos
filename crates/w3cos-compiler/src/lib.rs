@@ -2,6 +2,7 @@ pub mod codegen;
 pub mod css_parser;
 pub mod css_values;
 pub mod esm_codegen;
+pub mod esm_css;
 pub mod esm_lowering;
 pub mod esm_resolver;
 pub mod media_query;
@@ -194,20 +195,31 @@ fn compile_with_source_dir(
         std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
     } else {
         let output = ts_transpiler::transpile_with_flags(ts_source)?;
-        let (esm_diagnostics, esm_bundle_code) = if let Some(entry_path) = source_path {
-            match build_esm_artifacts(entry_path) {
-                Ok(artifacts) => (artifacts.diagnostics, artifacts.bundle_code),
-                Err(err) => (format!("//! ESM graph: unresolved ({err})\n\n"), None),
-            }
-        } else {
-            (String::new(), None)
-        };
+        let (esm_diagnostics, esm_bundle_code, has_esm_entry) =
+            if let Some(entry_path) = source_path {
+                match build_esm_artifacts(entry_path) {
+                    Ok(artifacts) => (
+                        artifacts.diagnostics,
+                        artifacts.bundle_code,
+                        artifacts.has_entry_main,
+                    ),
+                    Err(err) => (
+                        format!("//! ESM graph: unresolved ({err})\n\n"),
+                        None,
+                        false,
+                    ),
+                }
+            } else {
+                (String::new(), None, false)
+            };
         let esm_needs_core = esm_bundle_code
             .as_ref()
             .is_some_and(|code| code.contains("w3cos_core::"));
-        let esm_has_entry = esm_bundle_code
+        // Generated ESM bundles reference the jsdom bridge for JS globals
+        // (document/window/timers/navigator/...), so they need the runtime.
+        let esm_uses_jsdom = esm_bundle_code
             .as_ref()
-            .is_some_and(|code| code.contains("run_entry() -> w3cos_core::Value { m"));
+            .is_some_and(|code| code.contains("w3cos_runtime::jsdom"));
         let flags = CompileFlags {
             needs_hashmap: output.needs_hashmap,
             needs_async: output.needs_async,
@@ -215,9 +227,11 @@ fn compile_with_source_dir(
             needs_core: output.needs_core || esm_needs_core,
             needs_fetch: output.needs_fetch,
             needs_history: output.needs_history,
-            needs_runtime: output.code.contains("use w3cos_runtime") || esm_has_entry,
+            needs_runtime: output.code.contains("use w3cos_runtime")
+                || has_esm_entry
+                || esm_uses_jsdom,
             needs_dom: output.code.contains("use w3cos_dom"),
-            needs_std: output.code.contains("use w3cos_std") || esm_has_entry,
+            needs_std: output.code.contains("use w3cos_std") || has_esm_entry,
             needs_react_compat: esm_bundle_code
                 .as_ref()
                 .is_some_and(|code| code.contains("w3cos_react_compat::")),
@@ -229,15 +243,20 @@ fn compile_with_source_dir(
         if esm_bundle_code.is_some() {
             main_rs.push_str("mod esm_bundle;\n\n");
         }
-        let has_esm_entry = esm_bundle_code
-            .as_ref()
-            .is_some_and(|code| code.contains("run_entry() -> w3cos_core::Value { m"));
         if !has_esm_entry {
             main_rs.push_str(&output.code);
         }
         if has_esm_entry || !output.code.contains("fn main(") {
-            if has_esm_entry {
+            if has_esm_entry && flags.needs_react_compat {
                 main_rs.push_str("\nfn build_ui() -> w3cos_std::Component { w3cos_react_compat::aot::render_to_component(esm_bundle::run_entry()) }\nfn main() { if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() { if let Err(error) = w3cos_runtime::run_app(build_ui) { eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\"); } } else { let rendered = build_ui(); println!(\"W3COS_AOT_RENDER_OK nodes={}\", w3cos_react_compat::aot::component_count(&rendered)); } }\n");
+            } else if has_esm_entry {
+                // DOM-mode bundle (no React host imports): run the entry main,
+                // which registers baked-in stylesheet rules and builds the DOM.
+                // W3COS_DOM_DUMP=1 additionally prints the body's outer HTML
+                // (truncated) — the headless smoke signal for DOM apps.
+                main_rs.push_str(
+                    "\nfn main() {\n    if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() {\n        if let Err(error) = w3cos_runtime::run_app_dom(|| { esm_bundle::run_entry(); }) {\n            eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\");\n        }\n    } else {\n        esm_bundle::run_entry();\n        println!(\"W3COS_DOM_OK nodes={}\", w3cos_runtime::dom::node_count());\n        if std::env::var_os(\"W3COS_DOM_DUMP\").is_some() {\n            let html = w3cos_runtime::dom::outer_html(w3cos_runtime::dom::body_id());\n            let truncated: String = html.chars().take(8000).collect();\n            println!(\"W3COS_DOM_DUMP_BEGIN\\n{truncated}\\nW3COS_DOM_DUMP_END\");\n        }\n    }\n}\n",
+                );
             } else {
                 main_rs.push_str("\nfn main() {}\n");
             }
@@ -255,6 +274,9 @@ fn compile_with_source_dir(
 struct EsmArtifacts {
     diagnostics: String,
     bundle_code: Option<String>,
+    /// True when the bundle exports a `main` function from the entry module,
+    /// i.e. the generated `esm_bundle.rs` runs real app code via `run_entry()`.
+    has_entry_main: bool,
 }
 
 fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
@@ -267,6 +289,11 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
     let graph = resolver.build_graph_from_entry(entry_path)?;
     let parsed = resolver.parse_graph_from_entry(entry_path)?;
     let bundle = esm_resolver::EsmBundle::build(&parsed, &resolver, entry_path);
+
+    // Stylesheet collection: `.css` asset imports stay in the graph's import
+    // lists, so this is a walk over already-resolved modules. CSS problems
+    // degrade to diagnostics, never build errors.
+    let css = esm_css::collect_esm_css(&graph, &resolver);
 
     let mut diagnostics = String::new();
     diagnostics.push_str("//! ESM graph: resolved at compile time\n");
@@ -299,18 +326,31 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
             bundle.unresolved.len()
         ));
     }
+    diagnostics.push_str(&format!("//! ESM css files: {}\n", css.files));
+    diagnostics.push_str(&format!("//! ESM css rules: {}\n", css.rules.len()));
+    for warning in &css.warnings {
+        diagnostics.push_str(&format!("//! WARNING {warning}\n"));
+    }
     diagnostics.push('\n');
 
     // Only generate bundle code if there are symbols to compile.
     let bundle_code = if bundle.symbol_count() > 0 {
-        Some(esm_codegen::generate_with_bodies(&bundle))
+        Some(esm_codegen::generate_with_bodies_and_css(
+            &bundle, &css.rules,
+        ))
     } else {
         None
     };
+    let has_entry_main = bundle.symbol_count() > 0
+        && bundle
+            .symbols
+            .iter()
+            .any(|s| s.module == bundle.entry && s.original_name == "main");
 
     Ok(EsmArtifacts {
         diagnostics,
         bundle_code,
+        has_entry_main,
     })
 }
 
@@ -1082,6 +1122,50 @@ console.log("view", view);
     }
 
     #[test]
+    fn esm_bundle_with_jsdom_globals_adds_runtime_dependency() {
+        let root = std::env::temp_dir().join("w3cos_esm_jsdom_cargo_wiring");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        let app = root.join("src/app.ts");
+        std::fs::write(
+            &app,
+            r#"export function boot() {
+  const el = document.createElement("div");
+  setTimeout(() => {}, 0);
+  return el;
+}"#,
+        )
+        .unwrap();
+
+        let out = root.join("build");
+        compile_from_file(&app, &out).expect("compile_from_file should succeed");
+        let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs"))
+            .expect("esm_bundle.rs should be generated");
+        assert!(
+            bundle_rs.contains("w3cos_runtime::jsdom::document_value()"),
+            "document should map to the jsdom bridge: {bundle_rs}"
+        );
+        assert!(
+            bundle_rs.contains("w3cos_runtime::jsdom::window_value().get_property(\"setTimeout\")"),
+            "setTimeout should map to the jsdom window: {bundle_rs}"
+        );
+        // The fake builtin document must not be imported in generated modules.
+        assert!(
+            !bundle_rs.contains("console, document, parseFloat"),
+            "fake w3cos_core document must not be imported: {bundle_rs}"
+        );
+
+        let cargo_toml = std::fs::read_to_string(out.join("Cargo.toml")).unwrap();
+        assert!(
+            cargo_toml.contains("w3cos-runtime"),
+            "bundle referencing jsdom needs w3cos-runtime: {cargo_toml}"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn compile_from_file_builds_codemirror_esm_graph() {
         let root = std::env::temp_dir().join("w3cos_compile_codemirror_esm_graph");
         let _ = std::fs::remove_dir_all(&root);
@@ -1227,8 +1311,12 @@ export function keymap() {}"#,
         let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs"))
             .expect("esm_bundle.rs should be generated");
         assert!(
-            bundle_rs.contains("pub struct"),
-            "should contain struct definitions: {bundle_rs}"
+            bundle_rs.contains("__build_class"),
+            "classes should use the runtime class-factory pattern: {bundle_rs}"
+        );
+        assert!(
+            bundle_rs.contains("w3cos_core::class::construct(&EditorView()"),
+            "new EditorView() should lower to class::construct: {bundle_rs}"
         );
         assert!(
             bundle_rs.contains("EditorView"),
@@ -1244,7 +1332,8 @@ export function keymap() {}"#,
         );
         // Function bodies should be lowered, not todo!()
         assert!(
-            bundle_rs.contains("document.createElement"),
+            bundle_rs
+                .contains("w3cos_runtime::jsdom::document_value().call_method(\"createElement\""),
             "method body should be lowered: {bundle_rs}"
         );
         assert!(
@@ -1303,10 +1392,16 @@ export function keymap() {}"#,
             .expect("esm_bundle.rs should be generated");
         eprintln!("=== esm_bundle.rs stats ===");
         eprintln!("  lines: {}", bundle_rs.lines().count());
-        eprintln!("  structs: {}", bundle_rs.matches("pub struct").count());
+        eprintln!(
+            "  class factories: {}",
+            bundle_rs.matches("__build_class").count()
+        );
         eprintln!("  fns: {}", bundle_rs.matches("pub fn").count());
 
-        assert!(bundle_rs.contains("pub struct"), "should have struct defs");
+        assert!(
+            bundle_rs.contains("__build_class"),
+            "should use the runtime class-factory pattern"
+        );
         assert!(bundle_rs.contains("pub fn"), "should have fn defs");
         assert!(
             bundle_rs.contains("EditorState"),
@@ -1314,5 +1409,118 @@ export function keymap() {}"#,
         );
 
         eprintln!("=== real @codemirror/state compilation: SUCCESS ===");
+    }
+
+    #[test]
+    fn esm_css_import_baked_into_bundle_and_dom_main() {
+        let root = std::env::temp_dir().join("w3cos_esm_css_dom_main");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"import "./style.css";
+export function main() {
+  const el = document.createElement("div");
+  return el;
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/style.css"),
+            ".app { color: #ff0000; width: 10px; }\n.outer .inner { position: absolute; }",
+        )
+        .unwrap();
+
+        let out = root.join("build");
+        compile_from_file(&root.join("src/app.ts"), &out).expect("compile should succeed");
+
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains("ESM css files: 1"),
+            "missing css diagnostics: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("ESM css rules: 2"),
+            "missing css rule count: {main_rs}"
+        );
+        // Non-React bundle → DOM-mode main, not the React one.
+        assert!(
+            main_rs.contains("W3COS_DOM_OK nodes="),
+            "missing DOM-mode main: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("w3cos_runtime::run_app_dom"),
+            "missing run_app_dom glue: {main_rs}"
+        );
+        assert!(
+            !main_rs.contains("W3COS_AOT_RENDER_OK"),
+            "non-React bundle must not get the React main: {main_rs}"
+        );
+
+        let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs")).unwrap();
+        assert!(
+            bundle_rs.contains("pub fn register_styles()"),
+            "missing register_styles: {bundle_rs}"
+        );
+        assert!(
+            bundle_rs.contains(
+                "w3cos_runtime::stylesheet::register_rule(\".app\", &[(\"color\", \"#ff0000\"), (\"width\", \"10px\")]);"
+            ),
+            "missing baked rule: {bundle_rs}"
+        );
+        assert!(
+            bundle_rs.contains("register_rule(\".outer .inner\""),
+            "descendant selector text must survive: {bundle_rs}"
+        );
+        assert!(
+            bundle_rs.contains("pub fn run_entry() -> w3cos_core::Value { register_styles();"),
+            "run_entry must register styles first: {bundle_rs}"
+        );
+
+        let cargo_toml = std::fs::read_to_string(out.join("Cargo.toml")).unwrap();
+        assert!(
+            cargo_toml.contains("w3cos-runtime"),
+            "DOM-mode bundle needs w3cos-runtime: {cargo_toml}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn esm_react_bundle_keeps_react_main() {
+        let root = std::env::temp_dir().join("w3cos_esm_react_main");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"import { useState } from "react";
+export function main() {
+  const state = useState();
+  return state;
+}"#,
+        )
+        .unwrap();
+
+        let react = root.join("node_modules/react");
+        std::fs::create_dir_all(&react).unwrap();
+        std::fs::write(react.join("package.json"), r#"{"main":"index.js"}"#).unwrap();
+        std::fs::write(react.join("index.js"), "export function useState() {}").unwrap();
+
+        let out = root.join("build");
+        compile_from_file(&root.join("src/app.ts"), &out).expect("compile should succeed");
+
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains("W3COS_AOT_RENDER_OK"),
+            "React bundle must keep the React main: {main_rs}"
+        );
+        assert!(
+            !main_rs.contains("W3COS_DOM_OK"),
+            "React bundle must not get the DOM main: {main_rs}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

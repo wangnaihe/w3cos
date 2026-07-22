@@ -1,5 +1,8 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::object::JsObject;
 use crate::value::Value;
 
 type TrapGetFn = dyn Fn(&Value, &str, &Value) -> Value;
@@ -157,5 +160,150 @@ impl ProxyBuilder {
 impl Default for ProxyBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The dynamic `Proxy` constructor used by ESM-lowered code.
+///
+/// Handler properties are ordinary JavaScript function values. The native
+/// proxy callbacks forward operations to those functions while retaining the
+/// original target value supplied to `new Proxy(target, handler)`.
+pub fn proxy_class() -> Value {
+    Value::callable(HashMap::new(), |_this, args| {
+        let target = args.first().cloned().unwrap_or(Value::Undefined);
+        let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
+        create_dynamic_proxy(target, handler)
+    })
+}
+
+fn create_dynamic_proxy(target: Value, handler: Value) -> Value {
+    let mut properties = HashMap::new();
+    if let Value::Object(object) = &target {
+        let object = object.borrow();
+        for key in object.keys() {
+            properties.insert(key.clone(), object.get_direct(&key));
+        }
+    }
+
+    let mut traps = ProxyHandler::new();
+
+    let get = handler.get_property("get");
+    if get.is_function() || get.is_object() {
+        let original_target = target.clone();
+        let handler = handler.clone();
+        traps.get = Some(Rc::new(move |_snapshot, key, receiver| {
+            get.call(
+                handler.clone(),
+                vec![
+                    original_target.clone(),
+                    Value::String(key.to_string()),
+                    receiver.clone(),
+                ],
+            )
+        }));
+    }
+
+    let set = handler.get_property("set");
+    if set.is_function() || set.is_object() {
+        let original_target = target.clone();
+        let handler = handler.clone();
+        traps.set = Some(Rc::new(move |_snapshot, key, value, receiver| {
+            set.call(
+                handler.clone(),
+                vec![
+                    original_target.clone(),
+                    Value::String(key.to_string()),
+                    value,
+                    receiver.clone(),
+                ],
+            )
+            .to_bool()
+        }));
+    }
+
+    let has = handler.get_property("has");
+    if has.is_function() || has.is_object() {
+        let original_target = target.clone();
+        let handler = handler.clone();
+        traps.has = Some(Rc::new(move |_snapshot, key| {
+            has.call(
+                handler.clone(),
+                vec![original_target.clone(), Value::String(key.to_string())],
+            )
+            .to_bool()
+        }));
+    }
+
+    let delete_property = handler.get_property("deleteProperty");
+    if delete_property.is_function() || delete_property.is_object() {
+        let original_target = target.clone();
+        let handler = handler.clone();
+        traps.delete_property = Some(Rc::new(move |_snapshot, key| {
+            delete_property
+                .call(
+                    handler.clone(),
+                    vec![original_target.clone(), Value::String(key.to_string())],
+                )
+                .to_bool()
+        }));
+    }
+
+    let get_prototype_of = handler.get_property("getPrototypeOf");
+    if get_prototype_of.is_function() || get_prototype_of.is_object() {
+        let original_target = target;
+        let handler = handler.clone();
+        traps.get_prototype_of = Some(Rc::new(move |_snapshot| {
+            get_prototype_of.call(handler.clone(), vec![original_target.clone()])
+        }));
+    }
+
+    Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+        properties, traps,
+    ))))
+}
+
+#[cfg(test)]
+mod dynamic_tests {
+    use super::*;
+    use crate::class;
+
+    #[test]
+    fn dynamic_proxy_forwards_get_set_and_get_prototype_of() {
+        let target = Value::object(HashMap::from([("answer".into(), Value::Number(41.0))]));
+        let prototype = Value::object(HashMap::new());
+        let stored = Rc::new(RefCell::new(Value::Undefined));
+        let stored_for_set = stored.clone();
+        let stored_for_get = stored.clone();
+        let prototype_for_trap = prototype.clone();
+        let handler = Value::object(HashMap::from([
+            (
+                "get".into(),
+                Value::function(move |_, args| {
+                    let key = args.get(1).cloned().unwrap_or_default().to_js_string();
+                    if key == "stored" {
+                        stored_for_get.borrow().clone()
+                    } else {
+                        args.first().cloned().unwrap_or_default().get_property(&key)
+                    }
+                }),
+            ),
+            (
+                "set".into(),
+                Value::function(move |_, args| {
+                    *stored_for_set.borrow_mut() = args.get(2).cloned().unwrap_or_default();
+                    Value::Bool(true)
+                }),
+            ),
+            (
+                "getPrototypeOf".into(),
+                Value::function(move |_, _| prototype_for_trap.clone()),
+            ),
+        ]));
+
+        let proxy = class::construct(&proxy_class(), vec![target, handler]);
+        assert_eq!(proxy.get_property("answer").to_number(), 41.0);
+        proxy.set_property("stored", Value::Number(42.0));
+        assert_eq!(proxy.get_property("stored").to_number(), 42.0);
+        assert!(class::get_prototype_of(&proxy).strict_eq(&prototype));
     }
 }

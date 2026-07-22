@@ -33,11 +33,20 @@ impl BuiltinObject {
                 .into_iter()
                 .max_by(|left, right| left.to_number().total_cmp(&right.to_number()))
                 .unwrap_or(Value::Number(f64::NEG_INFINITY)),
-            (BuiltinKind::Math, "floor") => unary_number(arguments, f64::floor),
-            (BuiltinKind::Math, "ceil") => unary_number(arguments, f64::ceil),
-            (BuiltinKind::Math, "round") => unary_number(arguments, f64::round),
-            (BuiltinKind::Math, "trunc") => unary_number(arguments, f64::trunc),
-            (BuiltinKind::Math, "abs") => unary_number(arguments, f64::abs),
+            (BuiltinKind::Math, "abs") => unary_math(arguments, f64::abs),
+            (BuiltinKind::Math, "floor") => unary_math(arguments, f64::floor),
+            (BuiltinKind::Math, "ceil") => unary_math(arguments, f64::ceil),
+            (BuiltinKind::Math, "round") => unary_math(arguments, js_round),
+            (BuiltinKind::Math, "trunc") => unary_math(arguments, f64::trunc),
+            (BuiltinKind::Math, "sqrt") => unary_math(arguments, f64::sqrt),
+            (BuiltinKind::Math, "log") => unary_math(arguments, f64::ln),
+            (BuiltinKind::Math, "log2") => unary_math(arguments, f64::log2),
+            (BuiltinKind::Math, "exp") => unary_math(arguments, f64::exp),
+            (BuiltinKind::Math, "sin") => unary_math(arguments, f64::sin),
+            (BuiltinKind::Math, "cos") => unary_math(arguments, f64::cos),
+            (BuiltinKind::Math, "tan") => unary_math(arguments, f64::tan),
+            (BuiltinKind::Math, "pow") => binary_math(arguments, f64::powf),
+            (BuiltinKind::Math, "atan2") => binary_math(arguments, f64::atan2),
             (BuiltinKind::Object, "is") => Value::Bool(
                 arguments
                     .first()
@@ -56,7 +65,19 @@ impl BuiltinObject {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| Value::array(Vec::new())),
-            (BuiltinKind::Console, _) => Value::Undefined,
+            (BuiltinKind::Console, _) => {
+                // Debug channel for compiled apps: W3COS_JS_CONSOLE=1 makes
+                // console.* print to stderr (production default stays silent).
+                if std::env::var_os("W3COS_JS_CONSOLE").is_some() {
+                    let line = arguments
+                        .iter()
+                        .map(Value::to_js_string)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    eprintln!("[js.console.{key}] {line}");
+                }
+                Value::Undefined
+            }
             (BuiltinKind::Document, "createElement") => dom_element(),
             _ => Value::Undefined,
         }
@@ -70,12 +91,26 @@ impl BuiltinObject {
     }
 }
 
-fn unary_number(arguments: Vec<Value>, operation: fn(f64) -> f64) -> Value {
+fn unary_math(arguments: Vec<Value>, operation: fn(f64) -> f64) -> Value {
     Value::Number(operation(
         arguments.first().map(Value::to_number).unwrap_or(f64::NAN),
     ))
 }
 
+fn binary_math(arguments: Vec<Value>, operation: fn(f64, f64) -> f64) -> Value {
+    Value::Number(operation(
+        arguments.first().map(Value::to_number).unwrap_or(f64::NAN),
+        arguments.get(1).map(Value::to_number).unwrap_or(f64::NAN),
+    ))
+}
+
+fn js_round(value: f64) -> f64 {
+    if !value.is_finite() || value == 0.0 {
+        value
+    } else {
+        (value + 0.5).floor()
+    }
+}
 fn object_keys(value: &Value) -> Value {
     match value {
         Value::Object(object) => Value::array(
@@ -172,6 +207,31 @@ pub fn ErrorValue(arguments: Vec<Value>) -> Value {
 
 pub struct Map;
 
+/// The key for the JS `Map` builtin: SameValueZero semantics — primitive
+/// values by (type-tagged) value, objects/arrays/functions by reference
+/// identity (Rc pointer).
+fn map_key(value: &Value) -> String {
+    match value {
+        Value::Undefined => "u:".to_string(),
+        Value::Null => "z:".to_string(),
+        Value::Bool(b) => format!("b:{b}"),
+        // Canonicalize -0 to +0 (SameValueZero) and let all NaNs share a key.
+        Value::Number(n) => {
+            if n.is_nan() {
+                "n:NaN".to_string()
+            } else if *n == 0.0 {
+                "n:0".to_string()
+            } else {
+                format!("n:{n}")
+            }
+        }
+        Value::String(s) => format!("s:{s}"),
+        Value::Array(rc) => format!("a:{:p}", std::rc::Rc::as_ptr(rc)),
+        Value::Object(rc) => format!("o:{:p}", std::rc::Rc::as_ptr(rc)),
+        Value::Function(f) => format!("f:{:#x}", f.identity()),
+    }
+}
+
 impl Map {
     pub fn new(arguments: Vec<Value>) -> Value {
         let mut initial = HashMap::<String, Value>::new();
@@ -203,10 +263,7 @@ impl Map {
             map.set_property(
                 "get",
                 Value::function(move |_, arguments| {
-                    let key = arguments
-                        .first()
-                        .map(Value::to_js_string)
-                        .unwrap_or_default();
+                    let key = arguments.first().map(map_key).unwrap_or_default();
                     values
                         .borrow()
                         .get(&key)
@@ -220,10 +277,7 @@ impl Map {
             map.set_property(
                 "set",
                 Value::function(move |map, arguments| {
-                    let key = arguments
-                        .first()
-                        .map(Value::to_js_string)
-                        .unwrap_or_default();
+                    let key = arguments.first().map(map_key).unwrap_or_default();
                     let value = arguments.get(1).cloned().unwrap_or(Value::Undefined);
                     values.borrow_mut().insert(key, value);
                     sync_map_size(&map, values.borrow().len());
@@ -236,10 +290,7 @@ impl Map {
             map.set_property(
                 "has",
                 Value::function(move |_, arguments| {
-                    let key = arguments
-                        .first()
-                        .map(Value::to_js_string)
-                        .unwrap_or_default();
+                    let key = arguments.first().map(map_key).unwrap_or_default();
                     Value::Bool(values.borrow().contains_key(&key))
                 }),
             );
@@ -294,6 +345,70 @@ fn map_values_snapshot(values: &HashMap<String, Value>) -> Value {
 
 fn sync_map_size(map: &Value, len: usize) {
     map.set_property("size", Value::Number(len as f64));
+}
+
+pub struct Set;
+
+impl Set {
+    pub fn new(arguments: Vec<Value>) -> Value {
+        let values = std::rc::Rc::new(std::cell::RefCell::new(HashMap::<String, Value>::new()));
+        if let Some(iterable) = arguments.first() {
+            for item in iterable.iter() {
+                values.borrow_mut().insert(map_key(&item), item);
+            }
+        }
+        let set = Value::object(HashMap::new());
+        {
+            let values = values.clone();
+            let set_reference = set.clone();
+            set.set_property(
+                "add",
+                Value::function(move |_, arguments| {
+                    let item = arguments.first().cloned().unwrap_or(Value::Undefined);
+                    values.borrow_mut().insert(map_key(&item), item);
+                    set_reference.set_property("size", Value::Number(values.borrow().len() as f64));
+                    set_reference.clone()
+                }),
+            );
+        }
+        {
+            let values = values.clone();
+            set.set_property(
+                "has",
+                Value::function(move |_, arguments| {
+                    let key = arguments.first().map(map_key).unwrap_or_default();
+                    Value::Bool(values.borrow().contains_key(&key))
+                }),
+            );
+        }
+        {
+            let values = values.clone();
+            let set_reference = set.clone();
+            set.set_property(
+                "delete",
+                Value::function(move |_, arguments| {
+                    let key = arguments.first().map(map_key).unwrap_or_default();
+                    let removed = values.borrow_mut().remove(&key).is_some();
+                    set_reference.set_property("size", Value::Number(values.borrow().len() as f64));
+                    Value::Bool(removed)
+                }),
+            );
+        }
+        {
+            let values = values.clone();
+            let set_reference = set.clone();
+            set.set_property(
+                "clear",
+                Value::function(move |_, _| {
+                    values.borrow_mut().clear();
+                    set_reference.set_property("size", Value::Number(0.0));
+                    Value::Undefined
+                }),
+            );
+        }
+        set.set_property("size", Value::Number(values.borrow().len() as f64));
+        set
+    }
 }
 
 pub struct ResizeObserver {
@@ -489,7 +604,7 @@ pub fn dispatch_resize_observers_bounded(
 }
 
 #[cfg(test)]
-mod tests {
+mod monaco_tests {
     use super::*;
 
     #[test]
@@ -594,5 +709,26 @@ mod tests {
         assert_eq!(dispatch_resize_observers_bounded(&sizes, 4), (false, false));
         assert_eq!(&*deliveries.borrow(), &[4, 2]);
         observer.call_method("disconnect", vec![]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn math_round_and_common_numeric_methods() {
+        assert_eq!(
+            Math.call_method("round", vec![Value::Number(19.6)]),
+            Value::Number(20.0)
+        );
+        assert_eq!(
+            Math.call_method("floor", vec![Value::Number(19.9)]),
+            Value::Number(19.0)
+        );
+        assert_eq!(
+            Math.call_method("pow", vec![Value::Number(3.0), Value::Number(2.0)]),
+            Value::Number(9.0)
+        );
     }
 }
