@@ -1,4 +1,5 @@
 use w3cos_std::color::Color;
+use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
     AlignItems, Contain, Dimension, Display, Edges, FlexDirection, FlexWrap, JustifyContent,
     Overflow, Position, Spacing, Style, WillChange,
@@ -67,28 +68,48 @@ impl CSSStyleDeclaration {
                 }
             }
             "padding-top" | "paddingTop" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.padding.top = Spacing::Px(v)
+                if let Some(v) = parse_edge_spacing(value, SafeAreaEdge::Top, "top") {
+                    self.inner.padding.top = v
                 }
             }
             "padding-right" | "paddingRight" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.padding.right = Spacing::Px(v)
+                if let Some(v) = parse_edge_spacing(value, SafeAreaEdge::Right, "right") {
+                    self.inner.padding.right = v
                 }
             }
             "padding-bottom" | "paddingBottom" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.padding.bottom = Spacing::Px(v)
+                if let Some(v) = parse_edge_spacing(value, SafeAreaEdge::Bottom, "bottom") {
+                    self.inner.padding.bottom = v
                 }
             }
             "padding-left" | "paddingLeft" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.padding.left = Spacing::Px(v)
+                if let Some(v) = parse_edge_spacing(value, SafeAreaEdge::Left, "left") {
+                    self.inner.padding.left = v
                 }
             }
             "margin" => {
                 if let Some(v) = parse_px(value) {
                     self.inner.margin = Edges::all(v)
+                }
+            }
+            "margin-top" | "marginTop" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.margin.top = Spacing::Px(v)
+                }
+            }
+            "margin-right" | "marginRight" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.margin.right = Spacing::Px(v)
+                }
+            }
+            "margin-bottom" | "marginBottom" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.margin.bottom = Spacing::Px(v)
+                }
+            }
+            "margin-left" | "marginLeft" => {
+                if let Some(v) = parse_px(value) {
+                    self.inner.margin.left = Spacing::Px(v)
                 }
             }
 
@@ -109,12 +130,21 @@ impl CSSStyleDeclaration {
                 }
             }
 
-            "overflow" => self.inner.overflow = parse_overflow(value),
+            "overflow" | "overflow-y" | "overflowY" => self.inner.overflow = parse_overflow(value),
+            "overflow-anchor" | "overflowAnchor" => {
+                self.inner.overflow_anchor = !value.trim().eq_ignore_ascii_case("none")
+            }
 
             "background" | "background-color" | "backgroundColor" => {
-                self.inner.background = Color::from_hex(value)
+                if let Some(color) = Color::from_css(value) {
+                    self.inner.background = color
+                }
             }
-            "color" => self.inner.color = Color::from_hex(value),
+            "color" => {
+                if let Some(color) = Color::from_css(value) {
+                    self.inner.color = color
+                }
+            }
             "font-size" | "fontSize" => {
                 if let Some(v) = parse_px(value) {
                     self.inner.font_size = v
@@ -135,7 +165,11 @@ impl CSSStyleDeclaration {
                     self.inner.border_width = v
                 }
             }
-            "border-color" | "borderColor" => self.inner.border_color = Color::from_hex(value),
+            "border-color" | "borderColor" => {
+                if let Some(color) = Color::from_css(value) {
+                    self.inner.border_color = color
+                }
+            }
             "opacity" => {
                 if let Ok(v) = value.parse() {
                     self.inner.opacity = v
@@ -177,8 +211,11 @@ impl CSSStyleDeclaration {
             "text-align" | "textAlign" => self.inner.text_align = parse_text_align(value),
             "white-space" | "whiteSpace" => self.inner.white_space = parse_white_space(value),
             "line-height" | "lineHeight" => {
-                if let Ok(v) = value.trim().trim_end_matches("px").parse() {
-                    self.inner.line_height = v;
+                let value = value.trim();
+                if let Some(px) = value.strip_suffix("px").and_then(|v| v.parse::<f32>().ok()) {
+                    self.inner.line_height = (px / self.inner.font_size.max(1.0)).max(0.0);
+                } else if let Ok(v) = value.parse::<f32>() {
+                    self.inner.line_height = v.max(0.0);
                 }
             }
             "letter-spacing" | "letterSpacing" => {
@@ -227,7 +264,11 @@ impl CSSStyleDeclaration {
                     self.inner.outline_width = v
                 }
             }
-            "outline-color" | "outlineColor" => self.inner.outline_color = Color::from_hex(value),
+            "outline-color" | "outlineColor" => {
+                if let Some(color) = Color::from_css(value) {
+                    self.inner.outline_color = color
+                }
+            }
             "outline-style" | "outlineStyle" => {
                 self.inner.outline_style = parse_outline_style(value)
             }
@@ -276,6 +317,31 @@ impl CSSStyleDeclaration {
     pub fn to_style(&self) -> Style {
         self.inner.clone()
     }
+}
+
+fn parse_edge_spacing(value: &str, edge: SafeAreaEdge, css_edge: &str) -> Option<Spacing> {
+    let value = value.trim();
+    let environment = format!("env(safe-area-inset-{css_edge})");
+    if value == environment {
+        return Some(Spacing::SafeAreaInset(edge));
+    }
+    if let Some(inner) = value
+        .strip_prefix("calc(")
+        .and_then(|value| value.strip_suffix(')'))
+        && let Some(px) = inner
+            .replace(&environment, "")
+            .replace('+', "")
+            .trim()
+            .strip_suffix("px")
+            .and_then(|value| value.trim().parse().ok())
+    {
+        return Some(Spacing::Composite {
+            px,
+            safe_area: Some(edge),
+            keyboard_inset: false,
+        });
+    }
+    parse_px(value).map(Spacing::Px)
 }
 
 impl Default for CSSStyleDeclaration {

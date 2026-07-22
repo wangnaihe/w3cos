@@ -40,7 +40,7 @@ pub fn write_mobile_project(
     Ok(())
 }
 
-pub fn write_mobile_react_project(
+pub fn write_mobile_dom_project(
     bundle: &str,
     output_dir: &Path,
     platform: &str,
@@ -50,22 +50,29 @@ pub fn write_mobile_react_project(
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir.join("src"))?;
     std::fs::write(output_dir.join("src/esm_bundle.rs"), bundle)?;
-    let body = r#"use w3cos_std::Component;
-
-pub fn build_ui() -> Component {
-    w3cos_react_compat::aot::render_to_component(crate::esm_bundle::run_entry())
+    let body = r#"pub fn setup() {
+    if w3cos_runtime::dom::get_element_by_id("root").is_none() {
+        let root = w3cos_runtime::dom::create_element("div");
+        w3cos_runtime::dom::set_attribute(root, "id", "root");
+        w3cos_runtime::dom::append_child(w3cos_runtime::dom::body_id(), root);
+    }
+    crate::esm_bundle::run_entry();
 }
 "#;
     if platform == "ios" {
         std::fs::write(output_dir.join("src/app_ui.rs"), body)?;
         std::fs::write(
             output_dir.join("src/layout_export.rs"),
-            generate_react_layout_export(safe_area),
+            generate_dom_layout_export(safe_area),
         )?;
-        let main = generate_ios_main(safe_area, interactive_widget)?.replacen(
-            "mod app_ui;",
-            "mod esm_bundle;\nmod app_ui;",
-            1,
+        let safe_init = if safe_area {
+            "    w3cos_std::safe_area::set_enabled(true);\n"
+        } else {
+            ""
+        };
+        let viewport_init = gen_viewport_init(interactive_widget);
+        let main = format!(
+            "//! Auto-generated iOS DOM app — do not edit.\nmod esm_bundle;\nmod app_ui;\n\nfn main() {{\n{safe_init}{viewport_init}    if let Err(error) = w3cos_mobile::run_mobile_app_dom(app_ui::setup) {{\n        eprintln!(\"w3cos iOS DOM app failed: {{error:#}}\");\n    }}\n}}\n"
         );
         std::fs::write(output_dir.join("src/main.rs"), main)?;
         std::fs::write(
@@ -73,11 +80,11 @@ pub fn build_ui() -> Component {
             generate_ios_cargo_toml(options)?,
         )?;
     } else {
-        let body = format!("mod esm_bundle;\n{body}");
-        std::fs::write(
-            output_dir.join("src/lib.rs"),
-            generate_android_lib(&body, interactive_widget)?,
-        )?;
+        let viewport_init = gen_viewport_init(interactive_widget);
+        let lib = format!(
+            "//! Auto-generated Android DOM app — do not edit.\nmod esm_bundle;\n{body}\n#[unsafe(no_mangle)]\npub extern \"C\" fn w3cos_app_run() -> i32 {{\n    match w3cos_mobile::run_mobile_app_dom(setup) {{\n        Ok(()) => 0,\n        Err(error) => {{ eprintln!(\"w3cos_app_run failed: {{error:#}}\"); 1 }}\n    }}\n}}\n\n#[cfg(target_os = \"android\")]\n#[unsafe(no_mangle)]\nfn android_main(app: winit::platform::android::activity::AndroidApp) {{\n    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info));\n{viewport_init}    if let Err(error) = w3cos_runtime::run_app_on_android_dom(app, setup) {{\n        log::error!(\"android_main failed: {{error:#}}\");\n    }}\n}}\n"
+        );
+        std::fs::write(output_dir.join("src/lib.rs"), lib)?;
         std::fs::write(
             output_dir.join("Cargo.toml"),
             generate_android_cargo_toml(options)?,
@@ -86,14 +93,14 @@ pub fn build_ui() -> Component {
     Ok(())
 }
 
-fn generate_react_layout_export(safe_area: bool) -> String {
+fn generate_dom_layout_export(safe_area: bool) -> String {
     let safe_init = if safe_area {
         "    w3cos_std::safe_area::set_enabled(true);\n"
     } else {
         ""
     };
     format!(
-        "mod esm_bundle;\nmod app_ui;\nfn main() {{\n{safe_init}    let root = app_ui::build_ui();\n    let layout = w3cos_runtime::layout::compute(&root, 402.0, 874.0).expect(\"layout compute\");\n    println!(\"{{}}\", serde_json::json!({{\"nodes\": layout.len()}}));\n}}\n"
+        "mod esm_bundle;\nmod app_ui;\nfn main() {{\n{safe_init}    app_ui::setup();\n    println!(\"{{}}\", serde_json::json!({{\"nodes\": w3cos_runtime::dom::node_count()}}));\n}}\n"
     )
 }
 
@@ -268,13 +275,11 @@ fn deps_block(root: &Path, options: &CompileOptions) -> String {
 w3cos-runtime = {{ path = "{runtime}"{runtime_features} }}
 w3cos-std = {{ path = "{std}" }}
 w3cos-core = {{ path = "{core}" }}
-w3cos-react-compat = {{ path = "{react}" }}
 log = "0.4""#,
         mobile = root.join("crates/w3cos-mobile").display(),
         runtime = root.join("crates/w3cos-runtime").display(),
         std = root.join("crates/w3cos-std").display(),
         core = root.join("crates/w3cos-core").display(),
-        react = root.join("crates/w3cos-react-compat").display(),
     )
 }
 

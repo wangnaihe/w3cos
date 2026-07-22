@@ -33,6 +33,23 @@ pub fn run_mobile_app(builder: fn() -> Component) -> Result<()> {
     }
 }
 
+/// Run a mobile application backed by the dynamic W3C DOM.
+pub fn run_mobile_app_dom(setup: fn()) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        // NativeActivity supplies its AndroidApp through `android_main`; this
+        // function is used by iOS and desktop entry points.
+        return w3cos_runtime::run_app_dom(setup);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        #[cfg(target_os = "ios")]
+        w3cos_std::safe_area::set_enabled(true);
+        w3cos_runtime::run_app_dom(setup)
+    }
+}
+
 /// C ABI entry for Android shell (`templates/android` loads `libw3cos_mobile.so`).
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]

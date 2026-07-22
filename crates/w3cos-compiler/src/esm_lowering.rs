@@ -73,6 +73,9 @@ pub struct LowerCtx {
     break_labels: Vec<String>,
     /// JS label name → Rust label for labeled statements in scope.
     named_labels: Vec<(String, String)>,
+    /// Subset of `named_labels` that target loops and are therefore legal
+    /// `continue` destinations in Rust as well as JavaScript.
+    named_loop_labels: Vec<(String, String)>,
     /// A JS label to attach to the next loop lowered (set by Stmt::Labeled).
     pending_loop_label: Option<String>,
 }
@@ -97,6 +100,7 @@ impl LowerCtx {
             loop_labels: Vec::new(),
             break_labels: Vec::new(),
             named_labels: Vec::new(),
+            named_loop_labels: Vec::new(),
             pending_loop_label: None,
         }
     }
@@ -120,6 +124,7 @@ impl LowerCtx {
             loop_labels: Vec::new(),
             break_labels: Vec::new(),
             named_labels: Vec::new(),
+            named_loop_labels: Vec::new(),
             pending_loop_label: None,
         }
     }
@@ -146,6 +151,7 @@ impl LowerCtx {
             loop_labels: Vec::new(),
             break_labels: Vec::new(),
             named_labels: Vec::new(),
+            named_loop_labels: Vec::new(),
             pending_loop_label: None,
         }
     }
@@ -160,6 +166,12 @@ impl LowerCtx {
     /// namespace accessor call `ns_fn()`, yielding the namespace object).
     pub fn with_namespaces(mut self, namespace_names: HashSet<String>) -> Self {
         self.namespace_names = namespace_names;
+        self
+    }
+
+    /// Enter a normal JavaScript function call scope with dynamic `this`.
+    pub fn with_function_this(mut self) -> Self {
+        self.this_name = Some("__this".to_string());
         self
     }
 
@@ -270,7 +282,12 @@ impl LowerCtx {
             && self.renames.iter().any(|(local, _)| local == name)
             && !self.value_bindings.contains(name)
         {
-            format!("w3cos_core::Value::function(move |_this, __args| {resolved}(__args))")
+            // Top-level JS function declarations are objects with stable
+            // identity: properties written through `Fn.prototype` must be
+            // visible to a later `new Fn()`. The generated `_value()`
+            // accessor interns that callable instead of allocating a fresh
+            // Value for every reference.
+            format!("{resolved}_value()")
         } else if self.dynamic_values
             && !self.renames.iter().any(|(local, _)| local == name)
             && let Some(global) = global_value_expr(name)
@@ -616,11 +633,21 @@ impl LowerCtx {
                             .map(|(_, rust)| rust.clone());
                         match rust {
                             Some(rust) => format!("{}break '{rust};", self.pad()),
+                            None if !self.try_flow_stack.is_empty() => format!(
+                                "{}return {}::Break({js:?});",
+                                self.pad(),
+                                self.try_flow_stack.last().expect("checked above")
+                            ),
                             None => format!("{}break; /* unresolved label {js} */", self.pad()),
                         }
                     }
                     None => match self.break_labels.last() {
                         Some(rust) => format!("{}break '{rust};", self.pad()),
+                        None if !self.try_flow_stack.is_empty() => format!(
+                            "{}return {}::Break(\"\");",
+                            self.pad(),
+                            self.try_flow_stack.last().expect("checked above")
+                        ),
                         None => format!("{}break;", self.pad()),
                     },
                 }
@@ -633,13 +660,18 @@ impl LowerCtx {
                     Some(label) => {
                         let js = atom_str(&label.sym);
                         let rust = self
-                            .named_labels
+                            .named_loop_labels
                             .iter()
                             .rev()
                             .find(|(name, _)| name == &js)
                             .map(|(_, rust)| rust.clone());
                         match rust {
                             Some(rust) => format!("{}continue '{rust};", self.pad()),
+                            None if !self.try_flow_stack.is_empty() => format!(
+                                "{}return {}::Continue({js:?});",
+                                self.pad(),
+                                self.try_flow_stack.last().expect("checked above")
+                            ),
                             None => {
                                 format!("{}continue; /* unresolved label {js} */", self.pad())
                             }
@@ -647,6 +679,11 @@ impl LowerCtx {
                     }
                     None => match self.loop_labels.last() {
                         Some(rust) => format!("{}continue '{rust};", self.pad()),
+                        None if !self.try_flow_stack.is_empty() => format!(
+                            "{}return {}::Continue(\"\");",
+                            self.pad(),
+                            self.try_flow_stack.last().expect("checked above")
+                        ),
                         None => format!("{}continue;", self.pad()),
                     },
                 }
@@ -802,9 +839,11 @@ impl LowerCtx {
                     | Stmt::ForOf(_)
                     | Stmt::While(_)
                     | Stmt::DoWhile(_) => {
-                        self.named_labels.push((label, rust.clone()));
+                        self.named_labels.push((label.clone(), rust.clone()));
+                        self.named_loop_labels.push((label.clone(), rust.clone()));
                         self.pending_loop_label = Some(rust);
                         let out = self.lower_stmt(&labeled.body);
+                        self.named_loop_labels.pop();
                         self.named_labels.pop();
                         out
                     }
@@ -993,6 +1032,7 @@ impl LowerCtx {
                 let saved_loop_labels = std::mem::take(&mut self.loop_labels);
                 let saved_break_labels = std::mem::take(&mut self.break_labels);
                 let saved_named_labels = std::mem::take(&mut self.named_labels);
+                let saved_named_loop_labels = std::mem::take(&mut self.named_loop_labels);
                 let pats: Vec<Pat> = fn_decl
                     .function
                     .params
@@ -1023,6 +1063,7 @@ impl LowerCtx {
                 self.loop_labels = saved_loop_labels;
                 self.break_labels = saved_break_labels;
                 self.named_labels = saved_named_labels;
+                self.named_loop_labels = saved_named_loop_labels;
                 self.leave_fn_scope(saved_boxed);
                 if self.dynamic_values {
                     // Nested fn items use the bundle-wide `(__args)` calling
@@ -1278,7 +1319,7 @@ impl LowerCtx {
         // JS try/catch/finally on top of panic unwinding:
         //
         // ```text
-        // enum __FlowN { Done, Return(Value), Throw(Box<dyn Any + Send>) }
+        // enum __FlowN { Done, Return(Value), Break(&str), Continue(&str), Throw(...) }
         // let __flowN = (|| -> __FlowN {
         //     match catch_unwind(|| { <try body>; __FlowN::Done }) {
         //         Ok(flow) => flow,
@@ -1301,6 +1342,10 @@ impl LowerCtx {
         let pad2 = " ".repeat(self.indent + 8);
         let pad3 = " ".repeat(self.indent + 12);
         let pad4 = " ".repeat(self.indent + 16);
+        let outer_break_label = self.break_labels.last().cloned();
+        let outer_continue_label = self.loop_labels.last().cloned();
+        let outer_named_labels = self.named_labels.clone();
+        let outer_named_loop_labels = self.named_loop_labels.clone();
 
         let mut out = String::new();
         if try_has_await(try_stmt) {
@@ -1311,7 +1356,7 @@ impl LowerCtx {
             ));
         }
         out.push_str(&format!(
-            "{pad0}{{\n{pad1}enum {flow} {{ Done, Return(w3cos_core::Value), Throw(std::boxed::Box<dyn std::any::Any + Send>) }}\n{pad1}let __flow{index}: {flow} = (|| -> {flow} {{\n{pad2}let __caught{index} = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> {flow} {{\n"
+            "{pad0}{{\n{pad1}enum {flow} {{ Done, Return(w3cos_core::Value), Break(&'static str), Continue(&'static str), Throw(std::boxed::Box<dyn std::any::Any + Send>) }}\n{pad1}let __flow{index}: {flow} = (|| -> {flow} {{\n{pad2}let __caught{index} = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> {flow} {{\n"
         ));
 
         self.try_flow_stack.push(flow.clone());
@@ -1321,10 +1366,12 @@ impl LowerCtx {
         let saved_loop_labels = std::mem::take(&mut self.loop_labels);
         let saved_break_labels = std::mem::take(&mut self.break_labels);
         let saved_named_labels = std::mem::take(&mut self.named_labels);
+        let saved_named_loop_labels = std::mem::take(&mut self.named_loop_labels);
         let try_body = self.lower_stmts(&try_stmt.block.stmts);
         self.loop_labels = saved_loop_labels;
         self.break_labels = saved_break_labels;
         self.named_labels = saved_named_labels;
+        self.named_loop_labels = saved_named_loop_labels;
         self.indent -= 12;
         out.push_str(&try_body);
         out.push_str(&format!(
@@ -1369,10 +1416,12 @@ impl LowerCtx {
             let saved_loop_labels = std::mem::take(&mut self.loop_labels);
             let saved_break_labels = std::mem::take(&mut self.break_labels);
             let saved_named_labels = std::mem::take(&mut self.named_labels);
+            let saved_named_loop_labels = std::mem::take(&mut self.named_loop_labels);
             let catch_body = self.lower_stmts(&handler.body.stmts);
             self.loop_labels = saved_loop_labels;
             self.break_labels = saved_break_labels;
             self.named_labels = saved_named_labels;
+            self.named_loop_labels = saved_named_loop_labels;
             self.indent -= 20;
             self.known_values = saved_known;
             out.push_str(&catch_body);
@@ -1404,8 +1453,34 @@ impl LowerCtx {
             Some(outer) => format!("return {outer}::Return(v);"),
             None => "return v;".to_string(),
         };
+        let propagate_break = match self.try_flow_stack.last() {
+            Some(outer) => lower_flow_control_target_or(
+                "break",
+                outer_break_label.as_deref(),
+                &outer_named_labels,
+                &format!("return {outer}::Break(label);"),
+            ),
+            None => lower_flow_control_target(
+                "break",
+                outer_break_label.as_deref(),
+                &outer_named_labels,
+            ),
+        };
+        let propagate_continue = match self.try_flow_stack.last() {
+            Some(outer) => lower_flow_control_target_or(
+                "continue",
+                outer_continue_label.as_deref(),
+                &outer_named_loop_labels,
+                &format!("return {outer}::Continue(label);"),
+            ),
+            None => lower_flow_control_target(
+                "continue",
+                outer_continue_label.as_deref(),
+                &outer_named_loop_labels,
+            ),
+        };
         out.push_str(&format!(
-            "{pad1}match __flow{index} {{\n{pad2}{flow}::Done => {{}}\n{pad2}{flow}::Return(v) => {{ {propagate} }}\n{pad2}{flow}::Throw(p) => {{ std::panic::resume_unwind(p); }}\n{pad1}}}\n{pad0}}}"
+            "{pad1}match __flow{index} {{\n{pad2}{flow}::Done => {{}}\n{pad2}{flow}::Return(v) => {{ {propagate} }}\n{pad2}{flow}::Break(label) => {{ {propagate_break} }}\n{pad2}{flow}::Continue(label) => {{ {propagate_continue} }}\n{pad2}{flow}::Throw(p) => {{ std::panic::resume_unwind(p); }}\n{pad1}}}\n{pad0}}}"
         ));
         out
     }
@@ -1461,32 +1536,38 @@ impl LowerCtx {
             let index = self.temp_index;
             self.temp_index += 1;
             let sw = format!("__sw{index}");
+            let selected = format!("__case{index}");
             let pad = self.pad();
-            let mut out = format!("{pad}'{sw}: {{\n{pad}    let __disc = {disc};\n");
-            let mut default_body = None;
+            let mut out = format!(
+                "{pad}'{sw}: {{\n{pad}    let __disc = {disc};\n{pad}    let mut {selected}: i32 = -1;\n"
+            );
+            let default_index = switch.cases.iter().position(|case| case.test.is_none());
+            for (case_index, case) in switch.cases.iter().enumerate() {
+                if let Some(test) = &case.test {
+                    let test = self.lower_expr(test);
+                    out.push_str(&format!(
+                        "{pad}    if {selected} < 0 && __disc.strict_eq(&{test}) {{ {selected} = {case_index}; }}\n"
+                    ));
+                }
+            }
+            if let Some(default_index) = default_index {
+                out.push_str(&format!(
+                    "{pad}    if {selected} < 0 {{ {selected} = {default_index}; }}\n"
+                ));
+            }
             self.indent += 4;
             // A `break` inside a case targets the switch; a `continue`
             // targets the enclosing loop (its label stays on the loop stack).
             self.break_labels.push(sw.clone());
-            for case in &switch.cases {
+            for (case_index, case) in switch.cases.iter().enumerate() {
                 let body = self.lower_stmts(&case.cons);
-                if let Some(test) = &case.test {
-                    let test = self.lower_expr(test);
-                    out.push_str(&format!(
-                        "{}if __disc.strict_eq(&{test}) {{\n{body}\n{}    break '{sw};\n{}}}\n",
-                        self.pad(),
-                        self.pad(),
-                        self.pad()
-                    ));
-                } else {
-                    default_body = Some(body);
-                }
+                out.push_str(&format!(
+                    "{}if {selected} >= 0 && {selected} <= {case_index} {{\n{body}\n{}}}\n",
+                    self.pad(),
+                    self.pad()
+                ));
             }
             self.break_labels.pop();
-            if let Some(body) = default_body {
-                out.push_str(&body);
-                out.push('\n');
-            }
             self.indent -= 4;
             out.push_str(&format!("{pad}}}"));
             return out;
@@ -1788,6 +1869,7 @@ impl LowerCtx {
                     match unary.op {
                         UnaryOp::Bang => format!("{arg}.js_not()"),
                         UnaryOp::Minus => format!("{arg}.js_neg()"),
+                        UnaryOp::Tilde => format!("{arg}.js_bitnot()"),
                         UnaryOp::TypeOf => format!("w3cos_core::type_of(&{arg})"),
                         UnaryOp::Void => "w3cos_core::Value::Undefined".to_string(),
                         _ => format!("{arg}"),
@@ -1876,11 +1958,7 @@ impl LowerCtx {
                     let mut captures =
                         capture_names(&self.known_values, &parameter_names, &referenced);
                     self.push_parent_capture(&mut captures);
-                    let capture_bindings = captures
-                        .iter()
-                        .map(|name| format!("let mut {name} = {name}.clone(); "))
-                        .collect::<String>();
-                    let (bindings, body) = match arrow.body.as_ref() {
+                    let lower_body = |captures: &[String]| match arrow.body.as_ref() {
                         BlockStmtOrExpr::Expr(expression) => {
                             let mut ctx = self.child_dynamic_ctx();
                             ctx.known_values.extend(captures.iter().cloned());
@@ -1909,6 +1987,28 @@ impl LowerCtx {
                             )
                         }
                     };
+                    let (mut bindings, mut body) = lower_body(&captures);
+                    // The AST reference walker intentionally stays lightweight and
+                    // can miss identifiers nested in newer TS/JSX wrapper nodes.
+                    // Reconcile against the emitted Rust, then lower once more so
+                    // newly discovered captures use `.clone()` at value positions.
+                    let candidates = self
+                        .known_values
+                        .difference(&parameter_names)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let lowered = format!("{bindings}{body}");
+                    for capture in referenced_captures(candidates, &lowered) {
+                        if !captures.contains(&capture) {
+                            captures.push(capture);
+                        }
+                    }
+                    captures.sort();
+                    (bindings, body) = lower_body(&captures);
+                    let capture_bindings = captures
+                        .iter()
+                        .map(|name| format!("let mut {name} = {name}.clone(); "))
+                        .collect::<String>();
                     // Arrows capture the lexical `this` of the enclosing class
                     // member when (and only when) the body references it.
                     let this_capture = if self.this_name.is_some() && body.contains("__this") {
@@ -1957,9 +2057,10 @@ impl LowerCtx {
                                     self.lower_expr(&key_value.value)
                                 )),
                                 Prop::Shorthand(identifier) => {
+                                    let key = identifier.sym.to_string();
                                     let name = atom_str(&identifier.sym);
                                     Some(format!(
-                                        "w3cos_core::js_object! {{ {name:?} => {} }}",
+                                        "w3cos_core::js_object! {{ {key:?} => {} }}",
                                         self.resolve_value(&name)
                                     ))
                                 }
@@ -1981,8 +2082,9 @@ impl LowerCtx {
                                 Some(format!("{key} => {val}"))
                             }
                             Prop::Shorthand(ident) => {
+                                let key = ident.sym.to_string();
                                 let name = atom_str(&ident.sym);
-                                Some(format!("{name:?} => {}", self.resolve_value(&name)))
+                                Some(format!("{key:?} => {}", self.resolve_value(&name)))
                             }
                             Prop::Method(method) => {
                                 let key = self.lower_object_key(&method.key);
@@ -2159,6 +2261,19 @@ impl LowerCtx {
                 let cons = self.lower_expr(&cond.cons);
                 let alt = self.lower_expr(&cond.alt);
                 format!("if {test} {{ {cons} }} else {{ {alt} }}")
+            }
+            Expr::TsTypeAssertion(assertion) => self.lower_expr(&assertion.expr),
+            Expr::TsConstAssertion(assertion) => self.lower_expr(&assertion.expr),
+            Expr::TsNonNull(non_null) => self.lower_expr(&non_null.expr),
+            Expr::TsAs(as_expr) => self.lower_expr(&as_expr.expr),
+            Expr::TsInstantiation(instantiation) => self.lower_expr(&instantiation.expr),
+            Expr::TsSatisfies(satisfies) => self.lower_expr(&satisfies.expr),
+            Expr::MetaProp(meta) if meta.kind == MetaPropKind::ImportMeta => {
+                if self.dynamic_values {
+                    "w3cos_core::js_object! { \"env\" => w3cos_core::js_object! { \"DEV\" => false, \"PROD\" => true, \"MODE\" => \"production\" } }".to_string()
+                } else {
+                    "Default::default() /* import.meta */".to_string()
+                }
             }
             Expr::Await(await_expr) => {
                 let arg = self.lower_expr(&await_expr.arg);
@@ -2354,7 +2469,7 @@ impl LowerCtx {
             }
             Expr::JSXElement(element) => self.lower_jsx_element(element),
             Expr::JSXFragment(fragment) => self.lower_jsx_children(&fragment.children),
-            _ => format!("todo!(\"lower: {:?}\")", expr_kind_name(expr)),
+            _ => format!("todo!(\"lower: {}\")", expr_kind_name(expr)),
         }
     }
 
@@ -2366,12 +2481,15 @@ impl LowerCtx {
             .iter()
             .filter_map(|child| self.lower_jsx_child(child))
             .collect::<Vec<_>>();
-        let children = if children.is_empty() {
-            String::new()
+        let props = if children.is_empty() {
+            props
         } else {
-            format!(", {}", children.join(", "))
+            let children = format!("w3cos_core::Value::array(vec![{}])", children.join(", "));
+            format!(
+                "w3cos_core::Value::object_from_parts(vec![{props}, w3cos_core::js_object! {{ \"children\" => {children} }}])"
+            )
         };
-        format!("w3cos_react_compat::aot::createElement(vec![{element_type}, {props}{children}])")
+        format!("w3cos_core::js_object! {{ \"type\" => {element_type}, \"props\" => {props} }}")
     }
 
     fn lower_jsx_children(&self, children: &[JSXElementChild]) -> String {
@@ -3594,6 +3712,37 @@ fn contains_rust_identifier(source: &str, identifier: &str) -> bool {
     })
 }
 
+fn lower_flow_control_target(
+    keyword: &str,
+    default_target: Option<&str>,
+    named_targets: &[(String, String)],
+) -> String {
+    lower_flow_control_target_or(
+        keyword,
+        default_target,
+        named_targets,
+        &format!("panic!(\"{keyword} escaped a non-{keyword}able try block\");"),
+    )
+}
+
+fn lower_flow_control_target_or(
+    keyword: &str,
+    default_target: Option<&str>,
+    named_targets: &[(String, String)],
+    fallback: &str,
+) -> String {
+    let mut arms = named_targets
+        .iter()
+        .rev()
+        .map(|(js, rust)| format!("{js:?} => {keyword} '{rust},"))
+        .collect::<Vec<_>>();
+    arms.push(match default_target {
+        Some(rust) => format!("_ => {keyword} '{rust},"),
+        None => format!("_ => {{ {fallback} }}"),
+    });
+    format!("match label {{ {} }}", arms.join(" "))
+}
+
 fn lower_closure_params(
     params: &[Pat],
     renames: &[(String, String)],
@@ -4142,11 +4291,14 @@ fn global_value_expr(name: &str) -> Option<String> {
         }
         // Property globals: read off the jsdom window singleton.
         "navigator" | "localStorage" | "sessionStorage" | "indexedDB" | "IDBKeyRange" | "performance" | "location"
-        | "screen" => format!("w3cos_runtime::jsdom::window_value().get_property({name:?})"),
+        | "screen" | "crypto" | "navigation" | "reportError" | "setImmediate"
+        | "MessageChannel" | "__REACT_DEVTOOLS_GLOBAL_HOOK__" => {
+            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+        }
         // Scheduling/utility globals: the jsdom window holds them as function
         // values, so a bare reference is just the property read (calling it
         // goes through the normal `Value::call` path).
-        "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
+        "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval" | "checkDCE"
         | "requestAnimationFrame" | "cancelAnimationFrame" | "queueMicrotask"
         | "matchMedia" | "getComputedStyle" | "getSelection" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
@@ -4202,10 +4354,10 @@ fn global_value_expr(name: &str) -> Option<String> {
         // builds every service through it). The optional newTarget argument
         // is ignored; all other Reflect members degrade to Undefined.
         "Reflect" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"construct\".to_string(), w3cos_core::Value::function(|_this, __args| { let __target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let __ctor_args: Vec<w3cos_core::Value> = __args.get(1).map(|__a| __a.iter().collect()).unwrap_or_default(); w3cos_core::class::construct(&__target, __ctor_args) }))]))".to_string(),
-        // Well-known iterator symbol. Symbols are represented by collision-
-        // resistant string keys in the compact runtime; Value::call_method
-        // recognizes this key and returns a standards-shaped `next()` object.
-        "Symbol" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"iterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_iterator\"))]))".to_string(),
+        // Symbols use collision-resistant string sentinels in the compact
+        // runtime. `Symbol.for(key)` must be stable because libraries such as
+        // React use the global registry for element type identity.
+        "Symbol" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"iterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_iterator\")), (\"for\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::from(format!(\"__w3cos_symbol_for:{}\", __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string()))))]))".to_string(),
         // Unimplemented builtin globals: harmless empty-object stubs keep
         // references total (`new X()` yields Undefined via construct on a
         // non-callable; `X.y` yields Undefined).
@@ -4214,7 +4366,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "encodeURI" | "encodeURIComponent" | "decodeURI" | "decodeURIComponent" | "escape"
         | "unescape" | "TextEncoder" | "fetch" | "Request" | "Response"
         | "Headers" | "FormData" | "AbortController" | "AbortSignal" | "Event"
-        | "EventTarget" | "CustomEvent" | "MessageChannel" | "MessagePort" | "Worker"
+        | "EventTarget" | "CustomEvent" | "MessagePort" | "Worker"
         | "ImageData" | "OffscreenCanvas" | "Path2D" | "DOMRect" | "DOMPoint" | "DOMMatrix"
         | "MutationObserver" | "IntersectionObserver" | "PerformanceObserver" | "Report"
         // DOM constructors / event types (instanceof degrades to false).
@@ -4688,14 +4840,17 @@ mod tests {
     }
 
     #[test]
-    fn lowers_standard_tsx_elements_to_react_host_calls() {
+    fn lowers_standard_tsx_elements_to_generic_values() {
         let statements = parse_tsx_stmts(
             r#"const view = <List rowCount={1000} {...props}><span onClick={open}>你好</span></List>;"#,
         );
         let mut context = LowerCtx::new_dynamic(vec![]);
         let code = context.lower_stmts(&statements);
 
-        assert!(code.contains("aot::createElement"), "tsx host call: {code}");
+        assert!(
+            code.contains("js_object! { \"type\"") && code.contains("\"props\""),
+            "tsx value: {code}"
+        );
         assert!(
             code.contains("Value::from(\"span\")"),
             "intrinsic tag: {code}"
@@ -4703,6 +4858,35 @@ mod tests {
         assert!(code.contains("rowCount"), "component prop: {code}");
         assert!(code.contains("object_from_parts"), "spread props: {code}");
         assert!(code.contains("你好"), "text child: {code}");
+    }
+
+    #[test]
+    fn erases_typescript_expression_wrappers() {
+        let statements = parse_stmts(
+            "const a = value as string; const b = value!; const c = value satisfies string;",
+        );
+        let mut context = LowerCtx::new_dynamic(vec![]);
+        let code = context.lower_stmts(&statements);
+
+        assert!(
+            !code.contains("unknown_expr"),
+            "typescript wrappers: {code}"
+        );
+        assert!(code.matches("value").count() >= 3, "wrapped values: {code}");
+    }
+
+    #[test]
+    fn lowers_import_meta_env_to_native_build_metadata() {
+        let statements = parse_stmts("const dev = import.meta.env.DEV;");
+        let mut context = LowerCtx::new_dynamic(vec![]);
+        let code = context.lower_stmts(&statements);
+
+        assert!(code.contains("\"env\""), "import.meta env object: {code}");
+        assert!(code.contains("\"DEV\" => false"), "native DEV flag: {code}");
+        assert!(
+            !code.contains("unknown_expr"),
+            "import.meta lowering: {code}"
+        );
     }
 
     #[test]
@@ -4859,6 +5043,25 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_jsx_callbacks_clone_nested_captures() {
+        let stmts = parse_tsx_stmts(
+            "const columns = []; const ctx = {}; const view = () => <div>{columns.map((column) => <span>{ctx[column]}</span>)}</div>;",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.matches("let mut columns = columns.clone();").count() >= 1,
+            "outer JSX callback must retain columns: {code}"
+        );
+        assert!(
+            code.contains("let mut ctx = ctx.clone();")
+                && code.contains("ctx.clone().get_property"),
+            "nested JSX callback must clone ctx before use: {code}"
+        );
+    }
+
+    #[test]
     fn dynamic_lowering_exposes_resize_observer_as_a_constructor() {
         let stmts = parse_stmts("const supported = typeof ResizeObserver < \"u\";");
         let mut ctx = LowerCtx::new_dynamic(vec![]);
@@ -4890,6 +5093,28 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_lowering_reads_optional_browser_globals_from_window() {
+        let stmts = parse_stmts(
+            "typeof __REACT_DEVTOOLS_GLOBAL_HOOK__; typeof navigation; typeof reportError; typeof setImmediate; typeof MessageChannel;",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        for name in [
+            "__REACT_DEVTOOLS_GLOBAL_HOOK__",
+            "navigation",
+            "reportError",
+            "setImmediate",
+            "MessageChannel",
+        ] {
+            assert!(
+                code.contains(&format!("window_value().get_property({name:?})")),
+                "optional global {name}: {code}"
+            );
+        }
+    }
+
+    #[test]
     fn lowers_if_else() {
         let stmts = parse_stmts("if (x > 0) { return x; } else { return 0; }");
         let mut ctx = LowerCtx::new(vec![]);
@@ -4916,6 +5141,64 @@ mod tests {
         assert!(!code.contains(";;"), "no double semicolons: {code}");
         // update should appear
         assert!(code.contains("i += 1"), "update increment: {code}");
+    }
+
+    #[test]
+    fn dynamic_lowering_preserves_bitwise_not() {
+        let stmts = parse_stmts("const available = pending & ~suspended;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("suspended.js_bitnot()"),
+            "bitwise not must not degrade to the operand: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_preserves_switch_fallthrough() {
+        let stmts = parse_stmts(
+            "switch (tag) { case 7: case 8: bubble(); return null; case 9: stop(); break; default: fail(); }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains("if __case0 >= 0 && __case0 <= 0")
+                && code.contains("if __case0 >= 0 && __case0 <= 1"),
+            "case bodies execute from the selected case onward: {code}"
+        );
+        assert!(
+            !code.contains("strict_eq(&w3cos_core::Value::Number(7.0)) {\n\n")
+                || !code.contains("break '__sw0;"),
+            "an empty case must not implicitly break the switch: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_preserves_shorthand_property_key() {
+        let stmts = parse_stmts("const type = 'main'; const element = { type };");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains("\"type\" => type_.clone()"),
+            "the JavaScript key stays `type` while only the Rust binding is escaped: {code}"
+        );
+        assert!(!code.contains("\"type_\" =>"), "escaped key leaked: {code}");
+    }
+
+    #[test]
+    fn dynamic_lowering_selects_middle_default_only_when_no_case_matches() {
+        let stmts = parse_stmts(
+            "switch (value) { case 1: one(); break; default: fallback(); case 2: two(); }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains("if __case0 < 0 { __case0 = 1; }") && code.contains("__case0 <= 2"),
+            "default selection still falls through to following cases: {code}"
+        );
     }
 
     #[test]
@@ -4964,7 +5247,7 @@ mod tests {
         let code = ctx.lower_stmts(&stmts);
 
         assert!(
-            code.contains("enum __Flow0 { Done, Return(w3cos_core::Value), Throw(std::boxed::Box<dyn std::any::Any + Send>) }"),
+            code.contains("enum __Flow0 { Done, Return(w3cos_core::Value), Break(&'static str), Continue(&'static str), Throw(std::boxed::Box<dyn std::any::Any + Send>) }"),
             "flow enum: {code}"
         );
         assert!(
@@ -5007,6 +5290,46 @@ mod tests {
         assert!(
             code.contains("std::panic::resume_unwind(p)"),
             "finally without catch resumes the panic: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_propagates_loop_control_through_try_finally() {
+        let stmts = parse_stmts(
+            "outer: while (ready) { try { if (done) break outer; continue; } finally { cleanup(); } }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains("return __Flow") && code.contains("::Break(\"outer\")"),
+            "labeled break becomes a flow value: {code}"
+        );
+        assert!(
+            code.contains("::Continue(\"\")"),
+            "continue becomes a flow value: {code}"
+        );
+        assert!(
+            code.contains("break '__js_outer") && code.contains("continue '__js_outer"),
+            "flow epilogue targets the enclosing loop: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_consumes_nested_try_break_at_inner_label() {
+        let stmts = parse_stmts(
+            "try { outer: { try { inner: { break inner; } break outer; } finally { cleanup(); } unreachable(); } } finally { finish(); }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains("\"outer\" => break '__js_outer"),
+            "a label declared inside an outer try must consume a break propagated by an inner try: {code}"
+        );
+        assert!(
+            !code.contains("__Flow0::Break(label) => { return"),
+            "the inner label must be resolved before flow escapes the labeled block: {code}"
         );
     }
 
@@ -5461,7 +5784,7 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(renames);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::class::construct(&w3cos_core::Value::function"),
+            code.contains("w3cos_core::class::construct(&makeWidget_value()"),
             "new on a function value → construct: {code}"
         );
         // The Error special-case stays intact; Map is no longer special-cased
@@ -5617,6 +5940,18 @@ function f(window) { return window.x; }"#,
         assert!(
             code.contains("__w3cos_symbol_iterator"),
             "well-known iterator symbol: {code}"
+        );
+    }
+
+    #[test]
+    fn lowers_symbol_for_to_stable_registry_key() {
+        let statements = parse_stmts("const element = Symbol.for('react.element');");
+        let mut context = LowerCtx::new_dynamic(vec![]);
+        let code = context.lower_stmts(&statements);
+
+        assert!(
+            code.contains("__w3cos_symbol_for:{}") && code.contains("call_method(\"for\""),
+            "Symbol.for registry facade: {code}"
         );
     }
 

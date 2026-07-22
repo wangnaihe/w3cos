@@ -47,6 +47,14 @@ impl BuiltinObject {
             (BuiltinKind::Math, "tan") => unary_math(arguments, f64::tan),
             (BuiltinKind::Math, "pow") => binary_math(arguments, f64::powf),
             (BuiltinKind::Math, "atan2") => binary_math(arguments, f64::atan2),
+            (BuiltinKind::Math, "clz32") => Value::Number(
+                arguments
+                    .first()
+                    .map(Value::to_i32)
+                    .unwrap_or(0)
+                    .cast_unsigned()
+                    .leading_zeros() as f64,
+            ),
             (BuiltinKind::Object, "is") => Value::Bool(
                 arguments
                     .first()
@@ -85,6 +93,23 @@ impl BuiltinObject {
 
     pub fn get_property(&self, key: &str) -> Value {
         match (self.0, key) {
+            (
+                BuiltinKind::Math,
+                "min" | "max" | "abs" | "floor" | "ceil" | "round" | "trunc" | "sqrt" | "log"
+                | "log2" | "exp" | "sin" | "cos" | "tan" | "pow" | "atan2" | "clz32",
+            ) => {
+                let builtin = *self;
+                let method = key.to_string();
+                Value::function(move |_, arguments| builtin.call_method(&method, arguments))
+            }
+            (BuiltinKind::Math, "E") => Value::Number(std::f64::consts::E),
+            (BuiltinKind::Math, "LN2") => Value::Number(std::f64::consts::LN_2),
+            (BuiltinKind::Math, "LN10") => Value::Number(std::f64::consts::LN_10),
+            (BuiltinKind::Math, "LOG2E") => Value::Number(std::f64::consts::LOG2_E),
+            (BuiltinKind::Math, "LOG10E") => Value::Number(std::f64::consts::LOG10_E),
+            (BuiltinKind::Math, "PI") => Value::Number(std::f64::consts::PI),
+            (BuiltinKind::Math, "SQRT1_2") => Value::Number(std::f64::consts::FRAC_1_SQRT_2),
+            (BuiltinKind::Math, "SQRT2") => Value::Number(std::f64::consts::SQRT_2),
             (BuiltinKind::Document, "body") => dom_element(),
             _ => Value::Undefined,
         }
@@ -111,6 +136,7 @@ fn js_round(value: f64) -> f64 {
         (value + 0.5).floor()
     }
 }
+
 fn object_keys(value: &Value) -> Value {
     match value {
         Value::Object(object) => Value::array(
@@ -729,6 +755,24 @@ mod tests {
         assert_eq!(
             Math.call_method("pow", vec![Value::Number(3.0), Value::Number(2.0)]),
             Value::Number(9.0)
+        );
+    }
+
+    #[test]
+    fn math_methods_are_first_class_function_values() {
+        let log = Math.get_property("log");
+        assert!(log.is_function());
+        assert_eq!(
+            log.call(Value::Undefined, vec![Value::Number(8.0)])
+                .to_number(),
+            8.0_f64.ln()
+        );
+        assert_eq!(Math.get_property("LN2").to_number(), std::f64::consts::LN_2);
+        assert_eq!(
+            Math.get_property("clz32")
+                .call(Value::Undefined, vec![Value::Number(32.0)])
+                .to_number(),
+            26.0
         );
     }
 }

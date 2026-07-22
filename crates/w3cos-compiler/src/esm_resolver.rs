@@ -382,6 +382,8 @@ pub struct BundledModule {
     /// Imports implemented by a native AOT host ABI rather than another ESM
     /// source module (for example React hooks and JSX runtime entry points).
     pub host_imports: Vec<(String, String)>,
+    /// JSON/default asset imports embedded as compile-time literals.
+    pub literal_imports: Vec<(String, String)>,
     /// `import * as ns` bindings: the local name evaluates to a lazily built
     /// namespace object exposing the target module's exports.
     pub namespace_imports: Vec<NamespaceImport>,
@@ -456,6 +458,7 @@ impl EsmBundle {
                 namespace,
                 local_to_bundled,
                 host_imports: Vec::new(),
+                literal_imports: Vec::new(),
                 namespace_imports: Vec::new(),
             });
         }
@@ -478,6 +481,31 @@ impl EsmBundle {
             };
 
             for import in &info.imports {
+                if Path::new(&import.source)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    == Some("json")
+                {
+                    let from_dir = path.parent().unwrap_or_else(|| Path::new("."));
+                    match resolver
+                        .resolve(&import.source, from_dir)
+                        .and_then(|resolved| {
+                            std::fs::read_to_string(&resolved.path).with_context(|| {
+                                format!("Could not read JSON import {}", resolved.path.display())
+                            })
+                        }) {
+                        Ok(source) => bundle.modules[module_index]
+                            .literal_imports
+                            .push((import.local.clone(), source)),
+                        Err(error) => bundle.unresolved.push(format!(
+                            "{}: `{}` -> could not embed `{}`: {error}",
+                            path.display(),
+                            import.local,
+                            import.source
+                        )),
+                    }
+                    continue;
+                }
                 if let Some(host_path) = host_import_path(&import.source, &import.imported) {
                     bundle.modules[module_index]
                         .host_imports
@@ -558,19 +586,7 @@ impl EsmBundle {
 
 fn host_import_path(source: &str, imported: &str) -> Option<&'static str> {
     match (source, imported) {
-        ("react", "useState") => Some("w3cos_react_compat::aot::useState"),
-        ("react", "useMemo") => Some("w3cos_react_compat::aot::useMemo"),
-        ("react", "useCallback") => Some("w3cos_react_compat::aot::useCallback"),
-        ("react", "useRef") => Some("w3cos_react_compat::aot::useRef"),
-        ("react", "useEffect") => Some("w3cos_react_compat::aot::useEffect"),
-        ("react", "useLayoutEffect") => Some("w3cos_react_compat::aot::useLayoutEffect"),
-        ("react", "useImperativeHandle") => Some("w3cos_react_compat::aot::useImperativeHandle"),
-        ("react", "memo") => Some("w3cos_react_compat::aot::memo"),
-        ("react", "createElement") => Some("w3cos_react_compat::aot::createElement"),
-        ("react/jsx-runtime", "jsx") => Some("w3cos_react_compat::aot::jsx"),
-        ("react/jsx-runtime", "jsxs") => Some("w3cos_react_compat::aot::jsxs"),
-        ("react/jsx-runtime", "Fragment") => Some("w3cos_react_compat::aot::Fragment"),
-        ("w3cos/native", "invoke") => Some("w3cos_core::host::invoke"),
+        ("w3cos/native", "invoke") => Some("w3cos/native::invoke"),
         _ => None,
     }
 }
@@ -756,7 +772,7 @@ impl EsmResolver {
         let package_dir = self.find_package_dir(&package_name, from_dir)?;
 
         let entry = if let Some(subpath) = subpath {
-            self.resolve_path_like(&package_dir.join(subpath))?
+            self.resolve_package_subpath(&package_dir, &subpath)?
         } else {
             self.resolve_package_entry(&package_dir)?
         };
@@ -767,6 +783,32 @@ impl EsmResolver {
             kind: ModuleKind::Package,
             package_name: Some(package_name),
         })
+    }
+
+    fn resolve_package_subpath(&self, package_dir: &Path, subpath: &str) -> Result<PathBuf> {
+        let package_json_path = package_dir.join("package.json");
+        if let Ok(package_json) = std::fs::read_to_string(&package_json_path) {
+            let package: PackageJson = serde_json::from_str(&package_json).with_context(|| {
+                format!("Invalid package.json at {}", package_json_path.display())
+            })?;
+            let export_key = format!("./{subpath}");
+            if let Some(entry) = package
+                .exports
+                .as_ref()
+                .and_then(|exports| resolve_exports_key(exports, &export_key))
+            {
+                return self
+                    .resolve_path_like(&package_dir.join(entry.trim_start_matches("./")))
+                    .with_context(|| {
+                        format!(
+                            "Could not resolve package export `{export_key}` in {}",
+                            package_dir.display()
+                        )
+                    });
+            }
+        }
+
+        self.resolve_path_like(&package_dir.join(subpath))
     }
 
     fn find_package_dir(&self, package_name: &str, from_dir: &Path) -> Result<PathBuf> {
@@ -859,7 +901,7 @@ impl EsmResolver {
 }
 
 fn is_host_module(specifier: &str) -> bool {
-    matches!(specifier, "react" | "react/jsx-runtime" | "w3cos/native")
+    matches!(specifier, "w3cos/native")
 }
 
 /// Lexically normalize a path: fold `.` and `..` components without touching
@@ -903,6 +945,13 @@ fn resolve_exports_root(exports: &Value) -> Option<String> {
     }
 }
 
+fn resolve_exports_key(exports: &Value, key: &str) -> Option<String> {
+    let Value::Object(map) = exports else {
+        return None;
+    };
+    map.get(key).and_then(resolve_exports_root)
+}
+
 fn resolve_browser_string(browser: Option<&Value>) -> Option<String> {
     match browser {
         Some(Value::String(s)) => Some(s.clone()),
@@ -930,16 +979,33 @@ fn split_package_specifier(specifier: &str) -> Result<(String, Option<String>)> 
 
 pub fn collect_static_imports(source: &str) -> Vec<String> {
     let mut imports = Vec::new();
+    let mut pending = String::new();
     for line in source.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("import ") || trimmed.starts_with("export ") {
-            if let Some(spec) =
-                extract_from_clause(trimmed).or_else(|| extract_bare_import(trimmed))
-            {
-                if !imports.contains(&spec) {
-                    imports.push(spec);
-                }
+        if pending.is_empty() {
+            let starts_import = trimmed.starts_with("import ");
+            let starts_reexport =
+                trimmed.starts_with("export {") || trimmed.starts_with("export *");
+            if !starts_import && !starts_reexport {
+                continue;
             }
+            pending.push_str(trimmed);
+        } else {
+            pending.push(' ');
+            pending.push_str(trimmed);
+        }
+
+        if pending.ends_with(';')
+            || extract_from_clause(&pending).is_some()
+            || extract_bare_import(&pending).is_some()
+        {
+            if let Some(spec) =
+                extract_from_clause(&pending).or_else(|| extract_bare_import(&pending))
+                && !imports.contains(&spec)
+            {
+                imports.push(spec);
+            }
+            pending.clear();
         }
     }
     imports
@@ -1260,12 +1326,49 @@ mod tests {
 import { EditorView } from "@codemirror/view";
 import "./theme.css";
 export { EditorState } from '@codemirror/state';
+import {
+  Metric,
+  DataTable,
+} from './components/DisplayComponents';
 "#,
         );
         assert_eq!(
             imports,
-            vec!["@codemirror/view", "./theme.css", "@codemirror/state"]
+            vec![
+                "@codemirror/view",
+                "./theme.css",
+                "@codemirror/state",
+                "./components/DisplayComponents",
+            ]
         );
+    }
+
+    #[test]
+    fn embeds_default_json_import_as_a_literal_binding() {
+        let root = fixture_root("w3cos_esm_json_import");
+        std::fs::write(root.join("catalog.json"), r#"{"ready":"Ready"}"#).unwrap();
+        std::fs::write(
+            root.join("app.ts"),
+            r#"import catalog from "./catalog.json";
+export function message() { return catalog.ready; }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("app.ts"));
+        let entry = bundle
+            .modules
+            .iter()
+            .find(|module| module.path.ends_with("app.ts"))
+            .unwrap();
+        assert_eq!(
+            entry.literal_imports,
+            vec![("catalog".to_string(), r#"{"ready":"Ready"}"#.to_string())]
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1286,7 +1389,7 @@ export function main() { return invoke("example", "ping"); }"#,
         assert_eq!(bundle.modules.len(), 1);
         assert_eq!(
             bundle.modules[0].host_imports,
-            vec![("invoke".into(), "w3cos_core::host::invoke".into())]
+            vec![("invoke".into(), "w3cos/native::invoke".into())]
         );
 
         std::fs::remove_dir_all(root).ok();
@@ -1312,6 +1415,32 @@ export function main() { return invoke("example", "ping"); }"#,
                 .path
                 .ends_with("node_modules/@codemirror/view/dist/index.js")
         );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolves_scoped_package_subpath_export() {
+        let root = fixture_root("w3cos_esm_resolver_scoped_package_subpath");
+        let pkg = root.join("node_modules/@logidesk/contract");
+        std::fs::create_dir_all(pkg.join("src/generated")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"exports":{".":"./src/index.ts","./generated/composer-rules":"./src/generated/composer-rules.ts"}}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("src/index.ts"), "export const root = true;").unwrap();
+        std::fs::write(
+            pkg.join("src/generated/composer-rules.ts"),
+            "export const rules = {};",
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let resolved = resolver
+            .resolve("@logidesk/contract/generated/composer-rules", &root)
+            .unwrap();
+        assert!(resolved.path.ends_with("src/generated/composer-rules.ts"));
 
         std::fs::remove_dir_all(root).ok();
     }

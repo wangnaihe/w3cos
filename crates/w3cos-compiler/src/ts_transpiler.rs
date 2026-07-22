@@ -3329,7 +3329,6 @@ mod tests {
             needs_runtime: false,
             needs_dom: false,
             needs_std: false,
-            needs_react_compat: false,
         };
         let toml = crate::generate_standalone_cargo_toml(&flags);
         assert!(

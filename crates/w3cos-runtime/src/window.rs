@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
+use w3cos_dom::host_runtime;
 use winit::application::ApplicationHandler;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use winit::dpi::LogicalSize;
@@ -1619,15 +1620,15 @@ impl App {
     }
 
     fn rebuild_if_dirty(&mut self) {
-        let react_dirty = w3cos_react_compat::aot::has_pending_render();
-        let signal_dirty = state::is_dirty() || react_dirty;
+        let host_dirty = host_runtime::has_pending_render();
+        let signal_dirty = state::is_dirty() || host_dirty;
         let dom_dirty = self.dom_mode && crate::dom::is_document_dirty();
 
         if !signal_dirty && !dom_dirty {
             return;
         }
 
-        // A React commit replaces the component tree. Move the old tree out
+        // A host commit replaces the component tree. Move the old tree out
         // instead of deep-cloning every mounted row before building its
         // replacement; the old tree remains available for diffing, stable
         // index remapping and transition discovery below.
@@ -1640,11 +1641,11 @@ impl App {
         if signal_dirty {
             state::clear_dirty();
         }
-        if react_dirty {
+        if host_dirty {
             // Drain before calling the builder. Ref callbacks and effects may
             // enqueue a follow-up render while the new tree is being built;
             // that work must remain pending for the next event-loop turn.
-            w3cos_react_compat::aot::clear_pending_render();
+            host_runtime::clear_pending_render();
         }
         if dom_dirty {
             crate::dom::clear_document_dirty();
@@ -1666,9 +1667,9 @@ impl App {
             let reconcile_started = Instant::now();
             let new_flat = layout::pre_flatten(&self.root);
             let visual_output_changed =
-                react_dirty && react_rebuild_changes_visual_output(&old_flat, &new_flat);
+                host_dirty && react_rebuild_changes_visual_output(&old_flat, &new_flat);
             let stable_index_remap = build_stable_index_remap(&old_flat, &new_flat);
-            let external_damage_indices = react_dirty.then(|| {
+            let external_damage_indices = host_dirty.then(|| {
                 old_flat
                     .iter()
                     .zip(&new_flat)
@@ -1727,13 +1728,13 @@ impl App {
                     std::mem::take(&mut self.repaint_mode),
                     &self.recent_scroll_damage,
                 )
-            } else if react_dirty {
+            } else if host_dirty {
                 // A fixed-size virtual window only unmounts rows that have
                 // already left the viewport. When the retained host slots keep
                 // the same paint payload, preserve accumulated scroll damage.
                 repaint_after_react_rebuild(std::mem::take(&mut self.repaint_mode))
             } else {
-                // Non-React signal/DOM work is never a deferred virtual-window
+                // Signal/DOM work outside the host adapter is never a deferred virtual-window
                 // swap and therefore invalidates the complete frame.
                 RepaintMode::Full
             };
@@ -1799,7 +1800,7 @@ impl App {
         if !std::mem::take(&mut self.deferred_react_scroll_commit) {
             return;
         }
-        if !w3cos_react_compat::aot::has_pending_render() {
+        if !host_runtime::has_pending_render() {
             self.deferred_react_scroll_distance.clear();
             return;
         }
@@ -3699,7 +3700,7 @@ impl App {
                 )
             });
         }
-        w3cos_react_compat::aot::dispatch_pointer_chain(
+        host_runtime::dispatch_pointer_chain(
             &chain,
             phase,
             self.mouse_x,
@@ -3908,7 +3909,7 @@ impl App {
         if self.get_window().is_none() {
             return false;
         }
-        let requests = w3cos_react_compat::aot::take_scroll_requests();
+        let requests = host_runtime::take_scroll_requests();
         if requests.is_empty() {
             return false;
         }
@@ -3951,7 +3952,7 @@ impl App {
             }
             self.scroll_offsets.insert(index, (next_x, next_y));
             crate::uitest::set_programmatic_scroll_offset(index, next_y, requested_y);
-            w3cos_react_compat::aot::dispatch_scroll(host_id, next_y);
+            host_runtime::dispatch_scroll(host_id, next_y);
             if let Some(ordinal) = self.virtual_scroll_indices.get(&index).copied() {
                 self.materialize_virtual_list(ordinal, viewport.height, next_y);
                 self.needs_tree_rebuild = true;
@@ -4134,7 +4135,7 @@ impl App {
             self.scroll_offsets
                 .insert(scroll_index, (scroll_x, new_scroll_y));
             crate::uitest::set_anchor_scroll_offset(scroll_index, new_scroll_y);
-            w3cos_react_compat::aot::dispatch_scroll(anchor.scroll_host_id, new_scroll_y);
+            host_runtime::dispatch_scroll(anchor.scroll_host_id, new_scroll_y);
         }
     }
 
@@ -4174,8 +4175,8 @@ impl App {
                         _ => None,
                     });
             if let Some(host_id) = native_scroll {
-                w3cos_react_compat::aot::dispatch_scroll(host_id, new_oy);
-                let pending_render = w3cos_react_compat::aot::has_pending_render();
+                host_runtime::dispatch_scroll(host_id, new_oy);
+                let pending_render = host_runtime::has_pending_render();
                 self.deferred_react_scroll_commit |= pending_render;
                 if pending_render {
                     *self.deferred_react_scroll_distance.entry(idx).or_default() += applied.abs();
@@ -4693,33 +4694,18 @@ impl App {
             self.rebuild_if_dirty();
             return true;
         }
-        if w3cos_react_compat::aot::dispatch_before_input_chain(
-            &chain,
-            data,
-            input_type,
-            is_composing,
-        ) {
+        if host_runtime::dispatch_before_input_chain(&chain, data, input_type, is_composing) {
             self.rebuild_if_dirty();
             return false;
         }
         self.text_input_values.insert(idx, value.clone());
-        w3cos_react_compat::aot::dispatch_input_chain(
-            &chain,
-            value,
-            data,
-            input_type,
-            is_composing,
-        );
+        host_runtime::dispatch_input_chain(&chain, value, data, input_type, is_composing);
         self.rebuild_if_dirty();
         true
     }
 
     fn dispatch_native_composition(&mut self, idx: usize, phase: &str, data: &str) {
-        w3cos_react_compat::aot::dispatch_composition_chain(
-            &self.native_host_chain(idx),
-            phase,
-            data,
-        );
+        host_runtime::dispatch_composition_chain(&self.native_host_chain(idx), phase, data);
         self.rebuild_if_dirty();
     }
 
@@ -4791,7 +4777,7 @@ impl App {
                 .first()
                 .is_some_and(|target| crate::jsdom::dispatch_native_click(*target as u32))
         } else {
-            w3cos_react_compat::aot::dispatch_click_chain(&chain)
+            host_runtime::dispatch_click_chain(&chain)
         }
     }
 
@@ -4834,7 +4820,7 @@ impl App {
                     crate::jsdom::dispatch_native_focus(*target as u32, false);
                 }
             } else {
-                w3cos_react_compat::aot::dispatch_focus_chain(&chain, false);
+                host_runtime::dispatch_focus_chain(&chain, false);
             }
         }
         self.focused_index = next;
@@ -4847,7 +4833,7 @@ impl App {
                     crate::jsdom::dispatch_native_focus(*target as u32, true);
                 }
             } else {
-                w3cos_react_compat::aot::dispatch_focus_chain(&chain, true);
+                host_runtime::dispatch_focus_chain(&chain, true);
             }
         }
         self.rebuild_if_dirty();
@@ -5810,7 +5796,7 @@ impl ApplicationHandler for App {
         let mut rebuilt = false;
         if !self.deferred_react_scroll_commit {
             for _ in 0..8 {
-                if !state::is_dirty() && !w3cos_react_compat::aot::has_pending_render() {
+                if !state::is_dirty() && !host_runtime::has_pending_render() {
                     break;
                 }
                 self.rebuild_if_dirty();
@@ -5967,7 +5953,7 @@ impl ApplicationHandler for App {
         let has_pending_frame_work = self.get_window().is_some()
             && (self.deferred_react_scroll_commit
                 || state::is_dirty()
-                || w3cos_react_compat::aot::has_pending_render()
+                || host_runtime::has_pending_render()
                 || self.needs_layout
                 || !matches!(self.repaint_mode, RepaintMode::Clean));
         let now = Instant::now();
@@ -6535,7 +6521,7 @@ impl ApplicationHandler for App {
                             )
                         })
                     } else {
-                        w3cos_react_compat::aot::dispatch_key_chain(
+                        host_runtime::dispatch_key_chain(
                             &chain,
                             &key,
                             &code,
@@ -6613,7 +6599,7 @@ impl ApplicationHandler for App {
                                         if self.dom_mode {
                                             crate::dom::tag_name(*host_id as u32) == "textarea"
                                         } else {
-                                            w3cos_react_compat::aot::host_local_name(*host_id)
+                                            host_runtime::host_local_name(*host_id)
                                                 .is_some_and(|name| name == "textarea")
                                         }
                                     });
@@ -6645,8 +6631,7 @@ impl ApplicationHandler for App {
                                             "insertLineBreak",
                                             false,
                                         );
-                                    } else if w3cos_react_compat::aot::dispatch_submit_chain(&chain)
-                                        .is_some()
+                                    } else if host_runtime::dispatch_submit_chain(&chain).is_some()
                                     {
                                         self.rebuild_if_dirty();
                                         self.repaint_after_interaction();
@@ -6834,7 +6819,7 @@ impl ApplicationHandler for App {
                 let prevented = self
                     .hit_test(self.mouse_x, self.mouse_y)
                     .is_some_and(|idx| {
-                        w3cos_react_compat::aot::dispatch_wheel_chain(
+                        host_runtime::dispatch_wheel_chain(
                             &self.native_host_chain(idx),
                             self.mouse_x,
                             self.mouse_y,
@@ -8338,6 +8323,18 @@ pub fn run_reactive_android(
     use winit::platform::android::EventLoopBuilderExtAndroid;
     let event_loop = EventLoop::builder().with_android_app(android_app).build()?;
     let mut app = App::new_reactive(builder);
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn run_dom_android(
+    android_app: winit::platform::android::activity::AndroidApp,
+    setup: fn(),
+) -> Result<()> {
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+    let event_loop = EventLoop::builder().with_android_app(android_app).build()?;
+    let mut app = App::new_dom(setup);
     event_loop.run_app(&mut app)?;
     Ok(())
 }

@@ -131,8 +131,10 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
             (w, h)
         }
         ComponentKind::TextInput { .. } => {
-            let w = dim_to_px(style.width).unwrap_or(200.0);
-            let h = dim_to_px(style.height).unwrap_or(40.0);
+            // Match the browser UA baseline for an `<input size="20">`
+            // instead of imposing the former mobile-only 200×40 control.
+            let w = dim_to_px(style.width).unwrap_or(169.0);
+            let h = dim_to_px(style.height).unwrap_or(20.0);
             (w, h)
         }
         _ => (0.0, 0.0),
@@ -247,7 +249,12 @@ fn leaf_taffy_size(
     base: &taffy::Style,
 ) -> taffy::Size<Dimension> {
     let width = if matches!(style.width, WDim::Auto) {
-        Dimension::auto()
+        match kind {
+            ComponentKind::TextInput { .. } => {
+                Dimension::length(leaf_intrinsic_size(kind, style).0)
+            }
+            _ => Dimension::auto(),
+        }
     } else {
         base.size.width
     };
@@ -473,6 +480,7 @@ impl LayoutEngine {
                 root,
                 &mut idx,
                 None,
+                None,
                 viewport_w,
                 viewport_h,
             )?);
@@ -553,6 +561,7 @@ pub fn compute_with_scroll(
         root,
         &mut node_index,
         None,
+        None,
         viewport_w,
         viewport_h,
     )?;
@@ -607,6 +616,7 @@ fn build_taffy_tree(
     comp: &Component,
     idx: &mut usize,
     parent_direction: Option<WDir>,
+    parent_display: Option<WDisplay>,
     viewport_w: f32,
     viewport_h: f32,
 ) -> Result<NodeId, taffy::TaffyError> {
@@ -617,6 +627,8 @@ fn build_taffy_tree(
 
     if comp.children.is_empty() {
         let size = leaf_taffy_size(&comp.kind, &comp.style, &style);
+        let inline_control_in_block = matches!(comp.style.display, WDisplay::InlineBlock)
+            && !matches!(parent_display, Some(WDisplay::Flex | WDisplay::Grid));
         let (min_w, size_w) = if matches!(comp.style.width, WDim::Auto) {
             match &comp.kind {
                 ComponentKind::Text { content } => {
@@ -647,7 +659,16 @@ fn build_taffy_tree(
                 }
                 ComponentKind::Button { label } => {
                     let w = button_intrinsic_size(label, &comp.style).0;
-                    (Dimension::length(w), Dimension::auto())
+                    let size = if inline_control_in_block {
+                        Dimension::length(w)
+                    } else {
+                        Dimension::auto()
+                    };
+                    (Dimension::length(w), size)
+                }
+                ComponentKind::TextInput { .. } if inline_control_in_block => {
+                    let w = leaf_intrinsic_size(&comp.kind, &comp.style).0;
+                    (Dimension::length(w), Dimension::length(w))
                 }
                 _ => (Dimension::auto(), size.width),
             }
@@ -690,6 +711,7 @@ fn build_taffy_tree(
                     c,
                     idx,
                     Some(comp.style.flex_direction),
+                    Some(comp.style.display),
                     viewport_w,
                     viewport_h,
                 )
@@ -1517,6 +1539,64 @@ mod tests {
             input.width > 200.0,
             "flex-grow input should consume the remaining row width, got {}",
             input.width
+        );
+    }
+
+    #[test]
+    fn form_controls_keep_intrinsic_width_in_block_layout() {
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(375.0),
+                    ..Style::default()
+                },
+                vec![
+                    Component::text_input(
+                        "shipper@demo",
+                        "",
+                        Style {
+                            display: WDisp::InlineBlock,
+                            ..Style::default()
+                        },
+                    ),
+                    Component::button(
+                        "登录",
+                        Style {
+                            display: WDisp::InlineBlock,
+                            font_size: 13.333_333,
+                            padding: w3cos_std::style::Edges::xy(6.0, 1.0),
+                            border_width: 1.0,
+                            ..Style::default()
+                        },
+                    ),
+                ],
+            ),
+            375.0,
+            812.0,
+        )
+        .unwrap();
+
+        let input = layout
+            .iter()
+            .find(|(_, index)| *index == 1)
+            .map(|(rect, _)| rect)
+            .expect("input layout");
+        let button = layout
+            .iter()
+            .find(|(_, index)| *index == 2)
+            .map(|(rect, _)| rect)
+            .expect("button layout");
+
+        assert!(
+            (input.width - 169.0).abs() < 2.0,
+            "default input should stay near the browser's intrinsic width, got {}",
+            input.width
+        );
+        assert!(
+            button.width < 80.0,
+            "default button should not stretch across a block container, got {}",
+            button.width
         );
     }
 

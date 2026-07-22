@@ -8,6 +8,7 @@ use crate::events::EventRegistry;
 use crate::node::{DomNode, NodeId, NodeType};
 use crate::selection::{Range, Selection};
 use crate::stylesheet;
+use crate::user_agent;
 
 /// W3C Document — the root of the DOM tree.
 ///
@@ -303,11 +304,13 @@ impl Document {
     // -----------------------------------------------------------------------
 
     fn alloc_node(&mut self, mut node: DomNode) -> NodeId {
+        let initial_style =
+            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
         let id = if let Some(slot) = self.free_list.pop() {
             node.id = NodeId(slot);
             let idx = slot as usize;
             self.nodes[idx] = Some(node);
-            self.styles[idx] = CSSStyleDeclaration::new();
+            self.styles[idx] = initial_style;
             self.layout_rects[idx] = DOMRect::zero();
             self.scroll_offsets[idx] = (0.0, 0.0);
             NodeId(slot)
@@ -316,7 +319,7 @@ impl Document {
             node.id = id;
             let tag = node.tag;
             self.nodes.push(Some(node));
-            self.styles.push(CSSStyleDeclaration::new());
+            self.styles.push(initial_style);
             self.layout_rects.push(DOMRect::zero());
             self.scroll_offsets.push((0.0, 0.0));
             // Update tag index
@@ -411,6 +414,21 @@ impl Document {
         }
         self.nodes[id.0 as usize] = None;
         self.free_list.push(id.0);
+    }
+
+    /// Remove a node and all descendants from the retained document.
+    ///
+    /// DOM wrappers normally become collectible after detachment. The native
+    /// arena needs an explicit sweep so framework adapters can release host
+    /// subtrees without leaking slots or selector indexes.
+    pub fn remove_node(&mut self, id: NodeId) {
+        let children = self.children_ids(id);
+        for child in children {
+            self.remove_node(child);
+        }
+        self.unlink_from_parent(id);
+        self.events.remove_all(id);
+        self.free_node(id);
     }
 
     // -----------------------------------------------------------------------
@@ -521,6 +539,52 @@ impl Document {
         self.node_to_component(self.body_id, &mut ancestors)
     }
 
+    /// Lower one connected DOM subtree while preserving selector ancestry.
+    pub fn to_component_subtree(&self, id: NodeId) -> w3cos_std::Component {
+        let mut lineage = Vec::new();
+        let mut current = self.get_node(id).parent;
+        while let Some(parent) = current {
+            if self.get_node(parent).node_type == NodeType::Element {
+                lineage.push(parent);
+            }
+            current = self.get_node(parent).parent;
+        }
+        lineage.reverse();
+        let mut ancestors = lineage
+            .into_iter()
+            .map(|ancestor| self.selector_context(ancestor))
+            .collect();
+        self.node_to_component(id, &mut ancestors)
+    }
+
+    fn attach_native_host(
+        &self,
+        id: NodeId,
+        mut component: w3cos_std::Component,
+    ) -> w3cos_std::Component {
+        component.on_click = w3cos_std::EventAction::NativeHost {
+            id: id.as_u32() as u64,
+            click: false,
+            scroll: false,
+            input: false,
+            focus: false,
+            keyboard: false,
+            submit: false,
+            pointer: true,
+            wheel: false,
+        };
+        component
+    }
+
+    fn descendant_text_content(&self, id: NodeId) -> String {
+        let node = self.get_node(id);
+        let mut text = node.text_content.clone().unwrap_or_default();
+        for child in self.children_ids(id) {
+            text.push_str(&self.descendant_text_content(child));
+        }
+        text
+    }
+
     /// Selector context for stylesheet matching: tag, `id` attribute, classes.
     fn selector_context(&self, id: NodeId) -> stylesheet::SelectorContext {
         let node = self.get_node(id);
@@ -562,7 +626,8 @@ impl Document {
         if matched.is_empty() {
             return inline.to_style();
         }
-        let mut merged = CSSStyleDeclaration::new();
+        let mut merged =
+            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
         for (prop, value, _specificity) in &matched {
             merged.set_property(prop, value);
         }
@@ -598,15 +663,34 @@ impl Document {
                 let child_ids = self.children_ids(id);
                 if matches!(
                     tag.as_str(),
-                    "span" | "label" | "em" | "strong" | "code" | "small"
+                    "abbr"
+                        | "b"
+                        | "button"
+                        | "a"
+                        | "span"
+                        | "label"
+                        | "em"
+                        | "i"
+                        | "p"
+                        | "strong"
+                        | "code"
+                        | "small"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
                 ) && child_ids.len() == 1
                 {
                     let child = self.get_node(child_ids[0]);
                     if child.node_type == NodeType::Text {
-                        return w3cos_std::Component::text(
-                            child.text_content.as_deref().unwrap_or(""),
-                            style,
-                        );
+                        let text = child.text_content.as_deref().unwrap_or("");
+                        let component = match tag.as_str() {
+                            "button" | "a" => w3cos_std::Component::button(text, style),
+                            _ => w3cos_std::Component::text(text, style),
+                        };
+                        return self.attach_native_host(id, component);
                     }
 
                     // Browser inline formatting does not map directly onto
@@ -631,9 +715,12 @@ impl Document {
                                 ancestors.push(self.selector_context(id));
                                 let child_style = self.computed_style(child_ids[0], ancestors);
                                 ancestors.pop();
-                                return w3cos_std::Component::text(
-                                    grandchild.text_content.as_deref().unwrap_or(""),
-                                    child_style,
+                                return self.attach_native_host(
+                                    id,
+                                    w3cos_std::Component::text(
+                                        grandchild.text_content.as_deref().unwrap_or(""),
+                                        child_style,
+                                    ),
                                 );
                             }
                         }
@@ -656,10 +743,11 @@ impl Document {
 
                 if let Some(text) = &node.text_content {
                     if children.is_empty() {
-                        return match tag.as_str() {
+                        let component = match tag.as_str() {
                             "button" | "a" => w3cos_std::Component::button(text, style),
                             _ => w3cos_std::Component::text(text, style),
                         };
+                        return self.attach_native_host(id, component);
                     }
                 }
 
@@ -681,7 +769,10 @@ impl Document {
                     "span" | "label" | "em" | "strong" | "code" | "small" | "li" | "dd" | "dt" => {
                         if let Some(text) = &node.text_content {
                             if children.is_empty() {
-                                return w3cos_std::Component::text(text, style);
+                                return self.attach_native_host(
+                                    id,
+                                    w3cos_std::Component::text(text, style),
+                                );
                             }
                         }
                         if is_row {
@@ -693,7 +784,10 @@ impl Document {
                     "p" => {
                         if let Some(text) = &node.text_content {
                             if children.is_empty() {
-                                return w3cos_std::Component::text(text, style);
+                                return self.attach_native_host(
+                                    id,
+                                    w3cos_std::Component::text(text, style),
+                                );
                             }
                         }
                         w3cos_std::Component::column(style, children)
@@ -721,7 +815,8 @@ impl Document {
                         }
                     }
                     "button" => {
-                        let label = node.text_content.as_deref().unwrap_or("Button");
+                        let label = self.descendant_text_content(id);
+                        let label = if label.is_empty() { "Button" } else { &label };
                         w3cos_std::Component::button(label, style)
                     }
                     "img" => {

@@ -62,7 +62,6 @@ pub struct CompileFlags {
     pub needs_runtime: bool,
     pub needs_dom: bool,
     pub needs_std: bool,
-    pub needs_react_compat: bool,
 }
 
 /// Compile a TypeScript source file into a standalone Rust project.
@@ -113,7 +112,7 @@ pub fn compile_mobile_from_file_with_options(
         let bundle = artifacts.bundle_code.ok_or_else(|| {
             anyhow::anyhow!("React AOT mobile entry did not produce an ESM bundle")
         })?;
-        return mobile_codegen::write_mobile_react_project(
+        return mobile_codegen::write_mobile_dom_project(
             &bundle,
             output_dir,
             platform,
@@ -195,7 +194,7 @@ fn compile_with_source_dir(
         std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
     } else {
         let output = ts_transpiler::transpile_with_flags(ts_source)?;
-        let (esm_diagnostics, esm_bundle_code, has_esm_entry) =
+        let (esm_diagnostics, esm_bundle_code, _has_entry_main) =
             if let Some(entry_path) = source_path {
                 match build_esm_artifacts(entry_path) {
                     Ok(artifacts) => (
@@ -212,6 +211,7 @@ fn compile_with_source_dir(
             } else {
                 (String::new(), None, false)
             };
+        let has_esm_bundle = esm_bundle_code.is_some();
         let esm_needs_core = esm_bundle_code
             .as_ref()
             .is_some_and(|code| code.contains("w3cos_core::"));
@@ -222,19 +222,20 @@ fn compile_with_source_dir(
             .is_some_and(|code| code.contains("w3cos_runtime::jsdom"));
         let flags = CompileFlags {
             needs_hashmap: output.needs_hashmap,
-            needs_async: output.needs_async,
+            // The legacy transpiler still scans the source before the ESM
+            // pipeline takes ownership. Its async flag must not pull Tokio
+            // into an ESM-only artifact whose generated bundle contains no
+            // Tokio code.
+            needs_async: output.needs_async && !has_esm_bundle,
             needs_rc: output.needs_rc,
             needs_core: output.needs_core || esm_needs_core,
             needs_fetch: output.needs_fetch,
             needs_history: output.needs_history,
             needs_runtime: output.code.contains("use w3cos_runtime")
-                || has_esm_entry
+                || has_esm_bundle
                 || esm_uses_jsdom,
             needs_dom: output.code.contains("use w3cos_dom"),
-            needs_std: output.code.contains("use w3cos_std") || has_esm_entry,
-            needs_react_compat: esm_bundle_code
-                .as_ref()
-                .is_some_and(|code| code.contains("w3cos_react_compat::")),
+            needs_std: output.code.contains("use w3cos_std") || has_esm_bundle,
         };
         let cargo_toml = generate_standalone_cargo_toml(&flags);
         std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
@@ -243,19 +244,17 @@ fn compile_with_source_dir(
         if esm_bundle_code.is_some() {
             main_rs.push_str("mod esm_bundle;\n\n");
         }
-        if !has_esm_entry {
+        if !has_esm_bundle {
             main_rs.push_str(&output.code);
         }
-        if has_esm_entry || !output.code.contains("fn main(") {
-            if has_esm_entry && flags.needs_react_compat {
-                main_rs.push_str("\nfn build_ui() -> w3cos_std::Component { w3cos_react_compat::aot::render_to_component(esm_bundle::run_entry()) }\nfn main() { if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() { if let Err(error) = w3cos_runtime::run_app(build_ui) { eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\"); } } else { let rendered = build_ui(); println!(\"W3COS_AOT_RENDER_OK nodes={}\", w3cos_react_compat::aot::component_count(&rendered)); } }\n");
-            } else if has_esm_entry {
+        if has_esm_bundle || !output.code.contains("fn main(") {
+            if has_esm_bundle {
                 // DOM-mode bundle (no React host imports): run the entry main,
                 // which registers baked-in stylesheet rules and builds the DOM.
                 // W3COS_DOM_DUMP=1 additionally prints the body's outer HTML
                 // (truncated) — the headless smoke signal for DOM apps.
                 main_rs.push_str(
-                    "\nfn main() {\n    if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() {\n        if let Err(error) = w3cos_runtime::run_app_dom(|| { esm_bundle::run_entry(); }) {\n            eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\");\n        }\n    } else {\n        esm_bundle::run_entry();\n        println!(\"W3COS_DOM_OK nodes={}\", w3cos_runtime::dom::node_count());\n        if std::env::var_os(\"W3COS_DOM_DUMP\").is_some() {\n            let html = w3cos_runtime::dom::outer_html(w3cos_runtime::dom::body_id());\n            let truncated: String = html.chars().take(8000).collect();\n            println!(\"W3COS_DOM_DUMP_BEGIN\\n{truncated}\\nW3COS_DOM_DUMP_END\");\n        }\n    }\n}\n",
+                    "\nfn setup_dom() {\n    if w3cos_runtime::dom::get_element_by_id(\"root\").is_none() {\n        let root = w3cos_runtime::dom::create_element(\"div\");\n        w3cos_runtime::dom::set_attribute(root, \"id\", \"root\");\n        w3cos_runtime::dom::append_child(w3cos_runtime::dom::body_id(), root);\n    }\n    esm_bundle::run_entry();\n}\n\nfn main() {\n    if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() {\n        if let Err(error) = w3cos_runtime::run_app_dom(setup_dom) {\n            eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\");\n        }\n    } else {\n        setup_dom();\n        for _ in 0..16 {\n            w3cos_runtime::jsdom::drain_microtasks();\n            w3cos_runtime::jsdom::tick_timers();\n        }\n        println!(\"W3COS_DOM_OK nodes={}\", w3cos_runtime::dom::node_count());\n        if std::env::var_os(\"W3COS_DOM_DUMP\").is_some() {\n            let html = w3cos_runtime::dom::outer_html(w3cos_runtime::dom::body_id());\n            let truncated: String = html.chars().take(8000).collect();\n            println!(\"W3COS_DOM_DUMP_BEGIN\\n{truncated}\\nW3COS_DOM_DUMP_END\");\n        }\n    }\n}\n",
                 );
             } else {
                 main_rs.push_str("\nfn main() {}\n");
@@ -280,6 +279,15 @@ struct EsmArtifacts {
 }
 
 fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
+    if let Some(prebundled_entry) = prebundle_web_entry(entry_path)? {
+        let mut artifacts = build_esm_artifacts(&prebundled_entry)?;
+        artifacts.diagnostics.insert_str(
+            0,
+            "//! Web dependency graph: bundled with vite.config.w3cos.ts\n",
+        );
+        return Ok(artifacts);
+    }
+
     let project_root = find_project_root(
         entry_path
             .parent()
@@ -288,7 +296,12 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
     let resolver = esm_resolver::EsmResolver::new(project_root);
     let graph = resolver.build_graph_from_entry(entry_path)?;
     let parsed = resolver.parse_graph_from_entry(entry_path)?;
-    let bundle = esm_resolver::EsmBundle::build(&parsed, &resolver, entry_path);
+    // The manifest may reference an entry through `../` segments. Use the
+    // resolver's normalized identity for bundle ordering as well; otherwise
+    // the raw spelling is emitted as a phantom entry module before the real
+    // normalized module and its imports are left unbound.
+    let resolved_entry = resolver.resolve_entry(entry_path)?.path;
+    let bundle = esm_resolver::EsmBundle::build(&parsed, &resolver, &resolved_entry);
 
     // Stylesheet collection: `.css` asset imports stay in the graph's import
     // lists, so this is a walk over already-resolved modules. CSS problems
@@ -352,6 +365,97 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
         bundle_code,
         has_entry_main,
     })
+}
+
+/// Opt-in web dependency bundling for framework applications. A colocated
+/// `vite.config.w3cos.ts` is the contract: Vite resolves npm/CJS packages
+/// (including the official React runtime), while native host modules remain
+/// external for the W3COS ESM resolver.
+fn prebundle_web_entry(entry_path: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    if !matches!(
+        entry_path
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("ts" | "tsx" | "jsx")
+    ) {
+        return Ok(None);
+    }
+    let Some(source_dir) = entry_path.parent() else {
+        return Ok(None);
+    };
+    let Some(app_dir) = source_dir.parent() else {
+        return Ok(None);
+    };
+    let config = app_dir.join("vite.config.w3cos.ts");
+    if !config.is_file() {
+        return Ok(None);
+    }
+    let vite = app_dir.join("node_modules/.bin/vite");
+    if !vite.is_file() {
+        anyhow::bail!(
+            "{} requires the local Vite dependency; install workspace dependencies first",
+            config.display()
+        );
+    }
+
+    let output_dir = std::env::temp_dir().join(format!(
+        "w3cos-vite-{}-{}",
+        std::process::id(),
+        entry_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("entry")
+    ));
+    if output_dir.exists() {
+        std::fs::remove_dir_all(&output_dir)?;
+    }
+    let status = std::process::Command::new(&vite)
+        .current_dir(app_dir)
+        .args(["build", "--config"])
+        .arg(&config)
+        .args(["--outDir"])
+        .arg(&output_dir)
+        .arg("--emptyOutDir")
+        .status()
+        .with_context(|| format!("Could not run {}", vite.display()))?;
+    if !status.success() {
+        anyhow::bail!("W3COS Vite dependency bundle failed with {status}");
+    }
+
+    let assets_dir = output_dir.join("assets");
+    let mut javascript = Vec::new();
+    let mut stylesheets = Vec::new();
+    for entry in std::fs::read_dir(&assets_dir)
+        .with_context(|| format!("Could not read {}", assets_dir.display()))?
+    {
+        let path = entry?.path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("js") => javascript.push(path),
+            Some("css") => stylesheets.push(path),
+            _ => {}
+        }
+    }
+    javascript.sort();
+    stylesheets.sort();
+    let bundle = javascript
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Vite emitted no JavaScript bundle"))?;
+    let wrapper = output_dir.join("w3cos-entry.js");
+    let relative_asset = |path: &std::path::Path| {
+        format!(
+            "./assets/{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+        )
+    };
+    let mut source = format!("import {:?};\n", relative_asset(&bundle));
+    for stylesheet in stylesheets {
+        source.push_str(&format!("import {:?};\n", relative_asset(&stylesheet)));
+    }
+    std::fs::write(&wrapper, source)?;
+    Ok(Some(wrapper))
 }
 
 fn find_project_root(start: &std::path::Path) -> std::path::PathBuf {
@@ -561,10 +665,6 @@ edition = "2024"
     if flags.needs_std {
         toml.push_str(&dependency("w3cos-std"));
     }
-    if flags.needs_react_compat {
-        toml.push_str(&dependency("w3cos-react-compat"));
-    }
-
     toml
 }
 
@@ -741,7 +841,6 @@ console.log("Done!");
             needs_runtime: false,
             needs_dom: false,
             needs_std: false,
-            needs_react_compat: false,
         };
         let toml = generate_standalone_cargo_toml(&flags);
         assert!(!toml.contains("tokio"), "should not include tokio: {toml}");
@@ -759,7 +858,6 @@ console.log("Done!");
             needs_runtime: false,
             needs_dom: false,
             needs_std: false,
-            needs_react_compat: false,
         };
         let toml = generate_standalone_cargo_toml(&flags);
         assert!(toml.contains("tokio"), "should include tokio: {toml}");
@@ -1488,7 +1586,7 @@ export function main() {
     }
 
     #[test]
-    fn esm_react_bundle_keeps_react_main() {
+    fn framework_package_bundle_uses_dom_main() {
         let root = std::env::temp_dir().join("w3cos_esm_react_main");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1513,14 +1611,72 @@ export function main() {
 
         let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
         assert!(
-            main_rs.contains("W3COS_AOT_RENDER_OK"),
-            "React bundle must keep the React main: {main_rs}"
+            main_rs.contains("W3COS_DOM_OK"),
+            "framework bundle must use the DOM main: {main_rs}"
         );
         assert!(
-            !main_rs.contains("W3COS_DOM_OK"),
-            "React bundle must not get the DOM main: {main_rs}"
+            !main_rs.contains("install_host_modules"),
+            "framework bundle must not install a framework host runtime: {main_rs}"
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn esm_framework_bundle_runs_standard_create_root_entry_without_exported_main() {
+        let root = std::env::temp_dir().join("w3cos_esm_react_create_root_entry");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(
+            root.join("src/main.tsx"),
+            r#"import { createRoot } from "react-dom/client";
+import App from "./App";
+createRoot(document.getElementById("root")!).render(App());"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/App.tsx"),
+            r#"export default function App() { return "ready"; }"#,
+        )
+        .unwrap();
+        let react_dom = root.join("node_modules/react-dom");
+        std::fs::create_dir_all(&react_dom).unwrap();
+        std::fs::write(
+            react_dom.join("package.json"),
+            r#"{"exports":{"./client":"./client.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            react_dom.join("client.js"),
+            "export function createRoot() { return { render() {} }; }",
+        )
+        .unwrap();
+
+        let out = root.join("build");
+        let manifest_style_entry = root.join("src/nested/../main.tsx");
+        compile_from_file(&manifest_style_entry, &out).expect("compile should succeed");
+
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains("W3COS_DOM_OK"),
+            "standard framework entry must use the DOM runtime: {main_rs}"
+        );
+        let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs")).unwrap();
+        assert!(
+            bundle_rs.contains("createRoot(vec!") && bundle_rs.contains("m0__init();"),
+            "top-level Web bootstrap must execute through module init: {bundle_rs}"
+        );
+        assert!(
+            !bundle_rs.contains("host_modules::call(\"react"),
+            "framework packages must compile from their real sources: {bundle_rs}"
+        );
+        let main_marker = format!("/// ESM module: {}", root.join("src/main.tsx").display());
+        assert_eq!(
+            bundle_rs.matches(&main_marker).count(),
+            1,
+            "a path containing `..` must not create a phantom duplicate entry module: {bundle_rs}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

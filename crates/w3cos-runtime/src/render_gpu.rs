@@ -589,12 +589,6 @@ fn render_node(
             );
         }
         ComponentKind::Button { label } => {
-            let btn_bg = if bg.a == 0 {
-                node_color(AppColor::rgb(55, 65, 81), opacity, color_chain)
-            } else {
-                bg
-            };
-            draw_rect(scene, rect, btn_bg, style.border_radius.max(6.0), dpi);
             draw_text_centered_in_rect(
                 scene,
                 rect,
@@ -665,32 +659,6 @@ fn render_node(
             } else {
                 (display_value, text_color)
             };
-            let input_bg = if bg.a == 0 {
-                AppColor::rgb(30, 30, 40)
-            } else {
-                bg
-            };
-            draw_rect(scene, rect, input_bg, style.border_radius.max(4.0), dpi);
-            let border_color = if is_focused {
-                AppColor::rgb(108, 92, 231)
-            } else if style.border_color.a > 0 {
-                style.border_color
-            } else {
-                AppColor::rgb(75, 85, 99)
-            };
-            let border_w = if is_focused {
-                style.border_width.max(2.0)
-            } else {
-                style.border_width.max(1.0)
-            };
-            draw_border(
-                scene,
-                rect,
-                border_color,
-                border_w,
-                style.border_radius.max(4.0),
-                dpi,
-            );
             let border = style.border_width;
             let padding = style.padding_lengths();
             let content = LayoutRect {

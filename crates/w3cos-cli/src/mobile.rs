@@ -135,9 +135,7 @@ pub fn mobile_build(
         &interactive_widget,
         &CompileOptions { devtools },
     )?;
-    if platform == "ios" {
-        apply_native_extensions(project_dir, &build_dir)?;
-    }
+    apply_native_extensions(project_dir, &build_dir)?;
 
     match platform {
         "android" => build_android(project_dir, &build_dir, release)?,
@@ -484,7 +482,7 @@ fn safe_rust_path(value: &str) -> bool {
         })
 }
 
-/// Adds application-owned Rust adapters after generic UI code generation.
+/// Adds application-owned Rust adapters after generic mobile UI code generation.
 /// W3COS only validates and wires the declared dependency + initializer.
 fn apply_native_extensions(project_dir: &Path, build_dir: &Path) -> Result<()> {
     let Some(manifest) = manifest_json(project_dir) else {
@@ -554,15 +552,33 @@ fn apply_native_extensions(project_dir: &Path, build_dir: &Path) -> Result<()> {
     fs::write(cargo_path, cargo)?;
 
     let main_path = build_dir.join("src/main.rs");
-    let main = fs::read_to_string(&main_path)?;
-    let marker = "fn main() {\n";
-    if !main.contains(marker) {
-        bail!("generated iOS main has no registration point");
+    if main_path.exists() {
+        let main = fs::read_to_string(&main_path)?;
+        let marker = "fn main() {\n";
+        if !main.contains(marker) {
+            bail!("generated iOS main has no native extension registration point");
+        }
+        fs::write(
+            main_path,
+            main.replacen(marker, &format!("{marker}{registrations}"), 1),
+        )?;
+        return Ok(());
     }
-    fs::write(
-        main_path,
-        main.replacen(marker, &format!("{marker}{registrations}"), 1),
-    )?;
+
+    let lib_path = build_dir.join("src/lib.rs");
+    let mut lib = fs::read_to_string(&lib_path)
+        .context("generated Android library has no native extension registration point")?;
+    let entry_markers = [
+        "pub extern \"C\" fn w3cos_app_run() -> i32 {\n",
+        "fn android_main(app: winit::platform::android::activity::AndroidApp) {\n",
+    ];
+    for marker in entry_markers {
+        if !lib.contains(marker) {
+            bail!("generated Android library is missing entry point: {marker:?}");
+        }
+        lib = lib.replacen(marker, &format!("{marker}{registrations}"), 1);
+    }
+    fs::write(lib_path, lib)?;
     Ok(())
 }
 

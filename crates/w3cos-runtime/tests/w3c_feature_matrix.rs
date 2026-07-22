@@ -291,19 +291,6 @@ fn a11y_tree_from_dom_document() {
 }
 
 #[test]
-fn react_use_state_survives_rerender() {
-    use w3cos_react_compat::{ComponentId, begin_render, use_state};
-
-    begin_render(ComponentId(1));
-    let count = use_state(|| 7_i64);
-    assert_eq!(count.get(), 7);
-    count.set(8);
-    begin_render(ComponentId(1));
-    let count = use_state(|| 0_i64);
-    assert_eq!(count.get(), 8);
-}
-
-#[test]
 fn ecma_proxy_get_trap() {
     use std::collections::HashMap;
     use w3cos_core::{JsObject, ProxyBuilder, Value};

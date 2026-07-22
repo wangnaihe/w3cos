@@ -331,7 +331,7 @@ fn render_node(
     typeface: &Typeface,
     metrics_font: &fontdue::Font,
     text_input_value: Option<&str>,
-    focused: bool,
+    _focused: bool,
 ) {
     let transform = style.transform;
     let rect = LayoutRect {
@@ -398,34 +398,11 @@ fn render_node(
             draw_text_in_rect(canvas, rect, content, style, typeface, metrics_font);
         }
         ComponentKind::Button { label } => {
-            if bg.a == 0 {
-                draw_round_rect(
-                    canvas,
-                    rect,
-                    style.border_radius.max(6.0),
-                    &color_paint(w3cos_std::color::Color::rgb(55, 65, 81), style.opacity),
-                );
-            }
             draw_centered_text(canvas, rect, label, style, typeface, metrics_font);
         }
         ComponentKind::TextInput { value, placeholder } => {
             let value = text_input_value.unwrap_or(value);
             let text = if value.is_empty() { placeholder } else { value };
-            if bg.a == 0 {
-                draw_round_rect(
-                    canvas,
-                    rect,
-                    style.border_radius.max(4.0),
-                    &color_paint(w3cos_std::color::Color::rgb(30, 30, 40), style.opacity),
-                );
-            }
-            if focused && style.border_width > 0.0 {
-                let mut focus =
-                    color_paint(w3cos_std::color::Color::rgb(108, 92, 231), style.opacity);
-                focus.set_style(paint::Style::Stroke);
-                focus.set_stroke_width(style.border_width.max(2.0));
-                draw_round_rect(canvas, rect, style.border_radius.max(4.0), &focus);
-            }
             let color = if value.is_empty() {
                 w3cos_std::color::Color::rgb(107, 114, 128)
             } else {

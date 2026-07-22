@@ -71,7 +71,7 @@
 - [x] Multi-window: w3cos:// URL scheme with app manifest + registry
 - [x] Multi-window: postMessage cross-window communication
 - [x] Multi-window: WindowManager with focus stack (z-order)
-- [x] React hooks compatibility layer (@w3cos/react-compat — useState/useEffect/useMemo/useRef/useReducer/useContext on top of `w3cos-core` signals)
+- [x] Official React runtime executes through the generic JS/DOM AOT pipeline
 - [x] React Native API mapping (@w3cos/rn-compat) (#19 — View/Text/TouchableOpacity/Pressable/ScrollView/Image/TextInput/SafeAreaView/FlatList/Switch + StyleSheet.create + use_state)
 - [x] Wire up AI Bridge to runtime (end-to-end AI agent demo) (#14 — DOM-mode integration + `frame_cache` PNG screenshot pipeline + `ScreenshotProvider` trait)
 
@@ -214,7 +214,7 @@
 
 ## Phase 3 — Compatibility & Migration
 - [x] React Native API mapping (`w3cos-rn-compat`: View/Text/TouchableOpacity/Pressable/ScrollView/Image/TextInput/SafeAreaView/FlatList/Switch/Button/StatusBar + StyleSheet.create + use_state)
-- [x] React hooks compatibility (`w3cos-react-compat`: useState/useEffect/useMemo/useCallback/useRef/useReducer/useContext + provideContext + flushSync, slot-table model on top of `w3cos-core` signals)
+- [x] React hooks run in the bundled official React runtime with no framework-specific host layer
 - [ ] React Native app auto-migration tool (`w3cos migrate --from rn`)
 - [ ] Electron app AST transpiler (strip Chromium, map APIs)
 - [x] PWA manifest support (`w3cos_runtime::pwa::PwaManifest` parses W3C Web App Manifest — `name`/`short_name`/`id`/`start_url`/`display`/`display_override`/`theme_color`/`background_color`/`icons`/`shortcuts` + closest-icon picker + `into_app_manifest` adapter for the W3C OS app registry)

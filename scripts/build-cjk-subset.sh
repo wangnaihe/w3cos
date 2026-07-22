@@ -14,13 +14,18 @@ import re
 from pathlib import Path
 
 roots = [
-    Path("$AINATIVE/demo/native/logidesk-focus.tsx"),
-    Path("$AINATIVE/demo/native/logidesk-focus.css"),
+    Path("$AINATIVE/apps/logidesk-web/src"),
+    Path("$AINATIVE/packages/logidesk-renderer-react/src"),
+    Path("$AINATIVE/packages/logidesk-shell-web/src"),
+    Path("$AINATIVE/locales"),
 ]
 chars = set(chr(i) for i in range(32, 127))
 chars.update("·→▼✕✦×—…，。、；：？！（）《》「」【】")
-for path in roots:
-    if path.exists():
+for root in roots:
+    paths = root.rglob("*") if root.is_dir() else [root]
+    for path in paths:
+        if not path.is_file() or path.suffix not in {".ts", ".tsx", ".css", ".json"}:
+            continue
         text = path.read_text(encoding="utf-8")
         for m in re.finditer(r">([^<{]+)<", text):
             chars.update(m.group(1).strip())

@@ -2,6 +2,7 @@ mod builtins;
 pub mod class;
 pub mod collections;
 pub mod host;
+pub mod host_modules;
 pub mod json;
 mod object;
 pub mod promise;

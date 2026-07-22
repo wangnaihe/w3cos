@@ -22,6 +22,10 @@ pub fn construct(class_value: &Value, args: Vec<Value>) -> Value {
         Value::Object(_) => class_value.call(Value::Undefined, args),
         Value::Function(function) => {
             let instance = Value::object(HashMap::new());
+            let prototype = class_value.get_property("prototype");
+            if prototype.is_object() {
+                set_prototype_of(&instance, &prototype);
+            }
             let result = function.call(instance.clone(), args);
             if result.is_object() || result.is_array() {
                 result
@@ -188,6 +192,17 @@ mod tests {
         });
         let instance = construct(&ctor, vec![Value::Number(9.0)]);
         assert_eq!(instance.get_property("v").to_number(), 9.0);
+    }
+
+    #[test]
+    fn construct_plain_function_installs_its_prototype() {
+        let ctor = Value::function(|_, _| Value::Undefined);
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("render", Value::string("ready"));
+        ctor.set_property("prototype", prototype);
+
+        let instance = construct(&ctor, vec![]);
+        assert_eq!(instance.get_property("render").to_js_string(), "ready");
     }
 
     #[test]

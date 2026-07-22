@@ -782,18 +782,6 @@ fn render_node(
             draw_text_in_rect(pixmap, rect, content, style, text_color, font, clip_mask);
         }
         ComponentKind::Button { label } => {
-            let btn_bg = if bg.a == 0 {
-                node_color(Color::rgb(55, 65, 81), opacity, color_chain)
-            } else {
-                bg
-            };
-            draw_rect(
-                pixmap,
-                rect,
-                btn_bg,
-                style.border_radius.max(6.0),
-                clip_mask,
-            );
             draw_text_centered_in_rect(pixmap, rect, label, style, text_color, font, clip_mask);
         }
         ComponentKind::Image { src } => {
@@ -850,38 +838,6 @@ fn render_node(
             } else {
                 (display_value, None)
             };
-            let input_bg = if bg.a == 0 {
-                apply_opacity(Color::rgb(30, 30, 40), opacity)
-            } else {
-                bg
-            };
-            draw_rect(
-                pixmap,
-                rect,
-                input_bg,
-                style.border_radius.max(4.0),
-                clip_mask,
-            );
-            let border_w = if is_focused && style.border_width > 0.0 {
-                style.border_width.max(2.0)
-            } else {
-                style.border_width
-            };
-            if border_w > 0.0 {
-                let border_color = if is_focused {
-                    apply_opacity(Color::rgb(108, 92, 231), opacity)
-                } else {
-                    apply_opacity(style.border_color, opacity)
-                };
-                draw_border(
-                    pixmap,
-                    rect,
-                    border_color,
-                    border_w,
-                    style.border_radius.max(4.0),
-                    clip_mask,
-                );
-            }
             let content = text_content_box(rect, style);
             let text_x = content.x;
             let text_y = text_layout::y_for_draw_text_line_centered(

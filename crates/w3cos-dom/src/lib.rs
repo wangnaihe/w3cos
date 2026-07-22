@@ -6,10 +6,12 @@ pub mod dom_rect;
 pub mod element;
 pub mod events;
 pub mod history;
+pub mod host_runtime;
 pub mod location;
 pub mod node;
 pub mod selection;
 pub mod stylesheet;
+pub mod user_agent;
 pub mod window;
 
 pub use document::Document;
@@ -355,6 +357,32 @@ mod tests {
     }
 
     #[test]
+    fn html_form_controls_use_ua_defaults_below_author_styles() {
+        crate::stylesheet::clear_rules();
+        let mut doc = Document::new();
+        let input = doc.create_element("input");
+        input.set_attribute(&mut doc, "value", "demo");
+        doc.body().append_child(&mut doc, input);
+
+        let tree = doc.to_component_tree();
+        assert_eq!(tree.children[0].style.background, w3cos_std::Color::WHITE);
+        assert_eq!(tree.children[0].style.border_width, 1.0);
+
+        crate::stylesheet::register_rule(
+            "input",
+            &[("background-color", "#123456"), ("border-radius", "8px")],
+        );
+        let tree = doc.to_component_tree();
+        assert_eq!(
+            tree.children[0].style.background,
+            w3cos_std::Color::rgb(18, 52, 86)
+        );
+        assert_eq!(tree.children[0].style.border_radius, 8.0);
+        assert_eq!(tree.children[0].style.border_width, 1.0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_stylesheet_descendant_selector_uses_dom_ancestors() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
@@ -462,6 +490,35 @@ mod tests {
                 ..
             } if id == editor.id.as_u32() as u64
         ));
+    }
+
+    #[test]
+    fn test_component_subtree_preserves_dom_ancestry_and_host_identity() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".panel .action", &[("color", "#123456")]);
+        let mut doc = Document::new();
+        let panel = doc.create_element("section");
+        panel.set_class_name(&mut doc, "panel");
+        let button = doc.create_element("button");
+        button.set_class_name(&mut doc, "action");
+        let label = doc.create_text_node("Dispatch");
+        button.append_child(&mut doc, label);
+        panel.append_child(&mut doc, button);
+        doc.body().append_child(&mut doc, panel);
+
+        let component = doc.to_component_subtree(button.id);
+
+        assert!(matches!(
+            component.kind,
+            w3cos_std::ComponentKind::Button { ref label } if label == "Dispatch"
+        ));
+        assert_eq!(component.style.color, w3cos_std::Color::from_hex("#123456"));
+        assert!(matches!(
+            component.on_click,
+            w3cos_std::EventAction::NativeHost { id, .. }
+                if id == button.id.as_u32() as u64
+        ));
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
@@ -593,6 +650,34 @@ mod tests {
     }
 
     #[test]
+    fn test_cssom_supports_web_host_style_mutations() {
+        use w3cos_std::Color;
+        use w3cos_std::safe_area::SafeAreaEdge;
+        use w3cos_std::style::{Overflow, Spacing};
+
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("fontSize", "16");
+        style.set_property("lineHeight", "24px");
+        style.set_property("marginTop", "12px");
+        style.set_property("paddingTop", "calc(18px + env(safe-area-inset-top))");
+        style.set_property("overflowY", "auto");
+        style.set_property("backgroundColor", "rgba(10, 20, 30, 0.5)");
+
+        assert_eq!(style.inner.line_height, 1.5);
+        assert_eq!(style.inner.margin.top, Spacing::Px(12.0));
+        assert!(matches!(
+            style.inner.padding.top,
+            Spacing::Composite {
+                px: 18.0,
+                safe_area: Some(SafeAreaEdge::Top),
+                keyboard_inset: false,
+            }
+        ));
+        assert!(matches!(style.inner.overflow, Overflow::Auto));
+        assert_eq!(style.inner.background, Color::rgba(10, 20, 30, 128));
+    }
+
+    #[test]
     fn test_css_compositor_properties() {
         let mut style = CSSStyleDeclaration::new();
         style.set_property("will-change", "transform, opacity");
@@ -638,6 +723,21 @@ mod tests {
         parent.remove_child(&mut doc, &child);
         assert_eq!(parent.children(&doc).len(), 0);
         assert!(child.parent_element(&doc).is_none());
+    }
+
+    #[test]
+    fn test_remove_node_reclaims_a_retained_subtree() {
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        let child = doc.create_element("span");
+        doc.body().append_child(&mut doc, parent);
+        parent.append_child(&mut doc, child);
+        assert_eq!(doc.node_count(), 4);
+
+        doc.remove_node(parent.id);
+
+        assert_eq!(doc.node_count(), 2);
+        assert!(doc.body().children(&doc).is_empty());
     }
 
     #[test]

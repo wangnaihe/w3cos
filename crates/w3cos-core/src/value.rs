@@ -49,9 +49,15 @@ pub struct JsFunction {
 
 impl JsFunction {
     pub fn new(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
+        let mut props = std::collections::HashMap::new();
+        // Ordinary JavaScript function objects own a prototype object. The
+        // compiler uses these Values for function declarations/constructors;
+        // ReactDOM installs `render` on `ReactDOMRoot.prototype` before
+        // constructing root instances.
+        props.insert("prototype".to_string(), Value::object(HashMap::new()));
         Self {
             inner: Rc::new(f),
-            props: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            props: Rc::new(RefCell::new(props)),
         }
     }
 
@@ -66,6 +72,10 @@ impl JsFunction {
             .get(key)
             .cloned()
             .unwrap_or(Value::Undefined)
+    }
+
+    pub fn has_own_property(&self, key: &str) -> bool {
+        self.props.borrow().contains_key(key)
     }
 
     /// Assign a property on the function object.
@@ -143,6 +153,7 @@ impl Value {
             Value::Null => "object",
             Value::Bool(_) => "boolean",
             Value::Number(_) => "number",
+            Value::String(value) if value.starts_with("__w3cos_symbol_") => "symbol",
             Value::String(_) => "string",
             Value::Array(_) | Value::Object(_) => "object",
             Value::Function(_) => "function",
@@ -473,6 +484,24 @@ impl Value {
     pub fn call_method(&self, key: &str, args: Vec<Value>) -> Value {
         if key == "__w3cos_symbol_iterator" {
             return iterator_object(self.iter().collect());
+        }
+        if key == "hasOwnProperty" {
+            let property = args
+                .first()
+                .cloned()
+                .unwrap_or(Value::Undefined)
+                .to_js_string();
+            return Value::Bool(match self {
+                Value::Object(object) => object.borrow().properties.contains_key(&property),
+                Value::Array(values) => {
+                    property == "length"
+                        || property
+                            .parse::<usize>()
+                            .is_ok_and(|index| index < values.borrow().len())
+                }
+                Value::Function(function) => function.has_own_property(&property),
+                _ => false,
+            });
         }
         if let Value::Array(values) = self
             && let Some(result) = array_call_method(values, key, args.clone(), self)
@@ -1405,6 +1434,27 @@ mod tests {
         assert_eq!(Value::Number(42.0).type_of(), "number");
         assert_eq!(Value::String("hi".into()).type_of(), "string");
         assert_eq!(Value::Bool(true).type_of(), "boolean");
+        assert_eq!(
+            Value::String("__w3cos_symbol_for:react.element".into()).type_of(),
+            "symbol"
+        );
+    }
+
+    #[test]
+    fn plain_objects_expose_has_own_property() {
+        let object = crate::js_object! {
+            "present" => Value::Undefined,
+        };
+        assert!(
+            object
+                .call_method("hasOwnProperty", vec![Value::from("present")])
+                .to_bool()
+        );
+        assert!(
+            !object
+                .call_method("hasOwnProperty", vec![Value::from("missing")])
+                .to_bool()
+        );
     }
 
     #[test]

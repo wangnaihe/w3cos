@@ -119,7 +119,8 @@ fn css_and_scss_examples_emit_standalone_projects() {
 
 #[test]
 fn logidesk_native_app_compiles_when_present() {
-    let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../demo/native/app.tsx");
+    let app =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../apps/logidesk-native/app.tsx");
     if !app.is_file() {
         eprintln!(
             "skip logidesk_native_app_compiles_when_present: {}",

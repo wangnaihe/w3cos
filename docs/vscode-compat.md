@@ -118,7 +118,7 @@ These are capabilities the **platform** must implement. They are not VS Code-spe
 | Web Workers | new Worker(), postMessage, SharedWorker | Node.js worker_threads | Done (Rust-closure workers + SharedWorker ports) | P1 |
 | WebSocket | new WebSocket(), onmessage, send | Node.js ws / net | Done (tungstenite RFC 6455) | P1 |
 | Storage | localStorage, sessionStorage | Electron Store | Done localStorage (JSON persistence); sessionStorage: None | P1 |
-| IndexedDB | Structured data storage | Node.js sqlite / json files | Done (stores/indexes/transactions, JSON-file backed) | P2 |
+| IndexedDB | Structured data storage | Node.js sqlite / json files | Prototype only (sync Rust/JSON backend; standard global, request events and atomic transactions pending) | P2 |
 | Notifications | new Notification() | Electron Notification | Have (notify-rust) | P2 |
 | WHATWG Streams | ReadableStream, WritableStream, TransformStream | Node.js stream | Partial (ReadableStream only) | P1 |
 | WHATWG Encoding | TextEncoder, TextDecoder | Node.js Buffer | Done | P1 |

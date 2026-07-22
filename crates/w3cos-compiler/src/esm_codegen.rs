@@ -16,6 +16,52 @@ use swc_common::{FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 
+fn json_value_expr(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "w3cos_core::Value::Null".to_string(),
+        serde_json::Value::Bool(value) => format!("w3cos_core::Value::Bool({value})"),
+        serde_json::Value::Number(value) => format!(
+            "w3cos_core::Value::Number({})",
+            value.as_f64().unwrap_or_default()
+        ),
+        serde_json::Value::String(value) => {
+            format!("w3cos_core::Value::from({value:?})")
+        }
+        serde_json::Value::Array(values) => format!(
+            "w3cos_core::Value::array(vec![{}])",
+            values
+                .iter()
+                .map(json_value_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        serde_json::Value::Object(values) => format!(
+            "w3cos_core::Value::object(::std::collections::HashMap::from([{}]))",
+            values
+                .iter()
+                .map(|(key, value)| format!("({key:?}.to_string(), {})", json_value_expr(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn emit_literal_imports(module: &BundledModule) -> String {
+    module
+        .literal_imports
+        .iter()
+        .map(|(local, source)| {
+            let value = serde_json::from_str(source)
+                .map(|value| json_value_expr(&value))
+                .unwrap_or_else(|_| "w3cos_core::Value::Undefined".to_string());
+            format!(
+                "    pub fn {}_get() -> w3cos_core::Value {{ {value} }}\n",
+                sanitize_ident(local)
+            )
+        })
+        .collect()
+}
+
 /// Generate a Rust module skeleton from a fully built ESM bundle.
 pub fn generate_skeleton(bundle: &EsmBundle) -> String {
     let mut out = String::new();
@@ -44,10 +90,11 @@ fn generate_module(bundle: &EsmBundle, module: &BundledModule) -> String {
     ));
     for (local, host_path) in &module.host_imports {
         out.push_str(&format!(
-            "    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ w3cos_react_compat::aot::call_host({host_path:?}, __args) }}\n",
+            "    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ w3cos_core::host_modules::call({host_path:?}, __args) }}\n",
             sanitize_ident(local),
         ));
     }
+    out.push_str(&emit_literal_imports(module));
     for ns_import in &module.namespace_imports {
         out.push_str(&format!(
             "    /// namespace import {} ({} exports)\n    pub fn {}() {{ todo!(\"namespace object\") }}\n",
@@ -247,10 +294,11 @@ fn generate_module_with_bodies(
         .collect();
     for (local, host_path) in &module.host_imports {
         out.push_str(&format!(
-            "    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ w3cos_react_compat::aot::call_host({host_path:?}, __args) }}\n",
+            "    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ w3cos_core::host_modules::call({host_path:?}, __args) }}\n",
             sanitize_ident(local),
         ));
     }
+    out.push_str(&emit_literal_imports(module));
 
     // Emit cross-module use aliases (same as skeleton), except variable
     // symbols: those are exposed through `{bundled}_get`/`{bundled}_set`
@@ -277,6 +325,19 @@ fn generate_module_with_bodies(
                     sanitize_ident(local),
                     owner.namespace,
                     bundled
+                ));
+            } else if sym.kind == SymbolKind::Function {
+                let local = sanitize_ident(local);
+                out.push_str(&format!(
+                    "    pub use super::{}::{} as {};\n    pub use super::{}::{}_value;\n    pub use super::{}::{}_value as {}_value;\n",
+                    owner.namespace,
+                    bundled,
+                    local,
+                    owner.namespace,
+                    bundled,
+                    owner.namespace,
+                    bundled,
+                    local,
                 ));
             } else {
                 out.push_str(&format!(
@@ -312,6 +373,12 @@ fn generate_module_with_bodies(
             _ => None,
         })
         .collect();
+    value_bindings.extend(
+        module
+            .literal_imports
+            .iter()
+            .map(|(local, _)| sanitize_ident(local)),
+    );
     // Variables emitted in `{bundled}_get`/`_set` accessor form read through
     // the accessor — including own ambient/stubbed variables and aliases to
     // non-local targets (see variable_has_get_accessors).
@@ -371,19 +438,37 @@ fn generate_module_with_bodies(
                     &value_bindings,
                     &class_names,
                     &namespace_names,
+                    false,
                 )
                 .unwrap_or_else(|| {
-                    format!("        todo!(\"body not found: {}\")", sym.original_name)
+                    format!("        todo!(\"body not found: {}\");", sym.original_name)
                 });
+                let callable_body = find_function(
+                    &functions,
+                    &sym.original_name,
+                    &renames,
+                    &value_bindings,
+                    &class_names,
+                    &namespace_names,
+                    true,
+                )
+                .unwrap_or_else(|| body.clone());
                 out.push_str(&format!(
-                    "\n    /// function {} (from ESM)\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n",
-                    sym.original_name, sym.bundled_name, body
+                    "\n    /// function {} (from ESM)\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n",
+                    sym.original_name, sym.bundled_name, body, sym.bundled_name, callable_body
+                ));
+                out.push_str(&format!(
+                    "    std::thread_local! {{ static {}_VALUE: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }}; }}\n    pub fn {}_value() -> w3cos_core::Value {{\n        {}_VALUE.with(|cell| {{\n            if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }}\n            let value = w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args));\n            *cell.borrow_mut() = Some(value.clone());\n            value\n        }})\n    }}\n",
+                    sym.bundled_name.to_uppercase(),
+                    sym.bundled_name,
+                    sym.bundled_name.to_uppercase(),
+                    sym.bundled_name,
                 ));
                 let alias = sanitize_ident(&sym.original_name);
                 if alias != sym.bundled_name {
                     out.push_str(&format!(
-                        "    pub use self::{} as {};\n",
-                        sym.bundled_name, alias
+                        "    pub use self::{} as {};\n    pub use self::{}_value as {}_value;\n",
+                        sym.bundled_name, alias, sym.bundled_name, alias
                     ));
                 }
             }
@@ -396,16 +481,34 @@ fn generate_module_with_bodies(
                     &value_bindings,
                     &class_names,
                     &namespace_names,
+                    false,
                 ) {
+                    let callable_body = find_function(
+                        &functions,
+                        &sym.original_name,
+                        &renames,
+                        &value_bindings,
+                        &class_names,
+                        &namespace_names,
+                        true,
+                    )
+                    .unwrap_or_else(|| body.clone());
                     out.push_str(&format!(
-                        "\n    /// function-valued variable {} (from ESM)\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n",
-                        sym.original_name, sym.bundled_name, body
+                        "\n    /// function-valued variable {} (from ESM)\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n",
+                        sym.original_name, sym.bundled_name, body, sym.bundled_name, callable_body
+                    ));
+                    out.push_str(&format!(
+                        "    std::thread_local! {{ static {}_VALUE: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }}; }}\n    pub fn {}_value() -> w3cos_core::Value {{\n        {}_VALUE.with(|cell| {{\n            if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }}\n            let value = w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args));\n            *cell.borrow_mut() = Some(value.clone());\n            value\n        }})\n    }}\n",
+                        sym.bundled_name.to_uppercase(),
+                        sym.bundled_name,
+                        sym.bundled_name.to_uppercase(),
+                        sym.bundled_name,
                     ));
                     let alias = sanitize_ident(&sym.original_name);
                     if alias != sym.bundled_name {
                         out.push_str(&format!(
-                            "    pub use self::{} as {};\n",
-                            sym.bundled_name, alias
+                            "    pub use self::{} as {};\n    pub use self::{}_value as {}_value;\n",
+                            sym.bundled_name, alias, sym.bundled_name, alias
                         ));
                     }
                 } else if let Some(target) = find_alias(&functions, &sym.original_name) {
@@ -431,10 +534,7 @@ fn generate_module_with_bodies(
                             }
                         };
                         let get_body = match shape {
-                            NamespacePropShape::FnValue => format!(
-                                "w3cos_core::Value::function(move |_this, __args| {}(__args))",
-                                fwd("")
-                            ),
+                            NamespacePropShape::FnValue => format!("{}_value()", fwd("")),
                             NamespacePropShape::ClassValue => format!("{}()", fwd("")),
                             NamespacePropShape::VariableValue => format!("{}_get()", fwd("")),
                             NamespacePropShape::Missing => {
@@ -854,9 +954,7 @@ fn emit_namespace_import(
                 format!("super::{owner}::{bundled}()")
             }
             (Some(owner), NamespacePropShape::FnValue) => {
-                format!(
-                    "w3cos_core::Value::function(move |_this, __args| super::{owner}::{bundled}(__args))"
-                )
+                format!("super::{owner}::{bundled}_value()")
             }
             (Some(owner), NamespacePropShape::VariableValue) => {
                 // Snapshot clone at namespace-build time; live-binding
@@ -1017,6 +1115,10 @@ fn lowering_names(module: &BundledModule) -> Vec<(String, String)> {
             .iter()
             .map(|(local, _)| (sanitize_ident(local), sanitize_ident(local))),
     );
+    names.extend(module.literal_imports.iter().map(|(local, _)| {
+        let local = sanitize_ident(local);
+        (local.clone(), local)
+    }));
     names.extend(module.namespace_imports.iter().map(|ns| {
         (
             sanitize_ident(&ns.local),
@@ -1122,14 +1224,41 @@ fn parse_module_items(path: &Path) -> ParsedModuleItems {
                 }
             }
             ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(default_decl)) => {
-                // `export default class X {}` — recorded under its local name.
-                if let DefaultDecl::Class(class_expr) = &default_decl.decl
-                    && let Some(ident) = &class_expr.ident
-                {
-                    items.push(TopLevelItem::Class {
-                        name: ident.sym.to_string(),
-                        class: class_expr.class.clone(),
-                    });
+                match &default_decl.decl {
+                    // `export default class X {}` — recorded under its local name.
+                    DefaultDecl::Class(class_expr) => {
+                        if let Some(ident) = &class_expr.ident {
+                            items.push(TopLevelItem::Class {
+                                name: ident.sym.to_string(),
+                                class: class_expr.class.clone(),
+                            });
+                        }
+                    }
+                    // A named default function is still a normal local declaration.
+                    // The resolver records it as the `default` export, so codegen must
+                    // retain its body for imports such as `import App from './App'`.
+                    DefaultDecl::Fn(function) => {
+                        if let Some(ident) = &function.ident {
+                            let params = function
+                                .function
+                                .params
+                                .iter()
+                                .map(|param| param.pat.clone())
+                                .collect();
+                            let body = function
+                                .function
+                                .body
+                                .as_ref()
+                                .map(|block| block.stmts.clone())
+                                .unwrap_or_default();
+                            items.push(TopLevelItem::Function {
+                                name: ident.sym.to_string(),
+                                params,
+                                body,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
             ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(default_expr)) => {
@@ -1270,6 +1399,7 @@ fn find_function(
     value_bindings: &HashSet<String>,
     class_names: &HashSet<String>,
     namespace_names: &HashSet<String>,
+    dynamic_this: bool,
 ) -> Option<String> {
     for item in items {
         if let TopLevelItem::Function {
@@ -1283,6 +1413,9 @@ fn find_function(
                     LowerCtx::new_dynamic_with_bindings(renames.to_vec(), value_bindings.clone())
                         .with_classes(class_names.clone())
                         .with_namespaces(namespace_names.clone());
+                if dynamic_this {
+                    ctx = ctx.with_function_this();
+                }
                 ctx.bind_patterns(params);
                 // Boxed-scope analysis must run before param bindings and the
                 // hoisting prologue are emitted (captured+assigned locals —
@@ -1908,12 +2041,46 @@ export function main() { return effect; }"#,
         let code = generate_with_bodies(&bundle);
 
         assert!(
-            code.contains("alias effect → browser") && code.contains("m0_browser(__args)"),
+            code.contains("alias effect → browser") && code.contains("m0_browser_value()"),
             "native window host must select the browser branch: {code}"
         );
         assert!(
             !code.contains("alias effect → fallback"),
             "native window host must not select the SSR fallback: {code}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn named_default_function_keeps_its_body() {
+        let root = fixture_root("w3cos_esm_codegen_default_function");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/App.tsx"),
+            r#"export default function App() { return <main>ready</main>; }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.tsx"),
+            r#"import App from "./App";
+export function boot() { return <App />; }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/main.tsx"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/main.tsx"));
+        let code = generate_with_bodies(&bundle);
+
+        assert!(
+            code.contains("w3cos_core::Value::from(\"main\")"),
+            "default function body must be lowered: {code}"
+        );
+        assert!(
+            !code.contains("body not found: App"),
+            "default function must not fall back to a stub: {code}"
         );
         std::fs::remove_dir_all(root).ok();
     }
@@ -1971,11 +2138,9 @@ export function boot() {
             code.contains("props.insert(\"Widget\".to_string(), super::m1::m1_Widget());"),
             "class prop: {code}"
         );
-        // Plain function export → wrapped fn value.
+        // Plain function export → stable interned function object.
         assert!(
-            code.contains(
-                "props.insert(\"greet\".to_string(), w3cos_core::Value::function(move |_this, __args| super::m1::m1_greet(__args)));"
-            ),
+            code.contains("props.insert(\"greet\".to_string(), super::m1::m1_greet_value());"),
             "function prop: {code}"
         );
         // Variable export → snapshot via the _get accessor.
@@ -1985,9 +2150,7 @@ export function boot() {
         );
         // Alias export (`export const helper = greet`) resolves to the aliased fn.
         assert!(
-            code.contains(
-                "props.insert(\"helper\".to_string(), w3cos_core::Value::function(move |_this, __args| super::m1::m1_greet(__args)));"
-            ),
+            code.contains("props.insert(\"helper\".to_string(), super::m1::m1_greet_value());"),
             "alias prop: {code}"
         );
         // Star re-export (`export * from`) is included.

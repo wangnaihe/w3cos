@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use w3cos_dom::host_runtime;
 use w3cos_std::EventAction;
 
 /// Thread-local reactive signal store.
@@ -299,7 +300,7 @@ pub fn execute_action(action: &w3cos_std::EventAction) {
             id: host_id, click, ..
         } => {
             if *click {
-                w3cos_react_compat::aot::dispatch_click(*host_id);
+                host_runtime::dispatch_click(*host_id);
             }
         }
     }

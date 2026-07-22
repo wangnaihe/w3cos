@@ -2,13 +2,13 @@
 
 use std::path::Path;
 
-fn repo_demo_native() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../demo/native")
+fn repo_native_shell() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../apps/logidesk-native")
 }
 
 #[test]
 fn test_ios_web_emit_has_actions_and_binds() {
-    let demo = repo_demo_native();
+    let demo = repo_native_shell();
     let tsx = demo.join("test-ios.tsx");
     if !tsx.is_file() {
         eprintln!("skip: {} not in checkout", tsx.display());

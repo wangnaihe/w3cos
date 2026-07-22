@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`w3cos.ipc`** (`w3cos_runtime::ipc`) — typed length-prefixed JSON message bus over Unix Domain Sockets (Linux/macOS) or TCP loopback (Windows). Multi-client `IpcServer` with `broadcast` / `send_to`, `IpcClient` with reader+writer worker threads.
   - **`w3cos.menu`** (`w3cos_runtime::menu`) — application menu bar + context menu data model with `MenuItem`/`MenuItemKind` (Normal/Separator/Checkbox/Radio), accelerators, roles, and a global `MenuEvent` queue.
 - **AI Bridge end-to-end** (#14) — runtime now installs a `ScreenshotProvider` backed by the new `frame_cache` module. The CPU renderer caches each frame; the AI Bridge `/screenshot` endpoint returns a PNG-encoded snapshot of the latest frame instead of a stub error response.
-- **`w3cos-react-compat` crate** — React hooks compatibility on top of `w3cos-core` signals: `use_state` / `use_effect` / `use_memo` / `use_callback` / `use_ref` / `use_reducer` / `use_context` / `provide_context` / `flush_sync` with a slot-table render lifecycle (`begin_render` / `end_render` / `mark_dirty` / `take_dirty` / `unmount`).
+- **Official React AOT path** — npm/CJS dependencies are bundled before W3COS compiles the application through its generic JavaScript and DOM runtime.
 - **`w3cos-rn-compat` crate updates** — React Native mapping now exports `View` / `Text` / `TouchableOpacity` / `Pressable` / `ScrollView` / `SafeAreaView` / `Image` / `TextInput` / `FlatList` / `StatusBar` / `ActivityIndicator` / `Button` / `Switch` plus `StyleSheet.create` and `use_state`, fulfilling issue #19.
 - README badges (CI, License, Rust version)
 - CODE_OF_CONDUCT.md (Contributor Covenant v2.1)

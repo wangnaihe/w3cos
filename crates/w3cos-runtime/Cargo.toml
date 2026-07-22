@@ -29,7 +29,6 @@ libc = "0.2"
 tempfile = { workspace = true }
 glob = { workspace = true }
 w3cos-ffi = { path = "../w3cos-ffi" }
-w3cos-react-compat = { workspace = true }
 
 # GPU rendering (default)
 vello = { workspace = true, optional = true }

@@ -40,8 +40,8 @@
 //!
 //! JS timers are kept in a bridge-side store rather than
 //! [`crate::timers`]: `timers::set_timeout` only accepts `EventAction`, which
-//! has no JS-callback variant (`NativeClick` is owned by the react-compat
-//! host; `Notify` would fire desktop notifications via `state::execute_action`).
+//! has no JS-callback variant; framework adapters use the separate DOM host
+//! boundary (`Notify` would fire desktop notifications via `state::execute_action`).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
