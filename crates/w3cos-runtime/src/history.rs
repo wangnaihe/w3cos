@@ -60,7 +60,7 @@ pub fn replace_state(state: Option<&str>, title: &str, url: &str) {
     mark_dirty();
 }
 
-pub fn back() {
+pub fn back() -> bool {
     let (navigated, state_val) = STORE.with(|s| {
         let mut store = s.borrow_mut();
         let nav = store.history.back();
@@ -73,6 +73,7 @@ pub fn back() {
         mark_dirty();
         fire_popstate(state_val);
     }
+    navigated
 }
 
 pub fn forward() {
@@ -176,6 +177,12 @@ fn fire_popstate(state: Option<String>) {
             handler(state.clone());
         }
     });
+    crate::jsdom::dispatch_native_popstate(state);
+}
+
+/// Whether the current session-history entry has a predecessor.
+pub fn can_go_back() -> bool {
+    STORE.with(|s| s.borrow().history.can_go_back())
 }
 
 #[allow(dead_code)]

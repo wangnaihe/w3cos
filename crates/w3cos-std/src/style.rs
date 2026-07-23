@@ -52,6 +52,9 @@ pub struct Style {
 
     // Visual
     pub background: Color,
+    /// Raw CSS gradient layers. Solid backgrounds continue to use `background`.
+    #[serde(default)]
+    pub background_image: Option<String>,
     pub color: Color,
     pub font_size: f32,
     pub font_weight: u16,
@@ -145,6 +148,7 @@ impl Default for Style {
             scroll_initial_target: ScrollInitialTarget::None,
             overflow_anchor: true,
             background: Color::TRANSPARENT,
+            background_image: None,
             color: Color::WHITE,
             font_size: 16.0,
             font_weight: 400,

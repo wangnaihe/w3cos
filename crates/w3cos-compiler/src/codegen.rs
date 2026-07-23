@@ -590,11 +590,18 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
         fields.push(format!("line_height: {lh}_f32"));
     }
     if let Some(ref c) = s.color {
-        fields.push(format!("color: Color::from_hex({c:?})"));
+        fields.push(format!("color: {}", gen_color_rust(c, "Color::BLACK")));
     }
     if s.background_from_signal.is_none() {
         if let Some(ref bg) = s.background {
-            fields.push(format!("background: Color::from_hex({bg:?})"));
+            if bg.contains("gradient(") {
+                fields.push(format!("background_image: Some({bg:?}.to_string())"));
+            } else {
+                fields.push(format!(
+                    "background: {}",
+                    gen_color_rust(bg, "Color::TRANSPARENT")
+                ));
+            }
         }
     }
     if let Some(br) = s.border_radius {
@@ -604,7 +611,10 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
         fields.push(format!("border_width: {bw}_f32"));
     }
     if let Some(ref bc) = s.border_color {
-        fields.push(format!("border_color: Color::from_hex({bc:?})"));
+        fields.push(format!(
+            "border_color: {}",
+            gen_color_rust(bc, "Color::TRANSPARENT")
+        ));
     }
     if let Some(ref ai) = s.align_items {
         let variant = match ai.as_str() {
@@ -848,6 +858,14 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     }
 }
 
+fn gen_color_rust(value: &str, fallback: &str) -> String {
+    if value.trim().starts_with('#') {
+        format!("Color::from_hex({value:?})")
+    } else {
+        format!("Color::from_css({value:?}).unwrap_or({fallback})")
+    }
+}
+
 fn gen_flex_direction(s: &str) -> String {
     match s {
         "row" => "FlexDirection::Row".to_string(),
@@ -966,7 +984,7 @@ fn gen_transform_rust(value: &str) -> String {
 fn gen_box_shadow_rust(value: &str) -> Option<String> {
     let s = parse_box_shadow(value)?;
     Some(format!(
-        "box_shadow: Some(BoxShadow::new({}_f32, {}_f32, {}_f32, {}_f32, Color::from_hex({:?})))",
+        "box_shadow: Some(BoxShadow::new({}_f32, {}_f32, {}_f32, {}_f32, Color::from_css({:?}).unwrap_or(Color::TRANSPARENT)))",
         s.offset_x, s.offset_y, s.blur, s.spread, s.color
     ))
 }

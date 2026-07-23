@@ -137,7 +137,10 @@ impl CSSStyleDeclaration {
 
             "background" | "background-color" | "backgroundColor" => {
                 if let Some(color) = Color::from_css(value) {
-                    self.inner.background = color
+                    self.inner.background = color;
+                    self.inner.background_image = None;
+                } else if value.contains("gradient(") {
+                    self.inner.background_image = Some(value.trim().to_string());
                 }
             }
             "color" => {
@@ -170,6 +173,7 @@ impl CSSStyleDeclaration {
                     self.inner.border_color = color
                 }
             }
+            "border" => apply_border_shorthand(&mut self.inner, value),
             "opacity" => {
                 if let Ok(v) = value.parse() {
                     self.inner.opacity = v
@@ -510,27 +514,59 @@ fn parse_dimension(value: &str) -> Dimension {
 }
 
 fn parse_box_shadow(value: &str) -> Option<w3cos_std::style::BoxShadow> {
-    // Format: "4px 4px 10px 0px rgba(0,0,0,0.5)" or "4 4 10 0 #000000"
-    let parts: Vec<&str> = value.trim().splitn(5, ' ').collect();
-    if parts.len() < 4 {
+    // CSS allows the spread radius to be omitted: `x y blur color`.
+    let parts = split_css_whitespace(value);
+    if parts.len() < 3 {
         return None;
     }
-    let ox = parse_px(parts[0])?;
-    let oy = parse_px(parts[1])?;
-    let blur = parse_px(parts[2])?;
-    let spread = parse_px(parts.get(3).unwrap_or(&"0"));
-    let color = if let Some(c) = parts.get(4) {
-        Color::from_hex(c)
-    } else {
-        Color::rgba(0, 0, 0, 80)
-    };
+    let ox = parse_px(&parts[0])?;
+    let oy = parse_px(&parts[1])?;
+    let blur = parse_px(&parts[2])?;
+    let (spread, color_index) = parts
+        .get(3)
+        .and_then(|part| parse_px(part))
+        .map_or((0.0, 3), |spread| (spread, 4));
+    let color = parts
+        .get(color_index)
+        .and_then(|color| Color::from_css(color))
+        .unwrap_or(Color::rgba(0, 0, 0, 80));
     Some(w3cos_std::style::BoxShadow::new(
-        ox,
-        oy,
-        blur,
-        spread.unwrap_or(0.0),
-        color,
+        ox, oy, blur, spread, color,
     ))
+}
+
+fn split_css_whitespace(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = None;
+    let mut depth = 0_u32;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if ch.is_whitespace() && depth == 0 {
+            if let Some(from) = start.take() {
+                parts.push(value[from..index].to_string());
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(from) = start {
+        parts.push(value[from..].to_string());
+    }
+    parts
+}
+
+fn apply_border_shorthand(style: &mut Style, value: &str) {
+    for part in split_css_whitespace(value) {
+        if let Some(width) = parse_px(&part) {
+            style.border_width = width;
+        } else if let Some(color) = Color::from_css(&part) {
+            style.border_color = color;
+        }
+    }
 }
 
 fn parse_transform(value: &str) -> w3cos_std::style::Transform2D {
@@ -812,4 +848,37 @@ fn parse_transition(value: &str) -> Option<w3cos_std::style::Transition> {
         easing,
         delay_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn border_shorthand_accepts_rgba_color() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border", "1px solid rgba(215, 224, 238, 0.92)");
+        assert_eq!(declaration.inner.border_width, 1.0);
+        assert_eq!(
+            declaration.inner.border_color,
+            Color::rgba(215, 224, 238, 235)
+        );
+    }
+
+    #[test]
+    fn box_shadow_accepts_omitted_spread_and_rgba_color() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("box-shadow", "0 18px 56px rgba(28, 55, 90, 0.12)");
+        let shadow = declaration.inner.box_shadow.expect("parsed shadow");
+        assert_eq!(shadow.spread_radius, 0.0);
+        assert_eq!(shadow.color, Color::rgba(28, 55, 90, 31));
+    }
+
+    #[test]
+    fn background_retains_gradient_layers() {
+        let value = "radial-gradient(circle at 85% 8%, rgba(22, 119, 255, 0.18), transparent 34%), linear-gradient(160deg, #f7faff 0%, #eef3fb 100%)";
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("background", value);
+        assert_eq!(declaration.inner.background_image.as_deref(), Some(value));
+    }
 }

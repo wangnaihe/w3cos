@@ -1169,6 +1169,9 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "placeholder" => {
             Value::string(&dom::get_attribute(node, "placeholder").unwrap_or_default())
         }
+        "type" if dom::tag_name(node) == "input" => {
+            Value::string(&dom::get_attribute(node, "type").unwrap_or_else(|| "text".to_string()))
+        }
         "selectionStart" | "selectionEnd" => get_expando(node, key).unwrap_or(Value::Number(0.0)),
         "selectionDirection" => Value::string("none"),
         "setSelectionRange" => func(move |_, args| {
@@ -1237,7 +1240,7 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
                 dom::remove_attribute(node, "checked");
             }
         }
-        "title" | "dir" | "lang" | "slot" | "placeholder" => {
+        "title" | "dir" | "lang" | "slot" | "placeholder" | "type" => {
             dom::set_attribute(node, key, &value.to_js_string());
         }
         "contentEditable" => dom::set_attribute(node, "contenteditable", &value.to_js_string()),
@@ -1904,6 +1907,11 @@ fn dispatch_sync(target: u32, et: EventType, data: EventData) -> bool {
     let mut ev = Event::new(et, NodeId::from_u32(target));
     ev.data = data;
     dispatch_event_to_js(ev)
+}
+
+/// Deliver a platform/session-history traversal to `window` listeners.
+pub(crate) fn dispatch_native_popstate(_state: Option<String>) {
+    let _ = dispatch_sync(0, EventType::PopState, EventData::None);
 }
 
 /// Synchronously bridge native window focus into the compiled-JS DOM.
@@ -3360,22 +3368,29 @@ fn navigator_value() -> Value {
 
 fn location_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
-    props.insert("href".to_string(), Value::string("w3cos://app"));
-    props.insert("origin".to_string(), Value::string("w3cos://app"));
-    props.insert("protocol".to_string(), Value::string("w3cos:"));
-    props.insert("host".to_string(), Value::string("app"));
-    props.insert("hostname".to_string(), Value::string("app"));
-    props.insert("port".to_string(), Value::string(""));
-    props.insert("pathname".to_string(), Value::string("/"));
-    props.insert("search".to_string(), Value::string(""));
-    props.insert("hash".to_string(), Value::string(""));
+    for (name, getter) in [
+        ("href", crate::history::get_href as fn() -> String),
+        ("origin", crate::history::get_origin),
+        ("protocol", crate::history::get_protocol),
+        ("host", crate::history::get_host),
+        ("hostname", crate::history::get_hostname),
+        ("port", crate::history::get_port),
+        ("pathname", crate::history::get_pathname),
+        ("search", crate::history::get_search),
+        ("hash", crate::history::get_hash),
+    ] {
+        props.insert(
+            format!("__w3cos_getter_{name}"),
+            func(move |_, _| Value::string(&getter())),
+        );
+    }
     props.insert("ancestorOrigins".to_string(), js_array(vec![]));
     for name in ["assign", "replace", "reload"] {
         props.insert(name.to_string(), func(|_, _| Value::Undefined));
     }
     props.insert(
         "toString".to_string(),
-        func(|_, _| Value::string("w3cos://app")),
+        func(|_, _| Value::string(&crate::history::get_href())),
     );
     Value::object(props)
 }
@@ -3611,15 +3626,70 @@ fn build_window_value() -> Value {
     props.insert("length".to_string(), Value::Number(0.0));
     props.insert("frames".to_string(), js_array(vec![]));
 
-    // history stub
+    // Session History API. Values are live so navigation performed by a
+    // platform gesture is immediately observable by application code.
     {
         let mut history: HashMap<String, Value> = HashMap::new();
-        history.insert("length".to_string(), Value::Number(1.0));
-        history.insert("state".to_string(), Value::Null);
+        history.insert(
+            "__w3cos_getter_length".to_string(),
+            func(|_, _| Value::Number(crate::history::get_length() as f64)),
+        );
+        history.insert(
+            "__w3cos_getter_state".to_string(),
+            func(|_, _| {
+                crate::history::get_state()
+                    .map(|state| Value::string(&state))
+                    .unwrap_or(Value::Null)
+            }),
+        );
         history.insert("scrollRestoration".to_string(), Value::string("auto"));
-        for name in ["pushState", "replaceState", "back", "forward", "go"] {
-            history.insert(name.to_string(), func(|_, _| Value::Undefined));
-        }
+        history.insert(
+            "pushState".to_string(),
+            func(|_, args| {
+                let state = arg(&args, 0);
+                let state = (!state.is_nullish()).then(|| state.to_js_string());
+                crate::history::push_state(
+                    state.as_deref(),
+                    &arg(&args, 1).to_js_string(),
+                    &arg(&args, 2).to_js_string(),
+                );
+                Value::Undefined
+            }),
+        );
+        history.insert(
+            "replaceState".to_string(),
+            func(|_, args| {
+                let state = arg(&args, 0);
+                let state = (!state.is_nullish()).then(|| state.to_js_string());
+                crate::history::replace_state(
+                    state.as_deref(),
+                    &arg(&args, 1).to_js_string(),
+                    &arg(&args, 2).to_js_string(),
+                );
+                Value::Undefined
+            }),
+        );
+        history.insert(
+            "back".to_string(),
+            func(|_, _| {
+                crate::history::back();
+                Value::Undefined
+            }),
+        );
+        history.insert(
+            "forward".to_string(),
+            func(|_, _| {
+                crate::history::forward();
+                Value::Undefined
+            }),
+        );
+        history.insert(
+            "go".to_string(),
+            func(|_, args| {
+                crate::history::go(arg(&args, 0).to_number() as i32);
+                Value::Undefined
+            }),
+        );
         props.insert("history".to_string(), Value::object(history));
     }
 
@@ -3950,6 +4020,24 @@ pub fn drain_microtasks() -> usize {
     ran
 }
 
+/// Complete immediately runnable framework work before the first DOM snapshot.
+///
+/// React's concurrent root schedules its initial commit through a zero-delay
+/// host task. Native DOM windows take their first component-tree snapshot
+/// before the platform event loop starts, so that task must get a bounded
+/// bootstrap checkpoint or the first frame contains only the empty mount node.
+pub(crate) fn drain_bootstrap_tasks(max_turns: usize) -> usize {
+    let mut total = 0;
+    for _ in 0..max_turns {
+        let ran = drain_microtasks() + tick_timers() + drain_microtasks();
+        total += ran;
+        if ran == 0 {
+            break;
+        }
+    }
+    total
+}
+
 /// True when the bridge has work for the frame loop: pending JS timers,
 /// rAF callbacks, microtasks, or undelivered native events.
 pub fn has_pending_work() -> bool {
@@ -4012,6 +4100,7 @@ mod tests {
     fn setup() {
         dom::reset_document();
         reset_bridge();
+        crate::history::reset();
     }
 
     fn create_in_body(tag: &str) -> Value {
@@ -4020,6 +4109,48 @@ mod tests {
         doc.get_property("body")
             .call_method("appendChild", vec![el.clone()]);
         el
+    }
+
+    #[test]
+    fn window_history_is_live_and_dispatches_popstate() {
+        setup();
+        let window = window_value();
+        let history = window.get_property("history");
+        let popstate_calls = Rc::new(Cell::new(0));
+        let calls = popstate_calls.clone();
+        window.call_method(
+            "addEventListener",
+            vec![
+                Value::string("popstate"),
+                func(move |_, _| {
+                    calls.set(calls.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+
+        history.call_method(
+            "pushState",
+            vec![Value::Null, Value::string(""), Value::string("/?task=42")],
+        );
+        assert_eq!(
+            window
+                .get_property("location")
+                .get_property("search")
+                .to_js_string(),
+            "?task=42"
+        );
+        assert_eq!(history.get_property("length").to_number(), 2.0);
+
+        history.call_method("back", vec![]);
+        assert_eq!(
+            window
+                .get_property("location")
+                .get_property("search")
+                .to_js_string(),
+            ""
+        );
+        assert_eq!(popstate_calls.get(), 1);
     }
 
     #[test]
@@ -4798,6 +4929,21 @@ mod tests {
         assert!(input.get_property("checked").to_bool());
         input.set_property("checked", Value::Bool(false));
         assert!(!input.get_property("checked").to_bool());
+    }
+
+    #[test]
+    fn input_type_property_reflects_to_the_type_attribute() {
+        setup();
+        let input = create_in_body("input");
+        assert_eq!(input.get_property("type").to_js_string(), "text");
+
+        input.set_property("type", Value::string("password"));
+
+        assert_eq!(input.get_property("type").to_js_string(), "password");
+        assert_eq!(
+            dom::get_attribute(node_id_of(&input).unwrap(), "type").as_deref(),
+            Some("password")
+        );
     }
 
     #[test]

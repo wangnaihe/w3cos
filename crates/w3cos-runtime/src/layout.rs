@@ -5,9 +5,9 @@ use std::sync::OnceLock;
 use taffy::prelude::*;
 use w3cos_std::component::EventAction;
 use w3cos_std::style::{
-    AlignItems as WAlign, Dimension as WDim, Display as WDisplay, FlexDirection as WDir,
-    FlexWrap as WWrap, JustifyContent as WJustify, Overflow as WOverflow, Position as WPos,
-    WhiteSpace as WWhiteSpace,
+    AlignItems as WAlign, AlignSelf as WAlignSelf, Dimension as WDim, Display as WDisplay,
+    FlexDirection as WDir, FlexWrap as WWrap, JustifyContent as WJustify, Overflow as WOverflow,
+    Position as WPos, WhiteSpace as WWhiteSpace,
 };
 use w3cos_std::{Component, ComponentKind};
 
@@ -285,12 +285,14 @@ fn kinds_layout_eq(a: &ComponentKind, b: &ComponentKind) -> bool {
             ComponentKind::TextInput {
                 value: va,
                 placeholder: pa,
+                secure: sa,
             },
             ComponentKind::TextInput {
                 value: vb,
                 placeholder: pb,
+                secure: sb,
             },
-        ) => va == vb && pa == pb,
+        ) => va == vb && pa == pb && sa == sb,
         (
             ComponentKind::Canvas {
                 width: wa,
@@ -481,6 +483,7 @@ impl LayoutEngine {
                 &mut idx,
                 None,
                 None,
+                None,
                 viewport_w,
                 viewport_h,
             )?);
@@ -562,6 +565,7 @@ pub fn compute_with_scroll(
         &mut node_index,
         None,
         None,
+        None,
         viewport_w,
         viewport_h,
     )?;
@@ -617,6 +621,7 @@ fn build_taffy_tree(
     idx: &mut usize,
     parent_direction: Option<WDir>,
     parent_display: Option<WDisplay>,
+    parent_align_items: Option<WAlign>,
     viewport_w: f32,
     viewport_h: f32,
 ) -> Result<NodeId, taffy::TaffyError> {
@@ -643,6 +648,17 @@ fn build_taffy_tree(
                         }
                         let dim = Dimension::length(w);
                         (dim, dim)
+                    } else if text_uses_intrinsic_cross_size(
+                        &comp.style,
+                        parent_direction,
+                        parent_display,
+                        parent_align_items,
+                    ) {
+                        let mut w = text_intrinsic_size(content, &comp.style).0;
+                        if let WDim::Px(mw) = comp.style.min_width {
+                            w = w.max(mw);
+                        }
+                        (Dimension::length(w), Dimension::auto())
                     } else if matches!(parent_direction, Some(WDir::Column | WDir::ColumnReverse)) {
                         let min_width = match comp.style.min_width {
                             WDim::Px(mw) => Dimension::length(mw),
@@ -712,6 +728,7 @@ fn build_taffy_tree(
                     idx,
                     Some(comp.style.flex_direction),
                     Some(comp.style.display),
+                    Some(comp.style.align_items),
                     viewport_w,
                     viewport_h,
                 )
@@ -720,6 +737,27 @@ fn build_taffy_tree(
         let node = tree.new_with_children(style, &child_nodes)?;
         tree.set_node_context(node, Some(my_idx))?;
         Ok(node)
+    }
+}
+
+fn text_uses_intrinsic_cross_size(
+    style: &w3cos_std::style::Style,
+    parent_direction: Option<WDir>,
+    parent_display: Option<WDisplay>,
+    parent_align_items: Option<WAlign>,
+) -> bool {
+    if !matches!(parent_direction, Some(WDir::Column | WDir::ColumnReverse))
+        || !matches!(parent_display, Some(WDisplay::Flex))
+    {
+        return false;
+    }
+
+    match style.align_self {
+        WAlignSelf::Stretch => false,
+        WAlignSelf::Auto => !matches!(parent_align_items, Some(WAlign::Stretch)),
+        WAlignSelf::FlexStart | WAlignSelf::FlexEnd | WAlignSelf::Center | WAlignSelf::Baseline => {
+            true
+        }
     }
 }
 
@@ -1738,6 +1776,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(l.len(), 3);
+    }
+
+    #[test]
+    fn centered_column_text_children_keep_intrinsic_width() {
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Flex,
+                    flex_direction: WDir::Column,
+                    align_items: WAlign::Center,
+                    width: WDim::Px(320.0),
+                    ..Style::default()
+                },
+                vec![
+                    Component::text("Product", s()),
+                    Component::text("Welcome back", s()),
+                    Component::text("Connect with a trusted identity", s()),
+                ],
+            ),
+            390.0,
+            844.0,
+        )
+        .unwrap();
+
+        assert_eq!(layout.len(), 4);
+        for (rect, _) in &layout[1..] {
+            assert!(
+                rect.width > 0.0,
+                "centered text must remain paintable: {rect:?}"
+            );
+        }
     }
 
     #[test]

@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use skia_safe::canvas::SaveLayerRec;
 use skia_safe::{
     AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, ImageFilter,
-    ImageInfo, MaskFilter, Paint, Rect, Surface, Typeface, color_filters, image_filters, images,
-    paint,
+    ImageInfo, MaskFilter, Paint, Rect, Surface, TileMode, Typeface, color_filters,
+    gradient_shader, image_filters, images, paint,
 };
 use w3cos_std::component::ComponentKind;
-use w3cos_std::style::{Style, TextAlign};
+use w3cos_std::style::{JustifyContent, Style, TextAlign};
 
 use crate::filter::{FilterChain, FilterOp, parse_css_filter};
 use crate::layout::LayoutRect;
@@ -375,6 +375,15 @@ fn render_node(
             &color_paint(bg, style.opacity),
         );
     }
+    if let Some(background_image) = style.background_image.as_deref() {
+        draw_background_image(
+            canvas,
+            rect,
+            style.border_radius,
+            background_image,
+            style.opacity,
+        );
+    }
     if style.border_width > 0.0 && style.border_color.a > 0 {
         let mut border = color_paint(style.border_color, style.opacity);
         border.set_style(paint::Style::Stroke);
@@ -400,9 +409,20 @@ fn render_node(
         ComponentKind::Button { label } => {
             draw_centered_text(canvas, rect, label, style, typeface, metrics_font);
         }
-        ComponentKind::TextInput { value, placeholder } => {
+        ComponentKind::TextInput {
+            value,
+            placeholder,
+            secure,
+        } => {
             let value = text_input_value.unwrap_or(value);
-            let text = if value.is_empty() { placeholder } else { value };
+            let masked_value = secure.then(|| "•".repeat(value.chars().count()));
+            let text = if value.is_empty() {
+                placeholder.as_str()
+            } else if let Some(masked) = masked_value.as_deref() {
+                masked
+            } else {
+                value
+            };
             let color = if value.is_empty() {
                 w3cos_std::color::Color::rgb(107, 114, 128)
             } else {
@@ -425,6 +445,7 @@ fn render_node(
                 color,
                 style.opacity,
                 typeface,
+                style.font_weight,
             );
         }
         ComponentKind::Image { src } => draw_image(canvas, rect, src, style.opacity),
@@ -722,7 +743,7 @@ fn draw_text_in_rect(
     let top = content.y + (content.height - layout.lines.len() as f32 * line_height).max(0.0) * 0.5;
     for (index, line) in layout.lines.iter().enumerate() {
         let ink = layout.ink_bounds[index];
-        let x = aligned_text_x(content, style.text_align, ink.left, ink.width);
+        let x = aligned_text_x(content, effective_text_align(style), ink.left, ink.width);
         draw_text_line(
             canvas,
             x,
@@ -732,6 +753,7 @@ fn draw_text_in_rect(
             style.color,
             style.opacity,
             typeface,
+            style.font_weight,
         );
     }
 }
@@ -757,6 +779,7 @@ fn draw_centered_text(
         style.color,
         style.opacity,
         typeface,
+        style.font_weight,
     );
 }
 
@@ -768,7 +791,7 @@ fn draw_text_ink_in_box(
     style: &Style,
     typeface: &Typeface,
 ) {
-    let x = aligned_text_x(rect, style.text_align, ink.left, ink.width);
+    let x = aligned_text_x(rect, effective_text_align(style), ink.left, ink.width);
     let y = rect.y + (rect.height - ink.height) * 0.5 - ink.top;
     draw_text_line(
         canvas,
@@ -779,7 +802,19 @@ fn draw_text_ink_in_box(
         style.color,
         style.opacity,
         typeface,
+        style.font_weight,
     );
+}
+
+fn effective_text_align(style: &Style) -> TextAlign {
+    // DOM text content is lowered into the host Text component instead of an
+    // anonymous flex child. Preserve the browser behavior of centering that
+    // anonymous child when the host itself is a centered flex container.
+    if matches!(style.justify_content, JustifyContent::Center) {
+        TextAlign::Center
+    } else {
+        style.text_align
+    }
 }
 
 fn aligned_text_x(rect: LayoutRect, align: TextAlign, ink_left: f32, ink_width: f32) -> f32 {
@@ -799,8 +834,10 @@ fn draw_text_line(
     color: w3cos_std::color::Color,
     opacity: f32,
     typeface: &Typeface,
+    font_weight: u16,
 ) {
-    let font = Font::new(typeface.clone(), font_size);
+    let mut font = Font::new(typeface.clone(), font_size);
+    font.set_embolden(font_weight >= 600);
     canvas.draw_str(
         text,
         (x, top + font_size),
@@ -821,7 +858,7 @@ fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
 }
 
 fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
-    if style.background.a > 0 {
+    if style.background.a > 0 || style.background_image.is_some() {
         let border = style.border_width;
         LayoutRect {
             x: rect.x + border,
@@ -832,6 +869,213 @@ fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
     } else {
         text_content_box(rect, style)
     }
+}
+
+#[derive(Clone, Copy)]
+struct GradientStop {
+    color: w3cos_std::color::Color,
+    position: Option<f32>,
+}
+
+fn draw_background_image(
+    canvas: &Canvas,
+    rect: LayoutRect,
+    radius: f32,
+    value: &str,
+    opacity: f32,
+) {
+    // CSS paints the first listed background on top of the following layers.
+    for layer in split_top_level(value, ',').into_iter().rev() {
+        let mut paint = Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_alpha_f(opacity.clamp(0.0, 1.0));
+        let shader = if let Some(arguments) = function_arguments(layer, "linear-gradient") {
+            linear_gradient_shader(rect, arguments)
+        } else if let Some(arguments) = function_arguments(layer, "radial-gradient") {
+            radial_gradient_shader(rect, arguments)
+        } else {
+            None
+        };
+        if let Some(shader) = shader {
+            paint.set_shader(shader);
+            draw_round_rect(canvas, rect, radius, &paint);
+        }
+    }
+}
+
+fn linear_gradient_shader(rect: LayoutRect, arguments: &str) -> Option<skia_safe::Shader> {
+    let mut parts = split_top_level(arguments, ',');
+    let has_angle = parts
+        .first()
+        .is_some_and(|part| part.trim().ends_with("deg"));
+    let angle = parts
+        .first()
+        .and_then(|part| part.trim().strip_suffix("deg"))
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(180.0);
+    if has_angle {
+        parts.remove(0);
+    }
+    let (colors, positions) = gradient_colors_and_positions(&parts)?;
+    let radians = angle.to_radians();
+    let direction = (radians.sin(), -radians.cos());
+    let center = (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5);
+    let extent = direction.0.abs() * rect.width * 0.5 + direction.1.abs() * rect.height * 0.5;
+    let start = (
+        center.0 - direction.0 * extent,
+        center.1 - direction.1 * extent,
+    );
+    let end = (
+        center.0 + direction.0 * extent,
+        center.1 + direction.1 * extent,
+    );
+    gradient_shader::linear(
+        (start, end),
+        colors.as_slice(),
+        positions.as_slice(),
+        TileMode::Clamp,
+        None,
+        None,
+    )
+}
+
+fn radial_gradient_shader(rect: LayoutRect, arguments: &str) -> Option<skia_safe::Shader> {
+    let mut parts = split_top_level(arguments, ',');
+    let mut center = (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5);
+    if let Some(header) = parts.first().copied()
+        && !parse_gradient_stop(header).is_some()
+    {
+        if let Some(at) = header.find(" at ") {
+            let coords: Vec<&str> = header[at + 4..].split_whitespace().collect();
+            if coords.len() >= 2 {
+                center.0 = rect.x + parse_percent(coords[0]).unwrap_or(0.5) * rect.width;
+                center.1 = rect.y + parse_percent(coords[1]).unwrap_or(0.5) * rect.height;
+            }
+        }
+        parts.remove(0);
+    }
+    let (colors, positions) = gradient_colors_and_positions(&parts)?;
+    let radius = [
+        (center.0 - rect.x).hypot(center.1 - rect.y),
+        (center.0 - (rect.x + rect.width)).hypot(center.1 - rect.y),
+        (center.0 - rect.x).hypot(center.1 - (rect.y + rect.height)),
+        (center.0 - (rect.x + rect.width)).hypot(center.1 - (rect.y + rect.height)),
+    ]
+    .into_iter()
+    .fold(0.0_f32, f32::max);
+    gradient_shader::radial(
+        center,
+        radius.max(1.0),
+        colors.as_slice(),
+        positions.as_slice(),
+        TileMode::Clamp,
+        None,
+        None,
+    )
+}
+
+fn gradient_colors_and_positions(parts: &[&str]) -> Option<(Vec<Color>, Vec<f32>)> {
+    let stops: Vec<GradientStop> = parts
+        .iter()
+        .filter_map(|part| parse_gradient_stop(part))
+        .collect();
+    if stops.len() < 2 {
+        return None;
+    }
+    let colors = stops
+        .iter()
+        .map(|stop| to_skia_color(stop.color, 1.0))
+        .collect();
+    let mut positions: Vec<Option<f32>> = stops.iter().map(|stop| stop.position).collect();
+    if positions.first().is_some_and(Option::is_none) {
+        positions[0] = Some(0.0);
+    }
+    let last = positions.len() - 1;
+    if positions[last].is_none() {
+        positions[last] = Some(1.0);
+    }
+    let mut anchor = 0;
+    while anchor < last {
+        let next = (anchor + 1..=last)
+            .find(|&index| positions[index].is_some())
+            .unwrap_or(last);
+        let from = positions[anchor].unwrap_or(0.0);
+        let to = positions[next].unwrap_or(1.0).max(from);
+        for index in anchor + 1..next {
+            let t = (index - anchor) as f32 / (next - anchor) as f32;
+            positions[index] = Some(from + (to - from) * t);
+        }
+        anchor = next;
+    }
+    Some((colors, positions.into_iter().map(Option::unwrap).collect()))
+}
+
+fn parse_gradient_stop(value: &str) -> Option<GradientStop> {
+    let parts = split_css_whitespace(value.trim());
+    let color = w3cos_std::color::Color::from_css(parts.first()?)?;
+    let position = parts.get(1).and_then(|value| parse_percent(value));
+    Some(GradientStop { color, position })
+}
+
+fn parse_percent(value: &str) -> Option<f32> {
+    value
+        .trim()
+        .strip_suffix('%')?
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .map(|value| (value / 100.0).clamp(0.0, 1.0))
+}
+
+fn function_arguments<'a>(value: &'a str, name: &str) -> Option<&'a str> {
+    value
+        .trim()
+        .strip_prefix(name)?
+        .strip_prefix('(')?
+        .strip_suffix(')')
+}
+
+fn split_top_level(value: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_u32;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if ch == separator && depth == 0 => {
+                parts.push(value[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+    parts
+}
+
+fn split_css_whitespace(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = None;
+    let mut depth = 0_u32;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if ch.is_whitespace() && depth == 0 {
+            if let Some(from) = start.take() {
+                parts.push(&value[from..index]);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(from) = start {
+        parts.push(&value[from..]);
+    }
+    parts
 }
 
 fn draw_round_rect(canvas: &Canvas, rect: LayoutRect, radius: f32, paint: &Paint) {
@@ -884,6 +1128,31 @@ mod tests {
         let opacity = css_color_matrix(&FilterOp::Opacity(0.25)).unwrap();
         assert_eq!(opacity[0], 1.0);
         assert_eq!(opacity[18], 0.25);
+    }
+
+    #[test]
+    fn parses_layered_css_gradients_without_splitting_rgba() {
+        let value = "radial-gradient(circle at 85% 8%, rgba(22, 119, 255, 0.18), transparent 34%), linear-gradient(160deg, #f7faff 0%, #eef3fb 100%)";
+        let layers = split_top_level(value, ',');
+        assert_eq!(layers.len(), 2);
+
+        let radial = function_arguments(layers[0], "radial-gradient").unwrap();
+        let radial_parts = split_top_level(radial, ',');
+        assert_eq!(radial_parts.len(), 3);
+        let stop = parse_gradient_stop(radial_parts[1]).unwrap();
+        assert_eq!(stop.color, w3cos_std::color::Color::rgba(22, 119, 255, 46));
+
+        let linear = function_arguments(layers[1], "linear-gradient").unwrap();
+        let linear_parts = split_top_level(linear, ',');
+        let (_, positions) = gradient_colors_and_positions(&linear_parts[1..]).unwrap();
+        assert_eq!(positions, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn centered_flex_host_centers_lowered_text_content() {
+        let mut style = Style::default();
+        style.justify_content = JustifyContent::Center;
+        assert_eq!(effective_text_align(&style), TextAlign::Center);
     }
 
     #[test]

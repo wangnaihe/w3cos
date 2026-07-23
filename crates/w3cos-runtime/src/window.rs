@@ -147,6 +147,23 @@ const ANDROID_IME_FALLBACK_INSET: f32 = 260.0;
 const ANDROID_VIEWPORT_WATCHDOG_INTERVAL_MS: u64 = 250;
 const REACT_SCROLL_ANCHOR_SUPPRESSION: Duration = Duration::from_secs(2);
 
+#[cfg(any(test, target_os = "ios", target_os = "android"))]
+const BACK_SWIPE_EDGE_WIDTH: f32 = 24.0;
+#[cfg(any(test, target_os = "ios", target_os = "android"))]
+const BACK_SWIPE_SLOP: f32 = 12.0;
+#[cfg(any(test, target_os = "ios", target_os = "android"))]
+const BACK_SWIPE_COMMIT_DISTANCE: f32 = 72.0;
+
+#[cfg(any(test, target_os = "ios", target_os = "android"))]
+fn is_horizontal_back_swipe(dx: f32, dy: f32) -> bool {
+    dx > BACK_SWIPE_SLOP && dx > dy.abs() * 1.25
+}
+
+#[cfg(any(test, target_os = "ios", target_os = "android"))]
+fn can_start_back_swipe(x: f32, can_go_back: bool) -> bool {
+    x <= BACK_SWIPE_EDGE_WIDTH && can_go_back
+}
+
 /// Maximum compositor-only travel before a deferred React virtualizer update
 /// is committed. Blink similarly keeps scrolling on the compositor while
 /// main-thread prepaint advances often enough that the interest rect cannot
@@ -513,12 +530,18 @@ fn react_rebuild_changes_painted_content(
                 ComponentKind::TextInput {
                     value: old_value,
                     placeholder: old_placeholder,
+                    secure: old_secure,
                 },
                 ComponentKind::TextInput {
                     value: new_value,
                     placeholder: new_placeholder,
+                    secure: new_secure,
                 },
-            ) => old_value != new_value || old_placeholder != new_placeholder,
+            ) => {
+                old_value != new_value
+                    || old_placeholder != new_placeholder
+                    || old_secure != new_secure
+            }
             (
                 ComponentKind::Canvas {
                     width: old_width,
@@ -1084,6 +1107,10 @@ struct App {
     touch_drag_y: f32,
     touch_scroll_active: bool,
     touch_scroll_index: Option<usize>,
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    back_swipe_start: Option<(f32, f32)>,
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    back_swipe_active: bool,
     kinetic_scroll: Option<KineticScroll>,
     content_inset_top: f32,
     viewport: ViewportLayout,
@@ -1172,6 +1199,7 @@ impl App {
     fn new_dom(setup: fn()) -> Self {
         crate::dom::reset_document();
         setup();
+        crate::jsdom::drain_bootstrap_tasks(64);
         let root = crate::dom::to_component_tree();
         crate::dom::clear_document_dirty();
         Self::create(None, Some(setup), true, root)
@@ -1234,6 +1262,10 @@ impl App {
             touch_drag_y: 0.0,
             touch_scroll_active: false,
             touch_scroll_index: None,
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            back_swipe_start: None,
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            back_swipe_active: false,
             kinetic_scroll: None,
             content_inset_top: if w3cos_std::safe_area::is_enabled() {
                 0.0
@@ -1422,13 +1454,19 @@ impl App {
                 continue;
             };
             let text = match &node.kind {
-                ComponentKind::Text { content } => content,
-                ComponentKind::Button { label } => label,
-                ComponentKind::TextInput { value, placeholder } => {
+                ComponentKind::Text { content } => content.clone(),
+                ComponentKind::Button { label } => label.clone(),
+                ComponentKind::TextInput {
+                    value,
+                    placeholder,
+                    secure,
+                } => {
                     if value.is_empty() {
-                        placeholder
+                        placeholder.clone()
+                    } else if *secure {
+                        "•".repeat(value.chars().count())
                     } else {
-                        value
+                        value.clone()
                     }
                 }
                 _ => continue,
@@ -1440,7 +1478,7 @@ impl App {
                 padding.left + padding.right + node.style.border_width * 2.0
             };
             requests.push(text_layout::TextPrepaintRequest {
-                text: text.clone(),
+                text,
                 width: ((rect.width - horizontal_inset).max(1.0)) * scale,
                 font_size: node.style.font_size * scale,
                 white_space: node.style.white_space,
@@ -4549,12 +4587,14 @@ impl App {
                 })
                 .unwrap_or_default();
             #[cfg(target_os = "ios")]
+            let secure = matches!(kind, ComponentKind::TextInput { secure: true, .. });
+            #[cfg(target_os = "ios")]
             crate::uitest::set_native_key_window(crate::ios_input::ensure_key_window(window));
             #[cfg(not(target_os = "ios"))]
             window.set_ime_allowed(true);
             #[cfg(target_os = "ios")]
             let is_first_responder =
-                crate::ios_input::ensure_text_input_first_responder(window, &initial_value);
+                crate::ios_input::ensure_text_input_first_responder(window, &initial_value, secure);
             #[cfg(target_os = "ios")]
             crate::uitest::set_native_first_responder(is_first_responder);
             if let Some(&(rect, _)) = self.layout_cache.iter().find(|(_, i)| *i == focus_idx) {
@@ -4642,6 +4682,17 @@ impl App {
             return;
         }
         let host_chain = self.native_host_chain(hit_index);
+        // Browser default focus delegation applies to a label and its control,
+        // not to every input that merely shares a form/section ancestor with
+        // the clicked element. Matching any common ancestor made a button tap
+        // focus the first input elsewhere in the same login card.
+        let Some(label_id) = host_chain
+            .iter()
+            .copied()
+            .find(|id| crate::dom::tag_name(*id as u32).eq_ignore_ascii_case("label"))
+        else {
+            return;
+        };
         let flat = layout::pre_flatten(&self.root);
         let candidate = flat.iter().enumerate().find_map(|(index, node)| {
             let EventAction::NativeHost { id, .. } = node.on_click else {
@@ -4652,9 +4703,7 @@ impl App {
             }
             let mut parent = crate::dom::parent_node(*id as u32);
             while let Some(parent_id) = parent {
-                if host_chain.contains(&(parent_id as u64))
-                    && !matches!(crate::dom::tag_name(parent_id).as_str(), "body" | "html")
-                {
+                if parent_id as u64 == label_id {
                     return Some(index);
                 }
                 parent = crate::dom::parent_node(parent_id);
@@ -4951,10 +5000,24 @@ impl App {
             ComponentKind::Text { content } => ("#text", Some(content.clone()), vec![]),
             ComponentKind::Button { label } => ("button", Some(label.clone()), vec![]),
             ComponentKind::Image { src } => ("img", None, vec![("src".to_string(), src.clone())]),
-            ComponentKind::TextInput { value, placeholder } => (
+            ComponentKind::TextInput {
+                value,
+                placeholder,
+                secure,
+            } => (
                 "input",
-                Some(value.clone()),
-                vec![("placeholder".to_string(), placeholder.clone())],
+                Some(if *secure {
+                    "•".repeat(value.chars().count())
+                } else {
+                    value.clone()
+                }),
+                vec![
+                    ("placeholder".to_string(), placeholder.clone()),
+                    (
+                        "type".to_string(),
+                        if *secure { "password" } else { "text" }.to_string(),
+                    ),
+                ],
             ),
             ComponentKind::Canvas { width, height } => (
                 "canvas",
@@ -5260,7 +5323,9 @@ fn replace_virtual_index(component: &mut Component, index: usize) {
     match &mut component.kind {
         ComponentKind::Text { content } => *content = content.replace("{index}", &replacement),
         ComponentKind::Button { label } => *label = label.replace("{index}", &replacement),
-        ComponentKind::TextInput { value, placeholder } => {
+        ComponentKind::TextInput {
+            value, placeholder, ..
+        } => {
             *value = value.replace("{index}", &replacement);
             *placeholder = placeholder.replace("{index}", &replacement);
         }
@@ -6331,10 +6396,48 @@ impl ApplicationHandler for App {
                         self.touch_drag_y = 0.0;
                         self.touch_scroll_active = false;
                         self.touch_scroll_index = self.hit_test_scroll(self.mouse_x, self.mouse_y);
+                        #[cfg(any(target_os = "ios", target_os = "android"))]
+                        {
+                            self.back_swipe_start =
+                                can_start_back_swipe(self.mouse_x, crate::history::can_go_back())
+                                    .then_some((self.mouse_x, self.mouse_y));
+                            self.back_swipe_active = false;
+                        }
                         self.pointer_pressed("touch", touch.id as i64);
                         self.touch_pointer_target = self.pressed_index;
                     }
                     TouchPhase::Moved => {
+                        #[cfg(any(target_os = "ios", target_os = "android"))]
+                        if let Some((start_x, start_y)) = self.back_swipe_start {
+                            let dx = self.mouse_x - start_x;
+                            let dy = self.mouse_y - start_y;
+                            if !self.back_swipe_active && is_horizontal_back_swipe(dx, dy) {
+                                self.back_swipe_active = true;
+                                if let Some(idx) = self.touch_pointer_target.take() {
+                                    self.dispatch_native_pointer(
+                                        idx,
+                                        "cancel",
+                                        touch.id as i64,
+                                        "touch",
+                                        -1,
+                                        0,
+                                        0.0,
+                                    );
+                                    self.rebuild_if_dirty();
+                                }
+                                self.pressed_index = None;
+                                self.pointer_down_default_prevented = false;
+                                self.touch_scroll_index = None;
+                            } else if !self.back_swipe_active
+                                && dy.abs() > BACK_SWIPE_SLOP
+                                && dy.abs() >= dx.abs()
+                            {
+                                self.back_swipe_start = None;
+                            }
+                            if self.back_swipe_active {
+                                return;
+                            }
+                        }
                         let pointer_target = if self.touch_scroll_active {
                             None
                         } else {
@@ -6407,6 +6510,30 @@ impl ApplicationHandler for App {
                         }
                     }
                     TouchPhase::Ended => {
+                        #[cfg(any(target_os = "ios", target_os = "android"))]
+                        if self.back_swipe_active {
+                            let should_navigate =
+                                self.back_swipe_start.is_some_and(|(start_x, _)| {
+                                    self.mouse_x - start_x >= BACK_SWIPE_COMMIT_DISTANCE
+                                });
+                            self.back_swipe_start = None;
+                            self.back_swipe_active = false;
+                            self.last_touch_y = None;
+                            self.touch_samples.clear();
+                            self.touch_drag_y = 0.0;
+                            self.touch_scroll_active = false;
+                            self.touch_scroll_index = None;
+                            self.touch_pointer_target = None;
+                            if should_navigate && crate::history::back() {
+                                self.rebuild_if_dirty();
+                                self.request_repaint();
+                            }
+                            return;
+                        }
+                        #[cfg(any(target_os = "ios", target_os = "android"))]
+                        {
+                            self.back_swipe_start = None;
+                        }
                         let release_velocity =
                             estimate_touch_velocity(&self.touch_samples, Instant::now())
                                 .unwrap_or(0.0);
@@ -6462,6 +6589,11 @@ impl ApplicationHandler for App {
                         }
                     }
                     TouchPhase::Cancelled => {
+                        #[cfg(any(target_os = "ios", target_os = "android"))]
+                        {
+                            self.back_swipe_start = None;
+                            self.back_swipe_active = false;
+                        }
                         if let Some(idx) = self.touch_pointer_target.take() {
                             self.dispatch_native_pointer(
                                 idx,
@@ -6502,6 +6634,15 @@ impl ApplicationHandler for App {
                 is_synthetic: false,
                 ..
             } => {
+                #[cfg(target_os = "android")]
+                if event.state == ElementState::Pressed
+                    && matches!(event.logical_key, Key::Named(NamedKey::BrowserBack))
+                    && crate::history::back()
+                {
+                    self.rebuild_if_dirty();
+                    self.request_repaint();
+                    return;
+                }
                 if let Some(focus_idx) = self.focused_index {
                     let chain = self.native_host_chain(focus_idx);
                     let key = web_key(&event.logical_key);
@@ -6930,6 +7071,86 @@ fn initial_scroll_target_offset(target_y: f32, scrollport_y: f32, max_y: f32) ->
 #[cfg(test)]
 mod scroll_physics_tests {
     use super::*;
+
+    #[test]
+    fn back_swipe_requires_an_edge_origin_and_horizontal_intent() {
+        assert!(can_start_back_swipe(5.0, true));
+        assert!(!can_start_back_swipe(25.0, true));
+        assert!(!can_start_back_swipe(5.0, false));
+        assert!(is_horizontal_back_swipe(20.0, 4.0));
+        assert!(!is_horizontal_back_swipe(10.0, 1.0));
+        assert!(!is_horizontal_back_swipe(20.0, 18.0));
+        assert!(96.0 >= BACK_SWIPE_COMMIT_DISTANCE);
+    }
+
+    fn label_focus_dom_setup() {
+        let button = crate::dom::create_element("button");
+        crate::dom::set_attribute(button, "id", "one-tap");
+        crate::dom::append_child(crate::dom::body_id(), button);
+
+        let label = crate::dom::create_element("label");
+        crate::dom::set_attribute(label, "id", "email-label");
+        let caption = crate::dom::create_element("span");
+        crate::dom::append_child(label, caption);
+        let input = crate::dom::create_element("input");
+        crate::dom::set_attribute(input, "id", "email-input");
+        crate::dom::append_child(label, input);
+        crate::dom::append_child(crate::dom::body_id(), label);
+    }
+
+    fn flat_index_for_dom_id(app: &App, dom_id: u32) -> usize {
+        layout::pre_flatten(&app.root)
+            .iter()
+            .position(|node| {
+                matches!(
+                    node.on_click,
+                    EventAction::NativeHost { id, .. } if *id == dom_id as u64
+                )
+            })
+            .expect("DOM node must be present in the component tree")
+    }
+
+    #[test]
+    fn button_does_not_focus_input_from_shared_form_ancestor() {
+        crate::jsdom::reset_bridge();
+        let mut app = App::new_dom(label_focus_dom_setup);
+        let button = crate::dom::get_element_by_id("one-tap").unwrap();
+        let label = crate::dom::get_element_by_id("email-label").unwrap();
+        let input = crate::dom::get_element_by_id("email-input").unwrap();
+        let button_index = flat_index_for_dom_id(&app, button);
+        let label_index = flat_index_for_dom_id(&app, label);
+        let input_index = flat_index_for_dom_id(&app, input);
+
+        app.focus_dom_text_input_within_hit(button_index);
+        assert_eq!(app.focused_index, None);
+
+        app.focus_dom_text_input_within_hit(label_index);
+        assert_eq!(app.focused_index, Some(input_index));
+    }
+
+    fn deferred_dom_setup() {
+        let mount = crate::dom::create_element("div");
+        crate::dom::append_child(crate::dom::body_id(), mount);
+        let commit = w3cos_core::Value::function(move |_, _| {
+            let text = crate::dom::create_text_node("mounted after host task");
+            crate::dom::append_child(mount, text);
+            w3cos_core::Value::Undefined
+        });
+        crate::jsdom::window_value()
+            .call_method("setTimeout", vec![commit, w3cos_core::Value::Number(0.0)]);
+    }
+
+    #[test]
+    fn dom_bootstrap_drains_deferred_initial_commit() {
+        crate::jsdom::reset_bridge();
+        let app = App::new_dom(deferred_dom_setup);
+        let flat = layout::pre_flatten(&app.root);
+
+        assert!(flat.iter().any(|node| matches!(
+            &node.kind,
+            ComponentKind::Text { content } if content == "mounted after host task"
+        )));
+    }
 
     #[test]
     fn static_event_loop_blocks_without_background_services() {

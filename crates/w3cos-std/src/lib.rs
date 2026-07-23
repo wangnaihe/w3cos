@@ -324,7 +324,11 @@ mod tests {
         let input = Component::text_input("", "Enter text", style.clone());
         assert!(matches!(
             &input.kind,
-            ComponentKind::TextInput { value, placeholder } if value == "" && placeholder == "Enter text"
+            ComponentKind::TextInput {
+                value,
+                placeholder,
+                secure: false,
+            } if value == "" && placeholder == "Enter text"
         ));
         assert_eq!(input.children.len(), 0);
     }

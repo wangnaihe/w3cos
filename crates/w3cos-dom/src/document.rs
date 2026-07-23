@@ -842,8 +842,15 @@ impl Document {
                             .map(|(_, v)| v.as_str())
                             .or(node.text_content.as_deref())
                             .unwrap_or("");
-                        let mut component =
-                            w3cos_std::Component::text_input(value, placeholder, style);
+                        let secure = tag.as_str() == "input"
+                            && node.attributes.iter().any(|(key, value)| {
+                                key.as_str() == "type" && value.eq_ignore_ascii_case("password")
+                            });
+                        let mut component = if secure {
+                            w3cos_std::Component::secure_text_input(value, placeholder, style)
+                        } else {
+                            w3cos_std::Component::text_input(value, placeholder, style)
+                        };
                         component.on_click = w3cos_std::EventAction::NativeHost {
                             id: id.as_u32() as u64,
                             click: true,

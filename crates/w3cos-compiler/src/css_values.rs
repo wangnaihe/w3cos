@@ -202,17 +202,20 @@ pub struct ParsedBoxShadow {
 }
 
 pub fn parse_box_shadow(value: &str) -> Option<ParsedBoxShadow> {
-    let parts: Vec<&str> = value.trim().splitn(5, ' ').collect();
-    if parts.len() < 4 {
+    let parts = split_css_whitespace(value);
+    if parts.len() < 3 {
         return None;
     }
-    let ox = parse_plain_px(parts[0])?;
-    let oy = parse_plain_px(parts[1])?;
-    let blur = parse_plain_px(parts[2])?;
-    let spread = parse_plain_px(parts.get(3).unwrap_or(&"0")).unwrap_or(0.0);
+    let ox = parse_plain_px(&parts[0])?;
+    let oy = parse_plain_px(&parts[1])?;
+    let blur = parse_plain_px(&parts[2])?;
+    let (spread, color_index) = parts
+        .get(3)
+        .and_then(|part| parse_plain_px(part))
+        .map_or((0.0, 3), |spread| (spread, 4));
     let color = parts
-        .get(4)
-        .map(|c| c.to_string())
+        .get(color_index)
+        .cloned()
         .unwrap_or_else(|| "rgba(0,0,0,0.3)".to_string());
     Some(ParsedBoxShadow {
         offset_x: ox,
@@ -221,6 +224,30 @@ pub fn parse_box_shadow(value: &str) -> Option<ParsedBoxShadow> {
         spread,
         color,
     })
+}
+
+fn split_css_whitespace(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = None;
+    let mut depth = 0_u32;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if ch.is_whitespace() && depth == 0 {
+            if let Some(from) = start.take() {
+                parts.push(value[from..index].to_string());
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(from) = start {
+        parts.push(value[from..].to_string());
+    }
+    parts
 }
 
 #[derive(Debug, Clone)]
@@ -270,4 +297,19 @@ fn extract_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     let open = rest.find('(')?;
     let close = rest.find(')')?;
     Some(&rest[open + 1..close])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn box_shadow_supports_omitted_spread_and_spaced_rgba() {
+        let shadow = parse_box_shadow("0 18px 56px rgba(28, 55, 90, 0.12)").expect("parsed shadow");
+        assert_eq!(shadow.offset_x, 0.0);
+        assert_eq!(shadow.offset_y, 18.0);
+        assert_eq!(shadow.blur, 56.0);
+        assert_eq!(shadow.spread, 0.0);
+        assert_eq!(shadow.color, "rgba(28, 55, 90, 0.12)");
+    }
 }

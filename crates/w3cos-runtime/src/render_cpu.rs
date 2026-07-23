@@ -828,13 +828,20 @@ fn render_node(
                 );
             }
         }
-        ComponentKind::TextInput { value, placeholder } => {
+        ComponentKind::TextInput {
+            value,
+            placeholder,
+            secure,
+        } => {
             let display_value = text_input_value.unwrap_or(value.as_str());
+            let masked_value = secure.then(|| "•".repeat(display_value.chars().count()));
             let (display_text, text_color_override) = if display_value.is_empty() {
                 (
                     placeholder.as_str(),
                     Some(apply_opacity(Color::rgb(107, 114, 128), opacity)),
                 )
+            } else if let Some(masked) = masked_value.as_deref() {
+                (masked, None)
             } else {
                 (display_value, None)
             };

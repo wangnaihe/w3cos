@@ -101,6 +101,8 @@ pub enum ComponentKind {
     TextInput {
         value: String,
         placeholder: String,
+        #[serde(default)]
+        secure: bool,
     },
     Canvas {
         width: u32,
@@ -219,6 +221,25 @@ impl Component {
             kind: ComponentKind::TextInput {
                 value: value.into(),
                 placeholder: placeholder.into(),
+                secure: false,
+            },
+            style,
+            children: vec![],
+            on_click: EventAction::None,
+            sticky_counter_signal: None,
+        }
+    }
+
+    pub fn secure_text_input(
+        value: impl Into<String>,
+        placeholder: impl Into<String>,
+        style: Style,
+    ) -> Self {
+        Self {
+            kind: ComponentKind::TextInput {
+                value: value.into(),
+                placeholder: placeholder.into(),
+                secure: true,
             },
             style,
             children: vec![],

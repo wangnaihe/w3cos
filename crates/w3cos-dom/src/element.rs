@@ -50,6 +50,10 @@ impl Element {
     }
 
     pub fn set_attribute(&self, doc: &mut Document, name: &str, value: &str) {
+        if name.eq_ignore_ascii_case("class") {
+            self.set_class_name(doc, value);
+            return;
+        }
         let atom_name = Atom::intern(name);
         let node = doc.get_node_mut(self.id);
         if let Some(attr) = node.attributes.iter_mut().find(|(k, _)| *k == atom_name) {
@@ -80,10 +84,17 @@ impl Element {
     }
 
     pub fn remove_attribute(&self, doc: &mut Document, name: &str) {
+        if name.eq_ignore_ascii_case("class") {
+            let old_classes: Vec<Atom> = std::mem::take(&mut doc.get_node_mut(self.id).class_list);
+            for class in old_classes {
+                doc.remove_from_class_index(self.id, &class);
+            }
+        }
         let atom_name = Atom::intern(name);
         doc.get_node_mut(self.id)
             .attributes
             .retain(|(k, _)| *k != atom_name);
+        doc.mark_dirty(self.id);
     }
 
     pub fn class_list_add(&self, doc: &mut Document, class: &str) {
@@ -246,6 +257,18 @@ impl Element {
         for class in name.split_whitespace() {
             self.class_list_add(doc, class);
         }
+        let class_attr = Atom::intern("class");
+        let node = doc.get_node_mut(self.id);
+        if let Some((_, value)) = node
+            .attributes
+            .iter_mut()
+            .find(|(key, _)| *key == class_attr)
+        {
+            *value = name.to_string();
+        } else {
+            node.attributes.push((class_attr, name.to_string()));
+        }
+        doc.mark_dirty(self.id);
     }
 
     /// `element.dataset` — returns all `data-*` attributes as key/value pairs.

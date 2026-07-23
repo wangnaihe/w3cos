@@ -232,8 +232,13 @@ pub struct NativeTextInputState {
 /// Use UIKit's UITextField as the native IME client. winit's iOS WinitView
 /// implements UIKeyInput only, which cannot provide Pinyin marked text and
 /// candidate selection.
-pub fn ensure_text_input_first_responder(window: &Window, initial: &str) -> Option<bool> {
+pub fn ensure_text_input_first_responder(
+    window: &Window,
+    initial: &str,
+    secure: bool,
+) -> Option<bool> {
     let field = text_field(window, true)?;
+    let _: () = unsafe { objc2::msg_send![field, setSecureTextEntry: secure] };
     let already_first: bool = unsafe { objc2::msg_send![field, isFirstResponder] };
     if !already_first {
         let value = ns_string(initial)?;

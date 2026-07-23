@@ -211,6 +211,31 @@ mod tests {
     }
 
     #[test]
+    fn test_class_attribute_updates_selector_state() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".title", &[("font-size", "24px")]);
+
+        let mut doc = Document::new();
+        let el = doc.create_element("div");
+        el.set_attribute(&mut doc, "class", "title featured");
+        assert_eq!(el.get_attribute(&doc, "class"), Some("title featured"));
+        assert!(el.class_list_contains(&doc, "title"));
+        assert!(el.class_list_contains(&doc, "featured"));
+
+        el.set_text_content(&mut doc, "hello");
+        doc.body().append_child(&mut doc, el);
+        assert_eq!(doc.to_component_tree().children[0].style.font_size, 24.0);
+
+        el.set_attribute(&mut doc, "class", "replacement");
+        assert!(!el.class_list_contains(&doc, "title"));
+        assert!(el.class_list_contains(&doc, "replacement"));
+        el.remove_attribute(&mut doc, "class");
+        assert_eq!(el.get_attribute(&doc, "class"), None);
+        assert!(!el.class_list_contains(&doc, "replacement"));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_element_class_list_add() {
         let mut doc = Document::new();
         let el = doc.create_element("div");
@@ -469,6 +494,25 @@ mod tests {
                 keyboard: true,
                 ..
             } if id == textarea.id.as_u32() as u64
+        ));
+    }
+
+    #[test]
+    fn test_password_input_becomes_secure_text_input() {
+        let mut doc = Document::new();
+        let input = doc.create_element("input");
+        input.set_attribute(&mut doc, "type", "password");
+        input.set_attribute(&mut doc, "value", "demo");
+        doc.body().append_child(&mut doc, input);
+
+        let tree = doc.to_component_tree();
+        assert!(matches!(
+            &tree.children[0].kind,
+            w3cos_std::ComponentKind::TextInput {
+                value,
+                secure: true,
+                ..
+            } if value == "demo"
         ));
     }
 

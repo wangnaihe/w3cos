@@ -95,6 +95,10 @@ impl History {
             .map(|e| e.url.as_str())
             .unwrap_or("/")
     }
+
+    pub fn can_go_back(&self) -> bool {
+        self.index > 0
+    }
 }
 
 impl Default for History {
@@ -133,6 +137,16 @@ mod tests {
         h.push_state(None, "", "/c");
         assert_eq!(h.length(), 3);
         assert_eq!(h.current_url(), "/c");
+    }
+
+    #[test]
+    fn reports_whether_back_navigation_is_available() {
+        let mut h = History::new();
+        assert!(!h.can_go_back());
+        h.push_state(None, "", "/a");
+        assert!(h.can_go_back());
+        h.back();
+        assert!(!h.can_go_back());
     }
 
     #[test]
