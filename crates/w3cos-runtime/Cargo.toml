@@ -44,6 +44,9 @@ softbuffer = { workspace = true, optional = true }
 winit = { workspace = true, features = ["android-native-activity"] }
 skia-safe = { version = "=0.93.1", optional = true, features = ["vulkan"] }
 ash = "0.38"
+# Android does not expose SQLite as an NDK system library. Bundle the
+# amalgamation so IndexedDB keeps its native SQLite persistence on mobile.
+libsqlite3-sys = { version = "0.35", features = ["bundled"] }
 
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 winit = { workspace = true }

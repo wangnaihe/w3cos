@@ -11,6 +11,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
+// Keep the bundled Android SQLite dependency linked even though this module
+// deliberately owns the small FFI surface used by IndexedDB.
+#[cfg(target_os = "android")]
+use libsqlite3_sys as _;
+
 use crate::indexed_db::{
     DatabaseState, IndexState, IndexedDbError, ObjectStoreState, Result, StoredRecord,
     canonicalize_key, index_keys,

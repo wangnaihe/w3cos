@@ -287,6 +287,12 @@ fn generate_module_with_bodies(
     out.push_str(
         "    #[allow(unused_imports)]\n    use w3cos_core::{Array, Error, ErrorValue, Map, Math, Object, RangeError, ResizeObserver, Set, console, parseFloat, parseInt};\n",
     );
+    // Android's pthread-key limit is small. Emitting one `thread_local!` for
+    // every lowered JS binding exhausts it before `android_main` can start, so
+    // keep all per-thread ESM state in two module-level registries.
+    out.push_str(
+        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str>> = std::cell::RefCell::new(::std::collections::HashSet::new());\n    }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
+    );
     let namespace_names: HashSet<String> = module
         .namespace_imports
         .iter()
@@ -458,10 +464,9 @@ fn generate_module_with_bodies(
                     sym.original_name, sym.bundled_name, body, sym.bundled_name, callable_body
                 ));
                 out.push_str(&format!(
-                    "    std::thread_local! {{ static {}_VALUE: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }}; }}\n    pub fn {}_value() -> w3cos_core::Value {{\n        {}_VALUE.with(|cell| {{\n            if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }}\n            let value = w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args));\n            *cell.borrow_mut() = Some(value.clone());\n            value\n        }})\n    }}\n",
-                    sym.bundled_name.to_uppercase(),
+                    "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
                     sym.bundled_name,
-                    sym.bundled_name.to_uppercase(),
+                    format!("{}:value", sym.bundled_name),
                     sym.bundled_name,
                 ));
                 let alias = sanitize_ident(&sym.original_name);
@@ -498,10 +503,9 @@ fn generate_module_with_bodies(
                         sym.original_name, sym.bundled_name, body, sym.bundled_name, callable_body
                     ));
                     out.push_str(&format!(
-                        "    std::thread_local! {{ static {}_VALUE: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }}; }}\n    pub fn {}_value() -> w3cos_core::Value {{\n        {}_VALUE.with(|cell| {{\n            if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }}\n            let value = w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args));\n            *cell.borrow_mut() = Some(value.clone());\n            value\n        }})\n    }}\n",
-                        sym.bundled_name.to_uppercase(),
+                        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
                         sym.bundled_name,
-                        sym.bundled_name.to_uppercase(),
+                        format!("{}:value", sym.bundled_name),
                         sym.bundled_name,
                     ));
                     let alias = sanitize_ident(&sym.original_name);
@@ -567,12 +571,11 @@ fn generate_module_with_bodies(
                         .with_namespaces(namespace_names.clone());
                         let initializer = ctx.lower_ident(target);
                         out.push_str(&format!(
-                            "\n    std::thread_local! {{ static {}_CELL: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }}; }}\n    pub fn {}_get() -> w3cos_core::Value {{ {}_CELL.with(|cell| {{ if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }} let value = {initializer}; *cell.borrow_mut() = Some(value.clone()); value }}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ {}_CELL.with(|cell| *cell.borrow_mut() = Some(value.clone())); value }}\n",
+                            "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_get_or_init({:?}, || {initializer}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
                             sym.bundled_name,
+                            format!("{}:cell", sym.bundled_name),
                             sym.bundled_name,
-                            sym.bundled_name,
-                            sym.bundled_name,
-                            sym.bundled_name,
+                            format!("{}:cell", sym.bundled_name),
                         ));
                         let alias = sanitize_ident(&sym.original_name);
                         if alias != sym.bundled_name {
@@ -591,12 +594,11 @@ fn generate_module_with_bodies(
                     .with_namespaces(namespace_names.clone());
                     let initializer = ctx.lower_expr(initializer);
                     out.push_str(&format!(
-                        "\n    std::thread_local! {{ static {}_CELL: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }}; }}\n    pub fn {}_get() -> w3cos_core::Value {{ {}_CELL.with(|cell| {{ if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }} let value = {initializer}; *cell.borrow_mut() = Some(value.clone()); value }}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ {}_CELL.with(|cell| *cell.borrow_mut() = Some(value.clone())); value }}\n",
+                        "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_get_or_init({:?}, || {initializer}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
                         sym.bundled_name,
+                        format!("{}:cell", sym.bundled_name),
                         sym.bundled_name,
-                        sym.bundled_name,
-                        sym.bundled_name,
-                        sym.bundled_name,
+                        format!("{}:cell", sym.bundled_name),
                     ));
                     let alias = sanitize_ident(&sym.original_name);
                     if alias != sym.bundled_name {
@@ -614,13 +616,12 @@ fn generate_module_with_bodies(
                     // (Event = {}));`) assign the namespace object later, and
                     // the write must stick (see emit_module_init).
                     out.push_str(&format!(
-                        "\n    /// variable {} (from ESM) — ambient/unlowered; Undefined until assigned\n    std::thread_local! {{ static {}_CELL: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }}; }}\n    pub fn {}_get() -> w3cos_core::Value {{ {}_CELL.with(|cell| {{ if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }} let value = w3cos_core::Value::Undefined; *cell.borrow_mut() = Some(value.clone()); value }}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ {}_CELL.with(|cell| *cell.borrow_mut() = Some(value.clone())); value }}\n",
+                        "\n    /// variable {} (from ESM) — ambient/unlowered; Undefined until assigned\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::Undefined) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
                         sym.original_name,
                         sym.bundled_name,
+                        format!("{}:cell", sym.bundled_name),
                         sym.bundled_name,
-                        sym.bundled_name,
-                        sym.bundled_name,
-                        sym.bundled_name,
+                        format!("{}:cell", sym.bundled_name),
                     ));
                     let alias = sanitize_ident(&sym.original_name);
                     if alias != sym.bundled_name {
@@ -807,9 +808,9 @@ fn emit_module_init(
         }
     }
 
-    let once = format!("{namespace}__init_ONCE");
+    let once = format!("{namespace}:init");
     format!(
-        "\n    /// Module top-level statements (ESM evaluation), executed once.\n    fn {namespace}__init_body() -> w3cos_core::Value {{\n{body}        w3cos_core::Value::Undefined\n    }}\n    std::thread_local! {{ static {once}: std::cell::Cell<bool> = const {{ std::cell::Cell::new(false) }}; }}\n    pub fn {namespace}__init() {{\n        {once}.with(|once| {{\n            if once.replace(true) {{ return; }}\n            {namespace}__init_body();\n        }});\n    }}\n"
+        "\n    /// Module top-level statements (ESM evaluation), executed once.\n    fn {namespace}__init_body() -> w3cos_core::Value {{\n{body}        w3cos_core::Value::Undefined\n    }}\n    pub fn {namespace}__init() {{\n        if __w3cos_esm_flag_replace({once:?}, true) {{ return; }}\n        {namespace}__init_body();\n    }}\n"
     )
 }
 
@@ -921,8 +922,8 @@ fn emit_namespace_import(
     parse_cache: &mut ModuleParseCache,
 ) -> String {
     let fn_name = namespace_fn_name(module, &ns_import.local);
-    let cell = format!("{}_CELL", fn_name.to_uppercase());
-    let building = format!("{}_BUILDING", fn_name.to_uppercase());
+    let cell = format!("{fn_name}:namespace");
+    let building = format!("{fn_name}:namespace-building");
     let mut out = String::new();
     out.push_str(&format!(
         "\n    /// namespace object for `import * as {}` ({} exports from {})\n",
@@ -931,10 +932,7 @@ fn emit_namespace_import(
         ns_import.target.display()
     ));
     out.push_str(&format!(
-        "    std::thread_local! {{\n        static {cell}: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }};\n        static {building}: std::cell::Cell<bool> = const {{ std::cell::Cell::new(false) }};\n    }}\n"
-    ));
-    out.push_str(&format!(
-        "    pub fn {fn_name}() -> w3cos_core::Value {{\n        {cell}.with(|cell| {{\n            if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }}\n            if {building}.with(|flag| flag.replace(true)) {{ return w3cos_core::Value::Undefined; }}\n            let mut props = ::std::collections::HashMap::new();\n"
+        "    pub fn {fn_name}() -> w3cos_core::Value {{\n        if let Some(value) = __w3cos_esm_get({cell:?}) {{ return value; }}\n        if __w3cos_esm_flag_replace({building:?}, true) {{ return w3cos_core::Value::Undefined; }}\n        let mut props = ::std::collections::HashMap::new();\n"
     ));
     for sym in &ns_import.exports {
         let (module_path, bundled, shape) = resolve_namespace_symbol(
@@ -970,7 +968,7 @@ fn emit_namespace_import(
         ));
     }
     out.push_str(&format!(
-        "            let value = w3cos_core::Value::object(props);\n            {building}.with(|flag| flag.set(false));\n            *cell.borrow_mut() = Some(value.clone());\n            value\n        }})\n    }}\n"
+        "        let value = w3cos_core::Value::object(props);\n        __w3cos_esm_flag_replace({building:?}, false);\n        __w3cos_esm_set({cell:?}, value.clone());\n        value\n    }}\n"
     ));
     // Alias so the local name resolves within this module (same convention as
     // class/function symbols).
@@ -1926,12 +1924,11 @@ fn emit_class(
     }
     out.push_str("    }\n");
 
-    // Thread-local singleton + accessor (the pub item other modules use).
+    // Per-thread singleton + accessor (the pub item other modules use).
+    let class_key = format!("{bundled}:class");
+    let building_key = format!("{bundled}:class-building");
     out.push_str(&format!(
-        "    std::thread_local! {{\n        static {bundled}_CLASS: std::cell::RefCell<Option<w3cos_core::Value>> = const {{ std::cell::RefCell::new(None) }};\n        static {bundled}_BUILDING: std::cell::Cell<bool> = const {{ std::cell::Cell::new(false) }};\n    }}\n"
-    ));
-    out.push_str(&format!(
-        "    pub fn {bundled}() -> w3cos_core::Value {{\n        {bundled}_CLASS.with(|cell| {{\n            if let Some(value) = cell.borrow().as_ref() {{ return value.clone(); }}\n            if {bundled}_BUILDING.with(|flag| flag.replace(true)) {{ return w3cos_core::Value::Undefined; }}\n            let value = {bundled}__build_class();\n            {bundled}_BUILDING.with(|flag| flag.set(false));\n            *cell.borrow_mut() = Some(value.clone());\n            {bundled}__init_statics(&value);\n            value\n        }})\n    }}\n"
+        "    pub fn {bundled}() -> w3cos_core::Value {{\n        if let Some(value) = __w3cos_esm_get({class_key:?}) {{ return value; }}\n        if __w3cos_esm_flag_replace({building_key:?}, true) {{ return w3cos_core::Value::Undefined; }}\n        let value = {bundled}__build_class();\n        __w3cos_esm_flag_replace({building_key:?}, false);\n        __w3cos_esm_set({class_key:?}, value.clone());\n        {bundled}__init_statics(&value);\n        value\n    }}\n"
     ));
     out
 }
@@ -2986,19 +2983,21 @@ export function main() { return result; }"#,
         let app_ns_end = code[app_ns_start..].find(' ').unwrap() + app_ns_start;
         let app_ns = &code[app_ns_start..app_ns_end];
 
-        // Init pair emitted, once-guarded.
+        // Init pair emitted, once-guarded through the shared module registry.
         let init_fn = format!("fn {app_ns}__init_body() -> w3cos_core::Value");
         let init_pos = code.find(&init_fn).expect("init body emitted");
         assert!(
-            code.contains(&format!("std::cell::Cell<bool>")),
-            "once cell: {code}"
+            code.contains("static __W3COS_ESM_FLAGS"),
+            "shared flag registry: {code}"
         );
         assert!(
-            code.contains(&format!("static {app_ns}__init_ONCE")),
-            "once guard cell: {code}"
+            code.contains(&format!(
+                "__w3cos_esm_flag_replace(\"{app_ns}:init\", true)"
+            )),
+            "once guard registry key: {code}"
         );
         assert!(
-            code.contains("if once.replace(true) { return; }"),
+            code.contains("if __w3cos_esm_flag_replace"),
             "once guard check: {code}"
         );
         assert!(
