@@ -1,242 +1,383 @@
 # W3C OS Roadmap
 
-## Phase 0 — Skeleton ✅
-- [x] Cargo workspace (9 crates)
-- [x] w3cos-std: Component, Style, Color, Dimension (rem/em/vw/vh)
-- [x] w3cos-std: BoxShadow, Transform2D, Transition, Easing
-- [x] w3cos-dom: Document, Element, Node arena, CSSStyleDeclaration
-- [x] w3cos-dom: Events (click/mouse/key/focus/scroll)
-- [x] w3cos-dom: querySelector, classList, setAttribute
-- [x] w3cos-a11y: DOM → ARIA tree, flatten for AI
-- [x] w3cos-ai-bridge: DOM access + a11y API + screenshot + permissions
-- [x] w3cos-compiler: JSON + TS parsing → Rust codegen (Component + DOM backends)
-- [x] w3cos-runtime: Taffy 0.9 (Flex/Grid/Block/position) + Vello GPU / tiny-skia CPU + winit
-- [x] w3cos-runtime: Mouse events, hover, click, hit-testing
-- [x] w3cos-cli: `w3cos build`, `w3cos run`, `w3cos dev`, `w3cos init`
-- [x] CSS: Flexbox, Grid, Block, position relative/absolute/fixed/sticky, overflow, z-index
-- [x] CSS: rem, em, vw, vh, box-shadow, transform, transition, opacity
-- [x] 13 example apps (hello, counter, dashboard, showcase, calculator, weather, settings-panel, chat-ui, css-demo, scss-demo, desktop-shell, file-manager, terminal, ai-agent)
-- [x] Dockerfile + .devcontainer
-- [x] Buildroot config + QEMU scripts + INSTALL.md
-- [x] ARCHITECTURE.md, README.md, CONTRIBUTING.md, ISSUES.md
+Last replanned: **2026-07-23**
+Baseline: `main` @ `ae6e458`
 
-## Phase 1 — Interactive Apps ✅
-- [x] Reactive state system (signal/create_signal/get_signal/set_signal)
-- [x] Event handlers in TSX (onClick compiled to EventAction)
-- [x] TSX syntax support (built-in parser, SWC integration planned #10)
-- [x] Text input component (TextInput with keyboard input)
-- [x] display: inline / inline-block (Taffy flex approximation)
-- [x] position: fixed / sticky
-- [x] CSS transitions (animated with 60fps frame loop)
-- [x] @keyframes animation support (Animation struct, keyframe types) (#11)
-- [x] Scroll support (overflow scroll, mouse wheel, touch slop, velocity sampling, kinetic deceleration)
-- [x] Image component (placeholder rendering, full decode #2)
-- [x] Focus management + keyboard navigation (Tab/Shift+Tab)
+## North Star
 
-## Phase 1.5 — TypeScript → Rust Transpiler ✅
-- [x] General TS → Rust transpilation (SWC parser → Rust codegen)
-- [x] Closures with Rc<RefCell<T>> capture + move semantics
-- [x] async/await → async fn + .await + tokio runtime
-- [x] Promise.all/race → tokio::join!/select!
-- [x] GC → Reference Counting (conservative Rc<RefCell<T>> strategy)
-- [x] w3cos-core crate: Value dynamic type system (JS-compatible)
-- [x] w3cos-core: JsObject with HashMap properties + prototype chain
-- [x] w3cos-core: Proxy with all 13 ECMAScript handler traps + ProxyBuilder
-- [x] w3cos-core: Signal<T> / Computed<T> / Effect / watch() / batch()
-- [x] Compiler: new Proxy(target, handler) → ProxyBuilder codegen
-- [x] Compiler: reactive() → Signal expansion (compile-time optimization)
-- [x] Compiler: watch()/computed()/effect() → w3cos-core API calls
-- [x] Compiler: reactive property access/assignment → signal.get()/set()
-- [x] Dynamic dependency generation (needs_core/needs_async/needs_rc/needs_fetch flags)
-- [x] Compiler: fetch() → w3cos_runtime::fetch bridge codegen
-- [ ] Escape analysis optimization for Rc<RefCell<T>> elision (P5)
-- [x] typeof operator runtime support via Value::type_of() + standalone type_of() function
+Compile a standards-oriented Web application — TypeScript/JavaScript, DOM, CSS,
+and npm dependencies — into a native desktop or mobile application without a
+browser or JavaScript VM.
 
-## Phase 2 — System APIs & Production Quality ✅
-- [x] GPU rendering (Vello + wgpu — replace tiny-skia, CPU fallback via feature flag) (#12)
-- [x] System bridge: File System Access API → Linux FS (#16)
-- [x] System bridge: Fetch API → native HTTP client (ureq) (#15)
-- [x] System bridge: Clipboard API (#17 — arboard integration)
-- [x] System bridge: Notifications API (#18 — notify-rust)
-- [x] System bridge: setTimeout / setInterval / requestAnimationFrame (#33)
-- [x] System bridge: Child Process API (spawn/exec/pipe) (#35)
-- [x] System bridge: Pseudo Terminal (PTY) API (#36)
-- [x] System bridge: Path utilities + Environment variables
-- [x] CSS Text properties: text-align, white-space, line-height, letter-spacing, text-decoration, text-overflow, font-family, font-style, word-break (#31)
-- [x] CSS Custom Properties: var(--x) support in Style struct (#34)
-- [x] CSS Containment: `contain` property (None/Layout/Size/Content/Strict) for layout isolation
-- [x] Hot reload during development (`w3cos dev` with file watcher) (#13)
-- [x] Live demo infrastructure (Docker + noVNC remote desktop)
-- [x] Multiple windows: W3C-standard window.open/close/focus/moveTo/resizeTo (#21)
-- [x] Multi-window: w3cos:// URL scheme with app manifest + registry
-- [x] Multi-window: postMessage cross-window communication
-- [x] Multi-window: WindowManager with focus stack (z-order)
-- [x] Official React runtime executes through the generic JS/DOM AOT pipeline
-- [x] React Native API mapping (@w3cos/rn-compat) (#19 — View/Text/TouchableOpacity/Pressable/ScrollView/Image/TextInput/SafeAreaView/FlatList/Switch + StyleSheet.create + use_state)
-- [x] Wire up AI Bridge to runtime (end-to-end AI agent demo) (#14 — DOM-mode integration + `frame_cache` PNG screenshot pipeline + `ScreenshotProvider` trait)
+The primary compatibility target is the **formal ESM/React application path**.
+A Rust module existing in `w3cos-runtime` is necessary, but it does not make a
+Web API complete until compiled application code can call the standard
+JavaScript surface.
 
-## Phase 2.5 — Dynamic DOM & Performance ✅
+## Definition of Done
 
-### Dynamic DOM (#30) ✅
-- [x] Thread-local Document in runtime (`w3cos_runtime::dom`)
-- [x] W3C DOM API wrappers: createElement, createTextNode, appendChild, removeChild, insertBefore
-- [x] DOM attributes: setAttribute, getAttribute, setTextContent
-- [x] DOM style: setStyleProperty via CSSStyleDeclaration
-- [x] DOM events: addEventListener with EventAction integration
-- [x] DOM queries: querySelector, querySelectorAll, getElementById
-- [x] DOM-driven rendering: `run_app_dom(setup)` entry point
-- [x] Dual dirty tracking: signal dirty + DOM dirty → to_component_tree() → layout → render
-- [x] Compiler DOM codegen backend: `generate_dom()` emits createElement/appendChild calls
-- [x] Improved to_component_tree(): flex-direction → Row/Column, img, input, h1-h6 defaults
-- [x] Event bubbling: dispatch_event_bubbling walks parent chain
-- [x] Backward compatible: existing Component-mode apps unchanged
+An API is marked complete only when all applicable layers pass:
 
-### CSS Ecosystem ✅
-- [x] External CSS file parsing: selector + property → `Stylesheet` / `CssRule` / `Selector`
-- [x] CSS selectors: universal (`*`), element (DOM tags: `div`, `span`, `h1`–`h6`, etc.), class (`.name`), compound (`div.name`)
-- [x] DOM selector mapping: W3COS component names → standard HTML tag aliases (Column → div, Text → span, etc.)
-- [x] `className` attribute in TSX parser + codegen
-- [x] `import "./styles.css"` / `import "./theme.scss"` in TSX
-- [x] Style matching: `resolve_style()` merges CSS rules with inline styles (inline wins)
-- [x] CSS Cascade Layers (`@layer`): explicit ordering, named/anonymous/nested layers, layer precedence in cascade
-- [x] SCSS preprocessor: `grass` crate integration (feature-gated `scss`)
-- [x] Compiler integration: `compile_from_file()` resolves CSS/SCSS imports, parses stylesheets, feeds to codegen
+1. **Engine** — the generic Rust implementation exists.
+2. **Web surface** — the standard JavaScript global, constructor, properties,
+   events, and errors are exposed through the ESM/jsdom path.
+3. **Conformance** — behavior tests execute compiled JavaScript, not only direct
+   Rust calls.
+4. **Platform** — required desktop/mobile adapters pass on their target
+   platform.
+5. **Downstream gate** — at least one real application exercises the API when
+   the capability is product-critical.
 
-### DOM Performance (Chrome/Blink Algorithms) ✅
-- [x] Interned Atoms: O(1) string comparison, 45 pre-interned common tags/attrs
-- [x] LCRS Tree: first_child/last_child/next_sibling/prev_sibling — O(1) tree mutations
-- [x] HashMap indexes: O(1) getElementById, querySelector by class/tag
-- [x] Direct event bubbling: walk parent pointers, no HashMap per event
-- [x] Node freelist: arena slot recycling for bounded memory
-- [x] Scoped dirty propagation: mark_dirty walks to nearest `contain` boundary
-- [x] CSS `contain` property: layout isolation for incremental re-layout
+Status:
 
-### Rendering Pipeline Optimizations ✅
-- [x] Pre-flatten architecture: `FlatNodeInfo` array replaces all `flatten_tree` / `get_*_at_index` calls — O(n²) → O(n)
-- [x] Viewport culling: `render_frame` skips nodes entirely outside visible area — 80%+ draw call reduction in scroll
-- [x] Glyph cache: `GlyphCache` HashMap keyed by `(char, quantized_font_size)` — eliminates repeated charmap lookup + fontdue rasterize
-- [x] Zero-copy animation/hover: `HashMap<usize, Style>` override table replaces `root.clone()` deep copy — only 0–2 styles cloned per frame
-- [x] Scroll info precomputation: top-down `scroll_ancestor` propagation in `collect_layouts` — O(n × depth) → O(n)
-- [x] Incremental layout: persistent `LayoutEngine` with cached `TaffyTree` — resize skips tree rebuild, Taffy internal caching applies
-- [x] Spatial index: `SpatialGrid` (64px grid hash) for hit testing — O(n) → O(k) per `CursorMoved` (k ≈ 1–5)
-- [x] Buffer reuse: `LayoutEngine`, `GlyphCache`, `SpatialGrid` persist in `App` — eliminates per-frame heap allocations
-- [x] Dirty generation tracking: `paint_generation` / `layout_generation` + `needs_tree_rebuild` flag — distinguishes tree change from resize-only
-- [x] Keyed virtual list core: sparse Fenwick height corrections, O(log n) offset lookup, overscan windowing, bounded node recycling, offscreen state restoration, anchor correction, per-item layer invalidation, and explicit logical scroll extent without materializing every item
+- ✅ complete under the definition above
+- 🚧 engine exists, but the Web surface or a platform adapter is incomplete
+- 📋 planned
+- ⛔ intentionally unsupported
 
-### Multi-Device Adaptive Layout ✅
-- [x] @media query engine: min-width, max-width, orientation, resolution, prefers-color-scheme
-- [x] Compound media queries: And, Or, Not conditions
-- [x] Media query string parser: "(min-width: 600px) and (max-width: 1024px)"
-- [x] CSS Container Queries: component-level responsive (min-width, max-width, And)
-- [x] Viewport helpers: orientation(), size_class() (Compact/Medium/Expanded)
-- [x] Adaptive layout example: flex-wrap + minWidth for phone/tablet/desktop
+## Release Order
 
-### System GUI Examples ✅
-- [x] Desktop Shell: taskbar + app launcher + system tray + desktop icons
-- [x] File Manager: split-pane with directory tree + file list + toolbar
-- [x] Terminal: multi-tab + colored output + input + status bar
-- [x] AI Agent Hub: agent list + permissions + DOM API conversation view
-- [x] Adaptive Layout: responsive dashboard that works on any screen size
+| Release | Outcome | Exit gate |
+|---------|---------|-----------|
+| **R0** | Trustworthy `main` | Required tests are green and API status cannot overclaim Rust-only modules |
+| **R1** | Native Web App P0 | Formal React app has localization, network streams, voice, location, and media capture |
+| **R2** | Web Platform Facade | Common browser constructors and events work from compiled ESM |
+| **R3** | Mobile Production Runtime | Android/iOS touch, IME, viewport, lifecycle, and device validation pass |
+| **R4** | npm Compatibility | Package support is driven by repeatable compatibility gates |
+| **R5** | W3C OS Distribution | Shell, package lifecycle, permissions, updates, and system agent are production-ready |
 
-## Phase 2.75 — VS Code Compatibility (see docs/vscode-compat.md)
+---
 
-### DOM Core ✅
-- [x] replaceChild, cloneNode(deep), DocumentFragment, Comment node types
-- [x] nextSibling/previousSibling/firstChild/lastChild accessors on Element
-- [x] is_connected, node_type, node_name, child_element_count
-- [x] getElementsByTagName, getElementsByClassName
-- [x] dataset (DOMStringMap), inner_text, outer_html (read-only)
-- [x] Runtime DOM bridge: all new APIs exposed via w3cos_runtime::dom
+## R0 — Restore a Trustworthy Main Branch
 
-### DOM Events ✅
-- [x] Full event sub-types: MouseEventData, KeyboardEventData, PointerEventData, WheelEventData
-- [x] 40+ EventType variants (pointer, touch, composition, custom, etc.)
-- [x] Event phases: Capturing → AtTarget → Bubbling (W3C 3-phase propagation)
-- [x] Listener options: capture, once, passive
-- [x] Single listener removal by ID
-- [x] stop_immediate_propagation support
-- [x] CustomEvent with detail
+No new API should be declared complete while the corresponding conformance
+suite is red.
 
-### CSS Engine ✅
-- [x] 30+ new CSS properties in StyleDecl/apply_css_property (cursor, visibility, pointer-events, user-select, outline-*, text-*, flex-basis, order, align-self, align-content, etc.)
-- [x] CSS shorthand parsing: flex, outline, border, margin/padding multi-value
-- [x] CSSStyleDeclaration: text-align, white-space, line-height, letter-spacing, text-decoration, text-overflow, font-family/style, word-break, cursor, visibility, pointer-events, user-select, outline-*, align-self/content
-- [x] Style struct: cursor, visibility, pointer_events, user_select, outline, flex_basis, order, align_self, align_content
-- [x] CSS Custom Properties: var(--name, fallback) resolution with inheritance
-- [x] @keyframes parsing: keyframe stops with percentage/from/to
-- [x] @media parsing: rules inside @media blocks now parsed (not skipped)
-- [x] @font-face parsing: font-family, src, weight, style extraction
-- [x] CSS pseudo-class selectors (:hover, :focus, :active, :first-child, :last-child, :nth-child, :only-child, :empty, :not(), :disabled, :enabled, :checked)
-- [x] CSS attribute selectors ([attr], [attr=value], [attr^=value], [attr$=value], [attr*=value], [attr~=value], [attr|=value])
+### Green baseline
 
-### Canvas 2D ✅
-- [x] Path: quadraticCurveTo, bezierCurveTo, ellipse, rect, clip
-- [x] Image: drawImage, putImageData
-- [x] Line styles: setLineCap, setLineJoin, setMiterLimit, setLineDash/getLineDash
-- [x] Transform: setTransform, resetTransform
-- [x] TextMetrics: width + boundingBox ascent/descent
+- [x] Fix `w3cos-runtime --test w3c_feature_matrix`
+  `dom_to_component_tree_smoke`.
+- [x] Fix `w3cos-compiler` `generated_bundle_runs_jsdom_globals`.
+- [ ] Make the required compiler/runtime suites part of the default CI gate.
+- [ ] Add a compiled-JavaScript API-surface test that checks `typeof`,
+  constructor calls, callbacks/events, and failure behavior.
+- [x] Add a `.d.ts`-driven `web-api-skeleton` tool that generates reviewable
+  Rust facades with named `todo!()` placeholders without wiring them into the
+  production runtime.
+- [ ] Separate test labels for:
+  - direct Rust engine API;
+  - ESM/JavaScript Web surface;
+  - desktop integration;
+  - Android/iOS integration.
 
-### Selection API ✅
-- [x] Range: collapse, selectNode, selectNodeContents, cloneRange, setStartBefore/After, setEndBefore/After
-- [x] Selection: removeRange, containsNode, selectionType
+### Status integrity
 
-### Observer APIs ✅
-- [x] ResizeObserver (observe/unobserve/disconnect/checkForChanges)
-- [x] MutationObserver (MutationType/MutationRecord)
-- [x] IntersectionObserver (observe/unobserve/disconnect/checkForIntersections)
-- [x] Window.matchMedia (min-width, max-width, prefers-color-scheme)
+- [ ] Generate or maintain one Web API capability matrix with the columns
+  `engine`, `esm_surface`, `desktop`, `android`, `ios`, and `conformance`.
+- [ ] Remove DONE claims where only a Rust module exists.
+- [ ] Keep roadmap, README capability claims, and mobile documentation aligned
+  in the same change that lands an API.
+
+**R0 exit:** required CI is green and every claimed Web API has an ESM-level
+test.
+
+---
+
+## R1 — Native Web App P0
+
+These APIs block the current formal downstream React application and therefore
+precede ecosystem breadth or migration tooling.
+
+### R1.1 Internationalization
+
+- [x] Implement the initial `Intl.NumberFormat` application profile.
+  - locale-aware decimal/grouping;
+  - currency style and ISO 4217 currency codes;
+  - stable behavior for unsupported locales.
+- [x] Implement the initial `Intl.DateTimeFormat` application profile.
+  - locale-aware date/time fields;
+  - UTC, fixed-offset, and selected non-DST IANA timezones;
+  - deterministic invalid-date and invalid-timezone behavior.
+- [x] Expose both constructors through the ESM global `Intl`.
+- [x] Add engine and compiled-JavaScript tests for `zh-CN` currency, `en-US`
+  decimal formatting, UTC input, and `Asia/Shanghai`.
+- [ ] Add locale data and DST-aware IANA timezone transitions beyond the
+  initial application profile.
+
+### R1.2 Network primitives
+
+- [x] Expose the existing WebSocket engine as the standard `WebSocket`
+  constructor.
+  - `CONNECTING`, `OPEN`, `CLOSING`, `CLOSED`;
+  - `onopen`, `onmessage`, `onerror`, `onclose`;
+  - text/binary send and close code/reason;
+  - event-loop polling and cleanup.
+- [x] Complete the initial Fetch companion surface used by application code:
+  `Request`, `Response`, `Headers`, and `AbortController`.
+- [ ] Support request cancellation and timeout cleanup without leaking native
+  work.
+- [x] Add an ESM integration test against a local WebSocket fixture.
+- [x] Add an ESM integration test against a local HTTP fixture for Fetch and
+  its companion constructors.
+
+### R1.3 Web Speech
+
+- [x] iOS native speech engine prototype (`SFSpeechRecognizer`).
+- [ ] Expose `window.SpeechRecognition` and the compatibility alias
+  `window.webkitSpeechRecognition`.
+- [ ] Implement browser-shaped results, alternatives, confidence, finality,
+  lifecycle events, and error events.
+- [ ] Add Android speech recognition adapter.
+- [ ] Define desktop behavior explicitly: supported adapter or standards-shaped
+  `not-supported` failure.
+- [ ] Validate permissions, denial, restart, continuous mode, and cancellation
+  on physical iOS and Android devices.
+
+### R1.4 Geolocation
+
+- [ ] Implement `navigator.geolocation`.
+- [ ] Support `getCurrentPosition`, `watchPosition`, and `clearWatch`.
+- [ ] Implement timeout, maximum age, accuracy fields, permission denial, and
+  platform-disabled errors.
+- [ ] Add iOS Core Location and Android location adapters with manifest/plist
+  generation.
+
+### R1.5 MediaDevices
+
+- [ ] Implement `navigator.mediaDevices`.
+- [ ] Implement `getUserMedia()` for camera and microphone.
+- [ ] Provide `MediaStream` and track lifecycle sufficient for preview,
+  capture, stop, and permission handling.
+- [ ] Add photo/evidence capture without product-specific native modules.
+- [ ] Validate camera/microphone denial and interruption on physical devices.
+
+### R1.6 Formal downstream conformance
+
+- [ ] Compile the formal downstream Vite production graph without a parallel
+  native UI or bootstrap.
+- [ ] Pass localization formatting.
+- [ ] Pass authenticated Fetch and IndexedDB/local-first startup.
+- [ ] Pass live WebSocket capture stream.
+- [ ] Pass voice capability detection and transcript delivery.
+- [ ] Pass location and camera evidence flows.
+
+**R1 exit:** the formal React application completes these flows on native
+desktop and the applicable mobile targets using standard Web APIs.
+
+---
+
+## R2 — Web Platform Facade
+
+R2 turns existing engine modules and partial shims into coherent browser-facing
+APIs. Work is ordered by common npm usage, not by number of Rust modules.
+
+### R2.1 Binary data and files
+
+- [ ] Expose working `TextEncoder` alongside `TextDecoder`.
+- [ ] Implement `ArrayBuffer`, `DataView`, and typed-array buffer/view
+  semantics.
+- [ ] Implement `Blob`, `File`, and `FileReader`.
+- [ ] Implement `FormData`, including Fetch request integration.
+- [ ] Implement `ImageData`, `Path2D`, and `OffscreenCanvas` where supported by
+  the existing Canvas engine.
+
+### R2.2 Events and DOM constructors
+
+- [ ] Implement callable `Event`, `CustomEvent`, and `EventTarget`.
+- [ ] Expose DOM constructors with useful identity and `instanceof` behavior:
+  `Node`, `Element`, `HTMLElement`, common HTML elements, `Range`, and
+  `Selection`.
+- [ ] Expose standard event subclasses: keyboard, pointer, input, clipboard,
+  drag, touch, animation, and transition events.
+- [ ] Replace silent empty-object fallbacks with standards-shaped exceptions or
+  explicit unsupported errors.
+
+### R2.3 Observers and background work
+
+- [x] ResizeObserver engine and compiler special case.
+- [ ] Expose standard `ResizeObserver` constructor behavior through ESM.
+- [ ] Expose `MutationObserver` and `IntersectionObserver` through ESM.
+- [ ] Implement `PerformanceObserver`.
+- [ ] Expose the Worker engine as `Worker`, `SharedWorker`, `MessageChannel`,
+  `MessagePort`, and structured message events.
+
+### R2.4 Remaining network/browser services
+
+- [ ] Expose `EventSource`.
+- [ ] Decide whether `XMLHttpRequest` is a compatibility shim over Fetch or an
+  explicitly unsupported legacy API.
+- [ ] Expose the Notifications API on supported desktop/mobile platforms.
+- [ ] Complete Clipboard item/data-transfer APIs beyond text-only clipboard.
+- [ ] Add secure randomness backed by the OS; do not use the current
+  deterministic fallback for security-sensitive APIs.
+
+### R2.5 DOM, viewport, and display
+
+- [ ] Implement Fullscreen API and `fullscreenchange` lifecycle.
+- [ ] Implement Screen Orientation state, `lock()`, `unlock()`, and events.
+- [ ] Make `VisualViewport` geometry and resize/scroll listeners live.
+- [ ] Complete computed style beyond inline-style reflection.
+- [ ] Complete SVG namespace/rendering support required by application gates.
+- [ ] Define cookie behavior: real store with policy or explicit unsupported
+  errors instead of inert assignment.
+
+**R2 exit:** supported APIs behave consistently when reached from compiled ESM;
+Rust-only modules are no longer advertised as browser APIs.
+
+---
+
+## R3 — Mobile Production Runtime
+
+### R3.1 Existing foundation
+
+- [x] `w3cos-mobile` crate and generic mobile demo.
+- [x] Android/iOS project templates.
+- [x] `w3cos mobile init`.
+- [x] `w3cos mobile build` for Android and iOS simulator artifacts.
+- [x] `w3cos mobile dev` with debug DevTools plumbing.
+- [x] Safe-area inset storage and native setter.
+- [x] HarmonyOS ArkUI/XComponent shell scaffold with fail-closed build.
+
+### R3.2 Touch and pointer input
+
+- [ ] Replace `TouchEvent::dispatch()` no-op with runtime hit-test dispatch.
+- [ ] Map Android MotionEvent and iOS touch input to Pointer Events and Touch
+  Events.
+- [ ] Support multi-touch identity, cancel, capture, pressure where available,
+  scrolling arbitration, and gesture interruption.
+- [ ] Report real `navigator.maxTouchPoints`.
+
+### R3.3 IME and editable text
+
+- [ ] Connect native focus to `<input>`, `<textarea>`, and contenteditable.
+- [ ] Implement UTF-8 commit/delete, caret geometry, selection ranges, and
+  keyboard viewport resize.
+- [ ] Complete `beforeinput`, `input`, and `composition*` lifecycle with marked
+  text.
+- [ ] Implement `inputmode`, `enterkeyhint`, secure input, and
+  EditContext-compatible geometry.
+- [ ] Add CJK, emoji, RTL, paste, autocorrect, and hardware-keyboard device
+  tests.
+
+### R3.4 Immersive viewport and shell
+
+- [ ] Implement edge-to-edge viewport and native system-bar integration.
+- [ ] Support `viewport-fit=cover`, CSS safe-area `env()`, and
+  `svh`/`lvh`/`dvh`.
+- [ ] Implement keyboard insets through live `VisualViewport`.
+- [ ] Replace RN-compat `StatusBar` and `ActivityIndicator` placeholders.
+- [ ] Add generic mobile-shell chrome hooks without application-specific UI.
+
+### R3.5 Platform completion
+
+- [ ] Run Android rendering on the real NativeActivity surface without desktop
+  fallback assumptions.
+- [ ] Produce and validate physical-device Android APKs.
+- [ ] Add iOS device archive/signing pipeline in addition to simulator builds.
+- [ ] Add lifecycle, background/foreground, rotation, memory pressure, and
+  interruption tests.
+- [ ] Implement HarmonyOS OHNativeWindow rendering, input, lifecycle, IME, and
+  safe-area adapters before enabling Harmony builds.
+
+**R3 exit:** one formal Web application passes the same input, layout,
+local-first, and device-capability flows on physical Android and iOS devices.
+
+---
+
+## R4 — npm and JavaScript Compatibility
+
+Package compatibility is validation-based. W3COS does not add
+framework-specific runtime paths to make individual packages pass.
+
+### R4.1 JavaScript semantics
+
+- [ ] Complete RegExp semantics required by package gates.
+- [ ] Implement `BigInt`.
+- [ ] Implement real `WeakMap`, `WeakSet`, `WeakRef`, and
+  `FinalizationRegistry` semantics where feasible.
+- [ ] Implement `ArrayBuffer`, shared-memory, and Atomics semantics selected by
+  the supported security model.
+- [ ] Complete URI encode/decode globals.
+- [ ] Remove reachable `todo!()` and silent unsupported-expression lowering
+  from production compiler paths.
+
+### R4.2 Package gates
+
+- [x] Official React and react-dom formal application gate.
+- [x] Monaco/CodeMirror-oriented compiler and DOM milestones.
+- [ ] Define a versioned compatibility suite for representative package
+  classes:
+  - pure logic;
+  - state/data;
+  - UI/component;
+  - editor/visualization;
+  - networking/storage.
+- [ ] Publish tested package versions and the Web APIs each gate requires.
+- [ ] Add CSS/Web API failures as generic platform issues, not package-specific
+  hard-coded bridges.
+- [ ] Claim broad npm compatibility only after the selected suite passes in CI.
+
+### R4.3 Migration tooling
+
+- [ ] React Native application analysis/migration command.
+- [ ] Electron application analysis and standards-oriented migration report.
+- [ ] Keep runtime compatibility work separate from source migration tooling.
+
+**R4 exit:** package support is reproducible, versioned, and explained by
+generic JavaScript/Web-platform coverage.
+
+---
+
+## R5 — W3C OS Distribution
+
+### Completed foundation
+
+- [x] Desktop shell and multi-window foundations.
+- [x] Buildroot boot pipeline and QEMU tooling.
+- [x] Bootable ISO release workflow.
+- [x] AI Bridge DOM/a11y/query/click/type/screenshot foundation.
+- [x] File system, process, PTY, IPC, menu, and dialog engine modules.
 
 ### Remaining
-- [x] Web Workers (W3C `Worker` + `SharedWorker` over native threads — `WorkerScope` `recv`/`post_message`/`report_error`, `MessagePort`-style `SharedWorkerPort` with broadcast, cooperative `terminate()` semantics, queued `WorkerEvent` stream for reactive frame loops)
-- [x] WebSocket API (RFC 6455 client over `tungstenite`, ready-state machine, async event queue, send_text / send_binary / close, browser-style `onopen`/`onmessage`/`onclose`/`onerror` semantics)
-- [x] localStorage (Web Storage API with JSON file persistence)
-- [x] IndexedDB (object stores + key paths + auto-increment + indexes + transactions; JSON-file backed at `~/.w3cos/indexeddb/<name>.json`)
-- [x] w3cos.dialog (open / open-multiple / open-directory / save / message via `rfd`, native XDG-Portal/GTK/Cocoa/Win32, non-blocking `DialogReceiver` API)
-- [x] w3cos.ipc (length-prefixed JSON message bus over Unix Domain Socket on Linux/macOS, TCP loopback fallback, `IpcServer::broadcast` / `send_to` + `IpcClient::send` / `try_recv`)
-- [x] w3cos.menu (application + context menu data model, MenuItem checkbox/radio/separator, `set_app_menu` / `pop_context` / `dispatch_event` / `poll_events`)
-- [ ] RegExp (full JS spec)
-- [x] TextEncoder / TextDecoder (UTF-8, UTF-16LE/BE, ASCII, BOM handling)
 
-### Monaco Editor Milestone ✅ (see docs/monaco-gap-report.md for the compatibility ledger)
-- [x] ESM resolver at Monaco scale: dotted-basename subpaths (`editor.api` → `editor.api.js`), lexical path normalization (graph dedup), resolve/symbol caches (528-module scan in 0.65s)
-- [x] `export * from` collection + forwarding, destructured exports (`export const { a, b } = ...`), `export default <expr>`
-- [x] JS class system (ESM path): extends / super() / super.method / instanceof / static members + static blocks / getters+setters / #private fields / class expressions — lowered to w3cos-core prototype-chain objects with call slots
-- [x] jsdom Value-level DOM bridge (`w3cos_runtime::jsdom`): real Document backing for compiled JS (elements, style proxy, classList, events, canvas 2D, selection, storage, timers, microtasks, matchMedia) + frame-loop integration
-- [x] `import * as ns` namespace objects (211 bindings)
-- [x] try/catch/finally/throw real semantics
-- [x] Promise objects + microtask queue
-- [x] JS globals: setTimeout/JSON/queueMicrotask/URL/atob/structuredClone
-- [x] CSS imports from ESM (Monaco has 110)
-- [x] Monaco editor.api end-to-end compile + render + input smoke test
-  - [x] Headless DOM materialization (`.monaco-editor`, 135 nodes, model/editor line count 5)
-  - [x] Window rendering smoke test (line numbers and source text visible in CPU-rendered native window)
-  - [x] Keyboard input changes model content (`X// Monaco...` verified in both native window and AI Bridge model probe)
+- [ ] Capability-based application permissions and user-facing consent.
+- [ ] Signed application package format, installer, updater, and rollback.
+- [ ] Package registry/store and dependency policy.
+- [ ] AI system agent with privileged APIs and auditable authorization.
+- [ ] Multi-device sync protocol with identity, encryption, and conflict
+  handling.
+- [ ] Recovery, crash reporting, diagnostics, and upgrade compatibility.
+- [ ] Hardware/driver support matrix and real-device release qualification.
 
-## Phase 3 — Compatibility & Migration
-- [x] React Native API mapping (`w3cos-rn-compat`: View/Text/TouchableOpacity/Pressable/ScrollView/Image/TextInput/SafeAreaView/FlatList/Switch/Button/StatusBar + StyleSheet.create + use_state)
-- [x] React hooks run in the bundled official React runtime with no framework-specific host layer
-- [ ] React Native app auto-migration tool (`w3cos migrate --from rn`)
-- [ ] Electron app AST transpiler (strip Chromium, map APIs)
-- [x] PWA manifest support (`w3cos_runtime::pwa::PwaManifest` parses W3C Web App Manifest — `name`/`short_name`/`id`/`start_url`/`display`/`display_override`/`theme_color`/`background_color`/`icons`/`shortcuts` + closest-icon picker + `into_app_manifest` adapter for the W3C OS app registry)
-- [ ] npm package compatibility (pure-logic packages)
-- [ ] Cross-compilation: Linux x86/ARM, macOS, **Android (APK), iOS**
-- [ ] **Mobile M1** 🚧 `w3cos-mobile` crate, `examples/mobile-demo`, `templates/android`, `w3cos mobile init`
-- [ ] **Mobile M2** `w3cos mobile build` → APK automation
-- [ ] **Mobile M3** `w3cos-mobile-shell` chrome (SafeArea, StatusBar)
-- [ ] **Mobile Immersive P0** edge-to-edge viewport, `viewport-fit=cover`, CSS `env(safe-area-inset-*)`, `svh` / `lvh` / `dvh`, VisualViewport geometry, and virtual-keyboard insets; native adapters own iOS/Android system-bar integration
-- [ ] **Mobile Immersive P1** Fullscreen API, Web App Manifest `display` / `display-mode`, Screen Orientation lock, fullscreen lifecycle/events, and physical-device conformance tests; do not introduce a non-standard `immersive` component property
-- [ ] **Mobile IME P0** `<input>` / `TextInput` native focus bridge, iOS keyboard activation, caret/baseline alignment, UTF-8 commit/delete, keyboard viewport resize, and physical-device UI regression
-- [ ] **Mobile IME P1** W3C UI Events + Input Events Level 2 composition lifecycle (`beforeinput` / `input` / `composition*`), marked text, selection ranges, input traits (`inputmode` / `enterkeyhint`), and EditContext-compatible geometry
+---
 
-## Phase 4 — Operating System ✅ (core done)
-- [x] w3cos-shell crate: native desktop shell binary (taskbar, icons, system tray)
-- [x] Boot pipeline: S99w3cos init → framebuffer detect → w3cos-shell fullscreen
-- [x] GitHub Actions build-iso.yml: auto-build ISO on version tag push
-- [x] Buildroot post-build: installs w3cos-shell + CLI + example apps
-- [x] QEMU script: --download flag, KVM detect, SSH forwarding
-- [x] Bootable ISO (Buildroot) available on GitHub Releases (#20)
-- [x] W3C OS as system shell (replaces desktop environment)
-- [ ] AI system agent with privileged APIs
-- [ ] Package manager for W3C OS applications
-- [ ] Multi-device sync protocol
-- [ ] App store / registry
+## Intentionally Unsupported or Deferred
+
+- ⛔ `eval()` and arbitrary runtime code generation: incompatible with the AOT
+  and security model.
+- ⛔ Writable `innerHTML` as an unrestricted script execution path. A safe,
+  inert markup subset may be supported for compatibility.
+- ⛔ Runtime CommonJS `require()`: dependencies must be statically resolved or
+  bundled.
+- ⛔ Service Workers until an offline/background execution and permission model
+  is designed. Local-first storage does not require Service Workers.
+- ⛔ WebRTC until a real product/package gate justifies the media, networking,
+  permission, and security surface.
+- 📋 Dynamic `import()` may be considered as statically known AOT chunks; fully
+  arbitrary runtime module loading is out of scope.
+- 📋 Escape-analysis optimization is performance work and must not precede
+  correctness or Web API conformance.
+
+## Change Policy
+
+When completing a roadmap item:
+
+1. land the generic implementation;
+2. expose the standard ESM/Web surface;
+3. add conformance tests at the appropriate layers;
+4. validate required platforms;
+5. update capability claims and this roadmap in the same change.
+
+Downstream applications may supply conformance cases, but product names,
+business semantics, and application-specific native modules do not belong in
+W3COS.

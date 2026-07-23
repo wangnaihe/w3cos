@@ -89,8 +89,8 @@ impl Location {
             format!("{}:{}", self.hostname, self.port)
         };
         format!(
-            "//{}{}{}{}",
-            authority, self.pathname, self.search, self.hash
+            "{}//{}{}{}{}",
+            self.protocol, authority, self.pathname, self.search, self.hash
         )
     }
 
@@ -164,6 +164,7 @@ mod tests {
         assert_eq!(loc.hash(), "");
         assert_eq!(loc.search(), "");
         assert_eq!(loc.hostname(), "localhost");
+        assert_eq!(loc.href(), "w3cos://localhost/");
     }
 
     #[test]
@@ -172,6 +173,7 @@ mod tests {
         assert_eq!(loc.pathname(), "/page");
         assert_eq!(loc.search(), "?q=hello");
         assert_eq!(loc.hash(), "#section");
+        assert_eq!(loc.href(), "w3cos://localhost/page?q=hello#section");
     }
 
     #[test]
@@ -184,6 +186,7 @@ mod tests {
         assert_eq!(loc.search(), "?k=v");
         assert_eq!(loc.hash(), "#frag");
         assert_eq!(loc.origin(), "https://example.com:8080");
+        assert_eq!(loc.href(), "https://example.com:8080/path?k=v#frag");
     }
 
     #[test]

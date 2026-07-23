@@ -379,7 +379,6 @@ fn web_code(key: PhysicalKey) -> String {
     }
 }
 
-#[cfg(any(target_os = "ios", test))]
 fn text_input_delta(previous: &str, next: &str) -> (String, &'static str) {
     let previous_chars = previous.chars().collect::<Vec<_>>();
     let next_chars = next.chars().collect::<Vec<_>>();
@@ -1347,6 +1346,100 @@ impl App {
         self.paint_cpu();
         #[cfg(not(all(feature = "gpu", feature = "cpu-render")))]
         crate::uitest::write_snapshot();
+    }
+
+    fn process_uitest_commands(&mut self) {
+        for command in crate::uitest::drain_pending_commands(256) {
+            let applied = match &command {
+                crate::uitest::PendingCommand::Action(action) => {
+                    state::execute_action(&state::parse_action_string(action));
+                    let changed = state::is_dirty();
+                    if changed {
+                        self.rebuild_if_dirty();
+                        self.repaint_mode = RepaintMode::Full;
+                    }
+                    changed
+                }
+                crate::uitest::PendingCommand::Scroll(dy) => {
+                    self.ensure_layout();
+                    let target = self
+                        .scrollable_nodes
+                        .iter()
+                        .max_by(|(_, _, left), (_, _, right)| {
+                            left.max_y
+                                .partial_cmp(&right.max_y)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(index, _, _)| *index);
+                    target
+                        .map(|index| self.scroll_node_by(index, *dy).abs() > 0.001)
+                        .unwrap_or(false)
+                }
+                crate::uitest::PendingCommand::Click(index) => {
+                    let exists = self
+                        .hit_nodes
+                        .iter()
+                        .any(|hit| hit.index == *index && hit.is_interactive);
+                    if exists {
+                        self.handle_click(*index);
+                    }
+                    exists
+                }
+                crate::uitest::PendingCommand::Input { index, value } => {
+                    let current =
+                        self.text_input_values.get(index).cloned().or_else(|| {
+                            match self.get_kind_at(*index) {
+                                Some(ComponentKind::TextInput { value, .. }) => Some(value.clone()),
+                                _ => None,
+                            }
+                        });
+                    current
+                        .map(|current| {
+                            let (data, input_type) = text_input_delta(&current, value);
+                            self.apply_native_text_input(
+                                *index,
+                                value.clone(),
+                                &data,
+                                input_type,
+                                false,
+                            )
+                        })
+                        .unwrap_or(false)
+                }
+            };
+            crate::uitest::record_command_result(&command, applied);
+        }
+
+        if crate::uitest::take_repaint_request() {
+            self.request_repaint();
+        }
+        self.schedule_next_bench_repaint();
+    }
+
+    fn schedule_next_bench_repaint(&mut self) {
+        if crate::uitest::take_bench_repaint() {
+            self.repaint_mode = RepaintMode::Full;
+            self.request_repaint();
+        }
+    }
+
+    /// Run the HTML microtask checkpoint at a native task boundary.
+    ///
+    /// Event listeners run synchronously, but Promise reactions and
+    /// `queueMicrotask` callbacks must settle before the next platform task.
+    /// Rebuild once after the queue reaches quiescence so React/DOM changes
+    /// produced by those jobs are visible without requiring a second input.
+    fn microtask_checkpoint(&mut self) -> usize {
+        let ran = crate::jsdom::drain_microtasks();
+        if ran > 0
+            || state::is_dirty()
+            || host_runtime::has_pending_render()
+            || (self.dom_mode && crate::dom::is_document_dirty())
+        {
+            self.rebuild_if_dirty();
+            self.request_repaint();
+        }
+        ran
     }
 
     fn prepare_compositor_tiles(&mut self) -> (Vec<TileRequest>, HashSet<usize>) {
@@ -2363,6 +2456,26 @@ impl App {
         }
 
         self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
+        crate::uitest::set_hit_targets(
+            self.hit_nodes
+                .iter()
+                .filter(|hit| hit.is_interactive)
+                .map(|hit| {
+                    let label = match self.get_kind_at(hit.index) {
+                        Some(ComponentKind::Button { label }) => label.clone(),
+                        Some(ComponentKind::TextInput { placeholder, .. }) => placeholder.clone(),
+                        _ => String::new(),
+                    };
+                    crate::uitest::UiHitTarget {
+                        index: hit.index,
+                        label,
+                        action: format!("{:?}", hit.on_click),
+                        cx: hit.rect.x + hit.rect.width / 2.0 + input_window_offset.0,
+                        cy: hit.rect.y + hit.rect.height / 2.0 + input_window_offset.1,
+                    }
+                })
+                .collect(),
+        );
         crate::uitest::set_input_targets(
             self.hit_nodes
                 .iter()
@@ -4721,6 +4834,15 @@ impl App {
         }
     }
 
+    fn dom_hit_is_label(&self, hit_index: usize) -> bool {
+        self.dom_mode
+            && self
+                .native_host_chain(hit_index)
+                .iter()
+                .copied()
+                .any(|id| crate::dom::tag_name(id as u32).eq_ignore_ascii_case("label"))
+    }
+
     fn apply_native_text_input(
         &mut self,
         idx: usize,
@@ -4781,20 +4903,30 @@ impl App {
                 if allow_default_focus {
                     self.set_focused_index(Some(idx));
                 }
-                let dispatched_native = self.dispatch_native_click_bubble(idx);
+                let click_prevented = self.dispatch_native_click_bubble(idx);
+                let submitted = if self.dom_mode && !click_prevented {
+                    self.native_host_chain(idx).first().and_then(|target| {
+                        crate::jsdom::dispatch_native_submit_for_control(*target as u32)
+                    })
+                } else {
+                    None
+                };
                 if !action.is_none() && !matches!(action, EventAction::NativeHost { .. }) {
                     state::execute_action(&action);
-                } else {
-                    if !dispatched_native {
-                        eprintln!("[W3C OS] Click → Button (no action)");
-                    }
+                } else if !click_prevented && submitted.is_none() {
+                    eprintln!("[W3C OS] Click → Button (no action)");
                 }
                 self.rebuild_if_dirty();
                 self.repaint_after_interaction();
                 return;
             }
             let action = hit.on_click.clone();
-            if !self.dom_mode {
+            // A browser moves focus away from a text control when the user
+            // activates a non-focusable surface. Do this before click
+            // dispatch so a click handler can still focus another control.
+            // Labels are excluded because pointer-down already delegated
+            // focus to their descendant input.
+            if allow_default_focus && !self.dom_hit_is_label(idx) {
                 self.set_focused_index(None);
             }
             let dispatched_native = self.dispatch_native_click_bubble(idx);
@@ -5986,6 +6118,13 @@ impl ApplicationHandler for App {
 
         #[cfg(feature = "ai-bridge")]
         self.poll_ai_bridge();
+
+        self.microtask_checkpoint();
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        self.process_uitest_commands();
+        self.microtask_checkpoint();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -6308,6 +6447,7 @@ impl ApplicationHandler for App {
                 }
                 self.paint();
                 self.flush_deferred_scroll_commit(false);
+                self.schedule_next_bench_repaint();
             }
 
             WindowEvent::Resized(_size) => {
@@ -6981,6 +7121,7 @@ impl ApplicationHandler for App {
 
             _ => {}
         }
+        self.microtask_checkpoint();
     }
 }
 
@@ -7149,6 +7290,34 @@ mod scroll_physics_tests {
         assert!(flat.iter().any(|node| matches!(
             &node.kind,
             ComponentKind::Text { content } if content == "mounted after host task"
+        )));
+    }
+
+    fn microtask_dom_setup() {
+        let mount = crate::dom::create_element("div");
+        crate::dom::set_attribute(mount, "id", "microtask-result");
+        crate::dom::append_child(crate::dom::body_id(), mount);
+    }
+
+    #[test]
+    fn native_task_microtask_checkpoint_commits_dom_before_next_input() {
+        crate::jsdom::reset_bridge();
+        let mut app = App::new_dom(microtask_dom_setup);
+        let mount = crate::dom::get_element_by_id("microtask-result").unwrap();
+        crate::jsdom::queue_microtask_value(w3cos_core::Value::function(move |_, _| {
+            let text = crate::dom::create_text_node("committed at task boundary");
+            crate::dom::append_child(mount, text);
+            w3cos_core::Value::Undefined
+        }));
+
+        assert!(!layout::pre_flatten(&app.root).iter().any(|node| matches!(
+            &node.kind,
+            ComponentKind::Text { content } if content == "committed at task boundary"
+        )));
+        assert_eq!(app.microtask_checkpoint(), 1);
+        assert!(layout::pre_flatten(&app.root).iter().any(|node| matches!(
+            &node.kind,
+            ComponentKind::Text { content } if content == "committed at task boundary"
         )));
     }
 
@@ -8517,6 +8686,7 @@ mod scroll_physics_tests {
 
 pub fn run_reactive(builder: fn() -> Component) -> Result<()> {
     let event_loop = EventLoop::new()?;
+    crate::uitest::set_event_loop_proxy(event_loop.create_proxy());
     let mut app = App::new_reactive(builder);
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -8524,6 +8694,7 @@ pub fn run_reactive(builder: fn() -> Component) -> Result<()> {
 
 pub fn run_static(root: Component) -> Result<()> {
     let event_loop = EventLoop::new()?;
+    crate::uitest::set_event_loop_proxy(event_loop.create_proxy());
     let mut app = App::new_static(root);
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -8531,6 +8702,7 @@ pub fn run_static(root: Component) -> Result<()> {
 
 pub fn run_dom(setup: fn()) -> Result<()> {
     let event_loop = EventLoop::new()?;
+    crate::uitest::set_event_loop_proxy(event_loop.create_proxy());
     let mut app = App::new_dom(setup);
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -8543,6 +8715,7 @@ pub fn run_reactive_android(
 ) -> Result<()> {
     use winit::platform::android::EventLoopBuilderExtAndroid;
     let event_loop = EventLoop::builder().with_android_app(android_app).build()?;
+    crate::uitest::set_event_loop_proxy(event_loop.create_proxy());
     let mut app = App::new_reactive(builder);
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -8555,6 +8728,7 @@ pub fn run_dom_android(
 ) -> Result<()> {
     use winit::platform::android::EventLoopBuilderExtAndroid;
     let event_loop = EventLoop::builder().with_android_app(android_app).build()?;
+    crate::uitest::set_event_loop_proxy(event_loop.create_proxy());
     let mut app = App::new_dom(setup);
     event_loop.run_app(&mut app)?;
     Ok(())

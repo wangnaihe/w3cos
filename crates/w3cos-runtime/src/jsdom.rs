@@ -34,6 +34,7 @@
 //!
 //! The window frame loop should call, once per frame:
 //! `jsdom::tick_timers(); jsdom::drain_microtasks();`
+//! The latter also polls native WebSocket workers and dispatches their events.
 //! `window.rs` is intentionally not modified by this module.
 //!
 //! # Timer model
@@ -2017,6 +2018,40 @@ pub(crate) fn dispatch_native_click(target: u32) -> bool {
     !dispatch_sync(target, EventType::Click, EventData::None)
 }
 
+/// Apply the HTML default action for an activated submit button.
+///
+/// Returns `None` when `target` is not a submit control or has no ancestor
+/// form. Otherwise returns whether the dispatched submit event was canceled.
+pub(crate) fn dispatch_native_submit_for_control(target: u32) -> Option<bool> {
+    let tag = dom::tag_name(target);
+    if !tag.eq_ignore_ascii_case("button") && !tag.eq_ignore_ascii_case("input") {
+        return None;
+    }
+    let control_type = dom::get_attribute(target, "type").unwrap_or_else(|| {
+        if tag.eq_ignore_ascii_case("button") {
+            "submit".to_string()
+        } else {
+            "text".to_string()
+        }
+    });
+    if !control_type.eq_ignore_ascii_case("submit") {
+        return None;
+    }
+
+    let mut current = dom::parent_node(target);
+    while let Some(node) = current {
+        if dom::tag_name(node).eq_ignore_ascii_case("form") {
+            return Some(!dispatch_sync(
+                node,
+                event_type_for("submit"),
+                EventData::None,
+            ));
+        }
+        current = dom::parent_node(node);
+    }
+    None
+}
+
 /// Synchronously bridge a native keyboard event. Returns true when JS called
 /// `preventDefault()`.
 #[allow(clippy::too_many_arguments)]
@@ -3617,6 +3652,18 @@ fn build_window_value() -> Value {
         "IDBKeyRange".to_string(),
         crate::indexed_db_web::key_range_constructor_value(),
     );
+    props.insert("WebSocket".to_string(), crate::websocket::websocket_class());
+    props.insert("Headers".to_string(), crate::fetch::headers_class());
+    props.insert("Request".to_string(), crate::fetch::request_class());
+    props.insert("Response".to_string(), crate::fetch::response_class());
+    props.insert(
+        "AbortController".to_string(),
+        crate::fetch::abort_controller_class(),
+    );
+    props.insert(
+        "AbortSignal".to_string(),
+        crate::fetch::abort_signal_class(),
+    );
     props.insert("closed".to_string(), Value::Bool(false));
     props.insert("isSecureContext".to_string(), Value::Bool(true));
     props.insert("crossOriginIsolated".to_string(), Value::Bool(false));
@@ -4001,6 +4048,7 @@ pub fn queue_microtask_value(callback: Value) {
 pub fn drain_microtasks() -> usize {
     let mut ran = 0;
     loop {
+        ran += crate::websocket::poll_js_events();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -4045,7 +4093,7 @@ pub fn has_pending_work() -> bool {
     let raf = RAF_QUEUE.with(|q| !q.borrow().is_empty());
     let micro = MICROTASKS.with(|m| !m.borrow().is_empty());
     let events = PENDING_EVENTS.with(|q| !q.borrow().is_empty());
-    timers || raf || micro || events
+    timers || raf || micro || events || crate::websocket::has_pending_js_sockets()
 }
 
 /// Earliest deadline the bridge needs to be woken at: the soonest pending JS
@@ -4054,11 +4102,13 @@ pub fn has_pending_work() -> bool {
 pub fn next_timer_deadline() -> Option<Instant> {
     let timer = JS_TIMERS.with(|t| t.borrow().iter().map(|timer| timer.fire_at).min());
     let raf = RAF_QUEUE.with(|q| !q.borrow().is_empty());
-    match (timer, raf) {
-        (Some(deadline), true) => Some(deadline.min(Instant::now() + Duration::from_millis(16))),
-        (Some(deadline), false) => Some(deadline),
-        (None, true) => Some(Instant::now() + Duration::from_millis(16)),
-        (None, false) => None,
+    let sockets = crate::websocket::has_pending_js_sockets();
+    let frame_deadline = (raf || sockets).then(|| Instant::now() + Duration::from_millis(16));
+    match (timer, frame_deadline) {
+        (Some(deadline), Some(frame_deadline)) => Some(deadline.min(frame_deadline)),
+        (Some(deadline), None) => Some(deadline),
+        (None, Some(frame_deadline)) => Some(frame_deadline),
+        (None, None) => None,
     }
 }
 
@@ -4085,6 +4135,7 @@ pub fn reset_bridge() {
     HEAD_ID.with(|h| *h.borrow_mut() = None);
     CANVAS_CONTEXTS.with(|c| c.borrow_mut().clear());
     SESSION_STORAGE.with(|s| s.borrow_mut().clear());
+    crate::websocket::reset_js_websockets();
     // DOCUMENT_VALUE / WINDOW_VALUE / SELECTION_VALUE survive on purpose:
     // their contents read all state lazily from the DOM and viewport.
 }
@@ -4511,6 +4562,40 @@ mod tests {
     }
 
     #[test]
+    fn submit_button_dispatches_submit_on_ancestor_form() {
+        setup();
+        let doc = document_value();
+        let form = create_in_body("form");
+        let button = doc.call_method("createElement", vec![Value::string("button")]);
+        form.call_method("appendChild", vec![button.clone()]);
+
+        let submissions = Rc::new(Cell::new(0));
+        let submissions2 = submissions.clone();
+        form.call_method(
+            "addEventListener",
+            vec![
+                Value::string("submit"),
+                func(move |_, args| {
+                    submissions2.set(submissions2.get() + 1);
+                    arg(&args, 0).call_method("preventDefault", vec![]);
+                    Value::Undefined
+                }),
+            ],
+        );
+
+        let button_id = node_id_of(&button).unwrap();
+        assert_eq!(dispatch_native_submit_for_control(button_id), Some(true));
+        assert_eq!(submissions.get(), 1);
+
+        button.call_method(
+            "setAttribute",
+            vec![Value::string("type"), Value::string("button")],
+        );
+        assert_eq!(dispatch_native_submit_for_control(button_id), None);
+        assert_eq!(submissions.get(), 1);
+    }
+
+    #[test]
     fn dispatch_event_sync_bubbles_and_cancels() {
         setup();
         let doc = document_value();
@@ -4780,7 +4865,7 @@ mod tests {
         assert_eq!(nav.get_property("maxTouchPoints").to_number(), 0.0);
         assert_eq!(nav.get_property("language").to_js_string(), "en-US");
         let loc = win.get_property("location");
-        assert_eq!(loc.get_property("href").to_js_string(), "w3cos://app");
+        assert_eq!(loc.get_property("href").to_js_string(), "w3cos://app/");
     }
 
     #[test]

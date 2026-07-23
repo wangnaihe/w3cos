@@ -1900,9 +1900,15 @@ impl LowerCtx {
                                 format!("{:?}", self.private_key(name))
                             }
                         };
-                        return format!(
-                            "{{ let __obj = {object}; let __w3cos_prev = __obj.get_property(&{key}); __obj.set_property(&{key}, __w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0))); __w3cos_prev }}"
-                        );
+                        return if update.prefix {
+                            format!(
+                                "{{ let __obj = {object}; let __w3cos_next = __obj.get_property(&{key}).{delta}(&w3cos_core::Value::Number(1.0)); __obj.set_property(&{key}, __w3cos_next.clone()); __w3cos_next }}"
+                            )
+                        } else {
+                            format!(
+                                "{{ let __obj = {object}; let __w3cos_prev = __obj.get_property(&{key}); __obj.set_property(&{key}, __w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0))); __w3cos_prev }}"
+                            )
+                        };
                     }
                     let arg = match update.arg.as_ref() {
                         Expr::Ident(identifier) => {
@@ -1919,24 +1925,42 @@ impl LowerCtx {
                                     .find(|(name, _)| name == &local)
                                     .map(|(_, bundled)| bundled.as_str())
                                     .unwrap_or(&local);
-                                return format!(
-                                    "{{ let __w3cos_prev = {bundled}_get(); {bundled}_set(__w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0))); __w3cos_prev }}"
-                                );
+                                return if update.prefix {
+                                    format!(
+                                        "{{ let __w3cos_next = {bundled}_get().{delta}(&w3cos_core::Value::Number(1.0)); {bundled}_set(__w3cos_next.clone()); __w3cos_next }}"
+                                    )
+                                } else {
+                                    format!(
+                                        "{{ let __w3cos_prev = {bundled}_get(); {bundled}_set(__w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0))); __w3cos_prev }}"
+                                    )
+                                };
                             }
                             if self.is_boxed(&local) && self.known_values.contains(&local) {
                                 // Rc<RefCell> local: read/write through the cell.
                                 let target = self.resolve_name(&local);
-                                return format!(
-                                    "{{ let __w3cos_prev = (*{target}.borrow()).clone(); *{target}.borrow_mut() = __w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
-                                );
+                                return if update.prefix {
+                                    format!(
+                                        "{{ let __w3cos_next = (*{target}.borrow()).clone().{delta}(&w3cos_core::Value::Number(1.0)); *{target}.borrow_mut() = __w3cos_next.clone(); __w3cos_next }}"
+                                    )
+                                } else {
+                                    format!(
+                                        "{{ let __w3cos_prev = (*{target}.borrow()).clone(); *{target}.borrow_mut() = __w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
+                                    )
+                                };
                             }
                             self.resolve_name(&local)
                         }
                         expression => self.lower_expr(expression),
                     };
-                    return format!(
-                        "{{ let __w3cos_prev = {arg}.clone(); {arg} = {arg}.{delta}(&w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
-                    );
+                    return if update.prefix {
+                        format!(
+                            "{{ let __w3cos_next = {arg}.{delta}(&w3cos_core::Value::Number(1.0)); {arg} = __w3cos_next.clone(); __w3cos_next }}"
+                        )
+                    } else {
+                        format!(
+                            "{{ let __w3cos_prev = {arg}.clone(); {arg} = {arg}.{delta}(&w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
+                        )
+                    };
                 }
                 let arg = self.lower_expr(&update.arg);
                 let op = if update.op == UpdateOp::PlusPlus {
@@ -1944,7 +1968,11 @@ impl LowerCtx {
                 } else {
                     "-= 1"
                 };
-                format!("{arg} {op}")
+                if update.prefix {
+                    format!("{{ {arg} {op}; {arg} }}")
+                } else {
+                    format!("{{ let __w3cos_prev = {arg}; {arg} {op}; __w3cos_prev }}")
+                }
             }
             Expr::Paren(paren) => {
                 let inner = self.lower_expr(&paren.expr);
@@ -4322,10 +4350,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         // calls (and the facades can be passed around as values).
         "Promise" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"resolve\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::resolve(__args))), (\"reject\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::reject(__args))), (\"all\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::all(__args))), (\"race\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::race(__args)))]))".to_string(),
         "JSON" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"parse\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::json::parse(__args))), (\"stringify\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::json::stringify(__args)))]))".to_string(),
-        // Intl is not implemented; a harmless empty object keeps references
-        // total (member access yields Undefined).
-        "Intl" => "w3cos_core::Value::object(::std::collections::HashMap::new()) /* Intl stub */"
-            .to_string(),
+        "Intl" => "w3cos_core::web::intl_value()".to_string(),
         // `arguments` — the current fn's argument list as an array value.
         // Only valid where `__args` is in scope (lowered fns/closures).
         "arguments" => "w3cos_core::Value::array(__args.clone())".to_string(),
@@ -4349,6 +4374,12 @@ fn global_value_expr(name: &str) -> Option<String> {
         "TextDecoder" => "w3cos_core::web::text_decoder_class()".to_string(),
         "Date" => "w3cos_core::web::date_class()".to_string(),
         "fetch" => "w3cos_core::Value::function(|_this, __args| w3cos_runtime::fetch::fetch_value(__args))".to_string(),
+        "WebSocket" => {
+            "w3cos_runtime::jsdom::window_value().get_property(\"WebSocket\")".to_string()
+        }
+        "Request" | "Response" | "Headers" | "AbortController" | "AbortSignal" => {
+            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+        }
         "Uint8Array" | "Uint8ClampedArray" | "Int8Array" | "Uint16Array" | "Int16Array"
         | "Uint32Array" | "Int32Array" | "Float32Array" | "Float64Array" | "BigInt64Array"
         | "BigUint64Array" => "w3cos_core::collections::typed_array_class()".to_string(),
@@ -4367,8 +4398,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         "BigInt" | "ArrayBuffer" | "SharedArrayBuffer" | "DataView"
         | "WeakRef" | "FinalizationRegistry" | "Atomics" | "eval"
         | "encodeURI" | "encodeURIComponent" | "decodeURI" | "decodeURIComponent" | "escape"
-        | "unescape" | "TextEncoder" | "Request" | "Response"
-        | "Headers" | "FormData" | "AbortController" | "AbortSignal" | "Event"
+        | "unescape" | "TextEncoder" | "FormData" | "Event"
         | "EventTarget" | "CustomEvent" | "MessagePort" | "Worker"
         | "ImageData" | "OffscreenCanvas" | "Path2D" | "DOMRect" | "DOMPoint" | "DOMMatrix"
         | "MutationObserver" | "IntersectionObserver" | "PerformanceObserver" | "Report"
@@ -4380,7 +4410,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "ShadowRoot" | "NodeList" | "CSSStyleDeclaration" | "MouseEvent" | "KeyboardEvent"
         | "PointerEvent" | "WheelEvent" | "FocusEvent" | "InputEvent" | "ClipboardEvent"
         | "DragEvent" | "TouchEvent" | "AnimationEvent" | "TransitionEvent" | "ErrorEvent"
-        | "EventSource" | "WebSocket" | "XMLHttpRequest" | "Blob" | "File" | "FileReader"
+        | "EventSource" | "XMLHttpRequest" | "Blob" | "File" | "FileReader"
         | "ClipboardItem" | "DataTransfer" | "DOMException" | "Range" | "Selection"
         | "DOMParser" | "XMLSerializer" | "CSS" | "CSSStyleSheet"
         // URL constructors are handled at `new` sites; bare values are stubs.
@@ -5508,6 +5538,12 @@ const bin = atob("aGk=");
 const enc = btoa(bin);
 const copy = structuredClone(obj);
 const response = fetch("/api", { method: "POST" });
+const headers = new Headers({ "x-test": "one" });
+const request = new Request("/api", { headers });
+const synthetic = new Response("ok", { status: 201 });
+const controller = new AbortController();
+const signal = AbortSignal.abort("done");
+const socket = new WebSocket("ws://127.0.0.1:9001");
 const u = new URL("https://example.com/x");
 const params = new URLSearchParams("a=1");"#,
         );
@@ -5550,6 +5586,22 @@ const params = new URLSearchParams("a=1");"#,
             "fetch facade: {code}"
         );
         assert!(
+            code.contains("window_value().get_property(\"WebSocket\")"),
+            "WebSocket facade: {code}"
+        );
+        for constructor in [
+            "Headers",
+            "Request",
+            "Response",
+            "AbortController",
+            "AbortSignal",
+        ] {
+            assert!(
+                code.contains(&format!("window_value().get_property(\"{constructor}\")")),
+                "{constructor} facade: {code}"
+            );
+        }
+        assert!(
             code.contains("w3cos_core::web::url_new(vec!["),
             "new URL: {code}"
         );
@@ -5560,15 +5612,13 @@ const params = new URLSearchParams("a=1");"#,
     }
 
     #[test]
-    fn dynamic_lowering_intl_is_a_harmless_stub() {
+    fn dynamic_lowering_intl_uses_web_runtime() {
         let stmts = parse_stmts("const nf = Intl.NumberFormat;");
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains(
-                "w3cos_core::Value::object(::std::collections::HashMap::new()) /* Intl stub */"
-            ),
-            "Intl stub object: {code}"
+            code.contains("w3cos_core::web::intl_value()"),
+            "Intl runtime object: {code}"
         );
     }
 
@@ -6181,6 +6231,47 @@ function f(window) { return window.x; }"#,
         assert!(
             code.contains("return __this.clone().get_property(\"x\");"),
             "this read: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_preserves_prefix_update_result() {
+        let stmts = parse_stmts(
+            "function bump(ref) { let local = 1; const a = ++local; const b = ++ref.current; return [a, b, local, ref.current]; }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains(
+                "let __w3cos_next = local.js_add(&w3cos_core::Value::Number(1.0)); local = __w3cos_next.clone(); __w3cos_next"
+            ),
+            "prefix local update must evaluate to the incremented value: {code}"
+        );
+        assert!(
+            code.contains(
+                "let __w3cos_next = __obj.get_property(&\"current\").js_add(&w3cos_core::Value::Number(1.0)); __obj.set_property(&\"current\", __w3cos_next.clone()); __w3cos_next"
+            ),
+            "prefix member update must evaluate to the incremented value: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_lowering_preserves_postfix_update_result() {
+        let stmts =
+            parse_stmts("function bump(ref) { let local = 1; const a = local++; const b = ref.current++; }");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains(
+                "let __w3cos_prev = local.clone(); local = local.js_add(&w3cos_core::Value::Number(1.0)); __w3cos_prev"
+            ),
+            "postfix local update must evaluate to the previous value: {code}"
+        );
+        assert!(
+            code.contains(
+                "let __w3cos_prev = __obj.get_property(&\"current\"); __obj.set_property(&\"current\", __w3cos_prev.js_add(&w3cos_core::Value::Number(1.0))); __w3cos_prev"
+            ),
+            "postfix member update must evaluate to the previous value: {code}"
         );
     }
 

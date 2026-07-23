@@ -13,6 +13,7 @@ pub mod scope_analysis;
 pub mod style_matcher;
 pub mod ts_transpiler;
 pub mod ts_types;
+pub mod web_api_skeleton;
 pub mod web_codegen;
 
 use anyhow::{Context, Result};

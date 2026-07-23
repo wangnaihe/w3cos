@@ -162,6 +162,22 @@ Native ELF/Mach-O binary              ← Machine code
 Runs directly on hardware             ← No runtime
 ```
 
+### Generate Web API skeletons
+
+Generate reviewable Rust facade scaffolding from a TypeScript declaration file:
+
+```bash
+w3cos web-api-skeleton path/to/lib.dom.d.ts \
+  --interface Event \
+  --interface Navigator \
+  --output web_api_stubs.rs
+```
+
+Inherited interface members are included by default; pass `--own-only` to emit
+only directly declared members. Generated constructors, methods, getters, and
+setters contain named `todo!()` placeholders and are not wired into the runtime
+automatically.
+
 ### Technology Stack
 
 

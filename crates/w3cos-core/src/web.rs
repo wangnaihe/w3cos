@@ -1,5 +1,5 @@
-//! Web platform builtins for the ESM compile pipeline: `atob` / `btoa`,
-//! `structuredClone`, `URL`, and `URLSearchParams`.
+//! Web platform builtins for the ESM compile pipeline: `Intl`, `Date`,
+//! `atob` / `btoa`, `structuredClone`, `URL`, and `URLSearchParams`.
 //!
 //! Everything is hand-rolled on top of `base64` (percent-encoding and the
 //! URL grammar are small enough to keep local — no `url` crate dependency).
@@ -67,24 +67,30 @@ pub fn text_decoder_class() -> Value {
 /// through standard Date methods.
 pub fn date_class() -> Value {
     Value::callable(
-        HashMap::from([(
-            "now".into(),
-            Value::function(|_, _| {
-                Value::Number(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|duration| duration.as_secs_f64() * 1000.0)
-                        .unwrap_or(f64::NAN),
-                )
-            }),
-        )]),
+        HashMap::from([
+            (
+                "now".into(),
+                Value::function(|_, _| Value::Number(now_milliseconds())),
+            ),
+            (
+                "parse".into(),
+                Value::function(|_, args| {
+                    Value::Number(
+                        args.first()
+                            .map(|value| parse_iso_instant(&value.to_js_string()))
+                            .unwrap_or(f64::NAN),
+                    )
+                }),
+            ),
+        ]),
         |_this, args| {
-            let milliseconds = args.first().map(Value::to_number).unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_secs_f64() * 1000.0)
-                    .unwrap_or(f64::NAN)
-            });
+            let milliseconds = args
+                .first()
+                .map(|value| match value {
+                    Value::String(text) => parse_iso_instant(text),
+                    _ => value.to_number(),
+                })
+                .unwrap_or_else(now_milliseconds);
             date_value(milliseconds)
         },
     )
@@ -105,6 +111,449 @@ pub fn date_value(milliseconds: f64) -> Value {
             Value::function(move |_, _| Value::Number(milliseconds)),
         ),
     ]))
+}
+
+fn now_milliseconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64() * 1000.0)
+        .unwrap_or(f64::NAN)
+}
+
+/// Compact `Intl` implementation for the native ESM runtime.
+///
+/// The first compatibility tier intentionally covers the locale-sensitive
+/// formatting used by native applications. Unsupported timezones fail
+/// deterministically instead of silently formatting in the host timezone.
+pub fn intl_value() -> Value {
+    Value::object(HashMap::from([
+        ("NumberFormat".into(), number_format_class()),
+        ("DateTimeFormat".into(), date_time_format_class()),
+    ]))
+}
+
+fn number_format_class() -> Value {
+    Value::callable(HashMap::new(), |_this, args| {
+        let locale = canonical_locale(args.first());
+        let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let style = string_option(&options, "style").unwrap_or_else(|| "decimal".into());
+        let currency = string_option(&options, "currency");
+        let currency_display =
+            string_option(&options, "currencyDisplay").unwrap_or_else(|| "symbol".into());
+        let default_fraction_digits = if style == "currency" { 2 } else { 3 };
+        let minimum_fraction_digits = usize_option(&options, "minimumFractionDigits")
+            .unwrap_or(if style == "currency" { 2 } else { 0 });
+        let maximum_fraction_digits = usize_option(&options, "maximumFractionDigits")
+            .unwrap_or(default_fraction_digits)
+            .max(minimum_fraction_digits)
+            .min(20);
+        let use_grouping = bool_option(&options, "useGrouping").unwrap_or(true);
+        let locale_for_format = locale.clone();
+        let style_for_format = style.clone();
+        let currency_for_format = currency.clone();
+        let currency_display_for_format = currency_display.clone();
+        let format = Value::function(move |_, args| {
+            let number = args.first().map(Value::to_number).unwrap_or(f64::NAN);
+            Value::string(&format_number(
+                number,
+                &locale_for_format,
+                &style_for_format,
+                currency_for_format.as_deref(),
+                &currency_display_for_format,
+                minimum_fraction_digits,
+                maximum_fraction_digits,
+                use_grouping,
+            ))
+        });
+        let locale_for_options = locale.clone();
+        let currency_for_options = currency.clone();
+        Value::object(HashMap::from([
+            ("format".into(), format),
+            (
+                "resolvedOptions".into(),
+                Value::function(move |_, _| {
+                    let mut resolved = HashMap::from([
+                        ("locale".into(), Value::string(&locale_for_options)),
+                        ("style".into(), Value::string(&style)),
+                        (
+                            "minimumFractionDigits".into(),
+                            Value::Number(minimum_fraction_digits as f64),
+                        ),
+                        (
+                            "maximumFractionDigits".into(),
+                            Value::Number(maximum_fraction_digits as f64),
+                        ),
+                        ("useGrouping".into(), Value::Bool(use_grouping)),
+                    ]);
+                    if let Some(currency) = &currency_for_options {
+                        resolved.insert("currency".into(), Value::string(currency));
+                    }
+                    Value::object(resolved)
+                }),
+            ),
+        ]))
+    })
+}
+
+fn date_time_format_class() -> Value {
+    Value::callable(HashMap::new(), |_this, args| {
+        let locale = canonical_locale(args.first());
+        let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let time_zone = string_option(&options, "timeZone").unwrap_or_else(|| "UTC".into());
+        let offset_minutes = time_zone_offset_minutes(&time_zone).unwrap_or_else(|| {
+            crate::throw_value(js_error(&format!(
+                "RangeError: unsupported time zone: {time_zone}"
+            )))
+        });
+        let date_style = string_option(&options, "dateStyle");
+        let time_style = string_option(&options, "timeStyle");
+        let locale_for_format = locale.clone();
+        let time_zone_for_options = time_zone.clone();
+        let date_style_for_format = date_style.clone();
+        let time_style_for_format = time_style.clone();
+        let format = Value::function(move |_, args| {
+            let milliseconds = args
+                .first()
+                .map(date_milliseconds)
+                .unwrap_or_else(now_milliseconds);
+            if !milliseconds.is_finite() {
+                crate::throw_value(js_error("RangeError: invalid time value"));
+            }
+            Value::string(&format_date_time(
+                milliseconds,
+                offset_minutes,
+                &locale_for_format,
+                date_style_for_format.as_deref(),
+                time_style_for_format.as_deref(),
+            ))
+        });
+        let locale_for_options = locale.clone();
+        Value::object(HashMap::from([
+            ("format".into(), format),
+            (
+                "resolvedOptions".into(),
+                Value::function(move |_, _| {
+                    Value::object(HashMap::from([
+                        ("locale".into(), Value::string(&locale_for_options)),
+                        ("timeZone".into(), Value::string(&time_zone_for_options)),
+                    ]))
+                }),
+            ),
+        ]))
+    })
+}
+
+fn canonical_locale(value: Option<&Value>) -> String {
+    let locale = value
+        .filter(|value| !value.is_nullish())
+        .map(Value::to_js_string)
+        .unwrap_or_else(|| "en-US".into());
+    if locale.to_ascii_lowercase().starts_with("zh") {
+        "zh-CN".into()
+    } else {
+        "en-US".into()
+    }
+}
+
+fn string_option(options: &Value, key: &str) -> Option<String> {
+    let value = options.get_property(key);
+    (!matches!(value, Value::Undefined | Value::Null)).then(|| value.to_js_string())
+}
+
+fn usize_option(options: &Value, key: &str) -> Option<usize> {
+    let value = options.get_property(key);
+    (!matches!(value, Value::Undefined | Value::Null)).then(|| value.to_number().max(0.0) as usize)
+}
+
+fn bool_option(options: &Value, key: &str) -> Option<bool> {
+    let value = options.get_property(key);
+    (!matches!(value, Value::Undefined | Value::Null)).then(|| value.to_bool())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_number(
+    number: f64,
+    locale: &str,
+    style: &str,
+    currency: Option<&str>,
+    currency_display: &str,
+    minimum_fraction_digits: usize,
+    maximum_fraction_digits: usize,
+    use_grouping: bool,
+) -> String {
+    if number.is_nan() {
+        return "NaN".into();
+    }
+    if number.is_infinite() {
+        return if number.is_sign_negative() {
+            "-∞".into()
+        } else {
+            "∞".into()
+        };
+    }
+    let negative = number.is_sign_negative();
+    let mut decimal = format!("{:.*}", maximum_fraction_digits, number.abs());
+    if let Some(dot) = decimal.find('.') {
+        while decimal.len() > dot + 1 + minimum_fraction_digits && decimal.ends_with('0') {
+            decimal.pop();
+        }
+        if decimal.ends_with('.') {
+            decimal.pop();
+        }
+    }
+    let (integer, fraction) = decimal
+        .split_once('.')
+        .map(|(integer, fraction)| (integer, Some(fraction)))
+        .unwrap_or((&decimal, None));
+    let integer = if use_grouping {
+        group_decimal(integer)
+    } else {
+        integer.to_string()
+    };
+    let formatted = if let Some(fraction) = fraction {
+        format!("{integer}.{fraction}")
+    } else {
+        integer
+    };
+    let formatted = if style == "currency" {
+        let currency = currency.unwrap_or("XXX").to_ascii_uppercase();
+        let display = match currency_display {
+            "code" => currency.clone(),
+            "name" => currency_name(&currency, locale).into(),
+            _ => currency_symbol(&currency).unwrap_or(&currency).into(),
+        };
+        if currency_display == "code" || currency_display == "name" {
+            format!("{display} {formatted}")
+        } else {
+            format!("{display}{formatted}")
+        }
+    } else {
+        formatted
+    };
+    if negative {
+        format!("-{formatted}")
+    } else {
+        formatted
+    }
+}
+
+fn group_decimal(integer: &str) -> String {
+    let mut grouped = String::with_capacity(integer.len() + integer.len() / 3);
+    for (index, character) in integer.chars().enumerate() {
+        if index > 0 && (integer.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    grouped
+}
+
+fn currency_symbol(currency: &str) -> Option<&'static str> {
+    match currency {
+        "CNY" | "JPY" => Some("¥"),
+        "USD" => Some("$"),
+        "EUR" => Some("€"),
+        "GBP" => Some("£"),
+        _ => None,
+    }
+}
+
+fn currency_name(currency: &str, locale: &str) -> &'static str {
+    match (currency, locale.starts_with("zh")) {
+        ("CNY", true) => "人民币",
+        ("USD", true) => "美元",
+        ("EUR", true) => "欧元",
+        ("CNY", false) => "Chinese yuan",
+        ("USD", false) => "US dollars",
+        ("EUR", false) => "euros",
+        _ => "currency",
+    }
+}
+
+fn date_milliseconds(value: &Value) -> f64 {
+    match value {
+        Value::String(text) => parse_iso_instant(text),
+        Value::Object(_) => value.get_property("__w3cos_date_milliseconds").to_number(),
+        _ => value.to_number(),
+    }
+}
+
+fn time_zone_offset_minutes(time_zone: &str) -> Option<i64> {
+    match time_zone {
+        "UTC" | "Etc/UTC" | "GMT" => Some(0),
+        "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Singapore" => Some(8 * 60),
+        "Asia/Tokyo" => Some(9 * 60),
+        _ => parse_fixed_offset(time_zone),
+    }
+}
+
+fn parse_fixed_offset(value: &str) -> Option<i64> {
+    let value = value
+        .strip_prefix("UTC")
+        .or_else(|| value.strip_prefix("GMT"))?;
+    if value.is_empty() {
+        return Some(0);
+    }
+    let sign = match value.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let parts: Vec<&str> = value[1..].split(':').collect();
+    let hours: i64 = parts.first()?.parse().ok()?;
+    let minutes: i64 = match parts.get(1) {
+        Some(part) => part.parse().ok()?,
+        None => 0,
+    };
+    (hours <= 23 && minutes <= 59).then_some(sign * (hours * 60 + minutes))
+}
+
+fn format_date_time(
+    milliseconds: f64,
+    offset_minutes: i64,
+    locale: &str,
+    date_style: Option<&str>,
+    time_style: Option<&str>,
+) -> String {
+    let local_seconds = (milliseconds / 1000.0).floor() as i64 + offset_minutes * 60;
+    let days = local_seconds.div_euclid(86_400);
+    let seconds = local_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds / 3_600;
+    let minute = seconds % 3_600 / 60;
+    let second = seconds % 60;
+    let include_date = date_style.is_some() || time_style.is_none();
+    let include_time = time_style.is_some();
+    let long_time = matches!(time_style, Some("medium" | "long" | "full"));
+    let date = if locale.starts_with("zh") {
+        format!("{year}年{month}月{day}日")
+    } else {
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        format!("{} {day}, {year}", MONTHS[(month - 1) as usize])
+    };
+    let time = if locale.starts_with("zh") {
+        if long_time {
+            format!("{hour:02}:{minute:02}:{second:02}")
+        } else {
+            format!("{hour:02}:{minute:02}")
+        }
+    } else {
+        let period = if hour < 12 { "AM" } else { "PM" };
+        let display_hour = match hour % 12 {
+            0 => 12,
+            hour => hour,
+        };
+        if long_time {
+            format!("{display_hour}:{minute:02}:{second:02} {period}")
+        } else {
+            format!("{display_hour}:{minute:02} {period}")
+        }
+    };
+    match (include_date, include_time) {
+        (true, true) if locale.starts_with("zh") => format!("{date} {time}"),
+        (true, true) => format!("{date}, {time}"),
+        (true, false) => date,
+        (false, true) => time,
+        (false, false) => date,
+    }
+}
+
+fn parse_iso_instant(value: &str) -> f64 {
+    let value = value.trim();
+    let Some((date, time_and_zone)) = value.split_once('T').or_else(|| value.split_once(' '))
+    else {
+        return f64::NAN;
+    };
+    let mut date_parts = date.split('-');
+    let (Some(year), Some(month), Some(day)) = (
+        date_parts.next().and_then(|part| part.parse::<i64>().ok()),
+        date_parts.next().and_then(|part| part.parse::<u32>().ok()),
+        date_parts.next().and_then(|part| part.parse::<u32>().ok()),
+    ) else {
+        return f64::NAN;
+    };
+    let (time, offset_minutes) = if let Some(time) = time_and_zone.strip_suffix('Z') {
+        (time, 0)
+    } else if let Some(index) = time_and_zone[1..].rfind(['+', '-']).map(|index| index + 1) {
+        let sign = if time_and_zone.as_bytes()[index] == b'+' {
+            1
+        } else {
+            -1
+        };
+        let offset = &time_and_zone[index + 1..];
+        let mut offset_parts = offset.split(':');
+        let Some(hours) = offset_parts
+            .next()
+            .and_then(|part| part.parse::<i64>().ok())
+        else {
+            return f64::NAN;
+        };
+        let minutes = offset_parts
+            .next()
+            .and_then(|part| part.parse::<i64>().ok())
+            .unwrap_or(0);
+        (&time_and_zone[..index], sign * (hours * 60 + minutes))
+    } else {
+        (time_and_zone, 0)
+    };
+    let mut time_parts = time.split(':');
+    let (Some(hour), Some(minute), Some(second_part)) = (
+        time_parts.next().and_then(|part| part.parse::<i64>().ok()),
+        time_parts.next().and_then(|part| part.parse::<i64>().ok()),
+        time_parts.next(),
+    ) else {
+        return f64::NAN;
+    };
+    let second = second_part.parse::<f64>().unwrap_or(f64::NAN);
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0.0..60.0).contains(&second)
+    {
+        return f64::NAN;
+    }
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60
+        - offset_minutes * 60;
+    (seconds as f64 + second) * 1000.0
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let adjusted_month = month as i64 + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month as u32, day as u32)
 }
 
 /// `atob(data)` — base64 → binary string (one Latin-1 char per byte).
@@ -1295,6 +1744,71 @@ mod tests {
         assert_eq!(
             decoder.call_method("decode", vec![units]).to_js_string(),
             "<div>✓</div>"
+        );
+    }
+
+    #[test]
+    fn intl_number_format_supports_grouping_currency_and_fraction_options() {
+        let intl = intl_value();
+        let number_format = intl.get_property("NumberFormat");
+        let currency_options = Value::object(HashMap::from([
+            ("style".into(), Value::string("currency")),
+            ("currency".into(), Value::string("CNY")),
+            ("currencyDisplay".into(), Value::string("narrowSymbol")),
+        ]));
+        let currency = crate::class::construct(
+            &number_format,
+            vec![Value::string("zh-CN"), currency_options],
+        );
+        assert_eq!(
+            currency
+                .call_method("format", vec![Value::Number(1_234_567.8)])
+                .to_js_string(),
+            "¥1,234,567.80"
+        );
+
+        let decimal_options = Value::object(HashMap::from([(
+            "maximumFractionDigits".into(),
+            Value::Number(2.0),
+        )]));
+        let decimal = crate::class::construct(
+            &number_format,
+            vec![Value::string("en-US"), decimal_options],
+        );
+        assert_eq!(
+            decimal
+                .call_method("format", vec![Value::Number(12_345.678)])
+                .to_js_string(),
+            "12,345.68"
+        );
+        assert_eq!(
+            currency
+                .call_method("format", vec![Value::Number(-12.5)])
+                .to_js_string(),
+            "-¥12.50"
+        );
+    }
+
+    #[test]
+    fn intl_date_time_format_handles_iso_date_and_shanghai_timezone() {
+        let date =
+            crate::class::construct(&date_class(), vec![Value::string("2026-07-23T08:30:15Z")]);
+        assert_eq!(
+            date.call_method("getTime", vec![]),
+            Value::Number(1_784_795_415_000.0)
+        );
+
+        let options = Value::object(HashMap::from([
+            ("timeZone".into(), Value::string("Asia/Shanghai")),
+            ("dateStyle".into(), Value::string("medium")),
+            ("timeStyle".into(), Value::string("short")),
+        ]));
+        let date_time_format = intl_value().get_property("DateTimeFormat");
+        let formatter =
+            crate::class::construct(&date_time_format, vec![Value::string("zh-CN"), options]);
+        assert_eq!(
+            formatter.call_method("format", vec![date]).to_js_string(),
+            "2026年7月23日 16:30"
         );
     }
 }

@@ -339,19 +339,17 @@ fn resize_observer_detects_size_change() {
 
 #[test]
 fn dom_to_component_tree_smoke() {
-    use w3cos_dom::document::Document;
     use w3cos_runtime::dom;
     use w3cos_std::component::ComponentKind;
 
-    let mut doc = Document::new();
-    let el = doc.create_element("div");
-    el.style_mut(&mut doc).set_property("display", "flex");
-    doc.body().append_child(&mut doc, el);
-
     dom::reset_document();
+    let el = dom::create_element("div");
+    dom::set_style_property(el, "display", "flex");
+    dom::append_child(dom::body_id(), el);
     let component = dom::to_component_tree();
     assert!(matches!(
         component.kind,
-        ComponentKind::Column | ComponentKind::Root
+        ComponentKind::Column | ComponentKind::Row | ComponentKind::Root
     ));
+    assert_eq!(component.children.len(), 1);
 }

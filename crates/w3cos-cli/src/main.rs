@@ -88,6 +88,20 @@ enum Commands {
         #[command(subcommand)]
         command: MobileCommands,
     },
+    /// Generate reviewable Rust Web API facade skeletons from a .d.ts file.
+    WebApiSkeleton {
+        /// TypeScript declaration file, such as TypeScript's lib.dom.d.ts.
+        input: PathBuf,
+        /// Interface to generate. Repeat this option to generate several APIs.
+        #[arg(short = 'i', long = "interface", required = true)]
+        interfaces: Vec<String>,
+        /// Write generated Rust to this file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Generate only members declared directly by each selected interface.
+        #[arg(long)]
+        own_only: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -246,6 +260,32 @@ fn main() -> Result<()> {
                 devtools_port,
             )?,
         },
+        Commands::WebApiSkeleton {
+            input,
+            interfaces,
+            output,
+            own_only,
+        } => {
+            let source = fs::read_to_string(&input)
+                .with_context(|| format!("Could not read {}", input.display()))?;
+            let generated =
+                w3cos_compiler::web_api_skeleton::generate(&source, &input, &interfaces, own_only)?;
+            if let Some(output) = output {
+                if let Some(parent) = output
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("Could not create output directory {}", parent.display())
+                    })?;
+                }
+                fs::write(&output, generated)
+                    .with_context(|| format!("Could not write {}", output.display()))?;
+                println!("✅ Generated: {}", output.display());
+            } else {
+                print!("{generated}");
+            }
+        }
     }
 
     Ok(())

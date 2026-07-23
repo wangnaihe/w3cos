@@ -278,6 +278,7 @@ pub fn summary_json() -> serde_json::Value {
         "observer": stats(&observer),
         "paint_paths": paint_paths,
         "viewport": viewport_label(),
+        "evidence": crate::uitest::scenario_evidence_json(),
     })
 }
 

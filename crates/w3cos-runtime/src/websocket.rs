@@ -17,8 +17,10 @@
 //! from their frame loop and treat each [`WebSocketEvent`] as if dispatched
 //! through `addEventListener`.
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::net::TcpStream;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -27,6 +29,7 @@ use std::time::Duration;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::Message;
 use tungstenite::stream::MaybeTlsStream;
+use w3cos_core::Value;
 
 /// `WebSocket.readyState` — matches the W3C numeric values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +141,9 @@ impl WebSocket {
 
     /// `WebSocket.send(string)` — queue a text frame for transmission.
     pub fn send_text(&self, payload: impl Into<String>) -> Result<(), String> {
+        if self.ready_state() != ReadyState::Open {
+            return Err("WebSocket is not open".to_string());
+        }
         let payload = payload.into();
         let len = payload.len();
         self.send_command(
@@ -148,6 +154,9 @@ impl WebSocket {
 
     /// `WebSocket.send(buffer)` — queue a binary frame.
     pub fn send_binary(&self, payload: Vec<u8>) -> Result<(), String> {
+        if self.ready_state() != ReadyState::Open {
+            return Err("WebSocket is not open".to_string());
+        }
         let len = payload.len();
         self.send_command(
             OutboundCommand::Send(Message::Binary(payload.into())),
@@ -157,6 +166,9 @@ impl WebSocket {
 
     /// `WebSocket.close([code[, reason]])` — initiate a clean close.
     pub fn close(&self, code: u16, reason: impl Into<String>) -> Result<(), String> {
+        if matches!(self.ready_state(), ReadyState::Closing | ReadyState::Closed) {
+            return Ok(());
+        }
         // Mark as Closing so callers see the transition before the worker exits.
         self.inner
             .state
@@ -196,8 +208,13 @@ impl WebSocket {
         self.inner
             .buffered
             .fetch_add(queued_bytes, Ordering::SeqCst);
-        tx.send(cmd)
-            .map_err(|e| format!("WebSocket send failed: {e}"))
+        if let Err(error) = tx.send(cmd) {
+            self.inner
+                .buffered
+                .fetch_sub(queued_bytes, Ordering::SeqCst);
+            return Err(format!("WebSocket send failed: {error}"));
+        }
+        Ok(())
     }
 }
 
@@ -207,6 +224,291 @@ impl Clone for WebSocket {
             inner: Arc::clone(&self.inner),
         }
     }
+}
+
+#[derive(Clone)]
+struct JsWebSocket {
+    socket: WebSocket,
+    value: Value,
+    listeners: Rc<RefCell<HashMap<String, Vec<Value>>>>,
+}
+
+thread_local! {
+    static JS_WEBSOCKETS: RefCell<Vec<JsWebSocket>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Standard JavaScript `WebSocket` constructor used by the ESM runtime.
+///
+/// The native worker owns transport I/O while [`poll_js_events`] delivers
+/// browser-shaped events on the JavaScript/application thread.
+pub fn websocket_class() -> Value {
+    let constructor = Value::function(|_, args| {
+        let url = args
+            .first()
+            .cloned()
+            .unwrap_or(Value::Undefined)
+            .to_js_string();
+        js_websocket_value(WebSocket::connect(url))
+    });
+    for (name, state) in [
+        ("CONNECTING", ReadyState::Connecting),
+        ("OPEN", ReadyState::Open),
+        ("CLOSING", ReadyState::Closing),
+        ("CLOSED", ReadyState::Closed),
+    ] {
+        constructor.set_property(name, Value::Number(state.as_u8() as f64));
+    }
+    constructor
+}
+
+fn js_websocket_value(socket: WebSocket) -> Value {
+    let listeners: Rc<RefCell<HashMap<String, Vec<Value>>>> = Rc::new(RefCell::new(HashMap::new()));
+    let mut props = HashMap::new();
+
+    for name in ["open", "message", "error", "close"] {
+        props.insert(format!("on{name}"), Value::Null);
+    }
+    props.insert("binaryType".to_string(), Value::from("blob"));
+    props.insert("extensions".to_string(), Value::from(""));
+    props.insert("protocol".to_string(), Value::from(""));
+
+    for (name, state) in [
+        ("CONNECTING", ReadyState::Connecting),
+        ("OPEN", ReadyState::Open),
+        ("CLOSING", ReadyState::Closing),
+        ("CLOSED", ReadyState::Closed),
+    ] {
+        props.insert(name.to_string(), Value::Number(state.as_u8() as f64));
+    }
+
+    let socket_for_url = socket.clone();
+    props.insert(
+        "__w3cos_getter_url".to_string(),
+        Value::function(move |_, _| Value::from(socket_for_url.url())),
+    );
+    let socket_for_state = socket.clone();
+    props.insert(
+        "__w3cos_getter_readyState".to_string(),
+        Value::function(move |_, _| Value::Number(socket_for_state.ready_state().as_u8() as f64)),
+    );
+    let socket_for_buffered = socket.clone();
+    props.insert(
+        "__w3cos_getter_bufferedAmount".to_string(),
+        Value::function(move |_, _| Value::Number(socket_for_buffered.buffered_amount() as f64)),
+    );
+
+    let socket_for_send = socket.clone();
+    props.insert(
+        "send".to_string(),
+        Value::function(move |this, args| {
+            let payload = args.first().cloned().unwrap_or(Value::Undefined);
+            let result = if let Value::Array(items) = payload {
+                socket_for_send.send_binary(
+                    items
+                        .borrow()
+                        .iter()
+                        .map(|item| item.to_u32() as u8)
+                        .collect(),
+                )
+            } else {
+                socket_for_send.send_text(payload.to_js_string())
+            };
+            if let Err(message) = result {
+                dispatch_js_event(&this, "error", Some(Value::from(message)), None);
+            }
+            Value::Undefined
+        }),
+    );
+    let socket_for_close = socket.clone();
+    props.insert(
+        "close".to_string(),
+        Value::function(move |_, args| {
+            let code = args
+                .first()
+                .filter(|value| !value.is_undefined())
+                .map(Value::to_u32)
+                .unwrap_or(1000) as u16;
+            let reason = args
+                .get(1)
+                .filter(|value| !value.is_undefined())
+                .map(Value::to_js_string)
+                .unwrap_or_default();
+            let _ = socket_for_close.close(code, reason);
+            Value::Undefined
+        }),
+    );
+
+    let listeners_for_add = Rc::clone(&listeners);
+    props.insert(
+        "addEventListener".to_string(),
+        Value::function(move |_, args| {
+            let event_type = args
+                .first()
+                .cloned()
+                .unwrap_or(Value::Undefined)
+                .to_js_string();
+            let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
+            if handler.is_function() {
+                listeners_for_add
+                    .borrow_mut()
+                    .entry(event_type)
+                    .or_default()
+                    .push(handler);
+            }
+            Value::Undefined
+        }),
+    );
+    let listeners_for_remove = Rc::clone(&listeners);
+    props.insert(
+        "removeEventListener".to_string(),
+        Value::function(move |_, args| {
+            let event_type = args
+                .first()
+                .cloned()
+                .unwrap_or(Value::Undefined)
+                .to_js_string();
+            let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
+            if let Some(handlers) = listeners_for_remove.borrow_mut().get_mut(&event_type) {
+                handlers.retain(|candidate| !candidate.same_value_zero(&handler));
+            }
+            Value::Undefined
+        }),
+    );
+    let listeners_for_dispatch = Rc::clone(&listeners);
+    props.insert(
+        "dispatchEvent".to_string(),
+        Value::function(move |this, args| {
+            let event = args.first().cloned().unwrap_or(Value::Undefined);
+            let event_type = event.get_property("type").to_js_string();
+            dispatch_to_handlers(&this, &listeners_for_dispatch, &event_type, event);
+            Value::Bool(true)
+        }),
+    );
+
+    let value = Value::object(props);
+    JS_WEBSOCKETS.with(|bindings| {
+        bindings.borrow_mut().push(JsWebSocket {
+            socket,
+            value: value.clone(),
+            listeners,
+        })
+    });
+    value
+}
+
+fn dispatch_to_handlers(
+    target: &Value,
+    listeners: &Rc<RefCell<HashMap<String, Vec<Value>>>>,
+    event_type: &str,
+    event: Value,
+) -> usize {
+    event.set_property("target", target.clone());
+    event.set_property("currentTarget", target.clone());
+    let mut handlers = listeners
+        .borrow()
+        .get(event_type)
+        .cloned()
+        .unwrap_or_default();
+    let property_handler = target.get_property(&format!("on{event_type}"));
+    if property_handler.is_function() {
+        handlers.insert(0, property_handler);
+    }
+    let count = handlers.len();
+    for handler in handlers {
+        handler.call(target.clone(), vec![event.clone()]);
+    }
+    count
+}
+
+fn dispatch_js_event(
+    target: &Value,
+    event_type: &str,
+    data: Option<Value>,
+    close: Option<(u16, String, bool)>,
+) -> usize {
+    let mut props = HashMap::from([
+        ("type".to_string(), Value::from(event_type)),
+        ("target".to_string(), target.clone()),
+        ("currentTarget".to_string(), target.clone()),
+    ]);
+    if let Some(data) = data {
+        if event_type == "error" {
+            props.insert("message".to_string(), data);
+        } else {
+            props.insert("data".to_string(), data);
+        }
+    }
+    if let Some((code, reason, was_clean)) = close {
+        props.insert("code".to_string(), Value::Number(code as f64));
+        props.insert("reason".to_string(), Value::from(reason));
+        props.insert("wasClean".to_string(), Value::Bool(was_clean));
+    }
+    let event = Value::object(props);
+    let listeners = JS_WEBSOCKETS.with(|bindings| {
+        bindings
+            .borrow()
+            .iter()
+            .find(|binding| binding.value.same_value_zero(target))
+            .map(|binding| Rc::clone(&binding.listeners))
+    });
+    listeners
+        .map(|listeners| dispatch_to_handlers(target, &listeners, event_type, event))
+        .unwrap_or(0)
+}
+
+/// Deliver queued native WebSocket events to JavaScript handlers.
+pub fn poll_js_events() -> usize {
+    let bindings = JS_WEBSOCKETS.with(|bindings| bindings.borrow().clone());
+    let mut delivered = 0;
+    for binding in &bindings {
+        for event in binding.socket.poll_events() {
+            delivered += match event {
+                WebSocketEvent::Open => dispatch_js_event(&binding.value, "open", None, None),
+                WebSocketEvent::Text(text) => {
+                    dispatch_js_event(&binding.value, "message", Some(Value::from(text)), None)
+                }
+                WebSocketEvent::Binary(bytes) => dispatch_js_event(
+                    &binding.value,
+                    "message",
+                    Some(Value::array(
+                        bytes
+                            .into_iter()
+                            .map(|byte| Value::Number(byte as f64))
+                            .collect(),
+                    )),
+                    None,
+                ),
+                WebSocketEvent::Error(message) => {
+                    dispatch_js_event(&binding.value, "error", Some(Value::from(message)), None)
+                }
+                WebSocketEvent::Close {
+                    code,
+                    reason,
+                    was_clean,
+                } => dispatch_js_event(
+                    &binding.value,
+                    "close",
+                    None,
+                    Some((code, reason, was_clean)),
+                ),
+            };
+        }
+    }
+    JS_WEBSOCKETS.with(|items| {
+        items
+            .borrow_mut()
+            .retain(|binding| binding.socket.ready_state() != ReadyState::Closed)
+    });
+    delivered
+}
+
+/// Whether an active JavaScript WebSocket needs periodic event-loop polling.
+pub fn has_pending_js_sockets() -> bool {
+    JS_WEBSOCKETS.with(|bindings| !bindings.borrow().is_empty())
+}
+
+pub(crate) fn reset_js_websockets() {
+    JS_WEBSOCKETS.with(|bindings| bindings.borrow_mut().clear());
 }
 
 fn worker_loop(inner: Arc<WebSocketInner>, cmd_rx: mpsc::Receiver<OutboundCommand>) {

@@ -1,19 +1,31 @@
 //! iOS UI-test hook — HTTP snapshot, perf metrics, bench driver (`:19090`).
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Mutex, Once};
 use std::thread;
+use winit::event_loop::EventLoopProxy;
 
+const MAX_PENDING_COMMANDS: usize = 256;
 static SERVER_ONCE: Once = Once::new();
 static SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
 static HIT_TARGETS: Mutex<Vec<UiHitTarget>> = Mutex::new(Vec::new());
 static INPUT_TARGETS: Mutex<Vec<UiInputTarget>> = Mutex::new(Vec::new());
-static PENDING_ACTION: Mutex<Option<String>> = Mutex::new(None);
-static PENDING_SCROLL_DY: AtomicI64 = AtomicI64::new(i64::MAX);
+static EVENT_LOOP_PROXY: Mutex<Option<EventLoopProxy<()>>> = Mutex::new(None);
+static PENDING_COMMANDS: Mutex<VecDeque<PendingCommand>> = Mutex::new(VecDeque::new());
 static NEEDS_REPAINT: AtomicBool = AtomicBool::new(false);
 static BENCH_REPAINTS: AtomicI64 = AtomicI64::new(0);
+static CONSUMED_ACTIONS: AtomicI64 = AtomicI64::new(0);
+static APPLIED_ACTIONS: AtomicI64 = AtomicI64::new(0);
+static CONSUMED_SCROLLS: AtomicI64 = AtomicI64::new(0);
+static APPLIED_SCROLLS: AtomicI64 = AtomicI64::new(0);
+static CONSUMED_CLICKS: AtomicI64 = AtomicI64::new(0);
+static APPLIED_CLICKS: AtomicI64 = AtomicI64::new(0);
+static CONSUMED_INPUTS: AtomicI64 = AtomicI64::new(0);
+static APPLIED_INPUTS: AtomicI64 = AtomicI64::new(0);
+static CONSUMED_REPAINTS: AtomicI64 = AtomicI64::new(0);
 static FOCUSED_INDEX: AtomicI64 = AtomicI64::new(-1);
 static POINTER_X_MILLI: AtomicI64 = AtomicI64::new(-1);
 static POINTER_Y_MILLI: AtomicI64 = AtomicI64::new(-1);
@@ -39,9 +51,19 @@ static KINETIC_APPLIED_MILLI: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Clone, serde::Serialize)]
 pub struct UiHitTarget {
+    pub index: usize,
+    pub label: String,
     pub action: String,
     pub cx: f32,
     pub cy: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PendingCommand {
+    Action(String),
+    Scroll(f32),
+    Click(usize),
+    Input { index: usize, value: String },
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -283,63 +305,128 @@ fn route_path(route: i64) -> &'static str {
     }
 }
 
-fn queue_action(action: impl Into<String>) {
-    if let Ok(mut pending) = PENDING_ACTION.lock() {
-        *pending = Some(action.into());
+pub fn set_event_loop_proxy(proxy: EventLoopProxy<()>) {
+    if let Ok(mut slot) = EVENT_LOOP_PROXY.lock() {
+        *slot = Some(proxy);
+    }
+}
+
+fn wake_event_loop() {
+    if let Ok(slot) = EVENT_LOOP_PROXY.lock()
+        && let Some(proxy) = slot.as_ref()
+    {
+        let _ = proxy.send_event(());
+    }
+}
+
+fn queue_command(command: PendingCommand) {
+    if let Ok(mut pending) = PENDING_COMMANDS.lock() {
+        if pending.len() == MAX_PENDING_COMMANDS {
+            pending.pop_front();
+        }
+        pending.push_back(command);
     }
     NEEDS_REPAINT.store(true, Ordering::SeqCst);
+    wake_event_loop();
+}
+
+fn queue_action(action: impl Into<String>) {
+    queue_command(PendingCommand::Action(action.into()));
 }
 
 fn queue_scroll(dy: f32) {
-    PENDING_SCROLL_DY.store(dy as i64, Ordering::SeqCst);
-    NEEDS_REPAINT.store(true, Ordering::SeqCst);
+    queue_command(PendingCommand::Scroll(dy));
 }
 
-pub fn drain_pending_action() -> Option<String> {
-    if !hook_enabled() {
-        return None;
-    }
-    PENDING_ACTION.lock().ok()?.take()
+fn queue_click(index: usize) {
+    queue_command(PendingCommand::Click(index));
 }
 
-pub fn drain_pending_scroll_dy() -> Option<f32> {
+fn queue_input(index: usize, value: impl Into<String>) {
+    queue_command(PendingCommand::Input {
+        index,
+        value: value.into(),
+    });
+}
+
+pub(crate) fn drain_pending_commands(limit: usize) -> Vec<PendingCommand> {
     if !hook_enabled() {
-        return None;
+        return Vec::new();
     }
-    let v = PENDING_SCROLL_DY.swap(i64::MAX, Ordering::SeqCst);
-    if v == i64::MAX { None } else { Some(v as f32) }
+    let Ok(mut pending) = PENDING_COMMANDS.lock() else {
+        return Vec::new();
+    };
+    let count = pending.len().min(limit);
+    pending.drain(..count).collect()
+}
+
+pub(crate) fn record_command_result(command: &PendingCommand, applied: bool) {
+    let (consumed, successful) = match command {
+        PendingCommand::Action(_) => (&CONSUMED_ACTIONS, &APPLIED_ACTIONS),
+        PendingCommand::Scroll(_) => (&CONSUMED_SCROLLS, &APPLIED_SCROLLS),
+        PendingCommand::Click(_) => (&CONSUMED_CLICKS, &APPLIED_CLICKS),
+        PendingCommand::Input { .. } => (&CONSUMED_INPUTS, &APPLIED_INPUTS),
+    };
+    consumed.fetch_add(1, Ordering::SeqCst);
+    if applied {
+        successful.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 pub fn take_repaint_request() -> bool {
     NEEDS_REPAINT.swap(false, Ordering::SeqCst)
 }
 
-/// Force N synchronous paints on the UI thread (bench sampling), batched per frame.
-pub fn take_bench_repaints() -> u32 {
+/// Consume one requested benchmark repaint for one distinct event-loop turn.
+pub fn take_bench_repaint() -> bool {
     if !hook_enabled() {
-        return 0;
+        return false;
     }
-    let pending = BENCH_REPAINTS.load(Ordering::SeqCst);
-    if pending <= 0 {
-        return 0;
+    let consumed = BENCH_REPAINTS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+            (pending > 0).then_some(pending - 1)
+        })
+        .is_ok();
+    if consumed {
+        CONSUMED_REPAINTS.fetch_add(1, Ordering::SeqCst);
     }
-    let batch = pending.min(12);
-    let remaining = pending - batch;
-    BENCH_REPAINTS.store(remaining, Ordering::SeqCst);
-    if remaining > 0 {
-        NEEDS_REPAINT.store(true, Ordering::SeqCst);
-    }
-    batch as u32
+    consumed
 }
 
 pub fn queue_bench_repaints(n: u32) {
     BENCH_REPAINTS.store(n as i64, Ordering::SeqCst);
     NEEDS_REPAINT.store(true, Ordering::SeqCst);
+    wake_event_loop();
 }
 
-/// UITest HTTP runs off the UI thread; poll the event loop while the hook is active.
-pub fn wants_event_loop_poll() -> bool {
-    hook_enabled()
+pub fn reset_scenario_evidence() {
+    for counter in [
+        &CONSUMED_ACTIONS,
+        &APPLIED_ACTIONS,
+        &CONSUMED_SCROLLS,
+        &APPLIED_SCROLLS,
+        &CONSUMED_CLICKS,
+        &APPLIED_CLICKS,
+        &CONSUMED_INPUTS,
+        &APPLIED_INPUTS,
+        &CONSUMED_REPAINTS,
+    ] {
+        counter.store(0, Ordering::SeqCst);
+    }
+}
+
+pub fn scenario_evidence_json() -> serde_json::Value {
+    serde_json::json!({
+        "consumed_actions": CONSUMED_ACTIONS.load(Ordering::SeqCst),
+        "applied_actions": APPLIED_ACTIONS.load(Ordering::SeqCst),
+        "consumed_scrolls": CONSUMED_SCROLLS.load(Ordering::SeqCst),
+        "applied_scrolls": APPLIED_SCROLLS.load(Ordering::SeqCst),
+        "consumed_clicks": CONSUMED_CLICKS.load(Ordering::SeqCst),
+        "applied_clicks": APPLIED_CLICKS.load(Ordering::SeqCst),
+        "consumed_inputs": CONSUMED_INPUTS.load(Ordering::SeqCst),
+        "applied_inputs": APPLIED_INPUTS.load(Ordering::SeqCst),
+        "consumed_repaints": CONSUMED_REPAINTS.load(Ordering::SeqCst),
+    })
 }
 
 pub fn has_pending_input() -> bool {
@@ -352,13 +439,10 @@ pub fn has_pending_input() -> bool {
     if BENCH_REPAINTS.load(Ordering::SeqCst) > 0 {
         return true;
     }
-    if PENDING_SCROLL_DY.load(Ordering::SeqCst) != i64::MAX {
-        return true;
-    }
-    PENDING_ACTION
+    PENDING_COMMANDS
         .lock()
         .ok()
-        .map(|g| g.is_some())
+        .map(|g| !g.is_empty())
         .unwrap_or(false)
 }
 
@@ -426,7 +510,23 @@ fn handle_client(mut stream: TcpStream) {
         return;
     }
 
+    if let Some(index) = path
+        .strip_prefix("/click/")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        queue_click(index);
+        let body = format!(r#"{{"ok":true,"index":{index}}}"#);
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    }
+
     if let Some(name) = path.strip_prefix("/scenario/") {
+        reset_scenario_evidence();
         crate::perf::set_scenario(name);
         let body = format!(r#"{{"scenario":"{name}"}}"#);
         let resp = format!(
@@ -457,8 +557,23 @@ fn handle_client(mut stream: TcpStream) {
         ("GET", "/metrics") => ("200 OK", crate::perf::summary_json().to_string()),
         ("POST", p) if p.starts_with("/scenario/") => {
             let name = p.trim_start_matches("/scenario/");
+            reset_scenario_evidence();
             crate::perf::set_scenario(name);
             ("200 OK", format!(r#"{{"scenario":"{name}"}}"#))
+        }
+        ("POST", p) if p.starts_with("/input/") => {
+            let index = p.trim_start_matches("/input/").parse::<usize>();
+            let value = request_body(&req);
+            match index {
+                Ok(index) if !value.is_empty() => {
+                    queue_input(index, value);
+                    ("200 OK", format!(r#"{{"ok":true,"index":{index}}}"#))
+                }
+                _ => (
+                    "400 Bad Request",
+                    r#"{"error":"invalid input target or empty value"}"#.into(),
+                ),
+            }
         }
         ("POST", "/action") => {
             let action = request_body(&req);
@@ -506,4 +621,55 @@ pub fn maybe_start_server() {
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset_pending() {
+        crate::perf::force_enable();
+        PENDING_COMMANDS.lock().unwrap().clear();
+        BENCH_REPAINTS.store(0, Ordering::SeqCst);
+        NEEDS_REPAINT.store(false, Ordering::SeqCst);
+        reset_scenario_evidence();
+    }
+
+    #[test]
+    fn commands_preserve_cross_type_fifo_order() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_pending();
+
+        queue_action("increment:0");
+        queue_scroll(-120.0);
+        queue_click(17);
+        queue_input(23, "benchmark");
+
+        assert_eq!(
+            drain_pending_commands(8),
+            vec![
+                PendingCommand::Action("increment:0".into()),
+                PendingCommand::Scroll(-120.0),
+                PendingCommand::Click(17),
+                PendingCommand::Input {
+                    index: 23,
+                    value: "benchmark".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn benchmark_repaints_are_consumed_one_turn_at_a_time() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_pending();
+
+        queue_bench_repaints(2);
+        assert!(take_bench_repaint());
+        assert!(take_bench_repaint());
+        assert!(!take_bench_repaint());
+        assert_eq!(scenario_evidence_json()["consumed_repaints"], 2);
+    }
 }

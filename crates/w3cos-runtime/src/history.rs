@@ -13,7 +13,7 @@ impl HistoryStore {
     fn new() -> Self {
         Self {
             history: History::new(),
-            location: Location::new("/"),
+            location: Location::new("w3cos://app/"),
             popstate_handlers: Vec::new(),
             hashchange_handlers: Vec::new(),
         }

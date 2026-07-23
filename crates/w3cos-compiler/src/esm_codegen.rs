@@ -2760,6 +2760,20 @@ fn main() {
             root.join("src/app.ts"),
             r#"export function navInfo() { return navigator.userAgent + "|" + location.href; }
 export function docShape() { return typeof document + ":" + typeof window + ":" + typeof self; }
+export function formatMoney() {
+  return new Intl.NumberFormat("zh-CN", {
+    style: "currency",
+    currency: "CNY",
+    currencyDisplay: "narrowSymbol"
+  }).format(1234567.8);
+}
+export function formatDate() {
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    dateStyle: "medium",
+    timeStyle: "short"
+  }).format(new Date("2026-07-23T08:30:15Z"));
+}
 let firedLog = "";
 export function timerFire() {
   setTimeout(() => { firedLog += "T"; }, 0);
@@ -2788,7 +2802,49 @@ export function startIdb() {
   };
   return request.readyState;
 }
-export function getIdbLog() { return idbLog; }"#,
+export function getIdbLog() { return idbLog; }
+let socketLog = "";
+export function socketShape() {
+  return typeof WebSocket + ":" + WebSocket.CONNECTING + ":" + WebSocket.OPEN + ":" + WebSocket.CLOSING + ":" + WebSocket.CLOSED;
+}
+export function startSocket(url) {
+  const socket = new WebSocket(url);
+  socket.onopen = () => {
+    socketLog += "O";
+    socket.send("ping");
+  };
+  socket.addEventListener("message", (event) => {
+    socketLog += "M" + event.data;
+    socket.close(1000, "done");
+  });
+  socket.onclose = (event) => { socketLog += "C" + event.code; };
+  return socket.readyState;
+}
+export function getSocketLog() { return socketLog; }
+export function fetchApiShape() {
+  const headers = new Headers({ "X-One": "first" });
+  headers.append("x-one", "second");
+  const controller = new AbortController();
+  let aborted = "";
+  controller.signal.addEventListener("abort", () => { aborted = controller.signal.reason; });
+  controller.abort("stopped");
+  const synthetic = Response.json({ local: true }, { status: 202 });
+  return typeof Request + ":" + typeof Response + ":" + typeof Headers + ":" +
+    controller.signal.aborted + ":" + aborted + ":" + headers.get("X-ONE") + ":" +
+    synthetic.status + ":" + synthetic.headers.get("content-type") + ":" + synthetic.json().local;
+}
+export function runFetch(url) {
+  const headers = new Headers({ "X-Trace": "one" });
+  headers.append("x-trace", "two");
+  const request = new Request(url, {
+    method: "post",
+    headers,
+    body: JSON.stringify({ id: 7 })
+  });
+  const response = fetch(request);
+  return response.status + ":" + response.headers.get("X-Reply") + ":" +
+    response.json().accepted + ":" + request.method + ":" + request.headers.get("x-trace");
+}"#,
         )
         .unwrap();
 
@@ -2811,7 +2867,7 @@ export function getIdbLog() { return idbLog; }"#,
         std::fs::write(
             crate_dir.join("Cargo.toml"),
             format!(
-                "[package]\nname = \"jsdom_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?}, default-features = false }}\n\n[workspace]\n"
+                "[package]\nname = \"jsdom_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?}, default-features = false }}\ntungstenite = \"0.24\"\n\n[workspace]\n"
             ),
         )
         .unwrap();
@@ -2821,13 +2877,23 @@ export function getIdbLog() { return idbLog; }"#,
 fn main() {
     let r = m0::m0_navInfo(vec![]);
     assert!(
-        matches!(&r, w3cos_core::Value::String(s) if s == "W3COS/0.1 (w3cos; like Gecko)|w3cos://app"),
+        matches!(&r, w3cos_core::Value::String(s) if s == "W3COS/0.1 (w3cos; like Gecko)|w3cos://app/"),
         "navigator/location: {r:?}"
     );
     let r = m0::m0_docShape(vec![]);
     assert!(
         matches!(&r, w3cos_core::Value::String(s) if s == "object:object:object"),
         "document/window/self: {r:?}"
+    );
+    let r = m0::m0_formatMoney(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "¥1,234,567.80"),
+        "Intl.NumberFormat: {r:?}"
+    );
+    let r = m0::m0_formatDate(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "2026年7月23日 16:30"),
+        "Intl.DateTimeFormat: {r:?}"
     );
     let r = m0::m0_idbShape(vec![]);
     assert!(
@@ -2839,6 +2905,96 @@ fn main() {
         matches!(&r, w3cos_core::Value::String(s) if s == "object:function"),
         "IDBKeyRange global: {r:?}"
     );
+    let r = m0::m0_fetchApiShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:true:stopped:first, second:202:application/json:true"),
+        "Fetch companion constructors: {r:?}"
+    );
+    let http_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = http_listener.local_addr().unwrap().port();
+    let http_server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = http_listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request_bytes = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            request_bytes.extend_from_slice(&chunk[..read]);
+            let request_text = String::from_utf8_lossy(&request_bytes);
+            if let Some(header_end) = request_text.find("\r\n\r\n") {
+                let content_length = request_text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request_bytes.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&request_bytes).to_ascii_lowercase();
+        assert!(request.starts_with("post /items "), "HTTP method/path: {request}");
+        assert!(request.contains("x-trace: one, two"), "Headers object reached fetch: {request}");
+        assert!(request.contains("{\"id\":7}"), "Request body reached fetch: {request}");
+        let body = "{\"accepted\":true}";
+        let response = format!(
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-Reply: yes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    let r = m0::m0_runFetch(vec![w3cos_core::Value::from(format!(
+        "http://127.0.0.1:{http_port}/items"
+    ))]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "201:yes:true:POST:one, two"),
+        "Request/Headers/fetch/Response HTTP round trip: {r:?}"
+    );
+    http_server.join().unwrap();
+    let r = m0::m0_socketShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:0:1:2:3"),
+        "WebSocket global/constants: {r:?}"
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut socket = tungstenite::accept(stream).unwrap();
+        if let Ok(tungstenite::Message::Text(text)) = socket.read() {
+            socket.send(tungstenite::Message::Text(text)).unwrap();
+        }
+        if let Ok(tungstenite::Message::Close(frame)) = socket.read() {
+            let _ = socket.close(frame);
+        }
+    });
+    let r = m0::m0_startSocket(vec![w3cos_core::Value::from(format!("ws://127.0.0.1:{port}"))]);
+    assert!(
+        matches!(&r, w3cos_core::Value::Number(state) if *state == 0.0 || *state == 1.0),
+        "WebSocket starts connecting/open: {r:?}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        w3cos_runtime::jsdom::drain_microtasks();
+        let log = m0::m0_getSocketLog(vec![]).to_js_string();
+        if log.contains("C1000") {
+            assert_eq!(log, "OMpingC1000", "WebSocket event order/payload");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "WebSocket ESM fixture timed out: {log}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    server.join().unwrap();
     let idb_dir = std::env::temp_dir().join(format!("w3cos-generated-idb-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&idb_dir);
     std::fs::create_dir_all(&idb_dir).unwrap();

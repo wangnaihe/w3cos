@@ -4,12 +4,13 @@
 //! Vello and tiny-skia backends. It does not perform layout or invent native
 //! widget defaults: CSS-derived geometry and style remain the source of truth.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use skia_safe::canvas::SaveLayerRec;
 use skia_safe::{
-    AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, ImageFilter,
-    ImageInfo, MaskFilter, Paint, Rect, Surface, TileMode, Typeface, color_filters,
+    AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, FontStyle,
+    ImageFilter, ImageInfo, MaskFilter, Paint, Rect, Surface, TileMode, Typeface, color_filters,
     gradient_shader, image_filters, images, paint,
 };
 use w3cos_std::component::ComponentKind;
@@ -19,6 +20,16 @@ use crate::filter::{FilterChain, FilterOp, parse_css_filter};
 use crate::layout::LayoutRect;
 use crate::paint_artifact::PaintArtifact;
 use crate::text_layout;
+
+const FONT_FALLBACK_CACHE_CAPACITY: usize = 2048;
+
+thread_local! {
+    /// System font matching is comparatively expensive on Apple platforms.
+    /// Cache Skia typeface references for characters missing from the primary
+    /// face; this does not copy the underlying system font into application memory.
+    static FONT_FALLBACK_CACHE: RefCell<HashMap<(char, u16), Option<Typeface>>> =
+        RefCell::new(HashMap::new());
+}
 
 pub(crate) struct ReplayFrame<'a> {
     pub nodes: &'a [(usize, LayoutRect, &'a ComponentKind, &'a Style)],
@@ -331,7 +342,7 @@ fn render_node(
     typeface: &Typeface,
     metrics_font: &fontdue::Font,
     text_input_value: Option<&str>,
-    _focused: bool,
+    focused: bool,
 ) {
     let transform = style.transform;
     let rect = LayoutRect {
@@ -436,7 +447,9 @@ fn render_node(
                 content.y,
                 content.height,
             );
-            draw_text_line(
+            let save = canvas.save();
+            canvas.clip_rect(to_rect(content), None, Some(false));
+            let text_width = draw_text_line(
                 canvas,
                 content.x,
                 y,
@@ -447,6 +460,20 @@ fn render_node(
                 typeface,
                 style.font_weight,
             );
+            if focused {
+                let cursor_x = content.x + if value.is_empty() { 0.0 } else { text_width };
+                let cursor_width = (style.font_size * 0.1).max(2.0);
+                let cursor_height = style.font_size.max(1.0).min(content.height);
+                let cursor_y = content.y + (content.height - cursor_height) * 0.5;
+                let cursor = LayoutRect {
+                    x: cursor_x.min(content.x + content.width - cursor_width),
+                    y: cursor_y,
+                    width: cursor_width,
+                    height: cursor_height,
+                };
+                canvas.draw_rect(to_rect(cursor), &color_paint(style.color, style.opacity));
+            }
+            canvas.restore_to_count(save);
         }
         ComponentKind::Image { src } => draw_image(canvas, rect, src, style.opacity),
         ComponentKind::Canvas { .. } => draw_canvas(canvas, client_index, rect, style.opacity),
@@ -835,15 +862,100 @@ fn draw_text_line(
     opacity: f32,
     typeface: &Typeface,
     font_weight: u16,
-) {
-    let mut font = Font::new(typeface.clone(), font_size);
-    font.set_embolden(font_weight >= 600);
-    canvas.draw_str(
-        text,
-        (x, top + font_size),
-        &font,
-        &color_paint(color, opacity),
-    );
+) -> f32 {
+    let paint = color_paint(color, opacity);
+    if text
+        .chars()
+        .all(|character| typeface.unichar_to_glyph(character as i32) != 0)
+    {
+        let mut font = Font::new(typeface.clone(), font_size);
+        font.set_embolden(font_weight >= 600);
+        canvas.draw_str(text, (x, top + font_size), &font, &paint);
+        return font.measure_str(text, Some(&paint)).0;
+    }
+
+    let mut cursor_x = x;
+    for run in fallback_font_runs(text, typeface, font_weight) {
+        let mut font = Font::new(run.typeface, font_size);
+        font.set_embolden(font_weight >= 600);
+        canvas.draw_str(run.text, (cursor_x, top + font_size), &font, &paint);
+        cursor_x += font.measure_str(run.text, Some(&paint)).0;
+    }
+    cursor_x - x
+}
+
+struct FallbackFontRun<'a> {
+    text: &'a str,
+    typeface: Typeface,
+}
+
+fn fallback_font_runs<'a>(
+    text: &'a str,
+    primary: &Typeface,
+    font_weight: u16,
+) -> Vec<FallbackFontRun<'a>> {
+    let mut runs = Vec::new();
+    let mut run_start = 0;
+    let mut run_typeface = primary.clone();
+    let mut run_typeface_id = primary.unique_id();
+
+    for (offset, character) in text.char_indices() {
+        let typeface = typeface_for_character(primary, character, font_weight);
+        let typeface_id = typeface.unique_id();
+        if offset > run_start && typeface_id != run_typeface_id {
+            runs.push(FallbackFontRun {
+                text: &text[run_start..offset],
+                typeface: run_typeface,
+            });
+            run_start = offset;
+            run_typeface = typeface;
+            run_typeface_id = typeface_id;
+        } else if offset == run_start {
+            run_typeface = typeface;
+            run_typeface_id = typeface_id;
+        }
+    }
+    if run_start < text.len() {
+        runs.push(FallbackFontRun {
+            text: &text[run_start..],
+            typeface: run_typeface,
+        });
+    }
+    runs
+}
+
+fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16) -> Typeface {
+    if primary.unichar_to_glyph(character as i32) != 0 {
+        return primary.clone();
+    }
+
+    let key = (character, font_weight);
+    let cached = FONT_FALLBACK_CACHE.with(|cache| cache.borrow().get(&key).cloned());
+    let fallback = match cached {
+        Some(cached) => cached,
+        None => {
+            let style = if font_weight >= 600 {
+                FontStyle::bold()
+            } else {
+                FontStyle::normal()
+            };
+            let matched = FontMgr::default().match_family_style_character(
+                "",
+                style,
+                &["en", "zh-Hans"],
+                character as i32,
+            );
+            FONT_FALLBACK_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if cache.len() >= FONT_FALLBACK_CACHE_CAPACITY {
+                    cache.clear();
+                }
+                cache.insert(key, matched.clone());
+            });
+            matched
+        }
+    };
+    fallback.unwrap_or_else(|| primary.clone())
 }
 
 fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
@@ -1153,6 +1265,23 @@ mod tests {
         let mut style = Style::default();
         style.justify_content = JustifyContent::Center;
         assert_eq!(effective_text_align(&style), TextAlign::Center);
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    #[test]
+    fn missing_cjk_glyphs_use_one_cached_system_font_run() {
+        let primary = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        assert_eq!(primary.unichar_to_glyph('丹' as i32), 0);
+
+        let fallback = typeface_for_character(&primary, '丹', 400);
+        assert_ne!(fallback.unichar_to_glyph('丹' as i32), 0);
+
+        let runs = fallback_font_runs("A丹丹B", &primary, 400);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].text, "A");
+        assert_eq!(runs[1].text, "丹丹");
+        assert_eq!(runs[2].text, "B");
+        assert_eq!(runs[1].typeface.unique_id(), fallback.unique_id());
     }
 
     #[test]
