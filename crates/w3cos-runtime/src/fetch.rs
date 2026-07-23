@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::streams::{ReadResult, ReadableStream};
+use w3cos_core::Value;
+
+use crate::streams::ReadableStream;
 
 #[derive(Debug, Clone, Default)]
 pub enum Method {
@@ -84,6 +86,72 @@ pub fn fetch(url: &str, options: FetchOptions) -> FetchResponse {
             body_stream: ReadableStream::from_bytes(Vec::new()),
         },
     }
+}
+
+/// JavaScript-facing synchronous `fetch` facade used by the ESM AOT pipeline.
+///
+/// The current ESM lowering executes `await` expressions synchronously, so
+/// returning a browser-shaped `Response` value here keeps `response.ok`,
+/// `response.status`, `response.text()` and `response.json()` available to
+/// compiled application code.
+pub fn fetch_value(arguments: Vec<Value>) -> Value {
+    let url = arguments
+        .first()
+        .cloned()
+        .unwrap_or(Value::Undefined)
+        .to_js_string();
+    let init = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+    let mut options = FetchOptions {
+        method: parse_method(&init.get_property("method").to_js_string()),
+        body: match init.get_property("body") {
+            Value::Undefined | Value::Null => None,
+            body => Some(body.to_js_string()),
+        },
+        ..FetchOptions::default()
+    };
+    if let Value::Object(headers) = init.get_property("headers") {
+        let headers = headers.borrow();
+        for key in headers.keys() {
+            options
+                .headers
+                .insert(key.clone(), headers.get_direct(&key).to_js_string());
+        }
+    }
+
+    response_value(fetch(&url, options))
+}
+
+fn response_value(response: FetchResponse) -> Value {
+    let status = response.status;
+    let ok = response.ok;
+    let status_text = response.status_text.clone();
+    let headers = Value::object(
+        response
+            .headers
+            .iter()
+            .map(|(key, value)| (key.clone(), Value::from(value.clone())))
+            .collect(),
+    );
+    let body = response.text().unwrap_or_default();
+    let text_body = body.clone();
+    let json_body = body;
+
+    Value::object(HashMap::from([
+        ("status".into(), Value::Number(status as f64)),
+        ("ok".into(), Value::Bool(ok)),
+        ("statusText".into(), Value::from(status_text)),
+        ("headers".into(), headers),
+        (
+            "text".into(),
+            Value::function(move |_, _| Value::from(text_body.clone())),
+        ),
+        (
+            "json".into(),
+            Value::function(move |_, _| {
+                w3cos_core::json::parse(vec![Value::from(json_body.clone())])
+            }),
+        ),
+    ]))
 }
 
 fn build_agent(options: &FetchOptions) -> ureq::Agent {
@@ -214,6 +282,27 @@ pub fn parse_method(s: &str) -> Method {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_value_exposes_browser_response_properties() {
+        let response = response_value(FetchResponse {
+            status: 200,
+            ok: true,
+            status_text: "OK".into(),
+            headers: HashMap::from([("content-type".into(), "application/json".into())]),
+            body_stream: ReadableStream::from_bytes(br#"{"token":"ok"}"#.to_vec()),
+        });
+
+        assert!(response.get_property("ok").to_bool());
+        assert_eq!(response.get_property("status").to_number(), 200.0);
+        assert_eq!(
+            response
+                .call_method("json", vec![])
+                .get_property("token")
+                .to_js_string(),
+            "ok"
+        );
+    }
 
     #[test]
     fn fetch_get_httpbin() {

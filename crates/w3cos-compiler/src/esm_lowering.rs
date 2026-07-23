@@ -4346,6 +4346,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         "Proxy" => "w3cos_core::proxy_class()".to_string(),
         "TextDecoder" => "w3cos_core::web::text_decoder_class()".to_string(),
         "Date" => "w3cos_core::web::date_class()".to_string(),
+        "fetch" => "w3cos_core::Value::function(|_this, __args| w3cos_runtime::fetch::fetch_value(__args))".to_string(),
         "Uint8Array" | "Uint8ClampedArray" | "Int8Array" | "Uint16Array" | "Int16Array"
         | "Uint32Array" | "Int32Array" | "Float32Array" | "Float64Array" | "BigInt64Array"
         | "BigUint64Array" => "w3cos_core::collections::typed_array_class()".to_string(),
@@ -4364,7 +4365,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         "BigInt" | "ArrayBuffer" | "SharedArrayBuffer" | "DataView"
         | "WeakRef" | "FinalizationRegistry" | "Atomics" | "eval"
         | "encodeURI" | "encodeURIComponent" | "decodeURI" | "decodeURIComponent" | "escape"
-        | "unescape" | "TextEncoder" | "fetch" | "Request" | "Response"
+        | "unescape" | "TextEncoder" | "Request" | "Response"
         | "Headers" | "FormData" | "AbortController" | "AbortSignal" | "Event"
         | "EventTarget" | "CustomEvent" | "MessagePort" | "Worker"
         | "ImageData" | "OffscreenCanvas" | "Path2D" | "DOMRect" | "DOMPoint" | "DOMMatrix"
@@ -5489,6 +5490,7 @@ const text = JSON.stringify(obj);
 const bin = atob("aGk=");
 const enc = btoa(bin);
 const copy = structuredClone(obj);
+const response = fetch("/api", { method: "POST" });
 const u = new URL("https://example.com/x");
 const params = new URLSearchParams("a=1");"#,
         );
@@ -5525,6 +5527,10 @@ const params = new URLSearchParams("a=1");"#,
         assert!(
             code.contains("w3cos_core::web::structured_clone(__args)"),
             "structuredClone: {code}"
+        );
+        assert!(
+            code.contains("w3cos_runtime::fetch::fetch_value(__args)"),
+            "fetch facade: {code}"
         );
         assert!(
             code.contains("w3cos_core::web::url_new(vec!["),
