@@ -1871,7 +1871,9 @@ impl LowerCtx {
                         UnaryOp::Minus => format!("{arg}.js_neg()"),
                         UnaryOp::Tilde => format!("{arg}.js_bitnot()"),
                         UnaryOp::TypeOf => format!("w3cos_core::type_of(&{arg})"),
-                        UnaryOp::Void => "w3cos_core::Value::Undefined".to_string(),
+                        UnaryOp::Void => {
+                            format!("{{ let _ = {arg}; w3cos_core::Value::Undefined }}")
+                        }
                         _ => format!("{arg}"),
                     }
                 } else {
@@ -5477,6 +5479,21 @@ const sel = getSelection();"#,
                 "{name} → window function value: {code}"
             );
         }
+    }
+
+    #[test]
+    fn dynamic_lowering_preserves_void_expression_side_effects() {
+        let stmts = parse_stmts("void reload();");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("let _ = reload.call("),
+            "void operand must still be evaluated: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::Value::Undefined"),
+            "void expression result: {code}"
+        );
     }
 
     #[test]
