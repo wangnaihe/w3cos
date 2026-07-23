@@ -83,7 +83,7 @@ enum Commands {
         /// Project name (creates a directory with this name).
         project_name: PathBuf,
     },
-    /// Mobile app scaffolding (Android / iOS shell + w3cos.app.json).
+    /// Mobile app scaffolding (Android / iOS / HarmonyOS shell + w3cos.app.json).
     Mobile {
         #[command(subcommand)]
         command: MobileCommands,
@@ -95,7 +95,7 @@ enum MobileCommands {
     /// Create a new mobile project from generic templates.
     Init {
         project_name: PathBuf,
-        /// Target platform: android, ios, or both.
+        /// Target platform: android, ios, harmony, both, or all.
         #[arg(long, default_value = "android")]
         platform: String,
     },
@@ -104,7 +104,7 @@ enum MobileCommands {
         /// Project directory (contains app.tsx, android/, ios/).
         #[arg(default_value = ".")]
         project: PathBuf,
-        /// Target platform: android, ios, or both.
+        /// Target platform: android, ios, harmony, or both.
         #[arg(long, default_value = "android")]
         platform: String,
         #[arg(long)]

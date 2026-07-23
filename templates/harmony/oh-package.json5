@@ -1,0 +1,9 @@
+{
+  "modelVersion": "5.0.0",
+  "description": "W3COS HarmonyOS native shell",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hvigor": "5.0.2",
+    "@ohos/hvigor-ohos-plugin": "5.0.2"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "0.1.0",
+  "description": "W3COS ArkUI XComponent host",
+  "main": "",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}

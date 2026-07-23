@@ -37,22 +37,29 @@ pub fn mobile_init(project_name: &PathBuf, platform: &str) -> Result<()> {
     if project_name.exists() {
         bail!("directory already exists: {}", project_name.display());
     }
+    validate_init_platform(platform)?;
 
     let root = w3cos_root()?;
     let shared = root.join("templates/shared");
     let android_tpl = root.join("templates/android");
     let ios_tpl = root.join("templates/ios");
+    let harmony_tpl = root.join("templates/harmony");
 
     fs::create_dir_all(project_name).context("create project dir")?;
     copy_dir_recursive(&shared, project_name).context("copy templates/shared")?;
 
-    if platform == "android" || platform == "both" {
+    if matches!(platform, "android" | "both" | "all") {
         copy_dir_recursive(&android_tpl, &project_name.join("android"))
             .context("copy templates/android")?;
     }
 
-    if platform == "ios" || platform == "both" {
+    if matches!(platform, "ios" | "both" | "all") {
         copy_dir_recursive(&ios_tpl, &project_name.join("ios")).context("copy templates/ios")?;
+    }
+
+    if matches!(platform, "harmony" | "all") {
+        copy_dir_recursive(&harmony_tpl, &project_name.join("harmony"))
+            .context("copy templates/harmony")?;
     }
 
     let readme = project_name.join("README.md");
@@ -73,8 +80,9 @@ w3cos build app.tsx -o app --release && ./app
 
 ```bash
 w3cos mobile build --platform android   # APK (needs SDK + NDK)
-w3cos mobile build --platform ios        # Simulator (needs Xcode)
-w3cos mobile build --platform both
+w3cos mobile build --platform ios       # Simulator (needs Xcode)
+w3cos mobile build --platform harmony   # HAP (OHOS runtime port required)
+w3cos mobile build --platform both      # Android + iOS
 ```
 
 Manifest: `w3cos.app.json`
@@ -84,13 +92,25 @@ Manifest: `w3cos.app.json`
     )?;
 
     println!("✅ Mobile project: {}", project_name.display());
-    if platform == "android" || platform == "both" {
+    if matches!(platform, "android" | "both" | "all") {
         println!("   android/  Gradle + NativeActivity");
     }
-    if platform == "ios" || platform == "both" {
+    if matches!(platform, "ios" | "both" | "all") {
         println!("   ios/      Xcode shell");
     }
+    if matches!(platform, "harmony" | "all") {
+        println!("   harmony/  ArkUI + XComponent shell");
+    }
     Ok(())
+}
+
+fn validate_init_platform(platform: &str) -> Result<()> {
+    match platform {
+        "android" | "ios" | "harmony" | "both" | "all" => Ok(()),
+        other => bail!(
+            "unknown platform: {other} (use android|ios|harmony|both|all; both means Android + iOS)"
+        ),
+    }
 }
 
 /// Debug mobile builds enable DevTools by default; release builds require `--devtools`.
@@ -110,6 +130,14 @@ pub fn mobile_build(
     release: bool,
     devtools: bool,
 ) -> Result<()> {
+    if platform == "harmony" {
+        return build_harmony(project_dir, release);
+    }
+    if platform == "all" {
+        bail!(
+            "--platform all is available for `mobile init` only until the HarmonyOS runtime port lands; build android|ios|both today"
+        );
+    }
     let (_, _, entry, safe_area, interactive_widget, _) = read_app_manifest(project_dir);
     let app_tsx = project_dir.join(&entry);
     if !app_tsx.exists() {
@@ -144,10 +172,47 @@ pub fn mobile_build(
             build_android(project_dir, &build_dir, release)?;
             build_ios(project_dir, &build_dir, release)?;
         }
-        other => bail!("unknown platform: {other} (use android|ios|both)"),
+        other => bail!("unknown platform: {other} (use android|ios|harmony|both)"),
     }
 
     Ok(())
+}
+
+fn build_harmony(project_dir: &Path, _release: bool) -> Result<()> {
+    let harmony_dir = project_dir.join("harmony");
+    if !harmony_dir.exists() {
+        bail!(
+            "harmony/ not found — run: w3cos mobile init . --platform harmony (in a new project) or copy templates/harmony"
+        );
+    }
+    let sdk_config = harmony_dir.join("local.properties");
+    if std::env::var_os("OHOS_SDK_HOME").is_none() && !sdk_config.exists() {
+        bail!(
+            "HarmonyOS SDK not configured. Set OHOS_SDK_HOME or create harmony/local.properties before building"
+        );
+    }
+    bail!(
+        "HarmonyOS ArkUI/XComponent shell is scaffolded, but the W3COS OHOS native runtime is not implemented yet. \
+         The required next step is an OHNativeWindow event/render backend; Android NativeActivity artifacts are not compatible with HarmonyOS NEXT"
+    )
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::validate_init_platform;
+
+    #[test]
+    fn accepts_harmony_and_all_scaffold_targets() {
+        for platform in ["android", "ios", "harmony", "both", "all"] {
+            validate_init_platform(platform).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_scaffold_target() {
+        let error = validate_init_platform("ohos").unwrap_err().to_string();
+        assert!(error.contains("use android|ios|harmony|both|all"));
+    }
 }
 
 /// Watch entry + CSS imports, rebuild mobile artifact, reinstall on device/simulator.
@@ -705,7 +770,16 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
     println!("🔨 Building iOS simulator binary ({profile})...");
     let mut cmd = Command::new("cargo");
     cmd.current_dir(build_dir)
-        .args(["build", "--target", target]);
+        .args(["build", "--target", target])
+        // Objective-C categories in static iOS SDKs are otherwise discarded
+        // when Cargo performs the final application link.
+        .env(
+            "RUSTFLAGS",
+            format!(
+                "{} -C link-arg=-ObjC",
+                std::env::var("RUSTFLAGS").unwrap_or_default()
+            ),
+        );
     if release {
         cmd.arg("--release");
     }

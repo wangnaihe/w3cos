@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "app_name",
+      "value": "W3COS"
+    },
+    {
+      "name": "module_desc",
+      "value": "W3COS HarmonyOS shell"
+    },
+    {
+      "name": "ability_desc",
+      "value": "W3COS native content host"
+    }
+  ]
+}
