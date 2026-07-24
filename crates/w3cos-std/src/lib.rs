@@ -3,11 +3,13 @@ pub mod component;
 pub mod keyboard_inset;
 pub mod safe_area;
 pub mod style;
+pub mod svg;
 pub mod viewport;
 
 pub use color::Color;
-pub use component::{Component, ComponentKind, EventAction};
+pub use component::{Component, ComponentKind, EventAction, SvgEventTarget};
 pub use style::Style;
+pub use svg::{SvgPathCommand, SvgPathData};
 
 #[cfg(test)]
 mod tests {

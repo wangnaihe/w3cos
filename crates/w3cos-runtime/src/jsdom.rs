@@ -109,6 +109,10 @@ thread_local! {
     static NEXT_RAF_ID: Cell<u32> = Cell::new(1);
     /// Viewport (width, height, devicePixelRatio) for window/matchMedia.
     static VIEWPORT: Cell<(f64, f64, f64)> = Cell::new((1024.0, 768.0, 1.0));
+    static WINDOW_SCROLL: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+    static FULLSCREEN_NODE: RefCell<Option<u32>> = const { RefCell::new(None) };
+    static SCREEN_ORIENTATION: RefCell<(String, f64)> =
+        RefCell::new(("landscape-primary".to_string(), 0.0));
     /// Bridge-side focus tracking (no real input focus exists yet).
     static ACTIVE_ELEMENT: RefCell<Option<u32>> = RefCell::new(None);
     /// Lazily-created <html> / <head> elements.
@@ -124,12 +128,11 @@ thread_local! {
         RefCell::new(HashMap::new());
     /// In-memory sessionStorage.
     static SESSION_STORAGE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static COOKIE_STORE: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     /// Clipboard fallback for non-desktop targets.
     static CLIPBOARD_FALLBACK: RefCell<String> = RefCell::new(String::new());
     /// performance.now() origin.
     static START_TIME: Instant = Instant::now();
-    /// PRNG state for crypto.getRandomValues (xorshift64).
-    static RNG_STATE: Cell<u64> = Cell::new(0);
 }
 
 // ── Small helpers ──────────────────────────────────────────────────────────
@@ -710,6 +713,221 @@ fn rect_value(rect: w3cos_dom::DOMRect) -> Value {
     Value::object(props)
 }
 
+fn is_svg_node(node: u32) -> bool {
+    get_expando(node, "namespaceURI")
+        .is_some_and(|namespace| namespace.to_js_string() == "http://www.w3.org/2000/svg")
+}
+
+fn svg_number_attribute(node: u32, name: &str, default: f64) -> f64 {
+    dom::get_attribute(node, name)
+        .and_then(|value| value.trim().trim_end_matches("px").parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn svg_animated_length(node: u32, name: &'static str) -> Value {
+    let current = svg_number_attribute(node, name, 0.0);
+    let length = Value::object(HashMap::from([
+        ("value".to_string(), Value::Number(current)),
+        (
+            "valueAsString".to_string(),
+            Value::string(&dom::get_attribute(node, name).unwrap_or_else(|| current.to_string())),
+        ),
+        ("valueInSpecifiedUnits".to_string(), Value::Number(current)),
+        ("unitType".to_string(), Value::Number(1.0)),
+    ]));
+    Value::object(HashMap::from([
+        ("baseVal".to_string(), length.clone()),
+        ("animVal".to_string(), length),
+    ]))
+}
+
+fn svg_bbox(node: u32) -> w3cos_dom::DOMRect {
+    match dom::tag_name(node).as_str() {
+        "rect" | "image" | "use" => w3cos_dom::DOMRect::new(
+            svg_number_attribute(node, "x", 0.0) as f32,
+            svg_number_attribute(node, "y", 0.0) as f32,
+            svg_number_attribute(node, "width", 0.0).max(0.0) as f32,
+            svg_number_attribute(node, "height", 0.0).max(0.0) as f32,
+        ),
+        "circle" => {
+            let r = svg_number_attribute(node, "r", 0.0).max(0.0) as f32;
+            w3cos_dom::DOMRect::new(
+                svg_number_attribute(node, "cx", 0.0) as f32 - r,
+                svg_number_attribute(node, "cy", 0.0) as f32 - r,
+                r * 2.0,
+                r * 2.0,
+            )
+        }
+        "ellipse" => {
+            let rx = svg_number_attribute(node, "rx", 0.0).max(0.0) as f32;
+            let ry = svg_number_attribute(node, "ry", 0.0).max(0.0) as f32;
+            w3cos_dom::DOMRect::new(
+                svg_number_attribute(node, "cx", 0.0) as f32 - rx,
+                svg_number_attribute(node, "cy", 0.0) as f32 - ry,
+                rx * 2.0,
+                ry * 2.0,
+            )
+        }
+        "line" => {
+            let x1 = svg_number_attribute(node, "x1", 0.0) as f32;
+            let y1 = svg_number_attribute(node, "y1", 0.0) as f32;
+            let x2 = svg_number_attribute(node, "x2", 0.0) as f32;
+            let y2 = svg_number_attribute(node, "y2", 0.0) as f32;
+            w3cos_dom::DOMRect::new(x1.min(x2), y1.min(y2), (x2 - x1).abs(), (y2 - y1).abs())
+        }
+        "svg" => w3cos_dom::DOMRect::new(
+            0.0,
+            0.0,
+            svg_number_attribute(node, "width", 300.0) as f32,
+            svg_number_attribute(node, "height", 150.0) as f32,
+        ),
+        _ => dom::bounding_rect(node),
+    }
+}
+
+fn svg_identity_matrix() -> Value {
+    Value::object(HashMap::from([
+        ("a".to_string(), Value::Number(1.0)),
+        ("b".to_string(), Value::Number(0.0)),
+        ("c".to_string(), Value::Number(0.0)),
+        ("d".to_string(), Value::Number(1.0)),
+        ("e".to_string(), Value::Number(0.0)),
+        ("f".to_string(), Value::Number(0.0)),
+    ]))
+}
+
+fn owner_svg_element(node: u32) -> Value {
+    let mut current = dom::parent_node(node);
+    while let Some(parent) = current {
+        if is_svg_node(parent) && dom::tag_name(parent) == "svg" {
+            return element_value(parent);
+        }
+        current = dom::parent_node(parent);
+    }
+    Value::Null
+}
+
+fn svg_computed_get(node: u32, key: &str) -> Option<Value> {
+    if !is_svg_node(node) {
+        return None;
+    }
+    let value = match key {
+        "tagName" => Value::string(&dom::tag_name(node)),
+        "ownerSVGElement" | "viewportElement" => owner_svg_element(node),
+        "className" => {
+            let class_name = dom::class_name(node);
+            Value::object(HashMap::from([
+                ("baseVal".to_string(), Value::string(&class_name)),
+                ("animVal".to_string(), Value::string(&class_name)),
+            ]))
+        }
+        "x" | "y" | "x1" | "y1" | "x2" | "y2" | "cx" | "cy" | "r" | "rx" | "ry" | "width"
+        | "height" => {
+            let name: &'static str = match key {
+                "x" => "x",
+                "y" => "y",
+                "x1" => "x1",
+                "y1" => "y1",
+                "x2" => "x2",
+                "y2" => "y2",
+                "cx" => "cx",
+                "cy" => "cy",
+                "r" => "r",
+                "rx" => "rx",
+                "ry" => "ry",
+                "width" => "width",
+                _ => "height",
+            };
+            svg_animated_length(node, name)
+        }
+        "viewBox" => {
+            let parts = dom::get_attribute(node, "viewBox")
+                .or_else(|| dom::get_attribute(node, "viewbox"))
+                .unwrap_or_default()
+                .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+                .filter_map(|part| part.parse::<f64>().ok())
+                .collect::<Vec<_>>();
+            let rect = Value::object(HashMap::from([
+                (
+                    "x".to_string(),
+                    Value::Number(parts.first().copied().unwrap_or(0.0)),
+                ),
+                (
+                    "y".to_string(),
+                    Value::Number(parts.get(1).copied().unwrap_or(0.0)),
+                ),
+                (
+                    "width".to_string(),
+                    Value::Number(parts.get(2).copied().unwrap_or(0.0)),
+                ),
+                (
+                    "height".to_string(),
+                    Value::Number(parts.get(3).copied().unwrap_or(0.0)),
+                ),
+            ]));
+            Value::object(HashMap::from([
+                ("baseVal".to_string(), rect.clone()),
+                ("animVal".to_string(), rect),
+            ]))
+        }
+        "getBBox" => Value::function(move |_, _| rect_value(svg_bbox(node))),
+        "getCTM" | "getScreenCTM" => Value::function(|_, _| svg_identity_matrix()),
+        "getTotalLength" => Value::function(move |_, _| {
+            let length = match dom::tag_name(node).as_str() {
+                "line" => {
+                    let dx = svg_number_attribute(node, "x2", 0.0)
+                        - svg_number_attribute(node, "x1", 0.0);
+                    let dy = svg_number_attribute(node, "y2", 0.0)
+                        - svg_number_attribute(node, "y1", 0.0);
+                    dx.hypot(dy)
+                }
+                "circle" => std::f64::consts::TAU * svg_number_attribute(node, "r", 0.0),
+                "rect" => {
+                    2.0 * (svg_number_attribute(node, "width", 0.0)
+                        + svg_number_attribute(node, "height", 0.0))
+                }
+                _ => 0.0,
+            };
+            Value::Number(length)
+        }),
+        "createSVGPoint" => Value::function(|_, _| {
+            let point = Value::object(HashMap::from([
+                ("x".to_string(), Value::Number(0.0)),
+                ("y".to_string(), Value::Number(0.0)),
+            ]));
+            point.set_property(
+                "matrixTransform",
+                Value::function(|this, args| {
+                    let matrix = args.first().cloned().unwrap_or_default();
+                    Value::object(HashMap::from([
+                        (
+                            "x".to_string(),
+                            Value::Number(
+                                this.get_property("x").to_number()
+                                    * matrix.get_property("a").to_number()
+                                    + matrix.get_property("e").to_number(),
+                            ),
+                        ),
+                        (
+                            "y".to_string(),
+                            Value::Number(
+                                this.get_property("y").to_number()
+                                    * matrix.get_property("d").to_number()
+                                    + matrix.get_property("f").to_number(),
+                            ),
+                        ),
+                    ]))
+                }),
+            );
+            point
+        }),
+        "createSVGMatrix" => Value::function(|_, _| svg_identity_matrix()),
+        "createSVGRect" => Value::function(|_, _| rect_value(w3cos_dom::DOMRect::zero())),
+        _ => return None,
+    };
+    Some(value)
+}
+
 fn is_inputish(node: u32) -> bool {
     matches!(
         dom::tag_name(node).as_str(),
@@ -718,6 +936,9 @@ fn is_inputish(node: u32) -> bool {
 }
 
 fn element_computed_get(node: u32, key: &str) -> Value {
+    if let Some(value) = svg_computed_get(node, key) {
+        return value;
+    }
     match key {
         // ── Node identity ──
         "nodeType" => Value::Number(dom::node_type(node) as f64),
@@ -837,8 +1058,15 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "hasAttribute" => func(move |_, args| {
             Value::Bool(dom::has_attribute(node, &arg(&args, 0).to_js_string()))
         }),
+        "hasAttributeNS" => func(move |_, args| {
+            Value::Bool(dom::has_attribute(node, &arg(&args, 1).to_js_string()))
+        }),
         "removeAttribute" => func(move |_, args| {
             dom::remove_attribute(node, &arg(&args, 0).to_js_string());
+            Value::Undefined
+        }),
+        "removeAttributeNS" => func(move |_, args| {
+            dom::remove_attribute(node, &arg(&args, 1).to_js_string());
             Value::Undefined
         }),
         "toggleAttribute" => func(move |_, args| {
@@ -1214,6 +1442,15 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 Value::Null
             }
         }),
+        "requestFullscreen" => func(move |_, _| {
+            FULLSCREEN_NODE.with(|current| *current.borrow_mut() = Some(node));
+            let event = w3cos_core::class::construct(
+                &crate::web_events::event_class(),
+                vec![Value::string("fullscreenchange")],
+            );
+            document_value().call_method("dispatchEvent", vec![event]);
+            resolved_thenable(Value::Undefined)
+        }),
 
         // ── Pointer capture (no-op; no real pointer routing yet) ──
         "setPointerCapture" | "releasePointerCapture" => func(|_, _| Value::Undefined),
@@ -1536,6 +1773,34 @@ fn style_value(node: u32) -> Value {
     value
 }
 
+fn computed_style_value(node: u32) -> Value {
+    let handler = ProxyBuilder::new()
+        .get(move |target, key, _| {
+            let stored = target.get_property(key);
+            if !stored.is_undefined() {
+                return stored;
+            }
+            Value::string(&dom::computed_style_property(node, &camel_to_kebab(key)))
+        })
+        .build();
+    let target = HashMap::from([
+        (
+            "getPropertyValue".to_string(),
+            func(move |_, args| {
+                Value::string(&dom::computed_style_property(
+                    node,
+                    &camel_to_kebab(&arg(&args, 0).to_js_string()),
+                ))
+            }),
+        ),
+        (
+            "getPropertyPriority".to_string(),
+            func(|_, _| Value::string("")),
+        ),
+    ]);
+    Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(target, handler))))
+}
+
 // ── JS event bridge ────────────────────────────────────────────────────────
 
 fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Value) {
@@ -1811,6 +2076,22 @@ fn build_event_value(ev: &Event) -> Value {
         "__w3cos_getter_cancelBubble",
         func(move |_, _| v.get_property("__sp")),
     );
+    let constructor = match &ev.data {
+        EventData::Mouse(_) => crate::web_events::event_subclass_class("MouseEvent"),
+        EventData::Pointer(_) => crate::web_events::event_subclass_class("PointerEvent"),
+        EventData::Wheel(_) => crate::web_events::event_subclass_class("WheelEvent"),
+        EventData::Keyboard(_) => crate::web_events::event_subclass_class("KeyboardEvent"),
+        EventData::Input { .. } | EventData::BeforeInput { .. } => {
+            crate::web_events::event_subclass_class("InputEvent")
+        }
+        EventData::Composition { .. } => {
+            crate::web_events::event_subclass_class("CompositionEvent")
+        }
+        EventData::Custom { .. } => crate::web_events::custom_event_class(),
+        EventData::Focus => crate::web_events::event_subclass_class("FocusEvent"),
+        EventData::None => crate::web_events::event_class(),
+    };
+    w3cos_core::class::set_prototype_of(&value, &constructor.get_property("prototype"));
     value
 }
 
@@ -2318,14 +2599,13 @@ fn farg(args: &[Value], i: usize) -> f32 {
 }
 
 fn image_data_value(data: &crate::canvas2d::ImageData) -> Value {
-    let mut props = HashMap::new();
-    props.insert("width".to_string(), Value::Number(data.width as f64));
-    props.insert("height".to_string(), Value::Number(data.height as f64));
-    props.insert(
-        "data".to_string(),
-        js_array(data.data.iter().map(|b| Value::Number(*b as f64)).collect()),
+    let bytes = w3cos_core::class::construct(
+        &w3cos_core::binary::typed_array_class("Uint8ClampedArray"),
+        vec![js_array(
+            data.data.iter().map(|b| Value::Number(*b as f64)).collect(),
+        )],
     );
-    Value::object(props)
+    crate::canvas_web::image_data_value(bytes, data.width, data.height)
 }
 
 fn canvas_context_value(node: u32) -> Value {
@@ -2565,14 +2845,20 @@ fn canvas_ctx_get(
         }
         "fill" => {
             let ctx = ctx.clone();
-            func(move |_, _| {
+            func(move |_, args| {
+                if let Some(ops) = args.first().and_then(crate::canvas_web::path_ops) {
+                    apply_path_ops(&mut ctx.borrow_mut(), &ops);
+                }
                 ctx.borrow_mut().fill();
                 Value::Undefined
             })
         }
         "stroke" => {
             let ctx = ctx.clone();
-            func(move |_, _| {
+            func(move |_, args| {
+                if let Some(ops) = args.first().and_then(crate::canvas_web::path_ops) {
+                    apply_path_ops(&mut ctx.borrow_mut(), &ops);
+                }
                 ctx.borrow_mut().stroke();
                 Value::Undefined
             })
@@ -2669,6 +2955,31 @@ fn canvas_ctx_get(
         "getLineDash" => func(|_, _| js_array(vec![])),
         "drawImage" => func(|_, _| Value::Undefined), // v1: no image sources (gap)
         _ => Value::Undefined,
+    }
+}
+
+fn apply_path_ops(
+    context: &mut crate::canvas2d::CanvasRenderingContext2D,
+    ops: &[crate::canvas2d::PathOp],
+) {
+    context.begin_path();
+    for op in ops {
+        match *op {
+            crate::canvas2d::PathOp::MoveTo(x, y) => context.move_to(x, y),
+            crate::canvas2d::PathOp::LineTo(x, y) => context.line_to(x, y),
+            crate::canvas2d::PathOp::QuadraticCurveTo(a, b, c, d) => {
+                context.quadratic_curve_to(a, b, c, d)
+            }
+            crate::canvas2d::PathOp::BezierCurveTo(a, b, c, d, e, f) => {
+                context.bezier_curve_to(a, b, c, d, e, f)
+            }
+            crate::canvas2d::PathOp::Arc(x, y, radius, start, end, ccw) => {
+                context.arc(x, y, radius, start, end, ccw)
+            }
+            crate::canvas2d::PathOp::Rect(x, y, width, height) => context.rect(x, y, width, height),
+            crate::canvas2d::PathOp::ClosePath => context.close_path(),
+            crate::canvas2d::PathOp::ArcTo(..) | crate::canvas2d::PathOp::Ellipse(..) => {}
+        }
     }
 }
 
@@ -3306,7 +3617,25 @@ fn build_document_value() -> Value {
     );
     props.insert(
         "__w3cos_getter_fullscreenElement".to_string(),
-        func(|_, _| Value::Null),
+        func(|_, _| {
+            FULLSCREEN_NODE
+                .with(|current| *current.borrow())
+                .map(element_value)
+                .unwrap_or(Value::Null)
+        }),
+    );
+    props.insert("fullscreenEnabled".to_string(), Value::Bool(true));
+    props.insert(
+        "exitFullscreen".to_string(),
+        func(|_, _| {
+            FULLSCREEN_NODE.with(|current| *current.borrow_mut() = None);
+            let event = w3cos_core::class::construct(
+                &crate::web_events::event_class(),
+                vec![Value::string("fullscreenchange")],
+            );
+            document_value().call_method("dispatchEvent", vec![event]);
+            resolved_thenable(Value::Undefined)
+        }),
     );
     props.insert(
         "__w3cos_getter_visibilityState".to_string(),
@@ -3318,7 +3647,37 @@ fn build_document_value() -> Value {
     );
     props.insert(
         "__w3cos_getter_cookie".to_string(),
-        func(|_, _| Value::string("")), // no cookie jar (gap); assignment works
+        func(|_, _| {
+            COOKIE_STORE.with(|cookies| {
+                Value::string(
+                    &cookies
+                        .borrow()
+                        .iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            })
+        }),
+    );
+    props.insert(
+        "__w3cos_setter_cookie".to_string(),
+        func(|_, args| {
+            let assignment = arg(&args, 0).to_js_string();
+            let pair = assignment.split(';').next().unwrap_or_default();
+            if let Some((name, value)) = pair.split_once('=') {
+                let name = name.trim().to_string();
+                let value = value.trim().to_string();
+                if !name.is_empty() {
+                    COOKIE_STORE.with(|cookies| {
+                        let mut cookies = cookies.borrow_mut();
+                        cookies.retain(|(candidate, _)| candidate != &name);
+                        cookies.push((name, value));
+                    });
+                }
+            }
+            Value::Undefined
+        }),
     );
     props.insert(
         "__w3cos_getter_title".to_string(),
@@ -3366,22 +3725,34 @@ fn resolved_thenable(result: Value) -> Value {
     Value::object(props)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 fn clipboard_read_text() -> String {
     crate::clipboard::Clipboard::read_text().unwrap_or_default()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+)))]
 fn clipboard_read_text() -> String {
     CLIPBOARD_FALLBACK.with(|c| c.borrow().clone())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 fn clipboard_write_text(text: &str) {
     let _ = crate::clipboard::Clipboard::write_text(text);
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+)))]
 fn clipboard_write_text(text: &str) {
     CLIPBOARD_FALLBACK.with(|c| *c.borrow_mut() = text.to_string());
 }
@@ -3403,7 +3774,7 @@ fn navigator_value() -> Value {
     props.insert("maxTouchPoints".to_string(), Value::Number(0.0));
     props.insert("hardwareConcurrency".to_string(), Value::Number(4.0));
     props.insert("onLine".to_string(), Value::Bool(true));
-    props.insert("cookieEnabled".to_string(), Value::Bool(false));
+    props.insert("cookieEnabled".to_string(), Value::Bool(true));
     props.insert("pdfViewerEnabled".to_string(), Value::Bool(false));
     props.insert("sendBeacon".to_string(), func(|_, _| Value::Bool(false)));
     props.insert("vibrate".to_string(), func(|_, _| Value::Bool(false)));
@@ -3422,13 +3793,28 @@ fn navigator_value() -> Value {
     );
     clipboard.insert(
         "read".to_string(),
-        func(|_, _| resolved_thenable(js_array(vec![]))),
+        func(|_, _| resolved_thenable(crate::clipboard_web::read_items())),
     );
     clipboard.insert(
         "write".to_string(),
-        func(|_, _| resolved_thenable(Value::Undefined)),
+        func(|_, args| {
+            crate::clipboard_web::write_items(&arg(&args, 0));
+            resolved_thenable(Value::Undefined)
+        }),
     );
     props.insert("clipboard".to_string(), Value::object(clipboard));
+    props.insert(
+        "geolocation".to_string(),
+        crate::geolocation_web::geolocation_value(),
+    );
+    props.insert(
+        "mediaDevices".to_string(),
+        crate::media_devices_web::media_devices_value(),
+    );
+    props.insert(
+        "bluetooth".to_string(),
+        crate::bluetooth_web::bluetooth_value(),
+    );
 
     Value::object(props)
 }
@@ -3489,6 +3875,15 @@ pub fn set_viewport(width: f64, height: f64) {
         let (_, _, dpr) = v.get();
         v.set((width, height, dpr));
     });
+    if let Some(window) = WINDOW_VALUE.with(|value| value.borrow().clone()) {
+        let event = w3cos_core::class::construct(
+            &crate::web_events::event_class(),
+            vec![Value::string("resize")],
+        );
+        window
+            .get_property("visualViewport")
+            .call_method("dispatchEvent", vec![event]);
+    }
 }
 
 /// Set the devicePixelRatio reported by the window. Default 1.0.
@@ -3581,31 +3976,17 @@ fn storage_value(persistent: bool) -> Value {
     Value::object(props)
 }
 
-fn next_random() -> u64 {
-    RNG_STATE.with(|s| {
-        let mut x = s.get();
-        if x == 0 {
-            x = (START_TIME.with(|t| t.elapsed().as_nanos()) as u64) | 0x9E3779B97F4A7C15;
-        }
-        // xorshift64*
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        s.set(x);
-        x.wrapping_mul(0x2545F4914F6CDD1D)
-    })
-}
-
 fn crypto_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
     props.insert(
         "getRandomValues".to_string(),
         func(|_, args| {
             let arr = arg(&args, 0);
-            if let Value::Array(items) = &arr {
-                let mut items = items.borrow_mut();
-                for slot in items.iter_mut() {
-                    *slot = Value::Number((next_random() & 0xff) as f64);
+            let length = arr.get_property("length").to_u32() as usize;
+            let mut bytes = vec![0u8; length];
+            if getrandom::fill(&mut bytes).is_ok() {
+                for (index, byte) in bytes.into_iter().enumerate() {
+                    arr.set_property(&index.to_string(), Value::Number(byte as f64));
                 }
             }
             arr
@@ -3615,9 +3996,8 @@ fn crypto_value() -> Value {
         "randomUUID".to_string(),
         func(|_, _| {
             let mut bytes = [0u8; 16];
-            for chunk in bytes.chunks_mut(8) {
-                let r = next_random().to_le_bytes();
-                chunk.copy_from_slice(&r[..chunk.len()]);
+            if getrandom::fill(&mut bytes).is_err() {
+                return Value::Undefined;
             }
             bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
             bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant
@@ -3685,6 +4065,94 @@ fn build_window_value() -> Value {
         crate::indexed_db_web::key_range_constructor_value(),
     );
     props.insert("WebSocket".to_string(), crate::websocket::websocket_class());
+    props.insert(
+        "EventSource".to_string(),
+        crate::eventsource::event_source_class(),
+    );
+    props.insert(
+        "XMLHttpRequest".to_string(),
+        crate::xhr::xml_http_request_class(),
+    );
+    props.insert(
+        "Notification".to_string(),
+        crate::notification_web::notification_class(),
+    );
+    props.insert(
+        "MediaStream".to_string(),
+        crate::media_devices_web::media_stream_class(),
+    );
+    props.insert(
+        "MediaStreamTrack".to_string(),
+        crate::media_devices_web::media_stream_track_class(),
+    );
+    props.insert(
+        "MediaDeviceInfo".to_string(),
+        crate::media_devices_web::media_device_info_class(),
+    );
+    let speech_recognition = crate::speech_web::speech_recognition_class();
+    props.insert("SpeechRecognition".to_string(), speech_recognition.clone());
+    props.insert("webkitSpeechRecognition".to_string(), speech_recognition);
+    props.insert(
+        "ClipboardItem".to_string(),
+        crate::clipboard_web::clipboard_item_class(),
+    );
+    props.insert(
+        "DataTransfer".to_string(),
+        crate::clipboard_web::data_transfer_class(),
+    );
+    props.insert("Worker".to_string(), crate::worker_web::worker_class());
+    props.insert(
+        "SharedWorker".to_string(),
+        crate::worker_web::shared_worker_class(),
+    );
+    props.insert(
+        "MessagePort".to_string(),
+        crate::worker_web::message_port_class(),
+    );
+    props.insert(
+        "MessageChannel".to_string(),
+        crate::worker_web::message_channel_class(),
+    );
+    props.insert(
+        "DOMException".to_string(),
+        crate::unsupported::dom_exception_class(),
+    );
+    props.insert("BigInt".to_string(), w3cos_core::bigint::bigint_class());
+    props.insert(
+        "WeakMap".to_string(),
+        w3cos_core::collections::weak_map_class(),
+    );
+    props.insert(
+        "WeakSet".to_string(),
+        w3cos_core::collections::weak_set_class(),
+    );
+    props.insert("WeakRef".to_string(), w3cos_core::weak::weak_ref_class());
+    props.insert(
+        "FinalizationRegistry".to_string(),
+        w3cos_core::weak::finalization_registry_class(),
+    );
+    props.insert(
+        "encodeURI".to_string(),
+        Value::function(|_, args| crate::uri_codec::encode_uri(args)),
+    );
+    props.insert(
+        "encodeURIComponent".to_string(),
+        Value::function(|_, args| crate::uri_codec::encode_uri_component(args)),
+    );
+    props.insert(
+        "decodeURI".to_string(),
+        Value::function(|_, args| crate::uri_codec::decode_uri(args)),
+    );
+    props.insert(
+        "decodeURIComponent".to_string(),
+        Value::function(|_, args| crate::uri_codec::decode_uri_component(args)),
+    );
+    for name in crate::unsupported::UNSUPPORTED_CONSTRUCTORS {
+        props.insert(
+            (*name).to_string(),
+            crate::unsupported::unsupported_constructor(name),
+        );
+    }
     props.insert("Headers".to_string(), crate::fetch::headers_class());
     props.insert("Request".to_string(), crate::fetch::request_class());
     props.insert("Response".to_string(), crate::fetch::response_class());
@@ -3704,6 +4172,54 @@ fn build_window_value() -> Value {
         "TextDecoder".to_string(),
         w3cos_core::web::text_decoder_class(),
     );
+    props.insert(
+        "ArrayBuffer".to_string(),
+        w3cos_core::binary::array_buffer_class(),
+    );
+    props.insert(
+        "SharedArrayBuffer".to_string(),
+        w3cos_core::binary::shared_array_buffer_class(),
+    );
+    props.insert("Atomics".to_string(), w3cos_core::binary::atomics_value());
+    props.insert(
+        "DataView".to_string(),
+        w3cos_core::binary::data_view_class(),
+    );
+    props.insert("Blob".to_string(), crate::files::blob_class());
+    props.insert("File".to_string(), crate::files::file_class());
+    props.insert("FileReader".to_string(), crate::files::file_reader_class());
+    props.insert("FormData".to_string(), crate::form_data::form_data_class());
+    props.insert(
+        "ImageData".to_string(),
+        crate::canvas_web::image_data_class(),
+    );
+    props.insert("Path2D".to_string(), crate::canvas_web::path_2d_class());
+    props.insert(
+        "OffscreenCanvas".to_string(),
+        crate::canvas_web::offscreen_canvas_class(),
+    );
+    props.insert(
+        "ResizeObserver".to_string(),
+        crate::observers_web::resize_observer_class(),
+    );
+    props.insert(
+        "MutationObserver".to_string(),
+        crate::observers_web::mutation_observer_class(),
+    );
+    props.insert(
+        "IntersectionObserver".to_string(),
+        crate::observers_web::intersection_observer_class(),
+    );
+    props.insert(
+        "PerformanceObserver".to_string(),
+        crate::observers_web::performance_observer_class(),
+    );
+    for name in w3cos_core::binary::TYPED_ARRAY_NAMES {
+        props.insert(
+            (*name).to_string(),
+            w3cos_core::binary::typed_array_class(name),
+        );
+    }
     props.insert("Event".to_string(), crate::web_events::event_class());
     props.insert(
         "CustomEvent".to_string(),
@@ -3713,6 +4229,12 @@ fn build_window_value() -> Value {
         "EventTarget".to_string(),
         crate::web_events::event_target_class(),
     );
+    for name in crate::web_events::EVENT_SUBCLASS_NAMES {
+        props.insert(
+            (*name).to_string(),
+            crate::web_events::event_subclass_class(name),
+        );
+    }
     for name in crate::dom_constructors::DOM_CONSTRUCTOR_NAMES {
         props.insert(
             (*name).to_string(),
@@ -3810,10 +4332,51 @@ fn build_window_value() -> Value {
         }
         screen.insert("colorDepth".to_string(), Value::Number(24.0));
         screen.insert("pixelDepth".to_string(), Value::Number(24.0));
-        let mut orientation: HashMap<String, Value> = HashMap::new();
-        orientation.insert("type".to_string(), Value::string("landscape-primary"));
-        orientation.insert("angle".to_string(), Value::Number(0.0));
-        screen.insert("orientation".to_string(), Value::object(orientation));
+        let orientation = Value::object(HashMap::from([
+            (
+                "__w3cos_getter_type".to_string(),
+                func(|_, _| SCREEN_ORIENTATION.with(|state| Value::string(&state.borrow().0))),
+            ),
+            (
+                "__w3cos_getter_angle".to_string(),
+                func(|_, _| SCREEN_ORIENTATION.with(|state| Value::Number(state.borrow().1))),
+            ),
+        ]));
+        crate::web_events::event_target_class().call(orientation.clone(), vec![]);
+        let orientation_for_lock = orientation.clone();
+        orientation.set_property(
+            "lock",
+            func(move |_, args| {
+                let requested = arg(&args, 0).to_js_string();
+                let angle = if requested.starts_with("portrait") {
+                    90.0
+                } else {
+                    0.0
+                };
+                SCREEN_ORIENTATION.with(|state| *state.borrow_mut() = (requested, angle));
+                let event = w3cos_core::class::construct(
+                    &crate::web_events::event_class(),
+                    vec![Value::string("change")],
+                );
+                orientation_for_lock.call_method("dispatchEvent", vec![event]);
+                resolved_thenable(Value::Undefined)
+            }),
+        );
+        let orientation_for_unlock = orientation.clone();
+        orientation.set_property(
+            "unlock",
+            func(move |_, _| {
+                SCREEN_ORIENTATION
+                    .with(|state| *state.borrow_mut() = ("landscape-primary".to_string(), 0.0));
+                let event = w3cos_core::class::construct(
+                    &crate::web_events::event_class(),
+                    vec![Value::string("change")],
+                );
+                orientation_for_unlock.call_method("dispatchEvent", vec![event]);
+                Value::Undefined
+            }),
+        );
+        screen.insert("orientation".to_string(), orientation);
         props.insert("screen".to_string(), Value::object(screen));
     }
 
@@ -3829,14 +4392,23 @@ fn build_window_value() -> Value {
             func(|_, _| Value::Number(viewport().1)),
         );
         vv.insert("scale".to_string(), Value::Number(1.0));
-        vv.insert("offsetLeft".to_string(), Value::Number(0.0));
-        vv.insert("offsetTop".to_string(), Value::Number(0.0));
-        vv.insert("pageLeft".to_string(), Value::Number(0.0));
-        vv.insert("pageTop".to_string(), Value::Number(0.0));
-        for name in ["addEventListener", "removeEventListener"] {
-            vv.insert(name.to_string(), func(|_, _| Value::Undefined));
+        for (name, horizontal) in [
+            ("offsetLeft", true),
+            ("offsetTop", false),
+            ("pageLeft", true),
+            ("pageTop", false),
+        ] {
+            vv.insert(
+                format!("__w3cos_getter_{name}"),
+                func(move |_, _| {
+                    let (x, y) = WINDOW_SCROLL.with(Cell::get);
+                    Value::Number(if horizontal { x } else { y })
+                }),
+            );
         }
-        props.insert("visualViewport".to_string(), Value::object(vv));
+        let viewport_value = Value::object(vv);
+        crate::web_events::event_target_class().call(viewport_value.clone(), vec![]);
+        props.insert("visualViewport".to_string(), viewport_value);
     }
 
     // Live viewport getters.
@@ -3868,9 +4440,13 @@ fn build_window_value() -> Value {
         "screenX",
         "screenY",
     ] {
+        let horizontal = matches!(key, "scrollX" | "pageXOffset" | "screenX");
         props.insert(
             format!("__w3cos_getter_{key}"),
-            func(|_, _| Value::Number(0.0)),
+            func(move |_, _| {
+                let (x, y) = WINDOW_SCROLL.with(Cell::get);
+                Value::Number(if horizontal { x } else { y })
+            }),
         );
     }
     props.insert(
@@ -3888,12 +4464,9 @@ fn build_window_value() -> Value {
     // Methods.
     props.insert(
         "getComputedStyle".to_string(),
-        func(|_, args| {
-            // Cascade gap: returns the element's inline style declaration.
-            match node_id_of(&arg(&args, 0)) {
-                Some(node) => style_value(node),
-                None => Value::object(HashMap::new()),
-            }
+        func(|_, args| match node_id_of(&arg(&args, 0)) {
+            Some(node) => computed_style_value(node),
+            None => Value::object(HashMap::new()),
         }),
     );
     props.insert(
@@ -3983,10 +4556,41 @@ fn build_window_value() -> Value {
     );
     props.insert("getSelection".to_string(), func(|_, _| selection_value()));
     for name in [
-        "scrollTo", "scrollBy", "scroll", "moveTo", "moveBy", "resizeTo", "resizeBy", "focus",
-        "blur", "print", "close", "stop",
+        "moveTo", "moveBy", "resizeTo", "resizeBy", "focus", "blur", "print", "close", "stop",
     ] {
         props.insert(name.to_string(), func(|_, _| Value::Undefined));
+    }
+    for name in ["scrollTo", "scroll", "scrollBy"] {
+        props.insert(
+            name.to_string(),
+            func(move |_, args| {
+                let (current_x, current_y) = WINDOW_SCROLL.with(Cell::get);
+                let first = arg(&args, 0);
+                let (mut x, mut y) = if first.is_object() {
+                    (
+                        first.get_property("left").to_number(),
+                        first.get_property("top").to_number(),
+                    )
+                } else {
+                    (first.to_number(), arg(&args, 1).to_number())
+                };
+                if name == "scrollBy" {
+                    x += current_x;
+                    y += current_y;
+                }
+                WINDOW_SCROLL.with(|offset| offset.set((x, y)));
+                if let Some(window) = WINDOW_VALUE.with(|value| value.borrow().clone()) {
+                    let event = w3cos_core::class::construct(
+                        &crate::web_events::event_class(),
+                        vec![Value::string("scroll")],
+                    );
+                    window
+                        .get_property("visualViewport")
+                        .call_method("dispatchEvent", vec![event]);
+                }
+                Value::Undefined
+            }),
+        );
     }
     props.insert("open".to_string(), func(|_, _| Value::Null));
     props.insert("alert".to_string(), func(|_, _| Value::Undefined));
@@ -4121,6 +4725,9 @@ pub fn drain_microtasks() -> usize {
     let mut ran = 0;
     loop {
         ran += crate::websocket::poll_js_events();
+        ran += crate::eventsource::poll_js_events();
+        ran += crate::worker_web::poll_js_events();
+        ran += crate::speech_web::poll_js_events();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -4174,13 +4781,11 @@ pub fn has_pending_work() -> bool {
 pub fn next_timer_deadline() -> Option<Instant> {
     let timer = JS_TIMERS.with(|t| t.borrow().iter().map(|timer| timer.fire_at).min());
     let sockets = crate::websocket::has_pending_js_sockets();
-    let frame_deadline = sockets.then(|| Instant::now() + Duration::from_millis(16));
-    match (timer, frame_deadline) {
-        (Some(deadline), Some(frame_deadline)) => Some(deadline.min(frame_deadline)),
-        (Some(deadline), None) => Some(deadline),
-        (None, Some(frame_deadline)) => Some(frame_deadline),
-        (None, None) => None,
-    }
+    let socket_deadline = sockets.then(|| Instant::now() + Duration::from_millis(16));
+    [timer, socket_deadline, crate::speech::next_deadline()]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 /// Reset all bridge state. Pair with [`crate::dom::reset_document`] in tests:
@@ -4207,6 +4812,9 @@ pub fn reset_bridge() {
     CANVAS_CONTEXTS.with(|c| c.borrow_mut().clear());
     SESSION_STORAGE.with(|s| s.borrow_mut().clear());
     crate::websocket::reset_js_websockets();
+    crate::speech_web::reset();
+    crate::geolocation_web::reset();
+    crate::media_devices_web::reset();
     // DOCUMENT_VALUE / WINDOW_VALUE / SELECTION_VALUE survive on purpose:
     // their contents read all state lazily from the DOM and viewport.
 }
@@ -4687,6 +5295,14 @@ mod tests {
             ));
             // The event target must be a real element value.
             assert!(node_id_of(&ev.get_property("target")).is_some());
+            assert!(w3cos_core::class::instance_of(
+                &ev,
+                &window_value().get_property("MouseEvent")
+            ));
+            assert!(w3cos_core::class::instance_of(
+                &ev,
+                &window_value().get_property("Event")
+            ));
             Value::Undefined
         });
         btn.call_method("addEventListener", vec![Value::string("click"), handler]);

@@ -27,10 +27,16 @@ pub struct Style {
 
     // Spacing
     pub gap: f32,
+    #[serde(default)]
+    pub row_gap: Option<f32>,
+    #[serde(default)]
+    pub column_gap: Option<f32>,
     pub padding: Edges,
     pub margin: Edges,
 
     // Sizing
+    #[serde(default)]
+    pub box_sizing: BoxSizing,
     pub width: Dimension,
     pub height: Dimension,
     pub min_width: Dimension,
@@ -40,6 +46,10 @@ pub struct Style {
 
     // Overflow
     pub overflow: Overflow,
+    #[serde(default)]
+    pub overflow_x: Option<Overflow>,
+    #[serde(default)]
+    pub overflow_y: Option<Overflow>,
     /// CSS Overscroll Behavior Level 1, block-axis subset.
     #[serde(default)]
     pub overscroll_behavior: OverscrollBehavior,
@@ -61,6 +71,22 @@ pub struct Style {
     pub border_radius: f32,
     pub border_width: f32,
     pub border_color: Color,
+    #[serde(default)]
+    pub border_top_width: Option<f32>,
+    #[serde(default)]
+    pub border_right_width: Option<f32>,
+    #[serde(default)]
+    pub border_bottom_width: Option<f32>,
+    #[serde(default)]
+    pub border_left_width: Option<f32>,
+    #[serde(default)]
+    pub border_top_color: Option<Color>,
+    #[serde(default)]
+    pub border_right_color: Option<Color>,
+    #[serde(default)]
+    pub border_bottom_color: Option<Color>,
+    #[serde(default)]
+    pub border_left_color: Option<Color>,
     pub opacity: f32,
 
     // CSS Text (#31)
@@ -103,6 +129,14 @@ pub struct Style {
     pub order: i32,
     pub align_self: AlignSelf,
     pub align_content: AlignContent,
+    #[serde(default)]
+    pub justify_self: AlignSelf,
+    #[serde(default)]
+    pub justify_items: AlignItems,
+    #[serde(default)]
+    pub grid_template_columns: Option<String>,
+    #[serde(default)]
+    pub grid_column: Option<String>,
 
     // Interaction
     pub cursor: Cursor,
@@ -135,8 +169,11 @@ impl Default for Style {
             left: Dimension::Auto,
             z_index: 0,
             gap: 0.0,
+            row_gap: None,
+            column_gap: None,
             padding: Edges::ZERO,
             margin: Edges::ZERO,
+            box_sizing: BoxSizing::ContentBox,
             width: Dimension::Auto,
             height: Dimension::Auto,
             min_width: Dimension::Auto,
@@ -144,6 +181,8 @@ impl Default for Style {
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             overflow: Overflow::Visible,
+            overflow_x: None,
+            overflow_y: None,
             overscroll_behavior: OverscrollBehavior::Auto,
             scroll_initial_target: ScrollInitialTarget::None,
             overflow_anchor: true,
@@ -155,6 +194,14 @@ impl Default for Style {
             border_radius: 0.0,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
+            border_top_width: None,
+            border_right_width: None,
+            border_bottom_width: None,
+            border_left_width: None,
+            border_top_color: None,
+            border_right_color: None,
+            border_bottom_color: None,
+            border_left_color: None,
             opacity: 1.0,
             text_align: TextAlign::Left,
             white_space: WhiteSpace::Normal,
@@ -177,6 +224,10 @@ impl Default for Style {
             order: 0,
             align_self: AlignSelf::Auto,
             align_content: AlignContent::Stretch,
+            justify_self: AlignSelf::Auto,
+            justify_items: AlignItems::Stretch,
+            grid_template_columns: None,
+            grid_column: None,
             cursor: Cursor::Default,
             pointer_events: PointerEvents::Auto,
             user_select: UserSelect::Auto,
@@ -220,6 +271,13 @@ pub enum Overflow {
     Hidden,
     Scroll,
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BoxSizing {
+    #[default]
+    ContentBox,
+    BorderBox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -287,10 +345,16 @@ pub enum Dimension {
     Vh(f32),
 }
 
-/// CSS length for padding/margin — `px`, `env()`, or `calc(px + env())`.
+/// CSS length for padding/margin.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Spacing {
     Px(f32),
+    Percent(f32),
+    Rem(f32),
+    Em(f32),
+    Vw(f32),
+    Vh(f32),
+    Auto,
     SafeAreaInset(SafeAreaEdge),
     /// `env(keyboard-inset-height)` — virtual keyboard occlusion (logical px).
     KeyboardInsetHeight,
@@ -312,6 +376,10 @@ impl Spacing {
     pub fn resolve_env(&self, insets: &SafeAreaInsets, keyboard_bottom: f32) -> f32 {
         match self {
             Spacing::Px(v) => *v,
+            Spacing::Percent(_) | Spacing::Auto => 0.0,
+            Spacing::Rem(v) => *v * 16.0,
+            Spacing::Em(v) => *v * 16.0,
+            Spacing::Vw(_) | Spacing::Vh(_) => 0.0,
             Spacing::SafeAreaInset(edge) => insets.value(*edge),
             Spacing::KeyboardInsetHeight => keyboard_bottom,
             Spacing::Composite {
@@ -395,6 +463,14 @@ impl Style {
 
     pub fn margin_lengths(&self) -> EdgeLengths {
         self.margin.resolve_lengths(&crate::safe_area::current())
+    }
+
+    pub fn resolved_overflow_x(&self) -> Overflow {
+        self.overflow_x.unwrap_or(self.overflow)
+    }
+
+    pub fn resolved_overflow_y(&self) -> Overflow {
+        self.overflow_y.unwrap_or(self.overflow)
     }
 }
 

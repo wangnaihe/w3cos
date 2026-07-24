@@ -172,8 +172,13 @@ impl PaintArtifact {
                 transform: node.style.transform,
             });
         }
+        let overflow_x = node.style.resolved_overflow_x();
+        let overflow_y = node.style.resolved_overflow_y();
         if matches!(
-            node.style.overflow,
+            overflow_x,
+            Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+        ) || matches!(
+            overflow_y,
             Overflow::Hidden | Overflow::Scroll | Overflow::Auto
         ) {
             properties.clip = self.properties.clips.len();
@@ -190,7 +195,9 @@ impl PaintArtifact {
                 filter: node.style.filter.clone(),
             });
         }
-        if matches!(node.style.overflow, Overflow::Scroll | Overflow::Auto) {
+        if matches!(overflow_x, Overflow::Scroll | Overflow::Auto)
+            || matches!(overflow_y, Overflow::Scroll | Overflow::Auto)
+        {
             properties.scroll = self.properties.scrolls.len();
             self.properties.scrolls.push(ScrollNode {
                 parent: inherited.scroll,

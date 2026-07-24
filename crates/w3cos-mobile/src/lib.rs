@@ -12,6 +12,8 @@ pub mod touch;
 
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(any(target_env = "ohos", feature = "ohos-check"))]
+pub mod harmony;
 
 use anyhow::Result;
 #[cfg(target_os = "ios")]
@@ -40,7 +42,7 @@ pub fn run_mobile_app(builder: fn() -> Component) -> Result<()> {
         return android::run(builder);
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(not(target_os = "android"), not(target_env = "ohos")))]
     {
         #[cfg(target_os = "ios")]
         {
@@ -48,6 +50,11 @@ pub fn run_mobile_app(builder: fn() -> Component) -> Result<()> {
             w3cos_std::safe_area::set_enabled(true);
         }
         w3cos_runtime::run_app(builder)
+    }
+    #[cfg(target_env = "ohos")]
+    {
+        let _ = builder;
+        anyhow::bail!("HarmonyOS apps start from an ArkUI XComponent surface callback")
     }
 }
 
@@ -60,7 +67,7 @@ pub fn run_mobile_app_dom(setup: fn()) -> Result<()> {
         return w3cos_runtime::run_app_dom(setup);
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(not(target_os = "android"), not(target_env = "ohos")))]
     {
         #[cfg(target_os = "ios")]
         {
@@ -68,6 +75,11 @@ pub fn run_mobile_app_dom(setup: fn()) -> Result<()> {
             w3cos_std::safe_area::set_enabled(true);
         }
         w3cos_runtime::run_app_dom(setup)
+    }
+    #[cfg(target_env = "ohos")]
+    {
+        let _ = setup;
+        anyhow::bail!("HarmonyOS apps start from an ArkUI XComponent surface callback")
     }
 }
 

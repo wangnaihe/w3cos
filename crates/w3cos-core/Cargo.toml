@@ -9,3 +9,6 @@ description = "W3C OS core — JS value types, Proxy, and reactive primitives"
 serde_json = { workspace = true }
 base64 = "0.22"
 regex = "1"
+fancy-regex = "0.18"
+num-bigint = "0.4"
+num-traits = "0.2"

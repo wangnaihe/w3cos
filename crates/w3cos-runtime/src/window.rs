@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::dom;
 use crate::paint_artifact::{PaintArtifact, PaintNode};
 use crate::text_layout;
 use crate::tile_manager::{TileManager, TileRequest};
@@ -580,6 +581,25 @@ fn react_rebuild_changes_painted_content(
                     height: new_height,
                 },
             ) => old_width != new_width || old_height != new_height,
+            (
+                ComponentKind::SvgDocument {
+                    source: old_source,
+                    width: old_width,
+                    height: old_height,
+                    event_targets: old_targets,
+                },
+                ComponentKind::SvgDocument {
+                    source: new_source,
+                    width: new_width,
+                    height: new_height,
+                    event_targets: new_targets,
+                },
+            ) => {
+                old_source != new_source
+                    || old_width != new_width
+                    || old_height != new_height
+                    || old_targets != new_targets
+            }
             (
                 ComponentKind::VirtualList {
                     item_count: old_count,
@@ -4110,7 +4130,12 @@ impl App {
         if self.get_window().is_none() {
             return false;
         }
-        let requests = host_runtime::take_scroll_requests();
+        let mut requests = host_runtime::take_scroll_requests();
+        requests.extend(
+            dom::take_scroll_requests()
+                .into_iter()
+                .map(|(node, left, top)| (u64::from(node), left, top)),
+        );
         if requests.is_empty() {
             return false;
         }
@@ -4152,6 +4177,7 @@ impl App {
                 continue;
             }
             self.scroll_offsets.insert(index, (next_x, next_y));
+            dom::sync_scroll_offset(host_id as u32, Some(next_x), Some(next_y));
             crate::uitest::set_programmatic_scroll_offset(index, next_y, requested_y);
             host_runtime::dispatch_scroll(host_id, next_y);
             if let Some(ordinal) = self.virtual_scroll_indices.get(&index).copied() {
@@ -4376,6 +4402,7 @@ impl App {
                         _ => None,
                     });
             if let Some(host_id) = native_scroll {
+                dom::sync_scroll_offset(host_id as u32, Some(ox), Some(new_oy));
                 host_runtime::dispatch_scroll(host_id, new_oy);
                 let pending_render = host_runtime::has_pending_render();
                 self.deferred_react_scroll_commit |= pending_render;
@@ -5014,6 +5041,45 @@ impl App {
 
     fn native_host_chain(&self, idx: usize) -> Vec<u64> {
         let flat = layout::pre_flatten(&self.root);
+        if let Some(node) = flat.get(idx)
+            && let ComponentKind::SvgDocument {
+                source,
+                width,
+                height,
+                event_targets,
+            } = node.kind
+            && let Some((rect, _)) = self
+                .layout_cache
+                .iter()
+                .find(|(_, node_index)| *node_index == idx)
+            && rect.width > 0.0
+            && rect.height > 0.0
+        {
+            let (layout_x, layout_y) = self.viewport_to_layout(self.mouse_x, self.mouse_y);
+            let raster_x = (layout_x - rect.x) * *width as f32 / rect.width;
+            let raster_y = (layout_y - rect.y) * *height as f32 / rect.height;
+            if let Some(mut host_ids) = crate::svg_renderer::hit_test(
+                source,
+                *width,
+                *height,
+                event_targets,
+                raster_x,
+                raster_y,
+            ) {
+                let mut current = node.parent;
+                while let Some(index) = current {
+                    let Some(ancestor) = flat.get(index) else {
+                        break;
+                    };
+                    if let EventAction::NativeHost { id, .. } = ancestor.on_click {
+                        host_ids.push(*id);
+                    }
+                    current = ancestor.parent;
+                }
+                return host_ids;
+            }
+        }
+
         let mut current = Some(idx);
         let mut host_ids = Vec::new();
         while let Some(index) = current {
@@ -5203,6 +5269,15 @@ impl App {
             ),
             ComponentKind::Canvas { width, height } => (
                 "canvas",
+                None,
+                vec![
+                    ("width".to_string(), width.to_string()),
+                    ("height".to_string(), height.to_string()),
+                ],
+            ),
+            ComponentKind::SvgPath { .. } => ("path", None, vec![]),
+            ComponentKind::SvgDocument { width, height, .. } => (
+                "svg",
                 None,
                 vec![
                     ("width".to_string(), width.to_string()),
@@ -5846,8 +5921,28 @@ fn build_scroll_info_fast<T: PaintNodeView>(
         .map(|(idx, ancestor)| match ancestor {
             Some(anc_idx) => {
                 if let Some(&clip) = scrollable_rect.get(anc_idx) {
-                    let (mut sx, mut sy) = offsets.get(anc_idx).copied().unwrap_or((0.0, 0.0));
+                    let (outer_sx, outer_sy) = accumulated_outer_scroll_transform(
+                        scroll_ancestor.get(*anc_idx).copied().flatten(),
+                        scroll_ancestor,
+                        &scrollable_rect,
+                        offsets,
+                        overscroll_states,
+                    );
+                    let (own_sx, own_sy) = offsets.get(anc_idx).copied().unwrap_or((0.0, 0.0));
+                    let mut sx = own_sx + outer_sx;
+                    let mut sy = own_sy + outer_sy;
                     let mut effective_clip = clip;
+                    effective_clip.x -= outer_sx;
+                    effective_clip.y -= outer_sy;
+                    if let Some(outer_clip) = outer_scrollport_visual_clip(
+                        scroll_ancestor.get(*anc_idx).copied().flatten(),
+                        scroll_ancestor,
+                        &scrollable_rect,
+                        offsets,
+                        overscroll_states,
+                    ) {
+                        effective_clip = intersect_layout_rect(effective_clip, outer_clip);
+                    }
                     if let Some(owner) = sticky_owner.get(idx).copied().flatten()
                         && let Some(owner_rect) = rect_by_index.get(owner).copied().flatten()
                     {
@@ -5896,12 +5991,33 @@ fn build_scroll_info_fast<T: PaintNodeView>(
                     sy -= overscroll_displacement_y(overscroll_states, *anc_idx);
                     Some((sx, sy, effective_clip))
                 } else if let Some(&clip) = clip_only_rect.get(anc_idx) {
-                    let mut sx = 0.0;
-                    let mut sy = 0.0;
-                    let mut effective_clip = clip;
+                    let (mut sx, mut sy) = accumulated_outer_scroll_transform(
+                        scroll_ancestor.get(*anc_idx).copied().flatten(),
+                        scroll_ancestor,
+                        &scrollable_rect,
+                        offsets,
+                        overscroll_states,
+                    );
+                    let mut effective_clip = LayoutRect {
+                        x: clip.x - sx,
+                        y: clip.y - sy,
+                        ..clip
+                    };
+                    if let Some(outer_clip) = outer_scrollport_visual_clip(
+                        scroll_ancestor.get(*anc_idx).copied().flatten(),
+                        scroll_ancestor,
+                        &scrollable_rect,
+                        offsets,
+                        overscroll_states,
+                    ) {
+                        effective_clip = intersect_layout_rect(effective_clip, outer_clip);
+                    }
                     if let Some(owner) = sticky_owner.get(idx).copied().flatten()
                         && let Some(owner_rect) = rect_by_index.get(owner).copied().flatten()
                     {
+                        sx = 0.0;
+                        sy = 0.0;
+                        effective_clip = clip;
                         let style = flat[owner].paint_style();
                         if let Some(sticky_scroll_idx) = scroll_ancestor[owner]
                             && let Some(&sticky_clip) = scrollable_rect.get(&sticky_scroll_idx)
@@ -5940,6 +6056,66 @@ fn build_scroll_info_fast<T: PaintNodeView>(
             None => None,
         })
         .collect()
+}
+
+fn accumulated_outer_scroll_transform(
+    mut ancestor: Option<usize>,
+    scroll_ancestor: &[Option<usize>],
+    scrollable_rect: &HashMap<usize, LayoutRect>,
+    offsets: &HashMap<usize, (f32, f32)>,
+    overscroll_states: &HashMap<usize, OverscrollState>,
+) -> (f32, f32) {
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    while let Some(index) = ancestor {
+        if scrollable_rect.contains_key(&index) {
+            let (offset_x, offset_y) = offsets.get(&index).copied().unwrap_or_default();
+            sx += offset_x;
+            sy += offset_y - overscroll_displacement_y(overscroll_states, index);
+        }
+        ancestor = scroll_ancestor.get(index).copied().flatten();
+    }
+    (sx, sy)
+}
+
+fn outer_scrollport_visual_clip(
+    mut ancestor: Option<usize>,
+    scroll_ancestor: &[Option<usize>],
+    scrollable_rect: &HashMap<usize, LayoutRect>,
+    offsets: &HashMap<usize, (f32, f32)>,
+    overscroll_states: &HashMap<usize, OverscrollState>,
+) -> Option<LayoutRect> {
+    while let Some(index) = ancestor {
+        if let Some(rect) = scrollable_rect.get(&index).copied() {
+            let (sx, sy) = accumulated_outer_scroll_transform(
+                scroll_ancestor.get(index).copied().flatten(),
+                scroll_ancestor,
+                scrollable_rect,
+                offsets,
+                overscroll_states,
+            );
+            return Some(LayoutRect {
+                x: rect.x - sx,
+                y: rect.y - sy,
+                ..rect
+            });
+        }
+        ancestor = scroll_ancestor.get(index).copied().flatten();
+    }
+    None
+}
+
+fn intersect_layout_rect(a: LayoutRect, b: LayoutRect) -> LayoutRect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    LayoutRect {
+        x,
+        y,
+        width: (right - x).max(0.0),
+        height: (bottom - y).max(0.0),
+    }
 }
 
 fn overscroll_displacement_y(states: &HashMap<usize, OverscrollState>, scroll_idx: usize) -> f32 {
@@ -6459,6 +6635,7 @@ impl ApplicationHandler for App {
 
     fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
         crate::image_loader::clear_cache();
+        crate::svg_renderer::clear_cache();
         crate::canvas2d::clear_surfaces();
         crate::text_layout::clear_paint_cache();
         #[cfg(feature = "cpu-render")]
@@ -7279,19 +7456,22 @@ fn apply_initial_scroll_targets(
         {
             continue;
         }
-        let Some(scroll_index) = scroll_ancestor.get(target_index).copied().flatten() else {
+        let Some(mut scroll_index) = scroll_ancestor.get(target_index).copied().flatten() else {
             continue;
         };
+        while !scrollports.contains_key(&scroll_index) {
+            let Some(parent_index) = scroll_ancestor.get(scroll_index).copied().flatten() else {
+                break;
+            };
+            scroll_index = parent_index;
+        }
         let (Some(target_rect), Some((scroll_rect, extent))) = (
             rects.get(&target_index).copied(),
             scrollports.get(&scroll_index).copied(),
         ) else {
             continue;
         };
-        if !claimed_scrollports.insert(scroll_index)
-            || initialized.contains(&scroll_index)
-            || user_scrolled.contains(&scroll_index)
-        {
+        if !claimed_scrollports.insert(scroll_index) || user_scrolled.contains(&scroll_index) {
             continue;
         }
         let y = initial_scroll_target_offset(target_rect.y, scroll_rect.y, extent.max_y);
@@ -7299,6 +7479,13 @@ fn apply_initial_scroll_targets(
             .get(&scroll_index)
             .map(|(x, _)| *x)
             .unwrap_or(0.0);
+        if initialized.contains(&scroll_index)
+            && scroll_offsets
+                .get(&scroll_index)
+                .is_some_and(|(_, current_y)| y <= *current_y + 0.01)
+        {
+            continue;
+        }
         scroll_offsets.insert(scroll_index, (x, y));
         initialized.insert(scroll_index);
     }
@@ -7553,6 +7740,27 @@ mod scroll_physics_tests {
     }
 
     #[test]
+    fn svg_revision_changes_pixels_without_changing_layout_shape() {
+        let old_root = Component::root(vec![Component::svg_document(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="red"/></svg>"#,
+            64,
+            32,
+            w3cos_std::style::Style::default(),
+        )]);
+        let new_root = Component::root(vec![Component::svg_document(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="blue"/></svg>"#,
+            64,
+            32,
+            w3cos_std::style::Style::default(),
+        )]);
+
+        let old_flat = layout::pre_flatten(&old_root);
+        let new_flat = layout::pre_flatten(&new_root);
+        assert!(layout::layout_shape_unchanged(&old_flat, &new_flat));
+        assert!(react_rebuild_changes_painted_content(&old_flat, &new_flat));
+    }
+
+    #[test]
     fn touch_velocity_uses_recent_motion_window_instead_of_last_delta() {
         let now = Instant::now();
         let samples = VecDeque::from([
@@ -7733,6 +7941,76 @@ mod scroll_physics_tests {
     }
 
     #[test]
+    fn initial_scroll_target_follows_late_content_growth() {
+        let target_style = w3cos_std::style::Style {
+            scroll_initial_target: w3cos_std::style::ScrollInitialTarget::Nearest,
+            ..w3cos_std::style::Style::default()
+        };
+        let root = Component::root(vec![Component::column(
+            w3cos_std::style::Style::default(),
+            vec![Component::boxed(target_style, vec![])],
+        )]);
+        let flat = layout::pre_flatten(&root);
+        let viewport = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 375.0,
+            height: 500.0,
+        };
+        let scrollable = vec![(
+            1,
+            viewport,
+            ScrollExtent {
+                max_x: 0.0,
+                max_y: 400.0,
+            },
+        )];
+        let ancestors = vec![None, None, Some(1)];
+        let mut offsets = HashMap::new();
+        let mut initialized = HashSet::new();
+        let mut user_scrolled = HashSet::new();
+
+        apply_initial_scroll_targets(
+            &flat,
+            &[
+                (viewport, 1),
+                (
+                    LayoutRect {
+                        y: 120.0,
+                        ..viewport
+                    },
+                    2,
+                ),
+            ],
+            &scrollable,
+            &ancestors,
+            &mut offsets,
+            &mut initialized,
+            &mut user_scrolled,
+        );
+        apply_initial_scroll_targets(
+            &flat,
+            &[
+                (viewport, 1),
+                (
+                    LayoutRect {
+                        y: 360.0,
+                        ..viewport
+                    },
+                    2,
+                ),
+            ],
+            &scrollable,
+            &ancestors,
+            &mut offsets,
+            &mut initialized,
+            &mut user_scrolled,
+        );
+
+        assert_eq!(offsets.get(&1), Some(&(0.0, 360.0)));
+    }
+
+    #[test]
     fn late_initial_scroll_target_does_not_override_user_scroll() {
         let target_style = w3cos_std::style::Style {
             scroll_initial_target: w3cos_std::style::ScrollInitialTarget::Nearest,
@@ -7869,6 +8147,57 @@ mod scroll_physics_tests {
             topmost_scroll_node_at(350.0, 400.0, &feed, &[None], &[0, 100], &drawer),
             Some(0)
         );
+    }
+
+    #[test]
+    fn clip_only_descendants_keep_outer_scroll_transform() {
+        let mut feed_style = w3cos_std::Style::default();
+        feed_style.overflow = w3cos_std::style::Overflow::Scroll;
+        let mut clip_style = w3cos_std::Style::default();
+        clip_style.overflow = w3cos_std::style::Overflow::Hidden;
+        let root = Component::root(vec![Component::column(
+            feed_style,
+            vec![Component::column(
+                clip_style,
+                vec![Component::column(w3cos_std::Style::default(), vec![])],
+            )],
+        )]);
+        let flat = layout::pre_flatten(&root);
+        let feed_rect = LayoutRect {
+            x: 0.0,
+            y: 100.0,
+            width: 375.0,
+            height: 600.0,
+        };
+        let clip_rect = LayoutRect {
+            x: 10.0,
+            y: 300.0,
+            width: 355.0,
+            height: 180.0,
+        };
+        let scroll_info = build_scroll_info_fast(
+            &[None, None, Some(1), Some(2)],
+            &[(
+                1,
+                feed_rect,
+                ScrollExtent {
+                    max_x: 0.0,
+                    max_y: 1_000.0,
+                },
+            )],
+            &[(2, clip_rect)],
+            &HashMap::from([(1, (0.0, 250.0))]),
+            &HashMap::new(),
+            &[(feed_rect, 1), (clip_rect, 2), (clip_rect, 3)],
+            &flat,
+            None,
+            375.0,
+            700.0,
+        );
+
+        let (_, sy, visual_clip) = scroll_info[3].unwrap();
+        assert_eq!(sy, 250.0);
+        assert_eq!(visual_clip.y, 100.0);
     }
 
     #[test]

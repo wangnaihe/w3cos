@@ -1,4 +1,5 @@
 use crate::style::Style;
+use crate::{Color, SvgPathCommand};
 use serde::{Deserialize, Serialize};
 
 /// An action triggered by a UI event (click, input, etc.).
@@ -83,6 +84,22 @@ pub struct Component {
     pub sticky_counter_signal: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SvgEventTarget {
+    pub svg_id: String,
+    /// Paint-order ordinal used when the element has no author-provided ID.
+    #[serde(default)]
+    pub render_index: Option<u32>,
+    #[serde(default = "default_svg_pointer_events")]
+    pub pointer_events: String,
+    /// DOM target followed by its SVG ancestors, including the `<svg>` root.
+    pub host_chain: Vec<u64>,
+}
+
+fn default_svg_pointer_events() -> String {
+    "auto".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ComponentKind {
     Root,
@@ -107,6 +124,22 @@ pub enum ComponentKind {
     Canvas {
         width: u32,
         height: u32,
+    },
+    SvgPath {
+        commands: Vec<SvgPathCommand>,
+        fill: Color,
+        stroke: Option<Color>,
+        stroke_width: f32,
+    },
+    /// Retained SVG subtree. The runtime parses `source` into a normalized
+    /// usvg tree and caches the raster independently from compositor-only
+    /// transform/opacity updates.
+    SvgDocument {
+        source: String,
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        event_targets: Vec<SvgEventTarget>,
     },
     /// Runtime-windowed list. `children` contains the item template before the
     /// runtime materializes the current keyed window.
@@ -251,6 +284,52 @@ impl Component {
     pub fn canvas(width: u32, height: u32, style: Style) -> Self {
         Self {
             kind: ComponentKind::Canvas { width, height },
+            style,
+            children: vec![],
+            on_click: EventAction::None,
+            sticky_counter_signal: None,
+        }
+    }
+
+    pub fn svg_path(
+        commands: Vec<SvgPathCommand>,
+        fill: Color,
+        stroke: Option<Color>,
+        stroke_width: f32,
+        style: Style,
+    ) -> Self {
+        Self {
+            kind: ComponentKind::SvgPath {
+                commands,
+                fill,
+                stroke,
+                stroke_width,
+            },
+            style,
+            children: vec![],
+            on_click: EventAction::None,
+            sticky_counter_signal: None,
+        }
+    }
+
+    pub fn svg_document(source: impl Into<String>, width: u32, height: u32, style: Style) -> Self {
+        Self::svg_document_with_targets(source, width, height, Vec::new(), style)
+    }
+
+    pub fn svg_document_with_targets(
+        source: impl Into<String>,
+        width: u32,
+        height: u32,
+        event_targets: Vec<SvgEventTarget>,
+        style: Style,
+    ) -> Self {
+        Self {
+            kind: ComponentKind::SvgDocument {
+                source: source.into(),
+                width: width.max(1),
+                height: height.max(1),
+                event_targets,
+            },
             style,
             children: vec![],
             on_click: EventAction::None,

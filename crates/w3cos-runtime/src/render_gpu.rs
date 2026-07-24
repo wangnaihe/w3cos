@@ -4,11 +4,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skrifa::MetadataProvider;
-use vello::kurbo::{Affine, Rect, RoundedRect, Stroke};
+use vello::kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
 use vello::peniko::{
     Blob, Color, Fill, FontData, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
 };
 use vello::{Glyph, Scene};
+use w3cos_std::SvgPathCommand;
 use w3cos_std::color::Color as AppColor;
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::{Style, TextAlign};
@@ -708,6 +709,58 @@ fn render_node(
                 );
             }
         }
+        ComponentKind::SvgPath {
+            commands,
+            fill,
+            stroke,
+            stroke_width,
+        } => {
+            let path = svg_bez_path(rect, commands);
+            if fill.a > 0 {
+                scene.fill(
+                    Fill::NonZero,
+                    dpi,
+                    color_to_vello(node_color(*fill, opacity, color_chain)),
+                    None,
+                    &path,
+                );
+            }
+            if let Some(stroke) = stroke.filter(|color| color.a > 0)
+                && *stroke_width > 0.0
+            {
+                scene.stroke(
+                    &Stroke::new(*stroke_width as f64),
+                    dpi,
+                    color_to_vello(node_color(stroke, opacity, color_chain)),
+                    None,
+                    &path,
+                );
+            }
+        }
+        ComponentKind::SvgDocument {
+            source,
+            width,
+            height,
+            ..
+        } => {
+            if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
+                let blob = Blob::new(raster.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
+                let image_data = ImageData {
+                    data: blob,
+                    format: ImageFormat::Rgba8,
+                    alpha_type: ImageAlphaType::Alpha,
+                    width: raster.width,
+                    height: raster.height,
+                };
+                let image_brush = ImageBrush::new(image_data);
+                let transform = Affine::translate((rect.x as f64, rect.y as f64))
+                    * Affine::scale_non_uniform(
+                        rect.width as f64 / raster.width as f64,
+                        rect.height as f64 / raster.height as f64,
+                    );
+                scene.draw_image(image_brush.as_ref(), transform);
+            }
+        }
         _ => {}
     }
 
@@ -718,6 +771,31 @@ fn render_node(
     if has_clip {
         scene.pop_layer();
     }
+}
+
+fn svg_bez_path(rect: LayoutRect, commands: &[SvgPathCommand]) -> BezPath {
+    let mut path = BezPath::new();
+    for command in commands {
+        match *command {
+            SvgPathCommand::MoveTo(x, y) => {
+                path.move_to((rect.x as f64 + x as f64, rect.y as f64 + y as f64));
+            }
+            SvgPathCommand::LineTo(x, y) => {
+                path.line_to((rect.x as f64 + x as f64, rect.y as f64 + y as f64));
+            }
+            SvgPathCommand::QuadTo(cx, cy, x, y) => path.quad_to(
+                (rect.x as f64 + cx as f64, rect.y as f64 + cy as f64),
+                (rect.x as f64 + x as f64, rect.y as f64 + y as f64),
+            ),
+            SvgPathCommand::CubicTo(c1x, c1y, c2x, c2y, x, y) => path.curve_to(
+                (rect.x as f64 + c1x as f64, rect.y as f64 + c1y as f64),
+                (rect.x as f64 + c2x as f64, rect.y as f64 + c2y as f64),
+                (rect.x as f64 + x as f64, rect.y as f64 + y as f64),
+            ),
+            SvgPathCommand::Close => path.close_path(),
+        }
+    }
+    path
 }
 
 fn draw_box_shadow(

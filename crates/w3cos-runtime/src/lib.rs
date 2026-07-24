@@ -1,6 +1,12 @@
+pub mod bluetooth_web;
 pub mod canvas2d;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub mod canvas_web;
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 pub mod clipboard;
+pub mod clipboard_web;
 pub mod compositor;
 #[cfg(feature = "devtools")]
 pub mod devtools;
@@ -9,15 +15,23 @@ pub mod dom;
 pub mod dom_constructors;
 pub mod eventsource;
 pub mod fetch;
+pub mod files;
 pub mod filter;
 mod fling;
 pub mod font_face;
+pub mod form_data;
 pub mod frame_cache;
 pub mod fs;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 pub mod fs_watch;
+pub mod geolocation_web;
 #[cfg(feature = "gpu")]
 pub mod gpu_filter;
+#[cfg(any(target_env = "ohos", feature = "ohos-check"))]
+pub mod harmony;
 pub mod history;
 pub mod image_loader;
 pub mod indexed_db;
@@ -25,38 +39,60 @@ mod indexed_db_sqlite;
 pub mod indexed_db_web;
 #[cfg(target_os = "ios")]
 mod ios_input;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 pub mod ipc;
 pub mod jsdom;
 pub mod layout;
 pub mod manifest;
 pub mod media;
+pub mod media_devices_web;
 pub mod menu;
 pub mod multi_window;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 pub mod notification;
+pub mod notification_web;
 pub mod observers;
+pub mod observers_web;
 mod overscroll;
 pub mod paint_artifact;
 pub mod perf;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 pub mod process;
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    unix,
+    any(target_os = "macos", target_os = "linux"),
+    not(target_env = "ohos")
+))]
 pub mod pty;
 pub mod pwa;
 pub mod speech;
+pub mod speech_web;
 pub mod state;
 pub mod storage;
 pub mod streams;
+pub mod svg_renderer;
 pub mod text_encoding;
 pub mod text_layout;
 pub mod tile_manager;
 pub mod timers;
 pub mod uitest;
+pub mod unsupported;
+pub mod uri_codec;
 pub mod virtual_list;
 pub mod web_events;
 pub mod websocket;
 pub mod worker;
+pub mod worker_web;
+pub mod xhr;
 
 // Native capability extensions
 pub use w3cos_ffi as ffi;
@@ -85,6 +121,7 @@ pub use render_gpu as render;
 #[cfg(all(feature = "cpu-render", not(feature = "gpu")))]
 pub use render_cpu as render;
 
+#[cfg(not(target_env = "ohos"))]
 pub mod window;
 
 use anyhow::Result;
@@ -101,11 +138,23 @@ pub fn enable_ai_bridge(port: u16) {
 /// Run a W3C OS application with a reactive builder function.
 /// The builder is re-called whenever signals change, producing a new component tree.
 pub fn run_app(builder: fn() -> Component) -> Result<()> {
+    #[cfg(target_env = "ohos")]
+    {
+        let _ = builder;
+        anyhow::bail!("OHOS applications are driven by ArkUI XComponent surface callbacks");
+    }
+    #[cfg(not(target_env = "ohos"))]
     window::run_reactive(builder)
 }
 
 /// Run a W3C OS application from a static component tree (non-reactive).
 pub fn run_app_static(root: Component) -> Result<()> {
+    #[cfg(target_env = "ohos")]
+    {
+        let _ = root;
+        anyhow::bail!("OHOS applications are driven by ArkUI XComponent surface callbacks");
+    }
+    #[cfg(not(target_env = "ohos"))]
     window::run_static(root)
 }
 
@@ -135,6 +184,12 @@ pub fn run_app_on_android_dom(
 /// The setup function builds the initial DOM tree via `w3cos_runtime::dom::*` APIs.
 /// DOM mutations and signal changes trigger automatic re-rendering.
 pub fn run_app_dom(setup: fn()) -> Result<()> {
+    #[cfg(target_env = "ohos")]
+    {
+        let _ = setup;
+        anyhow::bail!("OHOS applications are driven by ArkUI XComponent surface callbacks");
+    }
+    #[cfg(not(target_env = "ohos"))]
     window::run_dom(setup)
 }
 

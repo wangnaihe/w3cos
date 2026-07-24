@@ -24,6 +24,10 @@ W3C OS is a Linux-based operating system where:
 
 Write Web-standard code. Get native performance. Give AI full visibility.
 
+Implementation status is tracked per engine and target in the
+[Web API capability matrix](WEB_API_CAPABILITIES.md); planned work and exit
+gates live in the [roadmap](ROADMAP.md).
+
 ## Quick Start
 
 ```bash

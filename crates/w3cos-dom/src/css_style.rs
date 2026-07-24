@@ -1,8 +1,8 @@
 use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
-    AlignItems, Contain, Dimension, Display, Edges, FlexDirection, FlexWrap, JustifyContent,
-    Overflow, Position, Spacing, Style, WillChange,
+    AlignItems, BoxSizing, Contain, Dimension, Display, Edges, FlexDirection, FlexWrap,
+    JustifyContent, Overflow, Position, Spacing, Style, WillChange,
 };
 
 /// CSSStyleDeclaration — the `element.style` property.
@@ -56,15 +56,22 @@ impl CSSStyleDeclaration {
                     self.inner.flex_shrink = v
                 }
             }
+            "flex" => apply_flex_shorthand(&mut self.inner, value),
 
             "gap" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.gap = v
+                let parts = split_css_whitespace(value);
+                if let Some(v) = parts.first().and_then(|part| parse_px(part)) {
+                    self.inner.row_gap = Some(v);
+                    self.inner.column_gap =
+                        Some(parts.get(1).and_then(|part| parse_px(part)).unwrap_or(v));
+                    self.inner.gap = v;
                 }
             }
+            "row-gap" | "rowGap" => self.inner.row_gap = parse_px(value),
+            "column-gap" | "columnGap" => self.inner.column_gap = parse_px(value),
             "padding" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.padding = Edges::all(v)
+                if let Some(edges) = parse_edge_shorthand(value) {
+                    self.inner.padding = edges
                 }
             }
             "padding-top" | "paddingTop" => {
@@ -88,31 +95,38 @@ impl CSSStyleDeclaration {
                 }
             }
             "margin" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.margin = Edges::all(v)
+                if let Some(edges) = parse_edge_shorthand(value) {
+                    self.inner.margin = edges
                 }
             }
             "margin-top" | "marginTop" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.margin.top = Spacing::Px(v)
+                if let Some(v) = parse_spacing(value) {
+                    self.inner.margin.top = v
                 }
             }
             "margin-right" | "marginRight" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.margin.right = Spacing::Px(v)
+                if let Some(v) = parse_spacing(value) {
+                    self.inner.margin.right = v
                 }
             }
             "margin-bottom" | "marginBottom" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.margin.bottom = Spacing::Px(v)
+                if let Some(v) = parse_spacing(value) {
+                    self.inner.margin.bottom = v
                 }
             }
             "margin-left" | "marginLeft" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.margin.left = Spacing::Px(v)
+                if let Some(v) = parse_spacing(value) {
+                    self.inner.margin.left = v
                 }
             }
 
+            "box-sizing" | "boxSizing" => {
+                self.inner.box_sizing = if value.trim() == "border-box" {
+                    BoxSizing::BorderBox
+                } else {
+                    BoxSizing::ContentBox
+                }
+            }
             "width" => self.inner.width = parse_dimension(value),
             "height" => self.inner.height = parse_dimension(value),
             "min-width" | "minWidth" => self.inner.min_width = parse_dimension(value),
@@ -124,13 +138,33 @@ impl CSSStyleDeclaration {
             "right" => self.inner.right = parse_dimension(value),
             "bottom" => self.inner.bottom = parse_dimension(value),
             "left" => self.inner.left = parse_dimension(value),
+            "inset" => {
+                let values: Vec<Dimension> =
+                    value.split_whitespace().map(parse_dimension).collect();
+                if let Some((top, right, bottom, left)) = match values.as_slice() {
+                    [all] => Some((*all, *all, *all, *all)),
+                    [vertical, horizontal] => {
+                        Some((*vertical, *horizontal, *vertical, *horizontal))
+                    }
+                    [top, horizontal, bottom] => Some((*top, *horizontal, *bottom, *horizontal)),
+                    [top, right, bottom, left] => Some((*top, *right, *bottom, *left)),
+                    _ => None,
+                } {
+                    self.inner.top = top;
+                    self.inner.right = right;
+                    self.inner.bottom = bottom;
+                    self.inner.left = left;
+                }
+            }
             "z-index" | "zIndex" => {
                 if let Ok(v) = value.parse() {
                     self.inner.z_index = v
                 }
             }
 
-            "overflow" | "overflow-y" | "overflowY" => self.inner.overflow = parse_overflow(value),
+            "overflow" => self.inner.overflow = parse_overflow(value),
+            "overflow-x" | "overflowX" => self.inner.overflow_x = Some(parse_overflow(value)),
+            "overflow-y" | "overflowY" => self.inner.overflow_y = Some(parse_overflow(value)),
             "overflow-anchor" | "overflowAnchor" => {
                 self.inner.overflow_anchor = !value.trim().eq_ignore_ascii_case("none")
             }
@@ -168,12 +202,46 @@ impl CSSStyleDeclaration {
                     self.inner.border_width = v
                 }
             }
+            "border-top-width" | "borderTopWidth" => self.inner.border_top_width = parse_px(value),
+            "border-right-width" | "borderRightWidth" => {
+                self.inner.border_right_width = parse_px(value)
+            }
+            "border-bottom-width" | "borderBottomWidth" => {
+                self.inner.border_bottom_width = parse_px(value)
+            }
+            "border-left-width" | "borderLeftWidth" => {
+                self.inner.border_left_width = parse_px(value)
+            }
             "border-color" | "borderColor" => {
                 if let Some(color) = Color::from_css(value) {
                     self.inner.border_color = color
                 }
             }
+            "border-top-color" | "borderTopColor" => {
+                self.inner.border_top_color = Color::from_css(value)
+            }
+            "border-right-color" | "borderRightColor" => {
+                self.inner.border_right_color = Color::from_css(value)
+            }
+            "border-bottom-color" | "borderBottomColor" => {
+                self.inner.border_bottom_color = Color::from_css(value)
+            }
+            "border-left-color" | "borderLeftColor" => {
+                self.inner.border_left_color = Color::from_css(value)
+            }
             "border" => apply_border_shorthand(&mut self.inner, value),
+            "border-top" | "borderTop" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Top)
+            }
+            "border-right" | "borderRight" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Right)
+            }
+            "border-bottom" | "borderBottom" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Bottom)
+            }
+            "border-left" | "borderLeft" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Left)
+            }
             "opacity" => {
                 if let Ok(v) = value.parse() {
                     self.inner.opacity = v
@@ -261,6 +329,19 @@ impl CSSStyleDeclaration {
             "align-content" | "alignContent" => {
                 self.inner.align_content = parse_align_content(value)
             }
+            "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
+            "justify-items" | "justifyItems" => self.inner.justify_items = parse_align_items(value),
+            "place-items" | "placeItems" => {
+                let mut values = value.split_whitespace();
+                if let Some(align) = values.next() {
+                    self.inner.align_items = parse_align_items(align);
+                    self.inner.justify_items = parse_align_items(values.next().unwrap_or(align));
+                }
+            }
+            "grid-template-columns" | "gridTemplateColumns" => {
+                self.inner.grid_template_columns = Some(value.trim().to_string())
+            }
+            "grid-column" | "gridColumn" => self.inner.grid_column = Some(value.trim().to_string()),
 
             // Outline
             "outline-width" | "outlineWidth" => {
@@ -307,6 +388,16 @@ impl CSSStyleDeclaration {
             }
             "align-items" | "alignItems" => format!("{:?}", self.inner.align_items).to_lowercase(),
             "overflow" => format!("{:?}", self.inner.overflow).to_lowercase(),
+            "overflow-x" | "overflowX" => {
+                format!("{:?}", self.inner.resolved_overflow_x()).to_lowercase()
+            }
+            "overflow-y" | "overflowY" => {
+                format!("{:?}", self.inner.resolved_overflow_y()).to_lowercase()
+            }
+            "box-sizing" | "boxSizing" => match self.inner.box_sizing {
+                BoxSizing::ContentBox => "content-box".to_string(),
+                BoxSizing::BorderBox => "border-box".to_string(),
+            },
             "will-change" | "willChange" => will_change_to_css(&self.inner.will_change),
             "contain" => contain_to_css(self.inner.contain),
             "filter" => self
@@ -345,7 +436,106 @@ fn parse_edge_spacing(value: &str, edge: SafeAreaEdge, css_edge: &str) -> Option
             keyboard_inset: false,
         });
     }
+    parse_spacing(value)
+}
+
+fn parse_edge_shorthand(value: &str) -> Option<Edges> {
+    let parts: Vec<Spacing> = split_css_whitespace(value)
+        .iter()
+        .map(|part| parse_spacing(part))
+        .collect::<Option<_>>()?;
+    let (top, right, bottom, left) = match parts.as_slice() {
+        [all] => (*all, *all, *all, *all),
+        [vertical, horizontal] => (*vertical, *horizontal, *vertical, *horizontal),
+        [top, horizontal, bottom] => (*top, *horizontal, *bottom, *horizontal),
+        [top, right, bottom, left] => (*top, *right, *bottom, *left),
+        _ => return None,
+    };
+    Some(Edges {
+        top,
+        right,
+        bottom,
+        left,
+    })
+}
+
+fn parse_spacing(value: &str) -> Option<Spacing> {
+    let value = value.trim();
+    if value == "auto" {
+        return Some(Spacing::Auto);
+    }
+    for (suffix, constructor) in [
+        ("rem", Spacing::Rem as fn(f32) -> Spacing),
+        ("em", Spacing::Em),
+        ("vw", Spacing::Vw),
+        ("dvh", Spacing::Vh),
+        ("svh", Spacing::Vh),
+        ("lvh", Spacing::Vh),
+        ("vh", Spacing::Vh),
+        ("%", Spacing::Percent),
+    ] {
+        if let Some(number) = value.strip_suffix(suffix)
+            && let Ok(number) = number.trim().parse()
+        {
+            return Some(constructor(number));
+        }
+    }
     parse_px(value).map(Spacing::Px)
+}
+
+fn apply_flex_shorthand(style: &mut Style, value: &str) {
+    let value = value.trim();
+    match value {
+        "none" => {
+            style.flex_grow = 0.0;
+            style.flex_shrink = 0.0;
+            style.flex_basis = Dimension::Auto;
+            return;
+        }
+        "auto" => {
+            style.flex_grow = 1.0;
+            style.flex_shrink = 1.0;
+            style.flex_basis = Dimension::Auto;
+            return;
+        }
+        "initial" => {
+            style.flex_grow = 0.0;
+            style.flex_shrink = 1.0;
+            style.flex_basis = Dimension::Auto;
+            return;
+        }
+        _ => {}
+    }
+
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if let [grow] = parts.as_slice()
+        && let Ok(grow) = grow.parse::<f32>()
+    {
+        style.flex_grow = grow;
+        style.flex_shrink = 1.0;
+        style.flex_basis = Dimension::Percent(0.0);
+        return;
+    }
+    if let [grow, second] = parts.as_slice()
+        && let Ok(grow) = grow.parse::<f32>()
+    {
+        style.flex_grow = grow;
+        if let Ok(shrink) = second.parse::<f32>() {
+            style.flex_shrink = shrink;
+            style.flex_basis = Dimension::Percent(0.0);
+        } else {
+            style.flex_shrink = 1.0;
+            style.flex_basis = parse_dimension(second);
+        }
+        return;
+    }
+    if let [grow, shrink, basis] = parts.as_slice()
+        && let (Ok(grow), Ok(shrink)) = (grow.parse::<f32>(), shrink.parse::<f32>())
+    {
+        style.flex_grow = grow;
+        style.flex_shrink = shrink;
+        style.flex_basis = parse_dimension(basis);
+    }
 }
 
 impl Default for CSSStyleDeclaration {
@@ -497,7 +687,11 @@ fn parse_dimension(value: &str) -> Dimension {
     {
         return Dimension::Vw(n);
     }
-    if let Some(n) = v.strip_suffix("vh")
+    if let Some(n) = v
+        .strip_suffix("dvh")
+        .or_else(|| v.strip_suffix("svh"))
+        .or_else(|| v.strip_suffix("lvh"))
+        .or_else(|| v.strip_suffix("vh"))
         && let Ok(n) = n.trim().parse()
     {
         return Dimension::Vh(n);
@@ -565,6 +759,44 @@ fn apply_border_shorthand(style: &mut Style, value: &str) {
             style.border_width = width;
         } else if let Some(color) = Color::from_css(&part) {
             style.border_color = color;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BorderSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+fn apply_border_side_shorthand(style: &mut Style, value: &str, side: BorderSide) {
+    let mut width = None;
+    let mut color = None;
+    for part in split_css_whitespace(value) {
+        if let Some(parsed) = parse_px(&part) {
+            width = Some(parsed);
+        } else if let Some(parsed) = Color::from_css(&part) {
+            color = Some(parsed);
+        }
+    }
+    match side {
+        BorderSide::Top => {
+            style.border_top_width = width;
+            style.border_top_color = color;
+        }
+        BorderSide::Right => {
+            style.border_right_width = width;
+            style.border_right_color = color;
+        }
+        BorderSide::Bottom => {
+            style.border_bottom_width = width;
+            style.border_bottom_color = color;
+        }
+        BorderSide::Left => {
+            style.border_left_width = width;
+            style.border_left_color = color;
         }
     }
 }
@@ -880,5 +1112,81 @@ mod tests {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("background", value);
         assert_eq!(declaration.inner.background_image.as_deref(), Some(value));
+    }
+
+    #[test]
+    fn box_edge_shorthands_expand_like_css() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("padding", "12px 14px");
+        declaration.set_property("margin", "1px 2px 3px 4px");
+        assert_eq!(
+            declaration.inner.padding,
+            Edges {
+                top: Spacing::Px(12.0),
+                right: Spacing::Px(14.0),
+                bottom: Spacing::Px(12.0),
+                left: Spacing::Px(14.0),
+            }
+        );
+        assert_eq!(
+            declaration.inner.margin,
+            Edges {
+                top: Spacing::Px(1.0),
+                right: Spacing::Px(2.0),
+                bottom: Spacing::Px(3.0),
+                left: Spacing::Px(4.0),
+            }
+        );
+    }
+
+    #[test]
+    fn modern_box_model_values_match_css_semantics() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("box-sizing", "border-box");
+        declaration.set_property("margin", "1rem auto 12px 5%");
+        declaration.set_property("gap", "8px 16px");
+        declaration.set_property("flex", "1 0%");
+        declaration.set_property("overflow-x", "hidden");
+        declaration.set_property("overflow-y", "auto");
+        declaration.set_property("border-left", "4px solid #e74c3c");
+
+        assert_eq!(declaration.inner.box_sizing, BoxSizing::BorderBox);
+        assert_eq!(declaration.inner.margin.top, Spacing::Rem(1.0));
+        assert_eq!(declaration.inner.margin.right, Spacing::Auto);
+        assert_eq!(declaration.inner.margin.bottom, Spacing::Px(12.0));
+        assert_eq!(declaration.inner.margin.left, Spacing::Percent(5.0));
+        assert_eq!(declaration.inner.row_gap, Some(8.0));
+        assert_eq!(declaration.inner.column_gap, Some(16.0));
+        assert_eq!(declaration.inner.flex_grow, 1.0);
+        assert_eq!(declaration.inner.flex_shrink, 1.0);
+        assert_eq!(declaration.inner.flex_basis, Dimension::Percent(0.0));
+        assert_eq!(declaration.inner.resolved_overflow_x(), Overflow::Hidden);
+        assert_eq!(declaration.inner.resolved_overflow_y(), Overflow::Auto);
+        assert_eq!(declaration.inner.border_left_width, Some(4.0));
+        assert_eq!(
+            declaration.inner.border_left_color,
+            Some(Color::rgb(231, 76, 60))
+        );
+    }
+
+    #[test]
+    fn flex_shorthand_sets_grow_shrink_and_basis() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("flex", "1");
+        assert_eq!(declaration.inner.flex_grow, 1.0);
+        assert_eq!(declaration.inner.flex_shrink, 1.0);
+        assert_eq!(declaration.inner.flex_basis, Dimension::Percent(0.0));
+
+        declaration.set_property("flex", "0 0 auto");
+        assert_eq!(declaration.inner.flex_grow, 0.0);
+        assert_eq!(declaration.inner.flex_shrink, 0.0);
+        assert_eq!(declaration.inner.flex_basis, Dimension::Auto);
+    }
+
+    #[test]
+    fn dynamic_viewport_height_uses_viewport_units() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("height", "100dvh");
+        assert_eq!(declaration.inner.height, Dimension::Vh(100.0));
     }
 }

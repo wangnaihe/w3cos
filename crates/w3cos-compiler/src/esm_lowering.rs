@@ -2,7 +2,8 @@
 //!
 //! This module takes SWC `Stmt` and `Expr` nodes and produces equivalent Rust
 //! source text. It is intentionally a "best effort" structural lowering: JS
-//! semantics that have no Rust equivalent emit a `todo!()` with a comment.
+//! semantics that have no Rust equivalent return an explicit unsupported
+//! value instead of panicking in generated code.
 
 use std::collections::HashSet;
 use swc_ecma_ast::*;
@@ -1631,10 +1632,9 @@ impl LowerCtx {
                         // unshadowed they resolve (below) to the
                         // w3cos_core::collections class values and go through
                         // class::construct like any other class.
-                        if matches!(resolved.as_str(), "Error" | "ResizeObserver") {
+                        if resolved == "Error" {
                             // `Error::new` returns the struct — unwrap the Value.
-                            let unwrap = if resolved == "Error" { ".0" } else { "" };
-                            return format!("{resolved}::new(vec![{args}]){unwrap}");
+                            return format!("{resolved}::new(vec![{args}]).0");
                         }
                         // Unshadowed globals with dedicated core constructors.
                         if !self.is_name_shadowed(name) {
@@ -2499,7 +2499,10 @@ impl LowerCtx {
             }
             Expr::JSXElement(element) => self.lower_jsx_element(element),
             Expr::JSXFragment(fragment) => self.lower_jsx_children(&fragment.children),
-            _ => format!("todo!(\"lower: {}\")", expr_kind_name(expr)),
+            _ => format!(
+                "w3cos_runtime::unsupported::error_value(\"JavaScript expression: {}\")",
+                expr_kind_name(expr)
+            ),
         }
     }
 
@@ -2890,6 +2893,9 @@ impl LowerCtx {
                     wtf8_to_string(&value.exp),
                     wtf8_to_string(&value.flags)
                 ),
+                Lit::BigInt(value) => {
+                    format!("w3cos_core::bigint::parse({:?})", value.value.to_string())
+                }
                 _ => "w3cos_core::Value::Undefined".to_string(),
             };
         }
@@ -4300,6 +4306,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         // class value and goes through class::construct.
         "Map" => "w3cos_core::collections::map_class()".to_string(),
         "RegExp" => "w3cos_core::regexp::regexp_class()".to_string(),
+        "BigInt" => "w3cos_core::bigint::bigint_class()".to_string(),
         // `Array` as a value: callable facade — calling it mirrors the
         // `new Array` semantics (single numeric arg = length); the statics
         // implemented by the core builtin (currently `from`) are installed as
@@ -4321,6 +4328,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         }
         // Property globals: read off the jsdom window singleton.
         "navigator" | "localStorage" | "sessionStorage" | "indexedDB" | "IDBKeyRange" | "performance" | "location"
+        | "visualViewport"
         | "screen" | "crypto" | "navigation" | "reportError" | "setImmediate"
         | "MessageChannel" | "__REACT_DEVTOOLS_GLOBAL_HOOK__" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
@@ -4330,7 +4338,8 @@ fn global_value_expr(name: &str) -> Option<String> {
         // goes through the normal `Value::call` path).
         "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval" | "checkDCE"
         | "requestAnimationFrame" | "cancelAnimationFrame" | "queueMicrotask"
-        | "matchMedia" | "getComputedStyle" | "getSelection" => {
+        | "matchMedia" | "getComputedStyle" | "getSelection" | "scrollTo"
+        | "scrollBy" | "scroll" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
         }
         "atob" => {
@@ -4366,9 +4375,24 @@ fn global_value_expr(name: &str) -> Option<String> {
         // `Set` as a value: the real ES6 Set class (see Map above);
         // `new Set(...)` routes through class::construct on this class value.
         "Set" => "w3cos_core::collections::set_class()".to_string(),
-        // Weak collections: no weak semantics in v1 — they alias Map/Set.
+        // Weak collections and references use Rust weak pointers.
         "WeakMap" => "w3cos_core::collections::weak_map_class()".to_string(),
         "WeakSet" => "w3cos_core::collections::weak_set_class()".to_string(),
+        "WeakRef" => "w3cos_core::weak::weak_ref_class()".to_string(),
+        "FinalizationRegistry" => {
+            "w3cos_core::weak::finalization_registry_class()".to_string()
+        }
+        "SharedArrayBuffer" => {
+            "w3cos_core::binary::shared_array_buffer_class()".to_string()
+        }
+        "Atomics" => "w3cos_core::binary::atomics_value()".to_string(),
+        "ArrayBuffer" => "w3cos_core::binary::array_buffer_class()".to_string(),
+        "DataView" => "w3cos_core::binary::data_view_class()".to_string(),
+        "Uint8Array" | "Uint8ClampedArray" | "Int8Array" | "Uint16Array"
+        | "Int16Array" | "Uint32Array" | "Int32Array" | "Float32Array"
+        | "Float64Array" | "BigInt64Array" | "BigUint64Array" => {
+            format!("w3cos_core::binary::typed_array_class({name:?})")
+        }
         // Dynamic Proxy constructor backed by w3cos-core's proxy traps.
         "Proxy" => "w3cos_core::proxy_class()".to_string(),
         "Date" => "w3cos_core::web::date_class()".to_string(),
@@ -4378,16 +4402,39 @@ fn global_value_expr(name: &str) -> Option<String> {
         }
         "Request" | "Response" | "Headers" | "AbortController" | "AbortSignal"
         | "TextEncoder" | "TextDecoder" | "Event" | "CustomEvent" | "EventTarget"
+        | "UIEvent" | "MouseEvent" | "KeyboardEvent" | "PointerEvent" | "WheelEvent"
+        | "FocusEvent" | "InputEvent" | "CompositionEvent" | "ClipboardEvent"
+        | "DragEvent" | "TouchEvent" | "AnimationEvent" | "TransitionEvent" | "ErrorEvent"
+        | "ProgressEvent"
+        | "MessageEvent"
         | "Node" | "Element" | "HTMLElement" | "HTMLAnchorElement" | "HTMLDivElement"
         | "HTMLSpanElement" | "HTMLButtonElement" | "HTMLInputElement"
         | "HTMLTextAreaElement" | "HTMLSelectElement" | "HTMLFormElement"
         | "HTMLImageElement" | "HTMLVideoElement" | "HTMLCanvasElement" | "SVGElement"
-        | "DocumentFragment" | "Range" | "Selection" => {
+        | "SVGSVGElement" | "SVGGElement" | "SVGPathElement" | "SVGRectElement"
+        | "SVGCircleElement" | "SVGEllipseElement" | "SVGLineElement"
+        | "SVGPolylineElement" | "SVGPolygonElement" | "SVGTextElement"
+        | "SVGDefsElement" | "SVGUseElement"
+        | "DocumentFragment" | "Range" | "Selection"
+        | "Blob" | "File" | "FileReader" | "FormData"
+        | "ImageData" | "Path2D" | "OffscreenCanvas" | "ResizeObserver"
+        | "MutationObserver" | "IntersectionObserver" | "PerformanceObserver"
+        | "EventSource" | "XMLHttpRequest" | "Notification" | "ClipboardItem"
+        | "DataTransfer" | "Worker" | "SharedWorker" | "MessagePort"
+        | "SpeechRecognition" | "webkitSpeechRecognition" | "MediaStream"
+        | "MediaStreamTrack" | "MediaDeviceInfo" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
         }
-        "Uint8Array" | "Uint8ClampedArray" | "Int8Array" | "Uint16Array" | "Int16Array"
-        | "Uint32Array" | "Int32Array" | "Float32Array" | "Float64Array" | "BigInt64Array"
-        | "BigUint64Array" => "w3cos_core::collections::typed_array_class()".to_string(),
+        "DOMException"
+        | "DOMRect" | "DOMPoint" | "DOMMatrix" | "Report" | "Function"
+        | "ShadowRoot" | "NodeList" | "CSSStyleDeclaration" | "DOMParser"
+        | "XMLSerializer" | "CSSStyleSheet" | "eval"
+        | "escape" | "unescape" | "CSS" => {
+            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+        }
+        "encodeURI" | "encodeURIComponent" | "decodeURI" | "decodeURIComponent" => {
+            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+        }
         // `Reflect` facade: `Reflect.construct(target, args)` routes through
         // the class runtime (Monaco's InstantiationService._createInstance
         // builds every service through it). The optional newTarget argument
@@ -4400,22 +4447,8 @@ fn global_value_expr(name: &str) -> Option<String> {
         // Unimplemented builtin globals: harmless empty-object stubs keep
         // references total (`new X()` yields Undefined via construct on a
         // non-callable; `X.y` yields Undefined).
-        "BigInt" | "ArrayBuffer" | "SharedArrayBuffer" | "DataView"
-        | "WeakRef" | "FinalizationRegistry" | "Atomics" | "eval"
-        | "encodeURI" | "encodeURIComponent" | "decodeURI" | "decodeURIComponent" | "escape"
-        | "unescape" | "FormData" | "MessagePort" | "Worker"
-        | "ImageData" | "OffscreenCanvas" | "Path2D" | "DOMRect" | "DOMPoint" | "DOMMatrix"
-        | "MutationObserver" | "IntersectionObserver" | "PerformanceObserver" | "Report"
-        // DOM constructors / event types (instanceof degrades to false).
-        | "Function"
-        | "ShadowRoot" | "NodeList" | "CSSStyleDeclaration" | "MouseEvent" | "KeyboardEvent"
-        | "PointerEvent" | "WheelEvent" | "FocusEvent" | "InputEvent" | "ClipboardEvent"
-        | "DragEvent" | "TouchEvent" | "AnimationEvent" | "TransitionEvent" | "ErrorEvent"
-        | "EventSource" | "XMLHttpRequest" | "Blob" | "File" | "FileReader"
-        | "ClipboardItem" | "DataTransfer" | "DOMException"
-        | "DOMParser" | "XMLSerializer" | "CSS" | "CSSStyleSheet"
         // URL constructors are handled at `new` sites; bare values are stubs.
-        | "URL" | "URLSearchParams"
+        "URL" | "URLSearchParams"
         // CommonJS/Node artifacts that appear in UMD-wrapped sources.
         | "require" | "module" | "exports" | "process" | "global" | "Buffer" | "__dirname"
         | "__filename"
@@ -5969,12 +6002,12 @@ function f(window) { return window.x; }"#,
     }
 
     #[test]
-    fn typed_array_globals_use_runtime_storage() {
+    fn typed_array_globals_use_core_backing_storage() {
         let stmts = parse_stmts("const lines = new Uint16Array(4); lines.set([0, 2], 0);");
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::collections::typed_array_class()")
+            code.contains("w3cos_core::binary::typed_array_class(\"Uint16Array\")")
                 && code.contains("call_method(\"set\""),
             "typed arrays need indexed runtime storage: {code}"
         );

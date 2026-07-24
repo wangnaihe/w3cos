@@ -348,7 +348,7 @@ impl Element {
     /// document's style arena (CSS cascade is not yet fully implemented).
     /// Returns a clone so callers can read properties without borrowing the doc.
     pub fn get_computed_style(&self, doc: &Document) -> crate::css_style::CSSStyleDeclaration {
-        doc.get_style(self.id).clone()
+        crate::css_style::CSSStyleDeclaration::from_style(doc.computed_style_for(self.id))
     }
 
     /// W3C `Element.scrollTop` / `scrollLeft` — scroll position.

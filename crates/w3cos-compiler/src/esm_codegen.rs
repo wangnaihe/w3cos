@@ -447,7 +447,10 @@ fn generate_module_with_bodies(
                     false,
                 )
                 .unwrap_or_else(|| {
-                    format!("        todo!(\"body not found: {}\");", sym.original_name)
+                    format!(
+                        "        return w3cos_runtime::unsupported::error_value(\"function body missing: {}\");",
+                        sym.original_name
+                    )
                 });
                 let callable_body = find_function(
                     &functions,
@@ -2686,7 +2689,90 @@ export function jsonRoundtrip() {
 }
 export function base64() { return atob("aGk=") + btoa("!"); }
 export function cloneObj() { const c = structuredClone({ x: 7 }); return c.x; }
-export function urlParts() { return new URL("https://example.com/x").hostname; }"#,
+export function urlParts() { return new URL("https://example.com/x").hostname; }
+export function weakShape() {
+  const key = {};
+  const token = {};
+  const map = new WeakMap([[key, 7]]);
+  const set = new WeakSet([key]);
+  const ref = new WeakRef(key);
+  const registry = new FinalizationRegistry(() => {});
+  registry.register(key, "held", token);
+  return map.get(key) + ":" + map.has(key) + ":" + set.has(key) + ":" +
+    (ref.deref() === key) + ":" + registry.unregister(token) + ":" +
+    typeof registry.cleanupSome;
+}
+export function atomicsShape() {
+  const buffer = new SharedArrayBuffer(16);
+  const words = new Int32Array(buffer);
+  Atomics.store(words, 0, 5);
+  const previous = Atomics.add(words, 0, 3);
+  const exchanged = Atomics.compareExchange(words, 0, 8, 11);
+  const waited = Atomics.wait(words, 0, 99, 0);
+  return typeof SharedArrayBuffer + ":" + typeof Atomics + ":" +
+    buffer.byteLength + ":" + ArrayBuffer.isView(words) + ":" +
+    previous + ":" + exchanged + ":" + Atomics.load(words, 0) + ":" +
+    waited + ":" + Atomics.isLockFree(4);
+}
+export function bigintShape() {
+  const base = 9007199254740993n;
+  const computed = (base + BigInt("7")) * 2n;
+  let mixed = "";
+  try {
+    base + 1;
+  } catch (caught) {
+    mixed = caught.name;
+  }
+  const shifted = (5n << 2n) | 1n;
+  return typeof base + ":" + base + ":" + computed + ":" + (2n ** 10n) + ":" +
+    shifted + ":" + (-5n / 2n) + ":" +
+    (base === BigInt("9007199254740993")) + ":" + mixed + ":" +
+    BigInt("255").toString(16);
+}
+export function regexpShape() {
+  const regex = new RegExp("(?<word>[a-z]+)", "gi");
+  const matched = regex.exec("12Ab");
+  const copied = new RegExp(regex, "m");
+  let error = "";
+  try {
+    new RegExp("[", "");
+  } catch (caught) {
+    error = caught.name;
+  }
+  const replaced = "a1 b22".replace(/([0-9]+)/g, (full, digits, index) => {
+    return digits + "@" + index;
+  });
+  const tokens = "abc123xyz".replace(
+    new RegExp("(?<digits>[0-9]+)"),
+    "[$$][$&][$`][$'][$<digits>][$1]"
+  );
+  const matches = "a1b2".matchAll(new RegExp("(?<digit>[0-9])", "g"));
+  const first = matches.next().value;
+  const second = matches.next().value;
+  const done = matches.next().done;
+  const split = "a,b;c".split(/([,;])/, 4);
+  let matchAllError = "";
+  try {
+    "a".matchAll(/a/);
+  } catch (caught) {
+    matchAllError = caught.name;
+  }
+  const indexed = new RegExp("(?<face>😀)(x)?", "igd").exec("a😀x");
+  const looked = new RegExp("(?<=\\$)(\\d+)(?= USD)").exec("$42 USD");
+  const repeated = new RegExp("^(\\w+)\\s+\\1$").test("same same");
+  const unicodeSet = new RegExp("[\\p{ASCII}&&\\p{Letter}]+", "v").exec("éabc");
+  const stringSet = new RegExp("[\\q{ab|cd}]", "v").test("cd");
+  return regex.source + ":" + regex.flags + ":" + regex.global + ":" +
+    regex.ignoreCase + ":" + matched.groups.word + ":" + matched.index + ":" +
+    regex.lastIndex + ":" + copied.flags + ":" + "😀 Ab".search(/Ab/) + ":" +
+    error + ":" + regex.toString() + ":" + replaced + ":" + tokens + ":" +
+    first.groups.digit + ":" + first.index + ":" + second.groups.digit + ":" +
+    second.index + ":" + done + ":" + split.join("|") + ":" + matchAllError + ":" +
+    indexed.indices[0][0] + ":" + indexed.indices[0][1] + ":" +
+    indexed.indices.groups.face[1] + ":" + looked[1] + ":" + repeated + ":" +
+    unicodeSet[0] + ":" + unicodeSet.input.length + ":" +
+    new RegExp("x", "v").unicodeSets + ":" + stringSet;
+}"#,
         )
         .unwrap();
 
@@ -2725,6 +2811,26 @@ fn main() {
     assert!(matches!(r, w3cos_core::Value::Number(n) if n == 7.0), "structuredClone: {r:?}");
     let r = m0::m0_urlParts(vec![]);
     assert!(matches!(&r, w3cos_core::Value::String(s) if s == "example.com"), "URL: {r:?}");
+    let r = m0::m0_weakShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "7:true:true:true:true:function"),
+        "WeakMap, WeakSet, WeakRef, and FinalizationRegistry: {r:?}"
+    );
+    let r = m0::m0_atomicsShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:object:16:true:5:8:11:not-equal:true"),
+        "SharedArrayBuffer and Atomics: {r:?}"
+    );
+    let r = m0::m0_bigintShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "bigint:9007199254740993:18014398509482000:1024:21:-2:true:TypeError:ff"),
+        "BigInt literals, constructor, arithmetic, shifts, equality, and errors: {r:?}"
+    );
+    let r = m0::m0_regexpShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "(?<word>[a-z]+):gi:true:true:Ab:2:4:m:3:SyntaxError:/(?<word>[a-z]+)/gi:a1@1 b22@4:abc[$][123][abc][xyz][123][123]xyz:1:1:2:3:true:a|,|b|;:TypeError:1:4:3:42:true:abc:4:true:true"),
+        "RegExp constructor, metadata, named groups, search, and errors: {r:?}"
+    );
     println!("W3COS_GLOBALS_CORE_E2E_OK");
 }
 "#
@@ -2843,6 +2949,210 @@ export function textEncodingShape() {
     encoded[2] + ":" + encoded[3] + ":" + progress.read + ":" + progress.written + ":" +
     destination[0] + ":" + destination[1];
 }
+export function binaryViewShape() {
+  const buffer = new ArrayBuffer(8);
+  const bytes = new Uint8Array(buffer);
+  const words = new Uint16Array(buffer, 2, 2);
+  bytes[2] = 0x34;
+  bytes[3] = 0x12;
+  const view = new DataView(buffer);
+  view.setUint16(4, 0xabcd);
+  const sliced = buffer.slice(2, 6);
+  const bigBuffer = new ArrayBuffer(8);
+  const bigWords = new BigInt64Array(bigBuffer);
+  bigWords[0] = -2n;
+  const bigView = new DataView(bigBuffer);
+  return typeof ArrayBuffer + ":" + typeof DataView + ":" +
+    (window.Uint8Array === Uint8Array) + ":" + buffer.byteLength + ":" +
+    bytes.byteLength + ":" + words.byteOffset + ":" + words.byteLength + ":" +
+    words[0] + ":" + bytes[4] + ":" + bytes[5] + ":" +
+    view.getUint16(4) + ":" + sliced.byteLength + ":" +
+    (bytes instanceof Uint8Array) + ":" + (words instanceof Uint16Array) + ":" +
+    ArrayBuffer.isView(view) + ":" + Uint16Array.BYTES_PER_ELEMENT + ":" +
+    typeof bigWords[0] + ":" + bigWords[0] + ":" + bigView.getBigInt64(0, true);
+}
+export function sharedWindowShape() {
+  return (window.SharedArrayBuffer === SharedArrayBuffer) + ":" +
+    (window.Atomics === Atomics) + ":" + typeof Atomics.load;
+}
+export function fileApiShape() {
+  const blob = new Blob(["hello", new Uint8Array([32, 119, 111, 114, 108, 100])], {
+    type: "Text/Plain"
+  });
+  const file = new File([blob], "note.txt", { type: "text/plain", lastModified: 123 });
+  const reader = new FileReader();
+  let events = "";
+  reader.onload = () => { events += "L"; };
+  reader.onloadend = () => { events += "E"; };
+  reader.readAsText(file);
+  return typeof Blob + ":" + typeof File + ":" + typeof FileReader + ":" +
+    (window.Blob === Blob) + ":" + blob.size + ":" + blob.type + ":" + blob.text() + ":" +
+    file.name + ":" + file.lastModified + ":" + reader.result + ":" + reader.readyState + ":" +
+    events + ":" + blob.slice(6).text() + ":" + (file instanceof File) + ":" +
+    (file instanceof Blob) + ":" + (reader instanceof FileReader) + ":" +
+    (reader instanceof EventTarget);
+}
+export function formDataShape() {
+  const form = new FormData();
+  form.append("tag", "a");
+  form.append("tag", "b");
+  form.set("title", "hello");
+  form.append("file", new File(["data"], "a.txt", { type: "text/plain" }));
+  const entries = form.entries();
+  const request = new Request("https://example.test/upload", { method: "POST", body: form });
+  return typeof FormData + ":" + (window.FormData === FormData) + ":" +
+    (form instanceof FormData) + ":" + form.get("tag") + ":" + form.getAll("tag").length + ":" +
+    form.has("title") + ":" + entries.length + ":" + entries[0][0] + ":" + entries[3][1].name + ":" +
+    request.headers.get("content-type").startsWith("multipart/form-data; boundary=") + ":" +
+    request.text().includes('filename="a.txt"');
+}
+export function canvasObjectShape() {
+  const pixels = new ImageData(2, 3);
+  pixels.data[0] = 255;
+  const copied = new ImageData(pixels.data, 2);
+  const path = new Path2D();
+  path.rect(0, 0, 2, 2);
+  const pathCopy = new Path2D(path);
+  const canvas = new OffscreenCanvas(4, 5);
+  const context = canvas.getContext("2d");
+  context.fill(pathCopy);
+  const blob = canvas.convertToBlob();
+  const bitmap = canvas.transferToImageBitmap();
+  return typeof ImageData + ":" + typeof Path2D + ":" + typeof OffscreenCanvas + ":" +
+    (pixels instanceof ImageData) + ":" + (pixels.data instanceof Uint8ClampedArray) + ":" +
+    pixels.data.length + ":" + copied.height + ":" + (pathCopy instanceof Path2D) + ":" +
+    (canvas instanceof OffscreenCanvas) + ":" + canvas.width + ":" + canvas.height + ":" +
+    typeof context.fillRect + ":" + blob.type + ":" + bitmap.width + ":" + bitmap.height;
+}
+export function observerShape() {
+  const resize = new ResizeObserver(() => {});
+  const mutation = new MutationObserver(() => {});
+  let intersectionCount = 0;
+  const intersection = new IntersectionObserver((entries) => {
+    intersectionCount = entries.length;
+  }, { threshold: [0, 0.5] });
+  intersection.observe(document.createElement("div"));
+  let performanceCount = -1;
+  const performanceObserver = new PerformanceObserver((list) => {
+    performanceCount = list.getEntries().length;
+  });
+  performanceObserver.observe({ entryTypes: ["mark"] });
+  return typeof ResizeObserver + ":" + typeof MutationObserver + ":" +
+    typeof IntersectionObserver + ":" + typeof PerformanceObserver + ":" +
+    (window.ResizeObserver === ResizeObserver) + ":" +
+    (resize instanceof ResizeObserver) + ":" + typeof resize.observe + ":" +
+    (mutation instanceof MutationObserver) + ":" + mutation.takeRecords().length + ":" +
+    (intersection instanceof IntersectionObserver) + ":" + intersection.thresholds.length + ":" +
+    intersectionCount + ":" + (performanceObserver instanceof PerformanceObserver) + ":" +
+    performanceCount + ":" + PerformanceObserver.supportedEntryTypes.length;
+}
+export function browserServiceShape() {
+  const values = new Uint8Array(8);
+  crypto.getRandomValues(values);
+  const uuid = crypto.randomUUID();
+  const item = new ClipboardItem({ "text/plain": new Blob(["clip"], { type: "text/plain" }) });
+  const transfer = new DataTransfer();
+  transfer.setData("text/plain", "drag");
+  let fullscreenEvents = 0;
+  document.addEventListener("fullscreenchange", () => { fullscreenEvents += 1; });
+  const div = document.createElement("div");
+  div.style.fontSize = "17px";
+  div.requestFullscreen();
+  const entered = document.fullscreenElement === div;
+  document.exitFullscreen();
+  let orientationEvents = 0;
+  screen.orientation.addEventListener("change", () => { orientationEvents += 1; });
+  screen.orientation.lock("portrait-primary");
+  let viewportScrolls = 0;
+  visualViewport.addEventListener("scroll", () => { viewportScrolls += 1; });
+  scrollTo(4, 6);
+  document.cookie = "one=1; Path=/";
+  document.cookie = "two=2";
+  return typeof EventSource + ":" + EventSource.CONNECTING + ":" +
+    typeof XMLHttpRequest + ":" + XMLHttpRequest.DONE + ":" +
+    typeof Notification.requestPermission + ":" + Notification.permission + ":" +
+    uuid.length + ":" + values.length + ":" + ClipboardItem.supports("text/plain") + ":" +
+    item.types.length + ":" + item.getType("text/plain").text() + ":" +
+    transfer.getData("text/plain") + ":" + transfer.types.length + ":" +
+    entered + ":" + fullscreenEvents + ":" + (document.fullscreenElement === null) + ":" +
+    screen.orientation.type + ":" + screen.orientation.angle + ":" + orientationEvents + ":" +
+    visualViewport.pageLeft + ":" + visualViewport.pageTop + ":" + viewportScrolls + ":" +
+    getComputedStyle(div).fontSize + ":" + document.cookie;
+}
+export function unsupportedShape() {
+  const parser = new DOMParser();
+  const exception = new DOMException("bad data", "DataError");
+  return typeof DOMParser + ":" + DOMParser.supported + ":" + parser.name + ":" +
+    parser.api + ":" + typeof DOMException + ":" + (exception instanceof DOMException) + ":" +
+    exception.name + ":" + exception.message + ":" + typeof BigInt + ":" + BigInt.supported;
+}
+export function weakWindowShape() {
+  return (window.WeakMap === WeakMap) + ":" + (window.WeakSet === WeakSet) + ":" +
+    (window.WeakRef === WeakRef) + ":" +
+    (window.FinalizationRegistry === FinalizationRegistry);
+}
+let speechLog = "";
+export function speechShape() {
+  const recognition = new SpeechRecognition();
+  recognition.onerror = (event) => { speechLog += event.error; };
+  recognition.onend = () => { speechLog += ":end"; };
+  recognition.start();
+  return typeof SpeechRecognition + ":" +
+    (SpeechRecognition === webkitSpeechRecognition) + ":" +
+    (recognition instanceof SpeechRecognition) + ":" +
+    recognition.lang + ":" + recognition.maxAlternatives;
+}
+export function getSpeechLog() { return speechLog; }
+let geoLog = "";
+export function geolocationShape() {
+  const geo = navigator.geolocation;
+  geo.getCurrentPosition((position) => {
+    geoLog = position.coords.latitude + ":" + position.coords.longitude + ":" +
+      position.coords.accuracy + ":" + position.coords.altitude + ":" +
+      (position.timestamp > 0);
+  }, (error) => { geoLog = "error:" + error.code; }, { maximumAge: 1000 });
+  const watch = geo.watchPosition(() => { geoLog += ":watch"; });
+  geo.clearWatch(watch);
+  return typeof geo + ":" + typeof geo.getCurrentPosition + ":" +
+    typeof geo.watchPosition + ":" + typeof geo.clearWatch + ":" + (watch > 0);
+}
+export function getGeoLog() { return geoLog; }
+let mediaLog = "";
+export function mediaDevicesShape() {
+  const media = navigator.mediaDevices;
+  media.enumerateDevices().then((devices) => { mediaLog = "" + devices.length; });
+  media.getUserMedia({ audio: true, video: true }).then((stream) => {
+    const tracks = stream.getTracks();
+    mediaLog += ":" + tracks.length + ":" + stream.getAudioTracks().length + ":" +
+      stream.getVideoTracks().length + ":" + (stream instanceof MediaStream) + ":" +
+      (tracks[0] instanceof MediaStreamTrack);
+    tracks[0].stop();
+    tracks[1].stop();
+    mediaLog += ":" + stream.active;
+  });
+  return typeof media + ":" + typeof media.enumerateDevices + ":" +
+    typeof media.getUserMedia + ":" + typeof MediaStream + ":" +
+    typeof MediaStreamTrack + ":" + typeof MediaDeviceInfo;
+}
+export function getMediaLog() { return mediaLog; }
+let workerLog = "";
+export function workerShape() {
+  const channel = new MessageChannel();
+  let channelLog = "";
+  channel.port2.onmessage = (event) => { channelLog = event.data; };
+  channel.port1.postMessage("channel");
+  const shared = new SharedWorker("echo");
+  let sharedLog = "";
+  shared.port.onmessage = (event) => { sharedLog = event.data; };
+  shared.port.postMessage("shared");
+  const worker = new Worker("echo");
+  worker.onmessage = (event) => { workerLog = event.data.value; worker.terminate(); };
+  worker.postMessage({ value: "worker" });
+  return typeof Worker + ":" + typeof SharedWorker + ":" + typeof MessageChannel + ":" +
+    typeof MessagePort + ":" + (worker instanceof Worker) + ":" +
+    (channel.port1 instanceof MessagePort) + ":" + channelLog + ":" + sharedLog;
+}
+export function getWorkerLog() { return workerLog; }
 export function eventApiShape() {
   const target = new EventTarget();
   let log = "";
@@ -2873,6 +3183,77 @@ export function domConstructorShape() {
     (fragment instanceof Node) + ":" + typeof range.setStart + ":" +
     (range instanceof Range) + ":" + (selection instanceof Selection);
 }
+export function svgShape() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("width", "120");
+  svg.setAttribute("height", "80");
+  svg.setAttribute("viewBox", "0 0 120 80");
+  const rect = document.createElementNS(ns, "rect");
+  rect.setAttribute("x", "10");
+  rect.setAttribute("y", "12");
+  rect.setAttribute("width", "40");
+  rect.setAttribute("height", "20");
+  rect.setAttribute("fill", "red");
+  rect.setAttributeNS(null, "data-shape", "rect");
+  svg.appendChild(rect);
+  document.body.appendChild(svg);
+  const box = rect.getBBox();
+  const hadAttribute = rect.hasAttributeNS(null, "data-shape");
+  rect.removeAttributeNS(null, "data-shape");
+  const point = svg.createSVGPoint();
+  point.x = 3;
+  point.y = 4;
+  const transformed = point.matrixTransform(svg.createSVGMatrix());
+  return typeof SVGSVGElement + ":" + typeof SVGRectElement + ":" +
+    (svg instanceof SVGSVGElement) + ":" + (svg instanceof SVGElement) + ":" +
+    (rect instanceof SVGRectElement) + ":" + (rect instanceof SVGElement) + ":" +
+    svg.tagName + ":" + rect.namespaceURI + ":" + (rect.ownerSVGElement === svg) + ":" +
+    svg.width.baseVal.value + ":" + svg.viewBox.baseVal.width + ":" +
+    box.x + ":" + box.y + ":" + box.width + ":" + box.height + ":" +
+    rect.getTotalLength() + ":" + hadAttribute + ":" + rect.hasAttribute("data-shape") + ":" +
+    transformed.x + ":" + transformed.y;
+}
+export function uriCodecShape() {
+  return typeof encodeURI + ":" + (window.encodeURI === encodeURI) + ":" +
+    encodeURI("https://例子.test/a b?x=1#片") + ":" +
+    encodeURIComponent("a/b?中 文") + ":" +
+    decodeURIComponent("%E4%B8%AD%20x%2Fy") + ":" +
+    decodeURI("https://x.test/a%20b?x=1#%E7%89%87");
+}
+export function uriErrorShape() {
+  try {
+    decodeURIComponent("%GG");
+    return "missed";
+  } catch (error) {
+    return error.name;
+  }
+}
+export function eventSubclassShape() {
+  const keyboard = new KeyboardEvent("keydown", {
+    key: "K", code: "KeyK", ctrlKey: true, repeat: true
+  });
+  const pointer = new PointerEvent("pointerdown", {
+    clientX: 12, pointerId: 7, pointerType: "pen", pressure: 0.5
+  });
+  const input = new InputEvent("input", {
+    data: "x", inputType: "insertText", isComposing: true
+  });
+  const touch = new TouchEvent("touchstart");
+  const animation = new AnimationEvent("animationstart", {
+    animationName: "fade", elapsedTime: 1.25
+  });
+  return typeof KeyboardEvent + ":" + (window.KeyboardEvent === KeyboardEvent) + ":" +
+    (keyboard instanceof UIEvent) + ":" + (keyboard instanceof Event) + ":" +
+    keyboard.key + ":" + keyboard.code + ":" + keyboard.getModifierState("Control") + ":" +
+    keyboard.repeat + ":" + (pointer instanceof MouseEvent) + ":" + pointer.clientX + ":" +
+    pointer.pointerId + ":" + pointer.pointerType + ":" + pointer.pressure + ":" +
+    (input instanceof UIEvent) + ":" + input.data + ":" + input.inputType + ":" +
+    input.isComposing + ":" + input.getTargetRanges().length + ":" +
+    WheelEvent.DOM_DELTA_LINE + ":" + touch.touches.length + ":" +
+    animation.animationName + ":" + animation.elapsedTime + ":" +
+    typeof ClipboardEvent + ":" + typeof DragEvent + ":" + typeof TransitionEvent;
+}
 export function runFetch(url) {
   const headers = new Headers({ "X-Trace": "one" });
   headers.append("x-trace", "two");
@@ -2884,6 +3265,19 @@ export function runFetch(url) {
   const response = fetch(request);
   return response.status + ":" + response.headers.get("X-Reply") + ":" +
     response.json().accepted + ":" + request.method + ":" + request.headers.get("x-trace");
+}
+export function runXhr(url) {
+  const xhr = new XMLHttpRequest();
+  let events = "";
+  xhr.onload = () => { events += "L"; };
+  xhr.onloadend = () => { events += "E"; };
+  xhr.open("POST", url);
+  xhr.responseType = "json";
+  xhr.setRequestHeader("X-Xhr", "yes");
+  xhr.send('{"xhr":true}');
+  return xhr.status + ":" + xhr.response.accepted + ":" +
+    xhr.getResponseHeader("x-reply") + ":" + events + ":" +
+    (xhr instanceof XMLHttpRequest) + ":" + (xhr instanceof EventTarget);
 }"#,
         )
         .unwrap();
@@ -2904,10 +3298,11 @@ export function runFetch(url) {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let core_path = manifest_dir.join("../../crates/w3cos-core");
         let runtime_path = manifest_dir.join("../../crates/w3cos-runtime");
+        let std_path = manifest_dir.join("../../crates/w3cos-std");
         std::fs::write(
             crate_dir.join("Cargo.toml"),
             format!(
-                "[package]\nname = \"jsdom_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?}, default-features = false }}\ntungstenite = \"0.24\"\n\n[workspace]\n"
+                "[package]\nname = \"jsdom_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?}, default-features = false }}\nw3cos-std = {{ path = {std_path:?} }}\ntungstenite = \"0.24\"\n\n[workspace]\n"
             ),
         )
         .unwrap();
@@ -2955,6 +3350,116 @@ fn main() {
         matches!(&r, w3cos_core::Value::String(s) if s == "function:true:utf-8:4:65:226:156:147:1:2:195:169"),
         "TextEncoder constructor/window identity/UTF-8/encodeInto: {r:?}"
     );
+    let r = m0::m0_binaryViewShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:true:8:8:2:4:4660:171:205:43981:4:true:true:true:2:bigint:-2:-2"),
+        "ArrayBuffer/DataView/typed-array shared views: {r:?}"
+    );
+    let r = m0::m0_sharedWindowShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "true:true:function"),
+        "SharedArrayBuffer and Atomics window identity: {r:?}"
+    );
+    let r = m0::m0_fileApiShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:true:11:text/plain:hello world:note.txt:123:hello world:2:LE:world:true:true:true:true"),
+        "Blob/File/FileReader bytes, metadata, events, and prototypes: {r:?}"
+    );
+    let r = m0::m0_formDataShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:true:true:a:2:true:4:tag:a.txt:true:true"),
+        "FormData ordering, iteration, files, and Fetch multipart integration: {r:?}"
+    );
+    let r = m0::m0_canvasObjectShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:true:true:24:3:true:true:4:5:function:image/png:4:5"),
+        "ImageData, Path2D, and OffscreenCanvas constructors: {r:?}"
+    );
+    let r = m0::m0_observerShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:function:true:true:function:true:0:true:2:1:true:0:4"),
+        "observer constructors, identity, options, and callbacks: {r:?}"
+    );
+    let r = m0::m0_browserServiceShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:0:function:4:function:granted:36:8:true:1:clip:drag:1:true:2:true:portrait-primary:90:1:4:6:1:17px:one=1; two=2"),
+        "network services, crypto, clipboard, fullscreen, orientation, viewport, style, and cookies: {r:?}"
+    );
+    let r = m0::m0_unsupportedShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:false:NotSupportedError:DOMParser:function:true:DataError:bad data:function:undefined"),
+        "unsupported Web APIs return explicit NotSupportedError-shaped values: {r:?}"
+    );
+    let r = m0::m0_weakWindowShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "true:true:true:true"),
+        "weak-reference constructors are exposed on window: {r:?}"
+    );
+    let r = m0::m0_speechShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:true:true:en-US:1"),
+        "SpeechRecognition constructor, alias, defaults, and identity: {r:?}"
+    );
+    w3cos_runtime::jsdom::drain_microtasks();
+    let r = m0::m0_getSpeechLog(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "service-not-allowed:end"),
+        "unsupported desktop SpeechRecognition error lifecycle: {r:?}"
+    );
+    w3cos_runtime::geolocation_web::update_position(
+        w3cos_runtime::geolocation_web::GeoPosition::new(31.23, 121.47, 8.0),
+    );
+    let r = m0::m0_geolocationShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "object:function:function:function:true"),
+        "navigator.geolocation method surface: {r:?}"
+    );
+    w3cos_runtime::jsdom::drain_microtasks();
+    let r = m0::m0_getGeoLog(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "31.23:121.47:8:null:true"),
+        "Geolocation position/coords shape and clearWatch: {r:?}"
+    );
+    w3cos_runtime::media_devices_web::set_devices(vec![
+        w3cos_runtime::media_devices_web::MediaDevice {
+            device_id: "mic".into(),
+            kind: "audioinput".into(),
+            label: "Virtual microphone".into(),
+            group_id: "virtual".into(),
+        },
+        w3cos_runtime::media_devices_web::MediaDevice {
+            device_id: "camera".into(),
+            kind: "videoinput".into(),
+            label: "Virtual camera".into(),
+            group_id: "virtual".into(),
+        },
+    ]);
+    let r = m0::m0_mediaDevicesShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "object:function:function:function:function:function"),
+        "MediaDevices and media constructor surface: {r:?}"
+    );
+    w3cos_runtime::jsdom::drain_microtasks();
+    let r = m0::m0_getMediaLog(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "2:2:1:1:true:true:false"),
+        "MediaDevices enumeration, getUserMedia, stream identity, and track stop: {r:?}"
+    );
+    let r = m0::m0_workerShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:function:true:true:channel:shared"),
+        "Worker/SharedWorker/MessageChannel/MessagePort constructors: {r:?}"
+    );
+    let worker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        w3cos_runtime::jsdom::drain_microtasks();
+        let log = m0::m0_getWorkerLog(vec![]).to_js_string();
+        if log == "worker" {
+            break;
+        }
+        assert!(std::time::Instant::now() < worker_deadline, "Worker ESM fixture timed out: {log}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let r = m0::m0_eventApiShape(vec![]);
     assert!(
         matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:true:true:true:false:true:ready:payload:true:true:true"),
@@ -2964,6 +3469,39 @@ fn main() {
     assert!(
         matches!(&r, w3cos_core::Value::String(s) if s == "function:function:true:true:true:true:false:true:true:false:true:true:function:true:true"),
         "DOM constructor identity/prototype hierarchy/Range: {r:?}"
+    );
+    let r = m0::m0_svgShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:true:true:true:true:svg:http://www.w3.org/2000/svg:true:120:120:10:12:40:20:120:true:false:3:4"),
+        "SVG namespace, concrete constructors, animated lengths, and geometry: {r:?}"
+    );
+    let svg_tree = w3cos_runtime::dom::to_component_tree();
+    fn find_svg_rect(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+        if component.style.background == w3cos_std::color::Color::rgb(255, 0, 0)
+            && component.style.width == w3cos_std::style::Dimension::Px(40.0)
+            && component.style.height == w3cos_std::style::Dimension::Px(20.0)
+        {
+            return Some(component);
+        }
+        component.children.iter().find_map(find_svg_rect)
+    }
+    let rendered_rect = find_svg_rect(&svg_tree).expect("SVG rect should lower to a painted component");
+    assert_eq!(rendered_rect.style.left, w3cos_std::style::Dimension::Px(10.0));
+    assert_eq!(rendered_rect.style.top, w3cos_std::style::Dimension::Px(12.0));
+    let r = m0::m0_uriCodecShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:true:https://%E4%BE%8B%E5%AD%90.test/a%20b?x=1#%E7%89%87:a%2Fb%3F%E4%B8%AD%20%E6%96%87:中 x/y:https://x.test/a b?x=1#片"),
+        "URI encoding and decoding globals: {r:?}"
+    );
+    let r = m0::m0_uriErrorShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "URIError"),
+        "malformed URI input should throw URIError: {r:?}"
+    );
+    let r = m0::m0_eventSubclassShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:true:true:true:K:KeyK:true:true:true:12:7:pen:0.5:true:x:insertText:true:0:1:0:fade:1.25:function:function:function"),
+        "standard event subclass fields and prototype hierarchy: {r:?}"
     );
     let http_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let http_port = http_listener.local_addr().unwrap().port();
@@ -3016,6 +3554,39 @@ fn main() {
         "Request/Headers/fetch/Response HTTP round trip: {r:?}"
     );
     http_server.join().unwrap();
+    let xhr_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let xhr_port = xhr_listener.local_addr().unwrap().port();
+    let xhr_server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = xhr_listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 { break; }
+            request.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&request);
+            if text.contains("\r\n\r\n") && text.contains("{\"xhr\":true}") { break; }
+        }
+        let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(request.starts_with("post /xhr "), "XHR method/path: {request}");
+        assert!(request.contains("x-xhr: yes"), "XHR header: {request}");
+        let body = "{\"accepted\":true}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Reply: xhr\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    let r = m0::m0_runXhr(vec![w3cos_core::Value::from(format!(
+        "http://127.0.0.1:{xhr_port}/xhr"
+    ))]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "200:true:xhr:LE:true:true"),
+        "XMLHttpRequest Fetch compatibility round trip: {r:?}"
+    );
+    xhr_server.join().unwrap();
     let r = m0::m0_socketShape(vec![]);
     assert!(
         matches!(&r, w3cos_core::Value::String(s) if s == "function:0:1:2:3"),

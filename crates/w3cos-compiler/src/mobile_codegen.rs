@@ -27,6 +27,15 @@ pub fn write_mobile_project(
             output_dir.join("Cargo.toml"),
             generate_ios_cargo_toml(options)?,
         )?;
+    } else if platform == "harmony" {
+        std::fs::write(
+            output_dir.join("src/lib.rs"),
+            generate_harmony_component_lib(&body, interactive_widget)?,
+        )?;
+        std::fs::write(
+            output_dir.join("Cargo.toml"),
+            generate_harmony_cargo_toml(options)?,
+        )?;
     } else {
         std::fs::write(
             output_dir.join("src/lib.rs"),
@@ -78,6 +87,17 @@ pub fn write_mobile_dom_project(
         std::fs::write(
             output_dir.join("Cargo.toml"),
             generate_ios_cargo_toml(options)?,
+        )?;
+    } else if platform == "harmony" {
+        let viewport_init = gen_viewport_init(interactive_widget);
+        let lib = format!(
+            "//! Auto-generated HarmonyOS DOM app — do not edit.\nmod esm_bundle;\n{body}\n#[unsafe(no_mangle)]\npub extern \"C\" fn w3cos_harmony_surface_created(window: *mut core::ffi::c_void, width: u32, height: u32) -> i32 {{\n{viewport_init}    w3cos_mobile::harmony::surface_created_dom(window, width, height, setup)\n}}\n\n{harmony_common}",
+            harmony_common = generate_harmony_common_exports(),
+        );
+        std::fs::write(output_dir.join("src/lib.rs"), lib)?;
+        std::fs::write(
+            output_dir.join("Cargo.toml"),
+            generate_harmony_cargo_toml(options)?,
         )?;
     } else {
         let viewport_init = gen_viewport_init(interactive_widget);
@@ -244,6 +264,54 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {{
     ))
 }
 
+fn generate_harmony_component_lib(body: &str, interactive_widget: &str) -> Result<String> {
+    let viewport_init = gen_viewport_init(interactive_widget);
+    Ok(format!(
+        r#"//! Auto-generated HarmonyOS component app — do not edit.
+{body}
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_harmony_surface_created(
+    window: *mut core::ffi::c_void,
+    width: u32,
+    height: u32,
+) -> i32 {{
+{viewport_init}    w3cos_mobile::harmony::surface_created_component(window, width, height, build_ui)
+}}
+
+{common}
+"#,
+        common = generate_harmony_common_exports(),
+    ))
+}
+
+fn generate_harmony_common_exports() -> &'static str {
+    r#"#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_harmony_surface_changed(width: u32, height: u32) -> i32 {
+    w3cos_mobile::harmony::surface_changed(width, height)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_harmony_surface_destroyed() {
+    w3cos_mobile::harmony::surface_destroyed();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_harmony_frame() -> i32 {
+    w3cos_mobile::harmony::frame()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_harmony_touch(
+    phase: i32,
+    x: f32,
+    y: f32,
+    pointer_id: i64,
+    pressure: f32,
+) {
+    w3cos_mobile::harmony::touch(phase, x, y, pointer_id, pressure);
+}"#
+}
+
 fn gen_signal_inits(signals: &[SignalDecl]) -> String {
     if signals.is_empty() {
         return String::new();
@@ -327,5 +395,36 @@ android_logger = "0.14"
 winit = {{ version = "0.30", features = ["android-native-activity"] }}
 "#,
         deps = deps_block(&root, options),
+    ))
+}
+
+pub fn generate_harmony_cargo_toml(options: &CompileOptions) -> Result<String> {
+    let root = find_workspace_root()?;
+    let runtime_features = if options.devtools {
+        r#"["skia", "devtools"]"#
+    } else {
+        r#"["skia"]"#
+    };
+    Ok(format!(
+        r#"[package]
+name = "w3cos-mobile-app"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "w3cos_mobile_app"
+crate-type = ["cdylib"]
+
+[dependencies]
+w3cos-mobile = {{ path = "{mobile}", default-features = false }}
+w3cos-runtime = {{ path = "{runtime}", default-features = false, features = {runtime_features} }}
+w3cos-std = {{ path = "{std}" }}
+w3cos-core = {{ path = "{core}" }}
+log = "0.4"
+"#,
+        mobile = root.join("crates/w3cos-mobile").display(),
+        runtime = root.join("crates/w3cos-runtime").display(),
+        std = root.join("crates/w3cos-std").display(),
+        core = root.join("crates/w3cos-core").display(),
     ))
 }

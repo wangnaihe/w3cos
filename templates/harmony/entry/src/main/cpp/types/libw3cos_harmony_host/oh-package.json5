@@ -1,0 +1,7 @@
+{
+  "name": "libw3cos_harmony_host.so",
+  "version": "0.1.0",
+  "description": "W3COS HarmonyOS native host type declarations",
+  "main": "",
+  "types": "./index.d.ts"
+}

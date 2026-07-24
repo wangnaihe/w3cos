@@ -72,6 +72,146 @@ mod tests {
     }
 
     #[test]
+    fn svg_subtree_lowers_to_one_retained_document() {
+        let mut doc = Document::new();
+        let svg = doc.create_element("svg");
+        svg.set_attribute(&mut doc, "width", "100");
+        svg.set_attribute(&mut doc, "height", "80");
+
+        let path = doc.create_element("path");
+        path.set_attribute(&mut doc, "id", "route");
+        path.set_attribute(&mut doc, "d", "M10 20h20v20z");
+        path.set_attribute(&mut doc, "fill", "#ff0000");
+        path.set_attribute(&mut doc, "stroke", "#0000ff");
+        path.set_attribute(&mut doc, "stroke-width", "2");
+        path.set_attribute(&mut doc, "transform", "translate(3 4) scale(2)");
+        svg.append_child(&mut doc, path);
+
+        let polygon = doc.create_element("polygon");
+        polygon.set_attribute(&mut doc, "points", "0,0 10,0 5,10");
+        polygon
+            .style_mut(&mut doc)
+            .set_property("fill", "rgb(0, 255, 0)");
+        polygon
+            .style_mut(&mut doc)
+            .set_property("pointer-events", "none");
+        svg.append_child(&mut doc, polygon);
+        let label = doc.create_element("text");
+        let label_text = doc.create_text_node("A&B");
+        label.append_child(&mut doc, label_text);
+        svg.append_child(&mut doc, label);
+        doc.body().append_child(&mut doc, svg);
+
+        let tree = doc.to_component_tree();
+        let svg = &tree.children[0];
+        let w3cos_std::ComponentKind::SvgDocument {
+            source,
+            width,
+            height,
+            event_targets,
+        } = &svg.kind
+        else {
+            panic!("SVG root should lower to SvgDocument");
+        };
+        assert_eq!((*width, *height), (100, 80));
+        assert!(
+            event_targets
+                .iter()
+                .any(|target| target.host_chain.len() > 1)
+        );
+        assert!(event_targets.iter().any(|target| {
+            target.svg_id.is_empty()
+                && target.render_index.is_some()
+                && target.pointer_events == "none"
+        }));
+        assert!(
+            source.contains("xmlns=\"http://www.w3.org/2000/svg\"")
+                && source.contains("d=\"M10 20h20v20z\"")
+                && source.contains("<polygon points=\"0,0 10,0 5,10\"")
+                && source.contains("style=\"fill:rgb(0, 255, 0);pointer-events:none;\"")
+                && source.contains(">A&amp;B</text>"),
+            "{source}"
+        );
+        assert!(!source.contains("__w3cos_dom_node_"));
+        assert!(svg.children.is_empty());
+    }
+
+    #[test]
+    fn svg_defs_do_not_shift_anonymous_paint_ordinals() {
+        let mut doc = Document::new();
+        let svg = doc.create_element("svg");
+        svg.set_attribute(&mut doc, "width", "100");
+        svg.set_attribute(&mut doc, "height", "50");
+        let defs = doc.create_element("defs");
+        let template = doc.create_element("circle");
+        template.set_attribute(&mut doc, "id", "template");
+        template.set_attribute(&mut doc, "r", "5");
+        defs.append_child(&mut doc, template);
+        svg.append_child(&mut doc, defs);
+        let painted = doc.create_element("rect");
+        painted.set_attribute(&mut doc, "width", "20");
+        painted.set_attribute(&mut doc, "height", "10");
+        svg.append_child(&mut doc, painted);
+        let instance = doc.create_element("use");
+        instance.set_attribute(&mut doc, "href", "#template");
+        svg.append_child(&mut doc, instance);
+        doc.body().append_child(&mut doc, svg);
+
+        let tree = doc.to_component_tree();
+        let w3cos_std::ComponentKind::SvgDocument {
+            source,
+            event_targets,
+            ..
+        } = &tree.children[0].kind
+        else {
+            panic!("SVG root should lower to SvgDocument");
+        };
+        assert!(
+            !event_targets
+                .iter()
+                .any(|target| target.svg_id == "template")
+        );
+        assert!(
+            event_targets
+                .iter()
+                .any(|target| target.svg_id.is_empty() && target.render_index == Some(0))
+        );
+        assert!(
+            event_targets
+                .iter()
+                .any(|target| target.svg_id.starts_with("__w3cos_internal_use_")
+                    && target.render_index.is_none())
+        );
+        assert!(source.contains("<use href=\"#template\" id=\"__w3cos_internal_use_"));
+        assert!(instance.get_attribute(&doc, "id").is_none());
+    }
+
+    #[test]
+    fn svg_event_targets_inherit_pointer_events() {
+        let mut doc = Document::new();
+        let svg = doc.create_element("svg");
+        let group = doc.create_element("g");
+        group.set_attribute(&mut doc, "pointer-events", "fill");
+        let circle = doc.create_element("circle");
+        circle.set_attribute(&mut doc, "fill", "none");
+        circle.set_attribute(&mut doc, "stroke", "none");
+        group.append_child(&mut doc, circle);
+        svg.append_child(&mut doc, group);
+        doc.body().append_child(&mut doc, svg);
+
+        let tree = doc.to_component_tree();
+        let w3cos_std::ComponentKind::SvgDocument { event_targets, .. } = &tree.children[0].kind
+        else {
+            panic!("SVG root should lower to SvgDocument");
+        };
+        let circle_target = event_targets
+            .iter()
+            .find(|target| target.render_index == Some(0))
+            .expect("anonymous circle should have an event target");
+        assert_eq!(circle_target.pointer_events, "fill");
+    }
+
+    #[test]
     fn test_document_query_selector_id() {
         let mut doc = Document::new();
         let div = doc.create_element("div");
@@ -582,6 +722,66 @@ mod tests {
         let style = &tree.children[0].style;
         assert_eq!(style.color.r, 255);
         assert_eq!(style.color.b, 0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_computed_text_style_inherits_through_nested_elements() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".list",
+            &[
+                ("font-size", "13px"),
+                ("line-height", "1.4"),
+                ("color", "#123456"),
+            ],
+        );
+        crate::stylesheet::register_rule(".explicit", &[("font-size", "11px")]);
+
+        let mut doc = Document::new();
+        let list = doc.create_element("ul");
+        list.set_class_name(&mut doc, "list");
+        let item = doc.create_element("li");
+        let inherited = doc.create_element("span");
+        let explicit = doc.create_element("span");
+        explicit.set_class_name(&mut doc, "explicit");
+        item.append_child(&mut doc, inherited);
+        item.append_child(&mut doc, explicit);
+        list.append_child(&mut doc, item);
+        doc.body().append_child(&mut doc, list);
+
+        let inherited_style = doc.computed_style_for(inherited.id);
+        assert_eq!(inherited_style.font_size, 13.0);
+        assert_eq!(inherited_style.line_height, 1.4);
+        assert_eq!(inherited_style.color, w3cos_std::Color::from_hex("#123456"));
+        assert_eq!(doc.computed_style_for(explicit.id).font_size, 11.0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_current_color_background_uses_inherited_text_color() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".status", &[("color", "#1677ff")]);
+        crate::stylesheet::register_rule(
+            ".dot",
+            &[
+                ("width", "8px"),
+                ("height", "8px"),
+                ("background", "currentColor"),
+            ],
+        );
+
+        let mut doc = Document::new();
+        let status = doc.create_element("div");
+        status.set_class_name(&mut doc, "status");
+        let dot = doc.create_element("span");
+        dot.set_class_name(&mut doc, "dot");
+        status.append_child(&mut doc, dot);
+        doc.body().append_child(&mut doc, status);
+
+        let style = doc.computed_style_for(dot.id);
+        assert_eq!(style.color, w3cos_std::Color::from_hex("#1677ff"));
+        assert_eq!(style.background, style.color);
         crate::stylesheet::clear_rules();
     }
 

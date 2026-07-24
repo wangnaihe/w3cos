@@ -4,6 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_skia::{
     Color as SkColor, FillRule, Mask, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
 };
+use w3cos_std::SvgPathCommand;
 use w3cos_std::color::Color;
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::{Style, TextAlign};
@@ -764,7 +765,15 @@ fn render_node(
         draw_rect(pixmap, rect, bg, style.border_radius, clip_mask);
     }
 
-    if style.border_width > 0.0 && style.border_color.a > 0 {
+    let has_edge_border = style.border_top_width.is_some()
+        || style.border_right_width.is_some()
+        || style.border_bottom_width.is_some()
+        || style.border_left_width.is_some()
+        || style.border_top_color.is_some()
+        || style.border_right_color.is_some()
+        || style.border_bottom_color.is_some()
+        || style.border_left_color.is_some();
+    if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
         draw_border(
             pixmap,
             rect,
@@ -773,6 +782,56 @@ fn render_node(
             style.border_radius,
             clip_mask,
         );
+    } else if has_edge_border {
+        let widths = [
+            style.border_top_width.unwrap_or(style.border_width),
+            style.border_right_width.unwrap_or(style.border_width),
+            style.border_bottom_width.unwrap_or(style.border_width),
+            style.border_left_width.unwrap_or(style.border_width),
+        ];
+        let colors = [
+            style.border_top_color.unwrap_or(style.border_color),
+            style.border_right_color.unwrap_or(style.border_color),
+            style.border_bottom_color.unwrap_or(style.border_color),
+            style.border_left_color.unwrap_or(style.border_color),
+        ];
+        let edges = [
+            LayoutRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: widths[0],
+            },
+            LayoutRect {
+                x: rect.x + rect.width - widths[1],
+                y: rect.y,
+                width: widths[1],
+                height: rect.height,
+            },
+            LayoutRect {
+                x: rect.x,
+                y: rect.y + rect.height - widths[2],
+                width: rect.width,
+                height: widths[2],
+            },
+            LayoutRect {
+                x: rect.x,
+                y: rect.y,
+                width: widths[3],
+                height: rect.height,
+            },
+        ];
+        for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
+            if width > 0.0 && color.a > 0 {
+                draw_rect(
+                    pixmap,
+                    edge,
+                    node_color(color, opacity, color_chain),
+                    0.0,
+                    clip_mask,
+                );
+            }
+        }
     }
 
     let text_color = node_color(style.color, opacity, color_chain);
@@ -877,7 +936,101 @@ fn render_node(
                 );
             }
         }
+        ComponentKind::SvgPath {
+            commands,
+            fill,
+            stroke,
+            stroke_width,
+        } => draw_svg_path(
+            pixmap,
+            rect,
+            commands,
+            node_color(*fill, opacity, color_chain),
+            stroke.map(|color| node_color(color, opacity, color_chain)),
+            *stroke_width,
+            clip_mask,
+        ),
+        ComponentKind::SvgDocument {
+            source,
+            width,
+            height,
+            ..
+        } => {
+            if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
+                draw_image_pixels(
+                    pixmap,
+                    rect,
+                    raster.width,
+                    raster.height,
+                    raster.data.as_slice(),
+                    opacity,
+                    clip_mask,
+                );
+            }
+        }
         _ => {}
+    }
+}
+
+fn draw_svg_path(
+    pixmap: &mut Pixmap,
+    rect: LayoutRect,
+    commands: &[SvgPathCommand],
+    fill: Color,
+    stroke: Option<Color>,
+    stroke_width: f32,
+    clip_mask: Option<&Mask>,
+) {
+    let mut builder = PathBuilder::new();
+    for command in commands {
+        match *command {
+            SvgPathCommand::MoveTo(x, y) => builder.move_to(rect.x + x, rect.y + y),
+            SvgPathCommand::LineTo(x, y) => builder.line_to(rect.x + x, rect.y + y),
+            SvgPathCommand::QuadTo(cx, cy, x, y) => {
+                builder.quad_to(rect.x + cx, rect.y + cy, rect.x + x, rect.y + y)
+            }
+            SvgPathCommand::CubicTo(c1x, c1y, c2x, c2y, x, y) => builder.cubic_to(
+                rect.x + c1x,
+                rect.y + c1y,
+                rect.x + c2x,
+                rect.y + c2y,
+                rect.x + x,
+                rect.y + y,
+            ),
+            SvgPathCommand::Close => builder.close(),
+        }
+    }
+    let Some(path) = builder.finish() else {
+        return;
+    };
+    if fill.a > 0 {
+        let mut paint = Paint::default();
+        paint.set_color(SkColor::from_rgba8(fill.r, fill.g, fill.b, fill.a));
+        paint.anti_alias = true;
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            clip_mask,
+        );
+    }
+    if let Some(stroke) = stroke.filter(|color| color.a > 0)
+        && stroke_width > 0.0
+    {
+        let mut paint = Paint::default();
+        paint.set_color(SkColor::from_rgba8(stroke.r, stroke.g, stroke.b, stroke.a));
+        paint.anti_alias = true;
+        pixmap.stroke_path(
+            &path,
+            &paint,
+            &Stroke {
+                width: stroke_width,
+                ..Stroke::default()
+            },
+            Transform::identity(),
+            clip_mask,
+        );
     }
 }
 
@@ -1477,6 +1630,29 @@ mod font_cjk_tests {
         assert!(m.width > 0 && !bmp.is_empty());
         let (m2, _) = font.rasterize('A', 16.0);
         assert!(m2.advance_width > 0.0);
+    }
+
+    #[test]
+    fn svg_path_fill_and_stroke_are_rasterized() {
+        let path = w3cos_std::SvgPathData::parse("M2 2 L18 2 L10 18 Z").unwrap();
+        let mut pixmap = Pixmap::new(24, 24).unwrap();
+        draw_svg_path(
+            &mut pixmap,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 16.0,
+                height: 16.0,
+            },
+            &path.commands,
+            Color::rgb(255, 0, 0),
+            Some(Color::rgb(0, 0, 255)),
+            2.0,
+            None,
+        );
+
+        assert!(pixmap.pixels().iter().any(|pixel| pixel.red() > 0));
+        assert!(pixmap.pixels().iter().any(|pixel| pixel.blue() > 0));
     }
 
     #[test]

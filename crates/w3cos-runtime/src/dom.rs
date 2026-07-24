@@ -7,6 +7,9 @@ use w3cos_std::EventAction;
 thread_local! {
     static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
     static DOM_DIRTY: RefCell<bool> = RefCell::new(false);
+    static SCROLL_REQUESTS: RefCell<Vec<(u32, Option<f32>, Option<f32>)>> = const {
+        RefCell::new(Vec::new())
+    };
 }
 
 pub fn with_document<R>(f: impl FnOnce(&Document) -> R) -> R {
@@ -31,6 +34,7 @@ pub fn clear_document_dirty() {
 
 pub fn reset_document() {
     DOCUMENT.with(|d| *d.borrow_mut() = Document::new());
+    SCROLL_REQUESTS.with(|requests| requests.borrow_mut().clear());
     clear_document_dirty();
 }
 
@@ -173,6 +177,13 @@ pub fn query_selector_all(selector: &str) -> Vec<u32> {
 
 pub fn get_element_by_id(id: &str) -> Option<u32> {
     with_document(|doc| doc.get_element_by_id(id).map(|el| el.id.as_u32()))
+}
+
+pub fn computed_style_property(node: u32, property: &str) -> String {
+    with_document(|doc| {
+        let element = w3cos_dom::Element::new(NodeId::from_u32(node));
+        element.get_computed_style(doc).get_property(property)
+    })
 }
 
 pub fn children(node: u32) -> Vec<u32> {
@@ -362,6 +373,16 @@ pub fn get_scroll_offset(node: u32) -> (f32, f32) {
 /// Set scroll offsets; pass `None` to leave an axis unchanged.
 pub fn set_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
     with_document_mut(|doc| doc.set_scroll(NodeId::from_u32(node), left, top));
+    SCROLL_REQUESTS.with(|requests| requests.borrow_mut().push((node, left, top)));
+}
+
+/// Synchronize a clamped native offset into CSSOM without queuing another request.
+pub fn sync_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
+    with_document_mut(|doc| doc.set_scroll(NodeId::from_u32(node), left, top));
+}
+
+pub fn take_scroll_requests() -> Vec<(u32, Option<f32>, Option<f32>)> {
+    SCROLL_REQUESTS.with(|requests| std::mem::take(&mut *requests.borrow_mut()))
 }
 
 /// W3C `Element.getBoundingClientRect` — zeros until the layout engine runs.
@@ -466,5 +487,17 @@ mod tests {
         assert!(is_document_dirty());
         clear_document_dirty();
         assert!(!is_document_dirty());
+    }
+
+    #[test]
+    fn cssom_scroll_write_queues_a_native_request() {
+        reset_document();
+        let div = create_element("div");
+        set_scroll_offset(div, None, Some(120.0));
+        assert_eq!(get_scroll_offset(div), (0.0, 120.0));
+        assert_eq!(take_scroll_requests(), vec![(div, None, Some(120.0))]);
+        sync_scroll_offset(div, None, Some(80.0));
+        assert_eq!(get_scroll_offset(div), (0.0, 80.0));
+        assert!(take_scroll_requests().is_empty());
     }
 }

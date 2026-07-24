@@ -40,6 +40,9 @@ pub fn construct(class_value: &Value, args: Vec<Value>) -> Value {
 /// `obj instanceof X` — walk `obj`'s prototype chain looking for identity
 /// with `X.prototype`.
 pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
+    if crate::binary::typed_array_instance_of(obj, class_value) {
+        return true;
+    }
     let target = match class_value.get_property("prototype") {
         Value::Object(target) => target,
         _ => return false,

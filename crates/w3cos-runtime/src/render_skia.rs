@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use skia_safe::canvas::SaveLayerRec;
 use skia_safe::{
     AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, FontStyle,
-    ImageFilter, ImageInfo, MaskFilter, Paint, Rect, Surface, TileMode, Typeface, color_filters,
-    gradient_shader, image_filters, images, paint,
+    ImageFilter, ImageInfo, MaskFilter, Paint, PathBuilder, Rect, Surface, TileMode, Typeface,
+    color_filters, gradient_shader, image_filters, images, paint,
 };
+use w3cos_std::SvgPathCommand;
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::{JustifyContent, Style, TextAlign};
 
@@ -23,12 +24,34 @@ use crate::text_layout;
 
 const FONT_FALLBACK_CACHE_CAPACITY: usize = 2048;
 
+#[cfg(target_os = "android")]
+const INTRINSIC_FONT_BYTES: &[u8] = include_bytes!("../assets/CJK-Subset.ttf");
+#[cfg(not(target_os = "android"))]
+const INTRINSIC_FONT_BYTES: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
+
 thread_local! {
     /// System font matching is comparatively expensive on Apple platforms.
     /// Cache Skia typeface references for characters missing from the primary
     /// face; this does not copy the underlying system font into application memory.
     static FONT_FALLBACK_CACHE: RefCell<HashMap<(char, u16), Option<Typeface>>> =
         RefCell::new(HashMap::new());
+    static INTRINSIC_PRIMARY_TYPEFACE: Typeface =
+        primary_typeface(INTRINSIC_FONT_BYTES).expect("Skia intrinsic font");
+}
+
+fn primary_typeface(font_bytes: &[u8]) -> Option<Typeface> {
+    #[cfg(target_os = "ios")]
+    {
+        let font_manager = FontMgr::default();
+        // Use the concrete Latin face behind CSS `-apple-system`. The generic
+        // Apple cascade face reports CJK glyphs while retaining its shorter
+        // Latin line metrics; Blink instead resolves those glyphs to PingFang
+        // and uses that fallback face's full line box.
+        if let Some(system) = font_manager.match_family_style("SF Pro Text", FontStyle::normal()) {
+            return Some(system);
+        }
+    }
+    FontMgr::default().new_from_data(font_bytes, None)
 }
 
 pub(crate) struct ReplayFrame<'a> {
@@ -50,7 +73,7 @@ pub struct SkiaRasterizer {
 
 impl SkiaRasterizer {
     pub fn new(font_bytes: &[u8]) -> Option<Self> {
-        let typeface = FontMgr::default().new_from_data(font_bytes, None)?;
+        let typeface = primary_typeface(font_bytes)?;
         Some(Self {
             surface: None,
             size: (0, 0),
@@ -226,7 +249,7 @@ impl SkiaMetalPresenter {
         use objc2_quartz_core::CALayer;
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-        let typeface = FontMgr::default().new_from_data(font_bytes, None)?;
+        let typeface = primary_typeface(font_bytes)?;
         let device = MTLCreateSystemDefaultDevice()?;
         let layer = objc2_quartz_core::CAMetalLayer::new();
         layer.setDevice(Some(&device));
@@ -395,7 +418,15 @@ fn render_node(
             style.opacity,
         );
     }
-    if style.border_width > 0.0 && style.border_color.a > 0 {
+    let has_edge_border = style.border_top_width.is_some()
+        || style.border_right_width.is_some()
+        || style.border_bottom_width.is_some()
+        || style.border_left_width.is_some()
+        || style.border_top_color.is_some()
+        || style.border_right_color.is_some()
+        || style.border_bottom_color.is_some()
+        || style.border_left_color.is_some();
+    if !has_edge_border && style.border_width > 0.0 && style.border_color.a > 0 {
         let mut border = color_paint(style.border_color, style.opacity);
         border.set_style(paint::Style::Stroke);
         border.set_stroke_width(style.border_width);
@@ -411,6 +442,50 @@ fn render_node(
             style.border_radius,
             &border,
         );
+    } else if has_edge_border {
+        let widths = [
+            style.border_top_width.unwrap_or(style.border_width),
+            style.border_right_width.unwrap_or(style.border_width),
+            style.border_bottom_width.unwrap_or(style.border_width),
+            style.border_left_width.unwrap_or(style.border_width),
+        ];
+        let colors = [
+            style.border_top_color.unwrap_or(style.border_color),
+            style.border_right_color.unwrap_or(style.border_color),
+            style.border_bottom_color.unwrap_or(style.border_color),
+            style.border_left_color.unwrap_or(style.border_color),
+        ];
+        let edges = [
+            LayoutRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: widths[0],
+            },
+            LayoutRect {
+                x: rect.x + rect.width - widths[1],
+                y: rect.y,
+                width: widths[1],
+                height: rect.height,
+            },
+            LayoutRect {
+                x: rect.x,
+                y: rect.y + rect.height - widths[2],
+                width: rect.width,
+                height: widths[2],
+            },
+            LayoutRect {
+                x: rect.x,
+                y: rect.y,
+                width: widths[3],
+                height: rect.height,
+            },
+        ];
+        for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
+            if width > 0.0 && color.a > 0 {
+                draw_round_rect(canvas, edge, 0.0, &color_paint(color, style.opacity));
+            }
+        }
     }
 
     match kind {
@@ -477,11 +552,89 @@ fn render_node(
         }
         ComponentKind::Image { src } => draw_image(canvas, rect, src, style.opacity),
         ComponentKind::Canvas { .. } => draw_canvas(canvas, client_index, rect, style.opacity),
+        ComponentKind::SvgPath {
+            commands,
+            fill,
+            stroke,
+            stroke_width,
+        } => draw_svg_path(
+            canvas,
+            rect,
+            commands,
+            *fill,
+            *stroke,
+            *stroke_width,
+            style.opacity,
+        ),
+        ComponentKind::SvgDocument {
+            source,
+            width,
+            height,
+            ..
+        } => {
+            if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
+                draw_rgba_pixels(
+                    canvas,
+                    rect,
+                    raster.width,
+                    raster.height,
+                    raster.data.as_slice(),
+                    style.opacity,
+                );
+            }
+        }
         ComponentKind::Root
         | ComponentKind::Column
         | ComponentKind::Row
         | ComponentKind::Box
         | ComponentKind::VirtualList { .. } => {}
+    }
+}
+
+fn draw_svg_path(
+    canvas: &Canvas,
+    rect: LayoutRect,
+    commands: &[SvgPathCommand],
+    fill: w3cos_std::color::Color,
+    stroke: Option<w3cos_std::color::Color>,
+    stroke_width: f32,
+    opacity: f32,
+) {
+    let mut builder = PathBuilder::new();
+    for command in commands {
+        match *command {
+            SvgPathCommand::MoveTo(x, y) => {
+                builder.move_to((rect.x + x, rect.y + y));
+            }
+            SvgPathCommand::LineTo(x, y) => {
+                builder.line_to((rect.x + x, rect.y + y));
+            }
+            SvgPathCommand::QuadTo(cx, cy, x, y) => {
+                builder.quad_to((rect.x + cx, rect.y + cy), (rect.x + x, rect.y + y));
+            }
+            SvgPathCommand::CubicTo(c1x, c1y, c2x, c2y, x, y) => {
+                builder.cubic_to(
+                    (rect.x + c1x, rect.y + c1y),
+                    (rect.x + c2x, rect.y + c2y),
+                    (rect.x + x, rect.y + y),
+                );
+            }
+            SvgPathCommand::Close => {
+                builder.close();
+            }
+        }
+    }
+    let path = builder.detach();
+    if fill.a > 0 {
+        canvas.draw_path(&path, &color_paint(fill, opacity));
+    }
+    if let Some(stroke) = stroke.filter(|color| color.a > 0)
+        && stroke_width > 0.0
+    {
+        let mut paint = color_paint(stroke, opacity);
+        paint.set_style(paint::Style::Stroke);
+        paint.set_stroke_width(stroke_width);
+        canvas.draw_path(&path, &paint);
     }
 }
 
@@ -756,20 +909,19 @@ fn draw_text_in_rect(
         style.white_space,
     );
     if layout.lines.len() == 1 {
-        draw_text_ink_in_box(
-            canvas,
-            content,
+        let ink = measure_skia_text_ink_bounds(
             &layout.lines[0],
-            layout.ink_bounds[0],
-            style,
+            style.font_size,
             typeface,
+            style.font_weight,
         );
+        draw_text_ink_in_box(canvas, content, &layout.lines[0], ink, style, typeface);
         return;
     }
     let line_height = style.font_size * style.line_height;
     let top = content.y + (content.height - layout.lines.len() as f32 * line_height).max(0.0) * 0.5;
     for (index, line) in layout.lines.iter().enumerate() {
-        let ink = layout.ink_bounds[index];
+        let ink = measure_skia_text_ink_bounds(line, style.font_size, typeface, style.font_weight);
         let x = aligned_text_x(content, effective_text_align(style), ink.left, ink.width);
         draw_text_line(
             canvas,
@@ -791,10 +943,10 @@ fn draw_centered_text(
     text: &str,
     style: &Style,
     typeface: &Typeface,
-    metrics_font: &fontdue::Font,
+    _metrics_font: &fontdue::Font,
 ) {
     let content = text_paint_box(rect, style);
-    let ink = text_layout::measure_text_ink_bounds(text, style.font_size, metrics_font, 0.0, 0.0);
+    let ink = measure_skia_text_ink_bounds(text, style.font_size, typeface, style.font_weight);
     let x = content.x + (content.width - ink.width) * 0.5 - ink.left;
     let y = content.y + (content.height - ink.height) * 0.5 - ink.top;
     draw_text_line(
@@ -882,6 +1034,73 @@ fn draw_text_line(
         cursor_x += font.measure_str(run.text, Some(&paint)).0;
     }
     cursor_x - x
+}
+
+fn measure_skia_text_ink_bounds(
+    text: &str,
+    font_size: f32,
+    typeface: &Typeface,
+    font_weight: u16,
+) -> text_layout::InkBounds {
+    let mut cursor_x = 0.0_f32;
+    let mut left = f32::MAX;
+    let mut top = f32::MAX;
+    let mut right = f32::MIN;
+    let mut bottom = f32::MIN;
+    let mut saw_ink = false;
+
+    for run in fallback_font_runs(text, typeface, font_weight) {
+        let mut font = Font::new(run.typeface, font_size);
+        font.set_embolden(font_weight >= 600);
+        let (advance, bounds) = font.measure_str(run.text, None);
+        if bounds.width() > 0.0 || bounds.height() > 0.0 {
+            saw_ink = true;
+            left = left.min(cursor_x + bounds.left);
+            top = top.min(font_size + bounds.top);
+            right = right.max(cursor_x + bounds.right);
+            bottom = bottom.max(font_size + bounds.bottom);
+        }
+        cursor_x += advance;
+    }
+
+    if !saw_ink {
+        return text_layout::InkBounds::empty();
+    }
+
+    text_layout::InkBounds {
+        left,
+        top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    }
+}
+
+pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f32, f32) {
+    INTRINSIC_PRIMARY_TYPEFACE.with(|primary| {
+        let mut width = 0.0_f32;
+        let mut line_spacing = 0.0_f32;
+        for run in fallback_font_runs(text, primary, style.font_weight) {
+            let mut font = Font::new(run.typeface, style.font_size);
+            font.set_embolden(style.font_weight >= 600);
+            width += font.measure_str(run.text, None).0;
+            let (spacing, metrics) = font.metrics();
+            // CSS `normal` uses the font's full em line box, not only Skia's
+            // baseline spacing. `BOUNDS_INVALID` only describes the aggregate
+            // glyph bounds; top/bottom line metrics are still populated.
+            let normal_line_height = (metrics.bottom - metrics.top).max(spacing);
+            line_spacing = line_spacing.max(normal_line_height);
+        }
+        if text.is_empty() {
+            let font = Font::new(primary.clone(), style.font_size);
+            let (spacing, metrics) = font.metrics();
+            line_spacing = (metrics.bottom - metrics.top).max(spacing);
+        }
+        let padding = style.padding_lengths();
+        (
+            width + padding.left + padding.right,
+            line_spacing.max(style.font_size * style.line_height) + padding.top + padding.bottom,
+        )
+    })
 }
 
 struct FallbackFontRun<'a> {
@@ -1282,6 +1501,17 @@ mod tests {
         assert_eq!(runs[1].text, "丹丹");
         assert_eq!(runs[2].text, "B");
         assert_eq!(runs[1].typeface.unique_id(), fallback.unique_id());
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    #[test]
+    fn skia_ink_bounds_follow_the_actual_fallback_typeface() {
+        let primary = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let ink = measure_skia_text_ink_bounds("✦首次入驻", 17.0, &primary, 400);
+        assert!(ink.width > 0.0);
+        assert!(ink.height > 0.0);
+        assert!(ink.top.is_finite());
+        assert!(ink.height <= 24.0);
     }
 
     #[test]

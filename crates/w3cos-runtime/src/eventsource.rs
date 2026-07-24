@@ -27,12 +27,15 @@
 //! }
 //! ```
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use w3cos_core::Value;
 
 // ── ReadyState ─────────────────────────────────────────────────────────────
 
@@ -201,6 +204,175 @@ impl Clone for EventSource {
             inner: Arc::clone(&self.inner),
         }
     }
+}
+
+#[derive(Clone)]
+struct JsEventSource {
+    source: EventSource,
+    value: Value,
+    listeners: Rc<RefCell<HashMap<String, Vec<Value>>>>,
+}
+
+thread_local! {
+    static JS_EVENT_SOURCES: RefCell<Vec<JsEventSource>> = const { RefCell::new(Vec::new()) };
+    static EVENT_SOURCE_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+pub fn event_source_class() -> Value {
+    EVENT_SOURCE_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, args| {
+            let url = args.first().cloned().unwrap_or_default().to_js_string();
+            js_event_source_value(EventSource::new(url))
+        });
+        for (name, state) in [
+            ("CONNECTING", EventSourceState::Connecting),
+            ("OPEN", EventSourceState::Open),
+            ("CLOSED", EventSourceState::Closed),
+        ] {
+            class.set_property(name, Value::Number(state as u8 as f64));
+        }
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::web_events::event_target_class().get_property("prototype"),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn js_event_source_value(source: EventSource) -> Value {
+    let listeners = Rc::new(RefCell::new(HashMap::<String, Vec<Value>>::new()));
+    let value = Value::object(HashMap::from([
+        ("onopen".to_string(), Value::Null),
+        ("onmessage".to_string(), Value::Null),
+        ("onerror".to_string(), Value::Null),
+        ("withCredentials".to_string(), Value::Bool(false)),
+    ]));
+    let source_for_url = source.clone();
+    value.set_property(
+        "__w3cos_getter_url",
+        Value::function(move |_, _| Value::string(source_for_url.url())),
+    );
+    let source_for_state = source.clone();
+    value.set_property(
+        "__w3cos_getter_readyState",
+        Value::function(move |_, _| Value::Number(source_for_state.ready_state() as u8 as f64)),
+    );
+    let source_for_close = source.clone();
+    value.set_property(
+        "close",
+        Value::function(move |_, _| {
+            source_for_close.close();
+            Value::Undefined
+        }),
+    );
+    let add_listeners = Rc::clone(&listeners);
+    value.set_property(
+        "addEventListener",
+        Value::function(move |_, args| {
+            let event_type = args.first().cloned().unwrap_or_default().to_js_string();
+            let listener = args.get(1).cloned().unwrap_or_default();
+            if listener.is_function() {
+                add_listeners
+                    .borrow_mut()
+                    .entry(event_type)
+                    .or_default()
+                    .push(listener);
+            }
+            Value::Undefined
+        }),
+    );
+    let remove_listeners = Rc::clone(&listeners);
+    value.set_property(
+        "removeEventListener",
+        Value::function(move |_, args| {
+            let event_type = args.first().cloned().unwrap_or_default().to_js_string();
+            let listener = args.get(1).cloned().unwrap_or_default();
+            if let Some(items) = remove_listeners.borrow_mut().get_mut(&event_type) {
+                items.retain(|item| !item.same_value_zero(&listener));
+            }
+            Value::Undefined
+        }),
+    );
+    w3cos_core::class::set_prototype_of(&value, &event_source_class().get_property("prototype"));
+    JS_EVENT_SOURCES.with(|sources| {
+        sources.borrow_mut().push(JsEventSource {
+            source,
+            value: value.clone(),
+            listeners,
+        });
+    });
+    value
+}
+
+fn dispatch_js_event(binding: &JsEventSource, event_type: &str, event: Value) -> usize {
+    event.set_property("target", binding.value.clone());
+    event.set_property("currentTarget", binding.value.clone());
+    let mut callbacks = binding
+        .listeners
+        .borrow()
+        .get(event_type)
+        .cloned()
+        .unwrap_or_default();
+    let property = binding.value.get_property(&format!("on{event_type}"));
+    if property.is_function() {
+        callbacks.insert(0, property);
+    }
+    for callback in &callbacks {
+        callback.call(binding.value.clone(), vec![event.clone()]);
+    }
+    callbacks.len()
+}
+
+pub fn poll_js_events() -> usize {
+    let bindings = JS_EVENT_SOURCES.with(|sources| sources.borrow().clone());
+    let mut dispatched = 0;
+    for binding in bindings {
+        for event in binding.source.poll_events() {
+            let (event_type, value) = match event {
+                SseEvent::Open => ("open".to_string(), Value::Undefined),
+                SseEvent::Message {
+                    event, data, id, ..
+                } => (
+                    event,
+                    Value::object(HashMap::from([
+                        ("data".to_string(), Value::string(&data)),
+                        (
+                            "lastEventId".to_string(),
+                            id.map(|id| Value::string(&id)).unwrap_or(Value::string("")),
+                        ),
+                        ("origin".to_string(), Value::string("")),
+                    ])),
+                ),
+                SseEvent::Error(message) => ("error".to_string(), Value::string(&message)),
+                SseEvent::Close => ("error".to_string(), Value::Undefined),
+            };
+            let event_value = w3cos_core::class::construct(
+                &crate::web_events::event_class(),
+                vec![Value::string(&event_type)],
+            );
+            if !value.is_undefined() {
+                if value.is_object() {
+                    for key in ["data", "lastEventId", "origin"] {
+                        let property = value.get_property(key);
+                        if !property.is_undefined() {
+                            event_value.set_property(key, property);
+                        }
+                    }
+                } else {
+                    event_value.set_property("message", value);
+                }
+            }
+            dispatched += dispatch_js_event(&binding, &event_type, event_value);
+        }
+    }
+    dispatched
 }
 
 // ── SSE worker thread ──────────────────────────────────────────────────────

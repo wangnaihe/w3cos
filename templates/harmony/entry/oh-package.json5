@@ -5,5 +5,7 @@
   "main": "",
   "author": "",
   "license": "Apache-2.0",
-  "dependencies": {}
+  "dependencies": {
+    "libw3cos_harmony_host.so": "file:./src/main/cpp/types/libw3cos_harmony_host"
+  }
 }

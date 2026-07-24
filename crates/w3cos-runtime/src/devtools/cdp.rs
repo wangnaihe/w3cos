@@ -691,6 +691,14 @@ fn style_to_computed_properties(style: &Style) -> Vec<Value> {
     );
     add("opacity", style.opacity.to_string());
     add("overflow", format!("{:?}", style.overflow).to_lowercase());
+    add(
+        "overflow-x",
+        format!("{:?}", style.resolved_overflow_x()).to_lowercase(),
+    );
+    add(
+        "overflow-y",
+        format!("{:?}", style.resolved_overflow_y()).to_lowercase(),
+    );
     add("z-index", style.z_index.to_string());
 
     props

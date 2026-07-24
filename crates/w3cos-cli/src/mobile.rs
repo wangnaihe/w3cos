@@ -81,7 +81,7 @@ w3cos build app.tsx -o app --release && ./app
 ```bash
 w3cos mobile build --platform android   # APK (needs SDK + NDK)
 w3cos mobile build --platform ios       # Simulator (needs Xcode)
-w3cos mobile build --platform harmony   # HAP (OHOS runtime port required)
+w3cos mobile build --platform harmony   # HAP (needs DevEco/OHOS SDK)
 w3cos mobile build --platform both      # Android + iOS
 ```
 
@@ -130,12 +130,9 @@ pub fn mobile_build(
     release: bool,
     devtools: bool,
 ) -> Result<()> {
-    if platform == "harmony" {
-        return build_harmony(project_dir, release);
-    }
     if platform == "all" {
         bail!(
-            "--platform all is available for `mobile init` only until the HarmonyOS runtime port lands; build android|ios|both today"
+            "--platform all is available for `mobile init` only; build android|ios|harmony|both explicitly"
         );
     }
     let (_, _, entry, safe_area, interactive_widget, _) = read_app_manifest(project_dir);
@@ -168,6 +165,7 @@ pub fn mobile_build(
     match platform {
         "android" => build_android(project_dir, &build_dir, release)?,
         "ios" => build_ios(project_dir, &build_dir, release)?,
+        "harmony" => build_harmony(project_dir, &build_dir, release)?,
         "both" => {
             build_android(project_dir, &build_dir, release)?;
             build_ios(project_dir, &build_dir, release)?;
@@ -178,28 +176,221 @@ pub fn mobile_build(
     Ok(())
 }
 
-fn build_harmony(project_dir: &Path, _release: bool) -> Result<()> {
+fn build_harmony(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> {
     let harmony_dir = project_dir.join("harmony");
     if !harmony_dir.exists() {
         bail!(
             "harmony/ not found — run: w3cos mobile init . --platform harmony (in a new project) or copy templates/harmony"
         );
     }
-    let sdk_config = harmony_dir.join("local.properties");
-    if std::env::var_os("OHOS_SDK_HOME").is_none() && !sdk_config.exists() {
-        bail!(
-            "HarmonyOS SDK not configured. Set OHOS_SDK_HOME or create harmony/local.properties before building"
-        );
+    let native_dir = resolve_ohos_native_dir(&harmony_dir).context(
+        "HarmonyOS SDK not configured. Set ohos_sdk_native, OHOS_NDK_HOME, OHOS_SDK_HOME, or harmony/local.properties sdk.dir",
+    )?;
+    let clang = native_dir.join("llvm/bin/clang");
+    let clangxx = native_dir.join("llvm/bin/clang++");
+    let ar = native_dir.join("llvm/bin/llvm-ar");
+    for tool in [&clang, &clangxx, &ar] {
+        if !tool.exists() {
+            bail!("missing OHOS NDK tool: {}", tool.display());
+        }
     }
-    bail!(
-        "HarmonyOS ArkUI/XComponent shell is scaffolded, but the W3COS OHOS native runtime is not implemented yet. \
-         The required next step is an OHNativeWindow event/render backend; Android NativeActivity artifacts are not compatible with HarmonyOS NEXT"
-    )
+
+    let installed_targets = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .context("run rustup target list")?;
+    if !String::from_utf8_lossy(&installed_targets.stdout)
+        .lines()
+        .any(|target| target == "aarch64-unknown-linux-ohos")
+    {
+        bail!("missing Rust target. Run: rustup target add aarch64-unknown-linux-ohos");
+    }
+
+    let linker = write_ohos_linker_wrapper(build_dir, &clang, &native_dir, "clang")?;
+    let cxx_linker = write_ohos_linker_wrapper(build_dir, &clangxx, &native_dir, "clang++")?;
+    let sdk_parent = native_dir
+        .parent()
+        .context("OHOS native SDK directory has no parent")?;
+    let profile = if release { "release" } else { "debug" };
+
+    println!("🔨 Building HarmonyOS arm64-v8a ({profile})...");
+    let mut cargo = Command::new("cargo");
+    cargo
+        .current_dir(build_dir)
+        .args(["build", "--target", "aarch64-unknown-linux-ohos"])
+        .env("ohos_sdk_native", &native_dir)
+        .env("OHOS_NDK_HOME", sdk_parent)
+        .env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER", &linker)
+        .env("CC_aarch64_unknown_linux_ohos", &linker)
+        .env("CXX_aarch64_unknown_linux_ohos", &cxx_linker)
+        .env("AR_aarch64_unknown_linux_ohos", &ar);
+    if release {
+        cargo.arg("--release");
+    }
+    let status = cargo.status().context("HarmonyOS Rust build failed")?;
+    if !status.success() {
+        bail!("HarmonyOS native build failed");
+    }
+
+    let library = build_dir
+        .join("target/aarch64-unknown-linux-ohos")
+        .join(profile)
+        .join("libw3cos_mobile_app.so");
+    if !library.exists() {
+        bail!("expected HarmonyOS library: {}", library.display());
+    }
+    let libs = harmony_dir.join("entry/libs/arm64-v8a");
+    fs::create_dir_all(&libs)?;
+    let packaged_library = libs.join("libw3cos_mobile_app.so");
+    fs::copy(&library, &packaged_library)?;
+    println!("✅ Native lib: {}", packaged_library.display());
+
+    if command_available("ohpm") {
+        let status = Command::new("ohpm")
+            .arg("install")
+            .current_dir(&harmony_dir)
+            .status()
+            .context("ohpm install failed")?;
+        if !status.success() {
+            bail!("ohpm install failed");
+        }
+    }
+
+    let hvigor = if harmony_dir.join("hvigorw").exists() {
+        harmony_dir.join("hvigorw")
+    } else if command_available("hvigorw") {
+        PathBuf::from("hvigorw")
+    } else {
+        bail!("hvigorw not found. Open harmony/ in DevEco Studio or add DevEco's hvigorw to PATH");
+    };
+    println!("📦 Assembling HarmonyOS HAP...");
+    let status = Command::new(hvigor)
+        .current_dir(&harmony_dir)
+        .args([
+            "assembleHap",
+            "--mode",
+            "module",
+            "-p",
+            "product=default",
+            "-p",
+            "module=entry@default",
+            "-p",
+            if release {
+                "buildMode=release"
+            } else {
+                "buildMode=debug"
+            },
+            "--no-daemon",
+        ])
+        .status()
+        .context("hvigorw assembleHap failed")?;
+    if !status.success() {
+        bail!("HarmonyOS HAP assembly failed");
+    }
+    println!(
+        "✅ HAP output: {}",
+        harmony_dir
+            .join("entry/build/default/outputs/default")
+            .display()
+    );
+    Ok(())
+}
+
+fn resolve_ohos_native_dir(harmony_dir: &Path) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ohos_sdk_native").map(PathBuf::from) {
+        return path.exists().then_some(path);
+    }
+    if let Some(home) = std::env::var_os("OHOS_NDK_HOME").map(PathBuf::from) {
+        if let Some(native) = find_native_sdk(&home) {
+            return Some(native);
+        }
+    }
+    if let Some(home) = std::env::var_os("OHOS_SDK_HOME").map(PathBuf::from) {
+        if let Some(native) = find_native_sdk(&home) {
+            return Some(native);
+        }
+    }
+    read_deveco_sdk_dir(&harmony_dir.join("local.properties"))
+        .and_then(|home| find_native_sdk(&home))
+}
+
+fn read_deveco_sdk_dir(properties: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(properties).ok()?;
+    contents.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("sdk.dir=")?.trim();
+        (!value.is_empty()).then(|| PathBuf::from(value.replace("\\:", ":").replace("\\\\", "\\")))
+    })
+}
+
+fn find_native_sdk(home: &Path) -> Option<PathBuf> {
+    for native in [
+        home.to_path_buf(),
+        home.join("native"),
+        home.join("openharmony/native"),
+    ] {
+        if native.join("llvm/bin/clang").exists() {
+            return Some(native);
+        }
+    }
+
+    let mut versioned = Vec::new();
+    for root in [home.to_path_buf(), home.join("openharmony")] {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let native = entry.path().join("native");
+            if native.join("llvm/bin/clang").exists() {
+                let api = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<u32>()
+                    .unwrap_or_default();
+                versioned.push((api, native));
+            }
+        }
+    }
+    versioned.sort_by_key(|(api, _)| *api);
+    versioned.pop().map(|(_, native)| native)
+}
+
+fn write_ohos_linker_wrapper(
+    build_dir: &Path,
+    compiler: &Path,
+    native_dir: &Path,
+    name: &str,
+) -> Result<PathBuf> {
+    let wrapper = build_dir.join(format!("ohos-{name}.sh"));
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec {:?} --target=aarch64-linux-ohos --sysroot={:?} -D__MUSL__ \"$@\"\n",
+            compiler,
+            native_dir.join("sysroot"),
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&wrapper)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions)?;
+    }
+    Ok(wrapper)
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod platform_tests {
-    use super::validate_init_platform;
+    use super::{find_native_sdk, read_deveco_sdk_dir, validate_init_platform};
+    use std::fs;
 
     #[test]
     fn accepts_harmony_and_all_scaffold_targets() {
@@ -212,6 +403,31 @@ mod platform_tests {
     fn rejects_unknown_scaffold_target() {
         let error = validate_init_platform("ohos").unwrap_err().to_string();
         assert!(error.contains("use android|ios|harmony|both|all"));
+    }
+
+    #[test]
+    fn finds_latest_deveco_native_sdk() {
+        let root = tempfile::tempdir().unwrap();
+        for api in ["9", "12"] {
+            let bin = root.path().join(api).join("native/llvm/bin");
+            fs::create_dir_all(&bin).unwrap();
+            fs::write(bin.join("clang"), "").unwrap();
+        }
+        assert_eq!(
+            find_native_sdk(root.path()).unwrap(),
+            root.path().join("12/native")
+        );
+    }
+
+    #[test]
+    fn reads_deveco_local_properties() {
+        let root = tempfile::tempdir().unwrap();
+        let properties = root.path().join("local.properties");
+        fs::write(&properties, "sdk.dir=/opt/Huawei/Sdk\n").unwrap();
+        assert_eq!(
+            read_deveco_sdk_dir(&properties).unwrap(),
+            std::path::PathBuf::from("/opt/Huawei/Sdk")
+        );
     }
 }
 
@@ -633,6 +849,16 @@ fn apply_native_extensions(project_dir: &Path, build_dir: &Path) -> Result<()> {
     let lib_path = build_dir.join("src/lib.rs");
     let mut lib = fs::read_to_string(&lib_path)
         .context("generated Android library has no native extension registration point")?;
+    let harmony_marker = "pub extern \"C\" fn w3cos_harmony_surface_created";
+    if lib.contains(harmony_marker) {
+        let body_marker = lib[lib.find(harmony_marker).unwrap()..]
+            .find("{\n")
+            .map(|offset| lib.find(harmony_marker).unwrap() + offset + 2)
+            .context("generated HarmonyOS library has no surface-created body")?;
+        lib.insert_str(body_marker, &registrations);
+        fs::write(lib_path, lib)?;
+        return Ok(());
+    }
     let entry_markers = [
         "pub extern \"C\" fn w3cos_app_run() -> i32 {\n",
         "fn android_main(app: winit::platform::android::activity::AndroidApp) {\n",

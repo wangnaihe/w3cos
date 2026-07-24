@@ -493,6 +493,12 @@ fn gen_transition_rust(value: &str) -> String {
 fn gen_spacing(s: Spacing) -> String {
     match s {
         Spacing::Px(v) => format!("Spacing::Px({v}_f32)"),
+        Spacing::Percent(v) => format!("Spacing::Percent({v}_f32)"),
+        Spacing::Rem(v) => format!("Spacing::Rem({v}_f32)"),
+        Spacing::Em(v) => format!("Spacing::Em({v}_f32)"),
+        Spacing::Vw(v) => format!("Spacing::Vw({v}_f32)"),
+        Spacing::Vh(v) => format!("Spacing::Vh({v}_f32)"),
+        Spacing::Auto => "Spacing::Auto".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Top) => {
             "Spacing::SafeAreaInset(SafeAreaEdge::Top)".to_string()
         }
@@ -570,12 +576,45 @@ fn gen_padding_edges(s: &StyleDecl) -> Option<String> {
     ))
 }
 
+fn gen_margin_edges(s: &StyleDecl) -> Option<String> {
+    let (t, r, b, l) = if s.margin_top.is_some()
+        || s.margin_right.is_some()
+        || s.margin_bottom.is_some()
+        || s.margin_left.is_some()
+    {
+        let fallback = s.margin.unwrap_or(Spacing::Px(0.0));
+        (
+            s.margin_top.unwrap_or(fallback),
+            s.margin_right.unwrap_or(fallback),
+            s.margin_bottom.unwrap_or(fallback),
+            s.margin_left.unwrap_or(fallback),
+        )
+    } else if let Some(margin) = s.margin {
+        (margin, margin, margin, margin)
+    } else {
+        return None;
+    };
+    Some(format!(
+        "margin: Edges {{ top: {}, right: {}, bottom: {}, left: {} }}",
+        gen_spacing(t),
+        gen_spacing(r),
+        gen_spacing(b),
+        gen_spacing(l),
+    ))
+}
+
 fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     let indent = "    ".repeat(depth);
     let mut fields = Vec::new();
 
     if let Some(gap) = s.gap {
         fields.push(format!("gap: {gap}_f32"));
+    }
+    if let Some(gap) = s.row_gap {
+        fields.push(format!("row_gap: Some({gap}_f32)"));
+    }
+    if let Some(gap) = s.column_gap {
+        fields.push(format!("column_gap: Some({gap}_f32)"));
     }
     if let Some(padding) = gen_padding_edges(s) {
         fields.push(padding);
@@ -615,6 +654,29 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
             "border_color: {}",
             gen_color_rust(bc, "Color::TRANSPARENT")
         ));
+    }
+    for (name, value) in [
+        ("border_top_width", s.border_top_width),
+        ("border_right_width", s.border_right_width),
+        ("border_bottom_width", s.border_bottom_width),
+        ("border_left_width", s.border_left_width),
+    ] {
+        if let Some(value) = value {
+            fields.push(format!("{name}: Some({value}_f32)"));
+        }
+    }
+    for (name, value) in [
+        ("border_top_color", s.border_top_color.as_ref()),
+        ("border_right_color", s.border_right_color.as_ref()),
+        ("border_bottom_color", s.border_bottom_color.as_ref()),
+        ("border_left_color", s.border_left_color.as_ref()),
+    ] {
+        if let Some(value) = value {
+            fields.push(format!(
+                "{name}: Some({})",
+                gen_color_rust(value, "Color::TRANSPARENT")
+            ));
+        }
     }
     if let Some(ref ai) = s.align_items {
         let variant = match ai.as_str() {
@@ -686,13 +748,13 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
         fields.push(format!("position: {variant}"));
     }
     if let Some(ref ov) = s.overflow {
-        let variant = match ov.as_str() {
-            "hidden" => "Overflow::Hidden",
-            "scroll" => "Overflow::Scroll",
-            "auto" => "Overflow::Auto",
-            _ => "Overflow::Visible",
-        };
-        fields.push(format!("overflow: {variant}"));
+        fields.push(format!("overflow: {}", gen_overflow(ov)));
+    }
+    if let Some(ref value) = s.overflow_x {
+        fields.push(format!("overflow_x: Some({})", gen_overflow(value)));
+    }
+    if let Some(ref value) = s.overflow_y {
+        fields.push(format!("overflow_y: Some({})", gen_overflow(value)));
     }
     if let Some(ref behavior) = s.overscroll_behavior {
         let variant = match behavior.as_str() {
@@ -709,12 +771,16 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
         };
         fields.push(format!("scroll_initial_target: {variant}"));
     }
-    if let Some(m) = s.margin {
-        if let Spacing::Px(v) = m {
-            fields.push(format!("margin: Edges::all({v}_f32)"));
+    if let Some(margin) = gen_margin_edges(s) {
+        fields.push(margin);
+    }
+    if let Some(ref box_sizing) = s.box_sizing {
+        let variant = if box_sizing == "border-box" {
+            "BoxSizing::BorderBox"
         } else {
-            fields.push(format!("margin: Edges::all({})", gen_spacing(m)));
-        }
+            "BoxSizing::ContentBox"
+        };
+        fields.push(format!("box_sizing: {variant}"));
     }
     if let Some(ref fw) = s.flex_wrap {
         let variant = match fw.as_str() {
@@ -781,6 +847,20 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     }
     if let Some(ref alc) = s.align_content {
         fields.push(format!("align_content: {}", gen_align_content(alc)));
+    }
+    if let Some(ref value) = s.justify_self {
+        fields.push(format!("justify_self: {}", gen_align_self(value)));
+    }
+    if let Some(ref value) = s.justify_items {
+        fields.push(format!("justify_items: {}", gen_align_items(value)));
+    }
+    if let Some(ref value) = s.grid_template_columns {
+        fields.push(format!(
+            "grid_template_columns: Some({value:?}.to_string())"
+        ));
+    }
+    if let Some(ref value) = s.grid_column {
+        fields.push(format!("grid_column: Some({value:?}.to_string())"));
     }
     if let Some(ref mw) = s.max_width {
         fields.push(format!("max_width: {}", gen_dimension(mw)));
@@ -883,6 +963,25 @@ fn gen_align_self(s: &str) -> String {
         "baseline" => "AlignSelf::Baseline".to_string(),
         "stretch" => "AlignSelf::Stretch".to_string(),
         _ => "AlignSelf::Auto".to_string(),
+    }
+}
+
+fn gen_overflow(value: &str) -> &'static str {
+    match value {
+        "hidden" | "clip" => "Overflow::Hidden",
+        "scroll" => "Overflow::Scroll",
+        "auto" => "Overflow::Auto",
+        _ => "Overflow::Visible",
+    }
+}
+
+fn gen_align_items(s: &str) -> String {
+    match s {
+        "center" => "AlignItems::Center".to_string(),
+        "flex-start" | "start" | "flexStart" => "AlignItems::FlexStart".to_string(),
+        "flex-end" | "end" | "flexEnd" => "AlignItems::FlexEnd".to_string(),
+        "baseline" => "AlignItems::Baseline".to_string(),
+        _ => "AlignItems::Stretch".to_string(),
     }
 }
 
@@ -1201,49 +1300,32 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     if let Some(gap) = style.gap {
         out.push_str(&sp("gap", &format!("{gap}px")));
     }
-    if let Some(p) = style.padding {
-        let css = match p {
-            Spacing::Px(v) => format!("{v}px"),
-            Spacing::SafeAreaInset(SafeAreaEdge::Top) => "env(safe-area-inset-top)".to_string(),
-            Spacing::SafeAreaInset(SafeAreaEdge::Right) => "env(safe-area-inset-right)".to_string(),
-            Spacing::SafeAreaInset(SafeAreaEdge::Bottom) => {
-                "env(safe-area-inset-bottom)".to_string()
-            }
-            Spacing::SafeAreaInset(SafeAreaEdge::Left) => "env(safe-area-inset-left)".to_string(),
-            Spacing::KeyboardInsetHeight => {
-                "env(keyboard-inset-height, var(--w3cos-keyboard-inset-height, 0px))".to_string()
-            }
-            Spacing::Composite {
-                px,
-                safe_area,
-                keyboard_inset,
-            } => {
-                let mut terms: Vec<String> = Vec::new();
-                if px.abs() > f32::EPSILON {
-                    terms.push(format!("{px}px"));
-                }
-                if let Some(e) = safe_area {
-                    terms.push(match e {
-                        SafeAreaEdge::Top => "env(safe-area-inset-top)".to_string(),
-                        SafeAreaEdge::Right => "env(safe-area-inset-right)".to_string(),
-                        SafeAreaEdge::Bottom => "env(safe-area-inset-bottom)".to_string(),
-                        SafeAreaEdge::Left => "env(safe-area-inset-left)".to_string(),
-                    });
-                }
-                if keyboard_inset {
-                    terms.push(
-                        "env(keyboard-inset-height, var(--w3cos-keyboard-inset-height, 0px))"
-                            .to_string(),
-                    );
-                }
-                match terms.len() {
-                    0 => "0px".to_string(),
-                    1 => terms[0].clone(),
-                    _ => format!("calc({})", terms.join(" + ")),
-                }
-            }
-        };
+    if let Some(gap) = style.row_gap {
+        out.push_str(&sp("row-gap", &format!("{gap}px")));
+    }
+    if let Some(gap) = style.column_gap {
+        out.push_str(&sp("column-gap", &format!("{gap}px")));
+    }
+    if let Some(css) = dom_edge_shorthand_css(
+        style.padding,
+        style.padding_top,
+        style.padding_right,
+        style.padding_bottom,
+        style.padding_left,
+    ) {
         out.push_str(&sp("padding", &css));
+    }
+    if let Some(css) = dom_edge_shorthand_css(
+        style.margin,
+        style.margin_top,
+        style.margin_right,
+        style.margin_bottom,
+        style.margin_left,
+    ) {
+        out.push_str(&sp("margin", &css));
+    }
+    if let Some(value) = style.box_sizing.as_ref() {
+        out.push_str(&sp("box-sizing", value));
     }
     if let Some(fs) = style.font_size {
         out.push_str(&sp("font-size", &format!("{fs}px")));
@@ -1266,11 +1348,43 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     if let Some(ref bc) = style.border_color {
         out.push_str(&sp("border-color", bc));
     }
+    for (name, value) in [
+        ("border-top-width", style.border_top_width),
+        ("border-right-width", style.border_right_width),
+        ("border-bottom-width", style.border_bottom_width),
+        ("border-left-width", style.border_left_width),
+    ] {
+        if let Some(value) = value {
+            out.push_str(&sp(name, &format!("{value}px")));
+        }
+    }
+    for (name, value) in [
+        ("border-top-color", style.border_top_color.as_ref()),
+        ("border-right-color", style.border_right_color.as_ref()),
+        ("border-bottom-color", style.border_bottom_color.as_ref()),
+        ("border-left-color", style.border_left_color.as_ref()),
+    ] {
+        if let Some(value) = value {
+            out.push_str(&sp(name, value));
+        }
+    }
     if let Some(ref ai) = style.align_items {
         out.push_str(&sp("align-items", ai));
     }
     if let Some(ref jc) = style.justify_content {
         out.push_str(&sp("justify-content", jc));
+    }
+    if let Some(ref value) = style.justify_self {
+        out.push_str(&sp("justify-self", value));
+    }
+    if let Some(ref value) = style.justify_items {
+        out.push_str(&sp("justify-items", value));
+    }
+    if let Some(ref value) = style.grid_template_columns {
+        out.push_str(&sp("grid-template-columns", value));
+    }
+    if let Some(ref value) = style.grid_column {
+        out.push_str(&sp("grid-column", value));
     }
     if let Some(ref w) = style.width {
         out.push_str(&sp("width", w));
@@ -1278,8 +1392,35 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     if let Some(ref h) = style.height {
         out.push_str(&sp("height", h));
     }
+    if let Some(ref value) = style.min_width {
+        out.push_str(&sp("min-width", value));
+    }
+    if let Some(ref value) = style.min_height {
+        out.push_str(&sp("min-height", value));
+    }
+    if let Some(ref value) = style.max_width {
+        out.push_str(&sp("max-width", value));
+    }
+    if let Some(ref value) = style.max_height {
+        out.push_str(&sp("max-height", value));
+    }
     if let Some(fg) = style.flex_grow {
         out.push_str(&sp("flex-grow", &fg.to_string()));
+    }
+    if let Some(value) = style.flex_shrink {
+        out.push_str(&sp("flex-shrink", &value.to_string()));
+    }
+    if let Some(ref value) = style.flex_basis {
+        out.push_str(&sp("flex-basis", value));
+    }
+    if let Some(ref value) = style.flex_direction {
+        out.push_str(&sp("flex-direction", value));
+    }
+    if let Some(ref value) = style.flex_wrap {
+        out.push_str(&sp("flex-wrap", value));
+    }
+    if let Some(value) = style.order {
+        out.push_str(&sp("order", &value.to_string()));
     }
     if let Some(ref d) = style.display {
         out.push_str(&sp("display", d));
@@ -1289,6 +1430,12 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     }
     if let Some(ref ov) = style.overflow {
         out.push_str(&sp("overflow", ov));
+    }
+    if let Some(ref value) = style.overflow_x {
+        out.push_str(&sp("overflow-x", value));
+    }
+    if let Some(ref value) = style.overflow_y {
+        out.push_str(&sp("overflow-y", value));
     }
     if let Some(ref t) = style.top {
         out.push_str(&sp("top", t));
@@ -1304,6 +1451,71 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     }
     if let Some(zi) = style.z_index {
         out.push_str(&sp("z-index", &zi.to_string()));
+    }
+}
+
+fn dom_edge_shorthand_css(
+    all: Option<Spacing>,
+    top: Option<Spacing>,
+    right: Option<Spacing>,
+    bottom: Option<Spacing>,
+    left: Option<Spacing>,
+) -> Option<String> {
+    let (top, right, bottom, left) =
+        if top.is_some() || right.is_some() || bottom.is_some() || left.is_some() {
+            let fallback = all.unwrap_or(Spacing::Px(0.0));
+            (
+                top.unwrap_or(fallback),
+                right.unwrap_or(fallback),
+                bottom.unwrap_or(fallback),
+                left.unwrap_or(fallback),
+            )
+        } else {
+            let all = all?;
+            (all, all, all, all)
+        };
+    Some(format!(
+        "{} {} {} {}",
+        dom_spacing_css(top),
+        dom_spacing_css(right),
+        dom_spacing_css(bottom),
+        dom_spacing_css(left)
+    ))
+}
+
+fn dom_spacing_css(value: Spacing) -> String {
+    match value {
+        Spacing::Px(v) => format!("{v}px"),
+        Spacing::Percent(v) => format!("{v}%"),
+        Spacing::Rem(v) => format!("{v}rem"),
+        Spacing::Em(v) => format!("{v}em"),
+        Spacing::Vw(v) => format!("{v}vw"),
+        Spacing::Vh(v) => format!("{v}vh"),
+        Spacing::Auto => "auto".to_string(),
+        Spacing::SafeAreaInset(edge) => format!(
+            "env(safe-area-inset-{})",
+            match edge {
+                SafeAreaEdge::Top => "top",
+                SafeAreaEdge::Right => "right",
+                SafeAreaEdge::Bottom => "bottom",
+                SafeAreaEdge::Left => "left",
+            }
+        ),
+        Spacing::KeyboardInsetHeight => "env(keyboard-inset-height)".to_string(),
+        Spacing::Composite {
+            px,
+            safe_area,
+            keyboard_inset,
+        } => {
+            let mut terms = vec![format!("{px}px")];
+            if let Some(edge) = safe_area {
+                terms.push(dom_spacing_css(Spacing::SafeAreaInset(edge)));
+            }
+            if keyboard_inset {
+                terms.push("env(keyboard-inset-height)".to_string());
+            }
+            format!("calc({})", terms.join(" + "))
+        }
     }
 }
 

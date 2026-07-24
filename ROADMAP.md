@@ -59,7 +59,7 @@ suite is red.
   `dom_to_component_tree_smoke`.
 - [x] Fix `w3cos-compiler` `generated_bundle_runs_jsdom_globals`.
 - [ ] Make the required compiler/runtime suites part of the default CI gate.
-- [ ] Add a compiled-JavaScript API-surface test that checks `typeof`,
+- [x] Add a compiled-JavaScript API-surface test that checks `typeof`,
   constructor calls, callbacks/events, and failure behavior.
 - [x] Add a `.d.ts`-driven `web-api-skeleton` tool that generates reviewable
   Rust facades with named `todo!()` placeholders without wiring them into the
@@ -72,7 +72,7 @@ suite is red.
 
 ### Status integrity
 
-- [ ] Generate or maintain one Web API capability matrix with the columns
+- [x] Generate or maintain one Web API capability matrix with the columns
   `engine`, `esm_surface`, `desktop`, `android`, `ios`, and `conformance`.
 - [ ] Remove DONE claims where only a Rust module exists.
 - [ ] Keep roadmap, README capability claims, and mobile documentation aligned
@@ -123,29 +123,30 @@ precede ecosystem breadth or migration tooling.
 ### R1.3 Web Speech
 
 - [x] iOS native speech engine prototype (`SFSpeechRecognizer`).
-- [ ] Expose `window.SpeechRecognition` and the compatibility alias
+- [x] Expose `window.SpeechRecognition` and the compatibility alias
   `window.webkitSpeechRecognition`.
-- [ ] Implement browser-shaped results, alternatives, confidence, finality,
+- [x] Implement browser-shaped results, alternatives, confidence, finality,
   lifecycle events, and error events.
 - [ ] Add Android speech recognition adapter.
-- [ ] Define desktop behavior explicitly: supported adapter or standards-shaped
+- [x] Define desktop behavior explicitly: supported adapter or standards-shaped
   `not-supported` failure.
 - [ ] Validate permissions, denial, restart, continuous mode, and cancellation
   on physical iOS and Android devices.
 
 ### R1.4 Geolocation
 
-- [ ] Implement `navigator.geolocation`.
-- [ ] Support `getCurrentPosition`, `watchPosition`, and `clearWatch`.
-- [ ] Implement timeout, maximum age, accuracy fields, permission denial, and
+- [x] Implement `navigator.geolocation`.
+- [x] Support `getCurrentPosition`, `watchPosition`, and `clearWatch`.
+- [x] Implement timeout, maximum age, accuracy fields, permission denial, and
   platform-disabled errors.
 - [ ] Add iOS Core Location and Android location adapters with manifest/plist
   generation.
 
 ### R1.5 MediaDevices
 
-- [ ] Implement `navigator.mediaDevices`.
-- [ ] Implement `getUserMedia()` for camera and microphone.
+- [x] Implement `navigator.mediaDevices`.
+- [x] Implement `getUserMedia()` for camera and microphone through the
+  host-device adapter boundary.
 - [ ] Provide `MediaStream` and track lifecycle sufficient for preview,
   capture, stop, and permission handling.
 - [ ] Add photo/evidence capture without product-specific native modules.
@@ -174,11 +175,11 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 ### R2.1 Binary data and files
 
 - [x] Expose working `TextEncoder` alongside `TextDecoder`.
-- [ ] Implement `ArrayBuffer`, `DataView`, and typed-array buffer/view
+- [x] Implement `ArrayBuffer`, `DataView`, and typed-array buffer/view
   semantics.
-- [ ] Implement `Blob`, `File`, and `FileReader`.
-- [ ] Implement `FormData`, including Fetch request integration.
-- [ ] Implement `ImageData`, `Path2D`, and `OffscreenCanvas` where supported by
+- [x] Implement `Blob`, `File`, and `FileReader`.
+- [x] Implement `FormData`, including Fetch request integration.
+- [x] Implement `ImageData`, `Path2D`, and `OffscreenCanvas` where supported by
   the existing Canvas engine.
 
 ### R2.2 Events and DOM constructors
@@ -187,39 +188,66 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 - [x] Expose DOM constructors with useful identity and `instanceof` behavior:
   `Node`, `Element`, `HTMLElement`, common HTML elements, `Range`, and
   `Selection`.
-- [ ] Expose standard event subclasses: keyboard, pointer, input, clipboard,
+- [x] Expose standard event subclasses: keyboard, pointer, input, clipboard,
   drag, touch, animation, and transition events.
-- [ ] Replace silent empty-object fallbacks with standards-shaped exceptions or
+- [x] Replace silent empty-object fallbacks with standards-shaped exceptions or
   explicit unsupported errors.
 
 ### R2.3 Observers and background work
 
 - [x] ResizeObserver engine and compiler special case.
-- [ ] Expose standard `ResizeObserver` constructor behavior through ESM.
-- [ ] Expose `MutationObserver` and `IntersectionObserver` through ESM.
-- [ ] Implement `PerformanceObserver`.
-- [ ] Expose the Worker engine as `Worker`, `SharedWorker`, `MessageChannel`,
+- [x] Expose standard `ResizeObserver` constructor behavior through ESM.
+- [x] Expose `MutationObserver` and `IntersectionObserver` through ESM.
+- [x] Implement `PerformanceObserver`.
+- [x] Expose the Worker engine as `Worker`, `SharedWorker`, `MessageChannel`,
   `MessagePort`, and structured message events.
 
 ### R2.4 Remaining network/browser services
 
-- [ ] Expose `EventSource`.
-- [ ] Decide whether `XMLHttpRequest` is a compatibility shim over Fetch or an
-  explicitly unsupported legacy API.
-- [ ] Expose the Notifications API on supported desktop/mobile platforms.
-- [ ] Complete Clipboard item/data-transfer APIs beyond text-only clipboard.
-- [ ] Add secure randomness backed by the OS; do not use the current
+- [x] Expose `EventSource`.
+- [x] Provide `XMLHttpRequest` as a compatibility shim over Fetch.
+- [x] Expose the Notifications API on supported desktop/mobile platforms.
+- [x] Complete Clipboard item/data-transfer APIs beyond text-only clipboard.
+- [x] Add secure randomness backed by the OS; do not use the current
   deterministic fallback for security-sensitive APIs.
 
 ### R2.5 DOM, viewport, and display
 
-- [ ] Implement Fullscreen API and `fullscreenchange` lifecycle.
-- [ ] Implement Screen Orientation state, `lock()`, `unlock()`, and events.
-- [ ] Make `VisualViewport` geometry and resize/scroll listeners live.
-- [ ] Complete computed style beyond inline-style reflection.
+- [x] Implement Fullscreen API and `fullscreenchange` lifecycle.
+- [x] Implement Screen Orientation state, `lock()`, `unlock()`, and events.
+- [x] Make `VisualViewport` geometry and resize/scroll listeners live.
+- [x] Complete computed style beyond inline-style reflection.
 - [ ] Complete SVG namespace/rendering support required by application gates.
-- [ ] Define cookie behavior: real store with policy or explicit unsupported
-  errors instead of inert assignment.
+  - [x] SVG namespace identity, concrete element constructors, animated
+    lengths, geometry methods, and basic `rect`/`circle`/`ellipse`/`line`/text
+    presentation attributes.
+  - [x] SVG path/polyline/polygon rasterization (including arcs and shorthand
+    commands), fill/stroke paint, and basic translate/scale/rotate transforms.
+  - [x] Retained SVG subtree normalization/rasterization through `usvg`/`resvg`,
+    including static gradients, clipping, masks, `<use>`, and viewBox scaling.
+    Raster revisions exclude compositor-only transform and opacity changes.
+  - [x] Retain parsed usvg trees across raster sizes and route pointer/click/wheel
+    events through DOM bubbling chains. Author-ID nodes use direct lookup;
+    anonymous basic shapes use paint-order mapping and cached per-node alpha
+    masks. Path hit testing covers `auto`/`visiblePainted`, `painted`, `fill`,
+    `visibleFill`, `stroke`, `visibleStroke`, `all`, `visible`, `none`, and
+    `bounding-box`; `<defs>` nodes no longer shift anonymous paint ordinals,
+    and both author-ID and anonymous `<use>` instances route to their DOM
+    bubbling chain. Text uses character-cell hit geometry; raster images use
+    per-pixel alpha for `painted` and their full rectangle for
+    `fill`/`stroke`/`all`. A separately cached hit tree removes `mask` and
+    `filter` effects while retaining transformed `clip-path` ancestry, matching
+    SVG pointer-event processing. Geometry-only hit modes inject paint only
+    into that hit tree, preserving otherwise-pruned unpainted shapes and text;
+    inherited `pointer-events` values are retained in DOM event metadata.
+    Unpainted `<use>` shadow content, including transitive nested references,
+    is retained only for geometry hit modes; painted instances continue to use
+    the display tree.
+  - [ ] Complete complex nested clip-path cases, animation-aware subtree
+    invalidation, tile-granular rerasterization, and an optional direct GPU
+    vector path.
+- [x] Define cookie behavior: real per-origin session store instead of inert
+  assignment.
 
 **R2 exit:** supported APIs behave consistently when reached from compiled ESM;
 Rust-only modules are no longer advertised as browser APIs.
@@ -291,14 +319,37 @@ framework-specific runtime paths to make individual packages pass.
 
 ### R4.1 JavaScript semantics
 
-- [ ] Complete RegExp semantics required by package gates.
-- [ ] Implement `BigInt`.
-- [ ] Implement real `WeakMap`, `WeakSet`, `WeakRef`, and
-  `FinalizationRegistry` semantics where feasible.
-- [ ] Implement `ArrayBuffer`, shared-memory, and Atomics semantics selected by
+- [x] Complete RegExp semantics required by package gates.
+  - [x] Constructor metadata, compiled literals, `exec`/`test`, global and
+    sticky `lastIndex`, named captures, `match`/`search`/`replace`, UTF-16
+    indices, and syntax errors.
+  - [x] Replacement callbacks and JavaScript substitution tokens.
+  - [x] `matchAll` iteration and regexp-aware `split`.
+  - [x] Match indices (`d`) with UTF-16 ranges and named groups.
+  - [x] Unicode sets (`v`), look-around, and backreferences required by
+    package gates.
+- [x] Implement `BigInt` literals, construction, arbitrary-precision
+  arithmetic, comparisons, bitwise operations, shifts, and radix formatting.
+- [x] Implement `WeakMap`, `WeakSet`, `WeakRef`, and `FinalizationRegistry`
+  semantics where feasible.
+  - [x] Weak object/array/function targets, weak-key collections, `deref`,
+    constructor identity, and primitive-target `TypeError`s.
+  - [x] `FinalizationRegistry.register`, `unregister`, and explicit
+    `cleanupSome` delivery for dead targets.
+  - [x] When tracing-GC timing is unavailable, retain the compatible API and
+    return shapes, emit one runtime warning, and expose explicit cleanup
+    instead of failing construction. Ephemeron tracing and automatic callback
+    timing are not claimed.
+- [x] Implement `ArrayBuffer`, shared-memory, and Atomics semantics selected by
   the supported security model.
-- [ ] Complete URI encode/decode globals.
-- [ ] Remove reachable `todo!()` and silent unsupported-expression lowering
+  - [x] Shared backing storage for integer and BigInt typed arrays with
+    `load`, `store`, arithmetic, bitwise, exchange, and compare-exchange.
+  - [x] Bounds/type errors, `isLockFree`, `notify`, and browser-compatible
+    `wait`/`waitAsync` return shapes.
+  - [x] Use a warning plus non-blocking `timed-out` fallback where the native
+    host cannot safely block; cross-thread Worker execution is not claimed.
+- [x] Complete URI encode/decode globals.
+- [x] Remove reachable `todo!()` and silent unsupported-expression lowering
   from production compiler paths.
 
 ### R4.2 Package gates

@@ -1,6 +1,23 @@
+import harmonyRuntime from 'libw3cos_harmony_host.so';
+
 @Entry
 @Component
 struct Index {
+  private frameTimer: number = -1
+
+  aboutToAppear(): void {
+    this.frameTimer = setInterval(() => {
+      harmonyRuntime.frame()
+    }, 16)
+  }
+
+  aboutToDisappear(): void {
+    if (this.frameTimer >= 0) {
+      clearInterval(this.frameTimer)
+      this.frameTimer = -1
+    }
+  }
+
   build() {
     Stack() {
       XComponent({

@@ -97,14 +97,11 @@ pub fn text_encoder_class() -> Value {
                         ])));
                     }
 
-                    let Value::Array(values) = destination else {
-                        unreachable!("typed arrays use Value::Array storage");
-                    };
-                    let mut values = values.borrow_mut();
-                    let mut bytes = vec![0u8; values.len()];
+                    let length = destination.get_property("length").to_number().max(0.0) as usize;
+                    let mut bytes = vec![0u8; length];
                     let progress = TextEncoder::new().encode_into(&input, &mut bytes);
-                    for (slot, byte) in values.iter_mut().zip(bytes).take(progress.written) {
-                        *slot = Value::Number(byte as f64);
+                    for (index, byte) in bytes.into_iter().take(progress.written).enumerate() {
+                        destination.set_property(&index.to_string(), Value::Number(byte as f64));
                     }
                     Value::object(HashMap::from([
                         ("read".to_string(), Value::Number(progress.read as f64)),

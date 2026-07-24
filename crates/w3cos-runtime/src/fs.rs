@@ -274,13 +274,19 @@ pub enum FsEventKind {
 }
 
 /// A handle to an active file watcher. Drop to stop watching.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 pub struct FsWatcher {
     _watcher: notify::RecommendedWatcher,
     pub rx: mpsc::Receiver<FsEvent>,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 impl FsWatcher {
     /// Drain all pending events (non-blocking).
     pub fn try_recv_all(&self) -> Vec<FsEvent> {
@@ -300,7 +306,10 @@ impl FsWatcher {
 /// Watch a path for changes. Returns a `FsWatcher` handle.
 ///
 /// The watcher runs on a background thread. Drop the handle to stop.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 pub fn watch(path: &str) -> Result<FsWatcher, String> {
     use notify::{EventKind, RecursiveMode, Watcher};
 
@@ -335,7 +344,10 @@ pub fn watch(path: &str) -> Result<FsWatcher, String> {
     })
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+)))]
 pub fn watch(_path: &str) -> Result<(), String> {
     Err("fs.watch is not available on mobile targets".to_string())
 }
@@ -361,13 +373,19 @@ pub fn chmod(path: &str, mode: u32) -> Result<(), String> {
 
 /// Change file owner and group (Unix desktop only).
 pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(target_env = "ohos")
+    ))]
     {
         use nix::unistd::{Gid, Uid};
         nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
             .map_err(|e| e.to_string())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(target_env = "ohos")
+    )))]
     {
         let _ = (path, uid, gid);
         Err("chown is only supported on Unix".to_string())

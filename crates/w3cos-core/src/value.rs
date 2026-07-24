@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 /// JavaScript-compatible dynamic value type.
 ///
@@ -45,6 +45,11 @@ pub struct JsFunction {
     /// `id.toString = () => name` (monaco's service decorators), static
     /// methods installed on constructor functions, etc.
     props: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+}
+
+pub(crate) struct WeakJsFunction {
+    inner: Weak<dyn Fn(Value, Vec<Value>) -> Value>,
+    props: Weak<RefCell<std::collections::HashMap<String, Value>>>,
 }
 
 impl JsFunction {
@@ -94,6 +99,22 @@ impl JsFunction {
     pub fn ptr_eq(&self, other: &JsFunction) -> bool {
         Rc::ptr_eq(&self.inner, &other.inner)
     }
+
+    pub(crate) fn downgrade(&self) -> WeakJsFunction {
+        WeakJsFunction {
+            inner: Rc::downgrade(&self.inner),
+            props: Rc::downgrade(&self.props),
+        }
+    }
+}
+
+impl WeakJsFunction {
+    pub(crate) fn upgrade(&self) -> Option<JsFunction> {
+        Some(JsFunction {
+            inner: self.inner.upgrade()?,
+            props: self.props.upgrade()?,
+        })
+    }
 }
 
 impl fmt::Debug for JsFunction {
@@ -111,6 +132,11 @@ impl Value {
     /// This is suitable for React-style hook dependency comparison.
     pub fn identity_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
+        if let Some(value) = crate::bigint::get(self) {
+            8_u8.hash(&mut hasher);
+            value.to_string().hash(&mut hasher);
+            return hasher.finish();
+        }
         match self {
             Value::Undefined => 0_u8.hash(&mut hasher),
             Value::Null => 1_u8.hash(&mut hasher),
@@ -148,6 +174,9 @@ impl Value {
 
     /// ECMAScript `typeof` operator.
     pub fn type_of(&self) -> &'static str {
+        if crate::bigint::get(self).is_some() {
+            return "bigint";
+        }
         match self {
             Value::Undefined => "undefined",
             Value::Null => "object",
@@ -162,6 +191,9 @@ impl Value {
 
     /// ECMAScript `ToBoolean`.
     pub fn to_bool(&self) -> bool {
+        if let Some(zero) = crate::bigint::is_zero(self) {
+            return !zero;
+        }
         match self {
             Value::Undefined | Value::Null => false,
             Value::Bool(b) => *b,
@@ -173,6 +205,15 @@ impl Value {
 
     /// ECMAScript `ToNumber`.
     pub fn to_number(&self) -> f64 {
+        if let Some(value) = crate::bigint::get(self) {
+            return value.to_string().parse().unwrap_or_else(|_| {
+                if value.sign() == num_bigint::Sign::Minus {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }
+            });
+        }
         match self {
             Value::Undefined => f64::NAN,
             Value::Null => 0.0,
@@ -191,6 +232,9 @@ impl Value {
 
     /// ECMAScript `ToString`.
     pub fn to_js_string(&self) -> String {
+        if let Some(value) = crate::bigint::get(self) {
+            return value.to_string();
+        }
         match self {
             Value::Undefined => "undefined".into(),
             Value::Null => "null".into(),
@@ -250,7 +294,7 @@ impl Value {
         matches!(self, Value::Bool(_))
     }
     pub fn is_object(&self) -> bool {
-        matches!(self, Value::Object(_))
+        matches!(self, Value::Object(_)) && crate::bigint::get(self).is_none()
     }
     pub fn is_array(&self) -> bool {
         matches!(self, Value::Array(_))
@@ -306,15 +350,13 @@ impl Value {
                 }
             }
             Value::Array(arr) => {
+                if let Some(value) = crate::binary::typed_array_property(self, key) {
+                    return value;
+                }
                 if let Ok(idx) = key.parse::<usize>() {
                     arr.borrow().get(idx).cloned().unwrap_or(Value::Undefined)
                 } else if key == "length" {
                     Value::Number(arr.borrow().len() as f64)
-                } else if key == "buffer" {
-                    // Typed arrays use the same Rc-backed storage as arrays
-                    // in the compact runtime; exposing it as `buffer` lets a
-                    // new typed-array view reuse/slice those code units.
-                    self.clone()
                 } else {
                     Value::Undefined
                 }
@@ -383,6 +425,9 @@ impl Value {
             }
             Value::Array(arr) => {
                 if let Ok(idx) = key.parse::<usize>() {
+                    if crate::binary::set_typed_array_index(self, idx, value.clone()) {
+                        return;
+                    }
                     let mut a = arr.borrow_mut();
                     if idx >= a.len() {
                         a.resize(idx + 1, Value::Undefined);
@@ -661,11 +706,14 @@ impl Value {
                 if separator.is_undefined() {
                     return Value::array(vec![Value::String(value.clone())]);
                 }
-                let separator = separator.to_js_string();
                 let limit = args
                     .get(1)
                     .map(|value| value.to_number().max(0.0) as usize)
                     .unwrap_or(usize::MAX);
+                if let Some(result) = crate::regexp::string_split(value, separator, limit) {
+                    return result;
+                }
+                let separator = separator.to_js_string();
                 let parts: Vec<Value> = if separator.is_empty() {
                     value
                         .chars()
@@ -687,13 +735,51 @@ impl Value {
                     return result;
                 }
             }
+            (Value::String(value), "matchAll") => {
+                let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+                if let Some(result) = crate::regexp::string_match_all(value, &pattern) {
+                    return result;
+                }
+                let global = crate::regexp::create(&pattern.to_js_string(), "g");
+                return crate::regexp::string_match_all(value, &global)
+                    .expect("fresh global regexp always produces an iterator");
+            }
+            (Value::String(value), "search") => {
+                let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+                if let Some(result) = crate::regexp::string_search(value, &pattern) {
+                    return result;
+                }
+                return Value::Number(
+                    value
+                        .find(&pattern.to_js_string())
+                        .map(|byte| value[..byte].encode_utf16().count() as f64)
+                        .unwrap_or(-1.0),
+                );
+            }
             (Value::String(value), "replace") => {
                 let pattern = args.first().cloned().unwrap_or(Value::Undefined);
                 let replacement = args.get(1).cloned().unwrap_or(Value::Undefined);
-                if let Some(result) =
-                    crate::regexp::string_replace(value, &pattern, &replacement.to_js_string())
-                {
+                if let Some(result) = crate::regexp::string_replace(value, &pattern, &replacement) {
                     return result;
+                }
+                if replacement.is_function()
+                    && let Some(byte) = value.find(&pattern.to_js_string())
+                {
+                    let matched = pattern.to_js_string();
+                    let result = replacement.call(
+                        Value::Undefined,
+                        vec![
+                            pattern,
+                            Value::Number(value[..byte].encode_utf16().count() as f64),
+                            Value::String(value.clone()),
+                        ],
+                    );
+                    return Value::String(format!(
+                        "{}{}{}",
+                        &value[..byte],
+                        result.to_js_string(),
+                        &value[byte + matched.len()..]
+                    ));
                 }
                 return Value::String(value.replacen(
                     &pattern.to_js_string(),
@@ -732,6 +818,12 @@ impl Value {
                     .iter()
                     .collect();
                 let offset = array_index(args.get(1), values.borrow().len(), 0);
+                if crate::binary::is_typed_array(self) {
+                    for (index, value) in source.into_iter().enumerate() {
+                        self.set_property(&(offset + index).to_string(), value);
+                    }
+                    return Value::Undefined;
+                }
                 let mut target = values.borrow_mut();
                 for (index, value) in source.into_iter().enumerate() {
                     if let Some(slot) = target.get_mut(offset + index) {
@@ -1187,70 +1279,120 @@ impl Value {
     pub fn js_add(&self, other: &Value) -> Value {
         if self.is_string() || other.is_string() {
             Value::String(format!("{}{}", self.to_js_string(), other.to_js_string()))
+        } else if let Some(value) = crate::bigint::add(self, other) {
+            value
         } else {
             Value::Number(self.to_number() + other.to_number())
         }
     }
 
     pub fn js_sub(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::sub(self, other) {
+            return value;
+        }
         Value::Number(self.to_number() - other.to_number())
     }
 
     pub fn js_mul(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::mul(self, other) {
+            return value;
+        }
         Value::Number(self.to_number() * other.to_number())
     }
 
     pub fn js_div(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::div(self, other) {
+            return value;
+        }
         Value::Number(self.to_number() / other.to_number())
     }
 
     pub fn js_rem(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::rem(self, other) {
+            return value;
+        }
         Value::Number(self.to_number() % other.to_number())
     }
 
     pub fn js_neg(&self) -> Value {
+        if let Some(value) = crate::bigint::neg(self) {
+            return value;
+        }
         Value::Number(-self.to_number())
     }
 
     pub fn js_pow(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::pow(self, other) {
+            return value;
+        }
         Value::Number(self.to_number().powf(other.to_number()))
     }
 
     // ── Bitwise operators ──
 
     pub fn js_bitor(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::bitor(self, other) {
+            return value;
+        }
         Value::Number((self.to_i32() | other.to_i32()) as f64)
     }
 
     pub fn js_bitand(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::bitand(self, other) {
+            return value;
+        }
         Value::Number((self.to_i32() & other.to_i32()) as f64)
     }
 
     pub fn js_bitxor(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::bitxor(self, other) {
+            return value;
+        }
         Value::Number((self.to_i32() ^ other.to_i32()) as f64)
     }
 
     pub fn js_bitnot(&self) -> Value {
+        if let Some(value) = crate::bigint::bitnot(self) {
+            return value;
+        }
         Value::Number((!self.to_i32()) as f64)
     }
 
     pub fn js_shl(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::shift_left(self, other) {
+            return value;
+        }
         let shift = (other.to_i32() as u32) & 0x1f;
         Value::Number((self.to_i32() << shift) as f64)
     }
 
     pub fn js_shr(&self, other: &Value) -> Value {
+        if let Some(value) = crate::bigint::shift_right(self, other) {
+            return value;
+        }
         let shift = (other.to_i32() as u32) & 0x1f;
         Value::Number((self.to_i32() >> shift) as f64)
     }
 
     pub fn js_ushr(&self, other: &Value) -> Value {
+        if crate::bigint::get(self).is_some() || crate::bigint::get(other).is_some() {
+            crate::throw_value(crate::Value::object(HashMap::from([
+                ("name".into(), Value::string("TypeError")),
+                (
+                    "message".into(),
+                    Value::string("BigInts have no unsigned right shift"),
+                ),
+            ])));
+        }
         let shift = (other.to_i32() as u32) & 0x1f;
         Value::Number(((self.to_i32() as u32) >> shift) as f64)
     }
 
     /// ECMAScript `===` (strict equality).
     pub fn strict_eq(&self, other: &Value) -> bool {
+        if let Some(equal) = crate::bigint::equals(self, other) {
+            return equal;
+        }
         match (self, other) {
             (Value::Undefined, Value::Undefined) => true,
             (Value::Null, Value::Null) => true,
@@ -1275,6 +1417,9 @@ impl Value {
     /// compare by reference identity (`Rc` pointer), Function keys by shared
     /// closure identity (clones of one function value are the same key).
     pub fn same_value_zero(&self, other: &Value) -> bool {
+        if let Some(equal) = crate::bigint::equals(self, other) {
+            return equal;
+        }
         match (self, other) {
             (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -1309,6 +1454,9 @@ impl Value {
     }
 
     pub fn js_lt(&self, other: &Value) -> bool {
+        if let Some(ordering) = crate::bigint::compare(self, other) {
+            return ordering.is_lt();
+        }
         match (self, other) {
             (Value::String(left), Value::String(right)) => left < right,
             _ => self.to_number() < other.to_number(),
@@ -1316,6 +1464,9 @@ impl Value {
     }
 
     pub fn js_gt(&self, other: &Value) -> bool {
+        if let Some(ordering) = crate::bigint::compare(self, other) {
+            return ordering.is_gt();
+        }
         match (self, other) {
             (Value::String(left), Value::String(right)) => left > right,
             _ => self.to_number() > other.to_number(),
@@ -1323,6 +1474,9 @@ impl Value {
     }
 
     pub fn js_le(&self, other: &Value) -> bool {
+        if let Some(ordering) = crate::bigint::compare(self, other) {
+            return !ordering.is_gt();
+        }
         match (self, other) {
             (Value::String(left), Value::String(right)) => left <= right,
             _ => self.to_number() <= other.to_number(),
@@ -1330,6 +1484,9 @@ impl Value {
     }
 
     pub fn js_ge(&self, other: &Value) -> bool {
+        if let Some(ordering) = crate::bigint::compare(self, other) {
+            return !ordering.is_lt();
+        }
         match (self, other) {
             (Value::String(left), Value::String(right)) => left >= right,
             _ => self.to_number() >= other.to_number(),

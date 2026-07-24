@@ -12,6 +12,9 @@ cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe"]
 devtools = []
 ai-bridge = ["dep:w3cos-ai-bridge"]
+# Type-check the OHOS renderer on a non-OHOS host without pretending that the
+# host libc has target_env="ohos". Production builds do not enable this.
+ohos-check = ["skia", "skia-safe/gl"]
 
 [dependencies]
 w3cos-std = { workspace = true }
@@ -23,9 +26,12 @@ parley = { workspace = true }
 fontdue = { workspace = true }
 anyhow = { workspace = true }
 image = { workspace = true }
+resvg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+quick-xml = { workspace = true }
 libc = "0.2"
+getrandom = "0.3"
 tempfile = { workspace = true }
 glob = { workspace = true }
 w3cos-ffi = { path = "../w3cos-ffi" }
@@ -61,12 +67,16 @@ objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLCom
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation", "objc2-metal", "CAMetalLayer"] }
 objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["objc2-quartz-core", "UIView", "UIResponder"] }
 
-[target.'cfg(all(not(target_os = "android"), not(target_os = "ios"), not(target_os = "macos")))'.dependencies]
+[target.'cfg(all(not(target_os = "android"), not(target_os = "ios"), not(target_os = "macos"), not(target_env = "ohos")))'.dependencies]
 winit = { workspace = true }
 skia-safe = { version = "=0.93.1", optional = true }
 
-# Desktop-only system bridges (not available on iOS/Android)
-[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
+[target.'cfg(target_env = "ohos")'.dependencies]
+skia-safe = { version = "=0.93.1", optional = true, features = ["gl", "egl"] }
+libsqlite3-sys = { version = "0.35", features = ["bundled"] }
+
+# Desktop-only system bridges. OHOS reports target_os="linux", so exclude it explicitly.
+[target.'cfg(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(target_env = "ohos")))'.dependencies]
 ureq = { workspace = true }
 notify-rust = "4"
 arboard = "3.6.1"
@@ -82,6 +92,6 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal"] }
 w3cos-a11y = { workspace = true }
 
 # Mobile-friendly HTTP + DevTools CDP (Chrome remote debug via adb forward / sim localhost)
-[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+[target.'cfg(any(target_os = "ios", target_os = "android", target_env = "ohos"))'.dependencies]
 ureq = { workspace = true }
 tungstenite = { workspace = true }

@@ -1010,16 +1010,27 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         return;
     }
     match property {
-        "gap" => style.gap = css_parse_px(value),
+        "gap" => {
+            let parts: Vec<f32> = value.split_whitespace().filter_map(css_parse_px).collect();
+            if let Some(row) = parts.first().copied() {
+                style.gap = Some(row);
+                style.row_gap = Some(row);
+                style.column_gap = Some(parts.get(1).copied().unwrap_or(row));
+            }
+        }
+        "row-gap" => style.row_gap = css_parse_px(value),
+        "column-gap" => style.column_gap = css_parse_px(value),
         "padding" => apply_padding_shorthand(style, value),
         "padding-top" => style.padding_top = css_parse_spacing(value),
         "padding-right" => style.padding_right = css_parse_spacing(value),
         "padding-bottom" => style.padding_bottom = css_parse_spacing(value),
         "padding-left" => style.padding_left = css_parse_spacing(value),
-        "margin" => style.margin = css_parse_spacing(value),
-        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
-            style.margin = css_parse_spacing(value);
-        }
+        "margin" => apply_margin_shorthand(style, value),
+        "margin-top" => style.margin_top = css_parse_spacing(value),
+        "margin-right" => style.margin_right = css_parse_spacing(value),
+        "margin-bottom" => style.margin_bottom = css_parse_spacing(value),
+        "margin-left" => style.margin_left = css_parse_spacing(value),
+        "box-sizing" => style.box_sizing = Some(value.to_string()),
         "font-size" => style.font_size = css_parse_px(value),
         "font-weight" => style.font_weight = parse_font_weight(value),
         "font-family" => {
@@ -1030,20 +1041,34 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "background" | "background-color" => style.background = Some(value.to_string()),
         "border-radius" => style.border_radius = css_parse_px(value),
         "border-width" => style.border_width = css_parse_px(value),
-        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
-            style.border_width = css_parse_px(value);
-        }
-        "border-color"
-        | "border-top-color"
-        | "border-right-color"
-        | "border-bottom-color"
-        | "border-left-color" => {
-            style.border_color = Some(value.to_string());
-        }
+        "border-top-width" => style.border_top_width = css_parse_px(value),
+        "border-right-width" => style.border_right_width = css_parse_px(value),
+        "border-bottom-width" => style.border_bottom_width = css_parse_px(value),
+        "border-left-width" => style.border_left_width = css_parse_px(value),
+        "border-color" => style.border_color = Some(value.to_string()),
+        "border-top-color" => style.border_top_color = Some(value.to_string()),
+        "border-right-color" => style.border_right_color = Some(value.to_string()),
+        "border-bottom-color" => style.border_bottom_color = Some(value.to_string()),
+        "border-left-color" => style.border_left_color = Some(value.to_string()),
+        "border-top" => parse_border_side_shorthand(style, value, BorderSide::Top),
+        "border-right" => parse_border_side_shorthand(style, value, BorderSide::Right),
+        "border-bottom" => parse_border_side_shorthand(style, value, BorderSide::Bottom),
+        "border-left" => parse_border_side_shorthand(style, value, BorderSide::Left),
         "align-items" => style.align_items = Some(value.to_string()),
         "align-self" => style.align_self = Some(value.to_string()),
         "align-content" => style.align_content = Some(value.to_string()),
+        "justify-self" => style.justify_self = Some(value.to_string()),
+        "justify-items" => style.justify_items = Some(value.to_string()),
+        "place-items" => {
+            let mut values = value.split_whitespace();
+            if let Some(align) = values.next() {
+                style.align_items = Some(align.to_string());
+                style.justify_items = Some(values.next().unwrap_or(align).to_string());
+            }
+        }
         "justify-content" => style.justify_content = Some(value.to_string()),
+        "grid-template-columns" => style.grid_template_columns = Some(value.to_string()),
+        "grid-column" => style.grid_column = Some(value.to_string()),
         "width" => style.width = Some(value.to_string()),
         "height" => style.height = Some(value.to_string()),
         "min-width" => style.min_width = Some(value.to_string()),
@@ -1058,12 +1083,30 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "flex" => parse_flex_shorthand(style, value),
         "order" => style.order = value.parse().ok(),
         "position" => style.position = Some(value.to_string()),
+        "inset" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let values = match parts.as_slice() {
+                [all] => Some((*all, *all, *all, *all)),
+                [vertical, horizontal] => Some((*vertical, *horizontal, *vertical, *horizontal)),
+                [top, horizontal, bottom] => Some((*top, *horizontal, *bottom, *horizontal)),
+                [top, right, bottom, left] => Some((*top, *right, *bottom, *left)),
+                _ => None,
+            };
+            if let Some((top, right, bottom, left)) = values {
+                style.top = Some(top.to_string());
+                style.right = Some(right.to_string());
+                style.bottom = Some(bottom.to_string());
+                style.left = Some(left.to_string());
+            }
+        }
         "top" => style.top = Some(value.to_string()),
         "right" => style.right = Some(value.to_string()),
         "bottom" => style.bottom = Some(value.to_string()),
         "left" => style.left = Some(value.to_string()),
         "z-index" => style.z_index = value.parse().ok(),
         "overflow" => style.overflow = Some(value.to_string()),
+        "overflow-x" => style.overflow_x = Some(value.to_string()),
+        "overflow-y" => style.overflow_y = Some(value.to_string()),
         "overscroll-behavior" | "overscroll-behavior-y" => {
             style.overscroll_behavior = Some(value.to_string())
         }
@@ -1099,20 +1142,47 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
 
 fn parse_flex_shorthand(style: &mut StyleDecl, value: &str) {
     let parts: Vec<&str> = value.split_whitespace().collect();
-    match parts.len() {
-        1 => {
-            if let Ok(v) = parts[0].parse::<f32>() {
-                style.flex_grow = Some(v);
+    match parts.as_slice() {
+        ["none"] => {
+            style.flex_grow = Some(0.0);
+            style.flex_shrink = Some(0.0);
+            style.flex_basis = Some("auto".to_string());
+        }
+        ["auto"] => {
+            style.flex_grow = Some(1.0);
+            style.flex_shrink = Some(1.0);
+            style.flex_basis = Some("auto".to_string());
+        }
+        ["initial"] => {
+            style.flex_grow = Some(0.0);
+            style.flex_shrink = Some(1.0);
+            style.flex_basis = Some("auto".to_string());
+        }
+        [single] => {
+            if let Ok(grow) = single.parse::<f32>() {
+                style.flex_grow = Some(grow);
+                style.flex_shrink = Some(1.0);
+                style.flex_basis = Some("0%".to_string());
+            } else {
+                style.flex_grow = Some(1.0);
+                style.flex_shrink = Some(1.0);
+                style.flex_basis = Some((*single).to_string());
             }
         }
-        2 => {
-            style.flex_grow = parts[0].parse().ok();
-            style.flex_shrink = parts[1].parse().ok();
+        [grow, second] => {
+            style.flex_grow = grow.parse().ok();
+            if let Ok(shrink) = second.parse() {
+                style.flex_shrink = Some(shrink);
+                style.flex_basis = Some("0%".to_string());
+            } else {
+                style.flex_shrink = Some(1.0);
+                style.flex_basis = Some((*second).to_string());
+            }
         }
-        3 => {
-            style.flex_grow = parts[0].parse().ok();
-            style.flex_shrink = parts[1].parse().ok();
-            style.flex_basis = Some(parts[2].to_string());
+        [grow, shrink, basis] => {
+            style.flex_grow = grow.parse().ok();
+            style.flex_shrink = shrink.parse().ok();
+            style.flex_basis = Some((*basis).to_string());
         }
         _ => {}
     }
@@ -1230,6 +1300,21 @@ fn apply_padding_shorthand(style: &mut StyleDecl, value: &str) {
     }
 }
 
+fn apply_margin_shorthand(style: &mut StyleDecl, value: &str) {
+    let Some((t, r, b, l)) = css_parse_spacing_shorthand(value) else {
+        return;
+    };
+    style.margin_top = Some(t);
+    style.margin_right = Some(r);
+    style.margin_bottom = Some(b);
+    style.margin_left = Some(l);
+    if t == r && r == b && b == l {
+        style.margin = Some(t);
+    } else {
+        style.margin = None;
+    }
+}
+
 fn parse_font_weight(value: &str) -> Option<u16> {
     match value.trim() {
         "normal" => Some(400),
@@ -1247,6 +1332,47 @@ fn parse_border_shorthand(style: &mut StyleDecl, value: &str) {
             style.border_width = Some(px);
         } else if part.starts_with('#') || part.starts_with("rgb") {
             style.border_color = Some(part.to_string());
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BorderSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+fn parse_border_side_shorthand(style: &mut StyleDecl, value: &str, side: BorderSide) {
+    let mut width = None;
+    let mut color = None;
+    for part in value.split_whitespace() {
+        if let Some(px) = css_parse_px(part) {
+            width = Some(px);
+        } else if !matches!(
+            part,
+            "none" | "hidden" | "solid" | "dashed" | "dotted" | "double"
+        ) {
+            color = Some(part.to_string());
+        }
+    }
+    match side {
+        BorderSide::Top => {
+            style.border_top_width = width;
+            style.border_top_color = color;
+        }
+        BorderSide::Right => {
+            style.border_right_width = width;
+            style.border_right_color = color;
+        }
+        BorderSide::Bottom => {
+            style.border_bottom_width = width;
+            style.border_bottom_color = color;
+        }
+        BorderSide::Left => {
+            style.border_left_width = width;
+            style.border_left_color = color;
         }
     }
 }
@@ -1333,6 +1459,31 @@ mod tests {
         assert_eq!(style.padding_right, Some(Spacing::Px(16.0)));
         assert_eq!(style.padding_bottom, Some(Spacing::Px(12.0)));
         assert_eq!(style.padding_left, Some(Spacing::Px(16.0)));
+    }
+
+    #[test]
+    fn parse_modern_box_model_shorthands() {
+        let sheet = parse_css(
+            ".card { box-sizing: border-box; margin: 1rem auto 12px 5%; gap: 8px 16px; overflow-y: auto; flex: 1 1 0%; grid-template-columns: 1fr 1fr; grid-column: 1 / -1; justify-self: end; border-bottom: 3px solid #1677ff; }",
+        );
+        let style = &sheet.rules[0].style;
+
+        assert_eq!(style.box_sizing.as_deref(), Some("border-box"));
+        assert_eq!(style.margin_top, Some(Spacing::Rem(1.0)));
+        assert_eq!(style.margin_right, Some(Spacing::Auto));
+        assert_eq!(style.margin_bottom, Some(Spacing::Px(12.0)));
+        assert_eq!(style.margin_left, Some(Spacing::Percent(5.0)));
+        assert_eq!(style.row_gap, Some(8.0));
+        assert_eq!(style.column_gap, Some(16.0));
+        assert_eq!(style.overflow_y.as_deref(), Some("auto"));
+        assert_eq!(style.flex_grow, Some(1.0));
+        assert_eq!(style.flex_shrink, Some(1.0));
+        assert_eq!(style.flex_basis.as_deref(), Some("0%"));
+        assert_eq!(style.grid_template_columns.as_deref(), Some("1fr 1fr"));
+        assert_eq!(style.grid_column.as_deref(), Some("1 / -1"));
+        assert_eq!(style.justify_self.as_deref(), Some("end"));
+        assert_eq!(style.border_bottom_width, Some(3.0));
+        assert_eq!(style.border_bottom_color.as_deref(), Some("#1677ff"));
     }
 
     #[test]

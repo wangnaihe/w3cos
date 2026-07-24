@@ -135,15 +135,25 @@ pub fn fetch_value(arguments: Vec<Value>) -> Value {
     } else {
         init.get_property("headers")
     };
+    let multipart = crate::form_data::serialize(&body);
     let mut options = FetchOptions {
         method: parse_method(&method.to_js_string()),
-        body: match body {
-            Value::Undefined | Value::Null => None,
-            body => Some(body.to_js_string()),
-        },
+        body: multipart
+            .as_ref()
+            .map(|(body, _)| body.clone())
+            .or_else(|| match body {
+                Value::Undefined | Value::Null => None,
+                body => Some(body.to_js_string()),
+            }),
         ..FetchOptions::default()
     };
     options.headers = headers_to_map(&headers);
+    if let Some((_, content_type)) = multipart {
+        options
+            .headers
+            .entry("content-type".to_string())
+            .or_insert(content_type);
+    }
     let timeout = init.get_property("timeout");
     if timeout.is_number() {
         options.timeout_ms = Some(timeout.to_number().max(0.0) as u64);
@@ -593,6 +603,17 @@ fn request_value(input: Value, init: Value) -> Value {
     } else {
         init.get_property("body")
     };
+    if let Some((_, content_type)) = crate::form_data::serialize(&body) {
+        if !headers
+            .call_method("has", vec![Value::string("content-type")])
+            .to_bool()
+        {
+            headers.call_method(
+                "set",
+                vec![Value::string("content-type"), Value::string(&content_type)],
+            );
+        }
+    }
     let signal = if init.get_property("signal").is_undefined() && inherited {
         input.get_property("signal")
     } else {
@@ -623,9 +644,14 @@ fn request_value(input: Value, init: Value) -> Value {
     let text_body = body.clone();
     props.insert(
         "text".into(),
-        Value::function(move |_, _| match &text_body {
-            Value::Undefined | Value::Null => Value::from(""),
-            value => Value::from(value.to_js_string()),
+        Value::function(move |_, _| {
+            if let Some((body, _)) = crate::form_data::serialize(&text_body) {
+                return Value::string(&body);
+            }
+            match &text_body {
+                Value::Undefined | Value::Null => Value::from(""),
+                value => Value::from(value.to_js_string()),
+            }
         }),
     );
     let json_body = body;
@@ -890,6 +916,45 @@ pub fn parse_method(s: &str) -> Method {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn http_fixture(
+        response_body: &'static str,
+        expected_request: &'static str,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local HTTP fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("set fixture read timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            while !String::from_utf8_lossy(&request).contains(expected_request) {
+                let read = stream.read(&mut chunk).expect("read fixture request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.contains(expected_request),
+                "fixture request did not contain {expected_request:?}: {request}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write fixture response");
+        });
+        (format!("http://{address}/fixture"), handle)
+    }
 
     #[test]
     fn fetch_value_exposes_browser_response_properties() {
@@ -991,8 +1056,10 @@ mod tests {
     }
 
     #[test]
-    fn fetch_get_httpbin() {
-        let resp = fetch("https://httpbin.org/get", FetchOptions::default());
+    fn fetch_get_local_fixture() {
+        let (url, fixture) = http_fixture(r#"{"ok":true}"#, "GET /fixture");
+        let resp = fetch(&url, FetchOptions::default());
+        fixture.join().expect("GET fixture completed");
         assert!(resp.ok, "status: {} {}", resp.status, resp.status_text);
         assert_eq!(resp.status, 200);
         assert!(!resp.text().unwrap().is_empty());
@@ -1000,14 +1067,16 @@ mod tests {
 
     #[test]
     fn fetch_post_json() {
+        let (url, fixture) = http_fixture(r#"{"data":"w3cos"}"#, r#"{"hello":"w3cos"}"#);
         let resp = fetch(
-            "https://httpbin.org/post",
+            &url,
             FetchOptions {
                 method: Method::Post,
                 body: Some(r#"{"hello":"w3cos"}"#.to_string()),
                 ..Default::default()
             },
         );
+        fixture.join().expect("POST fixture completed");
         assert!(resp.ok);
         let json = resp.json().unwrap();
         assert!(json["data"].as_str().unwrap().contains("w3cos"));
@@ -1028,8 +1097,10 @@ mod tests {
 
     #[test]
     fn fetch_async_works() {
-        let rx = fetch_async("https://httpbin.org/get", FetchOptions::default());
+        let (url, fixture) = http_fixture(r#"{"ok":true}"#, "GET /fixture");
+        let rx = fetch_async(&url, FetchOptions::default());
         let result = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        fixture.join().expect("async fixture completed");
         match result {
             FetchResult::Success(resp) => {
                 assert!(resp.ok);

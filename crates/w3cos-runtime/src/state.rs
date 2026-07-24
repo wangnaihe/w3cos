@@ -231,9 +231,15 @@ pub fn execute_action(action: &w3cos_std::EventAction) {
             set_signal(*id, if val == 0 { 1 } else { 0 });
         }
         w3cos_std::EventAction::Notify(title, body) => {
-            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            #[cfg(all(
+                any(target_os = "macos", target_os = "linux", target_os = "windows"),
+                not(target_env = "ohos")
+            ))]
             crate::notification::show(title, body);
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            #[cfg(not(all(
+                any(target_os = "macos", target_os = "linux", target_os = "windows"),
+                not(target_env = "ohos")
+            )))]
             {
                 let _ = (title, body);
             }

@@ -1,4 +1,4 @@
-//! JavaScript `Map` and `Set` (plus `WeakMap`/`WeakSet` aliases) for the ESM
+//! JavaScript `Map` and `Set` for the ESM
 //! compile pipeline.
 //!
 //! Both collections follow the `promise.rs` state-storage idiom: an instance
@@ -24,15 +24,13 @@
 //! - `entries()` / `keys()` / `values()` return plain **arrays**, not
 //!   iterator objects — `next()`-style iterator protocol is not supported.
 //!   `for … of` and spread still work because they lower to `Value::iter`.
-//! - `WeakMap` / `WeakSet` have no weak semantics (keys are strongly held);
-//!   they alias `Map` / `Set`, so `instanceof` treats them interchangeably.
 //! - The id registry never reclaims ids of dropped instances.
 //! - `forEach` iterates a snapshot: entries added during the callback are
 //!   not visited (deletions/mutations still land in the store).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 use crate::Value;
 
@@ -463,67 +461,29 @@ pub fn set_class() -> Value {
     })
 }
 
-/// `WeakMap` — v1 aliases [`map_class`]: no weak semantics (keys are
-/// strongly held) and `instanceof` treats WeakMap and Map interchangeably.
+/// JavaScript `WeakMap` backed by Rust weak pointers.
 pub fn weak_map_class() -> Value {
-    map_class()
+    crate::weak::weak_map_class()
 }
 
-/// `WeakSet` — v1 aliases [`set_class`] (no weak semantics; see
-/// [`weak_map_class`]).
+/// JavaScript `WeakSet` backed by Rust weak pointers.
 pub fn weak_set_class() -> Value {
-    set_class()
+    crate::weak::weak_set_class()
 }
 
 /// Minimal shared constructor for JavaScript typed arrays. The dynamic
 /// runtime represents their indexed storage as `Value::Array`; this preserves
 /// length, indexed access, iteration, and the `set` operation Monaco needs.
 pub fn typed_array_class() -> Value {
-    Value::callable(HashMap::new(), |_this, args| {
-        let Some(first) = args.first() else {
-            return typed_array_value(Vec::new());
-        };
-        if first.is_number() {
-            return typed_array_value(vec![
-                Value::Number(0.0);
-                first.to_number().max(0.0) as usize
-            ]);
-        }
-        let values: Vec<Value> = first.iter().collect();
-        let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-        let len = args
-            .get(2)
-            .map(Value::to_number)
-            .map(|len| len.max(0.0) as usize)
-            .unwrap_or_else(|| values.len().saturating_sub(start));
-        typed_array_value(values.into_iter().skip(start).take(len).collect())
-    })
-}
-
-thread_local! {
-    static TYPED_ARRAYS: RefCell<Vec<Weak<RefCell<Vec<Value>>>>> = const { RefCell::new(Vec::new()) };
+    crate::binary::typed_array_class("Uint8Array")
 }
 
 pub fn typed_array_value(values: Vec<Value>) -> Value {
-    let value = Value::array(values);
-    if let Value::Array(storage) = &value {
-        TYPED_ARRAYS.with(|arrays| arrays.borrow_mut().push(Rc::downgrade(storage)));
-    }
-    value
+    crate::binary::typed_array_value(values)
 }
 
 pub fn is_typed_array(value: &Value) -> bool {
-    let Value::Array(candidate) = value else {
-        return false;
-    };
-    TYPED_ARRAYS.with(|arrays| {
-        let mut arrays = arrays.borrow_mut();
-        arrays.retain(|array| array.strong_count() > 0);
-        arrays
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|array| Rc::ptr_eq(&array, candidate))
-    })
+    crate::binary::is_typed_array(value)
 }
 
 /// Entries yielded by `for … of` / spread over one of our collection
@@ -840,11 +800,13 @@ mod tests {
     }
 
     #[test]
-    fn weak_map_aliases_map() {
+    fn weak_map_uses_distinct_class_without_size() {
         let weak = construct(&weak_map_class(), vec![]);
-        weak.call_method("set", vec![Value::string("k"), Value::Number(1.0)]);
-        assert_eq!(weak.get_property("size").to_number(), 1.0);
+        let key = Value::object(HashMap::new());
+        weak.call_method("set", vec![key.clone(), Value::Number(1.0)]);
+        assert!(weak.get_property("size").is_undefined());
         assert!(instance_of(&weak, &weak_map_class()));
+        assert!(!instance_of(&weak, &map_class()));
     }
 
     // ── Set ─────────────────────────────────────────────────────────────
@@ -1010,11 +972,12 @@ mod tests {
         assert_eq!(typed.get_property("0").to_number(), 0.0);
         assert_eq!(typed.get_property("1").to_number(), 7.0);
         assert_eq!(typed.get_property("2").to_number(), 8.0);
-        assert!(typed.get_property("buffer").strict_eq(&typed));
+        let buffer = typed.get_property("buffer");
+        assert_eq!(buffer.get_property("byteLength").to_number(), 4.0);
 
         let view = crate::class::construct(
             &typed_array_class(),
-            vec![typed, Value::Number(1.0), Value::Number(2.0)],
+            vec![buffer, Value::Number(1.0), Value::Number(2.0)],
         );
         assert_eq!(view.get_property("length").to_number(), 2.0);
         assert_eq!(view.get_property("0").to_number(), 7.0);

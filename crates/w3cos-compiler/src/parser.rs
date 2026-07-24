@@ -95,6 +95,8 @@ pub struct StyleDecl {
     pub estimated_item_height: Option<f32>,
     pub virtual_overscan: Option<f32>,
     pub gap: Option<f32>,
+    pub row_gap: Option<f32>,
+    pub column_gap: Option<f32>,
     pub padding: Option<Spacing>,
     pub padding_top: Option<Spacing>,
     pub padding_right: Option<Spacing>,
@@ -107,6 +109,14 @@ pub struct StyleDecl {
     pub border_radius: Option<f32>,
     pub border_width: Option<f32>,
     pub border_color: Option<String>,
+    pub border_top_width: Option<f32>,
+    pub border_right_width: Option<f32>,
+    pub border_bottom_width: Option<f32>,
+    pub border_left_width: Option<f32>,
+    pub border_top_color: Option<String>,
+    pub border_right_color: Option<String>,
+    pub border_bottom_color: Option<String>,
+    pub border_left_color: Option<String>,
     pub align_items: Option<String>,
     pub justify_content: Option<String>,
     pub width: Option<String>,
@@ -119,17 +129,28 @@ pub struct StyleDecl {
     pub left: Option<String>,
     pub z_index: Option<i32>,
     pub overflow: Option<String>,
+    pub overflow_x: Option<String>,
+    pub overflow_y: Option<String>,
     pub overscroll_behavior: Option<String>,
     pub scroll_initial_target: Option<String>,
     pub display: Option<String>,
     // Phase 3 additions
     pub margin: Option<Spacing>,
+    pub margin_top: Option<Spacing>,
+    pub margin_right: Option<Spacing>,
+    pub margin_bottom: Option<Spacing>,
+    pub margin_left: Option<Spacing>,
+    pub box_sizing: Option<String>,
     pub flex_direction: Option<String>,
     pub flex_wrap: Option<String>,
     pub flex_shrink: Option<f32>,
     pub flex_basis: Option<String>,
     pub align_self: Option<String>,
     pub align_content: Option<String>,
+    pub justify_self: Option<String>,
+    pub justify_items: Option<String>,
+    pub grid_template_columns: Option<String>,
+    pub grid_column: Option<String>,
     pub order: Option<i32>,
     pub opacity: Option<f32>,
     pub text_align: Option<String>,
@@ -1156,6 +1177,8 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
 
             match key {
                 "gap" => style.gap = val.parse().ok(),
+                "rowGap" | "row_gap" => style.row_gap = val.parse().ok(),
+                "columnGap" | "column_gap" => style.column_gap = val.parse().ok(),
                 "padding" => style.padding = val.parse().ok().map(Spacing::Px),
                 "fontSize" | "font_size" => style.font_size = val.parse().ok(),
                 "fontWeight" | "font_weight" => style.font_weight = val.parse().ok(),
@@ -1163,8 +1186,36 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                 "borderRadius" | "border_radius" => style.border_radius = val.parse().ok(),
                 "borderWidth" | "border_width" => style.border_width = val.parse().ok(),
                 "borderColor" | "border_color" => style.border_color = Some(unquote(val)),
+                "borderTopWidth" | "border_top_width" => style.border_top_width = val.parse().ok(),
+                "borderRightWidth" | "border_right_width" => {
+                    style.border_right_width = val.parse().ok()
+                }
+                "borderBottomWidth" | "border_bottom_width" => {
+                    style.border_bottom_width = val.parse().ok()
+                }
+                "borderLeftWidth" | "border_left_width" => {
+                    style.border_left_width = val.parse().ok()
+                }
+                "borderTopColor" | "border_top_color" => {
+                    style.border_top_color = Some(unquote(val))
+                }
+                "borderRightColor" | "border_right_color" => {
+                    style.border_right_color = Some(unquote(val))
+                }
+                "borderBottomColor" | "border_bottom_color" => {
+                    style.border_bottom_color = Some(unquote(val))
+                }
+                "borderLeftColor" | "border_left_color" => {
+                    style.border_left_color = Some(unquote(val))
+                }
                 "alignItems" | "align_items" => style.align_items = Some(unquote(val)),
+                "justifySelf" | "justify_self" => style.justify_self = Some(unquote(val)),
+                "justifyItems" | "justify_items" => style.justify_items = Some(unquote(val)),
                 "justifyContent" | "justify_content" => style.justify_content = Some(unquote(val)),
+                "gridTemplateColumns" | "grid_template_columns" => {
+                    style.grid_template_columns = Some(unquote(val))
+                }
+                "gridColumn" | "grid_column" => style.grid_column = Some(unquote(val)),
                 "flexGrow" | "flex_grow" => style.flex_grow = val.parse().ok(),
                 "position" => style.position = Some(unquote(val)),
                 "top" => style.top = Some(unquote(val)),
@@ -1175,6 +1226,8 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                 "width" => style.width = Some(unquote(val)),
                 "height" => style.height = Some(unquote(val)),
                 "overflow" => style.overflow = Some(unquote(val)),
+                "overflowX" | "overflow_x" => style.overflow_x = Some(unquote(val)),
+                "overflowY" | "overflow_y" => style.overflow_y = Some(unquote(val)),
                 "overscrollBehavior" | "overscroll_behavior" => {
                     style.overscroll_behavior = Some(unquote(val))
                 }
@@ -1182,9 +1235,18 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                     style.scroll_initial_target = Some(unquote(val))
                 }
                 "display" => style.display = Some(unquote(val)),
-                "margin" | "marginTop" | "margin_top" => {
-                    style.margin = val.parse().ok().map(Spacing::Px)
+                "margin" => style.margin = val.parse().ok().map(Spacing::Px),
+                "marginTop" | "margin_top" => style.margin_top = val.parse().ok().map(Spacing::Px),
+                "marginRight" | "margin_right" => {
+                    style.margin_right = val.parse().ok().map(Spacing::Px)
                 }
+                "marginBottom" | "margin_bottom" => {
+                    style.margin_bottom = val.parse().ok().map(Spacing::Px)
+                }
+                "marginLeft" | "margin_left" => {
+                    style.margin_left = val.parse().ok().map(Spacing::Px)
+                }
+                "boxSizing" | "box_sizing" => style.box_sizing = Some(unquote(val)),
                 "flexWrap" | "flex_wrap" => style.flex_wrap = Some(unquote(val)),
                 "minWidth" | "min_width" => style.min_width = Some(unquote(val)),
                 "textAlign" | "text_align" => style.text_align = Some(unquote(val)),

@@ -5,9 +5,9 @@ use std::sync::OnceLock;
 use taffy::prelude::*;
 use w3cos_std::component::EventAction;
 use w3cos_std::style::{
-    AlignItems as WAlign, AlignSelf as WAlignSelf, Dimension as WDim, Display as WDisplay,
-    FlexDirection as WDir, FlexWrap as WWrap, JustifyContent as WJustify, Overflow as WOverflow,
-    Position as WPos, WhiteSpace as WWhiteSpace,
+    AlignItems as WAlign, AlignSelf as WAlignSelf, BoxSizing as WBoxSizing, Dimension as WDim,
+    Display as WDisplay, FlexDirection as WDir, FlexWrap as WWrap, JustifyContent as WJustify,
+    Overflow as WOverflow, Position as WPos, Spacing as WSpacing, WhiteSpace as WWhiteSpace,
 };
 use w3cos_std::{Component, ComponentKind};
 
@@ -137,6 +137,7 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
             let h = dim_to_px(style.height).unwrap_or(20.0);
             (w, h)
         }
+        ComponentKind::SvgDocument { width, height, .. } => (*width as f32, *height as f32),
         _ => (0.0, 0.0),
     }
 }
@@ -162,12 +163,28 @@ fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, 
         return measured;
     }
 
-    let measured = text_layout::text_intrinsic_size_font(
-        content,
-        style,
-        DEFAULT_TEXT_WRAP_WIDTH,
-        layout_font(),
-    );
+    let measured = if matches!(style.display, WDisplay::InlineBlock) {
+        #[cfg(feature = "skia")]
+        {
+            crate::render_skia::measure_skia_text_intrinsic_size(content, style)
+        }
+        #[cfg(not(feature = "skia"))]
+        {
+            text_layout::text_intrinsic_size_font(
+                content,
+                style,
+                DEFAULT_TEXT_WRAP_WIDTH,
+                layout_font(),
+            )
+        }
+    } else {
+        text_layout::text_intrinsic_size_font(
+            content,
+            style,
+            DEFAULT_TEXT_WRAP_WIDTH,
+            layout_font(),
+        )
+    };
     TEXT_MEASURE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         cache.make_room();
@@ -179,6 +196,48 @@ fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, 
         cache.entries += 1;
     });
     measured
+}
+
+fn text_intrinsic_size_in_parent(
+    content: &str,
+    style: &w3cos_std::style::Style,
+    parent_display: Option<WDisplay>,
+) -> (f32, f32) {
+    let (width, mut height) = text_intrinsic_size(content, style);
+    if let Some(browser_height) = browser_normal_cjk_height(content, style, parent_display) {
+        height = height.max(browser_height);
+    }
+    (width, height)
+}
+
+fn browser_normal_cjk_height(
+    content: &str,
+    style: &w3cos_std::style::Style,
+    parent_display: Option<WDisplay>,
+) -> Option<f32> {
+    if (matches!(style.display, WDisplay::InlineBlock)
+        || matches!(parent_display, Some(WDisplay::InlineBlock)))
+        && content.chars().any(is_cjk)
+        && (style.line_height - w3cos_std::style::Style::default().line_height).abs() < f32::EPSILON
+    {
+        let padding = style.padding_lengths();
+        let browser_normal_line_height = (style.font_size * 1.4 * 2.0).ceil() * 0.5;
+        Some(browser_normal_line_height + padding.top + padding.bottom)
+    } else {
+        None
+    }
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2E80}'..='\u{2FFF}'
+            | '\u{3000}'..='\u{303F}'
+            | '\u{31C0}'..='\u{31EF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+    )
 }
 
 fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::style::Style) -> f32 {
@@ -247,6 +306,7 @@ fn leaf_taffy_size(
     kind: &ComponentKind,
     style: &w3cos_std::style::Style,
     base: &taffy::Style,
+    parent_display: Option<WDisplay>,
 ) -> taffy::Size<Dimension> {
     let width = if matches!(style.width, WDim::Auto) {
         match kind {
@@ -260,7 +320,9 @@ fn leaf_taffy_size(
     };
     let height = if matches!(style.height, WDim::Auto) {
         let h = match kind {
-            ComponentKind::Text { content } => text_intrinsic_size(content, style).1,
+            ComponentKind::Text { content } => {
+                text_intrinsic_size_in_parent(content, style, parent_display).1
+            }
             ComponentKind::Button { label } => button_intrinsic_size(label, style).1,
             _ => leaf_intrinsic_size(kind, style).1,
         };
@@ -301,6 +363,18 @@ fn kinds_layout_eq(a: &ComponentKind, b: &ComponentKind) -> bool {
             ComponentKind::Canvas {
                 width: wb,
                 height: hb,
+            },
+        ) => wa == wb && ha == hb,
+        (
+            ComponentKind::SvgDocument {
+                width: wa,
+                height: ha,
+                ..
+            },
+            ComponentKind::SvgDocument {
+                width: wb,
+                height: hb,
+                ..
             },
         ) => wa == wb && ha == hb,
         _ => false,
@@ -438,8 +512,13 @@ impl LayoutResults {
 
 impl LayoutEngine {
     pub fn new() -> Self {
+        let mut tree = TaffyTree::new();
+        // Preserve CSS subpixel geometry. The renderer applies device-scale
+        // rasterization later; rounding here would turn Chromium's 26.5px
+        // inline box into 26px before a 3× mobile surface ever sees it.
+        tree.disable_rounding();
         Self {
-            tree: TaffyTree::new(),
+            tree,
             root_node: None,
             tree_valid: false,
             viewport: None,
@@ -496,7 +575,7 @@ impl LayoutEngine {
             height: AvailableSpace::Definite(viewport_h),
         };
         self.tree.compute_layout(root_node, space)?;
-        update_text_leaf_heights(&mut self.tree, root_node, flat)?;
+        update_text_leaf_heights(&mut self.tree, root_node, flat, None)?;
         self.tree.compute_layout(root_node, space)?;
 
         let mut results = Vec::new();
@@ -557,6 +636,7 @@ pub fn compute_with_scroll(
 )> {
     let flat = pre_flatten(root);
     let mut tree: TaffyTree<usize> = TaffyTree::new();
+    tree.disable_rounding();
     let mut node_index: usize = 0;
 
     let root_node = build_taffy_tree(
@@ -576,7 +656,7 @@ pub fn compute_with_scroll(
             height: AvailableSpace::Definite(viewport_h),
         },
     )?;
-    update_text_leaf_heights(&mut tree, root_node, &flat)?;
+    update_text_leaf_heights(&mut tree, root_node, &flat, None)?;
     tree.compute_layout(
         root_node,
         Size {
@@ -631,7 +711,7 @@ fn build_taffy_tree(
     let style = to_taffy_style(&comp.style, viewport_w, viewport_h);
 
     if comp.children.is_empty() {
-        let size = leaf_taffy_size(&comp.kind, &comp.style, &style);
+        let size = leaf_taffy_size(&comp.kind, &comp.style, &style, parent_display);
         let inline_control_in_block = matches!(comp.style.display, WDisplay::InlineBlock)
             && !matches!(parent_display, Some(WDisplay::Flex | WDisplay::Grid));
         let (min_w, size_w) = if matches!(comp.style.width, WDim::Auto) {
@@ -641,7 +721,9 @@ fn build_taffy_tree(
                         comp.style.white_space,
                         WWhiteSpace::NoWrap | WWhiteSpace::Pre
                     );
-                    if nowrap {
+                    let shrink_to_fit =
+                        matches!(comp.style.display, WDisplay::Inline | WDisplay::InlineBlock);
+                    if nowrap || shrink_to_fit {
                         let mut w = text_intrinsic_size(content, &comp.style).0;
                         if let WDim::Px(mw) = comp.style.min_width {
                             w = w.max(mw);
@@ -693,9 +775,9 @@ fn build_taffy_tree(
         };
         let min_h = if matches!(comp.style.height, WDim::Auto) {
             match &comp.kind {
-                ComponentKind::Text { content } => {
-                    Dimension::length(text_intrinsic_size(content, &comp.style).1)
-                }
+                ComponentKind::Text { content } => Dimension::length(
+                    text_intrinsic_size_in_parent(content, &comp.style, parent_display).1,
+                ),
                 ComponentKind::Button { label } => {
                     Dimension::length(button_intrinsic_size(label, &comp.style).1)
                 }
@@ -718,11 +800,12 @@ fn build_taffy_tree(
         };
         tree.new_leaf_with_context(leaf_style, my_idx)
     } else {
-        let child_nodes: Vec<NodeId> = comp
+        let mut child_nodes: Vec<(i32, usize, NodeId)> = comp
             .children
             .iter()
-            .map(|c| {
-                build_taffy_tree(
+            .enumerate()
+            .map(|(source_index, c)| {
+                let node = build_taffy_tree(
                     tree,
                     c,
                     idx,
@@ -731,9 +814,12 @@ fn build_taffy_tree(
                     Some(comp.style.align_items),
                     viewport_w,
                     viewport_h,
-                )
+                )?;
+                Ok((c.style.order, source_index, node))
             })
             .collect::<Result<_, _>>()?;
+        child_nodes.sort_by_key(|(order, source_index, _)| (*order, *source_index));
+        let child_nodes: Vec<NodeId> = child_nodes.into_iter().map(|(_, _, node)| node).collect();
         let node = tree.new_with_children(style, &child_nodes)?;
         tree.set_node_context(node, Some(my_idx))?;
         Ok(node)
@@ -787,6 +873,7 @@ fn update_text_leaf_heights(
     tree: &mut TaffyTree<usize>,
     node: NodeId,
     flat: &[FlatNodeInfo<'_>],
+    parent_display: Option<WDisplay>,
 ) -> Result<(), taffy::TaffyError> {
     let layout = tree.layout(node)?;
     let node_width = layout.size.width;
@@ -796,7 +883,12 @@ fn update_text_leaf_heights(
             if let ComponentKind::Text { content } = flat[idx].kind {
                 let style = flat[idx].style;
                 if matches!(style.height, WDim::Auto) {
-                    let h = wrapped_text_height(content, node_width, style);
+                    let mut h = wrapped_text_height(content, node_width, style);
+                    if let Some(browser_height) =
+                        browser_normal_cjk_height(content, style, parent_display)
+                    {
+                        h = h.max(browser_height);
+                    }
                     let mut taffy_style = tree.style(node)?.clone();
                     let measured_height = Dimension::length(h);
                     if taffy_style.min_size.height != measured_height
@@ -811,8 +903,13 @@ fn update_text_leaf_heights(
         }
     }
 
+    let current_display = tree
+        .get_node_context(node)
+        .copied()
+        .and_then(|idx| flat.get(idx))
+        .map(|info| info.style.display);
     for child in tree.children(node)? {
-        update_text_leaf_heights(tree, child, flat)?;
+        update_text_leaf_heights(tree, child, flat, current_display)?;
     }
     Ok(())
 }
@@ -876,27 +973,37 @@ fn collect_layouts_fast(
                 out.push((rect, ctx));
             }
 
-            match info.style.overflow {
-                WOverflow::Scroll | WOverflow::Auto => {
-                    let max_x = layout.scroll_width().max(0.0);
-                    let max_y = match info.kind {
+            let overflow_x = info.style.resolved_overflow_x();
+            let overflow_y = info.style.resolved_overflow_y();
+            let scrolls_x = matches!(overflow_x, WOverflow::Scroll | WOverflow::Auto);
+            let scrolls_y = matches!(overflow_y, WOverflow::Scroll | WOverflow::Auto);
+            if scrolls_x || scrolls_y {
+                let max_x = if scrolls_x {
+                    layout.scroll_width().max(0.0)
+                } else {
+                    0.0
+                };
+                let max_y = if scrolls_y {
+                    match info.kind {
                         ComponentKind::VirtualList { total_extent, .. } => {
                             (*total_extent - rect.height).max(0.0)
                         }
                         _ => layout.scroll_height().max(0.0),
-                    };
-                    if max_x > 0.0 || max_y > 0.0 {
-                        scrollable.push((ctx, rect, ScrollExtent { max_x, max_y }));
-                    } else {
-                        clip_only.push((ctx, rect));
                     }
-                    new_scroll_container = Some(ctx);
-                }
-                WOverflow::Hidden => {
+                } else {
+                    0.0
+                };
+                if max_x > 0.0 || max_y > 0.0 {
+                    scrollable.push((ctx, rect, ScrollExtent { max_x, max_y }));
+                } else {
                     clip_only.push((ctx, rect));
-                    new_scroll_container = Some(ctx);
                 }
-                WOverflow::Visible => {}
+                new_scroll_container = Some(ctx);
+            } else if matches!(overflow_x, WOverflow::Hidden)
+                || matches!(overflow_y, WOverflow::Hidden)
+            {
+                clip_only.push((ctx, rect));
+                new_scroll_container = Some(ctx);
             }
         }
     }
@@ -975,8 +1082,6 @@ fn compute_fixed_rect(
 // ---------------------------------------------------------------------------
 
 fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32) -> Style {
-    let pad = s.padding_lengths();
-    let mar = s.margin_lengths();
     let (display, flex_grow, flex_shrink, size) = match s.display {
         WDisplay::Flex => (
             taffy::Display::Flex,
@@ -1036,6 +1141,10 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
 
     Style {
         display,
+        box_sizing: match s.box_sizing {
+            WBoxSizing::ContentBox => BoxSizing::ContentBox,
+            WBoxSizing::BorderBox => BoxSizing::BorderBox,
+        },
         position: match s.position {
             WPos::Static | WPos::Relative | WPos::Sticky => taffy::Position::Relative,
             WPos::Absolute | WPos::Fixed => taffy::Position::Absolute,
@@ -1061,6 +1170,15 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             WAlign::Stretch => AlignItems::Stretch,
             WAlign::Baseline => AlignItems::Baseline,
         }),
+        align_self: to_taffy_align_self(s.align_self),
+        justify_items: Some(match s.justify_items {
+            WAlign::FlexStart => AlignItems::FlexStart,
+            WAlign::FlexEnd => AlignItems::FlexEnd,
+            WAlign::Center => AlignItems::Center,
+            WAlign::Stretch => AlignItems::Stretch,
+            WAlign::Baseline => AlignItems::Baseline,
+        }),
+        justify_self: to_taffy_align_self(s.justify_self),
         flex_wrap: match s.flex_wrap {
             WWrap::NoWrap => FlexWrap::NoWrap,
             WWrap::Wrap => FlexWrap::Wrap,
@@ -1068,6 +1186,7 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
         },
         flex_grow,
         flex_shrink,
+        flex_basis: to_taffy_dim(s.flex_basis, s.font_size, viewport_w, viewport_h),
         inset: Rect {
             top: to_taffy_auto(s.top, s.font_size, viewport_w, viewport_h),
             right: to_taffy_auto(s.right, s.font_size, viewport_w, viewport_h),
@@ -1075,24 +1194,30 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             left: to_taffy_auto(s.left, s.font_size, viewport_w, viewport_h),
         },
         gap: Size {
-            width: LengthPercentage::length(s.gap),
-            height: LengthPercentage::length(s.gap),
+            width: LengthPercentage::length(s.column_gap.unwrap_or(s.gap)),
+            height: LengthPercentage::length(s.row_gap.unwrap_or(s.gap)),
         },
         padding: Rect {
-            top: LengthPercentage::length(pad.top + s.border_width),
-            right: LengthPercentage::length(pad.right + s.border_width),
-            bottom: LengthPercentage::length(pad.bottom + s.border_width),
-            left: LengthPercentage::length(pad.left + s.border_width),
+            top: to_taffy_spacing(s.padding.top, s.font_size, viewport_w, viewport_h),
+            right: to_taffy_spacing(s.padding.right, s.font_size, viewport_w, viewport_h),
+            bottom: to_taffy_spacing(s.padding.bottom, s.font_size, viewport_w, viewport_h),
+            left: to_taffy_spacing(s.padding.left, s.font_size, viewport_w, viewport_h),
+        },
+        border: Rect {
+            top: LengthPercentage::length(s.border_top_width.unwrap_or(s.border_width)),
+            right: LengthPercentage::length(s.border_right_width.unwrap_or(s.border_width)),
+            bottom: LengthPercentage::length(s.border_bottom_width.unwrap_or(s.border_width)),
+            left: LengthPercentage::length(s.border_left_width.unwrap_or(s.border_width)),
         },
         margin: Rect {
-            top: LengthPercentageAuto::length(mar.top),
-            right: LengthPercentageAuto::length(mar.right),
-            bottom: LengthPercentageAuto::length(mar.bottom),
-            left: LengthPercentageAuto::length(mar.left),
+            top: to_taffy_margin(s.margin.top, s.font_size, viewport_w, viewport_h),
+            right: to_taffy_margin(s.margin.right, s.font_size, viewport_w, viewport_h),
+            bottom: to_taffy_margin(s.margin.bottom, s.font_size, viewport_w, viewport_h),
+            left: to_taffy_margin(s.margin.left, s.font_size, viewport_w, viewport_h),
         },
         overflow: taffy::Point {
-            x: to_taffy_overflow(s.overflow),
-            y: to_taffy_overflow(s.overflow),
+            x: to_taffy_overflow(s.resolved_overflow_x()),
+            y: to_taffy_overflow(s.resolved_overflow_y()),
         },
         size,
         min_size: Size {
@@ -1103,7 +1228,220 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             width: to_taffy_dim(s.max_width, s.font_size, viewport_w, viewport_h),
             height: to_taffy_dim(s.max_height, s.font_size, viewport_w, viewport_h),
         },
+        grid_template_columns: s
+            .grid_template_columns
+            .as_deref()
+            .map(parse_grid_template_columns)
+            .unwrap_or_default(),
+        grid_column: s
+            .grid_column
+            .as_deref()
+            .map(parse_grid_column)
+            .unwrap_or_default(),
         ..Style::DEFAULT
+    }
+}
+
+fn to_taffy_align_self(value: WAlignSelf) -> Option<AlignSelf> {
+    match value {
+        WAlignSelf::Auto => None,
+        WAlignSelf::FlexStart => Some(AlignSelf::FlexStart),
+        WAlignSelf::FlexEnd => Some(AlignSelf::FlexEnd),
+        WAlignSelf::Center => Some(AlignSelf::Center),
+        WAlignSelf::Baseline => Some(AlignSelf::Baseline),
+        WAlignSelf::Stretch => Some(AlignSelf::Stretch),
+    }
+}
+
+fn parse_grid_template_columns(value: &str) -> Vec<GridTemplateComponent<String>> {
+    let mut tracks = Vec::new();
+    for token in split_css_top_level_whitespace(value) {
+        if let Some(inner) = token
+            .strip_prefix("repeat(")
+            .and_then(|value| value.strip_suffix(')'))
+            && let Some((count, track)) = split_css_top_level_once(inner, ',')
+        {
+            let count = count
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .or_else(|| {
+                    count.rsplit_once(',').and_then(|(_, fallback)| {
+                        fallback.trim_end_matches(')').trim().parse().ok()
+                    })
+                })
+                .unwrap_or(1)
+                .min(64);
+            if let Some(track) = parse_grid_track(track.trim()) {
+                tracks.extend(std::iter::repeat_n(track, count));
+            }
+        } else if let Some(track) = parse_grid_track(token.trim()) {
+            tracks.push(track);
+        }
+    }
+    tracks
+}
+
+fn parse_grid_track(value: &str) -> Option<GridTemplateComponent<String>> {
+    let value = value.trim();
+    if let Some(number) = value.strip_suffix("fr")
+        && let Ok(number) = number.trim().parse::<f32>()
+    {
+        return Some(taffy::style_helpers::flex(number));
+    }
+    if let Some(inner) = value
+        .strip_prefix("minmax(")
+        .and_then(|value| value.strip_suffix(')'))
+        && let Some((min, max)) = split_css_top_level_once(inner, ',')
+    {
+        let min = parse_grid_min_track(min.trim())?;
+        let max = parse_grid_max_track(max.trim())?;
+        return Some(taffy::style_helpers::minmax(min, max));
+    }
+    if value == "auto" {
+        return Some(taffy::style_helpers::auto());
+    }
+    if let Some(number) = value.strip_suffix('%')
+        && let Ok(number) = number.trim().parse::<f32>()
+    {
+        return Some(taffy::style_helpers::percent(number / 100.0));
+    }
+    parse_css_length_px(value).map(taffy::style_helpers::length)
+}
+
+fn parse_grid_min_track(value: &str) -> Option<MinTrackSizingFunction> {
+    if value == "auto" {
+        return Some(taffy::style_helpers::auto());
+    }
+    if value == "0" {
+        return Some(taffy::style_helpers::zero());
+    }
+    if let Some(number) = value.strip_suffix('%')
+        && let Ok(number) = number.trim().parse::<f32>()
+    {
+        return Some(taffy::style_helpers::percent(number / 100.0));
+    }
+    parse_css_length_px(value).map(taffy::style_helpers::length)
+}
+
+fn parse_grid_max_track(value: &str) -> Option<MaxTrackSizingFunction> {
+    if let Some(number) = value.strip_suffix("fr")
+        && let Ok(number) = number.trim().parse::<f32>()
+    {
+        return Some(taffy::style_helpers::fr(number));
+    }
+    if value == "auto" {
+        return Some(taffy::style_helpers::auto());
+    }
+    if let Some(number) = value.strip_suffix('%')
+        && let Ok(number) = number.trim().parse::<f32>()
+    {
+        return Some(taffy::style_helpers::percent(number / 100.0));
+    }
+    parse_css_length_px(value).map(taffy::style_helpers::length)
+}
+
+fn parse_css_length_px(value: &str) -> Option<f32> {
+    value
+        .trim()
+        .strip_suffix("px")
+        .unwrap_or(value.trim())
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn split_css_top_level_whitespace(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = None;
+    let mut depth = 0_u32;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if ch.is_whitespace() && depth == 0 {
+            if let Some(from) = start.take() {
+                parts.push(&value[from..index]);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(from) = start {
+        parts.push(&value[from..]);
+    }
+    parts
+}
+
+fn split_css_top_level_once(value: &str, separator: char) -> Option<(&str, &str)> {
+    let mut depth = 0_u32;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if ch == separator && depth == 0 => {
+                return Some((&value[..index], &value[index + ch.len_utf8()..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_grid_column(value: &str) -> Line<GridPlacement<String>> {
+    let value = value.trim();
+    if let Some(span) = value.strip_prefix("span ")
+        && let Ok(span) = span.trim().parse::<u16>()
+    {
+        return Line {
+            start: taffy::style_helpers::span(span),
+            end: GridPlacement::Auto,
+        };
+    }
+    if let Some((start, end)) = value.split_once('/')
+        && let (Ok(start), Ok(end)) = (start.trim().parse::<i16>(), end.trim().parse::<i16>())
+    {
+        return Line {
+            start: taffy::style_helpers::line(start),
+            end: taffy::style_helpers::line(end),
+        };
+    }
+    Line::default()
+}
+
+fn to_taffy_spacing(
+    spacing: WSpacing,
+    local_font_size: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> LengthPercentage {
+    match spacing {
+        WSpacing::Percent(v) => LengthPercentage::percent(v / 100.0),
+        WSpacing::Rem(v) => LengthPercentage::length(v * ROOT_FONT_SIZE),
+        WSpacing::Em(v) => LengthPercentage::length(v * local_font_size),
+        WSpacing::Vw(v) => LengthPercentage::length(v * viewport_w / 100.0),
+        WSpacing::Vh(v) => LengthPercentage::length(v * viewport_h / 100.0),
+        WSpacing::Auto => LengthPercentage::length(0.0),
+        other => LengthPercentage::length(other.resolve(&w3cos_std::safe_area::current())),
+    }
+}
+
+fn to_taffy_margin(
+    spacing: WSpacing,
+    local_font_size: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> LengthPercentageAuto {
+    match spacing {
+        WSpacing::Auto => LengthPercentageAuto::auto(),
+        WSpacing::Percent(v) => LengthPercentageAuto::percent(v / 100.0),
+        WSpacing::Rem(v) => LengthPercentageAuto::length(v * ROOT_FONT_SIZE),
+        WSpacing::Em(v) => LengthPercentageAuto::length(v * local_font_size),
+        WSpacing::Vw(v) => LengthPercentageAuto::length(v * viewport_w / 100.0),
+        WSpacing::Vh(v) => LengthPercentageAuto::length(v * viewport_h / 100.0),
+        other => LengthPercentageAuto::length(other.resolve(&w3cos_std::safe_area::current())),
     }
 }
 
@@ -1205,6 +1543,159 @@ mod tests {
 
         assert_eq!(layout[0].0.width, 400.0);
         assert_eq!(layout[0].0.height, 150.0);
+    }
+
+    #[test]
+    fn flex_basis_is_forwarded_to_taffy() {
+        let style = to_taffy_style(
+            &Style {
+                flex_basis: WDim::Percent(25.0),
+                ..Style::default()
+            },
+            400.0,
+            800.0,
+        );
+
+        assert_eq!(style.flex_basis, Dimension::percent(0.25));
+    }
+
+    #[test]
+    fn css_box_sizing_controls_declared_outer_size() {
+        let make_box = |box_sizing| {
+            Component::boxed(
+                Style {
+                    box_sizing,
+                    width: WDim::Px(100.0),
+                    height: WDim::Px(40.0),
+                    padding: w3cos_std::style::Edges::all(10.0),
+                    border_width: 2.0,
+                    ..Style::default()
+                },
+                Vec::new(),
+            )
+        };
+
+        let content_box = compute(
+            &make_box(w3cos_std::style::BoxSizing::ContentBox),
+            400.0,
+            400.0,
+        )
+        .unwrap();
+        let border_box = compute(
+            &make_box(w3cos_std::style::BoxSizing::BorderBox),
+            400.0,
+            400.0,
+        )
+        .unwrap();
+
+        assert_eq!(content_box[0].0.width, 124.0);
+        assert_eq!(content_box[0].0.height, 64.0);
+        assert_eq!(border_box[0].0.width, 100.0);
+        assert_eq!(border_box[0].0.height, 40.0);
+
+        let bottom_border_only = compute(
+            &Component::boxed(
+                Style {
+                    width: WDim::Px(100.0),
+                    height: WDim::Px(40.0),
+                    border_bottom_width: Some(3.0),
+                    ..Style::default()
+                },
+                Vec::new(),
+            ),
+            400.0,
+            400.0,
+        )
+        .unwrap();
+        assert_eq!(bottom_border_only[0].0.width, 100.0);
+        assert_eq!(bottom_border_only[0].0.height, 43.0);
+    }
+
+    #[test]
+    fn modern_grid_tracks_span_and_flex_order_match_css() {
+        let spanning = Component::boxed(
+            Style {
+                grid_column: Some("1 / -1".to_string()),
+                height: WDim::Px(20.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let grid = Component::column(
+            Style {
+                display: WDisp::Grid,
+                width: WDim::Px(210.0),
+                grid_template_columns: Some("1fr 1fr".to_string()),
+                column_gap: Some(10.0),
+                ..Style::default()
+            },
+            vec![
+                spanning,
+                Component::boxed(
+                    Style {
+                        height: WDim::Px(20.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        height: WDim::Px(20.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+        let grid_layout = compute(&grid, 210.0, 200.0).unwrap();
+        assert_eq!(grid_layout[1].0.width, 210.0);
+        assert_eq!(grid_layout[2].0.width, 100.0);
+        assert_eq!(grid_layout[3].0.x, 110.0);
+
+        let ordered = Component::row(
+            Style {
+                width: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        order: 1,
+                        width: WDim::Px(80.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        order: 0,
+                        width: WDim::Px(80.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+        let ordered_layout = compute(&ordered, 200.0, 100.0).unwrap();
+        let first_source_child = ordered_layout
+            .iter()
+            .find(|(_, index)| *index == 1)
+            .unwrap()
+            .0;
+        let second_source_child = ordered_layout
+            .iter()
+            .find(|(_, index)| *index == 2)
+            .unwrap()
+            .0;
+        assert_eq!(second_source_child.x, 0.0);
+        assert_eq!(first_source_child.x, 80.0);
+    }
+
+    #[test]
+    fn grid_repeat_uses_custom_property_fallback_count() {
+        let tracks =
+            parse_grid_template_columns("repeat(var(--schema-grid-columns, 12), minmax(0, 1fr))");
+        assert_eq!(tracks.len(), 12);
     }
 
     #[test]
@@ -1635,6 +2126,80 @@ mod tests {
             button.width < 80.0,
             "default button should not stretch across a block container, got {}",
             button.width
+        );
+    }
+
+    #[test]
+    fn inline_block_text_shrink_wraps_content_and_padding() {
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(300.0),
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    "首次入驻",
+                    Style {
+                        display: WDisp::InlineBlock,
+                        box_sizing: WBoxSizing::BorderBox,
+                        font_size: 13.0,
+                        line_height: 1.3,
+                        padding: w3cos_std::style::Edges::xy(10.0, 4.0),
+                        ..Style::default()
+                    },
+                )],
+            ),
+            300.0,
+            200.0,
+        )
+        .unwrap();
+        let badge = layout[1].0;
+        assert!(
+            (badge.width - 72.0).abs() < 1.0,
+            "inline-block width should equal four CJK ems plus padding, got {}",
+            badge.width
+        );
+        assert!(
+            (badge.height - 24.9).abs() < 1.0,
+            "inline-block height should equal line box plus padding, got {}",
+            badge.height
+        );
+    }
+
+    #[test]
+    fn inline_block_container_uses_browser_cjk_normal_line_box() {
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(300.0),
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::InlineBlock,
+                        padding: w3cos_std::style::Edges::xy(10.0, 4.0),
+                        ..Style::default()
+                    },
+                    vec![Component::text(
+                        "首次入驻",
+                        Style {
+                            font_size: 13.0,
+                            ..Style::default()
+                        },
+                    )],
+                )],
+            ),
+            300.0,
+            200.0,
+        )
+        .unwrap();
+        let badge = layout[1].0;
+        assert!(
+            (badge.height - 26.5).abs() < 0.01,
+            "inline-block CJK normal line box should preserve Chromium subpixels, got {}",
+            badge.height
         );
     }
 

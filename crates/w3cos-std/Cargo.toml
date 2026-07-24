@@ -7,3 +7,4 @@ description = "W3C OS standard library — component types, style definitions, a
 
 [dependencies]
 serde = { workspace = true }
+kurbo = { workspace = true }

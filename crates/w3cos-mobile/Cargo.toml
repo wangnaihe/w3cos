@@ -5,16 +5,20 @@ edition.workspace = true
 license.workspace = true
 description = "W3C OS mobile platform — touch, safe area, lifecycle; Android/iOS host integration"
 
+[features]
+default = []
+ohos-check = ["w3cos-runtime/ohos-check"]
+
 [dependencies]
-w3cos-runtime = { workspace = true }
+w3cos-runtime = { workspace = true, default-features = false }
 w3cos-std = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+log = "0.4"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
-log = "0.4"
 android_logger = "0.14"
 
 [lib]

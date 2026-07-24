@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.5.0)
 project(w3cos_harmony_host)
 
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 set(NATIVERENDER_ROOT_PATH ${CMAKE_CURRENT_SOURCE_DIR})
 
 include_directories(${NATIVERENDER_ROOT_PATH})
@@ -12,4 +15,5 @@ target_link_libraries(
   libace_napi.z.so
   libace_ndk.z.so
   libhilog_ndk.z.so
+  libdl.so
 )

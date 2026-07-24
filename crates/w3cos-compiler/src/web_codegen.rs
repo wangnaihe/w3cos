@@ -321,11 +321,16 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
         };
     }
     px!(s.gap, "gap");
+    px!(s.row_gap, "row-gap");
+    px!(s.column_gap, "column-gap");
     if let Some(p) = padding_css(s) {
         parts.push(p);
     }
-    if let Some(m) = s.margin {
-        parts.push(format!("margin:{}", spacing_css(m)));
+    if let Some(margin) = margin_css(s) {
+        parts.push(margin);
+    }
+    if let Some(box_sizing) = s.box_sizing.as_ref() {
+        parts.push(format!("box-sizing:{box_sizing}"));
     }
     px!(s.font_size, "font-size");
     if let Some(w) = s.font_weight {
@@ -349,11 +354,37 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
         parts.push(format!("border-color:{c}"));
         parts.push("border-style:solid".into());
     }
+    px!(s.border_top_width, "border-top-width");
+    px!(s.border_right_width, "border-right-width");
+    px!(s.border_bottom_width, "border-bottom-width");
+    px!(s.border_left_width, "border-left-width");
+    for (name, value) in [
+        ("border-top-color", s.border_top_color.as_ref()),
+        ("border-right-color", s.border_right_color.as_ref()),
+        ("border-bottom-color", s.border_bottom_color.as_ref()),
+        ("border-left-color", s.border_left_color.as_ref()),
+    ] {
+        if let Some(value) = value {
+            parts.push(format!("{name}:{value}"));
+        }
+    }
     if let Some(ai) = s.align_items.as_ref() {
         parts.push(format!("align-items:{}", css_flex_align(ai)));
     }
     if let Some(jc) = s.justify_content.as_ref() {
         parts.push(format!("justify-content:{}", css_flex_justify(jc)));
+    }
+    if let Some(value) = s.justify_self.as_ref() {
+        parts.push(format!("justify-self:{value}"));
+    }
+    if let Some(value) = s.justify_items.as_ref() {
+        parts.push(format!("justify-items:{value}"));
+    }
+    if let Some(value) = s.grid_template_columns.as_ref() {
+        parts.push(format!("grid-template-columns:{value}"));
+    }
+    if let Some(value) = s.grid_column.as_ref() {
+        parts.push(format!("grid-column:{value}"));
     }
     if let Some(display) = s.display.as_ref() {
         parts.push(format!("display:{display}"));
@@ -425,6 +456,12 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     if let Some(ov) = s.overflow.as_ref() {
         parts.push(format!("overflow:{ov}"));
     }
+    if let Some(value) = s.overflow_x.as_ref() {
+        parts.push(format!("overflow-x:{value}"));
+    }
+    if let Some(value) = s.overflow_y.as_ref() {
+        parts.push(format!("overflow-y:{value}"));
+    }
     if let Some(behavior) = s.overscroll_behavior.as_ref() {
         parts.push(format!("overscroll-behavior:{behavior}"));
     }
@@ -455,6 +492,12 @@ fn spacing_css(s: Spacing) -> String {
     const KB_ENV: &str = "env(keyboard-inset-height, var(--w3cos-keyboard-inset-height, 0px))";
     match s {
         Spacing::Px(v) => format!("{v}px"),
+        Spacing::Percent(v) => format!("{v}%"),
+        Spacing::Rem(v) => format!("{v}rem"),
+        Spacing::Em(v) => format!("{v}em"),
+        Spacing::Vw(v) => format!("{v}vw"),
+        Spacing::Vh(v) => format!("{v}vh"),
+        Spacing::Auto => "auto".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Top) => "env(safe-area-inset-top)".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Right) => "env(safe-area-inset-right)".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Bottom) => "env(safe-area-inset-bottom)".to_string(),
@@ -514,6 +557,39 @@ fn padding_css(s: &StyleDecl) -> Option<String> {
     } else {
         Some(format!(
             "padding:{} {} {} {}",
+            spacing_css(t),
+            spacing_css(r),
+            spacing_css(b),
+            spacing_css(l)
+        ))
+    }
+}
+
+fn margin_css(s: &StyleDecl) -> Option<String> {
+    let (t, r, b, l) = if s.margin_top.is_some()
+        || s.margin_right.is_some()
+        || s.margin_bottom.is_some()
+        || s.margin_left.is_some()
+    {
+        let fallback = s.margin.unwrap_or(Spacing::Px(0.0));
+        (
+            s.margin_top.unwrap_or(fallback),
+            s.margin_right.unwrap_or(fallback),
+            s.margin_bottom.unwrap_or(fallback),
+            s.margin_left.unwrap_or(fallback),
+        )
+    } else if let Some(margin) = s.margin {
+        (margin, margin, margin, margin)
+    } else {
+        return None;
+    };
+    if t == r && r == b && b == l {
+        Some(format!("margin:{}", spacing_css(t)))
+    } else if t == b && r == l {
+        Some(format!("margin:{} {}", spacing_css(t), spacing_css(r)))
+    } else {
+        Some(format!(
+            "margin:{} {} {} {}",
             spacing_css(t),
             spacing_css(r),
             spacing_css(b),

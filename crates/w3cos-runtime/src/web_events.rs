@@ -11,7 +11,27 @@ thread_local! {
     static EVENT_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static CUSTOM_EVENT_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static EVENT_TARGET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static EVENT_SUBCLASSES: RefCell<Option<HashMap<String, Value>>> = const { RefCell::new(None) };
 }
+
+pub const EVENT_SUBCLASS_NAMES: &[&str] = &[
+    "UIEvent",
+    "MouseEvent",
+    "KeyboardEvent",
+    "PointerEvent",
+    "WheelEvent",
+    "FocusEvent",
+    "InputEvent",
+    "CompositionEvent",
+    "ClipboardEvent",
+    "DragEvent",
+    "TouchEvent",
+    "AnimationEvent",
+    "TransitionEvent",
+    "ErrorEvent",
+    "ProgressEvent",
+    "MessageEvent",
+];
 
 #[derive(Clone)]
 struct Listener {
@@ -156,6 +176,342 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
             Value::Undefined
         }),
     );
+}
+
+fn init_value(init: &Value, name: &str, default: Value) -> Value {
+    if !init.is_object() {
+        return default;
+    }
+    let value = init.get_property(name);
+    if value.is_undefined() { default } else { value }
+}
+
+fn install_fields(this: &Value, init: &Value, fields: &[(&str, Value)]) {
+    for (name, default) in fields {
+        this.set_property(name, init_value(init, name, default.clone()));
+    }
+}
+
+fn install_ui_fields(this: &Value, init: &Value) {
+    install_fields(
+        this,
+        init,
+        &[
+            ("detail", Value::Number(0.0)),
+            ("view", Value::Null),
+            ("which", Value::Number(0.0)),
+        ],
+    );
+}
+
+fn install_modifier_fields(this: &Value, init: &Value) {
+    install_fields(
+        this,
+        init,
+        &[
+            ("ctrlKey", Value::Bool(false)),
+            ("shiftKey", Value::Bool(false)),
+            ("altKey", Value::Bool(false)),
+            ("metaKey", Value::Bool(false)),
+        ],
+    );
+    this.set_property(
+        "getModifierState",
+        Value::function(|this, args| {
+            let property = match arg(&args, 0).to_js_string().as_str() {
+                "Alt" => "altKey",
+                "Control" => "ctrlKey",
+                "Meta" => "metaKey",
+                "Shift" => "shiftKey",
+                _ => return Value::Bool(false),
+            };
+            Value::Bool(this.get_property(property).to_bool())
+        }),
+    );
+}
+
+fn install_mouse_fields(this: &Value, init: &Value) {
+    install_ui_fields(this, init);
+    install_modifier_fields(this, init);
+    install_fields(
+        this,
+        init,
+        &[
+            ("screenX", Value::Number(0.0)),
+            ("screenY", Value::Number(0.0)),
+            ("clientX", Value::Number(0.0)),
+            ("clientY", Value::Number(0.0)),
+            ("pageX", Value::Number(0.0)),
+            ("pageY", Value::Number(0.0)),
+            ("offsetX", Value::Number(0.0)),
+            ("offsetY", Value::Number(0.0)),
+            ("movementX", Value::Number(0.0)),
+            ("movementY", Value::Number(0.0)),
+            ("button", Value::Number(0.0)),
+            ("buttons", Value::Number(0.0)),
+            ("relatedTarget", Value::Null),
+        ],
+    );
+}
+
+#[derive(Clone, Copy)]
+enum EventSubclass {
+    Ui,
+    Mouse,
+    Keyboard,
+    Pointer,
+    Wheel,
+    Focus,
+    Input,
+    Composition,
+    Clipboard,
+    Drag,
+    Touch,
+    Animation,
+    Transition,
+    Error,
+    Progress,
+    Message,
+}
+
+fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
+    install_event(this, args, false);
+    let init = arg(args, 1);
+    match kind {
+        EventSubclass::Ui => install_ui_fields(this, &init),
+        EventSubclass::Mouse => install_mouse_fields(this, &init),
+        EventSubclass::Keyboard => {
+            install_ui_fields(this, &init);
+            install_modifier_fields(this, &init);
+            install_fields(
+                this,
+                &init,
+                &[
+                    ("key", Value::string("")),
+                    ("code", Value::string("")),
+                    ("location", Value::Number(0.0)),
+                    ("repeat", Value::Bool(false)),
+                    ("isComposing", Value::Bool(false)),
+                    ("charCode", Value::Number(0.0)),
+                    ("keyCode", Value::Number(0.0)),
+                ],
+            );
+        }
+        EventSubclass::Pointer => {
+            install_mouse_fields(this, &init);
+            install_fields(
+                this,
+                &init,
+                &[
+                    ("pointerId", Value::Number(0.0)),
+                    ("width", Value::Number(1.0)),
+                    ("height", Value::Number(1.0)),
+                    ("pressure", Value::Number(0.0)),
+                    ("tangentialPressure", Value::Number(0.0)),
+                    ("tiltX", Value::Number(0.0)),
+                    ("tiltY", Value::Number(0.0)),
+                    ("twist", Value::Number(0.0)),
+                    ("pointerType", Value::string("")),
+                    ("isPrimary", Value::Bool(false)),
+                ],
+            );
+        }
+        EventSubclass::Wheel => {
+            install_mouse_fields(this, &init);
+            install_fields(
+                this,
+                &init,
+                &[
+                    ("deltaX", Value::Number(0.0)),
+                    ("deltaY", Value::Number(0.0)),
+                    ("deltaZ", Value::Number(0.0)),
+                    ("deltaMode", Value::Number(0.0)),
+                ],
+            );
+            for (name, value) in [
+                ("DOM_DELTA_PIXEL", 0.0),
+                ("DOM_DELTA_LINE", 1.0),
+                ("DOM_DELTA_PAGE", 2.0),
+            ] {
+                this.set_property(name, Value::Number(value));
+            }
+        }
+        EventSubclass::Focus => {
+            install_ui_fields(this, &init);
+            install_fields(this, &init, &[("relatedTarget", Value::Null)]);
+        }
+        EventSubclass::Input => {
+            install_ui_fields(this, &init);
+            install_fields(
+                this,
+                &init,
+                &[
+                    ("data", Value::Null),
+                    ("isComposing", Value::Bool(false)),
+                    ("inputType", Value::string("")),
+                    ("dataTransfer", Value::Null),
+                ],
+            );
+            this.set_property(
+                "getTargetRanges",
+                Value::function(|_, _| Value::array(vec![])),
+            );
+        }
+        EventSubclass::Composition => {
+            install_ui_fields(this, &init);
+            install_fields(this, &init, &[("data", Value::string(""))]);
+        }
+        EventSubclass::Clipboard => {
+            install_fields(this, &init, &[("clipboardData", Value::Null)]);
+        }
+        EventSubclass::Drag => {
+            install_mouse_fields(this, &init);
+            install_fields(this, &init, &[("dataTransfer", Value::Null)]);
+        }
+        EventSubclass::Touch => {
+            install_ui_fields(this, &init);
+            install_modifier_fields(this, &init);
+            install_fields(
+                this,
+                &init,
+                &[
+                    ("touches", Value::array(vec![])),
+                    ("targetTouches", Value::array(vec![])),
+                    ("changedTouches", Value::array(vec![])),
+                ],
+            );
+        }
+        EventSubclass::Animation => install_fields(
+            this,
+            &init,
+            &[
+                ("animationName", Value::string("")),
+                ("elapsedTime", Value::Number(0.0)),
+                ("pseudoElement", Value::string("")),
+            ],
+        ),
+        EventSubclass::Transition => install_fields(
+            this,
+            &init,
+            &[
+                ("propertyName", Value::string("")),
+                ("elapsedTime", Value::Number(0.0)),
+                ("pseudoElement", Value::string("")),
+            ],
+        ),
+        EventSubclass::Error => install_fields(
+            this,
+            &init,
+            &[
+                ("message", Value::string("")),
+                ("filename", Value::string("")),
+                ("lineno", Value::Number(0.0)),
+                ("colno", Value::Number(0.0)),
+                ("error", Value::Null),
+            ],
+        ),
+        EventSubclass::Progress => install_fields(
+            this,
+            &init,
+            &[
+                ("lengthComputable", Value::Bool(false)),
+                ("loaded", Value::Number(0.0)),
+                ("total", Value::Number(0.0)),
+            ],
+        ),
+        EventSubclass::Message => install_fields(
+            this,
+            &init,
+            &[
+                ("data", Value::Null),
+                ("origin", Value::string("")),
+                ("lastEventId", Value::string("")),
+                ("source", Value::Null),
+                ("ports", Value::array(vec![])),
+            ],
+        ),
+    }
+}
+
+fn subclass_kind(name: &str) -> EventSubclass {
+    match name {
+        "UIEvent" => EventSubclass::Ui,
+        "MouseEvent" => EventSubclass::Mouse,
+        "KeyboardEvent" => EventSubclass::Keyboard,
+        "PointerEvent" => EventSubclass::Pointer,
+        "WheelEvent" => EventSubclass::Wheel,
+        "FocusEvent" => EventSubclass::Focus,
+        "InputEvent" => EventSubclass::Input,
+        "CompositionEvent" => EventSubclass::Composition,
+        "ClipboardEvent" => EventSubclass::Clipboard,
+        "DragEvent" => EventSubclass::Drag,
+        "TouchEvent" => EventSubclass::Touch,
+        "AnimationEvent" => EventSubclass::Animation,
+        "TransitionEvent" => EventSubclass::Transition,
+        "ErrorEvent" => EventSubclass::Error,
+        "ProgressEvent" => EventSubclass::Progress,
+        "MessageEvent" => EventSubclass::Message,
+        _ => EventSubclass::Ui,
+    }
+}
+
+fn subclass_parent(name: &str) -> &'static str {
+    match name {
+        "MouseEvent" | "KeyboardEvent" | "FocusEvent" | "InputEvent" | "CompositionEvent"
+        | "TouchEvent" => "UIEvent",
+        "PointerEvent" | "WheelEvent" | "DragEvent" => "MouseEvent",
+        _ => "Event",
+    }
+}
+
+fn build_event_subclasses() -> HashMap<String, Value> {
+    let mut constructors = HashMap::new();
+    for name in EVENT_SUBCLASS_NAMES {
+        let kind = subclass_kind(name);
+        let constructor = Value::function(move |this, args| {
+            install_subclass(&this, &args, kind);
+            Value::Undefined
+        });
+        constructor.set_property("name", Value::string(name));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", constructor.clone());
+        constructor.set_property("prototype", prototype);
+        if *name == "WheelEvent" {
+            for (constant, value) in [
+                ("DOM_DELTA_PIXEL", 0.0),
+                ("DOM_DELTA_LINE", 1.0),
+                ("DOM_DELTA_PAGE", 2.0),
+            ] {
+                constructor.set_property(constant, Value::Number(value));
+            }
+        }
+        constructors.insert((*name).to_string(), constructor);
+    }
+    for name in EVENT_SUBCLASS_NAMES {
+        let parent_prototype = if subclass_parent(name) == "Event" {
+            event_class().get_property("prototype")
+        } else {
+            constructors[subclass_parent(name)].get_property("prototype")
+        };
+        w3cos_core::class::set_prototype_of(
+            &constructors[*name].get_property("prototype"),
+            &parent_prototype,
+        );
+    }
+    constructors
+}
+
+pub fn event_subclass_class(name: &str) -> Value {
+    EVENT_SUBCLASSES.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(build_event_subclasses());
+        }
+        slot.borrow()
+            .as_ref()
+            .and_then(|constructors| constructors.get(name))
+            .cloned()
+            .unwrap_or(Value::Undefined)
+    })
 }
 
 fn make_event_constructor(custom: bool) -> Value {
@@ -395,5 +751,79 @@ mod tests {
         let event = w3cos_core::class::construct(&event_class(), vec![Value::string("tick")]);
         assert!(target.call_method("dispatchEvent", vec![event]).to_bool());
         assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn event_subclasses_expose_fields_and_prototype_hierarchy() {
+        let keyboard_class = event_subclass_class("KeyboardEvent");
+        let keyboard = w3cos_core::class::construct(
+            &keyboard_class,
+            vec![
+                Value::string("keydown"),
+                Value::object(HashMap::from([
+                    ("key".to_string(), Value::string("Enter")),
+                    ("code".to_string(), Value::string("Enter")),
+                    ("ctrlKey".to_string(), Value::Bool(true)),
+                    ("repeat".to_string(), Value::Bool(true)),
+                ])),
+            ],
+        );
+        assert_eq!(keyboard.get_property("key").to_js_string(), "Enter");
+        assert_eq!(keyboard.get_property("code").to_js_string(), "Enter");
+        assert!(keyboard.get_property("repeat").to_bool());
+        assert!(
+            keyboard
+                .call_method("getModifierState", vec![Value::string("Control")])
+                .to_bool()
+        );
+        assert!(w3cos_core::class::instance_of(
+            &keyboard,
+            &event_subclass_class("UIEvent")
+        ));
+        assert!(w3cos_core::class::instance_of(&keyboard, &event_class()));
+
+        let pointer = w3cos_core::class::construct(
+            &event_subclass_class("PointerEvent"),
+            vec![
+                Value::string("pointerdown"),
+                Value::object(HashMap::from([
+                    ("clientX".to_string(), Value::Number(12.0)),
+                    ("pointerId".to_string(), Value::Number(7.0)),
+                    ("pointerType".to_string(), Value::string("pen")),
+                    ("pressure".to_string(), Value::Number(0.5)),
+                ])),
+            ],
+        );
+        assert_eq!(pointer.get_property("clientX").to_number(), 12.0);
+        assert_eq!(pointer.get_property("pointerId").to_number(), 7.0);
+        assert_eq!(pointer.get_property("pointerType").to_js_string(), "pen");
+        assert_eq!(pointer.get_property("pressure").to_number(), 0.5);
+        assert!(w3cos_core::class::instance_of(
+            &pointer,
+            &event_subclass_class("MouseEvent")
+        ));
+        assert!(w3cos_core::class::instance_of(&pointer, &event_class()));
+
+        let input = w3cos_core::class::construct(
+            &event_subclass_class("InputEvent"),
+            vec![
+                Value::string("input"),
+                Value::object(HashMap::from([
+                    ("data".to_string(), Value::string("x")),
+                    ("inputType".to_string(), Value::string("insertText")),
+                    ("isComposing".to_string(), Value::Bool(true)),
+                ])),
+            ],
+        );
+        assert_eq!(input.get_property("data").to_js_string(), "x");
+        assert_eq!(input.get_property("inputType").to_js_string(), "insertText");
+        assert!(input.get_property("isComposing").to_bool());
+        assert_eq!(
+            input
+                .call_method("getTargetRanges", vec![])
+                .get_property("length")
+                .to_number(),
+            0.0
+        );
     }
 }

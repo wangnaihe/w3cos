@@ -1,4 +1,4 @@
-//! Mobile codegen smoke — iOS/Android project scaffolding from TSX.
+//! Mobile codegen smoke — iOS/Android/HarmonyOS project scaffolding from TSX.
 
 use w3cos_compiler::{css_parser, mobile_codegen, parser};
 
@@ -93,6 +93,60 @@ fn mobile_android_devtools_cargo_feature() {
         cargo.contains(r#"features = ["devtools"]"#),
         "devtools feature missing: {cargo}"
     );
+}
+
+#[test]
+fn mobile_harmony_writes_xcomponent_abi() {
+    let tree = parser::parse(COUNTER_TSX).expect("parse counter tsx");
+    let dir = tempfile::tempdir().unwrap();
+    mobile_codegen::write_mobile_project(
+        &tree,
+        &css_parser::Stylesheet::empty(),
+        dir.path(),
+        "harmony",
+        false,
+        "resizes-content",
+        &w3cos_compiler::CompileOptions::default(),
+    )
+    .expect("write HarmonyOS project");
+
+    let lib_rs = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    for symbol in [
+        "w3cos_harmony_surface_created",
+        "w3cos_harmony_surface_changed",
+        "w3cos_harmony_surface_destroyed",
+        "w3cos_harmony_frame",
+        "w3cos_harmony_touch",
+    ] {
+        assert!(lib_rs.contains(symbol), "missing HarmonyOS ABI: {symbol}");
+    }
+    assert!(lib_rs.contains("surface_created_component"));
+    assert!(lib_rs.contains("set_interactive_widget"));
+
+    let cargo = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+    assert!(cargo.contains(r#"crate-type = ["cdylib"]"#));
+    assert!(cargo.contains(r#"default-features = false, features = ["skia"]"#));
+    assert!(!cargo.contains("winit"));
+}
+
+#[test]
+fn mobile_harmony_dom_writes_surface_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    mobile_codegen::write_mobile_dom_project(
+        "pub fn run_entry() {}",
+        dir.path(),
+        "harmony",
+        false,
+        "overlays-content",
+        &w3cos_compiler::CompileOptions { devtools: true },
+    )
+    .expect("write HarmonyOS DOM project");
+
+    let lib_rs = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(lib_rs.contains("surface_created_dom"));
+    assert!(lib_rs.contains("InteractiveWidget::OverlaysContent"));
+    let cargo = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+    assert!(cargo.contains(r#"features = ["skia", "devtools"]"#));
 }
 
 #[test]

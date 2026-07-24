@@ -536,7 +536,7 @@ impl Document {
 
     pub fn to_component_tree(&self) -> w3cos_std::Component {
         let mut ancestors = Vec::new();
-        self.node_to_component(self.body_id, &mut ancestors)
+        self.node_to_component(self.body_id, &mut ancestors, None)
     }
 
     /// Lower one connected DOM subtree while preserving selector ancestry.
@@ -554,7 +554,11 @@ impl Document {
             .into_iter()
             .map(|ancestor| self.selector_context(ancestor))
             .collect();
-        self.node_to_component(id, &mut ancestors)
+        let inherited = self
+            .get_node(id)
+            .parent
+            .map(|parent| self.computed_style_for(parent));
+        self.node_to_component(id, &mut ancestors, inherited.as_ref())
     }
 
     fn attach_native_host(
@@ -605,47 +609,116 @@ impl Document {
         &self,
         id: NodeId,
         ancestors: &[stylesheet::SelectorContext],
+        inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::style::Style {
         let inline = &self.styles[id.0 as usize];
-        if !stylesheet::has_rules() {
-            return inline.to_style();
-        }
         let node = self.get_node(id);
-        if node.node_type != NodeType::Element {
-            return inline.to_style();
+        let matched = if stylesheet::has_rules() && node.node_type == NodeType::Element {
+            let id_attr = node
+                .attributes
+                .iter()
+                .find(|(k, _)| k.as_str() == "id")
+                .map(|(_, v)| v.as_str());
+            let classes: Vec<String> = node.class_list.iter().map(|c| c.as_str()).collect();
+            let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+            stylesheet::matching_declarations(&node.tag.as_str(), id_attr, &class_refs, ancestors)
+        } else {
+            Vec::new()
+        };
+        let mut style = if matched.is_empty() {
+            inline.to_style()
+        } else {
+            let mut merged =
+                CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
+            for (prop, value, _specificity) in &matched {
+                merged.set_property(prop, value);
+            }
+            // Inline wins: re-apply the node's own `set_property` history on top.
+            for (prop, value) in &inline.inline_declarations {
+                merged.set_property(prop, value);
+            }
+            merged.to_style()
+        };
+
+        if let Some(parent) = inherited {
+            let declares = |property: &str| {
+                matched
+                    .iter()
+                    .any(|(name, _, _)| css_property_eq(name, property))
+                    || inline
+                        .inline_declarations
+                        .iter()
+                        .any(|(name, _)| css_property_eq(name, property))
+            };
+            inherit_text_style(&mut style, parent, &node.tag.as_str(), declares);
         }
-        let id_attr = node
-            .attributes
-            .iter()
-            .find(|(k, _)| k.as_str() == "id")
-            .map(|(_, v)| v.as_str());
-        let classes: Vec<String> = node.class_list.iter().map(|c| c.as_str()).collect();
-        let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
-        let matched =
-            stylesheet::matching_declarations(&node.tag.as_str(), id_attr, &class_refs, ancestors);
-        if matched.is_empty() {
-            return inline.to_style();
+        let declared_value = |properties: &[&str]| {
+            matched
+                .iter()
+                .filter(|(name, _, _)| {
+                    properties
+                        .iter()
+                        .any(|property| css_property_eq(name, property))
+                })
+                .map(|(_, value, _)| value.as_str())
+                .chain(
+                    inline
+                        .inline_declarations
+                        .iter()
+                        .filter(|(name, _)| {
+                            properties
+                                .iter()
+                                .any(|property| css_property_eq(name, property))
+                        })
+                        .map(|(_, value)| value.as_str()),
+                )
+                .last()
+        };
+        if declared_value(&["background", "background-color"])
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("currentcolor"))
+        {
+            style.background = style.color;
         }
-        let mut merged =
-            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
-        for (prop, value, _specificity) in &matched {
-            merged.set_property(prop, value);
+        if declared_value(&["border-color"])
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("currentcolor"))
+        {
+            style.border_color = style.color;
         }
-        // Inline wins: re-apply the node's own `set_property` history on top.
-        for (prop, value) in &inline.inline_declarations {
-            merged.set_property(prop, value);
+        style
+    }
+
+    /// Resolve stylesheet rules, ancestor selectors, user-agent defaults, and
+    /// inline declarations for a node.
+    pub fn computed_style_for(&self, id: NodeId) -> w3cos_std::style::Style {
+        let mut ancestor_ids = Vec::new();
+        let mut current = self.get_node(id).parent;
+        while let Some(parent) = current {
+            ancestor_ids.push(parent);
+            current = self.get_node(parent).parent;
         }
-        merged.to_style()
+        ancestor_ids.reverse();
+        let mut ancestors = Vec::new();
+        let mut inherited = None;
+        for ancestor in ancestor_ids {
+            let style = self.computed_style(ancestor, &ancestors, inherited.as_ref());
+            inherited = Some(style);
+            if self.get_node(ancestor).node_type == NodeType::Element {
+                ancestors.push(self.selector_context(ancestor));
+            }
+        }
+        self.computed_style(id, &ancestors, inherited.as_ref())
     }
 
     fn node_to_component(
         &self,
         id: NodeId,
         ancestors: &mut Vec<stylesheet::SelectorContext>,
+        inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::Component {
         let node = self.get_node(id);
-        let style = self.computed_style(id, ancestors);
+        let mut style = self.computed_style(id, ancestors, inherited);
         let tag = node.tag.as_str();
+        self.apply_svg_presentation_style(id, &tag, &mut style);
 
         match node.node_type {
             NodeType::Text => {
@@ -656,6 +729,31 @@ impl Document {
                 return w3cos_std::Component::column(style, vec![]);
             }
             NodeType::Element | NodeType::Document | NodeType::DocumentFragment => {
+                if tag == "svg" {
+                    let (attribute_width, attribute_height) = self.svg_root_size(id);
+                    let width = match style.width {
+                        w3cos_std::style::Dimension::Px(width) => width,
+                        _ => attribute_width,
+                    }
+                    .max(1.0)
+                    .ceil() as u32;
+                    let height = match style.height {
+                        w3cos_std::style::Dimension::Px(height) => height,
+                        _ => attribute_height,
+                    }
+                    .max(1.0)
+                    .ceil() as u32;
+                    let (source, event_targets) = self.svg_markup(id);
+                    let component = w3cos_std::Component::svg_document_with_targets(
+                        source,
+                        width,
+                        height,
+                        event_targets,
+                        style,
+                    );
+                    return self.attach_native_host(id, component);
+                }
+
                 // HTML parsers create real text-node children. Preserve the
                 // inline element's own computed typography when lowering a
                 // simple `<span>text</span>` instead of wrapping the text in
@@ -713,7 +811,8 @@ impl Document {
                             let grandchild = self.get_node(grandchild_ids[0]);
                             if grandchild.node_type == NodeType::Text {
                                 ancestors.push(self.selector_context(id));
-                                let child_style = self.computed_style(child_ids[0], ancestors);
+                                let child_style =
+                                    self.computed_style(child_ids[0], ancestors, Some(&style));
                                 ancestors.pop();
                                 return self.attach_native_host(
                                     id,
@@ -735,7 +834,7 @@ impl Document {
                 let children: Vec<w3cos_std::Component> = self
                     .children_ids(id)
                     .iter()
-                    .map(|&child_id| self.node_to_component(child_id, ancestors))
+                    .map(|&child_id| self.node_to_component(child_id, ancestors, Some(&style)))
                     .collect();
                 if pushed {
                     ancestors.pop();
@@ -758,6 +857,17 @@ impl Document {
                 );
 
                 let mut component = match tag.as_str() {
+                    "svg" | "g" | "defs" => w3cos_std::Component::boxed(style, children),
+                    "rect" | "circle" | "ellipse" | "line" | "use" => {
+                        w3cos_std::Component::boxed(style, children)
+                    }
+                    "polyline" | "polygon" | "path" => self
+                        .svg_path_component(id, &tag, style.clone())
+                        .unwrap_or_else(|| w3cos_std::Component::boxed(style, children)),
+                    "text" => {
+                        let text = self.descendant_text_content(id);
+                        w3cos_std::Component::text(text, style)
+                    }
                     "body" | "div" | "section" | "main" | "article" | "nav" | "header"
                     | "footer" | "aside" | "form" | "fieldset" | "ul" | "ol" | "dl" => {
                         if is_row {
@@ -912,6 +1022,490 @@ impl Document {
                 }
                 component
             }
+        }
+    }
+
+    fn svg_attribute(&self, id: NodeId, name: &str) -> Option<String> {
+        let mut current = Some(id);
+        while let Some(node_id) = current {
+            let node = self.get_node(node_id);
+            if let Some((_, value)) = node.attributes.iter().find(|(key, _)| key.as_str() == name) {
+                return Some(value.clone());
+            }
+            current = node.parent;
+        }
+        None
+    }
+
+    fn svg_number(&self, id: NodeId, name: &str, default: f32) -> f32 {
+        self.get_node(id)
+            .attributes
+            .iter()
+            .find(|(key, _)| key.as_str() == name)
+            .and_then(|(_, value)| value.trim().trim_end_matches("px").parse::<f32>().ok())
+            .unwrap_or(default)
+    }
+
+    fn svg_transform_chain(&self, id: NodeId) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut current = Some(id);
+        while let Some(node_id) = current {
+            let node = self.get_node(node_id);
+            if let Some((_, value)) = node
+                .attributes
+                .iter()
+                .find(|(key, _)| key.as_str() == "transform")
+            {
+                values.push(value.clone());
+            }
+            current = node.parent;
+        }
+        values.reverse();
+        values
+    }
+
+    fn svg_root_size(&self, id: NodeId) -> (f32, f32) {
+        let node = self.get_node(id);
+        let view_box = node
+            .attributes
+            .iter()
+            .find(|(key, _)| key.as_str().eq_ignore_ascii_case("viewbox"))
+            .map(|(_, value)| {
+                value
+                    .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+                    .filter_map(|part| part.parse::<f32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let fallback_width = view_box.get(2).copied().unwrap_or(300.0);
+        let fallback_height = view_box.get(3).copied().unwrap_or(150.0);
+        (
+            self.svg_number(id, "width", fallback_width),
+            self.svg_number(id, "height", fallback_height),
+        )
+    }
+
+    fn svg_markup(&self, id: NodeId) -> (String, Vec<w3cos_std::SvgEventTarget>) {
+        let mut source = String::new();
+        let mut event_targets = Vec::new();
+        let mut render_index = 0;
+        self.serialize_svg_node(
+            id,
+            id,
+            false,
+            "auto",
+            &mut source,
+            &mut event_targets,
+            &mut render_index,
+        );
+        let node = self.get_node(id);
+        let has_namespace = node
+            .attributes
+            .iter()
+            .any(|(name, _)| name.as_str() == "xmlns");
+        if !has_namespace {
+            source.insert_str("<svg".len(), " xmlns=\"http://www.w3.org/2000/svg\"");
+        }
+        (source, event_targets)
+    }
+
+    fn serialize_svg_node(
+        &self,
+        id: NodeId,
+        svg_root: NodeId,
+        in_defs: bool,
+        inherited_pointer_events: &str,
+        out: &mut String,
+        event_targets: &mut Vec<w3cos_std::SvgEventTarget>,
+        render_index: &mut u32,
+    ) {
+        let node = self.get_node(id);
+        match node.node_type {
+            NodeType::Text => {
+                if let Some(text) = node.text_content.as_deref() {
+                    push_xml_escaped(out, text, false);
+                }
+            }
+            NodeType::Comment => {
+                out.push_str("<!--");
+                if let Some(text) = node.text_content.as_deref() {
+                    out.push_str(text);
+                }
+                out.push_str("-->");
+            }
+            NodeType::Element => {
+                let tag = node.tag.as_str();
+                let in_defs = in_defs || tag == "defs";
+                let author_id = node
+                    .attributes
+                    .iter()
+                    .find(|(name, _)| name.as_str() == "id")
+                    .map(|(_, value)| value.clone());
+                let internal_use_id =
+                    (!in_defs && tag == "use" && author_id.is_none()).then(|| {
+                        let base = format!("__w3cos_internal_use_{}", id.as_u32());
+                        let mut candidate = base.clone();
+                        let mut suffix = 0_u32;
+                        while self.get_element_by_id(&candidate).is_some() {
+                            suffix = suffix.wrapping_add(1);
+                            candidate = format!("{base}_{suffix}");
+                        }
+                        candidate
+                    });
+                let lookup_id = author_id.clone().or_else(|| internal_use_id.clone());
+                let pointer_events = self
+                    .get_style(id)
+                    .inline_declarations
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| matches!(name.as_str(), "pointer-events" | "pointerEvents"))
+                    .map(|(_, value)| value.clone())
+                    .or_else(|| self.svg_attribute(id, "pointer-events"))
+                    .unwrap_or_else(|| inherited_pointer_events.to_string());
+                let node_render_index = (!in_defs
+                    && matches!(
+                        tag.as_str(),
+                        "path"
+                            | "rect"
+                            | "circle"
+                            | "ellipse"
+                            | "line"
+                            | "polyline"
+                            | "polygon"
+                            | "image"
+                            | "text"
+                    ))
+                .then(|| {
+                    let index = *render_index;
+                    *render_index = (*render_index).wrapping_add(1);
+                    index
+                });
+                if !in_defs && (lookup_id.is_some() || node_render_index.is_some()) {
+                    let mut host_chain = Vec::new();
+                    let mut current = Some(id);
+                    while let Some(node_id) = current {
+                        host_chain.push(node_id.as_u32() as u64);
+                        if node_id == svg_root {
+                            break;
+                        }
+                        current = self.get_node(node_id).parent;
+                    }
+                    event_targets.push(w3cos_std::SvgEventTarget {
+                        svg_id: lookup_id.unwrap_or_default(),
+                        render_index: node_render_index,
+                        pointer_events: pointer_events.clone(),
+                        host_chain,
+                    });
+                }
+
+                out.push('<');
+                out.push_str(&tag);
+                for (name, value) in &node.attributes {
+                    if name.as_str() == "style" {
+                        continue;
+                    }
+                    out.push(' ');
+                    out.push_str(&name.as_str());
+                    out.push_str("=\"");
+                    push_xml_escaped(out, value, true);
+                    out.push('"');
+                }
+                if let Some(internal_use_id) = internal_use_id {
+                    out.push_str(" id=\"");
+                    push_xml_escaped(out, &internal_use_id, true);
+                    out.push('"');
+                }
+                if !node.class_list.is_empty() {
+                    out.push_str(" class=\"");
+                    for (index, class) in node.class_list.iter().enumerate() {
+                        if index > 0 {
+                            out.push(' ');
+                        }
+                        push_xml_escaped(out, &class.as_str(), true);
+                    }
+                    out.push('"');
+                }
+
+                let attribute_style = node
+                    .attributes
+                    .iter()
+                    .find(|(name, _)| name.as_str() == "style")
+                    .map(|(_, value)| value.as_str())
+                    .unwrap_or_default();
+                let inline = &self.get_style(id).inline_declarations;
+                if !attribute_style.is_empty() || !inline.is_empty() {
+                    out.push_str(" style=\"");
+                    push_xml_escaped(out, attribute_style, true);
+                    if !attribute_style.is_empty() && !attribute_style.trim_end().ends_with(';') {
+                        out.push(';');
+                    }
+                    for (name, value) in inline {
+                        push_xml_escaped(out, name, true);
+                        out.push(':');
+                        push_xml_escaped(out, value, true);
+                        out.push(';');
+                    }
+                    out.push('"');
+                }
+
+                out.push('>');
+                if let Some(text) = node.text_content.as_deref() {
+                    push_xml_escaped(out, text, false);
+                }
+                let mut child = node.first_child;
+                while let Some(child_id) = child {
+                    self.serialize_svg_node(
+                        child_id,
+                        svg_root,
+                        in_defs,
+                        &pointer_events,
+                        out,
+                        event_targets,
+                        render_index,
+                    );
+                    child = self.get_node(child_id).next_sibling;
+                }
+                out.push_str("</");
+                out.push_str(&tag);
+                out.push('>');
+            }
+            NodeType::Document | NodeType::DocumentFragment => {
+                let mut child = node.first_child;
+                while let Some(child_id) = child {
+                    self.serialize_svg_node(
+                        child_id,
+                        svg_root,
+                        in_defs,
+                        inherited_pointer_events,
+                        out,
+                        event_targets,
+                        render_index,
+                    );
+                    child = self.get_node(child_id).next_sibling;
+                }
+            }
+        }
+    }
+
+    fn svg_path_data(&self, id: NodeId, tag: &str) -> Result<w3cos_std::SvgPathData, String> {
+        let node = self.get_node(id);
+        let attribute = |name: &str| {
+            node.attributes
+                .iter()
+                .find(|(key, _)| key.as_str() == name)
+                .map(|(_, value)| value.as_str())
+                .unwrap_or("")
+        };
+        match tag {
+            "path" => w3cos_std::SvgPathData::parse(attribute("d")),
+            "polyline" => w3cos_std::SvgPathData::from_points(attribute("points"), false),
+            "polygon" => w3cos_std::SvgPathData::from_points(attribute("points"), true),
+            _ => Err(format!("unsupported SVG path element `{tag}`")),
+        }
+    }
+
+    fn svg_path_component(
+        &self,
+        id: NodeId,
+        tag: &str,
+        style: w3cos_std::style::Style,
+    ) -> Option<w3cos_std::Component> {
+        use w3cos_std::color::Color;
+
+        let path = match self.svg_path_data(id, tag) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("W3COS warning: <{tag}> geometry was ignored: {error}");
+                return None;
+            }
+        };
+        let fill = self
+            .svg_attribute(id, "fill")
+            .unwrap_or_else(|| "black".to_string());
+        let fill = if fill == "none" {
+            Color::TRANSPARENT
+        } else if fill == "currentColor" {
+            style.color
+        } else {
+            Color::from_css(&fill).unwrap_or(Color::BLACK)
+        };
+        let stroke = self
+            .svg_attribute(id, "stroke")
+            .filter(|stroke| stroke != "none")
+            .and_then(|stroke| {
+                if stroke == "currentColor" {
+                    Some(style.color)
+                } else {
+                    Color::from_css(&stroke)
+                }
+            });
+        Some(w3cos_std::Component::svg_path(
+            path.commands,
+            fill,
+            stroke,
+            self.svg_number(id, "stroke-width", 1.0).max(0.0),
+            style,
+        ))
+    }
+
+    fn apply_svg_presentation_style(
+        &self,
+        id: NodeId,
+        tag: &str,
+        style: &mut w3cos_std::style::Style,
+    ) {
+        use w3cos_std::color::Color;
+        use w3cos_std::style::{Dimension, Position};
+
+        if !matches!(
+            tag,
+            "svg"
+                | "g"
+                | "defs"
+                | "rect"
+                | "circle"
+                | "ellipse"
+                | "line"
+                | "polyline"
+                | "polygon"
+                | "path"
+                | "text"
+                | "use"
+        ) {
+            return;
+        }
+
+        let fill = self
+            .svg_attribute(id, "fill")
+            .unwrap_or_else(|| "black".to_string());
+        let fill = if fill == "none" {
+            Color::TRANSPARENT
+        } else if fill == "currentColor" {
+            style.color
+        } else {
+            Color::from_css(&fill).unwrap_or(Color::BLACK)
+        };
+        let stroke = self
+            .svg_attribute(id, "stroke")
+            .filter(|stroke| stroke != "none")
+            .and_then(|stroke| {
+                if stroke == "currentColor" {
+                    Some(style.color)
+                } else {
+                    Color::from_css(&stroke)
+                }
+            });
+        let stroke_width = self.svg_number(id, "stroke-width", 1.0).max(0.0);
+        let opacity = self.svg_number(id, "opacity", 1.0).clamp(0.0, 1.0);
+
+        style.opacity *= opacity;
+        style.flex_shrink = 0.0;
+        match tag {
+            "svg" => {
+                let (width, height) = self.svg_root_size(id);
+                style.position = Position::Relative;
+                if matches!(style.width, Dimension::Auto) {
+                    style.width = Dimension::Px(width);
+                }
+                if matches!(style.height, Dimension::Auto) {
+                    style.height = Dimension::Px(height);
+                }
+            }
+            "g" | "defs" => {
+                style.position = Position::Absolute;
+                style.left = Dimension::Px(0.0);
+                style.top = Dimension::Px(0.0);
+                style.width = Dimension::Percent(1.0);
+                style.height = Dimension::Percent(1.0);
+            }
+            "rect" => {
+                style.position = Position::Absolute;
+                style.left = Dimension::Px(self.svg_number(id, "x", 0.0));
+                style.top = Dimension::Px(self.svg_number(id, "y", 0.0));
+                style.width = Dimension::Px(self.svg_number(id, "width", 0.0).max(0.0));
+                style.height = Dimension::Px(self.svg_number(id, "height", 0.0).max(0.0));
+                style.background = fill;
+                style.border_radius = self
+                    .svg_number(id, "rx", self.svg_number(id, "ry", 0.0))
+                    .max(0.0);
+            }
+            "circle" => {
+                let radius = self.svg_number(id, "r", 0.0).max(0.0);
+                style.position = Position::Absolute;
+                style.left = Dimension::Px(self.svg_number(id, "cx", 0.0) - radius);
+                style.top = Dimension::Px(self.svg_number(id, "cy", 0.0) - radius);
+                style.width = Dimension::Px(radius * 2.0);
+                style.height = Dimension::Px(radius * 2.0);
+                style.background = fill;
+                style.border_radius = radius;
+            }
+            "ellipse" => {
+                let rx = self.svg_number(id, "rx", 0.0).max(0.0);
+                let ry = self.svg_number(id, "ry", 0.0).max(0.0);
+                style.position = Position::Absolute;
+                style.left = Dimension::Px(self.svg_number(id, "cx", 0.0) - rx);
+                style.top = Dimension::Px(self.svg_number(id, "cy", 0.0) - ry);
+                style.width = Dimension::Px(rx * 2.0);
+                style.height = Dimension::Px(ry * 2.0);
+                style.background = fill;
+                style.border_radius = rx.min(ry);
+            }
+            "line" => {
+                let x1 = self.svg_number(id, "x1", 0.0);
+                let y1 = self.svg_number(id, "y1", 0.0);
+                let x2 = self.svg_number(id, "x2", 0.0);
+                let y2 = self.svg_number(id, "y2", 0.0);
+                let length = (x2 - x1).hypot(y2 - y1);
+                style.position = Position::Absolute;
+                style.left = Dimension::Px(x1.min(x2));
+                style.top = Dimension::Px(y1.min(y2));
+                style.width = Dimension::Px(length);
+                style.height = Dimension::Px(stroke_width.max(1.0));
+                style.background = stroke.unwrap_or(fill);
+                style.transform.rotate_deg = (y2 - y1).atan2(x2 - x1).to_degrees();
+            }
+            "text" => {
+                style.position = Position::Absolute;
+                style.left = Dimension::Px(self.svg_number(id, "x", 0.0));
+                style.top =
+                    Dimension::Px(self.svg_number(id, "y", style.font_size) - style.font_size);
+                style.color = fill;
+            }
+            "polyline" | "polygon" | "path" => {
+                style.position = Position::Absolute;
+                match self.svg_path_data(id, tag) {
+                    Ok(path) => {
+                        style.left = Dimension::Px(path.bounds[0]);
+                        style.top = Dimension::Px(path.bounds[1]);
+                        style.width = Dimension::Px(path.bounds[2].max(stroke_width));
+                        style.height = Dimension::Px(path.bounds[3].max(stroke_width));
+                    }
+                    Err(_) => {
+                        style.left = Dimension::Px(0.0);
+                        style.top = Dimension::Px(0.0);
+                        style.width = Dimension::Px(0.0);
+                        style.height = Dimension::Px(0.0);
+                    }
+                }
+                style.background = Color::TRANSPARENT;
+                style.border_width = 0.0;
+                for transform in self.svg_transform_chain(id) {
+                    apply_svg_transform(&transform, &mut style.transform);
+                }
+            }
+            _ => {
+                style.position = Position::Absolute;
+                style.left = Dimension::Px(0.0);
+                style.top = Dimension::Px(0.0);
+                style.width = Dimension::Px(0.0);
+                style.height = Dimension::Px(0.0);
+            }
+        }
+        if let Some(stroke) = stroke
+            && !matches!(tag, "polyline" | "polygon" | "path")
+        {
+            style.border_width = stroke_width;
+            style.border_color = stroke;
         }
     }
 
@@ -1167,8 +1761,122 @@ impl Document {
     }
 }
 
+fn css_property_eq(actual: &str, canonical: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .filter(|ch| *ch != '-')
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    normalize(actual) == normalize(canonical)
+}
+
+fn inherit_text_style(
+    style: &mut w3cos_std::style::Style,
+    parent: &w3cos_std::style::Style,
+    tag: &str,
+    declares: impl Fn(&str) -> bool,
+) {
+    let form_control = matches!(tag, "button" | "input" | "select" | "textarea");
+    let heading = matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
+
+    if !declares("color") && !form_control {
+        style.color = parent.color;
+    }
+    if !declares("font-size") && !form_control && !heading {
+        style.font_size = parent.font_size;
+    }
+    if !declares("font-weight") && !heading && !matches!(tag, "b" | "strong") {
+        style.font_weight = parent.font_weight;
+    }
+    if !declares("font-family") {
+        style.font_family = parent.font_family.clone();
+    }
+    if !declares("font-style") && !matches!(tag, "em" | "i") {
+        style.font_style = parent.font_style;
+    }
+    if !declares("line-height") {
+        style.line_height = parent.line_height;
+    }
+    if !declares("letter-spacing") {
+        style.letter_spacing = parent.letter_spacing;
+    }
+    if !declares("text-align") {
+        style.text_align = parent.text_align;
+    }
+    if !declares("white-space") {
+        style.white_space = parent.white_space;
+    }
+    if !declares("word-break") {
+        style.word_break = parent.word_break;
+    }
+}
+
 impl Default for Document {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn apply_svg_transform(value: &str, transform: &mut w3cos_std::style::Transform2D) {
+    let mut rest = value.trim();
+    while let Some(open) = rest.find('(') {
+        let name = rest[..open].trim();
+        let Some(close_offset) = rest[open + 1..].find(')') else {
+            eprintln!("W3COS warning: malformed SVG transform `{value}` was ignored");
+            return;
+        };
+        let close = open + 1 + close_offset;
+        let values = rest[open + 1..close]
+            .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse::<f32>().ok())
+            .collect::<Vec<_>>();
+        match (name, values.as_slice()) {
+            ("translate", [x]) => transform.translate_x += x,
+            ("translate", [x, y, ..]) => {
+                transform.translate_x += x;
+                transform.translate_y += y;
+            }
+            ("scale", [scale]) => {
+                transform.scale_x *= scale;
+                transform.scale_y *= scale;
+            }
+            ("scale", [x, y, ..]) => {
+                transform.scale_x *= x;
+                transform.scale_y *= y;
+            }
+            ("rotate", [degrees]) => transform.rotate_deg += degrees,
+            ("rotate", [degrees, _, _, ..]) => {
+                // The retained transform model rotates around the laid-out
+                // shape center, which matches the common rotate(angle cx cy)
+                // case after the path has been reduced to its bounds.
+                transform.rotate_deg += degrees;
+            }
+            ("matrix", [a, b, c, d, e, f, ..]) if b.abs() < 0.0001 && c.abs() < 0.0001 => {
+                transform.scale_x *= a;
+                transform.scale_y *= d;
+                transform.translate_x += e;
+                transform.translate_y += f;
+            }
+            _ => eprintln!(
+                "W3COS warning: SVG transform `{name}` uses unsupported skew/matrix semantics"
+            ),
+        }
+        rest = rest[close + 1..].trim_start();
+    }
+}
+
+fn push_xml_escaped(out: &mut String, value: &str, attribute: bool) {
+    for character in value.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' if attribute => out.push_str("&quot;"),
+            '\'' if attribute => out.push_str("&apos;"),
+            _ => out.push(character),
+        }
     }
 }

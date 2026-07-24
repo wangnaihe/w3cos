@@ -62,7 +62,7 @@ pub fn parse_plain_px(value: &str) -> Option<f32> {
     v.parse().ok()
 }
 
-/// Parse spacing: `px`, `env()`, or `calc(px + env())`.
+/// Parse spacing used by padding/margin.
 pub fn css_parse_spacing_value(value: &str) -> Option<Spacing> {
     let trimmed = value.trim().trim_end_matches(';');
     if let Some(inner) = trimmed
@@ -117,6 +117,25 @@ pub fn css_parse_spacing_value(value: &str) -> Option<Spacing> {
             "keyboard-inset-height" => Some(Spacing::KeyboardInsetHeight),
             _ => None,
         };
+    }
+    if trimmed == "auto" {
+        return Some(Spacing::Auto);
+    }
+    for (suffix, constructor) in [
+        ("rem", Spacing::Rem as fn(f32) -> Spacing),
+        ("em", Spacing::Em),
+        ("vw", Spacing::Vw),
+        ("dvh", Spacing::Vh),
+        ("svh", Spacing::Vh),
+        ("lvh", Spacing::Vh),
+        ("vh", Spacing::Vh),
+        ("%", Spacing::Percent),
+    ] {
+        if let Some(number) = trimmed.strip_suffix(suffix)
+            && let Ok(number) = number.trim().parse()
+        {
+            return Some(constructor(number));
+        }
     }
     parse_plain_px(trimmed).map(Spacing::Px)
 }

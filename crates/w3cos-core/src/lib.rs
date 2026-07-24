@@ -1,3 +1,5 @@
+pub mod bigint;
+pub mod binary;
 mod builtins;
 pub mod class;
 pub mod collections;
@@ -10,6 +12,7 @@ mod proxy;
 mod reactive;
 pub mod regexp;
 mod value;
+pub mod weak;
 pub mod web;
 
 pub use builtins::{

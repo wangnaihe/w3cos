@@ -21,6 +21,18 @@ pub const DOM_CONSTRUCTOR_NAMES: &[&str] = &[
     "HTMLVideoElement",
     "HTMLCanvasElement",
     "SVGElement",
+    "SVGSVGElement",
+    "SVGGElement",
+    "SVGPathElement",
+    "SVGRectElement",
+    "SVGCircleElement",
+    "SVGEllipseElement",
+    "SVGLineElement",
+    "SVGPolylineElement",
+    "SVGPolygonElement",
+    "SVGTextElement",
+    "SVGDefsElement",
+    "SVGUseElement",
     "DocumentFragment",
     "Range",
     "Selection",
@@ -35,6 +47,11 @@ fn parent_name(name: &str) -> Option<&'static str> {
         "Element" => Some("Node"),
         "HTMLElement" => Some("Element"),
         "SVGElement" => Some("Element"),
+        "SVGSVGElement" | "SVGGElement" | "SVGPathElement" | "SVGRectElement"
+        | "SVGCircleElement" | "SVGEllipseElement" | "SVGLineElement" | "SVGPolylineElement"
+        | "SVGPolygonElement" | "SVGTextElement" | "SVGDefsElement" | "SVGUseElement" => {
+            Some("SVGElement")
+        }
         "DocumentFragment" => Some("Node"),
         "HTMLAnchorElement"
         | "HTMLDivElement"
@@ -115,9 +132,27 @@ fn html_constructor_for_tag(tag: &str) -> &'static str {
     }
 }
 
+fn svg_constructor_for_tag(tag: &str) -> &'static str {
+    match tag {
+        "svg" => "SVGSVGElement",
+        "g" => "SVGGElement",
+        "path" => "SVGPathElement",
+        "rect" => "SVGRectElement",
+        "circle" => "SVGCircleElement",
+        "ellipse" => "SVGEllipseElement",
+        "line" => "SVGLineElement",
+        "polyline" => "SVGPolylineElement",
+        "polygon" => "SVGPolygonElement",
+        "text" => "SVGTextElement",
+        "defs" => "SVGDefsElement",
+        "use" => "SVGUseElement",
+        _ => "SVGElement",
+    }
+}
+
 pub fn prototype_for_node(node_type: u16, tag: &str, is_svg: bool) -> Value {
     match node_type {
-        1 if is_svg => prototype("SVGElement"),
+        1 if is_svg => prototype(svg_constructor_for_tag(tag)),
         1 => prototype(html_constructor_for_tag(tag)),
         11 => prototype("DocumentFragment"),
         _ => prototype("Node"),
