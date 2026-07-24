@@ -32,7 +32,7 @@ use crate::value::js_error;
 /// Typed arrays are represented as arrays of numeric elements, so UTF-16
 /// decoding consumes those values directly as code units.
 pub fn text_decoder_class() -> Value {
-    Value::callable(HashMap::new(), |_this, args| {
+    Value::function(|_this, args| {
         let encoding = args
             .first()
             .cloned()

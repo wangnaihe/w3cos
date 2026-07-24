@@ -335,6 +335,20 @@ fn event_loop_schedule(
     }
 }
 
+fn animation_frame_work_active(
+    rendering_active: bool,
+    native_pending: bool,
+    js_pending: bool,
+) -> bool {
+    rendering_active && (native_pending || js_pending)
+}
+
+fn touch_moved_beyond_slop(start: (f32, f32), current: (f32, f32)) -> bool {
+    let dx = current.0 - start.0;
+    let dy = current.1 - start.1;
+    dx * dx + dy * dy > TOUCH_SCROLL_SLOP * TOUCH_SCROLL_SLOP
+}
+
 #[cfg(target_os = "ios")]
 const IOS_IME_RETRY_INTERVAL_MS: u64 = 16;
 #[cfg(target_os = "ios")]
@@ -473,6 +487,21 @@ fn repaint_after_react_rebuild(current: RepaintMode) -> RepaintMode {
         RepaintMode::Clean => RepaintMode::Clean,
         RepaintMode::Full => RepaintMode::Full,
     }
+}
+
+fn prepare_for_repaint<T>(repaint_mode: &RepaintMode, prepare: impl FnOnce() -> T) -> Option<T> {
+    if matches!(repaint_mode, RepaintMode::Clean) {
+        None
+    } else {
+        Some(prepare())
+    }
+}
+
+fn take_repaint_for_present(
+    queued_repaint_mode: &mut RepaintMode,
+    has_active_animations: bool,
+) -> RepaintMode {
+    repaint_for_present(std::mem::take(queued_repaint_mode), has_active_animations)
 }
 
 fn repaint_after_react_content_change(
@@ -1102,8 +1131,8 @@ struct App {
     last_frame_time: Option<Instant>,
     modifiers: ModifiersState,
     last_touch_y: Option<f32>,
+    touch_start_position: Option<(f32, f32)>,
     touch_samples: VecDeque<(Instant, f32)>,
-    touch_drag_y: f32,
     touch_scroll_active: bool,
     touch_scroll_index: Option<usize>,
     #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -1149,6 +1178,9 @@ struct App {
     paint_generation: u64,
     layout_generation: u64,
     first_frame_presented: bool,
+    /// Whether the platform surface is active. Rendering opportunities,
+    /// including rAF callbacks, pause while the application is suspended.
+    rendering_active: bool,
 
     // DevTools integration (Chrome DevTools Protocol)
     #[cfg(feature = "devtools")]
@@ -1257,8 +1289,8 @@ impl App {
             last_frame_time: None,
             modifiers: ModifiersState::default(),
             last_touch_y: None,
+            touch_start_position: None,
             touch_samples: VecDeque::new(),
-            touch_drag_y: 0.0,
             touch_scroll_active: false,
             touch_scroll_index: None,
             #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -1296,6 +1328,7 @@ impl App {
             paint_generation: 0,
             layout_generation: 0,
             first_frame_presented: false,
+            rendering_active: false,
 
             #[cfg(feature = "devtools")]
             devtools_handle: None,
@@ -1430,6 +1463,16 @@ impl App {
     /// Rebuild once after the queue reaches quiescence so React/DOM changes
     /// produced by those jobs are visible without requiring a second input.
     fn microtask_checkpoint(&mut self) -> usize {
+        self.microtask_checkpoint_impl(true)
+    }
+
+    /// Checkpoint reached inside the current rendering opportunity. DOM/state
+    /// work is rebuilt before paint, so it must not request a redundant frame.
+    fn rendering_microtask_checkpoint(&mut self) -> usize {
+        self.microtask_checkpoint_impl(false)
+    }
+
+    fn microtask_checkpoint_impl(&mut self, request_repaint: bool) -> usize {
         let ran = crate::jsdom::drain_microtasks();
         if ran > 0
             || state::is_dirty()
@@ -1437,7 +1480,9 @@ impl App {
             || (self.dom_mode && crate::dom::is_document_dirty())
         {
             self.rebuild_if_dirty();
-            self.request_repaint();
+            if request_repaint {
+                self.request_repaint();
+            }
         }
         ran
     }
@@ -2929,7 +2974,6 @@ impl App {
     // -----------------------------------------------------------------------
     #[cfg(feature = "gpu")]
     fn paint_gpu(&mut self) {
-        crate::perf::begin_frame();
         self.sync_gpu_surface_to_window();
         let layout_started = Instant::now();
         self.ensure_layout();
@@ -2945,7 +2989,14 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
-        let (tile_requests, tile_clients) = self.prepare_compositor_tiles();
+        let has_active_animations = !self.animations.is_empty();
+        let repaint_mode = take_repaint_for_present(&mut self.repaint_mode, has_active_animations);
+        let Some((tile_requests, tile_clients)) =
+            prepare_for_repaint(&repaint_mode, || self.prepare_compositor_tiles())
+        else {
+            crate::perf::record_paint(paint_started.elapsed());
+            return;
+        };
 
         let now = Instant::now();
 
@@ -3233,7 +3284,6 @@ impl App {
     // -----------------------------------------------------------------------
     #[cfg(feature = "cpu-render")]
     fn paint_cpu(&mut self) {
-        crate::perf::begin_frame();
         let layout_started = Instant::now();
         self.ensure_layout();
         crate::perf::record_layout(layout_started.elapsed());
@@ -3255,16 +3305,16 @@ impl App {
         let direct_skia_present = skia_backend_requested() && cpu_ref.skia_vulkan.is_some();
         #[cfg(not(all(feature = "skia", any(target_os = "ios", target_os = "android"))))]
         let direct_skia_present = false;
-        let (tile_requests, tile_clients) = self.prepare_compositor_tiles();
         let has_active_animations = !self.animations.is_empty();
-        let queued_repaint_mode = std::mem::take(&mut self.repaint_mode);
         let animation_forced_full =
-            has_active_animations && !matches!(queued_repaint_mode, RepaintMode::Full);
-        let repaint_mode = repaint_for_present(queued_repaint_mode, has_active_animations);
-        if matches!(repaint_mode, RepaintMode::Clean) {
+            has_active_animations && !matches!(self.repaint_mode, RepaintMode::Full);
+        let repaint_mode = take_repaint_for_present(&mut self.repaint_mode, has_active_animations);
+        let Some((tile_requests, tile_clients)) =
+            prepare_for_repaint(&repaint_mode, || self.prepare_compositor_tiles())
+        else {
             crate::perf::record_paint(paint_started.elapsed());
             return;
-        }
+        };
 
         // Direct Metal/Vulkan frames never consume the CPU framebuffer. Keep a
         // one-pixel scratch value for the shared control flow instead of
@@ -6101,8 +6151,8 @@ impl ApplicationHandler for App {
             for action in &timer_actions {
                 state::execute_action(action);
             }
-            // Drive the compiled-JS bridge: setTimeout/setInterval/rAF fire
-            // here, then microtasks + deferred native events are delivered.
+            // Drive ordinary timers here. rAF is deliberately reserved for
+            // the next rendering opportunity immediately before paint.
             let js_ran = crate::jsdom::tick_timers() + crate::jsdom::drain_microtasks();
             if !timer_actions.is_empty() || js_ran > 0 {
                 self.rebuild_if_dirty();
@@ -6139,7 +6189,7 @@ impl ApplicationHandler for App {
         // the CAMetalLayer is still joining the foreground scene. Keep the
         // lifecycle active until a frame has actually been submitted.
         #[cfg(target_os = "ios")]
-        if !self.first_frame_presented {
+        if self.rendering_active && !self.first_frame_presented {
             self.request_repaint();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + std::time::Duration::from_millis(16),
@@ -6147,9 +6197,15 @@ impl ApplicationHandler for App {
             return;
         }
 
+        let has_animation_frame = animation_frame_work_active(
+            self.rendering_active,
+            crate::timers::has_pending_animation_frame(),
+            crate::jsdom::has_pending_animation_frame(),
+        );
         let has_animations = !self.animations.is_empty()
             || self.kinetic_scroll.is_some()
-            || !self.overscroll_states.is_empty();
+            || !self.overscroll_states.is_empty()
+            || has_animation_frame;
         // Android can coalesce request_redraw() with the redraw currently
         // being delivered. Keep one immediate turn alive while the renderer
         // or React still has frame work; after it drains, static screens block
@@ -6253,6 +6309,7 @@ impl ApplicationHandler for App {
                 std::env::var("W3COS_AI_PORT").ok()
             );
         }
+        self.rendering_active = true;
         self.first_frame_presented = false;
         // The platform may preserve the Rust application while replacing or
         // discarding the mobile backing surface. A redraw request alone is
@@ -6371,6 +6428,7 @@ impl ApplicationHandler for App {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.rendering_active = false;
         self.first_frame_presented = false;
 
         #[cfg(all(feature = "cpu-render", target_os = "android"))]
@@ -6439,6 +6497,20 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                crate::perf::begin_frame();
+                // HTML's rendering opportunity: run one snapshot of native
+                // and JS rAF callbacks before style/layout/paint. Callbacks
+                // queued by this batch remain pending for the next frame.
+                if self.rendering_active {
+                    let animation_actions = crate::timers::take_animation_frame_actions();
+                    for action in &animation_actions {
+                        state::execute_action(action);
+                    }
+                    let js_animation_callbacks = crate::jsdom::run_animation_frame();
+                    if !animation_actions.is_empty() || js_animation_callbacks > 0 {
+                        self.rendering_microtask_checkpoint();
+                    }
+                }
                 // Advance the virtualizer interest window before presenting.
                 // Doing this after paint permits one blank frame when a fling
                 // crosses the retained overscan boundary.
@@ -6447,6 +6519,7 @@ impl ApplicationHandler for App {
                 }
                 self.paint();
                 self.flush_deferred_scroll_commit(false);
+                crate::perf::end_frame();
                 self.schedule_next_bench_repaint();
             }
 
@@ -6531,9 +6604,9 @@ impl ApplicationHandler for App {
                         self.last_overscroll_tick = None;
                         let now = Instant::now();
                         self.last_touch_y = Some(self.mouse_y);
+                        self.touch_start_position = Some((self.mouse_x, self.mouse_y));
                         self.touch_samples.clear();
                         self.touch_samples.push_back((now, self.mouse_y));
-                        self.touch_drag_y = 0.0;
                         self.touch_scroll_active = false;
                         self.touch_scroll_index = self.hit_test_scroll(self.mouse_x, self.mouse_y);
                         #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -6599,7 +6672,6 @@ impl ApplicationHandler for App {
                         if let Some(last_y) = self.last_touch_y {
                             let now = Instant::now();
                             let dy = last_y - self.mouse_y;
-                            self.touch_drag_y += dy.abs();
                             self.touch_samples.push_back((now, self.mouse_y));
                             while self.touch_samples.len() > 2
                                 && now.duration_since(self.touch_samples[1].0)
@@ -6607,11 +6679,16 @@ impl ApplicationHandler for App {
                             {
                                 self.touch_samples.pop_front();
                             }
-                            if !self.touch_scroll_active
-                                && self.touch_drag_y > TOUCH_SCROLL_SLOP
-                                && self.touch_scroll_index.is_some()
-                            {
-                                self.touch_scroll_active = true;
+                            let moved_beyond_slop =
+                                self.touch_start_position.is_some_and(|start| {
+                                    touch_moved_beyond_slop(start, (self.mouse_x, self.mouse_y))
+                                });
+                            if !self.touch_scroll_active && moved_beyond_slop {
+                                // Losing/remapping the scroll host must not
+                                // restore tap eligibility. Gesture recognition
+                                // and scroll consumption are separate: any
+                                // movement beyond touch slop cancels activation.
+                                self.touch_scroll_active = self.touch_scroll_index.is_some();
                                 if let Some(idx) = self.touch_pointer_target.take() {
                                     self.dispatch_native_pointer(
                                         idx,
@@ -6659,8 +6736,8 @@ impl ApplicationHandler for App {
                             self.back_swipe_start = None;
                             self.back_swipe_active = false;
                             self.last_touch_y = None;
+                            self.touch_start_position = None;
                             self.touch_samples.clear();
-                            self.touch_drag_y = 0.0;
                             self.touch_scroll_active = false;
                             self.touch_scroll_index = None;
                             self.touch_pointer_target = None;
@@ -6673,6 +6750,29 @@ impl ApplicationHandler for App {
                         #[cfg(any(target_os = "ios", target_os = "android"))]
                         {
                             self.back_swipe_start = None;
+                        }
+                        let moved_beyond_slop =
+                            self.touch_start_position.take().is_some_and(|start| {
+                                touch_moved_beyond_slop(start, (self.mouse_x, self.mouse_y))
+                            });
+                        if moved_beyond_slop && !self.touch_scroll_active {
+                            // Some platforms coalesce the final movement into
+                            // TouchPhase::Ended. Revoke activation before the
+                            // release path can synthesize click.
+                            if let Some(idx) = self.touch_pointer_target.take() {
+                                self.dispatch_native_pointer(
+                                    idx,
+                                    "cancel",
+                                    touch.id as i64,
+                                    "touch",
+                                    -1,
+                                    0,
+                                    0.0,
+                                );
+                                self.rebuild_if_dirty();
+                            }
+                            self.pressed_index = None;
+                            self.pointer_down_default_prevented = false;
                         }
                         let release_velocity =
                             estimate_touch_velocity(&self.touch_samples, Instant::now())
@@ -6711,7 +6811,6 @@ impl ApplicationHandler for App {
                         }
                         self.last_touch_y = None;
                         self.touch_samples.clear();
-                        self.touch_drag_y = 0.0;
                         self.touch_scroll_index = None;
                         if self.touch_scroll_active {
                             self.touch_scroll_active = false;
@@ -6748,8 +6847,8 @@ impl ApplicationHandler for App {
                         }
                         self.release_active_overscroll(0.0);
                         self.last_touch_y = None;
+                        self.touch_start_position = None;
                         self.touch_samples.clear();
-                        self.touch_drag_y = 0.0;
                         self.touch_scroll_active = false;
                         self.touch_scroll_index = None;
                         self.pressed_index = None;
@@ -7224,6 +7323,14 @@ mod scroll_physics_tests {
         assert!(96.0 >= BACK_SWIPE_COMMIT_DISTANCE);
     }
 
+    #[test]
+    fn touch_slop_cancels_tap_for_vertical_and_horizontal_drag() {
+        let start = (120.0, 240.0);
+        assert!(!touch_moved_beyond_slop(start, (124.0, 244.0)));
+        assert!(touch_moved_beyond_slop(start, (120.0, 249.0)));
+        assert!(touch_moved_beyond_slop(start, (129.0, 240.0)));
+    }
+
     fn label_focus_dom_setup() {
         let button = crate::dom::create_element("button");
         crate::dom::set_attribute(button, "id", "one-tap");
@@ -7342,6 +7449,13 @@ mod scroll_physics_tests {
             event_loop_schedule(now, false, true, Some(now), None, false),
             EventLoopSchedule::Poll
         );
+    }
+
+    #[test]
+    fn animation_frame_work_pauses_while_surface_is_suspended() {
+        assert!(animation_frame_work_active(true, false, true));
+        assert!(animation_frame_work_active(true, true, false));
+        assert!(!animation_frame_work_active(false, true, true));
     }
 
     #[test]
@@ -8681,6 +8795,38 @@ mod scroll_physics_tests {
             repaint_for_present(RepaintMode::Clean, false),
             RepaintMode::Clean
         ));
+    }
+
+    #[test]
+    fn presented_frame_consumes_queued_repaint_state() {
+        let mut queued = RepaintMode::Full;
+
+        assert!(matches!(
+            take_repaint_for_present(&mut queued, false),
+            RepaintMode::Full
+        ));
+        assert!(matches!(queued, RepaintMode::Clean));
+    }
+
+    #[test]
+    fn clean_cpu_repaint_skips_compositor_preparation() {
+        let mut prepared = false;
+
+        let result = prepare_for_repaint(&RepaintMode::Clean, || {
+            prepared = true;
+            1
+        });
+
+        assert_eq!(result, None);
+        assert!(!prepared);
+
+        let result = prepare_for_repaint(&RepaintMode::Full, || {
+            prepared = true;
+            2
+        });
+
+        assert_eq!(result, Some(2));
+        assert!(prepared);
     }
 }
 

@@ -4371,13 +4371,18 @@ fn global_value_expr(name: &str) -> Option<String> {
         "WeakSet" => "w3cos_core::collections::weak_set_class()".to_string(),
         // Dynamic Proxy constructor backed by w3cos-core's proxy traps.
         "Proxy" => "w3cos_core::proxy_class()".to_string(),
-        "TextDecoder" => "w3cos_core::web::text_decoder_class()".to_string(),
         "Date" => "w3cos_core::web::date_class()".to_string(),
         "fetch" => "w3cos_core::Value::function(|_this, __args| w3cos_runtime::fetch::fetch_value(__args))".to_string(),
         "WebSocket" => {
             "w3cos_runtime::jsdom::window_value().get_property(\"WebSocket\")".to_string()
         }
-        "Request" | "Response" | "Headers" | "AbortController" | "AbortSignal" => {
+        "Request" | "Response" | "Headers" | "AbortController" | "AbortSignal"
+        | "TextEncoder" | "TextDecoder" | "Event" | "CustomEvent" | "EventTarget"
+        | "Node" | "Element" | "HTMLElement" | "HTMLAnchorElement" | "HTMLDivElement"
+        | "HTMLSpanElement" | "HTMLButtonElement" | "HTMLInputElement"
+        | "HTMLTextAreaElement" | "HTMLSelectElement" | "HTMLFormElement"
+        | "HTMLImageElement" | "HTMLVideoElement" | "HTMLCanvasElement" | "SVGElement"
+        | "DocumentFragment" | "Range" | "Selection" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
         }
         "Uint8Array" | "Uint8ClampedArray" | "Int8Array" | "Uint16Array" | "Int16Array"
@@ -4398,20 +4403,16 @@ fn global_value_expr(name: &str) -> Option<String> {
         "BigInt" | "ArrayBuffer" | "SharedArrayBuffer" | "DataView"
         | "WeakRef" | "FinalizationRegistry" | "Atomics" | "eval"
         | "encodeURI" | "encodeURIComponent" | "decodeURI" | "decodeURIComponent" | "escape"
-        | "unescape" | "TextEncoder" | "FormData" | "Event"
-        | "EventTarget" | "CustomEvent" | "MessagePort" | "Worker"
+        | "unescape" | "FormData" | "MessagePort" | "Worker"
         | "ImageData" | "OffscreenCanvas" | "Path2D" | "DOMRect" | "DOMPoint" | "DOMMatrix"
         | "MutationObserver" | "IntersectionObserver" | "PerformanceObserver" | "Report"
         // DOM constructors / event types (instanceof degrades to false).
-        | "Function" | "Node" | "Element" | "HTMLElement" | "HTMLAnchorElement"
-        | "HTMLDivElement" | "HTMLSpanElement" | "HTMLButtonElement" | "HTMLInputElement"
-        | "HTMLTextAreaElement" | "HTMLSelectElement" | "HTMLFormElement" | "HTMLImageElement"
-        | "HTMLVideoElement" | "HTMLCanvasElement" | "SVGElement" | "DocumentFragment"
+        | "Function"
         | "ShadowRoot" | "NodeList" | "CSSStyleDeclaration" | "MouseEvent" | "KeyboardEvent"
         | "PointerEvent" | "WheelEvent" | "FocusEvent" | "InputEvent" | "ClipboardEvent"
         | "DragEvent" | "TouchEvent" | "AnimationEvent" | "TransitionEvent" | "ErrorEvent"
         | "EventSource" | "XMLHttpRequest" | "Blob" | "File" | "FileReader"
-        | "ClipboardItem" | "DataTransfer" | "DOMException" | "Range" | "Selection"
+        | "ClipboardItem" | "DataTransfer" | "DOMException"
         | "DOMParser" | "XMLSerializer" | "CSS" | "CSSStyleSheet"
         // URL constructors are handled at `new` sites; bare values are stubs.
         | "URL" | "URLSearchParams"
@@ -6257,8 +6258,9 @@ function f(window) { return window.x; }"#,
 
     #[test]
     fn dynamic_lowering_preserves_postfix_update_result() {
-        let stmts =
-            parse_stmts("function bump(ref) { let local = 1; const a = local++; const b = ref.current++; }");
+        let stmts = parse_stmts(
+            "function bump(ref) { let local = 1; const a = local++; const b = ref.current++; }",
+        );
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(

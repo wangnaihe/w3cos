@@ -49,6 +49,15 @@ fn storage_path() -> PathBuf {
         .join("local.json")
 }
 
+/// Bind persistent Web Storage to an embedder-owned application data directory.
+///
+/// Mobile hosts must call this before the application setup function runs. Relying
+/// on `HOME` is not portable on iOS/Android and can leave localStorage process-only.
+pub fn set_base_dir(dir: PathBuf) {
+    let mut guard = STORAGE.lock().unwrap();
+    *guard = Some(WebStorage::new(Some(dir.join("local.json"))));
+}
+
 fn with_storage<F, R>(f: F) -> R
 where
     F: FnOnce(&mut WebStorage) -> R,
@@ -140,5 +149,20 @@ mod tests {
         let before = length();
         set_item("len_test", "v");
         assert!(length() >= before);
+    }
+
+    #[test]
+    fn persisted_storage_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local.json");
+        let mut first = WebStorage::new(Some(path.clone()));
+        first.data.insert("token".into(), "persisted".into());
+        first.flush();
+
+        let second = WebStorage::new(Some(path));
+        assert_eq!(
+            second.data.get("token").map(String::as_str),
+            Some("persisted")
+        );
     }
 }

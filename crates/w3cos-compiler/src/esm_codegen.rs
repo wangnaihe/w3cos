@@ -2833,6 +2833,46 @@ export function fetchApiShape() {
     controller.signal.aborted + ":" + aborted + ":" + headers.get("X-ONE") + ":" +
     synthetic.status + ":" + synthetic.headers.get("content-type") + ":" + synthetic.json().local;
 }
+export function textEncodingShape() {
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode("A✓");
+  const destination = new Uint8Array(2);
+  const progress = encoder.encodeInto("éx", destination);
+  return typeof TextEncoder + ":" + (window.TextEncoder === TextEncoder) + ":" +
+    encoder.encoding + ":" + encoded.length + ":" + encoded[0] + ":" + encoded[1] + ":" +
+    encoded[2] + ":" + encoded[3] + ":" + progress.read + ":" + progress.written + ":" +
+    destination[0] + ":" + destination[1];
+}
+export function eventApiShape() {
+  const target = new EventTarget();
+  let log = "";
+  target.addEventListener("ready", (event) => {
+    log += event.type + ":" + event.detail;
+    event.preventDefault();
+  }, { once: true });
+  const event = new CustomEvent("ready", { detail: "payload", cancelable: true });
+  const first = target.dispatchEvent(event);
+  const second = target.dispatchEvent(new Event("ready"));
+  return typeof Event + ":" + typeof CustomEvent + ":" + typeof EventTarget + ":" +
+    (window.Event === Event) + ":" + (window.CustomEvent === CustomEvent) + ":" +
+    (window.EventTarget === EventTarget) + ":" + first + ":" + event.defaultPrevented + ":" +
+    log + ":" + second + ":" + (event.target === target) + ":" + (event.currentTarget === null);
+}
+export function domConstructorShape() {
+  const div = document.createElement("div");
+  const input = document.createElement("input");
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const fragment = document.createDocumentFragment();
+  const range = new Range();
+  const selection = getSelection();
+  return typeof Node + ":" + typeof HTMLDivElement + ":" + (window.Node === Node) + ":" +
+    (div instanceof HTMLDivElement) + ":" + (div instanceof HTMLElement) + ":" +
+    (div instanceof Node) + ":" + (div instanceof HTMLSpanElement) + ":" +
+    (input instanceof HTMLInputElement) + ":" + (svg instanceof SVGElement) + ":" +
+    (svg instanceof HTMLElement) + ":" + (fragment instanceof DocumentFragment) + ":" +
+    (fragment instanceof Node) + ":" + typeof range.setStart + ":" +
+    (range instanceof Range) + ":" + (selection instanceof Selection);
+}
 export function runFetch(url) {
   const headers = new Headers({ "X-Trace": "one" });
   headers.append("x-trace", "two");
@@ -2909,6 +2949,21 @@ fn main() {
     assert!(
         matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:true:stopped:first, second:202:application/json:true"),
         "Fetch companion constructors: {r:?}"
+    );
+    let r = m0::m0_textEncodingShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:true:utf-8:4:65:226:156:147:1:2:195:169"),
+        "TextEncoder constructor/window identity/UTF-8/encodeInto: {r:?}"
+    );
+    let r = m0::m0_eventApiShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:true:true:true:false:true:ready:payload:true:true:true"),
+        "Event/CustomEvent/EventTarget constructors and dispatch: {r:?}"
+    );
+    let r = m0::m0_domConstructorShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:true:true:true:true:false:true:true:false:true:true:function:true:true"),
+        "DOM constructor identity/prototype hierarchy/Range: {r:?}"
     );
     let http_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let http_port = http_listener.local_addr().unwrap().port();

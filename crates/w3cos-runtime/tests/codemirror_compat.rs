@@ -21,7 +21,7 @@ use w3cos_runtime::font_face::FontFaceSet;
 use w3cos_runtime::observers::{
     IntersectionObserver, MutationObserver, MutationObserverInit, MutationRecord, ResizeObserver,
 };
-use w3cos_runtime::timers::{request_animation_frame, tick};
+use w3cos_runtime::timers::{request_animation_frame, take_animation_frame_actions, tick};
 use w3cos_std::EventAction;
 
 // ── Step 1: DOM Construction ───────────────────────────────────────────────
@@ -193,8 +193,9 @@ fn cm_step4_request_animation_frame() {
     // Schedule a frame — like CodeMirror's requestMeasure
     request_animation_frame(EventAction::Increment(42));
 
-    // Tick the timer — like the runtime's main loop
-    let actions = tick();
+    // A rendering opportunity drains rAF separately from ordinary timers.
+    assert!(tick().is_empty());
+    let actions = take_animation_frame_actions();
     assert!(
         actions
             .iter()
@@ -202,7 +203,7 @@ fn cm_step4_request_animation_frame() {
         "rAF callback should fire on tick"
     );
 
-    println!("[PASS] CM Step 4: requestAnimationFrame fires on tick");
+    println!("[PASS] CM Step 4: requestAnimationFrame fires at rendering opportunity");
 }
 
 // ── Step 5: document.fonts.ready ──────────────────────────────────────────
@@ -508,12 +509,12 @@ fn cm_full_editorview_init_simulation() {
     doc.set_layout_rect(content_dom.id, DOMRect::new(0.0, 0.0, 1280.0, 800.0));
 
     // --- Simulate rAF tick (measure cycle) ---
-    let actions = tick();
+    let actions = take_animation_frame_actions();
     assert!(
         actions
             .iter()
             .any(|a| matches!(a, EventAction::Increment(1))),
-        "rAF should fire on tick"
+        "rAF should fire at a rendering opportunity"
     );
     ms.store(true, Ordering::SeqCst);
 

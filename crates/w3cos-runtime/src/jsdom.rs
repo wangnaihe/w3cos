@@ -12,8 +12,9 @@
 //!   singletons for compiled JS.
 //! - [`drain_microtasks`] — runs queued microtasks AND delivers DOM events
 //!   that were dispatched through the native w3cos-dom path (see below).
-//! - [`tick_timers`] — fires due `setTimeout`/`setInterval` callbacks and
-//!   drained `requestAnimationFrame` callbacks.
+//! - [`tick_timers`] — fires due `setTimeout`/`setInterval` callbacks.
+//! - [`run_animation_frame`] — runs one `requestAnimationFrame` batch at a
+//!   rendering opportunity.
 //!
 //! # Event delivery model
 //!
@@ -30,12 +31,14 @@
 //! means `preventDefault`/`stopPropagation` from JS cannot affect native
 //! dispatch (documented limitation; affects e.g. `beforeinput`).
 //!
-//! # Frame-loop integration (NOT wired here)
+//! # Frame-loop integration
 //!
-//! The window frame loop should call, once per frame:
-//! `jsdom::tick_timers(); jsdom::drain_microtasks();`
-//! The latter also polls native WebSocket workers and dispatches their events.
-//! `window.rs` is intentionally not modified by this module.
+//! Native task turns call `tick_timers()` followed by `drain_microtasks()`.
+//! Immediately before painting, the window loop calls
+//! `run_animation_frame()` followed by another microtask checkpoint. This
+//! keeps rAF callbacks aligned with rendering opportunities rather than timer
+//! wakeups. `drain_microtasks()` also polls native WebSocket workers and
+//! dispatches their events.
 //!
 //! # Timer model
 //!
@@ -451,7 +454,18 @@ fn build_element_value(node: u32) -> Value {
         .set(move |_target, key, value, _receiver| element_computed_set(node, key, value))
         .build();
 
-    Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))))
+    let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
+    let is_svg = get_expando(node, "namespaceURI")
+        .is_some_and(|namespace| namespace.to_js_string() == "http://www.w3.org/2000/svg");
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype_for_node(
+            dom::node_type(node),
+            &dom::tag_name(node),
+            is_svg,
+        ),
+    );
+    value
 }
 
 fn child_elements(node: u32) -> Vec<u32> {
@@ -1763,8 +1777,10 @@ fn build_event_value(ev: &Event) -> Value {
     value.set_property(
         "preventDefault",
         func(move |_, _| {
-            v.set_property("__pd", Value::Bool(true));
-            v.set_property("returnValue", Value::Bool(false));
+            if v.get_property("cancelable").to_bool() {
+                v.set_property("__pd", Value::Bool(true));
+                v.set_property("returnValue", Value::Bool(false));
+            }
             Value::Undefined
         }),
     );
@@ -2233,7 +2249,21 @@ fn js_dispatch_event(node: u32, event_val: Value) -> bool {
     if !bubbles.is_undefined() {
         ev.bubbles = bubbles.to_bool();
     }
-    dispatch_event_to_js(ev)
+    let cancelable = event_val.get_property("cancelable");
+    if !cancelable.is_undefined() {
+        ev.cancelable = cancelable.to_bool();
+    }
+    let composed = event_val.get_property("composed");
+    if !composed.is_undefined() {
+        ev.composed = composed.to_bool();
+    }
+    let was_canceled = event_val.get_property("defaultPrevented").to_bool();
+    let dispatched = dispatch_event_to_js(ev);
+    if !dispatched {
+        event_val.set_property("__pd", Value::Bool(true));
+        event_val.set_property("returnValue", Value::Bool(false));
+    }
+    dispatched && !was_canceled
 }
 
 /// Deliver event snapshots taken by native dispatch to JS listeners.
@@ -2661,7 +2691,7 @@ fn range_to_w3cos(v: &Value) -> w3cos_dom::selection::Range {
     r
 }
 
-fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
+pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
     props.insert("__sc".to_string(), Value::Number(sc as f64));
     props.insert("__so".to_string(), Value::Number(so as f64));
@@ -2872,6 +2902,7 @@ fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
     );
     value.set_property("detach", func(|_, _| Value::Undefined));
     value.set_property("insertNode", func(|_, _| Value::Undefined)); // gap
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Range"));
     value
 }
 
@@ -3040,6 +3071,7 @@ fn selection_value() -> Value {
         }),
     );
     let value = Value::object(props);
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Selection"));
     SELECTION_VALUE.with(|s| *s.borrow_mut() = Some(value.clone()));
     value
 }
@@ -3664,6 +3696,29 @@ fn build_window_value() -> Value {
         "AbortSignal".to_string(),
         crate::fetch::abort_signal_class(),
     );
+    props.insert(
+        "TextEncoder".to_string(),
+        crate::text_encoding::text_encoder_class(),
+    );
+    props.insert(
+        "TextDecoder".to_string(),
+        w3cos_core::web::text_decoder_class(),
+    );
+    props.insert("Event".to_string(), crate::web_events::event_class());
+    props.insert(
+        "CustomEvent".to_string(),
+        crate::web_events::custom_event_class(),
+    );
+    props.insert(
+        "EventTarget".to_string(),
+        crate::web_events::event_target_class(),
+    );
+    for name in crate::dom_constructors::DOM_CONSTRUCTOR_NAMES {
+        props.insert(
+            (*name).to_string(),
+            crate::dom_constructors::constructor(name),
+        );
+    }
     props.insert("closed".to_string(), Value::Bool(false));
     props.insert("isSecureContext".to_string(), Value::Bool(true));
     props.insert("crossOriginIsolated".to_string(), Value::Bool(false));
@@ -3993,10 +4048,8 @@ fn js_clear_timer(id: u32) {
     JS_TIMERS.with(|t| t.borrow_mut().retain(|timer| timer.id != id));
 }
 
-/// Fire all due `setTimeout`/`setInterval` callbacks and drain the
-/// `requestAnimationFrame` queue. Returns the number of callbacks invoked.
-/// The frame loop should call this once per frame (integration point:
-/// `window.rs`, intentionally not wired by this module).
+/// Fire all due `setTimeout`/`setInterval` callbacks. Returns the number of
+/// callbacks invoked.
 pub fn tick_timers() -> usize {
     let mut fired: Vec<(Value, Vec<Value>)> = Vec::new();
     JS_TIMERS.with(|t| {
@@ -4017,20 +4070,39 @@ pub fn tick_timers() -> usize {
             }
         }
     });
-    let raf_callbacks: Vec<Value> =
-        RAF_QUEUE.with(|q| q.borrow_mut().drain(..).map(|(_, cb)| cb).collect());
-    let mut ran = fired.len();
+    let ran = fired.len();
     for (cb, args) in fired {
         cb.call(Value::Undefined, args);
     }
-    if !raf_callbacks.is_empty() {
-        let timestamp = Value::Number(performance_now());
-        for cb in raf_callbacks {
-            cb.call(Value::Undefined, vec![timestamp.clone()]);
-            ran += 1;
-        }
+    ran
+}
+
+/// Run one animation-frame callback batch at a rendering opportunity.
+///
+/// Taking the queue before invoking callbacks gives every callback in this
+/// batch the same timestamp and defers callbacks registered by a callback to
+/// the next frame, matching browser rAF batching semantics.
+pub fn run_animation_frame() -> usize {
+    let callbacks: Vec<Value> = RAF_QUEUE
+        .with(|q| std::mem::take(&mut *q.borrow_mut()))
+        .into_iter()
+        .map(|(_, callback)| callback)
+        .collect();
+    if callbacks.is_empty() {
+        return 0;
+    }
+
+    let timestamp = Value::Number(performance_now());
+    let ran = callbacks.len();
+    for callback in callbacks {
+        callback.call(Value::Undefined, vec![timestamp.clone()]);
     }
     ran
+}
+
+/// True when a rendering opportunity is needed for queued rAF callbacks.
+pub fn has_pending_animation_frame() -> bool {
+    RAF_QUEUE.with(|q| !q.borrow().is_empty())
 }
 
 /// Queue a microtask (also used internally for thenable callbacks).
@@ -4096,14 +4168,13 @@ pub fn has_pending_work() -> bool {
     timers || raf || micro || events || crate::websocket::has_pending_js_sockets()
 }
 
-/// Earliest deadline the bridge needs to be woken at: the soonest pending JS
-/// timer, or the next frame (~16ms) when rAF callbacks are queued. The event
-/// loop folds this into its `ControlFlow::WaitUntil` computation.
+/// Earliest non-rendering deadline the bridge needs to be woken at: the
+/// soonest pending JS timer, or a polling opportunity for native WebSockets.
+/// rAF cadence is owned by the window rendering scheduler.
 pub fn next_timer_deadline() -> Option<Instant> {
     let timer = JS_TIMERS.with(|t| t.borrow().iter().map(|timer| timer.fire_at).min());
-    let raf = RAF_QUEUE.with(|q| !q.borrow().is_empty());
     let sockets = crate::websocket::has_pending_js_sockets();
-    let frame_deadline = (raf || sockets).then(|| Instant::now() + Duration::from_millis(16));
+    let frame_deadline = sockets.then(|| Instant::now() + Duration::from_millis(16));
     match (timer, frame_deadline) {
         (Some(deadline), Some(frame_deadline)) => Some(deadline.min(frame_deadline)),
         (Some(deadline), None) => Some(deadline),
@@ -4160,6 +4231,80 @@ mod tests {
         doc.get_property("body")
             .call_method("appendChild", vec![el.clone()]);
         el
+    }
+
+    #[test]
+    fn dom_values_have_browser_shaped_constructor_identity() {
+        setup();
+        let window = window_value();
+        let document = document_value();
+        let div = document.call_method("createElement", vec![Value::string("div")]);
+        let input = document.call_method("createElement", vec![Value::string("input")]);
+        let svg = document.call_method(
+            "createElementNS",
+            vec![
+                Value::string("http://www.w3.org/2000/svg"),
+                Value::string("svg"),
+            ],
+        );
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+        let text = document.call_method("createTextNode", vec![Value::string("text")]);
+        let range = document.call_method("createRange", vec![]);
+        let selection = document.call_method("getSelection", vec![]);
+
+        for constructor in ["HTMLDivElement", "HTMLElement", "Element", "Node"] {
+            assert!(w3cos_core::class::instance_of(
+                &div,
+                &window.get_property(constructor)
+            ));
+        }
+        assert!(!w3cos_core::class::instance_of(
+            &div,
+            &window.get_property("HTMLSpanElement")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &input,
+            &window.get_property("HTMLInputElement")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &svg,
+            &window.get_property("SVGElement")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &svg,
+            &window.get_property("Element")
+        ));
+        assert!(!w3cos_core::class::instance_of(
+            &svg,
+            &window.get_property("HTMLElement")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &fragment,
+            &window.get_property("DocumentFragment")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &fragment,
+            &window.get_property("Node")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &text,
+            &window.get_property("Node")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &range,
+            &window.get_property("Range")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &selection,
+            &window.get_property("Selection")
+        ));
+
+        let constructed_range = w3cos_core::class::construct(&window.get_property("Range"), vec![]);
+        assert!(constructed_range.get_property("setStart").is_function());
+        assert!(w3cos_core::class::instance_of(
+            &constructed_range,
+            &window.get_property("Range")
+        ));
     }
 
     #[test]
@@ -4673,12 +4818,22 @@ mod tests {
                 }),
             ],
         );
-        let mut ev_props = HashMap::new();
-        ev_props.insert("type".to_string(), Value::string("cancel-me"));
+        let event_constructor = window_value().get_property("Event");
+        let event = w3cos_core::class::construct(
+            &event_constructor,
+            vec![
+                Value::string("cancel-me"),
+                Value::object(HashMap::from([(
+                    "cancelable".to_string(),
+                    Value::Bool(true),
+                )])),
+            ],
+        );
         let canceled = !child
-            .call_method("dispatchEvent", vec![Value::object(ev_props)])
+            .call_method("dispatchEvent", vec![event.clone()])
             .to_bool();
         assert!(canceled);
+        assert!(event.get_property("defaultPrevented").to_bool());
     }
 
     #[test]
@@ -4777,18 +4932,74 @@ mod tests {
     fn request_animation_frame_via_window() {
         setup();
         let win = window_value();
-        let got_ts = Rc::new(Cell::new(-1.0f64));
-        let got_ts2 = got_ts.clone();
+        let timestamps = Rc::new(RefCell::new(Vec::new()));
+        let timestamps1 = timestamps.clone();
         win.call_method(
             "requestAnimationFrame",
             vec![func(move |_, args| {
-                got_ts2.set(arg(&args, 0).to_number());
+                timestamps1.borrow_mut().push(arg(&args, 0).to_number());
                 Value::Undefined
             })],
         );
-        assert_eq!(tick_timers(), 1);
-        assert!(got_ts.get() >= 0.0);
-        assert_eq!(tick_timers(), 0);
+        let timestamps2 = timestamps.clone();
+        win.call_method(
+            "requestAnimationFrame",
+            vec![func(move |_, args| {
+                timestamps2.borrow_mut().push(arg(&args, 0).to_number());
+                Value::Undefined
+            })],
+        );
+
+        assert_eq!(tick_timers(), 0, "timer ticks must not execute rAF");
+        assert!(has_pending_animation_frame());
+        assert_eq!(run_animation_frame(), 2);
+        assert_eq!(timestamps.borrow().len(), 2);
+        assert!(timestamps.borrow()[0] >= 0.0);
+        assert_eq!(
+            timestamps.borrow()[0],
+            timestamps.borrow()[1],
+            "one rAF batch must share one timestamp"
+        );
+        assert!(!has_pending_animation_frame());
+    }
+
+    #[test]
+    fn animation_frame_requested_during_callback_waits_for_next_frame() {
+        setup();
+        let frames = Rc::new(RefCell::new(Vec::new()));
+        let first_frames = frames.clone();
+        window_value().call_method(
+            "requestAnimationFrame",
+            vec![func(move |_, args| {
+                first_frames
+                    .borrow_mut()
+                    .push((1, arg(&args, 0).to_number()));
+                let second_frames = first_frames.clone();
+                window_value().call_method(
+                    "requestAnimationFrame",
+                    vec![func(move |_, args| {
+                        second_frames
+                            .borrow_mut()
+                            .push((2, arg(&args, 0).to_number()));
+                        Value::Undefined
+                    })],
+                );
+                Value::Undefined
+            })],
+        );
+
+        assert_eq!(run_animation_frame(), 1);
+        assert_eq!(frames.borrow().len(), 1);
+        assert_eq!(frames.borrow()[0].0, 1);
+        assert!(has_pending_animation_frame());
+        std::thread::sleep(Duration::from_millis(1));
+        assert_eq!(run_animation_frame(), 1);
+        assert_eq!(frames.borrow().len(), 2);
+        assert_eq!(frames.borrow()[1].0, 2);
+        assert!(
+            frames.borrow()[1].1 >= frames.borrow()[0].1,
+            "rAF timestamps must be monotonic across frames"
+        );
     }
 
     #[test]

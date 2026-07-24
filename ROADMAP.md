@@ -173,7 +173,7 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 
 ### R2.1 Binary data and files
 
-- [ ] Expose working `TextEncoder` alongside `TextDecoder`.
+- [x] Expose working `TextEncoder` alongside `TextDecoder`.
 - [ ] Implement `ArrayBuffer`, `DataView`, and typed-array buffer/view
   semantics.
 - [ ] Implement `Blob`, `File`, and `FileReader`.
@@ -183,8 +183,8 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 
 ### R2.2 Events and DOM constructors
 
-- [ ] Implement callable `Event`, `CustomEvent`, and `EventTarget`.
-- [ ] Expose DOM constructors with useful identity and `instanceof` behavior:
+- [x] Implement callable `Event`, `CustomEvent`, and `EventTarget`.
+- [x] Expose DOM constructors with useful identity and `instanceof` behavior:
   `Node`, `Element`, `HTMLElement`, common HTML elements, `Range`, and
   `Selection`.
 - [ ] Expose standard event subclasses: keyboard, pointer, input, clipboard,

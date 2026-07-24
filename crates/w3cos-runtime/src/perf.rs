@@ -8,6 +8,7 @@ const MAX_SAMPLES: usize = 240;
 
 #[derive(Clone, Copy, Default)]
 struct FrameSample {
+    cpu_frame_us: u64,
     layout_us: u64,
     paint_us: u64,
     react_commit_us: u64,
@@ -18,6 +19,7 @@ struct FrameSample {
     react_drop_us: u64,
     observer_us: u64,
     total_us: u64,
+    paint_recorded: bool,
 }
 
 static SCENARIO: Mutex<String> = Mutex::new(String::new());
@@ -51,6 +53,9 @@ pub fn set_scenario(name: &str) {
     if let Ok(mut samples) = SAMPLES.lock() {
         samples.clear();
     }
+    if let Ok(mut started) = FRAME_START.lock() {
+        *started = None;
+    }
     if let Ok(mut paths) = PAINT_PATHS.lock() {
         paths.clear();
     }
@@ -69,6 +74,13 @@ pub fn begin_frame() {
     if let Ok(mut t) = FRAME_START.lock() {
         *t = Some(Instant::now());
     }
+    if let Ok(mut samples) = SAMPLES.lock() {
+        samples.push(FrameSample::default());
+        if samples.len() > MAX_SAMPLES {
+            let drop = samples.len() - MAX_SAMPLES;
+            samples.drain(0..drop);
+        }
+    }
 }
 
 pub fn record_layout(elapsed: Duration) {
@@ -76,22 +88,54 @@ pub fn record_layout(elapsed: Duration) {
         return;
     }
     let layout_us = elapsed.as_micros() as u64;
-    if let Ok(mut samples) = SAMPLES.lock() {
-        samples.push(FrameSample {
-            layout_us,
-            paint_us: 0,
-            react_commit_us: 0,
-            react_entry_us: 0,
-            react_host_us: 0,
-            react_builder_us: 0,
-            react_reconcile_us: 0,
-            react_drop_us: 0,
-            observer_us: 0,
-            total_us: layout_us,
-        });
-        if samples.len() > MAX_SAMPLES {
-            let drop = samples.len() - MAX_SAMPLES;
-            samples.drain(0..drop);
+    if let Ok(mut samples) = SAMPLES.lock()
+        && let Some(sample) = samples.last_mut()
+    {
+        sample.layout_us = layout_us;
+        sample.total_us = phase_sum_us(sample);
+    }
+}
+
+fn phase_sum_us(sample: &FrameSample) -> u64 {
+    sample
+        .layout_us
+        .saturating_add(sample.paint_us)
+        .saturating_add(sample.react_commit_us)
+        .saturating_add(sample.observer_us)
+}
+
+fn frame_in_progress() -> bool {
+    FRAME_START
+        .lock()
+        .ok()
+        .is_some_and(|started| started.is_some())
+}
+
+/// Finish the current rendering opportunity and record continuous main-thread
+/// wall time from before rAF/prepaint through snapshot/post-paint work.
+///
+/// This is a CPU-side deadline metric. It is not GPU completion or display
+/// presentation time.
+pub fn end_frame() {
+    if !enabled() {
+        return;
+    }
+    let started = FRAME_START
+        .lock()
+        .ok()
+        .and_then(|mut started| started.take());
+    let Some(started) = started else {
+        return;
+    };
+    if let Ok(mut samples) = SAMPLES.lock()
+        && let Some(sample) = samples.last_mut()
+    {
+        if sample.paint_recorded {
+            sample.cpu_frame_us = started.elapsed().as_micros() as u64;
+        } else {
+            // Surface acquisition/size failures are not completed frames and
+            // must not become zero-duration benchmark samples.
+            samples.pop();
         }
     }
 }
@@ -104,28 +148,9 @@ pub fn record_paint(elapsed: Duration) {
     if let Ok(mut samples) = SAMPLES.lock() {
         if let Some(last) = samples.last_mut() {
             last.paint_us = paint_us;
-            last.total_us = last.layout_us.saturating_add(paint_us);
-        } else {
-            samples.push(FrameSample {
-                layout_us: 0,
-                paint_us,
-                react_commit_us: 0,
-                react_entry_us: 0,
-                react_host_us: 0,
-                react_builder_us: 0,
-                react_reconcile_us: 0,
-                react_drop_us: 0,
-                observer_us: 0,
-                total_us: paint_us,
-            });
+            last.paint_recorded = true;
+            last.total_us = phase_sum_us(last);
         }
-        if samples.len() > MAX_SAMPLES {
-            let drop = samples.len() - MAX_SAMPLES;
-            samples.drain(0..drop);
-        }
-    }
-    if let Ok(mut t) = FRAME_START.lock() {
-        *t = None;
     }
 }
 
@@ -166,7 +191,7 @@ pub fn record_react_drop(elapsed: Duration) {
 }
 
 fn record_react_subphase(elapsed: Duration, update: impl FnOnce(&mut FrameSample, u64)) {
-    if !enabled() {
+    if !enabled() || !frame_in_progress() {
         return;
     }
     let elapsed_us = elapsed.as_micros() as u64;
@@ -184,7 +209,7 @@ pub fn record_observer_delivery(elapsed: Duration) {
 }
 
 fn record_post_paint_phase(elapsed: Duration, update: impl FnOnce(&mut FrameSample, u64)) {
-    if !enabled() {
+    if !enabled() || !frame_in_progress() {
         return;
     }
     let elapsed_us = elapsed.as_micros() as u64;
@@ -192,11 +217,7 @@ fn record_post_paint_phase(elapsed: Duration, update: impl FnOnce(&mut FrameSamp
         && let Some(sample) = samples.last_mut()
     {
         update(sample, elapsed_us);
-        sample.total_us = sample
-            .layout_us
-            .saturating_add(sample.paint_us)
-            .saturating_add(sample.react_commit_us)
-            .saturating_add(sample.observer_us);
+        sample.total_us = phase_sum_us(sample);
     }
 }
 
@@ -262,11 +283,22 @@ pub fn summary_json() -> serde_json::Value {
     let react_reconcile: Vec<u64> = samples.iter().map(|s| s.react_reconcile_us).collect();
     let react_drop: Vec<u64> = samples.iter().map(|s| s.react_drop_us).collect();
     let observer: Vec<u64> = samples.iter().map(|s| s.observer_us).collect();
+    let cpu_frame: Vec<u64> = samples.iter().map(|s| s.cpu_frame_us).collect();
     let total: Vec<u64> = samples.iter().map(|s| s.total_us).collect();
     serde_json::json!({
         "scenario": scenario,
         "backend": backend,
-        "frame": stats(&total),
+        "cpu_frame": stats(&cpu_frame),
+        "phase_sum": stats(&total),
+        "display_frame": {
+            "available": false,
+            "reason": "platform presentation timestamps are not instrumented"
+        },
+        "metric_semantics": {
+            "cpu_frame": "continuous main-thread wall time from rendering opportunity through post-paint work",
+            "phase_sum": "diagnostic sum of selected CPU phases; not a frame clock",
+            "paint": "CPU render and presentation submission call; not displayed latency"
+        },
         "layout": stats(&layout),
         "paint": stats(&paint),
         "react_commit": stats(&react_commit),
@@ -305,5 +337,30 @@ mod tests {
     #[test]
     fn percentile_single() {
         assert_eq!(percentile(&[100], 0.95), 100);
+    }
+
+    #[test]
+    fn summary_separates_cpu_wall_time_from_unavailable_display_time() {
+        force_enable();
+        set_scenario("metric-semantics");
+        begin_frame();
+        std::thread::sleep(Duration::from_millis(1));
+        record_layout(Duration::from_micros(100));
+        record_paint(Duration::from_micros(200));
+        end_frame();
+
+        let summary = summary_json();
+        assert_eq!(summary["cpu_frame"]["count"], 1);
+        assert!(summary.get("frame").is_none());
+        assert_eq!(summary["phase_sum"]["count"], 1);
+        assert_eq!(summary["display_frame"]["available"], false);
+
+        let before = summary["phase_sum"]["p95_ms"].as_f64().unwrap();
+        record_react_commit(Duration::from_millis(5));
+        assert_eq!(
+            summary_json()["phase_sum"]["p95_ms"].as_f64().unwrap(),
+            before,
+            "work outside an active rendering opportunity must not mutate the previous frame"
+        );
     }
 }

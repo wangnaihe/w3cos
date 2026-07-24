@@ -78,7 +78,7 @@ pub fn request_animation_frame(action: EventAction) {
     })
 }
 
-/// Fire all due timers and rAF callbacks. Returns actions to execute.
+/// Fire all due timers. Returns actions to execute.
 pub fn tick() -> Vec<EventAction> {
     TIMERS.with(|t| {
         let mut store = t.borrow_mut();
@@ -105,27 +105,28 @@ pub fn tick() -> Vec<EventAction> {
         });
         store.timers.extend(reschedule);
 
-        // Drain rAF callbacks
-        actions.extend(store.raf_actions.drain(..));
-
         actions
     })
+}
+
+/// Take one native animation-frame batch immediately before rendering.
+///
+/// Actions queued while this batch executes remain stored for the next
+/// rendering opportunity.
+pub fn take_animation_frame_actions() -> Vec<EventAction> {
+    TIMERS.with(|t| std::mem::take(&mut t.borrow_mut().raf_actions))
+}
+
+/// True when native rAF work needs a rendering opportunity.
+pub fn has_pending_animation_frame() -> bool {
+    TIMERS.with(|t| !t.borrow().raf_actions.is_empty())
 }
 
 /// Returns the duration until the next timer fires, or None if no timers are pending.
 pub fn next_deadline() -> Option<Instant> {
     TIMERS.with(|t| {
         let store = t.borrow();
-        let timer_deadline = store.timers.iter().map(|e| e.fire_at).min();
-        if !store.raf_actions.is_empty() {
-            let raf_deadline = Instant::now();
-            match timer_deadline {
-                Some(td) => Some(td.min(raf_deadline)),
-                None => Some(raf_deadline),
-            }
-        } else {
-            timer_deadline
-        }
+        store.timers.iter().map(|e| e.fire_at).min()
     })
 }
 
@@ -180,9 +181,14 @@ mod tests {
     #[test]
     fn request_animation_frame_fires_once() {
         request_animation_frame(EventAction::Increment(0));
-        let actions = tick();
+        assert!(
+            tick().is_empty(),
+            "ordinary timer ticks must not execute animation-frame work"
+        );
+        assert!(has_pending_animation_frame());
+        let actions = take_animation_frame_actions();
         assert_eq!(actions.len(), 1);
-        let actions2 = tick();
+        let actions2 = take_animation_frame_actions();
         assert!(actions2.is_empty());
     }
 

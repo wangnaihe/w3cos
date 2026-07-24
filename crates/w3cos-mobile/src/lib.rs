@@ -14,7 +14,22 @@ pub mod touch;
 pub mod android;
 
 use anyhow::Result;
+#[cfg(target_os = "ios")]
+use std::path::PathBuf;
 use w3cos_std::Component;
+
+#[cfg(target_os = "ios")]
+fn configure_ios_data_directory() {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let data_dir = home
+        .join("Library")
+        .join("Application Support")
+        .join("w3cos");
+    w3cos_runtime::storage::set_base_dir(data_dir.join("storage"));
+    w3cos_runtime::indexed_db::set_base_dir(data_dir.join("indexeddb"));
+}
 
 /// Run a mobile application. Uses the reactive component builder (same as desktop).
 ///
@@ -28,7 +43,10 @@ pub fn run_mobile_app(builder: fn() -> Component) -> Result<()> {
     #[cfg(not(target_os = "android"))]
     {
         #[cfg(target_os = "ios")]
-        w3cos_std::safe_area::set_enabled(true);
+        {
+            configure_ios_data_directory();
+            w3cos_std::safe_area::set_enabled(true);
+        }
         w3cos_runtime::run_app(builder)
     }
 }
@@ -45,7 +63,10 @@ pub fn run_mobile_app_dom(setup: fn()) -> Result<()> {
     #[cfg(not(target_os = "android"))]
     {
         #[cfg(target_os = "ios")]
-        w3cos_std::safe_area::set_enabled(true);
+        {
+            configure_ios_data_directory();
+            w3cos_std::safe_area::set_enabled(true);
+        }
         w3cos_runtime::run_app_dom(setup)
     }
 }

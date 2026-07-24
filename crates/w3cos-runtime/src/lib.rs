@@ -6,6 +6,7 @@ pub mod compositor;
 pub mod devtools;
 pub mod dialog;
 pub mod dom;
+pub mod dom_constructors;
 pub mod eventsource;
 pub mod fetch;
 pub mod filter;
@@ -53,6 +54,7 @@ pub mod tile_manager;
 pub mod timers;
 pub mod uitest;
 pub mod virtual_list;
+pub mod web_events;
 pub mod websocket;
 pub mod worker;
 
@@ -122,6 +124,10 @@ pub fn run_app_on_android_dom(
     android_app: winit::platform::android::activity::AndroidApp,
     setup: fn(),
 ) -> Result<()> {
+    if let Some(data_dir) = android_app.internal_data_path() {
+        storage::set_base_dir(data_dir.join("w3cos").join("storage"));
+        indexed_db::set_base_dir(data_dir.join("w3cos").join("indexeddb"));
+    }
     window::run_dom_android(android_app, setup)
 }
 

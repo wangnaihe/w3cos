@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
+use w3cos_core::Value;
+
 /// W3C Encoding API — TextEncoder / TextDecoder.
 ///
 /// TextEncoder always encodes to UTF-8 (per spec).
 /// TextDecoder supports UTF-8 (default) and common single-byte encodings.
-
 /// TextEncoder — encodes a string into a UTF-8 byte array.
 pub struct TextEncoder;
 
@@ -22,7 +25,6 @@ impl TextEncoder {
 
     /// `TextEncoder.encodeInto(string, destination)` → `EncodeResult`.
     pub fn encode_into(&self, input: &str, dest: &mut [u8]) -> EncodeResult {
-        let bytes = input.as_bytes();
         let mut read_chars = 0;
         let mut written = 0;
 
@@ -47,6 +49,74 @@ impl Default for TextEncoder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// JavaScript-facing `TextEncoder` constructor for the ESM/jsdom Web surface.
+pub fn text_encoder_class() -> Value {
+    Value::function(|_this, _args| {
+        Value::object(HashMap::from([
+            (
+                "encoding".to_string(),
+                Value::string(TextEncoder::new().encoding()),
+            ),
+            (
+                "encode".to_string(),
+                Value::function(|_this, args| {
+                    let input = args
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| Value::string(""))
+                        .to_js_string();
+                    w3cos_core::collections::typed_array_value(
+                        TextEncoder::new()
+                            .encode(&input)
+                            .into_iter()
+                            .map(|byte| Value::Number(byte as f64))
+                            .collect(),
+                    )
+                }),
+            ),
+            (
+                "encodeInto".to_string(),
+                Value::function(|_this, args| {
+                    let input = args
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| Value::string(""))
+                        .to_js_string();
+                    let destination = args.get(1).cloned().unwrap_or(Value::Undefined);
+                    if !w3cos_core::collections::is_typed_array(&destination) {
+                        w3cos_core::throw_value(Value::object(HashMap::from([
+                            ("name".to_string(), Value::string("TypeError")),
+                            (
+                                "message".to_string(),
+                                Value::string(
+                                    "TextEncoder.encodeInto destination must be a Uint8Array",
+                                ),
+                            ),
+                        ])));
+                    }
+
+                    let Value::Array(values) = destination else {
+                        unreachable!("typed arrays use Value::Array storage");
+                    };
+                    let mut values = values.borrow_mut();
+                    let mut bytes = vec![0u8; values.len()];
+                    let progress = TextEncoder::new().encode_into(&input, &mut bytes);
+                    for (slot, byte) in values.iter_mut().zip(bytes).take(progress.written) {
+                        *slot = Value::Number(byte as f64);
+                    }
+                    Value::object(HashMap::from([
+                        ("read".to_string(), Value::Number(progress.read as f64)),
+                        (
+                            "written".to_string(),
+                            Value::Number(progress.written as f64),
+                        ),
+                    ]))
+                }),
+            ),
+        ]))
+    })
 }
 
 /// Result of `TextEncoder.encodeInto()`.
@@ -225,6 +295,50 @@ mod tests {
         let result = enc.encode_into("hello world", &mut buf);
         assert_eq!(result.written, 5);
         assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn encoder_web_surface_returns_typed_array_and_reports_progress() {
+        let encoder = w3cos_core::class::construct(&text_encoder_class(), vec![]);
+        assert_eq!(encoder.get_property("encoding").to_js_string(), "utf-8");
+
+        let encoded = encoder.call_method("encode", vec![Value::string("A✓")]);
+        assert!(w3cos_core::collections::is_typed_array(&encoded));
+        assert_eq!(
+            encoded
+                .iter()
+                .map(|value| value.to_u32())
+                .collect::<Vec<_>>(),
+            vec![65, 226, 156, 147]
+        );
+
+        let destination = w3cos_core::collections::typed_array_value(vec![
+            Value::Number(0.0),
+            Value::Number(0.0),
+        ]);
+        let progress =
+            encoder.call_method("encodeInto", vec![Value::string("éx"), destination.clone()]);
+        assert_eq!(progress.get_property("read").to_u32(), 1);
+        assert_eq!(progress.get_property("written").to_u32(), 2);
+        assert_eq!(
+            destination
+                .iter()
+                .map(|value| value.to_u32())
+                .collect::<Vec<_>>(),
+            vec![195, 169]
+        );
+    }
+
+    #[test]
+    fn encoder_web_surface_rejects_plain_array_destination() {
+        let thrown = std::panic::catch_unwind(|| {
+            let encoder = w3cos_core::class::construct(&text_encoder_class(), vec![]);
+            encoder.call_method(
+                "encodeInto",
+                vec![Value::string("x"), Value::array(vec![Value::Number(0.0)])],
+            );
+        });
+        assert!(thrown.is_err());
     }
 
     #[test]
