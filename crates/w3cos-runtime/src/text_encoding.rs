@@ -1,6 +1,11 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use w3cos_core::Value;
+
+thread_local! {
+    static TEXT_ENCODER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
 
 /// W3C Encoding API — TextEncoder / TextDecoder.
 ///
@@ -53,66 +58,87 @@ impl Default for TextEncoder {
 
 /// JavaScript-facing `TextEncoder` constructor for the ESM/jsdom Web surface.
 pub fn text_encoder_class() -> Value {
-    Value::function(|_this, _args| {
-        Value::object(HashMap::from([
-            (
-                "encoding".to_string(),
-                Value::string(TextEncoder::new().encoding()),
-            ),
-            (
-                "encode".to_string(),
-                Value::function(|_this, args| {
-                    let input = args
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| Value::string(""))
-                        .to_js_string();
-                    w3cos_core::collections::typed_array_value(
-                        TextEncoder::new()
-                            .encode(&input)
-                            .into_iter()
-                            .map(|byte| Value::Number(byte as f64))
-                            .collect(),
-                    )
-                }),
-            ),
-            (
-                "encodeInto".to_string(),
-                Value::function(|_this, args| {
-                    let input = args
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| Value::string(""))
-                        .to_js_string();
-                    let destination = args.get(1).cloned().unwrap_or(Value::Undefined);
-                    if !w3cos_core::collections::is_typed_array(&destination) {
-                        w3cos_core::throw_value(Value::object(HashMap::from([
-                            ("name".to_string(), Value::string("TypeError")),
-                            (
-                                "message".to_string(),
-                                Value::string(
-                                    "TextEncoder.encodeInto destination must be a Uint8Array",
+    TEXT_ENCODER_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            let value = Value::object(HashMap::from([
+                (
+                    "encoding".to_string(),
+                    Value::string(TextEncoder::new().encoding()),
+                ),
+                (
+                    "encode".to_string(),
+                    Value::function(|_this, args| {
+                        let input = args
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| Value::string(""))
+                            .to_js_string();
+                        w3cos_core::collections::typed_array_value(
+                            TextEncoder::new()
+                                .encode(&input)
+                                .into_iter()
+                                .map(|byte| Value::Number(byte as f64))
+                                .collect(),
+                        )
+                    }),
+                ),
+                (
+                    "encodeInto".to_string(),
+                    Value::function(|_this, args| {
+                        let input = args
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| Value::string(""))
+                            .to_js_string();
+                        let destination = args.get(1).cloned().unwrap_or(Value::Undefined);
+                        if !w3cos_core::collections::is_typed_array(&destination) {
+                            w3cos_core::throw_value(Value::object(HashMap::from([
+                                ("name".to_string(), Value::string("TypeError")),
+                                (
+                                    "message".to_string(),
+                                    Value::string(
+                                        "TextEncoder.encodeInto destination must be a Uint8Array",
+                                    ),
                                 ),
-                            ),
-                        ])));
-                    }
+                            ])));
+                        }
 
-                    let length = destination.get_property("length").to_number().max(0.0) as usize;
-                    let mut bytes = vec![0u8; length];
-                    let progress = TextEncoder::new().encode_into(&input, &mut bytes);
-                    for (index, byte) in bytes.into_iter().take(progress.written).enumerate() {
-                        destination.set_property(&index.to_string(), Value::Number(byte as f64));
-                    }
-                    Value::object(HashMap::from([
-                        ("read".to_string(), Value::Number(progress.read as f64)),
-                        (
-                            "written".to_string(),
-                            Value::Number(progress.written as f64),
-                        ),
-                    ]))
-                }),
-            ),
-        ]))
+                        let length =
+                            destination.get_property("length").to_number().max(0.0) as usize;
+                        let mut bytes = vec![0u8; length];
+                        let progress = TextEncoder::new().encode_into(&input, &mut bytes);
+                        for (index, byte) in bytes.into_iter().take(progress.written).enumerate() {
+                            destination
+                                .set_property(&index.to_string(), Value::Number(byte as f64));
+                        }
+                        Value::object(HashMap::from([
+                            ("read".to_string(), Value::Number(progress.read as f64)),
+                            (
+                                "written".to_string(),
+                                Value::Number(progress.written as f64),
+                            ),
+                        ]))
+                    }),
+                ),
+            ]));
+            w3cos_core::class::set_prototype_of(
+                &value,
+                &text_encoder_class().get_property("prototype"),
+            );
+            value
+        });
+        class.set_property("name", Value::string("TextEncoder"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property("encode", Value::function(|_, _| Value::Undefined));
+        prototype.set_property("encodeInto", Value::function(|_, _| Value::Undefined));
+        prototype.set_property("encoding", Value::Undefined);
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
     })
 }
 
@@ -298,6 +324,10 @@ mod tests {
     fn encoder_web_surface_returns_typed_array_and_reports_progress() {
         let encoder = w3cos_core::class::construct(&text_encoder_class(), vec![]);
         assert_eq!(encoder.get_property("encoding").to_js_string(), "utf-8");
+        assert!(w3cos_core::class::instance_of(
+            &encoder,
+            &text_encoder_class()
+        ));
 
         let encoded = encoder.call_method("encode", vec![Value::string("A✓")]);
         assert!(w3cos_core::collections::is_typed_array(&encoded));

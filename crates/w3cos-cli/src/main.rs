@@ -1,5 +1,6 @@
 mod dev;
 mod mobile;
+mod web_api_audit;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -101,6 +102,18 @@ enum Commands {
         /// Generate only members declared directly by each selected interface.
         #[arg(long)]
         own_only: bool,
+    },
+    /// Compare Chromium's live window Web API surface with the w3cos runtime.
+    WebApiAudit {
+        /// Chrome/Chromium executable. Auto-detected when omitted.
+        #[arg(long)]
+        chrome: Option<PathBuf>,
+        /// Emit the complete machine-readable report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Exit unsuccessfully when browser API globals are missing.
+        #[arg(long)]
+        fail_on_missing: bool,
     },
 }
 
@@ -284,6 +297,24 @@ fn main() -> Result<()> {
                 println!("✅ Generated: {}", output.display());
             } else {
                 print!("{generated}");
+            }
+        }
+        Commands::WebApiAudit {
+            chrome,
+            json,
+            fail_on_missing,
+        } => {
+            let report = web_api_audit::run(chrome.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                web_api_audit::print_report(&report);
+            }
+            if fail_on_missing && !report.missing_globals.is_empty() {
+                anyhow::bail!(
+                    "{} Chromium Web API globals are missing",
+                    report.missing_globals.len()
+                );
             }
         }
     }

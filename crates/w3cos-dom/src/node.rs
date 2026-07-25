@@ -20,9 +20,12 @@ impl NodeId {
 pub enum NodeType {
     Element,
     Text,
+    CdataSection,
+    ProcessingInstruction,
     Document,
     DocumentFragment,
     Comment,
+    DocumentType,
 }
 
 impl NodeType {
@@ -31,8 +34,11 @@ impl NodeType {
         match self {
             NodeType::Element => 1,
             NodeType::Text => 3,
+            NodeType::CdataSection => 4,
+            NodeType::ProcessingInstruction => 7,
             NodeType::Comment => 8,
             NodeType::Document => 9,
+            NodeType::DocumentType => 10,
             NodeType::DocumentFragment => 11,
         }
     }
@@ -129,6 +135,58 @@ impl DomNode {
         }
     }
 
+    pub fn new_cdata_section(id: NodeId, content: impl Into<String>) -> Self {
+        Self {
+            id,
+            node_type: NodeType::CdataSection,
+            tag: Atom::intern("#cdata-section"),
+            text_content: Some(content.into()),
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            attributes: Vec::new(),
+            class_list: Vec::new(),
+        }
+    }
+
+    pub fn new_processing_instruction(
+        id: NodeId,
+        target: impl AsRef<str>,
+        data: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            node_type: NodeType::ProcessingInstruction,
+            tag: Atom::intern(target.as_ref()),
+            text_content: Some(data.into()),
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            attributes: Vec::new(),
+            class_list: Vec::new(),
+        }
+    }
+
+    pub fn new_document_type(id: NodeId, name: impl AsRef<str>) -> Self {
+        Self {
+            id,
+            node_type: NodeType::DocumentType,
+            tag: Atom::intern(name.as_ref()),
+            text_content: None,
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            attributes: Vec::new(),
+            class_list: Vec::new(),
+        }
+    }
+
     pub fn tag_str(&self) -> String {
         self.tag.as_str()
     }
@@ -138,6 +196,8 @@ impl DomNode {
         match self.node_type {
             NodeType::Element => self.tag.as_str().to_ascii_uppercase(),
             NodeType::Text => "#text".to_string(),
+            NodeType::CdataSection => "#cdata-section".to_string(),
+            NodeType::ProcessingInstruction | NodeType::DocumentType => self.tag.as_str(),
             NodeType::Comment => "#comment".to_string(),
             NodeType::Document => "#document".to_string(),
             NodeType::DocumentFragment => "#document-fragment".to_string(),

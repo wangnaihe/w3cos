@@ -34,6 +34,7 @@ w3cos-rn-compat = { path = "crates/w3cos-rn-compat" }
 w3cos-mobile = { path = "crates/w3cos-mobile" }
 png = "0.17"
 image = "0.25"
+flate2 = "1.1"
 
 # Layout: Taffy 0.9 — Flexbox + Grid + Block + position
 taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout", "content_size"] }
@@ -70,6 +71,8 @@ libloading = "0.8"
 
 # Core
 anyhow = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono-tz = "0.10.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 quick-xml = "0.39"

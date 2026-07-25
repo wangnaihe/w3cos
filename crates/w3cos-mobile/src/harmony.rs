@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use w3cos_std::Component;
 
 pub fn surface_created_dom(window: *mut c_void, width: u32, height: u32, setup: fn()) -> i32 {
+    crate::configure_mobile_web_capabilities();
     result_code(w3cos_runtime::harmony::surface_created_dom(
         window, width, height, setup,
     ))
@@ -16,6 +17,7 @@ pub fn surface_created_component(
     height: u32,
     builder: fn() -> Component,
 ) -> i32 {
+    crate::configure_mobile_web_capabilities();
     result_code(w3cos_runtime::harmony::surface_created_component(
         window, width, height, builder,
     ))

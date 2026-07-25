@@ -10,6 +10,9 @@ use w3cos_core::Value;
 
 thread_local! {
     static SPEECH_RECOGNITION_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static SPEECH_GRAMMAR_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static SPEECH_GRAMMAR_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static SPEECH_RECOGNITION_PHRASE_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static ACTIVE: RefCell<Option<ActiveRecognition>> = const { RefCell::new(None) };
 }
 
@@ -125,6 +128,8 @@ fn recognition_value() -> Value {
         ("interimResults".to_string(), Value::Bool(false)),
         ("maxAlternatives".to_string(), Value::Number(1.0)),
         ("processLocally".to_string(), Value::Bool(false)),
+        ("grammars".to_string(), speech_grammar_list_value()),
+        ("phrases".to_string(), Value::array(Vec::new())),
     ]));
     crate::web_events::event_target_class().call(value.clone(), vec![]);
     for name in [
@@ -170,6 +175,148 @@ fn recognition_value() -> Value {
     value
 }
 
+pub fn speech_grammar_class() -> Value {
+    SPEECH_GRAMMAR_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|this, args| {
+            this.set_property(
+                "src",
+                Value::string(&args.first().map(Value::to_js_string).unwrap_or_default()),
+            );
+            this.set_property(
+                "weight",
+                Value::Number(args.get(1).map(Value::to_number).unwrap_or(1.0)),
+            );
+            Value::Undefined
+        });
+        class.set_property("name", Value::string("SpeechGrammar"));
+        let prototype = Value::object(HashMap::from([
+            ("constructor".into(), class.clone()),
+            ("src".into(), Value::Undefined),
+            ("weight".into(), Value::Undefined),
+        ]));
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn refresh_grammar_list(list: &Value, grammars: &[Value], old_length: usize) {
+    for index in 0..old_length.max(grammars.len()) {
+        list.set_property(
+            &index.to_string(),
+            grammars.get(index).cloned().unwrap_or(Value::Undefined),
+        );
+    }
+    list.set_property("length", Value::Number(grammars.len() as f64));
+}
+
+fn speech_grammar_list_value() -> Value {
+    let grammars = std::rc::Rc::new(RefCell::new(Vec::<Value>::new()));
+    let list = Value::object(HashMap::from([("length".into(), Value::Number(0.0))]));
+    let item_grammars = std::rc::Rc::clone(&grammars);
+    list.set_property(
+        "item",
+        Value::function(move |_, args| {
+            item_grammars
+                .borrow()
+                .get(args.first().map(Value::to_u32).unwrap_or_default() as usize)
+                .cloned()
+                .unwrap_or(Value::Null)
+        }),
+    );
+    for (method, uri) in [("addFromString", false), ("addFromUri", true)] {
+        let add_grammars = std::rc::Rc::clone(&grammars);
+        let add_list = list.clone();
+        list.set_property(
+            method,
+            Value::function(move |_, args| {
+                let source = args.first().map(Value::to_js_string).unwrap_or_default();
+                if source.is_empty() {
+                    w3cos_core::throw_value(w3cos_core::error_instance(
+                        "TypeError",
+                        vec![Value::string("Speech grammar source must not be empty")],
+                    ));
+                }
+                if uri {
+                    eprintln!(
+                        "[w3cos] warning: SpeechGrammarList retains grammar URIs, but fetching \
+                         and compiling remote grammars requires a speech adapter"
+                    );
+                }
+                let grammar = w3cos_core::class::construct(
+                    &speech_grammar_class(),
+                    vec![
+                        Value::string(&source),
+                        Value::Number(args.get(1).map(Value::to_number).unwrap_or(1.0)),
+                    ],
+                );
+                let old_length = add_grammars.borrow().len();
+                add_grammars.borrow_mut().push(grammar);
+                refresh_grammar_list(&add_list, &add_grammars.borrow(), old_length);
+                Value::Undefined
+            }),
+        );
+    }
+    w3cos_core::class::set_prototype_of(
+        &list,
+        &speech_grammar_list_class().get_property("prototype"),
+    );
+    list
+}
+
+pub fn speech_grammar_list_class() -> Value {
+    SPEECH_GRAMMAR_LIST_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| speech_grammar_list_value());
+        class.set_property("name", Value::string("SpeechGrammarList"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for member in ["addFromString", "addFromUri", "item", "length"] {
+            prototype.set_property(member, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+pub fn speech_recognition_phrase_class() -> Value {
+    SPEECH_RECOGNITION_PHRASE_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|this, args| {
+            let phrase = args.first().map(Value::to_js_string).unwrap_or_default();
+            let boost = args.get(1).map(Value::to_number).unwrap_or(1.0);
+            if phrase.is_empty() || !boost.is_finite() || !(0.0..=10.0).contains(&boost) {
+                w3cos_core::throw_value(w3cos_core::error_instance(
+                    "TypeError",
+                    vec![Value::string(
+                        "SpeechRecognitionPhrase requires text and a boost from 0 to 10",
+                    )],
+                ));
+            }
+            this.set_property("phrase", Value::string(&phrase));
+            this.set_property("boost", Value::Number(boost));
+            Value::Undefined
+        });
+        class.set_property("name", Value::string("SpeechRecognitionPhrase"));
+        let prototype = Value::object(HashMap::from([
+            ("constructor".into(), class.clone()),
+            ("boost".into(), Value::Undefined),
+            ("phrase".into(), Value::Undefined),
+        ]));
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
 pub fn speech_recognition_class() -> Value {
     SPEECH_RECOGNITION_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
@@ -177,8 +324,54 @@ pub fn speech_recognition_class() -> Value {
         }
         let class = Value::function(|_, _| recognition_value());
         class.set_property("name", Value::string("SpeechRecognition"));
+        class.set_property(
+            "available",
+            Value::function(|_, _| {
+                eprintln!(
+                    "[w3cos] warning: SpeechRecognition.available reports the local runtime \
+                     adapter state; language-pack discovery is not available"
+                );
+                w3cos_core::promise::resolve(vec![Value::string("unavailable")])
+            }),
+        );
+        class.set_property(
+            "install",
+            Value::function(|_, _| {
+                eprintln!(
+                    "[w3cos] warning: SpeechRecognition.install cannot install browser language \
+                     packs; configure a native speech adapter instead"
+                );
+                w3cos_core::promise::resolve(vec![Value::Bool(false)])
+            }),
+        );
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
+        for member in [
+            "abort",
+            "continuous",
+            "grammars",
+            "interimResults",
+            "lang",
+            "maxAlternatives",
+            "onaudioend",
+            "onaudiostart",
+            "onend",
+            "onerror",
+            "onnomatch",
+            "onresult",
+            "onsoundend",
+            "onsoundstart",
+            "onspeechend",
+            "onspeechstart",
+            "onstart",
+            "phrases",
+            "processLocally",
+            "quality",
+            "start",
+            "stop",
+        ] {
+            prototype.set_property(member, Value::Undefined);
+        }
         w3cos_core::class::set_prototype_of(
             &prototype,
             &crate::web_events::event_target_class().get_property("prototype"),
@@ -284,5 +477,36 @@ mod tests {
                 ("end".to_string(), "undefined".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn grammar_lists_and_contextual_phrases_are_stateful() {
+        let list = w3cos_core::class::construct(&speech_grammar_list_class(), Vec::new());
+        list.call_method(
+            "addFromString",
+            vec![
+                Value::string("#JSGF V1.0; grammar colors;"),
+                Value::Number(0.5),
+            ],
+        );
+        assert_eq!(list.get_property("length").to_u32(), 1);
+        assert_eq!(
+            list.call_method("item", vec![Value::Number(0.0)])
+                .get_property("weight")
+                .to_number(),
+            0.5
+        );
+        let phrase = w3cos_core::class::construct(
+            &speech_recognition_phrase_class(),
+            vec![Value::string("w3cos"), Value::Number(4.0)],
+        );
+        assert_eq!(phrase.get_property("phrase").to_js_string(), "w3cos");
+        assert_eq!(phrase.get_property("boost").to_number(), 4.0);
+
+        let recognition = w3cos_core::class::construct(&speech_recognition_class(), Vec::new());
+        assert!(w3cos_core::class::instance_of(
+            &recognition.get_property("grammars"),
+            &speech_grammar_list_class()
+        ));
     }
 }

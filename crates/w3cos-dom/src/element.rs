@@ -401,12 +401,31 @@ impl Element {
                     out.push_str(t);
                 }
             }
+            NodeType::CdataSection => {
+                out.push_str("<![CDATA[");
+                out.push_str(node.text_content.as_deref().unwrap_or(""));
+                out.push_str("]]>");
+            }
+            NodeType::ProcessingInstruction => {
+                out.push_str("<?");
+                out.push_str(&node.tag.as_str());
+                if let Some(text) = node.text_content.as_deref().filter(|text| !text.is_empty()) {
+                    out.push(' ');
+                    out.push_str(text);
+                }
+                out.push_str("?>");
+            }
             NodeType::Comment => {
                 out.push_str("<!--");
                 if let Some(ref t) = node.text_content {
                     out.push_str(t);
                 }
                 out.push_str("-->");
+            }
+            NodeType::DocumentType => {
+                out.push_str("<!DOCTYPE ");
+                out.push_str(&node.tag.as_str());
+                out.push('>');
             }
             NodeType::Element => {
                 let tag = node.tag.as_str();

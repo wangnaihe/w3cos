@@ -1,4 +1,10 @@
+pub mod animations_web;
+pub mod audio_web;
+pub mod badging_web;
+pub mod barcode_detection_web;
+pub mod battery_web;
 pub mod bluetooth_web;
+pub mod cache_web;
 pub mod canvas2d;
 pub mod canvas_web;
 #[cfg(all(
@@ -7,19 +13,33 @@ pub mod canvas_web;
 ))]
 pub mod clipboard;
 pub mod clipboard_web;
+pub mod close_watcher_web;
+pub mod compat_web;
 pub mod compositor;
+pub mod cookie_store_web;
+pub mod credentials_web;
+pub mod css_rules_web;
+pub mod css_typed_om_web;
+pub mod custom_elements_web;
+pub mod device_access_web;
 #[cfg(feature = "devtools")]
 pub mod devtools;
 pub mod dialog;
 pub mod dom;
 pub mod dom_constructors;
+pub mod edit_context_web;
+pub mod encrypted_media_web;
 pub mod eventsource;
+pub mod experimental_web;
 pub mod fetch;
+pub mod file_system_web;
 pub mod files;
 pub mod filter;
 mod fling;
 pub mod font_face;
+pub mod font_loading_web;
 pub mod form_data;
+pub mod fragment_directive_web;
 pub mod frame_cache;
 pub mod fs;
 #[cfg(all(
@@ -27,13 +47,17 @@ pub mod fs;
     not(target_env = "ohos")
 ))]
 pub mod fs_watch;
+pub mod gamepad_web;
 pub mod geolocation_web;
+pub mod geometry_web;
 #[cfg(feature = "gpu")]
 pub mod gpu_filter;
 #[cfg(any(target_env = "ohos", feature = "ohos-check"))]
 pub mod harmony;
+pub mod highlight_web;
 pub mod history;
 pub mod image_loader;
+pub mod image_decoder_web;
 pub mod indexed_db;
 mod indexed_db_sqlite;
 pub mod indexed_db_web;
@@ -45,23 +69,39 @@ mod ios_input;
 ))]
 pub mod ipc;
 pub mod jsdom;
+pub mod launch_handler_web;
 pub mod layout;
+pub mod locks_web;
 pub mod manifest;
 pub mod media;
+pub mod media_capabilities_web;
 pub mod media_devices_web;
+pub mod media_recording_web;
+pub mod media_session_web;
+pub mod media_source_web;
 pub mod menu;
+pub mod midi_web;
 pub mod multi_window;
+pub mod navigation_web;
+pub mod navigator_web;
+pub mod network_information_web;
 #[cfg(all(
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
 pub mod notification;
 pub mod notification_web;
+pub mod observable_web;
 pub mod observers;
 pub mod observers_web;
+pub mod orientation_web;
 mod overscroll;
 pub mod paint_artifact;
+pub mod payment_web;
 pub mod perf;
+pub mod permissions_web;
+pub mod presentation_web;
+pub mod pressure_web;
 #[cfg(all(
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
@@ -73,26 +113,55 @@ pub mod process;
     not(target_env = "ohos")
 ))]
 pub mod pty;
+pub mod push_web;
 pub mod pwa;
+pub mod reporting_web;
+pub mod sanitizer_web;
+pub mod scheduler_web;
+pub mod screen_details_web;
+pub mod sensors_web;
+pub mod service_worker_web;
 pub mod speech;
+pub mod speech_synthesis_web;
 pub mod speech_web;
 pub mod state;
 pub mod storage;
+pub mod storage_buckets_web;
+pub mod storage_manager_web;
 pub mod streams;
+pub mod streams_web;
 pub mod svg_renderer;
+pub mod svg_values_web;
 pub mod text_encoding;
 pub mod text_layout;
+pub mod text_tracks_web;
 pub mod tile_manager;
 pub mod timers;
+pub mod trusted_types_web;
 pub mod uitest;
 pub mod unsupported;
 pub mod uri_codec;
+pub mod user_activation_web;
+pub mod user_mediated_web;
+pub mod view_transition_web;
 pub mod virtual_list;
+pub mod wake_lock_web;
 pub mod web_events;
+pub mod web_nfc;
+pub mod web_share;
+pub mod webcodecs_web;
+pub mod webgpu_web;
+pub mod webgl_web;
+mod webgl_constants_generated;
+pub mod web_transport_web;
+pub mod webrtc_web;
+pub mod webxr_web;
 pub mod websocket;
 pub mod worker;
 pub mod worker_web;
 pub mod xhr;
+pub mod xpath_web;
+pub mod xslt_web;
 
 // Native capability extensions
 pub use w3cos_ffi as ffi;
@@ -123,6 +192,7 @@ pub use render_cpu as render;
 
 #[cfg(not(target_env = "ohos"))]
 pub mod window;
+pub mod window_environment_web;
 
 use anyhow::Result;
 use w3cos_std::Component;

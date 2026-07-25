@@ -506,6 +506,18 @@ pub(crate) fn iter_collection(value: &Value) -> Option<Vec<Value>> {
     None
 }
 
+pub enum CollectionSnapshot {
+    Map(Vec<(Value, Value)>),
+    Set(Vec<Value>),
+}
+
+pub fn collection_snapshot(value: &Value) -> Option<CollectionSnapshot> {
+    if let Some(entries) = map_state_of(value) {
+        return Some(CollectionSnapshot::Map(entries.borrow().clone()));
+    }
+    set_state_of(value).map(|values| CollectionSnapshot::Set(values.borrow().clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

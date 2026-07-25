@@ -20,6 +20,20 @@ use anyhow::Result;
 use std::path::PathBuf;
 use w3cos_std::Component;
 
+pub(crate) fn configure_mobile_web_capabilities() {
+    #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
+    {
+        static CONFIGURE: std::sync::Once = std::sync::Once::new();
+        CONFIGURE.call_once(|| {
+            const MOBILE_TOUCH_FALLBACK: u32 = 5;
+            eprintln!(
+                "W3COS warning: navigator.maxTouchPoints uses mobile fallback {MOBILE_TOUCH_FALLBACK}; exact hardware reporting is pending"
+            );
+            w3cos_runtime::jsdom::set_max_touch_points(MOBILE_TOUCH_FALLBACK);
+        });
+    }
+}
+
 #[cfg(target_os = "ios")]
 fn configure_ios_data_directory() {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
@@ -37,6 +51,7 @@ fn configure_ios_data_directory() {
 ///
 /// On desktop targets this is a dev convenience until the Android/iOS backend is linked.
 pub fn run_mobile_app(builder: fn() -> Component) -> Result<()> {
+    configure_mobile_web_capabilities();
     #[cfg(target_os = "android")]
     {
         return android::run(builder);
@@ -60,6 +75,7 @@ pub fn run_mobile_app(builder: fn() -> Component) -> Result<()> {
 
 /// Run a mobile application backed by the dynamic W3C DOM.
 pub fn run_mobile_app_dom(setup: fn()) -> Result<()> {
+    configure_mobile_web_capabilities();
     #[cfg(target_os = "android")]
     {
         // NativeActivity supplies its AndroidApp through `android_main`; this

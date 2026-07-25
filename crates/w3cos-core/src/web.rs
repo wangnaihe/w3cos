@@ -1,5 +1,6 @@
 //! Web platform builtins for the ESM compile pipeline: `Intl`, `Date`,
-//! `atob` / `btoa`, `structuredClone`, `URL`, and `URLSearchParams`.
+//! `atob` / `btoa`, `structuredClone`, `URL`, `URLSearchParams`, and
+//! `URLPattern`.
 //!
 //! Everything is hand-rolled on top of `base64` (percent-encoding and the
 //! URL grammar are small enough to keep local — no `url` crate dependency).
@@ -13,52 +14,618 @@
 //! with `href`/`toString`. Its `searchParams` object shares the parts back
 //! (mutating params updates `search`), but writing `search` directly does
 //! NOT rebuild an already-exposed `searchParams` object (v1 limitation).
-//! `structuredClone` copies own enumerable properties only (no prototype),
-//! and clones functions by reference (per the platform's exclusion list).
+//! `structuredClone` preserves cycles/shared references and the runtime's
+//! BigInt, Date, RegExp, Map, Set, Error, DOMException, Blob, File, ImageData,
+//! ArrayBuffer, SharedArrayBuffer, TypedArray, and DataView representations.
+//! Functions raise `DataCloneError`; ArrayBuffer transfer/detach and
+//! two-phase host-registered transferable objects are supported.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::sync::Once;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use chrono::{Offset, TimeZone};
 
 use crate::Value;
 use crate::value::js_error;
 
+thread_local! {
+    static DOM_EXCEPTION_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static IMAGE_DATA_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static NEXT_BLOB_ID: Cell<u64> = const { Cell::new(1) };
+    static BLOBS: RefCell<HashMap<u64, Rc<BlobState>>> = RefCell::new(HashMap::new());
+    static BLOB_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static FILE_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static TEXT_DECODER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static HOST_TRANSFERABLES: RefCell<HashMap<usize, (Value, Value)>> =
+        RefCell::new(HashMap::new());
+}
+
+const BLOB_STATE_KEY: &str = "__w3cos_blob_id";
+
+#[derive(Clone)]
+struct BlobState {
+    bytes: Vec<u8>,
+    type_name: String,
+}
+
+const DOM_EXCEPTION_CODES: &[(&str, &str, f64)] = &[
+    ("INDEX_SIZE_ERR", "IndexSizeError", 1.0),
+    ("DOMSTRING_SIZE_ERR", "DOMStringSizeError", 2.0),
+    ("HIERARCHY_REQUEST_ERR", "HierarchyRequestError", 3.0),
+    ("WRONG_DOCUMENT_ERR", "WrongDocumentError", 4.0),
+    ("INVALID_CHARACTER_ERR", "InvalidCharacterError", 5.0),
+    ("NO_DATA_ALLOWED_ERR", "NoDataAllowedError", 6.0),
+    (
+        "NO_MODIFICATION_ALLOWED_ERR",
+        "NoModificationAllowedError",
+        7.0,
+    ),
+    ("NOT_FOUND_ERR", "NotFoundError", 8.0),
+    ("NOT_SUPPORTED_ERR", "NotSupportedError", 9.0),
+    ("INUSE_ATTRIBUTE_ERR", "InUseAttributeError", 10.0),
+    ("INVALID_STATE_ERR", "InvalidStateError", 11.0),
+    ("SYNTAX_ERR", "SyntaxError", 12.0),
+    ("INVALID_MODIFICATION_ERR", "InvalidModificationError", 13.0),
+    ("NAMESPACE_ERR", "NamespaceError", 14.0),
+    ("INVALID_ACCESS_ERR", "InvalidAccessError", 15.0),
+    ("VALIDATION_ERR", "ValidationError", 16.0),
+    ("TYPE_MISMATCH_ERR", "TypeMismatchError", 17.0),
+    ("SECURITY_ERR", "SecurityError", 18.0),
+    ("NETWORK_ERR", "NetworkError", 19.0),
+    ("ABORT_ERR", "AbortError", 20.0),
+    ("URL_MISMATCH_ERR", "URLMismatchError", 21.0),
+    ("QUOTA_EXCEEDED_ERR", "QuotaExceededError", 22.0),
+    ("TIMEOUT_ERR", "TimeoutError", 23.0),
+    ("INVALID_NODE_TYPE_ERR", "InvalidNodeTypeError", 24.0),
+    ("DATA_CLONE_ERR", "DataCloneError", 25.0),
+];
+
+fn dom_exception_code(name: &str) -> f64 {
+    DOM_EXCEPTION_CODES
+        .iter()
+        .find_map(|(_, exception_name, code)| (*exception_name == name).then_some(*code))
+        .unwrap_or(0.0)
+}
+
+fn initialize_dom_exception(this: &Value, args: &[Value]) {
+    let message = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| Value::string(""))
+        .to_js_string();
+    let name = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| Value::string("Error"))
+        .to_js_string();
+    this.set_property("message", Value::string(&message));
+    this.set_property("name", Value::string(&name));
+    this.set_property("code", Value::Number(dom_exception_code(&name)));
+    this.set_property(
+        "stack",
+        Value::String(if message.is_empty() {
+            name
+        } else {
+            format!("{name}: {message}")
+        }),
+    );
+}
+
+pub fn dom_exception_class() -> Value {
+    DOM_EXCEPTION_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|this, args| {
+            initialize_dom_exception(&this, &args);
+            Value::Undefined
+        });
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in ["code", "message", "name"] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        prototype.set_property(
+            "toString",
+            Value::function(|this, _| {
+                let name = this.get_property("name").to_js_string();
+                let message = this.get_property("message").to_js_string();
+                Value::String(if message.is_empty() {
+                    name
+                } else {
+                    format!("{name}: {message}")
+                })
+            }),
+        );
+        for (constant, _, code) in DOM_EXCEPTION_CODES {
+            class.set_property(constant, Value::Number(*code));
+            prototype.set_property(constant, Value::Number(*code));
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+pub fn dom_exception_instance(message: &str, name: &str) -> Value {
+    crate::class::construct(
+        &dom_exception_class(),
+        vec![Value::string(message), Value::string(name)],
+    )
+}
+
+pub fn image_data_class() -> Value {
+    IMAGE_DATA_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, args| {
+            let first = args.first().cloned().unwrap_or_default();
+            let (data, width, height, settings_index) = if crate::binary::is_typed_array(&first) {
+                let width = args.get(1).map(Value::to_u32).unwrap_or(0);
+                let bytes = crate::binary::bytes_of(&first).unwrap_or_default();
+                let explicit_height = args.get(2).filter(|value| value.is_number());
+                let height = explicit_height
+                    .map(Value::to_u32)
+                    .unwrap_or_else(|| (bytes.len() as u32 / 4) / width.max(1));
+                (
+                    first,
+                    width,
+                    height,
+                    usize::from(explicit_height.is_some()) + 2,
+                )
+            } else {
+                let width = first.to_u32();
+                let height = args.get(1).map(Value::to_u32).unwrap_or(0);
+                let data = crate::class::construct(
+                    &crate::binary::typed_array_class("Uint8ClampedArray"),
+                    vec![Value::Number((width * height * 4) as f64)],
+                );
+                (data, width, height, 2)
+            };
+            let color_space = args
+                .get(settings_index)
+                .map(|settings| settings.get_property("colorSpace").to_js_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "srgb".to_string());
+            image_data_value(data, width, height, &color_space)
+        });
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in ["colorSpace", "data", "height", "pixelFormat", "width"] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+pub fn image_data_value(data: Value, width: u32, height: u32, color_space: &str) -> Value {
+    let value = Value::object(HashMap::from([
+        ("data".to_string(), data),
+        ("width".to_string(), Value::Number(width as f64)),
+        ("height".to_string(), Value::Number(height as f64)),
+        ("colorSpace".to_string(), Value::string(color_space)),
+    ]));
+    crate::class::set_prototype_of(&value, &image_data_class().get_property("prototype"));
+    value
+}
+
+fn blob_state(value: &Value) -> Option<Rc<BlobState>> {
+    let Value::Object(object) = value else {
+        return None;
+    };
+    let Value::Number(id) = object.borrow().get_direct(BLOB_STATE_KEY) else {
+        return None;
+    };
+    BLOBS.with(|states| states.borrow().get(&(id as u64)).cloned())
+}
+
+pub fn blob_bytes(value: &Value) -> Option<Vec<u8>> {
+    blob_state(value).map(|state| state.bytes.clone())
+}
+
+fn blob_part_bytes(value: &Value) -> Vec<u8> {
+    if let Some(bytes) = blob_bytes(value) {
+        return bytes;
+    }
+    if let Some(bytes) = crate::binary::bytes_of(value) {
+        return bytes;
+    }
+    value.to_js_string().into_bytes()
+}
+
+fn normalize_blob_index(value: Option<&Value>, length: usize, fallback: usize) -> usize {
+    let number = value.map(Value::to_number).unwrap_or(fallback as f64);
+    if number.is_sign_negative() {
+        (length as i64 + number as i64).max(0) as usize
+    } else {
+        (number.max(0.0) as usize).min(length)
+    }
+}
+
+fn make_blob(bytes: Vec<u8>, type_name: String, prototype: Value) -> Value {
+    let id = NEXT_BLOB_ID.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        id
+    });
+    let state = Rc::new(BlobState {
+        bytes,
+        type_name: type_name.to_ascii_lowercase(),
+    });
+    BLOBS.with(|states| states.borrow_mut().insert(id, state.clone()));
+    let value = Value::object(HashMap::from([(
+        BLOB_STATE_KEY.to_string(),
+        Value::Number(id as f64),
+    )]));
+    crate::class::set_prototype_of(&value, &prototype);
+    value.set_property("size", Value::Number(state.bytes.len() as f64));
+    value.set_property("type", Value::string(&state.type_name));
+
+    let state_for_text = state.clone();
+    value.set_property(
+        "text",
+        Value::function(move |_, _| Value::string(&String::from_utf8_lossy(&state_for_text.bytes))),
+    );
+    let state_for_buffer = state.clone();
+    value.set_property(
+        "arrayBuffer",
+        Value::function(move |_, _| {
+            crate::binary::array_buffer_value(state_for_buffer.bytes.clone())
+        }),
+    );
+    let state_for_bytes = state.clone();
+    value.set_property(
+        "bytes",
+        Value::function(move |_, _| {
+            crate::binary::typed_array_value(
+                state_for_bytes
+                    .bytes
+                    .iter()
+                    .map(|byte| Value::Number(*byte as f64))
+                    .collect(),
+            )
+        }),
+    );
+    let state_for_slice = state;
+    value.set_property(
+        "slice",
+        Value::function(move |_, args| {
+            let length = state_for_slice.bytes.len();
+            let start = normalize_blob_index(args.first(), length, 0);
+            let end = normalize_blob_index(args.get(1), length, length).max(start);
+            let type_name = args.get(2).map(Value::to_js_string).unwrap_or_default();
+            make_blob(
+                state_for_slice.bytes[start..end].to_vec(),
+                type_name,
+                blob_class().get_property("prototype"),
+            )
+        }),
+    );
+    value
+}
+
+fn construct_blob(args: &[Value], prototype: Value) -> Value {
+    let parts = args.first().cloned().unwrap_or_default();
+    let options = args.get(1).cloned().unwrap_or_default();
+    let bytes = parts
+        .iter()
+        .flat_map(|part| blob_part_bytes(&part))
+        .collect::<Vec<_>>();
+    let type_name = if options.is_object() {
+        options.get_property("type").to_js_string()
+    } else {
+        String::new()
+    };
+    make_blob(bytes, type_name, prototype)
+}
+
+pub fn blob_class() -> Value {
+    BLOB_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, args| {
+            construct_blob(&args, blob_class().get_property("prototype"))
+        });
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for method in ["arrayBuffer", "bytes", "slice", "stream", "text"] {
+            prototype.set_property(
+                method,
+                if method == "stream" {
+                    Value::function(|_, _| {
+                        eprintln!(
+                            "[w3cos] warning: Blob.stream requires the runtime Streams adapter; \
+                             use arrayBuffer(), bytes(), or text() in core-only execution"
+                        );
+                        Value::Undefined
+                    })
+                } else {
+                    Value::function(|_, _| Value::Undefined)
+                },
+            );
+        }
+        for property in ["size", "type"] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn file_value(bytes: Vec<u8>, type_name: String, name: String, last_modified: f64) -> Value {
+    let value = make_blob(bytes, type_name, file_class().get_property("prototype"));
+    value.set_property("name", Value::string(&name.replace('/', ":")));
+    value.set_property("webkitRelativePath", Value::string(""));
+    value.set_property("lastModified", Value::Number(last_modified));
+    value
+}
+
+pub fn file_class() -> Value {
+    FILE_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, args| {
+            let parts = args.first().cloned().unwrap_or_default();
+            let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
+            let options = args.get(2).cloned().unwrap_or_default();
+            let bytes = parts
+                .iter()
+                .flat_map(|part| blob_part_bytes(&part))
+                .collect::<Vec<_>>();
+            let type_name = options.get_property("type").to_js_string();
+            let last_modified = options.get_property("lastModified");
+            file_value(
+                bytes,
+                type_name,
+                name,
+                if last_modified.is_undefined() {
+                    now_milliseconds()
+                } else {
+                    last_modified.to_number()
+                },
+            )
+        });
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in [
+            "lastModified",
+            "lastModifiedDate",
+            "name",
+            "webkitRelativePath",
+        ] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        crate::class::set_prototype_of(&prototype, &blob_class().get_property("prototype"));
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
 // ── atob / btoa ────────────────────────────────────────────────────────
 
-/// Minimal `TextDecoder` constructor used by generated browser code.
-/// Typed arrays are represented as arrays of numeric elements, so UTF-16
-/// decoding consumes those values directly as code units.
 pub fn text_decoder_class() -> Value {
-    Value::function(|_this, args| {
-        let encoding = args
-            .first()
-            .cloned()
-            .unwrap_or_else(|| Value::string("utf-8"))
-            .to_js_string()
-            .to_ascii_lowercase()
-            .replace('_', "-");
-        let decode_encoding = encoding.clone();
-        Value::object(HashMap::from([
-            ("encoding".to_string(), Value::string(&encoding)),
-            (
-                "decode".to_string(),
-                Value::function(move |_this, args| {
-                    let input = args.first().cloned().unwrap_or(Value::Undefined);
-                    let numbers: Vec<u16> =
-                        input.iter().map(|value| value.to_number() as u16).collect();
-                    if decode_encoding.contains("utf-16") {
-                        Value::String(String::from_utf16_lossy(&numbers))
-                    } else {
-                        let bytes: Vec<u8> = numbers.into_iter().map(|value| value as u8).collect();
-                        Value::String(String::from_utf8_lossy(&bytes).into_owned())
+    TEXT_DECODER_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, args| {
+            let label = args.first().cloned().unwrap_or(Value::Undefined);
+            let encoding = if label.is_undefined() {
+                "utf-8".to_string()
+            } else {
+                match label
+                    .to_js_string()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .replace('_', "-")
+                    .as_str()
+                {
+                    "unicode-1-1-utf-8" | "utf8" | "utf-8" => "utf-8".to_string(),
+                    "utf-16" | "utf-16le" | "utf16le" => "utf-16le".to_string(),
+                    "utf-16be" | "utf16be" => "utf-16be".to_string(),
+                    other => {
+                        eprintln!(
+                            "[w3cos] warning: TextDecoder encoding {other:?} uses the UTF-8 \
+                             compatibility fallback"
+                        );
+                        "utf-8".to_string()
                     }
-                }),
-            ),
-        ]))
+                }
+            };
+            let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+            let fatal = options.get_property("fatal").to_bool();
+            let ignore_bom = options.get_property("ignoreBOM").to_bool();
+            let decode_encoding = encoding.clone();
+            let state = Rc::new(RefCell::new(DecoderStreamState::default()));
+            let value = Value::object(HashMap::from([
+                ("encoding".to_string(), Value::string(&encoding)),
+                ("fatal".to_string(), Value::Bool(fatal)),
+                ("ignoreBOM".to_string(), Value::Bool(ignore_bom)),
+                (
+                    "decode".to_string(),
+                    Value::function(move |_this, args| {
+                        let input = args.first().cloned().unwrap_or(Value::Undefined);
+                        let decode_options = args.get(1).cloned().unwrap_or(Value::Undefined);
+                        let stream = decode_options.get_property("stream").to_bool();
+                        if decode_encoding.starts_with("utf-16")
+                            && !stream
+                            && !crate::binary::is_typed_array(&input)
+                        {
+                            let units: Vec<u16> =
+                                input.iter().map(|value| value.to_number() as u16).collect();
+                            return match String::from_utf16(&units) {
+                                Ok(text) => Value::String(text),
+                                Err(_) if fatal => {
+                                    crate::throw_value(Value::object(HashMap::from([
+                                        ("name".into(), Value::string("TypeError")),
+                                        (
+                                            "message".into(),
+                                            Value::string("The encoded data was not valid UTF-16"),
+                                        ),
+                                    ])))
+                                }
+                                Err(_) => Value::String(String::from_utf16_lossy(&units)),
+                            };
+                        }
+                        let bytes = crate::binary::bytes_of(&input).unwrap_or_else(|| {
+                            input.iter().map(|value| value.to_number() as u8).collect()
+                        });
+                        match decode_incremental(
+                            &decode_encoding,
+                            fatal,
+                            ignore_bom,
+                            &mut state.borrow_mut(),
+                            bytes,
+                            stream,
+                        ) {
+                            Ok(text) => Value::String(text),
+                            Err(message) => crate::throw_value(Value::object(HashMap::from([
+                                ("name".into(), Value::string("TypeError")),
+                                ("message".into(), Value::string(&message)),
+                            ]))),
+                        }
+                    }),
+                ),
+            ]));
+            crate::class::set_prototype_of(&value, &text_decoder_class().get_property("prototype"));
+            value
+        });
+        class.set_property("name", Value::string("TextDecoder"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property("decode", Value::function(|_, _| Value::Undefined));
+        for property in ["encoding", "fatal", "ignoreBOM"] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
     })
+}
+
+struct DecoderStreamState {
+    pending: Vec<u8>,
+    at_start: bool,
+}
+
+impl Default for DecoderStreamState {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            at_start: true,
+        }
+    }
+}
+
+fn decode_incremental(
+    encoding: &str,
+    fatal: bool,
+    ignore_bom: bool,
+    state: &mut DecoderStreamState,
+    bytes: Vec<u8>,
+    stream: bool,
+) -> Result<String, String> {
+    state.pending.extend(bytes);
+    let mut input = std::mem::take(&mut state.pending);
+
+    if state.at_start {
+        let bom: &[u8] = match encoding {
+            "utf-8" => &[0xef, 0xbb, 0xbf],
+            "utf-16le" => &[0xff, 0xfe],
+            "utf-16be" => &[0xfe, 0xff],
+            _ => &[],
+        };
+        if !ignore_bom && stream && input.len() < bom.len() && bom.starts_with(&input) {
+            state.pending = input;
+            return Ok(String::new());
+        }
+        if !ignore_bom && !bom.is_empty() && input.starts_with(bom) {
+            input.drain(..bom.len());
+        }
+        state.at_start = false;
+    }
+
+    let result = if encoding == "utf-8" {
+        if stream {
+            let incomplete = utf8_incomplete_suffix_len(&input);
+            if incomplete > 0 {
+                state.pending = input.split_off(input.len() - incomplete);
+            }
+        }
+        match String::from_utf8(input) {
+            Ok(text) => Ok(text),
+            Err(error) if fatal => Err(format!(
+                "The encoded data was not valid UTF-8 at byte {}",
+                error.utf8_error().valid_up_to()
+            )),
+            Err(error) => Ok(String::from_utf8_lossy(error.as_bytes()).into_owned()),
+        }
+    } else {
+        if stream && input.len() % 2 != 0 {
+            state.pending.insert(0, input.pop().unwrap_or_default());
+        }
+        let mut units = input
+            .chunks(2)
+            .map(|chunk| {
+                if chunk.len() < 2 {
+                    0xfffd
+                } else if encoding == "utf-16be" {
+                    u16::from_be_bytes([chunk[0], chunk[1]])
+                } else {
+                    u16::from_le_bytes([chunk[0], chunk[1]])
+                }
+            })
+            .collect::<Vec<_>>();
+        if stream
+            && units
+                .last()
+                .is_some_and(|unit| (0xd800..=0xdbff).contains(unit))
+        {
+            units.pop();
+            let split = input.len() - 2;
+            state.pending.splice(0..0, input[split..].iter().copied());
+        }
+        match String::from_utf16(&units) {
+            Ok(text) => Ok(text),
+            Err(_) if fatal => Err("The encoded data was not valid UTF-16".into()),
+            Err(_) => Ok(String::from_utf16_lossy(&units)),
+        }
+    };
+
+    if !stream || result.is_err() {
+        state.pending.clear();
+        state.at_start = true;
+    }
+    result
+}
+
+fn utf8_incomplete_suffix_len(bytes: &[u8]) -> usize {
+    let Some(mut index) = bytes.len().checked_sub(1) else {
+        return 0;
+    };
+    while index > 0 && bytes[index] & 0xc0 == 0x80 {
+        index -= 1;
+    }
+    let first = bytes[index];
+    let expected = match first {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return 0,
+    };
+    let available = bytes.len() - index;
+    (available < expected).then_some(available).unwrap_or(0)
 }
 
 /// Compact `Date` constructor used by the native JavaScript runtime. Date
@@ -122,9 +689,10 @@ fn now_milliseconds() -> f64 {
 
 /// Compact `Intl` implementation for the native ESM runtime.
 ///
-/// The first compatibility tier intentionally covers the locale-sensitive
-/// formatting used by native applications. Unsupported timezones fail
-/// deterministically instead of silently formatting in the host timezone.
+/// The first compatibility tier intentionally covers selected locale-sensitive
+/// formatting used by native applications. Unsupported locales fall back to
+/// `en-US`; unsupported timezones fail deterministically instead of silently
+/// formatting in the host timezone.
 pub fn intl_value() -> Value {
     Value::object(HashMap::from([
         ("NumberFormat".into(), number_format_class()),
@@ -140,9 +708,20 @@ fn number_format_class() -> Value {
         let currency = string_option(&options, "currency");
         let currency_display =
             string_option(&options, "currencyDisplay").unwrap_or_else(|| "symbol".into());
-        let default_fraction_digits = if style == "currency" { 2 } else { 3 };
-        let minimum_fraction_digits = usize_option(&options, "minimumFractionDigits")
-            .unwrap_or(if style == "currency" { 2 } else { 0 });
+        let default_fraction_digits = if style == "currency" {
+            currency
+                .as_deref()
+                .map(currency_fraction_digits)
+                .unwrap_or(2)
+        } else {
+            3
+        };
+        let minimum_fraction_digits =
+            usize_option(&options, "minimumFractionDigits").unwrap_or(if style == "currency" {
+                default_fraction_digits
+            } else {
+                0
+            });
         let maximum_fraction_digits = usize_option(&options, "maximumFractionDigits")
             .unwrap_or(default_fraction_digits)
             .max(minimum_fraction_digits)
@@ -200,7 +779,7 @@ fn date_time_format_class() -> Value {
         let locale = canonical_locale(args.first());
         let options = args.get(1).cloned().unwrap_or(Value::Undefined);
         let time_zone = string_option(&options, "timeZone").unwrap_or_else(|| "UTC".into());
-        let offset_minutes = time_zone_offset_minutes(&time_zone).unwrap_or_else(|| {
+        let time_zone_spec = parse_time_zone(&time_zone).unwrap_or_else(|| {
             crate::throw_value(js_error(&format!(
                 "RangeError: unsupported time zone: {time_zone}"
             )))
@@ -221,7 +800,7 @@ fn date_time_format_class() -> Value {
             }
             Value::string(&format_date_time(
                 milliseconds,
-                offset_minutes,
+                time_zone_spec.offset_minutes(milliseconds),
                 &locale_for_format,
                 date_style_for_format.as_deref(),
                 time_style_for_format.as_deref(),
@@ -248,10 +827,18 @@ fn canonical_locale(value: Option<&Value>) -> String {
         .filter(|value| !value.is_nullish())
         .map(Value::to_js_string)
         .unwrap_or_else(|| "en-US".into());
-    if locale.to_ascii_lowercase().starts_with("zh") {
-        "zh-CN".into()
-    } else {
-        "en-US".into()
+    match locale
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "zh" => "zh-CN".into(),
+        "de" => "de-DE".into(),
+        "fr" => "fr-FR".into(),
+        "ja" => "ja-JP".into(),
+        _ => "en-US".into(),
     }
 }
 
@@ -305,13 +892,14 @@ fn format_number(
         .split_once('.')
         .map(|(integer, fraction)| (integer, Some(fraction)))
         .unwrap_or((&decimal, None));
+    let profile = locale_profile(locale);
     let integer = if use_grouping {
-        group_decimal(integer)
+        group_decimal(integer, profile.grouping_separator)
     } else {
         integer.to_string()
     };
     let formatted = if let Some(fraction) = fraction {
-        format!("{integer}.{fraction}")
+        format!("{integer}{}{fraction}", profile.decimal_separator)
     } else {
         integer
     };
@@ -322,7 +910,9 @@ fn format_number(
             "name" => currency_name(&currency, locale).into(),
             _ => currency_symbol(&currency).unwrap_or(&currency).into(),
         };
-        if currency_display == "code" || currency_display == "name" {
+        if profile.currency_suffix {
+            format!("{formatted} {display}")
+        } else if currency_display == "code" || currency_display == "name" {
             format!("{display} {formatted}")
         } else {
             format!("{display}{formatted}")
@@ -337,15 +927,49 @@ fn format_number(
     }
 }
 
-fn group_decimal(integer: &str) -> String {
+fn group_decimal(integer: &str, separator: char) -> String {
     let mut grouped = String::with_capacity(integer.len() + integer.len() / 3);
     for (index, character) in integer.chars().enumerate() {
         if index > 0 && (integer.len() - index) % 3 == 0 {
-            grouped.push(',');
+            grouped.push(separator);
         }
         grouped.push(character);
     }
     grouped
+}
+
+#[derive(Clone, Copy)]
+struct LocaleProfile {
+    decimal_separator: char,
+    grouping_separator: char,
+    currency_suffix: bool,
+}
+
+fn locale_profile(locale: &str) -> LocaleProfile {
+    match locale {
+        "de-DE" => LocaleProfile {
+            decimal_separator: ',',
+            grouping_separator: '.',
+            currency_suffix: true,
+        },
+        "fr-FR" => LocaleProfile {
+            decimal_separator: ',',
+            grouping_separator: '\u{202f}',
+            currency_suffix: true,
+        },
+        _ => LocaleProfile {
+            decimal_separator: '.',
+            grouping_separator: ',',
+            currency_suffix: false,
+        },
+    }
+}
+
+fn currency_fraction_digits(currency: &str) -> usize {
+    match currency.to_ascii_uppercase().as_str() {
+        "JPY" | "KRW" => 0,
+        _ => 2,
+    }
 }
 
 fn currency_symbol(currency: &str) -> Option<&'static str> {
@@ -359,13 +983,22 @@ fn currency_symbol(currency: &str) -> Option<&'static str> {
 }
 
 fn currency_name(currency: &str, locale: &str) -> &'static str {
-    match (currency, locale.starts_with("zh")) {
-        ("CNY", true) => "人民币",
-        ("USD", true) => "美元",
-        ("EUR", true) => "欧元",
-        ("CNY", false) => "Chinese yuan",
-        ("USD", false) => "US dollars",
-        ("EUR", false) => "euros",
+    match (currency, locale) {
+        ("CNY", "zh-CN") => "人民币",
+        ("USD", "zh-CN") => "美元",
+        ("EUR", "zh-CN") => "欧元",
+        ("CNY", "de-DE") => "Chinesische Yuan",
+        ("USD", "de-DE") => "US-Dollar",
+        ("EUR", "de-DE") => "Euro",
+        ("CNY", "fr-FR") => "yuans renminbi chinois",
+        ("USD", "fr-FR") => "dollars des États-Unis",
+        ("EUR", "fr-FR") => "euros",
+        ("CNY", "ja-JP") => "中国人民元",
+        ("USD", "ja-JP") => "米ドル",
+        ("EUR", "ja-JP") => "ユーロ",
+        ("CNY", _) => "Chinese yuan",
+        ("USD", _) => "US dollars",
+        ("EUR", _) => "euros",
         _ => "currency",
     }
 }
@@ -378,16 +1011,41 @@ fn date_milliseconds(value: &Value) -> f64 {
     }
 }
 
-fn time_zone_offset_minutes(time_zone: &str) -> Option<i64> {
-    match time_zone {
-        "UTC" | "Etc/UTC" | "GMT" => Some(0),
-        "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Singapore" => Some(8 * 60),
-        "Asia/Tokyo" => Some(9 * 60),
-        _ => parse_fixed_offset(time_zone),
+#[derive(Clone, Copy)]
+enum TimeZoneSpec {
+    Fixed(i64),
+    Iana(chrono_tz::Tz),
+}
+
+impl TimeZoneSpec {
+    fn offset_minutes(self, milliseconds: f64) -> i64 {
+        match self {
+            Self::Fixed(minutes) => minutes,
+            Self::Iana(time_zone) => chrono::Utc
+                .timestamp_millis_opt(milliseconds.floor() as i64)
+                .single()
+                .map(|instant| {
+                    time_zone
+                        .offset_from_utc_datetime(&instant.naive_utc())
+                        .fix()
+                        .local_minus_utc() as i64
+                        / 60
+                })
+                .unwrap_or(0),
+        }
     }
 }
 
+fn parse_time_zone(time_zone: &str) -> Option<TimeZoneSpec> {
+    parse_fixed_offset(time_zone)
+        .map(TimeZoneSpec::Fixed)
+        .or_else(|| time_zone.parse().ok().map(TimeZoneSpec::Iana))
+}
+
 fn parse_fixed_offset(value: &str) -> Option<i64> {
+    if matches!(value, "UTC" | "Etc/UTC" | "GMT") {
+        return Some(0);
+    }
     let value = value
         .strip_prefix("UTC")
         .or_else(|| value.strip_prefix("GMT"))?;
@@ -425,15 +1083,25 @@ fn format_date_time(
     let include_date = date_style.is_some() || time_style.is_none();
     let include_time = time_style.is_some();
     let long_time = matches!(time_style, Some("medium" | "long" | "full"));
-    let date = if locale.starts_with("zh") {
-        format!("{year}年{month}月{day}日")
-    } else {
-        const MONTHS: [&str; 12] = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
-        format!("{} {day}, {year}", MONTHS[(month - 1) as usize])
+    let date = match locale {
+        "zh-CN" => format!("{year}年{month}月{day}日"),
+        "de-DE" => format!("{day:02}.{month:02}.{year}"),
+        "fr-FR" => {
+            const MONTHS: [&str; 12] = [
+                "janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.",
+                "nov.", "déc.",
+            ];
+            format!("{day} {} {year}", MONTHS[(month - 1) as usize])
+        }
+        "ja-JP" => format!("{year}/{month:02}/{day:02}"),
+        _ => {
+            const MONTHS: [&str; 12] = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            format!("{} {day}, {year}", MONTHS[(month - 1) as usize])
+        }
     };
-    let time = if locale.starts_with("zh") {
+    let time = if locale != "en-US" {
         if long_time {
             format!("{hour:02}:{minute:02}:{second:02}")
         } else {
@@ -452,7 +1120,7 @@ fn format_date_time(
         }
     };
     match (include_date, include_time) {
-        (true, true) if locale.starts_with("zh") => format!("{date} {time}"),
+        (true, true) if matches!(locale, "zh-CN" | "ja-JP") => format!("{date} {time}"),
         (true, true) => format!("{date}, {time}"),
         (true, false) => date,
         (false, true) => time,
@@ -595,57 +1263,288 @@ pub fn btoa(args: Vec<Value>) -> Value {
 
 // ── structuredClone ────────────────────────────────────────────────────
 
-/// `structuredClone(value)` — deep clone; shared substructures stay shared
-/// in the clone, cycles throw.
+/// Registers an opaque host object as transferable without exposing
+/// forgeable JavaScript properties. `prepare` returns the replacement object;
+/// `finalize` detaches the source after the complete clone succeeds.
+pub fn register_host_transferable(value: &Value, prepare: Value, finalize: Value) {
+    let Some(pointer) = heap_pointer(value) else {
+        return;
+    };
+    HOST_TRANSFERABLES.with(|items| {
+        items.borrow_mut().insert(pointer, (prepare, finalize));
+    });
+}
+
+/// Removes a previously registered host transferable wrapper.
+pub fn unregister_host_transferable(value: &Value) {
+    if let Some(pointer) = heap_pointer(value) {
+        HOST_TRANSFERABLES.with(|items| {
+            items.borrow_mut().remove(&pointer);
+        });
+    }
+}
+
+fn host_transfer_hooks(value: &Value) -> Option<(Value, Value)> {
+    let pointer = heap_pointer(value)?;
+    HOST_TRANSFERABLES.with(|items| items.borrow().get(&pointer).cloned())
+}
+
+/// `structuredClone(value)` — deep clone with shared references and cycles.
 pub fn structured_clone(args: Vec<Value>) -> Value {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let mut clones: HashMap<usize, CloneSlot> = HashMap::new();
-    clone_value(&value, &mut clones)
-}
-
-enum CloneSlot {
-    /// Currently being cloned — hitting it again means a cycle.
-    InProgress,
-    Done(Value),
-}
-
-fn clone_value(value: &Value, clones: &mut HashMap<usize, CloneSlot>) -> Value {
-    let pointer = match value {
-        Value::Array(items) => Rc::as_ptr(items) as usize,
-        Value::Object(object) => Rc::as_ptr(object) as usize,
-        // Primitives copy; functions clone by reference (spec exclusion).
-        _ => return value.clone(),
-    };
-    match clones.get(&pointer) {
-        Some(CloneSlot::InProgress) => {
-            crate::throw_value(js_error("DataCloneError: cyclic object value"))
+    let transfer = args
+        .get(1)
+        .map(|options| options.get_property("transfer").iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for (index, item) in transfer.iter().enumerate() {
+        let custom_transfer = host_transfer_hooks(item).is_some();
+        if !crate::binary::is_transferable_array_buffer(item) && !custom_transfer {
+            crate::throw_value(js_error(
+                "DataCloneError: transfer list item is not transferable",
+            ));
         }
-        Some(CloneSlot::Done(cloned)) => return cloned.clone(),
-        None => {}
+        if transfer[..index]
+            .iter()
+            .any(|existing| existing.strict_eq(item))
+        {
+            crate::throw_value(js_error(
+                "DataCloneError: duplicate transferable in transfer list",
+            ));
+        }
     }
-    clones.insert(pointer, CloneSlot::InProgress);
-    let cloned = match value {
+    let mut clones: HashMap<usize, Value> = HashMap::new();
+    let mut custom_finalizers = Vec::new();
+    for item in &transfer {
+        if crate::binary::is_transferable_array_buffer(item) {
+            continue;
+        }
+        let (prepare, finalize) =
+            host_transfer_hooks(item).expect("custom transferable validated above");
+        let transferred = prepare.call(item.clone(), vec![]);
+        let pointer = heap_pointer(item).expect("custom transferables are objects");
+        clones.insert(pointer, transferred);
+        custom_finalizers.push((item.clone(), finalize));
+    }
+    let cloned = clone_value(&value, &mut clones);
+    for item in transfer {
+        if crate::binary::is_transferable_array_buffer(&item) {
+            crate::binary::detach_array_buffer(&item);
+        }
+    }
+    for (item, finalize) in custom_finalizers {
+        finalize.call(item, vec![]);
+    }
+    cloned
+}
+
+fn heap_pointer(value: &Value) -> Option<usize> {
+    match value {
+        Value::Array(items) => Some(Rc::as_ptr(items) as usize),
+        Value::Object(object) => Some(Rc::as_ptr(object) as usize),
+        _ => None,
+    }
+}
+
+fn clone_value(value: &Value, clones: &mut HashMap<usize, Value>) -> Value {
+    if matches!(value, Value::Function(_)) {
+        crate::throw_value(js_error("DataCloneError: functions cannot be cloned"));
+    }
+    let pointer = match heap_pointer(value) {
+        Some(pointer) => pointer,
+        // Primitives copy directly.
+        None => return value.clone(),
+    };
+    if let Some(cloned) = clones.get(&pointer) {
+        return cloned.clone();
+    }
+    if let Some(bigint) = crate::bigint::get(value) {
+        let cloned = crate::bigint::parse(&bigint.to_string());
+        clones.insert(pointer, cloned.clone());
+        return cloned;
+    }
+    if let Some(descriptor) = crate::binary::clone_descriptor(value) {
+        let cloned = match descriptor {
+            crate::binary::BinaryCloneDescriptor::ArrayBuffer { shared } => {
+                crate::binary::clone_array_buffer(value, shared)
+            }
+            crate::binary::BinaryCloneDescriptor::TypedArray {
+                name,
+                buffer,
+                offset,
+                length,
+            } => {
+                let buffer = clone_value(&buffer, clones);
+                crate::class::construct(
+                    &crate::binary::typed_array_class(name),
+                    vec![
+                        buffer,
+                        Value::Number(offset as f64),
+                        Value::Number(length as f64),
+                    ],
+                )
+            }
+            crate::binary::BinaryCloneDescriptor::DataView {
+                buffer,
+                offset,
+                length,
+            } => {
+                let buffer = clone_value(&buffer, clones);
+                crate::class::construct(
+                    &crate::binary::data_view_class(),
+                    vec![
+                        buffer,
+                        Value::Number(offset as f64),
+                        Value::Number(length as f64),
+                    ],
+                )
+            }
+        };
+        clones.insert(pointer, cloned.clone());
+        return cloned;
+    }
+
+    match value {
         Value::Array(items) => {
-            let children = items
-                .borrow()
-                .iter()
-                .map(|item| clone_value(item, clones))
-                .collect();
-            Value::array(children)
+            let cloned = Value::array(Vec::new());
+            clones.insert(pointer, cloned.clone());
+            let children = items.borrow().clone();
+            for (index, item) in children.iter().enumerate() {
+                cloned.set_property(&index.to_string(), clone_value(item, clones));
+            }
+            cloned
         }
         Value::Object(object) => {
-            let mut properties = HashMap::new();
+            let milliseconds = value.get_property("__w3cos_date_milliseconds");
+            if !milliseconds.is_undefined() {
+                let cloned = date_value(milliseconds.to_number());
+                clones.insert(pointer, cloned.clone());
+                return cloned;
+            }
+            if let Some(name) = structured_error_name(value) {
+                let cloned = Value::object(HashMap::from([
+                    ("name".to_string(), Value::string(name)),
+                    ("message".to_string(), value.get_property("message")),
+                    ("stack".to_string(), value.get_property("stack")),
+                ]));
+                crate::class::set_prototype_of(
+                    &cloned,
+                    &crate::error_class(name).get_property("prototype"),
+                );
+                clones.insert(pointer, cloned.clone());
+                let cause = value.get_property("cause");
+                if !cause.is_undefined() {
+                    cloned.set_property("cause", clone_value(&cause, clones));
+                }
+                if name == "AggregateError" {
+                    cloned
+                        .set_property("errors", clone_value(&value.get_property("errors"), clones));
+                }
+                return cloned;
+            }
+            if crate::class::instance_of(value, &dom_exception_class()) {
+                let cloned = dom_exception_instance(
+                    &value.get_property("message").to_js_string(),
+                    &value.get_property("name").to_js_string(),
+                );
+                clones.insert(pointer, cloned.clone());
+                cloned.set_property("stack", value.get_property("stack"));
+                return cloned;
+            }
+            if crate::class::instance_of(value, &image_data_class()) {
+                let cloned_data = clone_value(&value.get_property("data"), clones);
+                let cloned = image_data_value(
+                    cloned_data,
+                    value.get_property("width").to_u32(),
+                    value.get_property("height").to_u32(),
+                    &value.get_property("colorSpace").to_js_string(),
+                );
+                clones.insert(pointer, cloned.clone());
+                return cloned;
+            }
+            if crate::class::instance_of(value, &file_class()) {
+                let state = blob_state(value).expect("File instances retain Blob state");
+                let cloned = file_value(
+                    state.bytes.clone(),
+                    state.type_name.clone(),
+                    value.get_property("name").to_js_string(),
+                    value.get_property("lastModified").to_number(),
+                );
+                clones.insert(pointer, cloned.clone());
+                return cloned;
+            }
+            if crate::class::instance_of(value, &blob_class()) {
+                let state = blob_state(value).expect("Blob instances retain state");
+                let cloned = make_blob(
+                    state.bytes.clone(),
+                    state.type_name.clone(),
+                    blob_class().get_property("prototype"),
+                );
+                clones.insert(pointer, cloned.clone());
+                return cloned;
+            }
+            if let Some((source, flags)) = crate::regexp::parts(value) {
+                let cloned = crate::regexp::create(&source, &flags);
+                cloned.set_property("lastIndex", value.get_property("lastIndex"));
+                clones.insert(pointer, cloned.clone());
+                return cloned;
+            }
+            if let Some(snapshot) = crate::collections::collection_snapshot(value) {
+                let cloned = match &snapshot {
+                    crate::collections::CollectionSnapshot::Map(_) => {
+                        crate::class::construct(&crate::collections::map_class(), vec![])
+                    }
+                    crate::collections::CollectionSnapshot::Set(_) => {
+                        crate::class::construct(&crate::collections::set_class(), vec![])
+                    }
+                };
+                clones.insert(pointer, cloned.clone());
+                match snapshot {
+                    crate::collections::CollectionSnapshot::Map(entries) => {
+                        for (key, item) in entries {
+                            cloned.call_method(
+                                "set",
+                                vec![clone_value(&key, clones), clone_value(&item, clones)],
+                            );
+                        }
+                    }
+                    crate::collections::CollectionSnapshot::Set(values) => {
+                        for item in values {
+                            cloned.call_method("add", vec![clone_value(&item, clones)]);
+                        }
+                    }
+                }
+                return cloned;
+            }
+
+            let cloned = Value::object(HashMap::new());
+            clones.insert(pointer, cloned.clone());
             let keys = object.borrow().keys();
             for key in keys {
                 let child = object.borrow().get_direct(&key);
-                properties.insert(key, clone_value(&child, clones));
+                cloned.set_property(&key, clone_value(&child, clones));
             }
-            Value::object(properties)
+            cloned
         }
         _ => unreachable!(),
-    };
-    clones.insert(pointer, CloneSlot::Done(cloned.clone()));
-    cloned
+    }
+}
+
+/// Returns the standard Error subclass represented by a runtime value.
+///
+/// Storage/message codecs use this to retain Error prototype identity.
+pub fn structured_error_name(value: &Value) -> Option<&'static str> {
+    [
+        "AggregateError",
+        "EvalError",
+        "RangeError",
+        "ReferenceError",
+        "SyntaxError",
+        "TypeError",
+        "URIError",
+        "Error",
+    ]
+    .into_iter()
+    .find(|name| crate::class::instance_of(value, &crate::error_class(name)))
 }
 
 // ── Percent encoding (application/x-www-form-urlencoded) ───────────────
@@ -701,6 +1600,540 @@ fn percent_decode(text: &str) -> String {
 // ── URLSearchParams ────────────────────────────────────────────────────
 
 type PairList = Rc<RefCell<Vec<(String, String)>>>;
+
+thread_local! {
+    static URL_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static URL_SEARCH_PARAMS_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static URL_PATTERN_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static OBJECT_URL_SEQUENCE: Cell<u64> = const { Cell::new(1) };
+    static OBJECT_URLS: RefCell<HashMap<String, Rc<BlobState>>> = RefCell::new(HashMap::new());
+}
+
+fn web_constructor_class(
+    slot: &'static std::thread::LocalKey<RefCell<Option<Value>>>,
+    name: &'static str,
+    construct: fn(Vec<Value>) -> Value,
+) -> Value {
+    slot.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(move |this, args| {
+            if this.is_undefined() {
+                crate::throw_value(js_error(&format!(
+                    "TypeError: Class constructor {name} cannot be invoked without 'new'"
+                )));
+            }
+            construct(args)
+        });
+        class.set_property("name", Value::string(name));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+pub fn url_class() -> Value {
+    let class = web_constructor_class(&URL_CLASS, "URL", url_new);
+    let prototype = class.get_property("prototype");
+    for property in [
+        "hash",
+        "host",
+        "hostname",
+        "href",
+        "origin",
+        "password",
+        "pathname",
+        "port",
+        "protocol",
+        "search",
+        "searchParams",
+        "toJSON",
+        "toString",
+        "username",
+    ] {
+        prototype.set_property(property, Value::Undefined);
+    }
+    if class.get_property("canParse").is_undefined() {
+        class.set_property(
+            "canParse",
+            Value::function(|_, args| Value::Bool(url_parts_from_args(&args).is_ok())),
+        );
+        class.set_property(
+            "parse",
+            Value::function(|_, args| match url_parts_from_args(&args) {
+                Ok(parts) => url_value(parts),
+                Err(_) => Value::Null,
+            }),
+        );
+        class.set_property(
+            "createObjectURL",
+            Value::function(|_, args| {
+                let source = args.first().cloned().unwrap_or(Value::Undefined);
+                let Some(state) = blob_state(&source) else {
+                    crate::throw_value(Value::object(HashMap::from([
+                        ("name".into(), Value::string("TypeError")),
+                        (
+                            "message".into(),
+                            Value::string("URL.createObjectURL requires a Blob or File"),
+                        ),
+                    ])));
+                };
+                let id = OBJECT_URL_SEQUENCE.with(|sequence| {
+                    let id = sequence.get();
+                    sequence.set(id.saturating_add(1));
+                    id
+                });
+                let url = format!("blob:w3cos/{id}");
+                OBJECT_URLS.with(|urls| {
+                    urls.borrow_mut().insert(url.clone(), state);
+                });
+                Value::string(&url)
+            }),
+        );
+        class.set_property(
+            "revokeObjectURL",
+            Value::function(|_, args| {
+                let url = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Undefined)
+                    .to_js_string();
+                OBJECT_URLS.with(|urls| {
+                    urls.borrow_mut().remove(&url);
+                });
+                Value::Undefined
+            }),
+        );
+    }
+    class
+}
+
+pub fn url_search_params_class() -> Value {
+    let class = web_constructor_class(
+        &URL_SEARCH_PARAMS_CLASS,
+        "URLSearchParams",
+        url_search_params_new,
+    );
+    let prototype = class.get_property("prototype");
+    for member in [
+        "append", "delete", "entries", "forEach", "get", "getAll", "has", "keys", "set", "size",
+        "sort", "toString", "values",
+    ] {
+        prototype.set_property(member, Value::Undefined);
+    }
+    class
+}
+
+const URL_PATTERN_COMPONENTS: [&str; 8] = [
+    "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash",
+];
+static URL_PATTERN_COMPLEX_WARNING: Once = Once::new();
+
+#[derive(Clone)]
+struct UrlPatternParts {
+    values: HashMap<String, String>,
+    ignore_case: bool,
+}
+
+fn pattern_value(parts: &UrlPatternParts, name: &str) -> String {
+    parts
+        .values
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| "*".to_string())
+}
+
+fn split_pattern_suffix(input: &str) -> (&str, String, String) {
+    let (before_hash, hash) = match input.split_once('#') {
+        Some((before, value)) => (before, value.to_string()),
+        None => (input, "*".to_string()),
+    };
+    let (before_search, search) = match before_hash.split_once('?') {
+        Some((before, value)) => (before, value.to_string()),
+        None => (before_hash, "*".to_string()),
+    };
+    (before_search, search, hash)
+}
+
+fn parse_url_pattern_string(input: &str, base: Option<&str>) -> Result<UrlPatternParts, String> {
+    let mut values = HashMap::new();
+    let (main, search, hash) = split_pattern_suffix(input);
+    values.insert("search".into(), search);
+    values.insert("hash".into(), hash);
+
+    if let Some((protocol, after_scheme)) = main.split_once("://") {
+        values.insert("protocol".into(), protocol.trim_end_matches(':').into());
+        let (authority, pathname) = split_authority(after_scheme);
+        let host_port = match authority.rsplit_once('@') {
+            Some((userinfo, host_port)) => {
+                let (username, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+                values.insert("username".into(), username.into());
+                values.insert("password".into(), password.into());
+                host_port
+            }
+            None => authority,
+        };
+        let (hostname, port) = host_port
+            .rsplit_once(':')
+            .filter(|(_, port)| !port.contains(']'))
+            .unwrap_or((host_port, ""));
+        values.insert("hostname".into(), hostname.into());
+        values.insert("port".into(), port.into());
+        values.insert(
+            "pathname".into(),
+            if pathname.is_empty() {
+                "/".into()
+            } else {
+                pathname.into()
+            },
+        );
+    } else {
+        let base = base.ok_or_else(|| {
+            "A relative URLPattern string requires an absolute baseURL".to_string()
+        })?;
+        let base_parts = parse_url(base, None)?;
+        values.insert(
+            "protocol".into(),
+            base_parts.protocol.trim_end_matches(':').into(),
+        );
+        values.insert("username".into(), base_parts.username);
+        values.insert("password".into(), base_parts.password);
+        values.insert("hostname".into(), base_parts.hostname);
+        values.insert("port".into(), base_parts.port);
+        let pathname = if main.starts_with('/') {
+            main.to_string()
+        } else {
+            let base_dir = base_parts
+                .pathname
+                .rfind('/')
+                .map(|index| &base_parts.pathname[..=index])
+                .unwrap_or("/");
+            format!("{base_dir}{main}")
+        };
+        values.insert("pathname".into(), pathname);
+    }
+    for name in URL_PATTERN_COMPONENTS {
+        values.entry(name.into()).or_insert_with(|| "*".into());
+    }
+    Ok(UrlPatternParts {
+        values,
+        ignore_case: false,
+    })
+}
+
+fn url_pattern_parts(args: &[Value]) -> Result<UrlPatternParts, String> {
+    let input = args.first().cloned().unwrap_or(Value::Undefined);
+    let second = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let (mut parts, options) = if input.is_object() {
+        let mut values = HashMap::new();
+        for name in URL_PATTERN_COMPONENTS {
+            let value = input.get_property(name);
+            values.insert(
+                name.into(),
+                if value.is_undefined() {
+                    "*".into()
+                } else {
+                    value.to_js_string()
+                },
+            );
+        }
+        let base = input.get_property("baseURL");
+        if !base.is_undefined() {
+            let base = parse_url(&base.to_js_string(), None)?;
+            for (name, value) in [
+                ("protocol", base.protocol.trim_end_matches(':').to_string()),
+                ("username", base.username),
+                ("password", base.password),
+                ("hostname", base.hostname),
+                ("port", base.port),
+                ("pathname", base.pathname),
+                ("search", base.search.trim_start_matches('?').to_string()),
+                ("hash", base.hash.trim_start_matches('#').to_string()),
+            ] {
+                if pattern_value(
+                    &UrlPatternParts {
+                        values: values.clone(),
+                        ignore_case: false,
+                    },
+                    name,
+                ) == "*"
+                {
+                    values.insert(name.into(), value);
+                }
+            }
+        }
+        (
+            UrlPatternParts {
+                values,
+                ignore_case: false,
+            },
+            second,
+        )
+    } else {
+        let base = if second.is_nullish() || second.is_object() {
+            None
+        } else {
+            Some(second.to_js_string())
+        };
+        (
+            parse_url_pattern_string(&input.to_js_string(), base.as_deref())?,
+            args.get(2).cloned().unwrap_or(Value::Undefined),
+        )
+    };
+    if options.is_object() {
+        parts.ignore_case = options.get_property("ignoreCase").to_bool();
+    }
+    Ok(parts)
+}
+
+fn component_regex(
+    pattern: &str,
+    component: &str,
+    ignore_case: bool,
+) -> Result<regex::Regex, String> {
+    let mut source = String::from("^");
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut index = 0;
+    let mut wildcard = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '*' => {
+                source.push_str(&format!("(?P<w{wildcard}>.*)"));
+                wildcard += 1;
+                index += 1;
+            }
+            ':' => {
+                let start = index + 1;
+                let mut end = start;
+                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                {
+                    end += 1;
+                }
+                if end == start {
+                    source.push_str("\\:");
+                    index += 1;
+                    continue;
+                }
+                let name: String = chars[start..end].iter().collect();
+                let matcher = match component {
+                    "pathname" => "[^/]+",
+                    "hostname" => "[^.]+",
+                    _ => ".+?",
+                };
+                if end < chars.len() && chars[end] == '(' {
+                    URL_PATTERN_COMPLEX_WARNING.call_once(|| {
+                        eprintln!(
+                            "[w3cos] warning: URLPattern custom regular-expression groups are \
+                             accepted as compatibility syntax but currently use the component's \
+                             default segment matcher"
+                        );
+                    });
+                    let mut depth = 1usize;
+                    end += 1;
+                    while end < chars.len() && depth > 0 {
+                        match chars[end] {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        end += 1;
+                    }
+                }
+                source.push_str(&format!("(?P<{name}>{matcher})"));
+                index = end;
+            }
+            value => {
+                source.push_str(&regex::escape(&value.to_string()));
+                index += 1;
+            }
+        }
+    }
+    source.push('$');
+    regex::RegexBuilder::new(&source)
+        .case_insensitive(ignore_case)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn input_url_pattern_parts(
+    args: &[Value],
+) -> Result<(HashMap<String, String>, Vec<Value>), String> {
+    let input = args.first().cloned().unwrap_or(Value::Undefined);
+    if input.is_object() {
+        let mut values = HashMap::new();
+        for name in URL_PATTERN_COMPONENTS {
+            let value = input.get_property(name);
+            values.insert(
+                name.into(),
+                if value.is_undefined() {
+                    String::new()
+                } else {
+                    value.to_js_string()
+                },
+            );
+        }
+        return Ok((values, vec![input]));
+    }
+    let input_string = input.to_js_string();
+    let base = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let base_parts = if base.is_nullish() {
+        None
+    } else {
+        Some(parse_url(&base.to_js_string(), None)?)
+    };
+    let parsed = parse_url(&input_string, base_parts.as_ref())?;
+    let values = HashMap::from([
+        (
+            "protocol".into(),
+            parsed.protocol.trim_end_matches(':').into(),
+        ),
+        ("username".into(), parsed.username),
+        ("password".into(), parsed.password),
+        ("hostname".into(), parsed.hostname),
+        ("port".into(), parsed.port),
+        ("pathname".into(), parsed.pathname),
+        (
+            "search".into(),
+            parsed.search.trim_start_matches('?').into(),
+        ),
+        ("hash".into(), parsed.hash.trim_start_matches('#').into()),
+    ]);
+    let mut inputs = vec![Value::string(&input_string)];
+    if !base.is_nullish() {
+        inputs.push(base);
+    }
+    Ok((values, inputs))
+}
+
+fn url_pattern_match(this: &Value, args: &[Value], include_result: bool) -> Value {
+    let (values, inputs) = match input_url_pattern_parts(args) {
+        Ok(value) => value,
+        Err(_) => {
+            return if include_result {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            };
+        }
+    };
+    let ignore_case = this.get_property("__w3cos_ignore_case").to_bool();
+    let mut component_results = HashMap::new();
+    for component in URL_PATTERN_COMPONENTS {
+        let pattern = this
+            .get_property(&format!("__w3cos_pattern_{component}"))
+            .to_js_string();
+        let regex = match component_regex(&pattern, component, ignore_case) {
+            Ok(regex) => regex,
+            Err(_) => {
+                return if include_result {
+                    Value::Null
+                } else {
+                    Value::Bool(false)
+                };
+            }
+        };
+        let input = values.get(component).cloned().unwrap_or_default();
+        let Some(captures) = regex.captures(&input) else {
+            return if include_result {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            };
+        };
+        if include_result {
+            let mut groups = HashMap::new();
+            let mut wildcard = 0usize;
+            for name in regex.capture_names().flatten() {
+                let key = name
+                    .strip_prefix('w')
+                    .map(|_| {
+                        let key = wildcard.to_string();
+                        wildcard += 1;
+                        key
+                    })
+                    .unwrap_or_else(|| name.to_string());
+                groups.insert(
+                    key,
+                    captures
+                        .name(name)
+                        .map(|value| Value::string(value.as_str()))
+                        .unwrap_or(Value::Undefined),
+                );
+            }
+            component_results.insert(
+                component.into(),
+                Value::object(HashMap::from([
+                    ("input".into(), Value::string(&input)),
+                    ("groups".into(), Value::object(groups)),
+                ])),
+            );
+        }
+    }
+    if !include_result {
+        return Value::Bool(true);
+    }
+    component_results.insert("inputs".into(), Value::array(inputs));
+    Value::object(component_results)
+}
+
+pub fn url_pattern_class() -> Value {
+    let class = web_constructor_class(&URL_PATTERN_CLASS, "URLPattern", url_pattern_new);
+    let prototype = class.get_property("prototype");
+    prototype.set_property("hasRegExpGroups", Value::Undefined);
+    if prototype.get_property("test").is_undefined() {
+        for component in URL_PATTERN_COMPONENTS {
+            // Keep the public accessor name visible to reflection while the
+            // runtime-specific getter stores the executable accessor body.
+            prototype.set_property(component, Value::Undefined);
+            prototype.set_property(
+                &format!("__w3cos_getter_{component}"),
+                Value::function(move |this, _| {
+                    this.get_property(&format!("__w3cos_pattern_{component}"))
+                }),
+            );
+        }
+        prototype.set_property(
+            "test",
+            Value::function(|this, args| url_pattern_match(&this, &args, false)),
+        );
+        prototype.set_property(
+            "exec",
+            Value::function(|this, args| url_pattern_match(&this, &args, true)),
+        );
+    }
+    class
+}
+
+pub fn url_pattern_new(args: Vec<Value>) -> Value {
+    let parts = match url_pattern_parts(&args) {
+        Ok(parts) => parts,
+        Err(message) => crate::throw_value(js_error(&format!(
+            "TypeError: Failed to construct 'URLPattern': {message}"
+        ))),
+    };
+    let instance = Value::object(HashMap::new());
+    for component in URL_PATTERN_COMPONENTS {
+        instance.set_property(
+            &format!("__w3cos_pattern_{component}"),
+            Value::string(&pattern_value(&parts, component)),
+        );
+    }
+    instance.set_property("__w3cos_ignore_case", Value::Bool(parts.ignore_case));
+    crate::class::set_prototype_of(&instance, &url_pattern_class().get_property("prototype"));
+    instance
+}
+
+/// Resolve a live object URL to its immutable Blob bytes and media type.
+pub fn object_url_resource(url: &str) -> Option<(Vec<u8>, String)> {
+    OBJECT_URLS.with(|urls| {
+        urls.borrow()
+            .get(url)
+            .map(|state| (state.bytes.clone(), state.type_name.clone()))
+    })
+}
 
 /// Parse `a=1&b=2` (leading `?` tolerated) into decoded pairs.
 fn parse_query(query: &str) -> Vec<(String, String)> {
@@ -917,6 +2350,41 @@ fn params_value(
             }),
         );
     }
+    {
+        let state = state.clone();
+        params.set_property(
+            "__w3cos_getter_size",
+            Value::function(move |_, _| Value::Number(state.borrow().len() as f64)),
+        );
+    }
+    for (name, projection) in [
+        ("keys", 0_u8),
+        ("values", 1_u8),
+        ("entries", 2_u8),
+        ("__w3cosIterableSnapshot", 2_u8),
+    ] {
+        let state = state.clone();
+        params.set_property(
+            name,
+            Value::function(move |_, _| {
+                Value::array(
+                    state
+                        .borrow()
+                        .iter()
+                        .map(|(key, value)| match projection {
+                            0 => Value::string(key),
+                            1 => Value::string(value),
+                            _ => Value::array(vec![Value::string(key), Value::string(value)]),
+                        })
+                        .collect(),
+                )
+            }),
+        );
+    }
+    crate::class::set_prototype_of(
+        &params,
+        &url_search_params_class().get_property("prototype"),
+    );
     params
 }
 
@@ -1366,12 +2834,20 @@ fn url_value(parts: UrlParts) -> Value {
     // searchParams shares the parts back: mutations rewrite `search`.
     let query_pairs = parse_query(shared.borrow().search.strip_prefix('?').unwrap_or(""));
     url.set_property("searchParams", params_value(query_pairs, Some(shared)));
+    crate::class::set_prototype_of(&url, &url_class().get_property("prototype"));
     url
 }
 
 /// `new URL(url[, base])` — minimal RFC 3986 parse; relative references
 /// resolve against `base`. Unparseable input throws a JS `TypeError`.
 pub fn url_new(args: Vec<Value>) -> Value {
+    match url_parts_from_args(&args) {
+        Ok(parts) => url_value(parts),
+        Err(message) => crate::throw_value(js_error(&format!("TypeError: Invalid URL: {message}"))),
+    }
+}
+
+fn url_parts_from_args(args: &[Value]) -> Result<UrlParts, String> {
     let input = args
         .first()
         .cloned()
@@ -1381,17 +2857,12 @@ pub fn url_new(args: Vec<Value>) -> Value {
     let base_parts = if base_arg.is_nullish() {
         None
     } else {
-        match parse_url(&base_arg.to_js_string(), None) {
-            Ok(parts) => Some(parts),
-            Err(message) => {
-                crate::throw_value(js_error(&format!("TypeError: Invalid base URL: {message}")));
-            }
-        }
+        Some(
+            parse_url(&base_arg.to_js_string(), None)
+                .map_err(|message| format!("Invalid base URL: {message}"))?,
+        )
     };
-    match parse_url(&input, base_parts.as_ref()) {
-        Ok(parts) => url_value(parts),
-        Err(message) => crate::throw_value(js_error(&format!("TypeError: Invalid URL: {message}"))),
-    }
+    parse_url(&input, base_parts.as_ref())
 }
 
 #[cfg(test)]
@@ -1434,10 +2905,17 @@ mod tests {
     // ── structuredClone ──
 
     #[test]
-    fn structured_clone_primitives_and_functions() {
+    fn structured_clone_primitives_and_rejects_functions() {
         assert_eq!(structured_clone(vec![Value::Number(5.0)]).to_number(), 5.0);
         let f = Value::function(|_, _| Value::Number(1.0));
-        assert!(structured_clone(vec![f]).is_function());
+        let payload = catch_unwind(AssertUnwindSafe(|| structured_clone(vec![f])))
+            .expect_err("functions are not structured-cloneable");
+        assert!(
+            payload_value(payload)
+                .get_property("message")
+                .to_js_string()
+                .contains("functions cannot be cloned")
+        );
     }
 
     #[test]
@@ -1467,18 +2945,393 @@ mod tests {
     }
 
     #[test]
-    fn structured_clone_cycle_throws() {
+    fn structured_clone_preserves_cycles() {
         let object = Value::object(HashMap::new());
         object.set_property("me", object.clone());
-        let outcome = catch_unwind(AssertUnwindSafe(|| structured_clone(vec![object])));
-        let payload = outcome.expect_err("cycle must throw");
-        let error = payload_value(payload);
-        assert!(
-            error
-                .get_property("message")
-                .to_js_string()
-                .contains("cyclic")
+        let cloned = structured_clone(vec![object.clone()]);
+        assert_ne!(cloned, object);
+        assert_eq!(cloned.get_property("me"), cloned);
+    }
+
+    #[test]
+    fn structured_clone_preserves_date_regexp_map_and_set_types() {
+        let bigint = crate::bigint::parse("9007199254740993123456789");
+        let cloned_bigint = structured_clone(vec![bigint]);
+        assert_eq!(
+            crate::bigint::get(&cloned_bigint)
+                .expect("BigInt should remain cloneable")
+                .to_string(),
+            "9007199254740993123456789"
         );
+
+        let date = date_value(1_784_795_415_000.0);
+        let cloned_date = structured_clone(vec![date]);
+        assert_eq!(
+            cloned_date.call_method("getTime", vec![]).to_number(),
+            1_784_795_415_000.0
+        );
+
+        let regexp = crate::regexp::create("a+", "gi");
+        regexp.set_property("lastIndex", Value::Number(3.0));
+        let cloned_regexp = structured_clone(vec![regexp]);
+        assert!(crate::class::instance_of(
+            &cloned_regexp,
+            &crate::regexp::regexp_class()
+        ));
+        assert_eq!(cloned_regexp.get_property("source").to_js_string(), "a+");
+        assert_eq!(cloned_regexp.get_property("flags").to_js_string(), "gi");
+        assert_eq!(cloned_regexp.get_property("lastIndex").to_number(), 3.0);
+
+        let map = crate::class::construct(&crate::collections::map_class(), vec![]);
+        map.call_method("set", vec![Value::string("self"), map.clone()]);
+        let cloned_map = structured_clone(vec![map]);
+        assert!(crate::class::instance_of(
+            &cloned_map,
+            &crate::collections::map_class()
+        ));
+        assert_eq!(
+            cloned_map.call_method("get", vec![Value::string("self")]),
+            cloned_map
+        );
+
+        let set = crate::class::construct(
+            &crate::collections::set_class(),
+            vec![Value::array(vec![Value::string("item")])],
+        );
+        let cloned_set = structured_clone(vec![set]);
+        assert!(crate::class::instance_of(
+            &cloned_set,
+            &crate::collections::set_class()
+        ));
+        assert!(
+            cloned_set
+                .call_method("has", vec![Value::string("item")])
+                .to_bool()
+        );
+    }
+
+    #[test]
+    fn structured_clone_preserves_error_types_causes_and_aggregate_entries() {
+        let typed = crate::error_instance("TypeError", vec![Value::string("bad input")]);
+        typed.set_property("cause", typed.clone());
+        let aggregate = crate::error_instance(
+            "AggregateError",
+            vec![
+                Value::array(vec![typed.clone(), typed]),
+                Value::string("many"),
+                Value::object(HashMap::from([(
+                    "cause".to_string(),
+                    Value::string("root"),
+                )])),
+            ],
+        );
+
+        let cloned = structured_clone(vec![aggregate.clone()]);
+        assert_ne!(cloned, aggregate);
+        assert!(crate::class::instance_of(
+            &cloned,
+            &crate::error_class("AggregateError")
+        ));
+        assert!(crate::class::instance_of(
+            &cloned,
+            &crate::error_class("Error")
+        ));
+        assert_eq!(cloned.get_property("message").to_js_string(), "many");
+        assert_eq!(cloned.get_property("cause").to_js_string(), "root");
+        let errors = cloned.get_property("errors");
+        assert_eq!(errors.get_property("0"), errors.get_property("1"));
+        let cloned_typed = errors.get_property("0");
+        assert!(crate::class::instance_of(
+            &cloned_typed,
+            &crate::error_class("TypeError")
+        ));
+        assert_eq!(cloned_typed.get_property("cause"), cloned_typed);
+    }
+
+    #[test]
+    fn dom_exception_has_legacy_codes_and_is_structured_cloneable() {
+        let exception = dom_exception_instance("stopped", "AbortError");
+        assert!(crate::class::instance_of(
+            &exception,
+            &dom_exception_class()
+        ));
+        assert_eq!(exception.get_property("code").to_number(), 20.0);
+        assert_eq!(
+            exception.call_method("toString", vec![]).to_js_string(),
+            "AbortError: stopped"
+        );
+        assert_eq!(
+            dom_exception_class()
+                .get_property("DATA_CLONE_ERR")
+                .to_number(),
+            25.0
+        );
+        assert_eq!(
+            dom_exception_class()
+                .get_property("prototype")
+                .get_property("ABORT_ERR")
+                .to_number(),
+            20.0
+        );
+
+        let cloned = structured_clone(vec![exception.clone()]);
+        assert_ne!(cloned, exception);
+        assert!(crate::class::instance_of(&cloned, &dom_exception_class()));
+        assert_eq!(cloned.get_property("name").to_js_string(), "AbortError");
+        assert_eq!(cloned.get_property("message").to_js_string(), "stopped");
+        assert_eq!(cloned.get_property("code").to_number(), 20.0);
+    }
+
+    #[test]
+    fn structured_clone_preserves_image_data_and_shared_pixel_storage() {
+        let data = crate::class::construct(
+            &crate::binary::typed_array_class("Uint8ClampedArray"),
+            vec![Value::Number(4.0)],
+        );
+        data.set_property("0", Value::Number(255.0));
+        let image = image_data_value(data.clone(), 1, 1, "display-p3");
+        let cloned = structured_clone(vec![Value::object(HashMap::from([
+            ("image".to_string(), image.clone()),
+            ("data".to_string(), data),
+        ]))]);
+        let cloned_image = cloned.get_property("image");
+        assert_ne!(cloned_image, image);
+        assert!(crate::class::instance_of(
+            &cloned_image,
+            &image_data_class()
+        ));
+        assert_eq!(
+            cloned_image.get_property("colorSpace").to_js_string(),
+            "display-p3"
+        );
+        assert_eq!(
+            cloned_image.get_property("data"),
+            cloned.get_property("data")
+        );
+        assert_eq!(
+            cloned_image
+                .get_property("data")
+                .get_property("0")
+                .to_number(),
+            255.0
+        );
+    }
+
+    #[test]
+    fn structured_clone_preserves_blob_and_file_bytes_and_metadata() {
+        let blob = crate::class::construct(
+            &blob_class(),
+            vec![
+                Value::array(vec![Value::string("hello")]),
+                Value::object(HashMap::from([(
+                    "type".to_string(),
+                    Value::string("Text/Plain"),
+                )])),
+            ],
+        );
+        let file = crate::class::construct(
+            &file_class(),
+            vec![
+                Value::array(vec![blob.clone()]),
+                Value::string("note.txt"),
+                Value::object(HashMap::from([
+                    ("type".to_string(), Value::string("text/custom")),
+                    ("lastModified".to_string(), Value::Number(123.0)),
+                ])),
+            ],
+        );
+        let cloned = structured_clone(vec![Value::array(vec![blob.clone(), file.clone()])]);
+        let cloned_blob = cloned.get_property("0");
+        let cloned_file = cloned.get_property("1");
+        assert_ne!(cloned_blob, blob);
+        assert_ne!(cloned_file, file);
+        assert!(crate::class::instance_of(&cloned_blob, &blob_class()));
+        assert!(crate::class::instance_of(&cloned_file, &file_class()));
+        assert!(crate::class::instance_of(&cloned_file, &blob_class()));
+        assert_eq!(
+            cloned_blob.call_method("text", vec![]).to_js_string(),
+            "hello"
+        );
+        assert_eq!(
+            cloned_blob.get_property("type").to_js_string(),
+            "text/plain"
+        );
+        assert_eq!(
+            cloned_file.call_method("text", vec![]).to_js_string(),
+            "hello"
+        );
+        assert_eq!(
+            cloned_file.get_property("type").to_js_string(),
+            "text/custom"
+        );
+        assert_eq!(cloned_file.get_property("name").to_js_string(), "note.txt");
+        assert_eq!(cloned_file.get_property("lastModified").to_number(), 123.0);
+    }
+
+    #[test]
+    fn structured_clone_preserves_binary_views_and_backing_relationships() {
+        let buffer = crate::class::construct(
+            &crate::binary::array_buffer_class(),
+            vec![Value::Number(8.0)],
+        );
+        let bytes = crate::class::construct(
+            &crate::binary::typed_array_class("Uint8Array"),
+            vec![buffer.clone(), Value::Number(2.0), Value::Number(3.0)],
+        );
+        bytes.set_property("0", Value::Number(7.0));
+        bytes.set_property("1", Value::Number(8.0));
+        let data_view = crate::class::construct(
+            &crate::binary::data_view_class(),
+            vec![buffer.clone(), Value::Number(2.0), Value::Number(3.0)],
+        );
+        let cloned = structured_clone(vec![Value::object(HashMap::from([
+            ("bytes".into(), bytes.clone()),
+            ("view".into(), data_view),
+        ]))]);
+        let cloned_bytes = cloned.get_property("bytes");
+        let cloned_view = cloned.get_property("view");
+        assert!(crate::class::instance_of(
+            &cloned_bytes,
+            &crate::binary::typed_array_class("Uint8Array")
+        ));
+        assert!(crate::class::instance_of(
+            &cloned_view,
+            &crate::binary::data_view_class()
+        ));
+        assert_eq!(cloned_bytes.get_property("byteOffset").to_number(), 2.0);
+        assert_eq!(cloned_bytes.get_property("length").to_number(), 3.0);
+        assert_eq!(
+            cloned_bytes.get_property("buffer"),
+            cloned_view.get_property("buffer")
+        );
+        assert_ne!(cloned_bytes.get_property("buffer"), buffer);
+        bytes.set_property("0", Value::Number(99.0));
+        assert_eq!(cloned_bytes.get_property("0").to_number(), 7.0);
+        assert_eq!(
+            cloned_view
+                .call_method("getUint8", vec![Value::Number(1.0)])
+                .to_number(),
+            8.0
+        );
+
+        let shared = crate::class::construct(
+            &crate::binary::shared_array_buffer_class(),
+            vec![Value::Number(2.0)],
+        );
+        let original_shared_view = crate::class::construct(
+            &crate::binary::typed_array_class("Uint8Array"),
+            vec![shared.clone()],
+        );
+        let cloned_shared = structured_clone(vec![shared.clone()]);
+        let cloned_shared_view = crate::class::construct(
+            &crate::binary::typed_array_class("Uint8Array"),
+            vec![cloned_shared.clone()],
+        );
+        assert_ne!(cloned_shared, shared);
+        cloned_shared_view.set_property("0", Value::Number(42.0));
+        assert_eq!(original_shared_view.get_property("0").to_number(), 42.0);
+    }
+
+    #[test]
+    fn structured_clone_transfers_and_detaches_array_buffers() {
+        let buffer = crate::class::construct(
+            &crate::binary::array_buffer_class(),
+            vec![Value::Number(4.0)],
+        );
+        let original_view = crate::class::construct(
+            &crate::binary::typed_array_class("Uint8Array"),
+            vec![buffer.clone()],
+        );
+        original_view.set_property("0", Value::Number(11.0));
+        let transferred = structured_clone(vec![
+            buffer.clone(),
+            Value::object(HashMap::from([(
+                "transfer".into(),
+                Value::array(vec![buffer.clone()]),
+            )])),
+        ]);
+        assert_eq!(buffer.get_property("byteLength").to_number(), 0.0);
+        assert_eq!(original_view.get_property("length").to_number(), 0.0);
+        assert_eq!(transferred.get_property("byteLength").to_number(), 4.0);
+        let transferred_view = crate::class::construct(
+            &crate::binary::typed_array_class("Uint8Array"),
+            vec![transferred],
+        );
+        assert_eq!(transferred_view.get_property("0").to_number(), 11.0);
+
+        let duplicate = crate::class::construct(
+            &crate::binary::array_buffer_class(),
+            vec![Value::Number(1.0)],
+        );
+        let duplicate_outcome = catch_unwind(AssertUnwindSafe(|| {
+            structured_clone(vec![
+                Value::Null,
+                Value::object(HashMap::from([(
+                    "transfer".into(),
+                    Value::array(vec![duplicate.clone(), duplicate.clone()]),
+                )])),
+            ])
+        }));
+        assert!(duplicate_outcome.is_err());
+        assert_eq!(duplicate.get_property("byteLength").to_number(), 1.0);
+
+        let shared = crate::class::construct(
+            &crate::binary::shared_array_buffer_class(),
+            vec![Value::Number(1.0)],
+        );
+        let shared_outcome = catch_unwind(AssertUnwindSafe(|| {
+            structured_clone(vec![
+                Value::Null,
+                Value::object(HashMap::from([(
+                    "transfer".into(),
+                    Value::array(vec![shared]),
+                )])),
+            ])
+        }));
+        assert!(shared_outcome.is_err());
+    }
+
+    #[test]
+    fn structured_clone_custom_transfer_finalizes_only_after_clone_succeeds() {
+        let finalized = Rc::new(Cell::new(false));
+        let transferable = Value::object(HashMap::new());
+        let prepare = Value::function(|_, _| {
+            Value::object(HashMap::from([("moved".to_string(), Value::Bool(true))]))
+        });
+        let finalized_for_hook = Rc::clone(&finalized);
+        let finalize = Value::function(move |_, _| {
+            finalized_for_hook.set(true);
+            Value::Undefined
+        });
+        register_host_transferable(&transferable, prepare, finalize);
+        let options = Value::object(HashMap::from([(
+            "transfer".to_string(),
+            Value::array(vec![transferable.clone()]),
+        )]));
+        let failed = catch_unwind(AssertUnwindSafe(|| {
+            structured_clone(vec![
+                Value::object(HashMap::from([
+                    ("port".to_string(), transferable.clone()),
+                    (
+                        "invalid".to_string(),
+                        Value::function(|_, _| Value::Undefined),
+                    ),
+                ])),
+                options.clone(),
+            ])
+        }));
+        assert!(failed.is_err());
+        assert!(
+            !finalized.get(),
+            "a failed clone must not detach transferables"
+        );
+
+        let cloned = structured_clone(vec![
+            Value::object(HashMap::from([("port".to_string(), transferable)])),
+            options,
+        ]);
+        assert!(finalized.get());
+        assert!(cloned.get_property("port").get_property("moved").to_bool());
     }
 
     // ── URL ──
@@ -1488,6 +3341,11 @@ mod tests {
         let url = url_new(vec![Value::string(
             "https://user:pw@Example.COM:8080/p/a?x=1&y=2#frag",
         )]);
+        assert!(crate::class::instance_of(&url, &url_class()));
+        assert!(crate::class::instance_of(
+            &url.get_property("searchParams"),
+            &url_search_params_class()
+        ));
         assert_eq!(url.get_property("protocol").to_js_string(), "https:");
         assert_eq!(url.get_property("username").to_js_string(), "user");
         assert_eq!(url.get_property("password").to_js_string(), "pw");
@@ -1604,6 +3462,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn url_pattern_matches_named_and_wildcard_groups() {
+        let pattern = url_pattern_new(vec![Value::string(
+            "https://*.example.com/books/:id?view=*",
+        )]);
+        assert_eq!(
+            pattern.get_property("pathname").to_js_string(),
+            "/books/:id"
+        );
+        assert!(
+            pattern
+                .call_method(
+                    "test",
+                    vec![Value::string("https://docs.example.com/books/42?view=full")],
+                )
+                .to_bool()
+        );
+        assert!(
+            !pattern
+                .call_method(
+                    "test",
+                    vec![Value::string(
+                        "https://docs.example.com/authors/42?view=full"
+                    )],
+                )
+                .to_bool()
+        );
+
+        let result = pattern.call_method(
+            "exec",
+            vec![Value::string("https://docs.example.com/books/42?view=full")],
+        );
+        assert_eq!(
+            result
+                .get_property("pathname")
+                .get_property("groups")
+                .get_property("id")
+                .to_js_string(),
+            "42"
+        );
+        assert_eq!(
+            result
+                .get_property("hostname")
+                .get_property("groups")
+                .get_property("0")
+                .to_js_string(),
+            "docs"
+        );
+    }
+
+    #[test]
+    fn url_pattern_resolves_relative_input_and_honors_ignore_case() {
+        let options = Value::object(HashMap::from([("ignoreCase".into(), Value::Bool(true))]));
+        let pattern = url_pattern_new(vec![
+            Value::string("/Users/:name"),
+            Value::string("https://example.com/base/"),
+            options,
+        ]);
+        assert!(
+            pattern
+                .call_method("test", vec![Value::string("https://EXAMPLE.com/users/Ada")],)
+                .to_bool()
+        );
+        assert!(
+            pattern
+                .call_method(
+                    "exec",
+                    vec![
+                        Value::string("../Users/Bob"),
+                        Value::string("https://example.com/base/page"),
+                    ],
+                )
+                .is_object()
+        );
+    }
+
     // ── URLSearchParams ──
 
     #[test]
@@ -1662,6 +3596,17 @@ mod tests {
         assert_eq!(
             params.call_method("toString", vec![]).to_js_string(),
             "a=1&b=2&c=3"
+        );
+        assert_eq!(params.get_property("size").to_u32(), 3);
+        assert_eq!(params.call_method("keys", vec![]).to_js_string(), "a,b,c");
+        assert_eq!(params.call_method("values", vec![]).to_js_string(), "1,2,3");
+        assert_eq!(
+            params.call_method("entries", vec![]).to_js_string(),
+            "a,1,b,2,c,3"
+        );
+        assert_eq!(
+            Value::array(params.iter().collect()).to_js_string(),
+            "a,1,b,2,c,3"
         );
 
         let log = Rc::new(RefCell::new(Vec::new()));
@@ -1745,6 +3690,102 @@ mod tests {
             decoder.call_method("decode", vec![units]).to_js_string(),
             "<div>✓</div>"
         );
+        assert!(crate::class::instance_of(&decoder, &text_decoder_class()));
+        assert_eq!(decoder.get_property("encoding"), Value::string("utf-16le"));
+        assert_eq!(decoder.get_property("fatal"), Value::Bool(false));
+        assert_eq!(decoder.get_property("ignoreBOM"), Value::Bool(false));
+    }
+
+    #[test]
+    fn text_decoder_honors_utf8_bom_and_options() {
+        let decoder = crate::class::construct(
+            &text_decoder_class(),
+            vec![
+                Value::string("utf8"),
+                Value::object(HashMap::from([
+                    ("fatal".into(), Value::Bool(true)),
+                    ("ignoreBOM".into(), Value::Bool(false)),
+                ])),
+            ],
+        );
+        let bytes = crate::binary::typed_array_value(
+            [0xef, 0xbb, 0xbf, b'o', b'k']
+                .into_iter()
+                .map(|byte| Value::Number(byte as f64))
+                .collect(),
+        );
+        assert_eq!(
+            decoder.call_method("decode", vec![bytes]),
+            Value::string("ok")
+        );
+        assert_eq!(decoder.get_property("fatal"), Value::Bool(true));
+    }
+
+    #[test]
+    fn text_decoder_streams_split_bom_utf8_and_utf16_sequences() {
+        fn bytes(values: &[u8]) -> Value {
+            crate::binary::typed_array_value(
+                values
+                    .iter()
+                    .map(|byte| Value::Number(*byte as f64))
+                    .collect(),
+            )
+        }
+        let stream = Value::object(HashMap::from([("stream".into(), Value::Bool(true))]));
+        let utf8 = crate::class::construct(&text_decoder_class(), vec![]);
+        for chunk in [&[0xef][..], &[0xbb][..], &[0xbf, 0xe2][..], &[0x9c][..]] {
+            assert_eq!(
+                utf8.call_method("decode", vec![bytes(chunk), stream.clone()]),
+                Value::string("")
+            );
+        }
+        assert_eq!(
+            utf8.call_method("decode", vec![bytes(&[0x93, b'!']), stream.clone()]),
+            Value::string("✓!")
+        );
+        assert_eq!(utf8.call_method("decode", vec![]), Value::string(""));
+        assert_eq!(
+            utf8.call_method("decode", vec![bytes(&[0xef, 0xbb, 0xbf, b'A'])]),
+            Value::string("A")
+        );
+
+        let utf16 = crate::class::construct(&text_decoder_class(), vec![Value::string("utf-16le")]);
+        assert_eq!(
+            utf16.call_method("decode", vec![bytes(&[0x3d, 0xd8, 0x00]), stream.clone()]),
+            Value::string("")
+        );
+        assert_eq!(
+            utf16.call_method("decode", vec![bytes(&[0xde]), stream]),
+            Value::string("😀")
+        );
+    }
+
+    #[test]
+    fn fatal_text_decoder_defers_incomplete_sequence_error_until_flush() {
+        let decoder = crate::class::construct(
+            &text_decoder_class(),
+            vec![
+                Value::string("utf-8"),
+                Value::object(HashMap::from([("fatal".into(), Value::Bool(true))])),
+            ],
+        );
+        let partial = crate::binary::typed_array_value(vec![Value::Number(0xe2 as f64)]);
+        assert_eq!(
+            decoder.call_method(
+                "decode",
+                vec![
+                    partial,
+                    Value::object(HashMap::from([("stream".into(), Value::Bool(true))])),
+                ],
+            ),
+            Value::string("")
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decoder.call_method("decode", vec![]);
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1790,6 +3831,82 @@ mod tests {
     }
 
     #[test]
+    fn intl_formats_additional_locale_profiles_and_currency_minor_units() {
+        let number_format = intl_value().get_property("NumberFormat");
+        let euro_options = Value::object(HashMap::from([
+            ("style".into(), Value::string("currency")),
+            ("currency".into(), Value::string("EUR")),
+        ]));
+        let german =
+            crate::class::construct(&number_format, vec![Value::string("de-AT"), euro_options]);
+        assert_eq!(
+            german
+                .call_method("format", vec![Value::Number(1_234_567.8)])
+                .to_js_string(),
+            "1.234.567,80 €"
+        );
+        assert_eq!(
+            german
+                .call_method("resolvedOptions", vec![])
+                .get_property("locale")
+                .to_js_string(),
+            "de-DE"
+        );
+
+        let french = crate::class::construct(
+            &number_format,
+            vec![
+                Value::string("fr-CA"),
+                Value::object(HashMap::from([(
+                    "maximumFractionDigits".into(),
+                    Value::Number(1.0),
+                )])),
+            ],
+        );
+        assert_eq!(
+            french
+                .call_method("format", vec![Value::Number(1_234_567.8)])
+                .to_js_string(),
+            "1 234 567,8"
+        );
+
+        let yen = crate::class::construct(
+            &number_format,
+            vec![
+                Value::string("ja-JP"),
+                Value::object(HashMap::from([
+                    ("style".into(), Value::string("currency")),
+                    ("currency".into(), Value::string("JPY")),
+                ])),
+            ],
+        );
+        assert_eq!(
+            yen.call_method("format", vec![Value::Number(1234.4)])
+                .to_js_string(),
+            "¥1,234"
+        );
+
+        let date_time_format = intl_value().get_property("DateTimeFormat");
+        let japanese = crate::class::construct(
+            &date_time_format,
+            vec![
+                Value::string("ja-JP"),
+                Value::object(HashMap::from([
+                    ("timeZone".into(), Value::string("Asia/Tokyo")),
+                    ("dateStyle".into(), Value::string("medium")),
+                    ("timeStyle".into(), Value::string("short")),
+                ])),
+            ],
+        );
+        assert_eq!(
+            japanese
+                .call_method("format", vec![Value::string("2026-07-23T08:30:15Z")])
+                .to_js_string(),
+            "2026/07/23 17:30"
+        );
+    }
+
+    #[test]
     fn intl_date_time_format_handles_iso_date_and_shanghai_timezone() {
         let date =
             crate::class::construct(&date_class(), vec![Value::string("2026-07-23T08:30:15Z")]);
@@ -1809,6 +3926,64 @@ mod tests {
         assert_eq!(
             formatter.call_method("format", vec![date]).to_js_string(),
             "2026年7月23日 16:30"
+        );
+    }
+
+    #[test]
+    fn intl_date_time_format_applies_iana_dst_transitions() {
+        let options = Value::object(HashMap::from([
+            ("timeZone".into(), Value::string("America/New_York")),
+            ("timeStyle".into(), Value::string("short")),
+        ]));
+        let formatter = crate::class::construct(
+            &intl_value().get_property("DateTimeFormat"),
+            vec![Value::string("en-US"), options],
+        );
+
+        assert_eq!(
+            formatter
+                .call_method("format", vec![Value::string("2026-03-08T06:30:00Z")])
+                .to_js_string(),
+            "1:30 AM"
+        );
+        assert_eq!(
+            formatter
+                .call_method("format", vec![Value::string("2026-03-08T07:30:00Z")])
+                .to_js_string(),
+            "3:30 AM"
+        );
+
+        let fixed = crate::class::construct(
+            &intl_value().get_property("DateTimeFormat"),
+            vec![
+                Value::string("en-US"),
+                Value::object(HashMap::from([
+                    ("timeZone".into(), Value::string("UTC+05:30")),
+                    ("timeStyle".into(), Value::string("short")),
+                ])),
+            ],
+        );
+        assert_eq!(
+            fixed
+                .call_method("format", vec![Value::string("2026-01-01T00:00:00Z")])
+                .to_js_string(),
+            "5:30 AM"
+        );
+
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::class::construct(
+                    &intl_value().get_property("DateTimeFormat"),
+                    vec![
+                        Value::string("en-US"),
+                        Value::object(HashMap::from([(
+                            "timeZone".into(),
+                            Value::string("Mars/Olympus_Mons"),
+                        )])),
+                    ],
+                );
+            }))
+            .is_err()
         );
     }
 }

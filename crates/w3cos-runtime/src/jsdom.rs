@@ -50,7 +50,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use w3cos_core::{JsObject, ProxyBuilder, Value};
 use w3cos_dom::Element;
@@ -58,6 +58,52 @@ use w3cos_dom::events::{Event, EventData, EventType};
 use w3cos_dom::node::NodeId;
 
 use crate::dom;
+
+const EVENT_COUNT_TYPES: &[&str] = &[
+    "pointerdown",
+    "touchend",
+    "input",
+    "keydown",
+    "mouseleave",
+    "mouseenter",
+    "drop",
+    "beforeinput",
+    "pointerenter",
+    "dragend",
+    "pointercancel",
+    "compositionupdate",
+    "mousedown",
+    "dragleave",
+    "dragover",
+    "mouseup",
+    "pointerover",
+    "lostpointercapture",
+    "mouseover",
+    "gotpointercapture",
+    "dblclick",
+    "keyup",
+    "keypress",
+    "pointerup",
+    "compositionstart",
+    "auxclick",
+    "dragstart",
+    "touchstart",
+    "compositionend",
+    "pointerout",
+    "dragenter",
+    "touchcancel",
+    "click",
+    "contextmenu",
+    "mouseout",
+    "pointerleave",
+];
+
+fn initial_event_counts() -> HashMap<String, u64> {
+    EVENT_COUNT_TYPES
+        .iter()
+        .map(|event_type| ((*event_type).to_string(), 0))
+        .collect()
+}
 
 // ── Bridge state (all thread-local, matching the thread-local Document) ────
 
@@ -74,6 +120,21 @@ struct JsTimer {
     args: Vec<Value>,
     fire_at: Instant,
     interval: Option<Duration>,
+}
+
+#[derive(Clone)]
+struct NativeTouch {
+    identifier: i64,
+    target: u32,
+    client_x: f32,
+    client_y: f32,
+    force: f32,
+}
+
+#[derive(Clone)]
+struct ShadowRootInfo {
+    root: u32,
+    mode: String,
 }
 
 thread_local! {
@@ -94,6 +155,12 @@ thread_local! {
     static NATIVELY_REGISTERED: RefCell<HashSet<(u32, EventType)>> = RefCell::new(HashSet::new());
     /// Event snapshots taken by native snapshot closures, awaiting delivery.
     static PENDING_EVENTS: RefCell<Vec<Event>> = RefCell::new(Vec::new());
+    /// Active native touch contacts in activation order.
+    static ACTIVE_TOUCHES: RefCell<Vec<NativeTouch>> = const { RefCell::new(Vec::new()) };
+    /// Active native pointer ids and their browser-facing pointer type.
+    static ACTIVE_POINTERS: RefCell<HashMap<i64, String>> = RefCell::new(HashMap::new());
+    /// pointer id → element holding explicit pointer capture.
+    static POINTER_CAPTURE: RefCell<HashMap<i64, u32>> = RefCell::new(HashMap::new());
     /// Custom event name → stable EventType (EventType::from_str mints a fresh
     /// Custom id per call for unknown names, so the bridge memoizes).
     static CUSTOM_EVENT_TYPES: RefCell<HashMap<String, EventType>> = RefCell::new(HashMap::new());
@@ -109,10 +176,21 @@ thread_local! {
     static NEXT_RAF_ID: Cell<u32> = Cell::new(1);
     /// Viewport (width, height, devicePixelRatio) for window/matchMedia.
     static VIEWPORT: Cell<(f64, f64, f64)> = Cell::new((1024.0, 768.0, 1.0));
+    /// Browser-shaped APIs whose host operation is unavailable. Each warning
+    /// is emitted once per process thread so compatibility fallbacks are
+    /// visible without flooding application logs.
+    static HOST_API_WARNINGS: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+    /// Live MediaQueryList objects that must be reevaluated when viewport
+    /// metrics change.
+    static MEDIA_QUERY_LISTS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+    static MEDIA_QUERY_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static VISUAL_VIEWPORT_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// Host-reported simultaneous touch contacts. Desktop defaults to zero.
+    static MAX_TOUCH_POINTS: Cell<u32> = const { Cell::new(0) };
     static WINDOW_SCROLL: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
     static FULLSCREEN_NODE: RefCell<Option<u32>> = const { RefCell::new(None) };
-    static SCREEN_ORIENTATION: RefCell<(String, f64)> =
-        RefCell::new(("landscape-primary".to_string(), 0.0));
+    static DOCUMENT_VISIBILITY: RefCell<String> = RefCell::new("visible".to_string());
+    static EVENT_COUNTS: RefCell<HashMap<String, u64>> = RefCell::new(initial_event_counts());
     /// Bridge-side focus tracking (no real input focus exists yet).
     static ACTIVE_ELEMENT: RefCell<Option<u32>> = RefCell::new(None);
     /// Lazily-created <html> / <head> elements.
@@ -123,16 +201,48 @@ thread_local! {
     static DOCUMENT_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static WINDOW_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static SELECTION_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static IDLE_DEADLINE_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static DOM_PARSER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static XML_SERIALIZER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static CSS_STYLE_DECLARATION_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static CSS_STYLE_SHEET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static STYLE_SHEET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static STYLE_SHEET_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static MEDIA_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static DOM_COLLECTION_CLASSES: RefCell<Option<HashMap<String, Value>>> =
+        const { RefCell::new(None) };
+    static LEGACY_ELEMENT_FACTORY_CLASSES: RefCell<Option<HashMap<String, Value>>> =
+        const { RefCell::new(None) };
+    static BAR_PROP_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static CRYPTO_KEY_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static DOM_ERROR_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static CARET_POSITION_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static MATH_ML_ELEMENT_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static WINDOW_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     /// Canvas 2D contexts per canvas node.
     static CANVAS_CONTEXTS: RefCell<HashMap<u32, Rc<RefCell<crate::canvas2d::CanvasRenderingContext2D>>>> =
         RefCell::new(HashMap::new());
     /// In-memory sessionStorage.
     static SESSION_STORAGE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    static COOKIE_STORE: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     /// Clipboard fallback for non-desktop targets.
     static CLIPBOARD_FALLBACK: RefCell<String> = RefCell::new(String::new());
+    static LOCATION_RELOAD_WARNED: Cell<bool> = const { Cell::new(false) };
+    static DRAW_IMAGE_SOURCE_WARNED: Cell<bool> = const { Cell::new(false) };
+    static CANVAS_PAINT_STYLE_WARNED: Cell<bool> = const { Cell::new(false) };
+    static SMOOTH_SCROLL_WARNED: Cell<bool> = const { Cell::new(false) };
+    static XML_PARSER_WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+    /// Shadow host node → detached DocumentFragment used as its shadow tree.
+    static SHADOW_ROOTS: RefCell<HashMap<u32, ShadowRootInfo>> = RefCell::new(HashMap::new());
+    static SHADOW_DOM_WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+    static EVAL_WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+    static FUNCTION_WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+    static RANGE_COMPLEX_WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
     /// performance.now() origin.
     static START_TIME: Instant = Instant::now();
+    static TIME_ORIGIN: f64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64() * 1000.0;
 }
 
 // ── Small helpers ──────────────────────────────────────────────────────────
@@ -145,12 +255,148 @@ fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Undefined)
 }
 
+fn warn_host_api(name: &'static str, fallback: &'static str) {
+    HOST_API_WARNINGS.with(|warned| {
+        if warned.borrow_mut().insert(name) {
+            eprintln!(
+                "[w3cos] warning: {name} is unavailable without a host adapter; returning {fallback}"
+            );
+        }
+    });
+}
+
 fn get_expando(node: u32, key: &str) -> Option<Value> {
     ELEMENT_PROPS.with(|p| p.borrow().get(&(node, key.to_string())).cloned())
 }
 
 fn set_expando(node: u32, key: &str, value: Value) {
     ELEMENT_PROPS.with(|p| p.borrow_mut().insert((node, key.to_string()), value));
+}
+
+fn shadow_host_for_root(root: u32) -> Option<u32> {
+    SHADOW_ROOTS.with(|roots| {
+        roots
+            .borrow()
+            .iter()
+            .find_map(|(&host, info)| (info.root == root).then_some(host))
+    })
+}
+
+fn tree_root(mut node: u32) -> u32 {
+    while let Some(parent) = dom::parent_node(node) {
+        node = parent;
+    }
+    node
+}
+
+fn node_is_connected(node: u32) -> bool {
+    if dom::is_connected(node) {
+        return true;
+    }
+    shadow_host_for_root(tree_root(node)).is_some_and(node_is_connected)
+}
+
+fn root_node_value(node: u32, composed: bool) -> Value {
+    let root = tree_root(node);
+    if let Some(host) = shadow_host_for_root(root) {
+        if composed {
+            return root_node_value(host, true);
+        }
+        return element_value(root);
+    }
+    if dom::is_connected(node) {
+        document_value()
+    } else {
+        element_value(root)
+    }
+}
+
+fn shadow_event_chain(target: u32, composed: bool) -> Vec<u32> {
+    let mut chain = vec![target];
+    let mut current = target;
+    loop {
+        if let Some(parent) = dom::parent_node(current) {
+            chain.push(parent);
+            current = parent;
+            continue;
+        }
+        let Some(host) = shadow_host_for_root(current).filter(|_| composed) else {
+            break;
+        };
+        chain.push(host);
+        current = host;
+    }
+    chain
+}
+
+fn retarget_shadow_event(mut target: u32, current_target: u32) -> u32 {
+    loop {
+        let root = tree_root(target);
+        let Some(host) = shadow_host_for_root(root) else {
+            return target;
+        };
+        if current_target == root || is_ancestor_of(root, current_target) {
+            return target;
+        }
+        target = host;
+    }
+}
+
+fn shadow_root_value(host: u32, options: Value) -> Value {
+    if SHADOW_ROOTS.with(|roots| roots.borrow().contains_key(&host)) {
+        w3cos_core::throw_value(Value::object(HashMap::from([
+            ("name".to_string(), Value::string("NotSupportedError")),
+            (
+                "message".to_string(),
+                Value::string("Shadow root cannot be created on a host which already hosts one"),
+            ),
+        ])));
+    }
+    let mode = options.get_property("mode").to_js_string();
+    if mode != "open" && mode != "closed" {
+        w3cos_core::throw_value(Value::object(HashMap::from([
+            ("name".to_string(), Value::string("TypeError")),
+            (
+                "message".to_string(),
+                Value::string("ShadowRootInit.mode must be \"open\" or \"closed\""),
+            ),
+        ])));
+    }
+
+    let root = dom::create_document_fragment();
+    let delegates_focus = options.get_property("delegatesFocus").to_bool();
+    let slot_assignment = match options
+        .get_property("slotAssignment")
+        .to_js_string()
+        .as_str()
+    {
+        "manual" => "manual",
+        _ => "named",
+    };
+    set_expando(root, "host", element_value(host));
+    set_expando(root, "mode", Value::string(&mode));
+    set_expando(root, "delegatesFocus", Value::Bool(delegates_focus));
+    set_expando(root, "slotAssignment", Value::string(slot_assignment));
+    set_expando(root, "activeElement", Value::Null);
+    set_expando(root, "pictureInPictureElement", Value::Null);
+    SHADOW_ROOTS.with(|roots| {
+        roots
+            .borrow_mut()
+            .insert(host, ShadowRootInfo { root, mode });
+    });
+
+    SHADOW_DOM_WARNING_EMITTED.with(|warned| {
+        if !warned.replace(true) {
+            eprintln!(
+                "[W3C OS][compat warning] ShadowRoot tree/query/event semantics are available; \
+                 slot distribution, declarative shadow DOM, and composed rendering are not yet \
+                 implemented"
+            );
+        }
+    });
+    let value = element_value(root);
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("ShadowRoot"));
+    value
 }
 
 /// Extract the DOM node id carried by an element Value (`__node_id` hidden
@@ -165,12 +411,168 @@ pub fn node_id_of(value: &Value) -> Option<u32> {
     None
 }
 
-fn performance_now() -> f64 {
+pub(crate) fn performance_now() -> f64 {
     START_TIME.with(|t| t.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn performance_time_origin() -> f64 {
+    TIME_ORIGIN.with(|origin| *origin)
 }
 
 fn js_array(items: Vec<Value>) -> Value {
     Value::array(items)
+}
+
+type CollectionProvider = Rc<dyn Fn() -> Vec<Value>>;
+
+fn build_dom_collection_classes() -> HashMap<String, Value> {
+    let mut classes = HashMap::new();
+    for name in ["NodeList", "HTMLCollection"] {
+        let api = name.to_string();
+        let class = Value::function(move |_, _| {
+            w3cos_core::throw_value(Value::object(HashMap::from([
+                ("name".to_string(), Value::string("TypeError")),
+                (
+                    "message".to_string(),
+                    Value::string(&format!("Illegal constructor: {api}")),
+                ),
+            ])))
+        });
+        class.set_property("name", Value::string(name));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        let methods: &[&str] = if name == "NodeList" {
+            &["entries", "forEach", "item", "keys", "values"]
+        } else {
+            &["item", "namedItem"]
+        };
+        for method in methods {
+            prototype.set_property(method, func(|_, _| Value::Undefined));
+        }
+        prototype.set_property("length", Value::Undefined);
+        class.set_property("prototype", prototype);
+        classes.insert(name.to_string(), class);
+    }
+    classes
+}
+
+fn dom_collection_class(name: &str) -> Value {
+    DOM_COLLECTION_CLASSES.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(build_dom_collection_classes());
+        }
+        slot.borrow()
+            .as_ref()
+            .and_then(|classes| classes.get(name))
+            .cloned()
+            .unwrap_or(Value::Undefined)
+    })
+}
+
+fn collection_value(provider: CollectionProvider, class_name: &'static str) -> Value {
+    let snapshot_provider = provider.clone();
+    let target = HashMap::from([(
+        "__w3cosMapValuesSnapshot".to_string(),
+        func(move |_, _| js_array(snapshot_provider())),
+    )]);
+    let get_provider = provider.clone();
+    let handler = ProxyBuilder::new()
+        .get(move |target, key, _| {
+            if let Ok(index) = key.parse::<usize>() {
+                return get_provider()
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(Value::Undefined);
+            }
+            match key {
+                "length" => Value::Number(get_provider().len() as f64),
+                "item" => {
+                    let provider = get_provider.clone();
+                    func(move |_, args| {
+                        provider()
+                            .get(arg(&args, 0).to_u32() as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                }
+                "namedItem" if class_name == "HTMLCollection" => {
+                    let provider = get_provider.clone();
+                    func(move |_, args| {
+                        let name = arg(&args, 0).to_js_string();
+                        provider()
+                            .into_iter()
+                            .find(|item| {
+                                item.get_property("id").to_js_string() == name
+                                    || item.get_property("name").to_js_string() == name
+                            })
+                            .unwrap_or(Value::Null)
+                    })
+                }
+                "forEach" if class_name == "NodeList" => {
+                    let provider = get_provider.clone();
+                    func(move |_, args| {
+                        let callback = arg(&args, 0);
+                        let this_arg = arg(&args, 1);
+                        for (index, item) in provider().into_iter().enumerate() {
+                            callback.call(
+                                this_arg.clone(),
+                                vec![item, Value::Number(index as f64), Value::Undefined],
+                            );
+                        }
+                        Value::Undefined
+                    })
+                }
+                "entries" => {
+                    let provider = get_provider.clone();
+                    func(move |_, _| {
+                        js_array(
+                            provider()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, value)| {
+                                    js_array(vec![Value::Number(index as f64), value])
+                                })
+                                .collect(),
+                        )
+                    })
+                }
+                "keys" => {
+                    let provider = get_provider.clone();
+                    func(move |_, _| {
+                        js_array(
+                            (0..provider().len())
+                                .map(|index| Value::Number(index as f64))
+                                .collect(),
+                        )
+                    })
+                }
+                "values" => {
+                    let provider = get_provider.clone();
+                    func(move |_, _| js_array(provider()))
+                }
+                _ => target.get_property(key),
+            }
+        })
+        .build();
+    let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(target, handler))));
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &dom_collection_class(class_name).get_property("prototype"),
+    );
+    value
+}
+
+pub(crate) fn node_list(items: Vec<Value>) -> Value {
+    let items = Rc::new(items);
+    collection_value(Rc::new(move || items.as_ref().clone()), "NodeList")
+}
+
+fn live_node_list(provider: impl Fn() -> Vec<Value> + 'static) -> Value {
+    collection_value(Rc::new(provider), "NodeList")
+}
+
+fn html_collection(provider: impl Fn() -> Vec<Value> + 'static) -> Value {
+    collection_value(Rc::new(provider), "HTMLCollection")
 }
 
 fn element_or_null(node: Option<u32>) -> Value {
@@ -351,6 +753,10 @@ fn is_ancestor_of(ancestor: u32, node: u32) -> bool {
     false
 }
 
+pub(crate) fn is_ancestor_node(ancestor: u32, node: u32) -> bool {
+    is_ancestor_of(ancestor, node)
+}
+
 /// Right-to-left descendant-combinator matching against the ancestor chain.
 fn matches_selector_chain(node: u32, parts: &[&str]) -> bool {
     if parts.is_empty() || !matches_simple(parts[parts.len() - 1], node) {
@@ -433,6 +839,112 @@ pub fn element_value(node: u32) -> Value {
     }
     let value = build_element_value(node);
     ELEMENT_VALUES.with(|c| c.borrow_mut().insert(node, value.clone()));
+    value
+}
+
+fn legacy_element_factory_class(name: &'static str) -> Value {
+    LEGACY_ELEMENT_FACTORY_CLASSES.with(|slot| {
+        if let Some(class) = slot
+            .borrow()
+            .as_ref()
+            .and_then(|classes| classes.get(name))
+            .cloned()
+        {
+            return class;
+        }
+        let class = match name {
+            "Image" => Value::function(|_, args| {
+                let image = element_value(dom::create_element("img"));
+                if let Some(width) = args.first() {
+                    image.set_property("width", Value::Number(width.to_u32() as f64));
+                }
+                if let Some(height) = args.get(1) {
+                    image.set_property("height", Value::Number(height.to_u32() as f64));
+                }
+                image
+            }),
+            "Audio" => Value::function(|_, args| {
+                let audio = element_value(dom::create_element("audio"));
+                audio.set_property("preload", Value::string("auto"));
+                if let Some(src) = args.first() {
+                    audio.set_property("src", Value::string(&src.to_js_string()));
+                }
+                audio
+            }),
+            "Option" => Value::function(|_, args| {
+                let option = element_value(dom::create_element("option"));
+                let text = args.first().map(Value::to_js_string).unwrap_or_default();
+                if !text.is_empty() {
+                    dom::append_child(
+                        node_id_of(&option).unwrap_or_default(),
+                        dom::create_text_node(&text),
+                    );
+                }
+                option.set_property(
+                    "value",
+                    Value::string(
+                        &args
+                            .get(1)
+                            .map(Value::to_js_string)
+                            .unwrap_or_else(|| text.clone()),
+                    ),
+                );
+                let default_selected = args.get(2).is_some_and(Value::to_bool);
+                option.set_property("defaultSelected", Value::Bool(default_selected));
+                if default_selected {
+                    dom::set_attribute(node_id_of(&option).unwrap_or_default(), "selected", "");
+                }
+                option.set_property(
+                    "selected",
+                    Value::Bool(args.get(3).map(Value::to_bool).unwrap_or(default_selected)),
+                );
+                option
+            }),
+            _ => unreachable!("unknown legacy element factory"),
+        };
+        class.set_property("name", Value::string(name));
+        let prototype_name = match name {
+            "Image" => "HTMLImageElement",
+            "Audio" => "HTMLAudioElement",
+            "Option" => "HTMLOptionElement",
+            _ => unreachable!("unknown legacy element factory"),
+        };
+        class.set_property(
+            "prototype",
+            crate::dom_constructors::prototype(prototype_name),
+        );
+        let mut classes = slot.borrow_mut();
+        classes
+            .get_or_insert_with(HashMap::new)
+            .insert(name.to_string(), class.clone());
+        class
+    })
+}
+
+fn bar_prop_class() -> Value {
+    BAR_PROP_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(w3cos_core::error_instance(
+                "TypeError",
+                vec![Value::string("Illegal constructor: BarProp")],
+            ))
+        });
+        class.set_property("name", Value::string("BarProp"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property("visible", Value::Undefined);
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn bar_prop_value() -> Value {
+    let value = Value::object(HashMap::from([("visible".to_string(), Value::Bool(false))]));
+    w3cos_core::class::set_prototype_of(&value, &bar_prop_class().get_property("prototype"));
     value
 }
 
@@ -610,6 +1122,14 @@ fn apply_html_attribute(node: u32, name: &str, value: &str) {
 /// renders visible lines through `innerHTML`, so treating markup as a text
 /// node leaves an otherwise healthy editor visually empty.
 fn append_html_fragment(parent: u32, html: &str) {
+    append_html_fragment_mode(parent, html, false);
+}
+
+pub(crate) fn append_sanitized_html_fragment(parent: u32, html: &str) {
+    append_html_fragment_mode(parent, html, true);
+}
+
+fn append_html_fragment_mode(parent: u32, html: &str, sanitize: bool) {
     let mut stack = vec![parent];
     let mut rest = html;
     while !rest.is_empty() {
@@ -669,8 +1189,33 @@ fn append_html_fragment(parent: u32, html: &str) {
         if name.is_empty() {
             continue;
         }
+        if sanitize
+            && matches!(
+                name.as_str(),
+                "script" | "style" | "iframe" | "object" | "embed" | "link" | "meta" | "base"
+            )
+        {
+            if matches!(name.as_str(), "script" | "style" | "iframe" | "object")
+                && let Some(close) = rest.to_ascii_lowercase().find(&format!("</{name}"))
+            {
+                rest = &rest[close..];
+            }
+            continue;
+        }
         let element = dom::create_element(&name);
         for (attribute, value) in parse_html_attributes(&tag[name_end..]) {
+            if sanitize
+                && (attribute.to_ascii_lowercase().starts_with("on")
+                    || (matches!(
+                        attribute.to_ascii_lowercase().as_str(),
+                        "href" | "src" | "action" | "formaction" | "xlink:href"
+                    ) && value
+                        .trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("javascript:")))
+            {
+                continue;
+            }
             apply_html_attribute(element, &attribute, &value);
         }
         dom::append_child(*stack.last().unwrap_or(&parent), element);
@@ -697,20 +1242,1145 @@ fn append_html_fragment(parent: u32, html: &str) {
     }
 }
 
+fn descendant_elements(root: u32) -> Vec<u32> {
+    let mut output = Vec::new();
+    let mut pending = dom::children(root);
+    while let Some(node) = pending.pop() {
+        pending.extend(dom::children(node));
+        if dom::node_type(node) == 1 {
+            output.push(node);
+        }
+    }
+    output
+}
+
+fn parsed_document_value(
+    root: u32,
+    content_type: &str,
+    head: Option<u32>,
+    body: Option<u32>,
+) -> Value {
+    let mut props = HashMap::from([
+        ("nodeType".to_string(), Value::Number(9.0)),
+        ("nodeName".to_string(), Value::string("#document")),
+        ("contentType".to_string(), Value::string(content_type)),
+        ("URL".to_string(), Value::string("about:blank")),
+        ("documentURI".to_string(), Value::string("about:blank")),
+        ("defaultView".to_string(), Value::Null),
+        ("documentElement".to_string(), element_value(root)),
+        (
+            "head".to_string(),
+            head.map(element_value).unwrap_or(Value::Null),
+        ),
+        (
+            "body".to_string(),
+            body.map(element_value).unwrap_or(Value::Null),
+        ),
+        (
+            "childNodes".to_string(),
+            node_list(vec![element_value(root)]),
+        ),
+        (
+            "__w3cos_document_root".to_string(),
+            Value::Number(root as f64),
+        ),
+    ]);
+    props.insert(
+        "querySelector".to_string(),
+        func(move |_, args| {
+            let selector = arg(&args, 0).to_js_string();
+            let parts: Vec<&str> = selector.split_whitespace().collect();
+            if !parts.is_empty() && matches_selector_chain(root, &parts) {
+                return element_value(root);
+            }
+            element_or_null(
+                query_selector_all_scoped(Some(root), &selector)
+                    .into_iter()
+                    .next(),
+            )
+        }),
+    );
+    props.insert(
+        "querySelectorAll".to_string(),
+        func(move |_, args| {
+            let selector = arg(&args, 0).to_js_string();
+            let mut matches = Vec::new();
+            let parts: Vec<&str> = selector.split_whitespace().collect();
+            if !parts.is_empty() && matches_selector_chain(root, &parts) {
+                matches.push(root);
+            }
+            matches.extend(query_selector_all_scoped(Some(root), &selector));
+            node_list(matches.into_iter().map(element_value).collect())
+        }),
+    );
+    props.insert(
+        "getElementById".to_string(),
+        func(move |_, args| {
+            let id = arg(&args, 0).to_js_string();
+            let found = dom::get_element_by_id(&id)
+                .filter(|node| *node == root || is_ancestor_of(root, *node));
+            element_or_null(found)
+        }),
+    );
+    props.insert(
+        "getElementsByTagName".to_string(),
+        func(move |_, args| {
+            let tag = arg(&args, 0).to_js_string().to_ascii_lowercase();
+            html_collection(move || {
+                let mut nodes = vec![root];
+                nodes.extend(descendant_elements(root));
+                nodes.retain(|node| tag == "*" || dom::tag_name(*node) == tag);
+                nodes.into_iter().map(element_value).collect()
+            })
+        }),
+    );
+    props.insert(
+        "createElement".to_string(),
+        func(|_, args| element_value(dom::create_element(&arg(&args, 0).to_js_string()))),
+    );
+    props.insert(
+        "createTextNode".to_string(),
+        func(|_, args| element_value(dom::create_text_node(&arg(&args, 0).to_js_string()))),
+    );
+    props.insert(
+        "createCDATASection".to_string(),
+        func({
+            let is_html = content_type == "text/html";
+            move |_, args| {
+                if is_html {
+                    dom_exception(
+                        "CDATA sections are not supported in HTML documents",
+                        "NotSupportedError",
+                    );
+                }
+                let data = arg(&args, 0).to_js_string();
+                if data.contains("]]>") {
+                    dom_exception("CDATA data must not contain ']]>'", "InvalidCharacterError");
+                }
+                element_value(dom::create_cdata_section(&data))
+            }
+        }),
+    );
+    props.insert(
+        "createProcessingInstruction".to_string(),
+        func(|_, args| {
+            create_processing_instruction_value(
+                &arg(&args, 0).to_js_string(),
+                &arg(&args, 1).to_js_string(),
+            )
+        }),
+    );
+    props.insert("implementation".to_string(), dom_implementation_value());
+    let document = Value::object(props);
+    w3cos_core::class::set_prototype_of(
+        &document,
+        &crate::dom_constructors::prototype(if content_type == "text/html" {
+            "HTMLDocument"
+        } else {
+            "XMLDocument"
+        }),
+    );
+    document
+}
+
+fn parse_document(source: &str, content_type: &str) -> Value {
+    parse_document_mode(source, content_type, false)
+}
+
+fn parse_document_mode(source: &str, content_type: &str, sanitize: bool) -> Value {
+    let container = dom::create_element("div");
+    if sanitize {
+        append_sanitized_html_fragment(container, source);
+    } else {
+        append_html_fragment(container, source);
+    }
+    let supported = matches!(
+        content_type,
+        "text/html" | "text/xml" | "application/xml" | "application/xhtml+xml" | "image/svg+xml"
+    );
+    if !supported {
+        let error = dom::create_element("parsererror");
+        dom::set_text_content(error, &format!("Unsupported MIME type: {content_type}"));
+        return parsed_document_value(error, "application/xml", None, None);
+    }
+    if content_type == "text/html" {
+        let existing_html = child_elements(container)
+            .into_iter()
+            .find(|node| dom::tag_name(*node) == "html");
+        let html = existing_html.unwrap_or_else(|| dom::create_element("html"));
+        let mut head = child_elements(html)
+            .into_iter()
+            .find(|node| dom::tag_name(*node) == "head");
+        let mut body = child_elements(html)
+            .into_iter()
+            .find(|node| dom::tag_name(*node) == "body");
+        if head.is_none() {
+            let node = dom::create_element("head");
+            match dom::first_child(html) {
+                Some(first) => dom::insert_before(html, node, first),
+                None => dom::append_child(html, node),
+            }
+            head = Some(node);
+        }
+        if body.is_none() {
+            let node = dom::create_element("body");
+            dom::append_child(html, node);
+            body = Some(node);
+        }
+        if existing_html.is_none() {
+            for child in dom::children(container) {
+                dom::append_child(body.unwrap(), child);
+            }
+        }
+        return parsed_document_value(html, content_type, head, body);
+    }
+
+    XML_PARSER_WARNING_EMITTED.with(|warned| {
+        if !warned.replace(true) {
+            eprintln!(
+                "[w3cos] warning: DOMParser XML modes use the compatibility parser; DTD, \
+                 namespace validation, and strict well-formedness diagnostics are unavailable"
+            );
+        }
+    });
+    let root = first_element_child(container).unwrap_or_else(|| {
+        let error = dom::create_element("parsererror");
+        dom::set_text_content(error, "No document element");
+        error
+    });
+    if content_type == "image/svg+xml" {
+        set_expando(
+            root,
+            "namespaceURI",
+            Value::string("http://www.w3.org/2000/svg"),
+        );
+    }
+    parsed_document_value(root, content_type, None, None)
+}
+
+pub(crate) fn sanitized_document_value(source: &str) -> Value {
+    parse_document_mode(source, "text/html", true)
+}
+
+pub(crate) fn unsafe_document_value(source: &str) -> Value {
+    parse_document(source, "text/html")
+}
+
+pub(crate) fn sanitized_fragment_value(source: &str) -> Value {
+    let fragment = dom::create_document_fragment();
+    append_sanitized_html_fragment(fragment, source);
+    element_value(fragment)
+}
+
+pub(crate) fn sanitized_element_value(tag_name: &str, source: &str) -> Value {
+    let element = dom::create_element(tag_name);
+    append_sanitized_html_fragment(element, source);
+    element_value(element)
+}
+
+fn dom_parser_class() -> Value {
+    DOM_PARSER_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = func(|_, _| {
+            let value = Value::object(HashMap::from([(
+                "parseFromString".to_string(),
+                func(|_, args| {
+                    parse_document(&arg(&args, 0).to_js_string(), &arg(&args, 1).to_js_string())
+                }),
+            )]));
+            w3cos_core::class::set_prototype_of(
+                &value,
+                &dom_parser_class().get_property("prototype"),
+            );
+            value
+        });
+        class.set_property("supported", Value::Bool(true));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property(
+            "parseFromString",
+            func(|_, args| {
+                parse_document(&arg(&args, 0).to_js_string(), &arg(&args, 1).to_js_string())
+            }),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn xml_serializer_class() -> Value {
+    XML_SERIALIZER_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = func(|_, _| {
+            let value = Value::object(HashMap::from([(
+                "serializeToString".to_string(),
+                func(|_, args| {
+                    let input = arg(&args, 0);
+                    let root = node_id_of(&input).or_else(|| {
+                        let root = input.get_property("__w3cos_document_root");
+                        (!root.is_undefined()).then(|| root.to_u32())
+                    });
+                    root.map(dom::outer_html)
+                        .map(Value::String)
+                        .unwrap_or_else(|| Value::string(""))
+                }),
+            )]));
+            w3cos_core::class::set_prototype_of(
+                &value,
+                &xml_serializer_class().get_property("prototype"),
+            );
+            value
+        });
+        class.set_property("supported", Value::Bool(true));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property(
+            "serializeToString",
+            func(|_, args| {
+                let input = arg(&args, 0);
+                let root = node_id_of(&input).or_else(|| {
+                    let root = input.get_property("__w3cos_document_root");
+                    (!root.is_undefined()).then(|| root.to_u32())
+                });
+                root.map(dom::outer_html)
+                    .map(Value::String)
+                    .unwrap_or_else(|| Value::string(""))
+            }),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn css_escape(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        let code = ch as u32;
+        if code == 0 {
+            output.push('\u{fffd}');
+        } else if (1..=31).contains(&code) || code == 127 {
+            output.push_str(&format!("\\{code:x} "));
+        } else if index == 0 && ch.is_ascii_digit() {
+            output.push_str(&format!("\\{code:x} "));
+        } else if index == 1 && ch.is_ascii_digit() && chars.first() == Some(&'-') {
+            output.push_str(&format!("\\{code:x} "));
+        } else if index == 0 && ch == '-' && chars.len() == 1 {
+            output.push_str("\\-");
+        } else if code >= 128 || ch == '-' || ch == '_' || ch.is_ascii_alphanumeric() {
+            output.push(ch);
+        } else {
+            output.push('\\');
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn legacy_escape(value: &str) -> String {
+    let mut output = String::new();
+    for unit in value.encode_utf16() {
+        let ch = char::from_u32(unit as u32);
+        if ch.is_some_and(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '@' | '*' | '_' | '+' | '-' | '.' | '/')
+        }) {
+            output.push(ch.expect("ASCII escape-safe code unit"));
+        } else if unit < 256 {
+            output.push_str(&format!("%{unit:02X}"));
+        } else {
+            output.push_str(&format!("%u{unit:04X}"));
+        }
+    }
+    output
+}
+
+fn legacy_unescape(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut units = Vec::<u16>::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 5 < bytes.len()
+            && bytes[index + 1] == b'u'
+            && let Ok(unit) = u16::from_str_radix(&value[index + 2..index + 6], 16)
+        {
+            units.push(unit);
+            index += 6;
+            continue;
+        }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(unit) = u16::from_str_radix(&value[index + 1..index + 3], 16)
+        {
+            units.push(unit);
+            index += 3;
+            continue;
+        }
+        let ch = value[index..].chars().next().expect("valid UTF-8 suffix");
+        units.extend(ch.to_string().encode_utf16());
+        index += ch.len_utf8();
+    }
+    String::from_utf16_lossy(&units)
+}
+
+fn eval_compat_value() -> Value {
+    func(|_, args| {
+        let input = arg(&args, 0);
+        if !matches!(input, Value::String(_)) {
+            return input;
+        }
+        EVAL_WARNING_EMITTED.with(|warned| {
+            if !warned.replace(true) {
+                eprintln!(
+                    "[W3C OS][compat warning] eval(string) is unavailable in the AOT runtime; \
+                     returning undefined"
+                );
+            }
+        });
+        Value::Undefined
+    })
+}
+
+fn function_compat_class() -> Value {
+    let class = Value::function(|_, _| {
+        FUNCTION_WARNING_EMITTED.with(|warned| {
+            if !warned.replace(true) {
+                eprintln!(
+                    "[W3C OS][compat warning] Function constructor source compilation is \
+                     unavailable in the AOT runtime; returned function yields undefined"
+                );
+            }
+        });
+        Value::function(|_, _| Value::Undefined)
+    });
+    class.set_property("name", Value::string("Function"));
+    let prototype = Value::object(HashMap::new());
+    prototype.set_property("constructor", class.clone());
+    class.set_property("prototype", prototype);
+    class
+}
+
+fn css_property_supported(property: &str, value: &str) -> bool {
+    let property = camel_to_kebab(property.trim());
+    if property.starts_with("--") {
+        return true;
+    }
+    if value.trim().is_empty() {
+        return false;
+    }
+    matches!(
+        property.as_str(),
+        "align-content"
+            | "align-items"
+            | "align-self"
+            | "animation"
+            | "appearance"
+            | "aspect-ratio"
+            | "backdrop-filter"
+            | "background"
+            | "background-color"
+            | "border"
+            | "border-radius"
+            | "bottom"
+            | "box-shadow"
+            | "box-sizing"
+            | "color"
+            | "column-gap"
+            | "contain"
+            | "content"
+            | "cursor"
+            | "display"
+            | "filter"
+            | "flex"
+            | "flex-basis"
+            | "flex-direction"
+            | "flex-grow"
+            | "flex-shrink"
+            | "flex-wrap"
+            | "font"
+            | "font-family"
+            | "font-size"
+            | "font-style"
+            | "font-weight"
+            | "gap"
+            | "grid"
+            | "grid-area"
+            | "grid-template-columns"
+            | "grid-template-rows"
+            | "height"
+            | "inset"
+            | "justify-content"
+            | "left"
+            | "letter-spacing"
+            | "line-height"
+            | "margin"
+            | "margin-bottom"
+            | "margin-left"
+            | "margin-right"
+            | "margin-top"
+            | "max-height"
+            | "max-width"
+            | "min-height"
+            | "min-width"
+            | "object-fit"
+            | "opacity"
+            | "order"
+            | "outline"
+            | "overflow"
+            | "overflow-x"
+            | "overflow-y"
+            | "padding"
+            | "padding-bottom"
+            | "padding-left"
+            | "padding-right"
+            | "padding-top"
+            | "pointer-events"
+            | "position"
+            | "right"
+            | "row-gap"
+            | "text-align"
+            | "text-decoration"
+            | "text-overflow"
+            | "top"
+            | "transform"
+            | "transform-origin"
+            | "transition"
+            | "user-select"
+            | "visibility"
+            | "white-space"
+            | "width"
+            | "will-change"
+            | "z-index"
+    )
+}
+
+fn css_condition_parts<'a>(condition: &'a str, keyword: &str) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let mut depth = 0_u32;
+    let mut start = 0;
+    let mut index = 0;
+    while index < condition.len() {
+        if depth == 0 && condition[index..].starts_with(keyword) {
+            parts.push(condition[start..index].trim());
+            index += keyword.len();
+            start = index;
+            continue;
+        }
+        let ch = condition[index..].chars().next().expect("valid UTF-8");
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        index += ch.len_utf8();
+    }
+    parts.push(condition[start..].trim());
+    parts
+}
+
+fn css_outer_group(condition: &str) -> Option<&str> {
+    if !condition.starts_with('(') || !condition.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0_u32;
+    for (index, ch) in condition.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && index + ch.len_utf8() != condition.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then(|| &condition[1..condition.len() - 1])
+}
+
+fn css_declaration_parts(condition: &str) -> Option<(&str, &str)> {
+    let mut depth = 0_u32;
+    for (index, ch) in condition.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => {
+                return Some((&condition[..index], &condition[index + 1..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn css_condition_supported(condition: &str) -> bool {
+    let condition = condition.trim();
+    if condition.is_empty() {
+        return false;
+    }
+    let or_parts = css_condition_parts(condition, " or ");
+    if or_parts.len() > 1 {
+        return or_parts.into_iter().any(css_condition_supported);
+    }
+    let and_parts = css_condition_parts(condition, " and ");
+    if and_parts.len() > 1 {
+        return and_parts.into_iter().all(css_condition_supported);
+    }
+    if condition
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("not "))
+    {
+        return !css_condition_supported(&condition[4..]);
+    }
+    if condition
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("selector("))
+        && condition.ends_with(')')
+    {
+        return !condition[9..condition.len() - 1].trim().is_empty();
+    }
+    if let Some(inner) = css_outer_group(condition) {
+        if let Some((property, value)) = css_declaration_parts(inner) {
+            return css_property_supported(property, value);
+        }
+        return css_condition_supported(inner);
+    }
+    css_declaration_parts(condition)
+        .is_some_and(|(property, value)| css_property_supported(property, value))
+}
+
+fn css_namespace_value() -> Value {
+    Value::object(HashMap::from([
+        (
+            "highlights".to_string(),
+            crate::highlight_web::highlight_registry_value(),
+        ),
+        (
+            "escape".to_string(),
+            func(|_, args| Value::string(&css_escape(&arg(&args, 0).to_js_string()))),
+        ),
+        (
+            "supports".to_string(),
+            func(|_, args| {
+                if args.len() >= 2 {
+                    return Value::Bool(css_property_supported(
+                        &arg(&args, 0).to_js_string(),
+                        &arg(&args, 1).to_js_string(),
+                    ));
+                }
+                Value::Bool(css_condition_supported(&arg(&args, 0).to_js_string()))
+            }),
+        ),
+    ]))
+}
+
+fn css_style_declaration_class() -> Value {
+    CSS_STYLE_DECLARATION_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(Value::object(HashMap::from([
+                ("name".to_string(), Value::string("TypeError")),
+                (
+                    "message".to_string(),
+                    Value::string("Illegal constructor: CSSStyleDeclaration"),
+                ),
+            ])))
+        });
+        class.set_property("name", Value::string("CSSStyleDeclaration"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for member in [
+            "cssFloat",
+            "cssText",
+            "getPropertyPriority",
+            "getPropertyValue",
+            "item",
+            "length",
+            "parentRule",
+            "removeProperty",
+            "setProperty",
+        ] {
+            prototype.set_property(member, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn illegal_cssom_class(
+    slot: &'static std::thread::LocalKey<RefCell<Option<Value>>>,
+    name: &'static str,
+    properties: &'static [&'static str],
+) -> Value {
+    slot.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(move |_, _| {
+            w3cos_core::throw_value(Value::object(HashMap::from([
+                ("name".into(), Value::string("TypeError")),
+                (
+                    "message".into(),
+                    Value::string(&format!("Illegal constructor: {name}")),
+                ),
+            ])))
+        });
+        class.set_property("name", Value::string(name));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in properties {
+            prototype.set_property(property, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn style_sheet_class() -> Value {
+    illegal_cssom_class(
+        &STYLE_SHEET_CLASS,
+        "StyleSheet",
+        &[
+            "disabled",
+            "href",
+            "media",
+            "ownerNode",
+            "parentStyleSheet",
+            "title",
+            "type",
+        ],
+    )
+}
+
+fn media_list_class() -> Value {
+    illegal_cssom_class(
+        &MEDIA_LIST_CLASS,
+        "MediaList",
+        &[
+            "appendMedium",
+            "deleteMedium",
+            "item",
+            "length",
+            "mediaText",
+            "toString",
+        ],
+    )
+}
+
+fn style_sheet_list_class() -> Value {
+    illegal_cssom_class(
+        &STYLE_SHEET_LIST_CLASS,
+        "StyleSheetList",
+        &["item", "length"],
+    )
+}
+
+fn parse_media_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|medium| !medium.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn media_list_value(text: &str) -> Value {
+    let media = Rc::new(RefCell::new(parse_media_list(text)));
+    let getter_media = Rc::clone(&media);
+    let setter_media = Rc::clone(&media);
+    let length_media = Rc::clone(&media);
+    let item_media = Rc::clone(&media);
+    let append_media = Rc::clone(&media);
+    let delete_media = Rc::clone(&media);
+    let string_media = media;
+    let value = Value::object(HashMap::from([
+        (
+            "__w3cos_getter_mediaText".into(),
+            func(move |_, _| Value::string(&getter_media.borrow().join(", "))),
+        ),
+        (
+            "__w3cos_setter_mediaText".into(),
+            func(move |_, args| {
+                *setter_media.borrow_mut() = parse_media_list(&arg(&args, 0).to_js_string());
+                Value::Undefined
+            }),
+        ),
+        (
+            "__w3cos_getter_length".into(),
+            func(move |_, _| Value::Number(length_media.borrow().len() as f64)),
+        ),
+        (
+            "item".into(),
+            func(move |_, args| {
+                item_media
+                    .borrow()
+                    .get(arg(&args, 0).to_u32() as usize)
+                    .map(|medium| Value::string(medium))
+                    .unwrap_or(Value::Null)
+            }),
+        ),
+        (
+            "appendMedium".into(),
+            func(move |_, args| {
+                let medium = arg(&args, 0).to_js_string();
+                if !append_media.borrow().iter().any(|item| item == &medium) {
+                    append_media.borrow_mut().push(medium);
+                }
+                Value::Undefined
+            }),
+        ),
+        (
+            "deleteMedium".into(),
+            func(move |_, args| {
+                let medium = arg(&args, 0).to_js_string();
+                let mut media = delete_media.borrow_mut();
+                let Some(index) = media.iter().position(|item| item == &medium) else {
+                    w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
+                        "The medium was not found",
+                        "NotFoundError",
+                    ));
+                };
+                media.remove(index);
+                Value::Undefined
+            }),
+        ),
+        (
+            "toString".into(),
+            func(move |_, _| Value::string(&string_media.borrow().join(", "))),
+        ),
+    ]));
+    w3cos_core::class::set_prototype_of(&value, &media_list_class().get_property("prototype"));
+    value
+}
+
+fn style_sheet_list_value(sheets: Rc<RefCell<Vec<Value>>>) -> Value {
+    let length_sheets = Rc::clone(&sheets);
+    let item_sheets = Rc::clone(&sheets);
+    let indexed_sheets = sheets;
+    let properties = HashMap::from([
+        (
+            "__w3cos_getter_length".into(),
+            func(move |_, _| Value::Number(length_sheets.borrow().len() as f64)),
+        ),
+        (
+            "item".into(),
+            func(move |_, args| {
+                item_sheets
+                    .borrow()
+                    .get(arg(&args, 0).to_u32() as usize)
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }),
+        ),
+    ]);
+    let handler = ProxyBuilder::new()
+        .get(move |target, key, _receiver| {
+            let inherited = target.get_property(key);
+            if !inherited.is_undefined() {
+                return inherited;
+            }
+            key.parse::<usize>()
+                .ok()
+                .and_then(|index| indexed_sheets.borrow().get(index).cloned())
+                .unwrap_or(Value::Undefined)
+        })
+        .build();
+    let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+        properties, handler,
+    ))));
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &style_sheet_list_class().get_property("prototype"),
+    );
+    value
+}
+
+fn stylesheet_rules_value(rules: &Rc<RefCell<Vec<String>>>) -> Value {
+    js_array(
+        rules
+            .borrow()
+            .iter()
+            .map(|css_text| {
+                let selector = css_text
+                    .split_once('{')
+                    .map(|(selector, _)| selector.trim())
+                    .unwrap_or_default();
+                crate::css_rules_web::style_rule_value(css_text, selector)
+            })
+            .collect(),
+    )
+}
+
+fn parse_stylesheet_rules(text: &str) -> Vec<String> {
+    text.split_inclusive('}')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && rule.contains('{'))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn stylesheet_value() -> Value {
+    let rules = Rc::new(RefCell::new(Vec::<String>::new()));
+    let value = Value::object(HashMap::from([
+        ("disabled".to_string(), Value::Bool(false)),
+        ("href".to_string(), Value::Null),
+        ("ownerNode".to_string(), Value::Null),
+        ("parentStyleSheet".to_string(), Value::Null),
+        ("title".to_string(), Value::Null),
+        ("type".to_string(), Value::string("text/css")),
+        ("media".to_string(), media_list_value("")),
+    ]));
+    for name in ["cssRules", "rules"] {
+        let rules = rules.clone();
+        value.set_property(
+            &format!("__w3cos_getter_{name}"),
+            func(move |_, _| stylesheet_rules_value(&rules)),
+        );
+    }
+    {
+        let rules = rules.clone();
+        value.set_property(
+            "insertRule",
+            func(move |_, args| {
+                let rule = arg(&args, 0).to_js_string();
+                let mut rules = rules.borrow_mut();
+                let index = if arg(&args, 1).is_undefined() {
+                    0
+                } else {
+                    arg(&args, 1).to_u32() as usize
+                };
+                if index > rules.len() {
+                    w3cos_core::throw_value(Value::object(HashMap::from([(
+                        "name".to_string(),
+                        Value::string("IndexSizeError"),
+                    )])));
+                }
+                rules.insert(index, rule);
+                Value::Number(index as f64)
+            }),
+        );
+    }
+    {
+        let rules = rules.clone();
+        value.set_property(
+            "deleteRule",
+            func(move |_, args| {
+                let index = arg(&args, 0).to_u32() as usize;
+                if index < rules.borrow().len() {
+                    rules.borrow_mut().remove(index);
+                }
+                Value::Undefined
+            }),
+        );
+    }
+    {
+        let rules = rules.clone();
+        value.set_property(
+            "replaceSync",
+            func(move |_, args| {
+                *rules.borrow_mut() = parse_stylesheet_rules(&arg(&args, 0).to_js_string());
+                Value::Undefined
+            }),
+        );
+    }
+    {
+        let rules = rules.clone();
+        let sheet = value.clone();
+        value.set_property(
+            "replace",
+            func(move |_, args| {
+                *rules.borrow_mut() = parse_stylesheet_rules(&arg(&args, 0).to_js_string());
+                resolved_thenable(sheet.clone())
+            }),
+        );
+    }
+    value.set_property("addRule", value.get_property("insertRule"));
+    value.set_property("removeRule", value.get_property("deleteRule"));
+    w3cos_core::class::set_prototype_of(&value, &css_style_sheet_class().get_property("prototype"));
+    value
+}
+
+fn css_style_sheet_class() -> Value {
+    CSS_STYLE_SHEET_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| stylesheet_value());
+        class.set_property("name", Value::string("CSSStyleSheet"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in [
+            "addRule",
+            "cssRules",
+            "deleteRule",
+            "insertRule",
+            "ownerRule",
+            "removeRule",
+            "replace",
+            "replaceSync",
+            "rules",
+        ] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &style_sheet_class().get_property("prototype"),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
 fn rect_value(rect: w3cos_dom::DOMRect) -> Value {
-    let mut props = HashMap::new();
-    let insert = |m: &mut HashMap<String, Value>, k: &str, v: f32| {
-        m.insert(k.to_string(), Value::Number(v as f64));
+    crate::geometry_web::rect(
+        rect.x as f64,
+        rect.y as f64,
+        rect.width as f64,
+        rect.height as f64,
+    )
+}
+
+fn caret_position_class() -> Value {
+    CARET_POSITION_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(w3cos_core::error_instance(
+                "TypeError",
+                vec![Value::string("Illegal constructor: CaretPosition")],
+            ))
+        });
+        class.set_property("name", Value::string("CaretPosition"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property("getClientRect", Value::Undefined);
+        prototype.set_property("offset", Value::Undefined);
+        prototype.set_property("offsetNode", Value::Undefined);
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn math_ml_element_class() -> Value {
+    MATH_ML_ELEMENT_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(w3cos_core::error_instance(
+                "TypeError",
+                vec![Value::string("Illegal constructor: MathMLElement")],
+            ))
+        });
+        class.set_property("name", Value::string("MathMLElement"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        if let Value::Object(html_prototype) = crate::dom_constructors::prototype("HTMLElement") {
+            for key in html_prototype.borrow().keys() {
+                if key != "constructor" {
+                    prototype.set_property(&key, Value::Undefined);
+                }
+            }
+        }
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::dom_constructors::prototype("Element"),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn window_class() -> Value {
+    WINDOW_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(w3cos_core::error_instance(
+                "TypeError",
+                vec![Value::string("Illegal constructor: Window")],
+            ))
+        });
+        class.set_property("name", Value::string("Window"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for (name, value) in [("TEMPORARY", 0.0), ("PERSISTENT", 1.0)] {
+            prototype.set_property(name, Value::Number(value));
+            class.set_property(name, Value::Number(value));
+        }
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::web_events::event_target_class().get_property("prototype"),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn deepest_node_at_point(node: u32, x: f32, y: f32) -> Option<u32> {
+    let mut found = None;
+    for child in dom::children(node) {
+        if let Some(descendant) = deepest_node_at_point(child, x, y) {
+            found = Some(descendant);
+            continue;
+        }
+        let rect = dom::bounding_rect(child);
+        if x >= rect.left() && x <= rect.right() && y >= rect.top() && y <= rect.bottom() {
+            found = Some(child);
+        }
+    }
+    found
+}
+
+fn first_text_descendant(node: u32) -> Option<u32> {
+    if dom::node_type(node) == 3 {
+        return Some(node);
+    }
+    dom::children(node)
+        .into_iter()
+        .find_map(first_text_descendant)
+}
+
+fn caret_position_from_point(x: f32, y: f32) -> Value {
+    let Some(hit) = deepest_node_at_point(document_element_id(), x, y) else {
+        return Value::Null;
     };
-    insert(&mut props, "x", rect.x);
-    insert(&mut props, "y", rect.y);
-    insert(&mut props, "width", rect.width);
-    insert(&mut props, "height", rect.height);
-    insert(&mut props, "top", rect.top());
-    insert(&mut props, "left", rect.left());
-    insert(&mut props, "right", rect.right());
-    insert(&mut props, "bottom", rect.bottom());
-    Value::object(props)
+    let offset_node = first_text_descendant(hit).unwrap_or(hit);
+    let text_length = dom::get_text_content(offset_node)
+        .unwrap_or_default()
+        .encode_utf16()
+        .count();
+    let rect = dom::bounding_rect(hit);
+    let offset = if text_length == 0 || rect.width <= 0.0 {
+        0
+    } else {
+        (((x - rect.left()) / rect.width).clamp(0.0, 1.0) * text_length as f32).round() as usize
+    };
+    let value = Value::object(HashMap::from([
+        ("offsetNode".into(), element_value(offset_node)),
+        ("offset".into(), Value::Number(offset as f64)),
+    ]));
+    value.set_property(
+        "getClientRect",
+        Value::function(move |_, _| rect_value(dom::bounding_rect(hit))),
+    );
+    w3cos_core::class::set_prototype_of(&value, &caret_position_class().get_property("prototype"));
+    value
 }
 
 fn is_svg_node(node: u32) -> bool {
@@ -786,14 +2456,7 @@ fn svg_bbox(node: u32) -> w3cos_dom::DOMRect {
 }
 
 fn svg_identity_matrix() -> Value {
-    Value::object(HashMap::from([
-        ("a".to_string(), Value::Number(1.0)),
-        ("b".to_string(), Value::Number(0.0)),
-        ("c".to_string(), Value::Number(0.0)),
-        ("d".to_string(), Value::Number(1.0)),
-        ("e".to_string(), Value::Number(0.0)),
-        ("f".to_string(), Value::Number(0.0)),
-    ]))
+    crate::geometry_web::identity_matrix()
 }
 
 fn owner_svg_element(node: u32) -> Value {
@@ -890,37 +2553,7 @@ fn svg_computed_get(node: u32, key: &str) -> Option<Value> {
             };
             Value::Number(length)
         }),
-        "createSVGPoint" => Value::function(|_, _| {
-            let point = Value::object(HashMap::from([
-                ("x".to_string(), Value::Number(0.0)),
-                ("y".to_string(), Value::Number(0.0)),
-            ]));
-            point.set_property(
-                "matrixTransform",
-                Value::function(|this, args| {
-                    let matrix = args.first().cloned().unwrap_or_default();
-                    Value::object(HashMap::from([
-                        (
-                            "x".to_string(),
-                            Value::Number(
-                                this.get_property("x").to_number()
-                                    * matrix.get_property("a").to_number()
-                                    + matrix.get_property("e").to_number(),
-                            ),
-                        ),
-                        (
-                            "y".to_string(),
-                            Value::Number(
-                                this.get_property("y").to_number()
-                                    * matrix.get_property("d").to_number()
-                                    + matrix.get_property("f").to_number(),
-                            ),
-                        ),
-                    ]))
-                }),
-            );
-            point
-        }),
+        "createSVGPoint" => Value::function(|_, _| crate::geometry_web::point(0.0, 0.0, 0.0, 1.0)),
         "createSVGMatrix" => Value::function(|_, _| svg_identity_matrix()),
         "createSVGRect" => Value::function(|_, _| rect_value(w3cos_dom::DOMRect::zero())),
         _ => return None,
@@ -933,6 +2566,378 @@ fn is_inputish(node: u32) -> bool {
         dom::tag_name(node).as_str(),
         "input" | "textarea" | "select" | "option"
     )
+}
+
+#[derive(Default)]
+struct ValiditySnapshot {
+    bad_input: bool,
+    custom_error: bool,
+    pattern_mismatch: bool,
+    range_overflow: bool,
+    range_underflow: bool,
+    step_mismatch: bool,
+    too_long: bool,
+    too_short: bool,
+    type_mismatch: bool,
+    value_missing: bool,
+}
+
+impl ValiditySnapshot {
+    fn valid(&self) -> bool {
+        !(self.bad_input
+            || self.custom_error
+            || self.pattern_mismatch
+            || self.range_overflow
+            || self.range_underflow
+            || self.step_mismatch
+            || self.too_long
+            || self.too_short
+            || self.type_mismatch
+            || self.value_missing)
+    }
+}
+
+fn constraint_validation_candidate(node: u32) -> bool {
+    let tag = dom::tag_name(node);
+    if !matches!(tag.as_str(), "input" | "textarea" | "select") {
+        return false;
+    }
+    if dom::has_attribute(node, "disabled") || dom::has_attribute(node, "readonly") {
+        return false;
+    }
+    if tag == "input" {
+        let input_type = dom::get_attribute(node, "type")
+            .unwrap_or_else(|| "text".into())
+            .to_ascii_lowercase();
+        if matches!(
+            input_type.as_str(),
+            "hidden" | "button" | "reset" | "submit" | "image"
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn validity_snapshot(node: u32) -> ValiditySnapshot {
+    if !constraint_validation_candidate(node) {
+        return ValiditySnapshot::default();
+    }
+    let value = dom::get_attribute(node, "value").unwrap_or_default();
+    let input_type = dom::get_attribute(node, "type")
+        .unwrap_or_else(|| "text".into())
+        .to_ascii_lowercase();
+    let value_missing = dom::has_attribute(node, "required") && value.is_empty();
+    let type_mismatch = !value.is_empty()
+        && match input_type.as_str() {
+            "email" => {
+                let (local, domain) = value.split_once('@').unwrap_or_default();
+                local.is_empty()
+                    || domain.is_empty()
+                    || domain.starts_with('.')
+                    || domain.ends_with('.')
+            }
+            "url" => {
+                let lower = value.to_ascii_lowercase();
+                !(lower.starts_with("http://")
+                    || lower.starts_with("https://")
+                    || lower.starts_with("ftp://"))
+            }
+            _ => false,
+        };
+    let utf16_len = value.encode_utf16().count();
+    let too_short = !value.is_empty()
+        && dom::get_attribute(node, "minlength")
+            .and_then(|length| length.parse::<usize>().ok())
+            .is_some_and(|minimum| utf16_len < minimum);
+    let too_long = dom::get_attribute(node, "maxlength")
+        .and_then(|length| length.parse::<usize>().ok())
+        .is_some_and(|maximum| utf16_len > maximum);
+    let numeric_value = value.parse::<f64>().ok();
+    let range_underflow = numeric_value.is_some_and(|number| {
+        dom::get_attribute(node, "min")
+            .and_then(|minimum| minimum.parse::<f64>().ok())
+            .is_some_and(|minimum| number < minimum)
+    });
+    let range_overflow = numeric_value.is_some_and(|number| {
+        dom::get_attribute(node, "max")
+            .and_then(|maximum| maximum.parse::<f64>().ok())
+            .is_some_and(|maximum| number > maximum)
+    });
+    let step_mismatch = numeric_value.is_some_and(|number| {
+        let Some(step) = dom::get_attribute(node, "step")
+            .filter(|step| step != "any")
+            .and_then(|step| step.parse::<f64>().ok())
+            .filter(|step| *step > 0.0)
+        else {
+            return false;
+        };
+        let base = dom::get_attribute(node, "min")
+            .and_then(|minimum| minimum.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let quotient = (number - base) / step;
+        (quotient - quotient.round()).abs() > 1e-9
+    });
+    let pattern_mismatch = if !value.is_empty() && dom::has_attribute(node, "pattern") {
+        static WARNING: std::sync::Once = std::sync::Once::new();
+        WARNING.call_once(|| {
+            eprintln!(
+                "[w3cos] warning: HTML pattern constraint parsing is not yet available; \
+                 ValidityState.patternMismatch remains false"
+            );
+        });
+        false
+    } else {
+        false
+    };
+    ValiditySnapshot {
+        custom_error: get_expando(node, "__validation_message")
+            .is_some_and(|message| !message.to_js_string().is_empty()),
+        pattern_mismatch,
+        range_overflow,
+        range_underflow,
+        step_mismatch,
+        too_long,
+        too_short,
+        type_mismatch,
+        value_missing,
+        ..Default::default()
+    }
+}
+
+fn validity_state_value(node: u32) -> Value {
+    if let Some(value) = get_expando(node, "validity") {
+        return value;
+    }
+    let value = Value::object(HashMap::new());
+    let getters: [(&str, fn(&ValiditySnapshot) -> bool); 11] = [
+        ("badInput", |state: &ValiditySnapshot| state.bad_input),
+        ("customError", |state: &ValiditySnapshot| state.custom_error),
+        ("patternMismatch", |state: &ValiditySnapshot| {
+            state.pattern_mismatch
+        }),
+        ("rangeOverflow", |state: &ValiditySnapshot| {
+            state.range_overflow
+        }),
+        ("rangeUnderflow", |state: &ValiditySnapshot| {
+            state.range_underflow
+        }),
+        ("stepMismatch", |state: &ValiditySnapshot| {
+            state.step_mismatch
+        }),
+        ("tooLong", |state: &ValiditySnapshot| state.too_long),
+        ("tooShort", |state: &ValiditySnapshot| state.too_short),
+        ("typeMismatch", |state: &ValiditySnapshot| {
+            state.type_mismatch
+        }),
+        ("valid", |state: &ValiditySnapshot| state.valid()),
+        ("valueMissing", |state: &ValiditySnapshot| {
+            state.value_missing
+        }),
+    ];
+    for (property, getter) in getters {
+        value.set_property(
+            &format!("__w3cos_getter_{property}"),
+            Value::function(move |_, _| Value::Bool(getter(&validity_snapshot(node)))),
+        );
+    }
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype("ValidityState"),
+    );
+    set_expando(node, "validity", value.clone());
+    value
+}
+
+fn validation_message(node: u32) -> String {
+    let state = validity_snapshot(node);
+    if state.valid() {
+        return String::new();
+    }
+    if state.custom_error {
+        return get_expando(node, "__validation_message")
+            .map(|message| message.to_js_string())
+            .unwrap_or_default();
+    }
+    if state.value_missing {
+        return "Please fill out this field.".into();
+    }
+    if state.type_mismatch {
+        return "Please enter a valid value.".into();
+    }
+    if state.too_short || state.too_long {
+        return "Please use the requested length.".into();
+    }
+    if state.range_underflow || state.range_overflow || state.step_mismatch {
+        return "Please enter a valid value within the requested range.".into();
+    }
+    "The value is invalid.".into()
+}
+
+fn validate_control(node: u32, report: bool) -> bool {
+    let valid = validity_snapshot(node).valid();
+    if !valid {
+        let event = w3cos_core::class::construct(
+            &crate::web_events::event_class(),
+            vec![
+                Value::string("invalid"),
+                Value::object(HashMap::from([("cancelable".into(), Value::Bool(true))])),
+            ],
+        );
+        let _ = js_dispatch_event(node, event);
+        if report {
+            static WARNING: std::sync::Once = std::sync::Once::new();
+            WARNING.call_once(|| {
+                eprintln!(
+                    "[w3cos] warning: reportValidity() dispatches invalid events, but native \
+                     validation UI requires a host adapter"
+                );
+            });
+        }
+    }
+    valid
+}
+
+fn form_controls(node: u32, controls: &mut Vec<u32>) {
+    for child in dom::children(node) {
+        if constraint_validation_candidate(child) {
+            controls.push(child);
+        }
+        form_controls(child, controls);
+    }
+}
+
+fn validate_form(node: u32, report: bool) -> bool {
+    let mut controls = Vec::new();
+    form_controls(node, &mut controls);
+    controls.into_iter().fold(true, |valid, control| {
+        validate_control(control, report) && valid
+    })
+}
+
+fn scroll_alignment_delta(
+    target_start: f32,
+    target_size: f32,
+    viewport_start: f32,
+    viewport_size: f32,
+    alignment: &str,
+) -> f32 {
+    match alignment {
+        "center" => target_start + target_size / 2.0 - (viewport_start + viewport_size / 2.0),
+        "end" => target_start + target_size - (viewport_start + viewport_size),
+        "nearest" => {
+            if target_start < viewport_start {
+                target_start - viewport_start
+            } else if target_start + target_size > viewport_start + viewport_size {
+                target_start + target_size - (viewport_start + viewport_size)
+            } else {
+                0.0
+            }
+        }
+        _ => target_start - viewport_start,
+    }
+}
+
+fn scroll_container_axes(node: u32) -> (bool, bool) {
+    dom::with_document(|document| {
+        let style = Element::new(NodeId::from_u32(node)).get_computed_style(document);
+        (
+            style.get_property("overflow-x") != "visible",
+            style.get_property("overflow-y") != "visible",
+        )
+    })
+}
+
+fn scroll_element_into_view(node: u32, options: Value) {
+    let (block, inline, nearest_only) = if options.is_object() {
+        let behavior = options.get_property("behavior").to_js_string();
+        if behavior == "smooth" {
+            SMOOTH_SCROLL_WARNED.with(|warned| {
+                if !warned.replace(true) {
+                    eprintln!(
+                        "[w3cos] warning: smooth scrollIntoView animation is unavailable; \
+                         applying the final scroll position immediately"
+                    );
+                }
+            });
+        }
+        let block = options.get_property("block").to_js_string();
+        let inline = options.get_property("inline").to_js_string();
+        (
+            if block.is_empty() {
+                "start".to_string()
+            } else {
+                block
+            },
+            if inline.is_empty() {
+                "nearest".to_string()
+            } else {
+                inline
+            },
+            options.get_property("container").to_js_string() == "nearest",
+        )
+    } else {
+        (
+            if matches!(&options, Value::Bool(false)) {
+                "end".to_string()
+            } else {
+                "start".to_string()
+            },
+            "nearest".to_string(),
+            false,
+        )
+    };
+
+    let mut target = dom::bounding_rect(node);
+    let mut parent = dom::parent_node(node);
+    let mut scrolled_container = false;
+    while let Some(ancestor) = parent {
+        let (scroll_x, scroll_y) = scroll_container_axes(ancestor);
+        if scroll_x || scroll_y {
+            let viewport = dom::bounding_rect(ancestor);
+            let (current_left, current_top) = dom::get_scroll_offset(ancestor);
+            let dx = scroll_x.then(|| {
+                scroll_alignment_delta(target.x, target.width, viewport.x, viewport.width, &inline)
+            });
+            let dy = scroll_y.then(|| {
+                scroll_alignment_delta(target.y, target.height, viewport.y, viewport.height, &block)
+            });
+            let new_left = dx.map(|delta| current_left + delta);
+            let new_top = dy.map(|delta| current_top + delta);
+            let changed = new_left.is_some_and(|value| value != current_left)
+                || new_top.is_some_and(|value| value != current_top);
+            if changed {
+                dom::set_scroll_offset(ancestor, new_left, new_top);
+                dispatch_sync(ancestor, EventType::Scroll, EventData::None);
+                target.x -= dx.unwrap_or(0.0);
+                target.y -= dy.unwrap_or(0.0);
+            }
+            scrolled_container = true;
+            if nearest_only {
+                break;
+            }
+        }
+        parent = dom::parent_node(ancestor);
+    }
+
+    if !nearest_only || !scrolled_container {
+        let (width, height, _) = VIEWPORT.with(Cell::get);
+        let dx = scroll_alignment_delta(target.x, target.width, 0.0, width as f32, &inline);
+        let dy = scroll_alignment_delta(target.y, target.height, 0.0, height as f32, &block);
+        if dx != 0.0 || dy != 0.0 {
+            let (left, top) = WINDOW_SCROLL.with(Cell::get);
+            WINDOW_SCROLL.with(|offset| offset.set((left + dx as f64, top + dy as f64)));
+            if let Some(window) = WINDOW_VALUE.with(|value| value.borrow().clone()) {
+                let event = w3cos_core::class::construct(
+                    &crate::web_events::event_class(),
+                    vec![Value::string("scroll")],
+                );
+                window
+                    .get_property("visualViewport")
+                    .call_method("dispatchEvent", vec![event]);
+            }
+        }
+    }
 }
 
 fn element_computed_get(node: u32, key: &str) -> Value {
@@ -959,7 +2964,105 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }
         "namespaceURI" => Value::string("http://www.w3.org/1999/xhtml"),
         "ownerDocument" => document_value(),
-        "isConnected" => Value::Bool(dom::is_connected(node)),
+        "isConnected" => Value::Bool(node_is_connected(node)),
+        "buffered" | "played" | "seekable"
+            if matches!(dom::tag_name(node).as_str(), "audio" | "video") =>
+        {
+            crate::compat_web::time_ranges_value(Vec::new())
+        }
+        "error" if matches!(dom::tag_name(node).as_str(), "audio" | "video") => Value::Null,
+        "textTracks" if matches!(dom::tag_name(node).as_str(), "audio" | "video") => {
+            if let Some(list) = get_expando(node, "textTracks") {
+                list
+            } else {
+                let list = crate::text_tracks_web::text_track_list_value();
+                set_expando(node, "textTracks", list.clone());
+                list
+            }
+        }
+        "addTextTrack" if matches!(dom::tag_name(node).as_str(), "audio" | "video") => {
+            func(move |_, args| {
+                let track = crate::text_tracks_web::text_track_value(
+                    &arg(&args, 0).to_js_string(),
+                    &arg(&args, 1).to_js_string(),
+                    &arg(&args, 2).to_js_string(),
+                );
+                let list = element_computed_get(node, "textTracks");
+                crate::text_tracks_web::append_track(&list, track.clone());
+                track
+            })
+        }
+        "getVideoPlaybackQuality" if dom::tag_name(node) == "video" => {
+            func(|_, _| crate::text_tracks_web::playback_quality_value())
+        }
+        "attachInternals" if dom::node_type(node) == 1 => func(move |_, _| {
+            if !dom::tag_name(node).contains('-') {
+                w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
+                    "ElementInternals are only available to custom elements",
+                    "NotSupportedError",
+                ));
+            }
+            if get_expando(node, "ElementInternals").is_some() {
+                w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
+                    "attachInternals() may only be called once",
+                    "NotSupportedError",
+                ));
+            }
+            let internals =
+                crate::custom_elements_web::element_internals_value(element_value(node), node);
+            set_expando(node, "ElementInternals", internals.clone());
+            internals
+        }),
+        "pseudo" if dom::node_type(node) == 1 => func(move |_, args| {
+            let element = element_value(node);
+            crate::custom_elements_web::css_pseudo_element_value(
+                element.clone(),
+                element,
+                arg(&args, 0).to_js_string(),
+            )
+        }),
+        "audioPlaybackStats" if matches!(dom::tag_name(node).as_str(), "audio" | "video") => {
+            if let Some(stats) = get_expando(node, "audioPlaybackStats") {
+                stats
+            } else {
+                let stats = crate::media_devices_web::media_stats_value("AudioPlaybackStats");
+                set_expando(node, "audioPlaybackStats", stats.clone());
+                stats
+            }
+        }
+        "remote" if matches!(dom::tag_name(node).as_str(), "audio" | "video") => {
+            if let Some(remote) = get_expando(node, "remote") {
+                remote
+            } else {
+                let remote = crate::compat_web::remote_playback_value();
+                set_expando(node, "remote", remote.clone());
+                remote
+            }
+        }
+        "requestPictureInPicture" if dom::tag_name(node) == "video" => func(|_, _| {
+            warn_host_api(
+                "HTMLVideoElement.requestPictureInPicture()",
+                "rejected NotSupportedError Promise",
+            );
+            w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
+                "Picture-in-Picture requires native multi-window video integration",
+                "NotSupportedError",
+            )])
+        }),
+        "animate" if dom::node_type(node) == 1 => func(move |_, args| {
+            crate::animations_web::animate_element(
+                element_value(node),
+                arg(&args, 0),
+                arg(&args, 1),
+                node,
+            )
+        }),
+        "getAnimations" if dom::node_type(node) == 1 => func(move |_, options| {
+            let subtree = options
+                .first()
+                .is_some_and(|options| options.get_property("subtree").to_bool());
+            crate::animations_web::animations_for(Some(node), subtree)
+        }),
 
         // ── Tree traversal ──
         "parentNode" => element_or_null(dom::parent_node(node)),
@@ -967,13 +3070,15 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Some(p) if dom::node_type(p) == 1 => element_value(p),
             _ => Value::Null,
         },
-        "children" => js_array(
+        "children" => html_collection(move || {
             child_elements(node)
                 .into_iter()
                 .map(element_value)
-                .collect(),
-        ),
-        "childNodes" => js_array(dom::children(node).into_iter().map(element_value).collect()),
+                .collect()
+        }),
+        "childNodes" => {
+            live_node_list(move || dom::children(node).into_iter().map(element_value).collect())
+        }
         "childElementCount" => Value::Number(child_elements(node).len() as f64),
         "firstChild" => element_or_null(dom::first_child(node)),
         "lastChild" => element_or_null(dom::last_child(node)),
@@ -984,7 +3089,10 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "nextElementSibling" => element_or_null(sibling_element(node, true)),
         "previousElementSibling" => element_or_null(sibling_element(node, false)),
         "hasChildNodes" => func(move |_, _| Value::Bool(dom::first_child(node).is_some())),
-        "getRootNode" => func(|_, _| document_value()),
+        "getRootNode" => func(move |_, args| {
+            let composed = arg(&args, 0).get_property("composed").to_bool();
+            root_node_value(node, composed)
+        }),
         "contains" => func(move |_, args| {
             let Some(other) = node_id_of(&arg(&args, 0)) else {
                 return Value::Bool(false);
@@ -1001,6 +3109,131 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Some(t) => Value::string(&t),
             None => Value::Null,
         },
+        "length" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => Value::Number(
+            dom::get_text_content(node)
+                .unwrap_or_default()
+                .encode_utf16()
+                .count() as f64,
+        ),
+        "substringData" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => func(move |_, args| {
+            let units = dom::get_text_content(node)
+                .unwrap_or_default()
+                .encode_utf16()
+                .collect::<Vec<_>>();
+            let offset = arg(&args, 0).to_u32() as usize;
+            if offset > units.len() {
+                w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
+                    "CharacterData offset is outside the data",
+                    "IndexSizeError",
+                ));
+            }
+            let end = offset
+                .saturating_add(arg(&args, 1).to_u32() as usize)
+                .min(units.len());
+            Value::string(&String::from_utf16_lossy(&units[offset..end]))
+        }),
+        "appendData" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => func(move |_, args| {
+            let mut data = dom::get_text_content(node).unwrap_or_default();
+            data.push_str(&arg(&args, 0).to_js_string());
+            dom::set_text_content(node, &data);
+            Value::Undefined
+        }),
+        "insertData" | "deleteData" | "replaceData"
+            if matches!(dom::node_type(node), 3 | 4 | 7 | 8) =>
+        {
+            let operation = key.to_string();
+            func(move |_, args| {
+                let mut units = dom::get_text_content(node)
+                    .unwrap_or_default()
+                    .encode_utf16()
+                    .collect::<Vec<_>>();
+                let offset = arg(&args, 0).to_u32() as usize;
+                if offset > units.len() {
+                    w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
+                        "CharacterData offset is outside the data",
+                        "IndexSizeError",
+                    ));
+                }
+                let (count_index, data_index) = if operation == "insertData" {
+                    (None, 1)
+                } else {
+                    (Some(1), 2)
+                };
+                let end = count_index
+                    .map(|index| {
+                        offset
+                            .saturating_add(arg(&args, index).to_u32() as usize)
+                            .min(units.len())
+                    })
+                    .unwrap_or(offset);
+                let replacement = if operation == "deleteData" {
+                    Vec::new()
+                } else {
+                    arg(&args, data_index)
+                        .to_js_string()
+                        .encode_utf16()
+                        .collect()
+                };
+                units.splice(offset..end, replacement);
+                dom::set_text_content(node, &String::from_utf16_lossy(&units));
+                Value::Undefined
+            })
+        }
+        "wholeText" if matches!(dom::node_type(node), 3 | 4) => {
+            let mut previous = Vec::new();
+            let mut cursor = dom::previous_sibling(node);
+            while let Some(sibling) = cursor {
+                if !matches!(dom::node_type(sibling), 3 | 4) {
+                    break;
+                }
+                previous.push(dom::get_text_content(sibling).unwrap_or_default());
+                cursor = dom::previous_sibling(sibling);
+            }
+            previous.reverse();
+            let mut text = previous.concat();
+            text.push_str(&dom::get_text_content(node).unwrap_or_default());
+            cursor = dom::next_sibling(node);
+            while let Some(sibling) = cursor {
+                if !matches!(dom::node_type(sibling), 3 | 4) {
+                    break;
+                }
+                text.push_str(&dom::get_text_content(sibling).unwrap_or_default());
+                cursor = dom::next_sibling(sibling);
+            }
+            Value::string(&text)
+        }
+        "assignedSlot" if matches!(dom::node_type(node), 3 | 4) => Value::Null,
+        "splitText" if matches!(dom::node_type(node), 3 | 4) => func(move |_, args| {
+            let mut units = dom::get_text_content(node)
+                .unwrap_or_default()
+                .encode_utf16()
+                .collect::<Vec<_>>();
+            let offset = arg(&args, 0).to_u32() as usize;
+            if offset > units.len() {
+                w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
+                    "Text offset is outside the data",
+                    "IndexSizeError",
+                ));
+            }
+            let trailing = units.split_off(offset);
+            dom::set_text_content(node, &String::from_utf16_lossy(&units));
+            let new_node = if dom::node_type(node) == 4 {
+                dom::create_cdata_section(&String::from_utf16_lossy(&trailing))
+            } else {
+                dom::create_text_node(&String::from_utf16_lossy(&trailing))
+            };
+            if let Some(parent) = dom::parent_node(node) {
+                match dom::next_sibling(node) {
+                    Some(next) => dom::insert_before(parent, new_node, next),
+                    None => dom::append_child(parent, new_node),
+                }
+            }
+            element_value(new_node)
+        }),
+        "target" if dom::node_type(node) == 7 => Value::string(&dom::tag_name(node)),
+        "sheet" if dom::node_type(node) == 7 => Value::Null,
+        "name" if dom::node_type(node) == 10 => Value::string(&dom::tag_name(node)),
+        "publicId" | "systemId" if dom::node_type(node) == 10 => Value::string(""),
         "innerText" => Value::string(&dom::inner_text(node)),
         "innerHTML" => {
             let mut s = dom::get_text_content(node).unwrap_or_default();
@@ -1016,14 +3249,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "className" => Value::string(&dom::class_name(node)),
         "classList" => class_list_value(node),
         "attributes" => attributes_value(node),
-        "dataset" => {
-            let map = dom::with_document(|doc| Element::new(NodeId::from_u32(node)).dataset(doc));
-            Value::object(
-                map.into_iter()
-                    .map(|(k, v)| (k, Value::String(v)))
-                    .collect(),
-            )
-        }
+        "dataset" => dataset_value(node),
         "getAttribute" => {
             func(
                 move |_, args| match dom::get_attribute(node, &arg(&args, 0).to_js_string()) {
@@ -1090,6 +3316,9 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "contentEditable" => Value::string(
             &dom::get_attribute(node, "contenteditable").unwrap_or_else(|| "inherit".into()),
         ),
+        "editContext" if dom::node_type(node) == 1 => {
+            get_expando(node, "editContext").unwrap_or(Value::Null)
+        }
         "hidden" => Value::Bool(dom::has_attribute(node, "hidden")),
         "tabIndex" => Value::Number(
             dom::get_attribute(node, "tabindex")
@@ -1104,19 +3333,30 @@ fn element_computed_get(node: u32, key: &str) -> Value {
 
         // ── Style ──
         "style" => style_value(node),
+        "attributeStyleMap" if dom::node_type(node) == 1 => typed_style_map_value(node, false),
+        "computedStyleMap" if dom::node_type(node) == 1 => {
+            func(move |_, _| typed_style_map_value(node, true))
+        }
 
         // ── Tree mutation ──
         "appendChild" => func(move |_, args| {
             let child = arg(&args, 0);
             if let Some(cid) = node_id_of(&child) {
                 dom::append_child(node, cid);
+                if dom::is_connected(cid) {
+                    crate::custom_elements_web::connected_subtree(&child);
+                }
             }
             child
         }),
         "removeChild" => func(move |_, args| {
             let child = arg(&args, 0);
             if let Some(cid) = node_id_of(&child) {
+                let was_connected = dom::is_connected(cid);
                 dom::remove_child(node, cid);
+                if was_connected {
+                    crate::custom_elements_web::disconnected_subtree(&child);
+                }
             }
             child
         }),
@@ -1128,6 +3368,9 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                     Some(rid) => dom::insert_before(node, nid, rid),
                     None => dom::append_child(node, nid),
                 }
+                if dom::is_connected(nid) {
+                    crate::custom_elements_web::connected_subtree(&new_child);
+                }
             }
             new_child
         }),
@@ -1135,7 +3378,14 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             let new_child = arg(&args, 0);
             let old_child = arg(&args, 1);
             if let (Some(nid), Some(oid)) = (node_id_of(&new_child), node_id_of(&old_child)) {
+                let old_was_connected = dom::is_connected(oid);
                 dom::replace_child(node, nid, oid);
+                if old_was_connected {
+                    crate::custom_elements_web::disconnected_subtree(&old_child);
+                }
+                if dom::is_connected(nid) {
+                    crate::custom_elements_web::connected_subtree(&new_child);
+                }
             }
             old_child
         }),
@@ -1145,7 +3395,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }),
         "remove" => func(move |_, _| {
             if let Some(parent) = dom::parent_node(node) {
+                let element = element_value(node);
+                let was_connected = dom::is_connected(node);
                 dom::remove_child(parent, node);
+                if was_connected {
+                    crate::custom_elements_web::disconnected_subtree(&element);
+                }
             }
             Value::Undefined
         }),
@@ -1266,6 +3521,25 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             }
             Value::Undefined
         }),
+        "setHTML" => func(move |_, args| {
+            clear_children(node);
+            dom::set_text_content(node, "");
+            append_sanitized_html_fragment(node, &arg(&args, 0).to_js_string());
+            Value::Undefined
+        }),
+        "setHTMLUnsafe" => func(move |_, args| {
+            static WARNING: std::sync::Once = std::sync::Once::new();
+            WARNING.call_once(|| {
+                eprintln!(
+                    "[w3cos] warning: setHTMLUnsafe parses inert markup; script execution and \
+                     declarative shadow-root activation remain unavailable"
+                );
+            });
+            clear_children(node);
+            dom::set_text_content(node, "");
+            append_html_fragment(node, &arg(&args, 0).to_js_string());
+            Value::Undefined
+        }),
 
         // ── Selectors ──
         "matches" => func(move |_, args| {
@@ -1295,7 +3569,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }),
         "querySelectorAll" => func(move |_, args| {
             let sel = arg(&args, 0).to_js_string();
-            js_array(
+            node_list(
                 query_selector_all_scoped(Some(node), &sel)
                     .into_iter()
                     .map(element_value)
@@ -1304,28 +3578,30 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }),
         "getElementsByTagName" => func(move |_, args| {
             let tag = arg(&args, 0).to_js_string().to_ascii_lowercase();
-            js_array(
+            html_collection(move || {
                 dom::get_elements_by_tag_name(&tag)
                     .into_iter()
                     .filter(|&c| is_ancestor_of(node, c))
                     .map(element_value)
-                    .collect(),
-            )
+                    .collect()
+            })
         }),
         "getElementsByClassName" => func(move |_, args| {
             let class = arg(&args, 0).to_js_string();
-            js_array(
+            html_collection(move || {
                 dom::get_elements_by_class_name(&class)
                     .into_iter()
                     .filter(|&c| is_ancestor_of(node, c))
                     .map(element_value)
-                    .collect(),
-            )
+                    .collect()
+            })
         }),
 
         // ── Layout (zeros until the layout engine runs) ──
         "getBoundingClientRect" => func(move |_, _| rect_value(dom::bounding_rect(node))),
-        "getClientRects" => func(move |_, _| js_array(vec![rect_value(dom::bounding_rect(node))])),
+        "getClientRects" => func(move |_, _| {
+            crate::geometry_web::rect_list(vec![rect_value(dom::bounding_rect(node))])
+        }),
         "offsetWidth" | "clientWidth" | "scrollWidth" => {
             Value::Number(dom::bounding_rect(node).width as f64)
         }
@@ -1338,7 +3614,10 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "clientTop" | "clientLeft" => Value::Number(0.0),
         "scrollTop" => Value::Number(dom::get_scroll_offset(node).1 as f64),
         "scrollLeft" => Value::Number(dom::get_scroll_offset(node).0 as f64),
-        "scrollIntoView" => func(|_, _| Value::Undefined),
+        "scrollIntoView" => func(move |_, args| {
+            scroll_element_into_view(node, arg(&args, 0));
+            Value::Undefined
+        }),
         "scrollTo" | "scrollBy" | "scroll" => func(move |_, args| {
             // Accepts (x, y) or an options object {left, top}.
             let (mut left, mut top) = dom::get_scroll_offset(node);
@@ -1393,13 +3672,80 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "dispatchEvent" => func(move |_, args| Value::Bool(js_dispatch_event(node, arg(&args, 0)))),
 
         // ── Form-ish ──
+        "validity"
+            if matches!(
+                dom::tag_name(node).as_str(),
+                "input" | "textarea" | "select"
+            ) =>
+        {
+            validity_state_value(node)
+        }
+        "willValidate"
+            if matches!(
+                dom::tag_name(node).as_str(),
+                "input" | "textarea" | "select"
+            ) =>
+        {
+            Value::Bool(constraint_validation_candidate(node))
+        }
+        "validationMessage"
+            if matches!(
+                dom::tag_name(node).as_str(),
+                "input" | "textarea" | "select"
+            ) =>
+        {
+            Value::string(&validation_message(node))
+        }
+        "setCustomValidity"
+            if matches!(
+                dom::tag_name(node).as_str(),
+                "input" | "textarea" | "select"
+            ) =>
+        {
+            func(move |_, args| {
+                set_expando(node, "__validation_message", arg(&args, 0));
+                Value::Undefined
+            })
+        }
+        "checkValidity" if dom::tag_name(node) == "form" => {
+            func(move |_, _| Value::Bool(validate_form(node, false)))
+        }
+        "reportValidity" if dom::tag_name(node) == "form" => {
+            func(move |_, _| Value::Bool(validate_form(node, true)))
+        }
+        "checkValidity"
+            if matches!(
+                dom::tag_name(node).as_str(),
+                "input" | "textarea" | "select"
+            ) =>
+        {
+            func(move |_, _| Value::Bool(validate_control(node, false)))
+        }
+        "reportValidity"
+            if matches!(
+                dom::tag_name(node).as_str(),
+                "input" | "textarea" | "select"
+            ) =>
+        {
+            func(move |_, _| Value::Bool(validate_control(node, true)))
+        }
         "value" => {
             if is_inputish(node) {
                 Value::string(&dom::get_attribute(node, "value").unwrap_or_default())
+            } else if dom::tag_name(node) == "option" {
+                Value::string(
+                    &dom::get_attribute(node, "value").unwrap_or_else(|| dom::inner_text(node)),
+                )
             } else {
                 Value::Undefined
             }
         }
+        "text" if dom::tag_name(node) == "option" => Value::string(&dom::inner_text(node)),
+        "defaultSelected" if dom::tag_name(node) == "option" => {
+            Value::Bool(dom::has_attribute(node, "selected"))
+        }
+        "selected" if dom::tag_name(node) == "option" => get_expando(node, "selected")
+            .unwrap_or_else(|| Value::Bool(dom::has_attribute(node, "selected"))),
         "checked" => {
             if is_inputish(node) {
                 Value::Bool(dom::has_attribute(node, "checked"))
@@ -1409,6 +3755,15 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }
         "disabled" => Value::Bool(dom::has_attribute(node, "disabled")),
         "readOnly" => Value::Bool(dom::has_attribute(node, "readonly")),
+        "required" => Value::Bool(dom::has_attribute(node, "required")),
+        "min" | "max" | "step" | "minLength" | "maxLength" | "pattern" => {
+            let attribute = match key {
+                "minLength" => "minlength",
+                "maxLength" => "maxlength",
+                other => other,
+            };
+            Value::string(&dom::get_attribute(node, attribute).unwrap_or_default())
+        }
         "placeholder" => {
             Value::string(&dom::get_attribute(node, "placeholder").unwrap_or_default())
         }
@@ -1416,14 +3771,28 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::string(&dom::get_attribute(node, "type").unwrap_or_else(|| "text".to_string()))
         }
         "selectionStart" | "selectionEnd" => get_expando(node, key).unwrap_or(Value::Number(0.0)),
-        "selectionDirection" => Value::string("none"),
+        "selectionDirection" => get_expando(node, key).unwrap_or_else(|| Value::string("none")),
         "setSelectionRange" => func(move |_, args| {
-            set_expando(node, "selectionStart", arg(&args, 0));
-            set_expando(node, "selectionEnd", arg(&args, 1));
+            set_text_control_selection(
+                node,
+                arg(&args, 0).to_number().max(0.0) as usize,
+                arg(&args, 1).to_number().max(0.0) as usize,
+                &arg(&args, 2).to_js_string(),
+            );
             Value::Undefined
         }),
-        "setRangeText" => func(|_, _| Value::Undefined),
-        "select" => func(|_, _| Value::Undefined),
+        "setRangeText" => func(move |_, args| {
+            set_range_text(node, &args);
+            Value::Undefined
+        }),
+        "select" => func(move |_, _| {
+            let len = dom::get_attribute(node, "value")
+                .unwrap_or_default()
+                .encode_utf16()
+                .count();
+            set_text_control_selection(node, 0, len, "none");
+            Value::Undefined
+        }),
 
         // ── Canvas ──
         "width" | "height" if dom::tag_name(node) == "canvas" => {
@@ -1436,11 +3805,56 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }
         "getContext" if dom::tag_name(node) == "canvas" => func(move |_, args| {
             let kind = arg(&args, 0).to_js_string();
-            if kind == "2d" {
-                canvas_context_value(node)
-            } else {
-                Value::Null
+            match kind.as_str() {
+                "2d" => canvas_context_value(node),
+                "bitmaprenderer" => {
+                    if let Some(context) = get_expando(node, "__ctxbitmap") {
+                        context
+                    } else {
+                        let context = crate::canvas_web::image_bitmap_rendering_context_value(
+                            element_value(node),
+                        );
+                        set_expando(node, "__ctxbitmap", context.clone());
+                        context
+                    }
+                }
+                "webgl" | "experimental-webgl" => {
+                    if let Some(context) = get_expando(node, "__ctxwebgl") {
+                        context
+                    } else {
+                        let context =
+                            crate::webgl_web::context_value(element_value(node), false);
+                        set_expando(node, "__ctxwebgl", context.clone());
+                        context
+                    }
+                }
+                "webgl2" => {
+                    if let Some(context) = get_expando(node, "__ctxwebgl2") {
+                        context
+                    } else {
+                        let context =
+                            crate::webgl_web::context_value(element_value(node), true);
+                        set_expando(node, "__ctxwebgl2", context.clone());
+                        context
+                    }
+                }
+                _ => Value::Null,
             }
+        }),
+        "captureStream" if dom::tag_name(node) == "canvas" => func(move |_, args| {
+            let frame_rate = args.first().map(Value::to_number).unwrap_or(0.0);
+            if frame_rate < 0.0 {
+                w3cos_core::throw_value(w3cos_core::error_instance(
+                    "NotSupportedError",
+                    vec![Value::string(
+                        "Canvas capture frame rate must not be negative",
+                    )],
+                ));
+            }
+            let track =
+                crate::canvas_web::canvas_capture_media_stream_track_value(element_value(node));
+            track.set_property("__w3cos_frame_rate", Value::Number(frame_rate));
+            crate::media_devices_web::stream_value(vec![track])
         }),
         "requestFullscreen" => func(move |_, _| {
             FULLSCREEN_NODE.with(|current| *current.borrow_mut() = Some(node));
@@ -1452,13 +3866,32 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             resolved_thenable(Value::Undefined)
         }),
 
-        // ── Pointer capture (no-op; no real pointer routing yet) ──
-        "setPointerCapture" | "releasePointerCapture" => func(|_, _| Value::Undefined),
-        "hasPointerCapture" => func(|_, _| Value::Bool(false)),
+        // ── Pointer capture ──
+        "setPointerCapture" => func(move |_, args| {
+            set_pointer_capture(node, arg(&args, 0).to_number() as i64);
+            Value::Undefined
+        }),
+        "releasePointerCapture" => func(move |_, args| {
+            release_pointer_capture(node, arg(&args, 0).to_number() as i64);
+            Value::Undefined
+        }),
+        "hasPointerCapture" => func(move |_, args| {
+            let pointer_id = arg(&args, 0).to_number() as i64;
+            Value::Bool(
+                POINTER_CAPTURE.with(|capture| capture.borrow().get(&pointer_id) == Some(&node)),
+            )
+        }),
 
-        // ── Shadow DOM (not supported) ──
-        "shadowRoot" => Value::Null,
-        "attachShadow" => func(|_, _| Value::Null),
+        // ── Shadow DOM ──
+        "shadowRoot" => SHADOW_ROOTS.with(|roots| {
+            roots
+                .borrow()
+                .get(&node)
+                .filter(|info| info.mode == "open")
+                .map(|info| element_value(info.root))
+                .unwrap_or(Value::Null)
+        }),
+        "attachShadow" => func(move |_, args| shadow_root_value(node, arg(&args, 0))),
 
         _ => Value::Undefined,
     }
@@ -1492,10 +3925,34 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
                 dom::remove_attribute(node, "checked");
             }
         }
-        "title" | "dir" | "lang" | "slot" | "placeholder" | "type" => {
+        "title" | "dir" | "lang" | "slot" | "placeholder" | "type" | "min" | "max" | "step"
+        | "pattern" => {
             dom::set_attribute(node, key, &value.to_js_string());
         }
+        "minLength" => dom::set_attribute(node, "minlength", &value.to_js_string()),
+        "maxLength" => dom::set_attribute(node, "maxlength", &value.to_js_string()),
+        "required" => {
+            if value.to_bool() {
+                dom::set_attribute(node, "required", "");
+            } else {
+                dom::remove_attribute(node, "required");
+            }
+        }
         "contentEditable" => dom::set_attribute(node, "contenteditable", &value.to_js_string()),
+        "editContext" if dom::node_type(node) == 1 => {
+            let element = element_value(node);
+            if let Some(previous) = get_expando(node, "editContext") {
+                if !previous.is_null() {
+                    crate::edit_context_web::detach_element(&previous, &element);
+                }
+            }
+            if value.is_null() || value.is_undefined() {
+                set_expando(node, "editContext", Value::Null);
+            } else {
+                crate::edit_context_web::attach_element(&value, element);
+                set_expando(node, "editContext", value);
+            }
+        }
         "draggable" => dom::set_attribute(node, "draggable", &value.to_js_string()),
         "hidden" => {
             if value.to_bool() {
@@ -1539,26 +3996,201 @@ fn attributes_value(node: u32) -> Value {
     });
     let mut props = HashMap::new();
     let len = attrs.len();
+    let mut attr_values = Vec::with_capacity(len);
+    let mut attrs_by_name = HashMap::with_capacity(len);
     for (i, (name, value)) in attrs.into_iter().enumerate() {
-        let mut attr_obj = HashMap::new();
-        attr_obj.insert("name".to_string(), Value::string(&name));
-        attr_obj.insert("value".to_string(), Value::string(&value));
-        attr_obj.insert("specified".to_string(), Value::Bool(true));
-        props.insert(i.to_string(), Value::object(attr_obj));
-        props.insert(name, Value::string(&value));
+        let attr = Value::object(HashMap::from([
+            ("name".to_string(), Value::string(&name)),
+            ("localName".to_string(), Value::string(&name)),
+            ("value".to_string(), Value::string(&value)),
+            ("nodeName".to_string(), Value::string(&name)),
+            ("nodeValue".to_string(), Value::string(&value)),
+            ("nodeType".to_string(), Value::Number(2.0)),
+            ("namespaceURI".to_string(), Value::Null),
+            ("prefix".to_string(), Value::Null),
+            ("ownerElement".to_string(), element_value(node)),
+            ("specified".to_string(), Value::Bool(true)),
+        ]));
+        w3cos_core::class::set_prototype_of(&attr, &crate::dom_constructors::prototype("Attr"));
+        attr_values.push(attr.clone());
+        attrs_by_name.insert(name.clone(), attr.clone());
+        props.insert(i.to_string(), attr.clone());
+        props.insert(name, attr);
     }
     props.insert("length".to_string(), Value::Number(len as f64));
+    let attr_values_for_ns = attr_values.clone();
+    let item_values = attr_values;
     props.insert(
         "item".to_string(),
         func(move |_, args| {
-            let _ = args;
-            Value::Null
+            let index = arg(&args, 0).to_number();
+            if !index.is_finite() || index < 0.0 {
+                return Value::Null;
+            }
+            item_values
+                .get(index as usize)
+                .cloned()
+                .unwrap_or(Value::Null)
         }),
     );
-    Value::object(props)
+    props.insert(
+        "getNamedItem".to_string(),
+        func(move |_, args| {
+            attrs_by_name
+                .get(&arg(&args, 0).to_js_string())
+                .cloned()
+                .unwrap_or(Value::Null)
+        }),
+    );
+    props.insert(
+        "getNamedItemNS".to_string(),
+        func(move |_, args| {
+            let name = arg(&args, 1).to_js_string();
+            attr_values_for_ns
+                .iter()
+                .find(|attribute| attribute.get_property("localName").to_js_string() == name)
+                .cloned()
+                .unwrap_or(Value::Null)
+        }),
+    );
+    for (method, name_index) in [("removeNamedItem", 0), ("removeNamedItemNS", 1)] {
+        props.insert(
+            method.to_string(),
+            func(move |_, args| {
+                let name = arg(&args, name_index).to_js_string();
+                let previous = dom::get_attribute(node, &name)
+                    .map(|value| {
+                        let attribute = Value::object(HashMap::from([
+                            ("name".to_string(), Value::string(&name)),
+                            ("localName".to_string(), Value::string(&name)),
+                            ("value".to_string(), Value::string(&value)),
+                            ("nodeType".to_string(), Value::Number(2.0)),
+                            ("ownerElement".to_string(), element_value(node)),
+                        ]));
+                        w3cos_core::class::set_prototype_of(
+                            &attribute,
+                            &crate::dom_constructors::prototype("Attr"),
+                        );
+                        attribute
+                    })
+                    .unwrap_or(Value::Null);
+                dom::remove_attribute(node, &name);
+                previous
+            }),
+        );
+    }
+    for method in ["setNamedItem", "setNamedItemNS"] {
+        props.insert(
+            method.to_string(),
+            func(move |_, args| {
+                let attribute = arg(&args, 0);
+                let name = attribute.get_property("name").to_js_string();
+                let previous = dom::get_attribute(node, &name)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null);
+                dom::set_attribute(node, &name, &attribute.get_property("value").to_js_string());
+                previous
+            }),
+        );
+    }
+    let value = Value::object(props);
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype("NamedNodeMap"),
+    );
+    value
+}
+
+fn dataset_attribute_name(key: &str) -> String {
+    let mut attribute = String::from("data-");
+    for character in key.chars() {
+        if character.is_ascii_uppercase() {
+            attribute.push('-');
+            attribute.push(character.to_ascii_lowercase());
+        } else {
+            attribute.push(character);
+        }
+    }
+    attribute
+}
+
+fn dataset_property_name(attribute: &str) -> Option<String> {
+    let suffix = attribute.strip_prefix("data-")?;
+    let mut property = String::new();
+    let mut uppercase_next = false;
+    for character in suffix.chars() {
+        if character == '-' {
+            uppercase_next = true;
+        } else if uppercase_next {
+            property.push(character.to_ascii_uppercase());
+            uppercase_next = false;
+        } else {
+            property.push(character);
+        }
+    }
+    Some(property)
+}
+
+fn dataset_keys(node: u32) -> Vec<String> {
+    dom::with_document(|doc| {
+        doc.get_node(NodeId::from_u32(node))
+            .attributes
+            .iter()
+            .filter_map(|(name, _)| dataset_property_name(&name.as_str()))
+            .collect()
+    })
+}
+
+fn dataset_value(node: u32) -> Value {
+    if let Some(value) = get_expando(node, "dataset") {
+        return value;
+    }
+    let handler = ProxyBuilder::new()
+        .get(move |target, key, _receiver| {
+            let inherited = target.get_property(key);
+            if !inherited.is_undefined() {
+                return inherited;
+            }
+            dom::get_attribute(node, &dataset_attribute_name(key))
+                .map(Value::String)
+                .unwrap_or(Value::Undefined)
+        })
+        .set(move |_target, key, value, _receiver| {
+            dom::set_attribute(node, &dataset_attribute_name(key), &value.to_js_string());
+            true
+        })
+        .has(move |_target, key| dom::has_attribute(node, &dataset_attribute_name(key)))
+        .delete_property(move |_target, key| {
+            dom::remove_attribute(node, &dataset_attribute_name(key));
+            true
+        })
+        .own_keys(move |_target| {
+            Value::array(dataset_keys(node).into_iter().map(Value::String).collect())
+        })
+        .build();
+    let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+        HashMap::new(),
+        handler,
+    ))));
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype("DOMStringMap"),
+    );
+    set_expando(node, "dataset", value.clone());
+    value
 }
 
 // ── classList ──────────────────────────────────────────────────────────────
+
+fn class_token_values(node: u32) -> Vec<Value> {
+    dom::with_document(|doc| {
+        doc.get_node(NodeId::from_u32(node))
+            .class_list
+            .iter()
+            .map(|token| Value::string(&token.as_str()))
+            .collect()
+    })
+}
 
 fn class_list_value(node: u32) -> Value {
     if let Some(v) = get_expando(node, "classList") {
@@ -1639,6 +4271,46 @@ fn class_list_value(node: u32) -> Value {
         "toString".to_string(),
         func(move |_, _| Value::string(&dom::class_name(node))),
     );
+    props.insert(
+        "values".to_string(),
+        func(move |_, _| Value::array(class_token_values(node))),
+    );
+    props.insert(
+        "keys".to_string(),
+        func(move |_, _| {
+            Value::array(
+                (0..class_token_values(node).len())
+                    .map(|index| Value::Number(index as f64))
+                    .collect(),
+            )
+        }),
+    );
+    props.insert(
+        "entries".to_string(),
+        func(move |_, _| {
+            Value::array(
+                class_token_values(node)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, token)| Value::array(vec![Value::Number(index as f64), token]))
+                    .collect(),
+            )
+        }),
+    );
+    props.insert(
+        "forEach".to_string(),
+        func(move |this, args| {
+            let callback = arg(&args, 0);
+            for (index, token) in class_token_values(node).into_iter().enumerate() {
+                callback.call(
+                    Value::Undefined,
+                    vec![token.clone(), Value::Number(index as f64), this.clone()],
+                );
+            }
+            Value::Undefined
+        }),
+    );
+    props.insert("supports".to_string(), func(|_, _| Value::Bool(false)));
     // Live getters via the value.rs getter convention (plain object).
     props.insert(
         "__w3cos_getter_length".to_string(),
@@ -1653,6 +4325,10 @@ fn class_list_value(node: u32) -> Value {
         func(move |_, _| Value::string(&dom::class_name(node))),
     );
     let value = Value::object(props);
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype("DOMTokenList"),
+    );
     set_expando(node, "classList", value.clone());
     value
 }
@@ -1670,14 +4346,19 @@ fn style_read(node: u32, kebab: &str) -> String {
     })
 }
 
+pub(crate) fn resolved_style_property(node: u32, kebab: &str) -> String {
+    let inline = style_read(node, kebab);
+    if inline.is_empty() {
+        dom::computed_style_property(node, kebab)
+    } else {
+        inline
+    }
+}
+
 fn style_apply(node: u32, kebab: &str, value: &str) {
     STYLE_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if value.is_empty() {
-            cache.remove(&(node, kebab.to_string()));
-        } else {
-            cache.insert((node, kebab.to_string()), value.to_string());
-        }
+        c.borrow_mut()
+            .insert((node, kebab.to_string()), value.to_string());
     });
     // Forward to the typed style (known properties drive layout; unknown ones
     // are dropped there but stay in the bridge cache).
@@ -1689,7 +4370,7 @@ fn style_css_text(node: u32) -> String {
         let cache = c.borrow();
         let mut pairs: Vec<(&String, &String)> = cache
             .iter()
-            .filter(|((n, _), _)| *n == node)
+            .filter(|((n, _), value)| *n == node && !value.is_empty())
             .map(|((_, k), v)| (k, v))
             .collect();
         pairs.sort();
@@ -1702,6 +4383,228 @@ fn style_css_text(node: u32) -> String {
         }
         out
     })
+}
+
+fn style_property_names(node: u32) -> Vec<String> {
+    STYLE_CACHE.with(|cache| {
+        let mut names = cache
+            .borrow()
+            .iter()
+            .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+            .map(|((_, name), _)| name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    })
+}
+
+fn typed_style_map_value(node: u32, readonly: bool) -> Value {
+    let expando = if readonly {
+        "__computedStyleMap"
+    } else {
+        "attributeStyleMap"
+    };
+    if let Some(value) = get_expando(node, expando) {
+        return value;
+    }
+    let value = Value::object(HashMap::new());
+    let read = move |name: &str| {
+        if readonly {
+            dom::computed_style_property(node, name)
+        } else {
+            STYLE_CACHE.with(|cache| {
+                cache
+                    .borrow()
+                    .get(&(node, name.to_string()))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+        }
+    };
+    let read_get = read;
+    value.set_property(
+        "get",
+        func(move |_, args| {
+            let name = camel_to_kebab(&arg(&args, 0).to_js_string());
+            let text = read_get(&name);
+            if text.is_empty() {
+                Value::Undefined
+            } else {
+                crate::css_typed_om_web::parse_style_value(&text)
+            }
+        }),
+    );
+    let read_all = read;
+    value.set_property(
+        "getAll",
+        func(move |_, args| {
+            let name = camel_to_kebab(&arg(&args, 0).to_js_string());
+            let text = read_all(&name);
+            if text.is_empty() {
+                Value::array(Vec::new())
+            } else {
+                Value::array(vec![crate::css_typed_om_web::parse_style_value(&text)])
+            }
+        }),
+    );
+    let read_has = read;
+    value.set_property(
+        "has",
+        func(move |_, args| {
+            let name = camel_to_kebab(&arg(&args, 0).to_js_string());
+            Value::Bool(!read_has(&name).is_empty())
+        }),
+    );
+    value.set_property(
+        "__w3cos_getter_size",
+        func(move |_, _| Value::Number(style_property_names(node).len() as f64)),
+    );
+    for method in ["keys", "values", "entries"] {
+        value.set_property(
+            method,
+            func(move |_, _| {
+                let names = style_property_names(node);
+                let values = names
+                    .into_iter()
+                    .map(|name| {
+                        let parsed = crate::css_typed_om_web::parse_style_value(&if readonly {
+                            dom::computed_style_property(node, &name)
+                        } else {
+                            STYLE_CACHE.with(|cache| {
+                                cache
+                                    .borrow()
+                                    .get(&(node, name.clone()))
+                                    .cloned()
+                                    .unwrap_or_default()
+                            })
+                        });
+                        match method {
+                            "keys" => Value::string(&name),
+                            "values" => parsed,
+                            _ => Value::array(vec![Value::string(&name), parsed]),
+                        }
+                    })
+                    .collect();
+                Value::array(values).call_method("__w3cos_symbol_iterator", Vec::new())
+            }),
+        );
+    }
+    let each_value = value.clone();
+    value.set_property(
+        "forEach",
+        func(move |_, args| {
+            let callback = arg(&args, 0);
+            if !callback.is_function() {
+                w3cos_core::throw_value(w3cos_core::error_instance(
+                    "TypeError",
+                    vec![Value::string(
+                        "StylePropertyMap.forEach requires a callback",
+                    )],
+                ));
+            }
+            let this_arg = arg(&args, 1);
+            for name in style_property_names(node) {
+                let text = if readonly {
+                    dom::computed_style_property(node, &name)
+                } else {
+                    STYLE_CACHE.with(|cache| {
+                        cache
+                            .borrow()
+                            .get(&(node, name.clone()))
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                };
+                callback.call(
+                    this_arg.clone(),
+                    vec![
+                        crate::css_typed_om_web::parse_style_value(&text),
+                        Value::string(&name),
+                        each_value.clone(),
+                    ],
+                );
+            }
+            Value::Undefined
+        }),
+    );
+    if !readonly {
+        value.set_property(
+            "set",
+            func(move |_, args| {
+                let name = camel_to_kebab(&arg(&args, 0).to_js_string());
+                let serialized = args
+                    .iter()
+                    .skip(1)
+                    .map(crate::css_typed_om_web::serialize_value)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if serialized.is_empty() {
+                    w3cos_core::throw_value(w3cos_core::error_instance(
+                        "TypeError",
+                        vec![Value::string("StylePropertyMap.set requires a value")],
+                    ));
+                }
+                style_apply(node, &name, &serialized);
+                Value::Undefined
+            }),
+        );
+        value.set_property(
+            "append",
+            func(move |_, args| {
+                let name = camel_to_kebab(&arg(&args, 0).to_js_string());
+                let addition = args
+                    .iter()
+                    .skip(1)
+                    .map(crate::css_typed_om_web::serialize_value)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let current = STYLE_CACHE.with(|cache| {
+                    cache
+                        .borrow()
+                        .get(&(node, name.clone()))
+                        .cloned()
+                        .unwrap_or_default()
+                });
+                style_apply(
+                    node,
+                    &name,
+                    &if current.is_empty() {
+                        addition
+                    } else {
+                        format!("{current} {addition}")
+                    },
+                );
+                Value::Undefined
+            }),
+        );
+        value.set_property(
+            "delete",
+            func(move |_, args| {
+                style_apply(node, &camel_to_kebab(&arg(&args, 0).to_js_string()), "");
+                Value::Undefined
+            }),
+        );
+        value.set_property(
+            "clear",
+            func(move |_, _| {
+                for name in style_property_names(node) {
+                    style_apply(node, &name, "");
+                }
+                Value::Undefined
+            }),
+        );
+    }
+    let class_name = if readonly {
+        "StylePropertyMapReadOnly"
+    } else {
+        "StylePropertyMap"
+    };
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::css_typed_om_web::class(class_name).get_property("prototype"),
+    );
+    set_expando(node, expando, value.clone());
+    value
 }
 
 fn parse_css_text(node: u32, css: &str) {
@@ -1744,10 +4647,12 @@ fn style_value(node: u32) -> Value {
                     Value::string(&old)
                 }),
                 "cssText" => Value::string(&style_css_text(node)),
-                "length" => Value::Number(
-                    STYLE_CACHE.with(|c| c.borrow().keys().filter(|(n, _)| *n == node).count())
-                        as f64,
-                ),
+                "length" => Value::Number(STYLE_CACHE.with(|c| {
+                    c.borrow()
+                        .iter()
+                        .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+                        .count()
+                }) as f64),
                 // Magic w3cos-core convention keys must stay Undefined:
                 // returning "" (a non-undefined value) for `__w3cos_setter_*`
                 // makes `Value::set_property` "call" the empty string and
@@ -1769,6 +4674,10 @@ fn style_value(node: u32) -> Value {
         HashMap::new(),
         handler,
     ))));
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &css_style_declaration_class().get_property("prototype"),
+    );
     set_expando(node, "style", value.clone());
     value
 }
@@ -1798,7 +4707,12 @@ fn computed_style_value(node: u32) -> Value {
             func(|_, _| Value::string("")),
         ),
     ]);
-    Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(target, handler))))
+    let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(target, handler))));
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &css_style_declaration_class().get_property("prototype"),
+    );
+    value
 }
 
 // ── JS event bridge ────────────────────────────────────────────────────────
@@ -2099,20 +5013,43 @@ fn build_event_value(ev: &Event) -> Value {
 /// borrow is held while JS handlers run, so handlers may mutate the DOM.
 /// Returns false when the event was canceled (preventDefault).
 fn dispatch_event_to_js(ev: Event) -> bool {
+    let js_ev = build_event_value(&ev);
+    js_ev.set_property("isTrusted", Value::Bool(true));
+    dispatch_event_value_to_js(&ev, js_ev)
+}
+
+fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
+    if js_ev.get_property("isTrusted").to_bool() {
+        record_event_count(&js_ev.get_property("type").to_js_string());
+    }
+    let _activation = (js_ev.get_property("isTrusted").to_bool()
+        && matches!(
+            ev.event_type,
+            EventType::KeyDown | EventType::MouseDown | EventType::PointerUp | EventType::TouchEnd
+        ))
+    .then(crate::user_activation_web::begin_transient_activation);
     let target = ev.target.as_u32();
     let trace = std::env::var_os("W3COS_INPUT_TRACE").is_some();
     let mut listener_calls = 0usize;
-    // [target, parent, ..., root]
-    let mut chain = vec![target];
-    let mut cur = dom::parent_node(target);
-    while let Some(id) = cur {
-        chain.push(id);
-        cur = dom::parent_node(id);
-    }
+    // [target, parent, ..., root], crossing shadow boundaries only for
+    // composed events.
+    let chain = shadow_event_chain(target, ev.composed);
+    js_ev.set_property(
+        "__w3cos_path",
+        js_array(chain.iter().copied().map(element_value).collect()),
+    );
 
-    let js_ev = build_event_value(&ev);
+    let target_value = element_value(target);
+    js_ev.set_property("target", target_value.clone());
+    js_ev.set_property("srcElement", target_value);
     let stopped = |v: &Value| v.get_property("__sp").to_bool();
     let immediate = |v: &Value| v.get_property("__sip").to_bool();
+    let set_current_target = |event: &Value, id: u32, phase: f64| {
+        event.set_property("target", element_value(retarget_shadow_event(target, id)));
+        event.set_property("srcElement", event.get_property("target"));
+        event.set_property("currentTarget", element_value(id));
+        event.set_property("eventPhase", Value::Number(phase));
+    };
 
     let snapshot_listeners = |node_id: u32, capture_phase: Option<bool>| -> Vec<Value> {
         LISTENERS.with(|l| {
@@ -2133,8 +5070,7 @@ fn dispatch_event_to_js(ev: Event) -> bool {
         if stopped(&js_ev) {
             break;
         }
-        js_ev.set_property("currentTarget", element_value(id));
-        js_ev.set_property("eventPhase", Value::Number(1.0));
+        set_current_target(&js_ev, id, 1.0);
         for h in snapshot_listeners(id, Some(true)) {
             listener_calls += 1;
             h.call(Value::Undefined, vec![js_ev.clone()]);
@@ -2146,8 +5082,7 @@ fn dispatch_event_to_js(ev: Event) -> bool {
 
     // Phase 2: at target (both capture and bubble listeners).
     if !stopped(&js_ev) {
-        js_ev.set_property("currentTarget", element_value(target));
-        js_ev.set_property("eventPhase", Value::Number(2.0));
+        set_current_target(&js_ev, target, 2.0);
         for h in snapshot_listeners(target, None) {
             listener_calls += 1;
             h.call(Value::Undefined, vec![js_ev.clone()]);
@@ -2163,8 +5098,7 @@ fn dispatch_event_to_js(ev: Event) -> bool {
             if stopped(&js_ev) {
                 break;
             }
-            js_ev.set_property("currentTarget", element_value(id));
-            js_ev.set_property("eventPhase", Value::Number(3.0));
+            set_current_target(&js_ev, id, 3.0);
             for h in snapshot_listeners(id, Some(false)) {
                 listener_calls += 1;
                 h.call(Value::Undefined, vec![js_ev.clone()]);
@@ -2176,6 +5110,8 @@ fn dispatch_event_to_js(ev: Event) -> bool {
     }
 
     js_ev.set_property("eventPhase", Value::Number(0.0));
+    js_ev.set_property("target", element_value(target));
+    js_ev.set_property("srcElement", element_value(target));
     if trace
         && matches!(
             ev.event_type,
@@ -2201,6 +5137,14 @@ fn dispatch_event_to_js(ev: Event) -> bool {
     !js_ev.get_property("__pd").to_bool()
 }
 
+fn record_event_count(event_type: &str) {
+    EVENT_COUNTS.with(|counts| {
+        if let Some(count) = counts.borrow_mut().get_mut(event_type) {
+            *count = count.saturating_add(1);
+        }
+    });
+}
+
 fn dispatch_sync(target: u32, et: EventType, data: EventData) -> bool {
     let mut ev = Event::new(et, NodeId::from_u32(target));
     ev.data = data;
@@ -2208,8 +5152,36 @@ fn dispatch_sync(target: u32, et: EventType, data: EventData) -> bool {
 }
 
 /// Deliver a platform/session-history traversal to `window` listeners.
-pub(crate) fn dispatch_native_popstate(_state: Option<String>) {
-    let _ = dispatch_sync(0, EventType::PopState, EventData::None);
+pub(crate) fn dispatch_native_popstate(state: Option<String>) {
+    let event = w3cos_core::class::construct(
+        &crate::web_events::event_subclass_class("PopStateEvent"),
+        vec![
+            Value::string("popstate"),
+            Value::object(HashMap::from([(
+                "state".to_string(),
+                state.as_deref().map(Value::string).unwrap_or(Value::Null),
+            )])),
+        ],
+    );
+    event.set_property("isTrusted", Value::Bool(true));
+    let native_event = Event::new(EventType::PopState, NodeId::from_u32(0));
+    let _ = dispatch_event_value_to_js(&native_event, event);
+}
+
+pub(crate) fn dispatch_native_hashchange(old_url: &str, new_url: &str) {
+    let event = w3cos_core::class::construct(
+        &crate::web_events::event_subclass_class("HashChangeEvent"),
+        vec![
+            Value::string("hashchange"),
+            Value::object(HashMap::from([
+                ("oldURL".to_string(), Value::string(old_url)),
+                ("newURL".to_string(), Value::string(new_url)),
+            ])),
+        ],
+    );
+    event.set_property("isTrusted", Value::Bool(true));
+    let native_event = Event::new(EventType::HashChange, NodeId::from_u32(0));
+    let _ = dispatch_event_value_to_js(&native_event, event);
 }
 
 /// Synchronously bridge native window focus into the compiled-JS DOM.
@@ -2237,6 +5209,204 @@ pub(crate) fn dispatch_native_focus(target: u32, focused: bool) -> bool {
 /// `textarea.focus()` also becomes the native keyboard target.
 pub(crate) fn active_element_id() -> Option<u32> {
     ACTIVE_ELEMENT.with(|active| *active.borrow())
+}
+
+fn native_touch_value(touch: &NativeTouch) -> Value {
+    let x = Value::Number(touch.client_x as f64);
+    let y = Value::Number(touch.client_y as f64);
+    w3cos_core::class::construct(
+        &crate::web_events::touch_class(),
+        vec![Value::object(HashMap::from([
+            (
+                "identifier".to_string(),
+                Value::Number(touch.identifier as f64),
+            ),
+            ("target".to_string(), element_value(touch.target)),
+            ("screenX".to_string(), x.clone()),
+            ("screenY".to_string(), y.clone()),
+            ("clientX".to_string(), x.clone()),
+            ("clientY".to_string(), y.clone()),
+            ("pageX".to_string(), x),
+            ("pageY".to_string(), y),
+            ("radiusX".to_string(), Value::Number(1.0)),
+            ("radiusY".to_string(), Value::Number(1.0)),
+            ("rotationAngle".to_string(), Value::Number(0.0)),
+            ("force".to_string(), Value::Number(touch.force as f64)),
+        ]))],
+    )
+}
+
+fn touch_list(touches: &[NativeTouch]) -> Value {
+    crate::web_events::touch_list_value(Value::array(
+        touches.iter().map(native_touch_value).collect(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_native_touch(
+    target: u32,
+    phase: &str,
+    client_x: f32,
+    client_y: f32,
+    pointer_id: i64,
+    pressure: f32,
+    alt_key: bool,
+    ctrl_key: bool,
+    meta_key: bool,
+    shift_key: bool,
+) -> bool {
+    let Some(event_type) = (match phase {
+        "down" => Some(EventType::TouchStart),
+        "move" => Some(EventType::TouchMove),
+        "up" => Some(EventType::TouchEnd),
+        "cancel" => Some(EventType::TouchCancel),
+        _ => None,
+    }) else {
+        return true;
+    };
+    let (event_target, changed, active) = ACTIVE_TOUCHES.with(|touches| {
+        let mut touches = touches.borrow_mut();
+        let existing = touches
+            .iter()
+            .position(|touch| touch.identifier == pointer_id);
+        let changed = NativeTouch {
+            identifier: pointer_id,
+            target: existing
+                .map(|index| touches[index].target)
+                .unwrap_or(target),
+            client_x,
+            client_y,
+            force: pressure,
+        };
+        match phase {
+            "down" | "move" => {
+                if let Some(index) = existing {
+                    touches[index] = changed.clone();
+                } else {
+                    touches.push(changed.clone());
+                }
+            }
+            "up" | "cancel" => {
+                if let Some(index) = existing {
+                    touches.remove(index);
+                }
+            }
+            _ => {}
+        }
+        (changed.target, changed, touches.clone())
+    });
+    let target_touches = active
+        .iter()
+        .filter(|touch| touch.target == event_target)
+        .cloned()
+        .collect::<Vec<_>>();
+    let event = w3cos_core::class::construct(
+        &crate::web_events::event_subclass_class("TouchEvent"),
+        vec![
+            Value::string(&event_type_name(event_type)),
+            Value::object(HashMap::from([
+                ("bubbles".to_string(), Value::Bool(true)),
+                (
+                    "cancelable".to_string(),
+                    Value::Bool(event_type != EventType::TouchCancel),
+                ),
+                ("composed".to_string(), Value::Bool(true)),
+                ("view".to_string(), window_value()),
+                ("touches".to_string(), touch_list(&active)),
+                ("targetTouches".to_string(), touch_list(&target_touches)),
+                (
+                    "changedTouches".to_string(),
+                    touch_list(std::slice::from_ref(&changed)),
+                ),
+                ("altKey".to_string(), Value::Bool(alt_key)),
+                ("ctrlKey".to_string(), Value::Bool(ctrl_key)),
+                ("metaKey".to_string(), Value::Bool(meta_key)),
+                ("shiftKey".to_string(), Value::Bool(shift_key)),
+            ])),
+        ],
+    );
+    event.set_property("isTrusted", Value::Bool(true));
+    let mut native_event = Event::new(event_type, NodeId::from_u32(event_target));
+    native_event.bubbles = true;
+    native_event.cancelable = event_type != EventType::TouchCancel;
+    native_event.composed = true;
+    dispatch_event_value_to_js(&native_event, event)
+}
+
+fn pointer_capture_error(pointer_id: i64) -> ! {
+    w3cos_core::throw_value(Value::object(HashMap::from([
+        ("name".to_string(), Value::string("NotFoundError")),
+        (
+            "message".to_string(),
+            Value::string(&format!("Pointer {pointer_id} is not active")),
+        ),
+    ])))
+}
+
+fn dispatch_pointer_capture_event(target: u32, event_type: &str, pointer_id: i64) {
+    let pointer_type = ACTIVE_POINTERS.with(|active| {
+        active
+            .borrow()
+            .get(&pointer_id)
+            .cloned()
+            .unwrap_or_default()
+    });
+    let mouse = w3cos_dom::events::MouseEventData {
+        client_x: 0.0,
+        client_y: 0.0,
+        page_x: 0.0,
+        page_y: 0.0,
+        offset_x: 0.0,
+        offset_y: 0.0,
+        button: 0,
+        buttons: 0,
+        ctrl_key: false,
+        shift_key: false,
+        alt_key: false,
+        meta_key: false,
+    };
+    dispatch_sync(
+        target,
+        event_type_for(event_type),
+        EventData::Pointer(w3cos_dom::events::PointerEventData {
+            mouse,
+            pointer_id: pointer_id as i32,
+            pointer_type,
+            pressure: 0.0,
+            width: 1.0,
+            height: 1.0,
+            is_primary: true,
+        }),
+    );
+}
+
+fn set_pointer_capture(node: u32, pointer_id: i64) {
+    if !ACTIVE_POINTERS.with(|active| active.borrow().contains_key(&pointer_id)) {
+        pointer_capture_error(pointer_id);
+    }
+    let previous = POINTER_CAPTURE.with(|capture| capture.borrow_mut().insert(pointer_id, node));
+    if previous == Some(node) {
+        return;
+    }
+    if let Some(previous) = previous {
+        dispatch_pointer_capture_event(previous, "lostpointercapture", pointer_id);
+    }
+    dispatch_pointer_capture_event(node, "gotpointercapture", pointer_id);
+}
+
+fn release_pointer_capture(node: u32, pointer_id: i64) {
+    if !ACTIVE_POINTERS.with(|active| active.borrow().contains_key(&pointer_id)) {
+        pointer_capture_error(pointer_id);
+    }
+    let released = POINTER_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        (capture.get(&pointer_id) == Some(&node))
+            .then(|| capture.remove(&pointer_id))
+            .flatten()
+    });
+    if released.is_some() {
+        dispatch_pointer_capture_event(node, "lostpointercapture", pointer_id);
+    }
 }
 
 /// Synchronously bridge the native pointer/mouse sequence into the compiled
@@ -2268,6 +5438,21 @@ pub(crate) fn dispatch_native_pointer(
         "cancel" => EventType::PointerCancel,
         _ => return false,
     };
+    if phase == "down" {
+        if let Some(previous) =
+            POINTER_CAPTURE.with(|capture| capture.borrow_mut().remove(&pointer_id))
+        {
+            dispatch_pointer_capture_event(previous, "lostpointercapture", pointer_id);
+        }
+        ACTIVE_POINTERS.with(|active| {
+            active
+                .borrow_mut()
+                .insert(pointer_id, pointer_type.to_string());
+        });
+    }
+    let pointer_target = POINTER_CAPTURE
+        .with(|capture| capture.borrow().get(&pointer_id).copied())
+        .unwrap_or(target);
     let mouse = w3cos_dom::events::MouseEventData {
         client_x: client_x as f64,
         client_y: client_y as f64,
@@ -2282,8 +5467,19 @@ pub(crate) fn dispatch_native_pointer(
         alt_key,
         meta_key,
     };
+    let primary = if pointer_type == "touch" {
+        ACTIVE_TOUCHES.with(|touches| {
+            touches
+                .borrow()
+                .first()
+                .map(|touch| touch.identifier == pointer_id)
+                .unwrap_or(phase == "down")
+        })
+    } else {
+        primary
+    };
     let pointer_allowed = dispatch_sync(
-        target,
+        pointer_target,
         pointer_type_event,
         EventData::Pointer(w3cos_dom::events::PointerEventData {
             mouse: mouse.clone(),
@@ -2304,11 +5500,29 @@ pub(crate) fn dispatch_native_pointer(
             "leave" => EventType::MouseLeave,
             _ => return !pointer_allowed,
         };
-        dispatch_sync(target, mouse_type, EventData::Mouse(mouse))
+        dispatch_sync(pointer_target, mouse_type, EventData::Mouse(mouse))
     } else {
         true
     };
-    !pointer_allowed || !mouse_allowed
+    let touch_allowed = if pointer_type == "touch" {
+        dispatch_native_touch(
+            target, phase, client_x, client_y, pointer_id, pressure, alt_key, ctrl_key, meta_key,
+            shift_key,
+        )
+    } else {
+        true
+    };
+    let prevented = !pointer_allowed || !mouse_allowed || !touch_allowed;
+    if matches!(phase, "up" | "cancel") {
+        let captured = POINTER_CAPTURE.with(|capture| capture.borrow_mut().remove(&pointer_id));
+        if let Some(captured) = captured {
+            dispatch_pointer_capture_event(captured, "lostpointercapture", pointer_id);
+        }
+        ACTIVE_POINTERS.with(|active| {
+            active.borrow_mut().remove(&pointer_id);
+        });
+    }
+    prevented
 }
 
 pub(crate) fn dispatch_native_click(target: u32) -> bool {
@@ -2402,21 +5616,132 @@ pub(crate) fn dispatch_native_before_input(
     )
 }
 
+fn utf16_offset_to_byte(value: &str, offset: usize) -> usize {
+    let len = value.encode_utf16().count();
+    if offset >= len {
+        return value.len();
+    }
+    let mut units = 0usize;
+    for (byte, ch) in value.char_indices() {
+        if units >= offset {
+            return byte;
+        }
+        units += ch.len_utf16();
+    }
+    value.len()
+}
+
+fn text_control_selection(node: u32, len: usize) -> (usize, usize, String) {
+    let mut start = get_expando(node, "selectionStart")
+        .map(|value| value.to_number().max(0.0) as usize)
+        .unwrap_or(0)
+        .min(len);
+    let end = get_expando(node, "selectionEnd")
+        .map(|value| value.to_number().max(0.0) as usize)
+        .unwrap_or(start)
+        .min(len);
+    if start > end {
+        start = end;
+    }
+    let direction = get_expando(node, "selectionDirection")
+        .map(|value| value.to_js_string())
+        .unwrap_or_else(|| "none".to_string());
+    (start, end, direction)
+}
+
+fn set_text_control_selection(node: u32, start: usize, end: usize, direction: &str) {
+    let len = dom::get_attribute(node, "value")
+        .unwrap_or_default()
+        .encode_utf16()
+        .count();
+    let end = end.min(len);
+    let start = start.min(end);
+    let direction = match direction {
+        "forward" | "backward" => direction,
+        _ => "none",
+    };
+    set_expando(node, "selectionStart", Value::Number(start as f64));
+    set_expando(node, "selectionEnd", Value::Number(end as f64));
+    set_expando(node, "selectionDirection", Value::string(direction));
+}
+
+fn set_range_text(node: u32, args: &[Value]) {
+    let replacement = arg(args, 0).to_js_string();
+    let value = dom::get_attribute(node, "value").unwrap_or_default();
+    let len = value.encode_utf16().count();
+    let (old_start, old_end, old_direction) = text_control_selection(node, len);
+    let explicit_range = args.len() >= 3;
+    let start = if explicit_range {
+        arg(args, 1).to_number().max(0.0) as usize
+    } else {
+        old_start
+    };
+    let end = if explicit_range {
+        arg(args, 2).to_number().max(0.0) as usize
+    } else {
+        old_end
+    };
+    if start > end {
+        w3cos_core::throw_value(Value::object(HashMap::from([
+            ("name".to_string(), Value::string("IndexSizeError")),
+            (
+                "message".to_string(),
+                Value::string("The start index is greater than the end index"),
+            ),
+        ])));
+    }
+    let start = start.min(len);
+    let end = end.min(len);
+    let start_byte = utf16_offset_to_byte(&value, start);
+    let end_byte = utf16_offset_to_byte(&value, end);
+    let edited = format!(
+        "{}{}{}",
+        &value[..start_byte],
+        replacement,
+        &value[end_byte..]
+    );
+    dom::set_attribute(node, "value", &edited);
+
+    let replacement_len = replacement.encode_utf16().count();
+    let replacement_end = start + replacement_len;
+    let mode = if explicit_range {
+        arg(args, 3).to_js_string()
+    } else {
+        "preserve".to_string()
+    };
+    let (selection_start, selection_end, direction) = match mode.as_str() {
+        "select" => (start, replacement_end, "none"),
+        "start" => (start, start, "none"),
+        "end" => (replacement_end, replacement_end, "none"),
+        _ => {
+            let adjust = |position: usize, inside_end: usize| {
+                if position > end {
+                    position
+                        .saturating_sub(end - start)
+                        .saturating_add(replacement_len)
+                } else if position > start {
+                    inside_end
+                } else {
+                    position
+                }
+            };
+            (
+                adjust(old_start, start),
+                adjust(old_end, replacement_end),
+                old_direction.as_str(),
+            )
+        }
+    };
+    set_text_control_selection(node, selection_start, selection_end, direction);
+}
+
 /// Compute the value a browser text control would have after applying an
 /// edit at its current UTF-16 selection. The actual mutation still happens
 /// after the cancelable `beforeinput` phase.
 pub(crate) fn text_control_value_after_edit(target: u32, data: &str, input_type: &str) -> String {
     let value = dom::get_attribute(target, "value").unwrap_or_default();
     let len = value.encode_utf16().count();
-    let mut start = get_expando(target, "selectionStart")
-        .map(|value| value.to_number().max(0.0) as usize)
-        .unwrap_or(0)
-        .min(len);
-    let end = get_expando(target, "selectionEnd")
-        .map(|value| value.to_number().max(0.0) as usize)
-        .unwrap_or(start)
-        .min(len)
-        .max(start);
+    let (mut start, end, _) = text_control_selection(target, len);
     if input_type == "deleteContentBackward" && start == end && start > 0 {
         let mut units = 0usize;
         for ch in value.chars() {
@@ -2429,21 +5754,8 @@ pub(crate) fn text_control_value_after_edit(target: u32, data: &str, input_type:
         }
     }
 
-    let utf16_to_byte = |offset: usize| {
-        if offset == len {
-            return value.len();
-        }
-        let mut units = 0usize;
-        for (byte, ch) in value.char_indices() {
-            if units >= offset {
-                return byte;
-            }
-            units += ch.len_utf16();
-        }
-        value.len()
-    };
-    let start_byte = utf16_to_byte(start);
-    let end_byte = utf16_to_byte(end);
+    let start_byte = utf16_offset_to_byte(&value, start);
+    let end_byte = utf16_offset_to_byte(&value, end);
     let inserted = if input_type.starts_with("delete") {
         ""
     } else {
@@ -2510,11 +5822,79 @@ pub(crate) fn dispatch_native_input(
 
 /// `element.dispatchEvent(eventValue)` — reads `.type` (and `.detail`,
 /// `.bubbles`) from the given object and dispatches synchronously.
+fn install_compat_event_controls(event: &Value) {
+    for (name, default) in [
+        ("__pd", Value::Bool(false)),
+        ("__sp", Value::Bool(false)),
+        ("__sip", Value::Bool(false)),
+        ("returnValue", Value::Bool(true)),
+    ] {
+        if event.get_property(name).is_undefined() {
+            event.set_property(name, default);
+        }
+    }
+    if !event.get_property("preventDefault").is_function() {
+        let event = event.clone();
+        event.clone().set_property(
+            "preventDefault",
+            func(move |_, _| {
+                if event.get_property("cancelable").to_bool() {
+                    event.set_property("__pd", Value::Bool(true));
+                    event.set_property("returnValue", Value::Bool(false));
+                }
+                Value::Undefined
+            }),
+        );
+    }
+    if !event.get_property("stopPropagation").is_function() {
+        let event = event.clone();
+        event.clone().set_property(
+            "stopPropagation",
+            func(move |_, _| {
+                event.set_property("__sp", Value::Bool(true));
+                Value::Undefined
+            }),
+        );
+    }
+    if !event.get_property("stopImmediatePropagation").is_function() {
+        let event = event.clone();
+        event.clone().set_property(
+            "stopImmediatePropagation",
+            func(move |_, _| {
+                event.set_property("__sp", Value::Bool(true));
+                event.set_property("__sip", Value::Bool(true));
+                Value::Undefined
+            }),
+        );
+    }
+    if event
+        .get_property("__w3cos_getter_defaultPrevented")
+        .is_undefined()
+    {
+        let event = event.clone();
+        event.clone().set_property(
+            "__w3cos_getter_defaultPrevented",
+            func(move |_, _| event.get_property("__pd")),
+        );
+    }
+    if event
+        .get_property("__w3cos_getter_cancelBubble")
+        .is_undefined()
+    {
+        let event = event.clone();
+        event.clone().set_property(
+            "__w3cos_getter_cancelBubble",
+            func(move |_, _| event.get_property("__sp")),
+        );
+    }
+}
+
 fn js_dispatch_event(node: u32, event_val: Value) -> bool {
     let type_name = event_val.get_property("type").to_js_string();
     if type_name.is_empty() || type_name == "undefined" {
         return true;
     }
+    install_compat_event_controls(&event_val);
     let et = event_type_for(&type_name);
     let detail = event_val.get_property("detail");
     let data = if detail.is_nullish() {
@@ -2539,7 +5919,7 @@ fn js_dispatch_event(node: u32, event_val: Value) -> bool {
         ev.composed = composed.to_bool();
     }
     let was_canceled = event_val.get_property("defaultPrevented").to_bool();
-    let dispatched = dispatch_event_to_js(ev);
+    let dispatched = dispatch_event_value_to_js(&ev, event_val.clone());
     if !dispatched {
         event_val.set_property("__pd", Value::Bool(true));
         event_val.set_property("returnValue", Value::Bool(false));
@@ -2631,21 +6011,38 @@ fn canvas_context_value(node: u32) -> Value {
 
     let handler = ProxyBuilder::new()
         .get(move |target, key, _receiver| {
-            let stored = target.get_property(key);
-            if !stored.is_undefined() {
-                return stored;
-            }
             if let Some(v) = get_expando(node, &format!("ctx:{key}")) {
                 return v;
             }
-            canvas_ctx_get(node, &ctx_get, key)
+            let live = canvas_ctx_get(node, &ctx_get, key);
+            if live.is_undefined() {
+                target.get_property(key)
+            } else {
+                live
+            }
         })
         .set(move |_target, key, value, _receiver| {
-            set_expando(node, &format!("ctx:{key}"), value.clone());
+            if key != "lineDashOffset" {
+                set_expando(node, &format!("ctx:{key}"), value.clone());
+            }
             match key {
+                "fillStyle" | "strokeStyle" if value.is_object() => {
+                    CANVAS_PAINT_STYLE_WARNED.with(|warned| {
+                        if !warned.replace(true) {
+                            eprintln!(
+                                "[w3cos] warning: CanvasGradient and CanvasPattern values retain \
+                                 browser identity and stops/transforms; gradient and pattern raster \
+                                 paint requires renderer integration"
+                            );
+                        }
+                    });
+                }
                 "fillStyle" => ctx.borrow_mut().set_fill_style(&value.to_js_string()),
                 "strokeStyle" => ctx.borrow_mut().set_stroke_style(&value.to_js_string()),
                 "lineWidth" => ctx.borrow_mut().set_line_width(value.to_number() as f32),
+                "lineDashOffset" => ctx
+                    .borrow_mut()
+                    .set_line_dash_offset(value.to_number() as f32),
                 "font" => ctx.borrow_mut().set_font(&value.to_js_string()),
                 "globalAlpha" => ctx.borrow_mut().set_global_alpha(value.to_number() as f32),
                 "textAlign" => ctx.borrow_mut().set_text_align(&value.to_js_string()),
@@ -2667,6 +6064,10 @@ fn canvas_context_value(node: u32) -> Value {
         HashMap::new(),
         handler,
     ))));
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::canvas_web::canvas_rendering_context_2d_class().get_property("prototype"),
+    );
     set_expando(node, "__ctx2d", value.clone());
     value
 }
@@ -2678,6 +6079,7 @@ fn canvas_ctx_get(
 ) -> Value {
     match key {
         "canvas" => element_value(node),
+        "lineDashOffset" => Value::Number(ctx.borrow().state.line_dash_offset as f64),
         "fillRect" => {
             let ctx = ctx.clone();
             func(move |_, args| {
@@ -2760,9 +6162,39 @@ fn canvas_ctx_get(
                     "fontBoundingBoxDescent".to_string(),
                     Value::Number(m.font_bounding_box_descent as f64),
                 );
-                Value::object(props)
+                crate::canvas_web::text_metrics_value(props)
             })
         }
+        "createLinearGradient" => {
+            func(move |_, args| crate::canvas_web::canvas_gradient_value("linear", &args))
+        }
+        "createRadialGradient" => {
+            func(move |_, args| crate::canvas_web::canvas_gradient_value("radial", &args))
+        }
+        "createConicGradient" => {
+            func(move |_, args| crate::canvas_web::canvas_gradient_value("conic", &args))
+        }
+        "createPattern" => func(move |_, args| {
+            let source = arg(&args, 0);
+            if !source.is_object() {
+                return Value::Null;
+            }
+            let repetition = args
+                .get(1)
+                .map(Value::to_js_string)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "repeat".to_string());
+            if !matches!(
+                repetition.as_str(),
+                "repeat" | "repeat-x" | "repeat-y" | "no-repeat"
+            ) {
+                w3cos_core::throw_value(w3cos_core::error_instance(
+                    "SyntaxError",
+                    vec![Value::string("Invalid CanvasPattern repetition mode")],
+                ));
+            }
+            crate::canvas_web::canvas_pattern_value(source, &repetition)
+        }),
         "beginPath" => {
             let ctx = ctx.clone();
             func(move |_, _| {
@@ -2951,9 +6383,105 @@ fn canvas_ctx_get(
                 Value::Undefined
             })
         }
-        "setLineDash" => func(|_, _| Value::Undefined), // runtime ctx lacks it (gap)
-        "getLineDash" => func(|_, _| js_array(vec![])),
-        "drawImage" => func(|_, _| Value::Undefined), // v1: no image sources (gap)
+        "setLineDash" => {
+            let ctx = ctx.clone();
+            func(move |_, args| {
+                let segments = arg(&args, 0)
+                    .iter()
+                    .map(|value| value.to_number() as f32)
+                    .collect();
+                ctx.borrow_mut().set_line_dash(segments);
+                Value::Undefined
+            })
+        }
+        "getLineDash" => {
+            let ctx = ctx.clone();
+            func(move |_, _| {
+                js_array(
+                    ctx.borrow()
+                        .get_line_dash()
+                        .into_iter()
+                        .map(|value| Value::Number(value as f64))
+                        .collect(),
+                )
+            })
+        }
+        "drawImage" => {
+            let target = ctx.clone();
+            func(move |_, args| {
+                let source = arg(&args, 0);
+                let source_node = node_id_of(&source).or_else(|| {
+                    let backing = source.get_property("__w3cos_canvas");
+                    node_id_of(&backing)
+                });
+                let source_context = source_node.and_then(|node| {
+                    CANVAS_CONTEXTS.with(|contexts| contexts.borrow().get(&node).cloned())
+                });
+                let Some(source_context) = source_context else {
+                    DRAW_IMAGE_SOURCE_WARNED.with(|warned| {
+                        if !warned.replace(true) {
+                            eprintln!(
+                                "[w3cos] warning: CanvasRenderingContext2D.drawImage currently \
+                                 supports canvas-backed sources; undecoded image/video sources \
+                                 are ignored"
+                            );
+                        }
+                    });
+                    return Value::Undefined;
+                };
+                let (source_width, source_height, source_pixels) = {
+                    let source = source_context.borrow();
+                    (source.width, source.height, source.pixels().to_vec())
+                };
+                let (sx, sy, sw, sh, dx, dy, dw, dh) = match args.len() {
+                    3 => (
+                        0.0,
+                        0.0,
+                        source_width as f32,
+                        source_height as f32,
+                        farg(&args, 1),
+                        farg(&args, 2),
+                        source_width as f32,
+                        source_height as f32,
+                    ),
+                    5 => (
+                        0.0,
+                        0.0,
+                        source_width as f32,
+                        source_height as f32,
+                        farg(&args, 1),
+                        farg(&args, 2),
+                        farg(&args, 3),
+                        farg(&args, 4),
+                    ),
+                    9.. => (
+                        farg(&args, 1),
+                        farg(&args, 2),
+                        farg(&args, 3),
+                        farg(&args, 4),
+                        farg(&args, 5),
+                        farg(&args, 6),
+                        farg(&args, 7),
+                        farg(&args, 8),
+                    ),
+                    _ => return Value::Undefined,
+                };
+                target.borrow_mut().draw_image_rgba(
+                    &source_pixels,
+                    source_width,
+                    source_height,
+                    sx,
+                    sy,
+                    sw,
+                    sh,
+                    dx,
+                    dy,
+                    dw,
+                    dh,
+                );
+                Value::Undefined
+            })
+        }
         _ => Value::Undefined,
     }
 }
@@ -3000,6 +6528,186 @@ fn range_to_w3cos(v: &Value) -> w3cos_dom::selection::Range {
         range_hidden(v, "__eo"),
     );
     r
+}
+
+fn range_warn_complex() {
+    RANGE_COMPLEX_WARNING_EMITTED.with(|warned| {
+        if !warned.replace(true) {
+            eprintln!(
+                "[W3C OS][compat warning] Range operations spanning different containers use \
+                 text-only fallback; same-container text and child ranges preserve DOM nodes"
+            );
+        }
+    });
+}
+
+fn range_client_rects(v: &Value) -> Vec<w3cos_dom::DOMRect> {
+    let start_container = range_hidden(v, "__sc");
+    let end_container = range_hidden(v, "__ec");
+    let start = range_hidden(v, "__so") as usize;
+    let end = range_hidden(v, "__eo") as usize;
+    if start_container == end_container && start == end {
+        return Vec::new();
+    }
+    if start_container == end_container {
+        if dom::node_type(start_container) == 3 {
+            return vec![dom::bounding_rect(start_container)];
+        }
+        let children = dom::children(start_container);
+        let from = start.min(children.len());
+        let to = end.min(children.len()).max(from);
+        return children[from..to]
+            .iter()
+            .map(|child| dom::bounding_rect(*child))
+            .collect();
+    }
+
+    range_warn_complex();
+    [start_container, end_container]
+        .into_iter()
+        .map(dom::bounding_rect)
+        .collect()
+}
+
+fn union_rects(rects: &[w3cos_dom::DOMRect]) -> w3cos_dom::DOMRect {
+    let Some(first) = rects.first() else {
+        return w3cos_dom::DOMRect::zero();
+    };
+    let (mut left, mut top, mut right, mut bottom) =
+        (first.left(), first.top(), first.right(), first.bottom());
+    for rect in &rects[1..] {
+        left = left.min(rect.left());
+        top = top.min(rect.top());
+        right = right.max(rect.right());
+        bottom = bottom.max(rect.bottom());
+    }
+    w3cos_dom::DOMRect::new(left, top, right - left, bottom - top)
+}
+
+fn range_fragment(v: &Value, extract: bool) -> Value {
+    let fragment = dom::create_document_fragment();
+    let start_container = range_hidden(v, "__sc");
+    let end_container = range_hidden(v, "__ec");
+    let start = range_hidden(v, "__so") as usize;
+    let end = range_hidden(v, "__eo") as usize;
+
+    if start_container == end_container {
+        if dom::node_type(start_container) == 3 {
+            let text = dom::get_text_content(start_container).unwrap_or_default();
+            let chars = text.chars().collect::<Vec<_>>();
+            let from = start.min(chars.len());
+            let to = end.min(chars.len()).max(from);
+            let selected = chars[from..to].iter().collect::<String>();
+            if !selected.is_empty() {
+                dom::append_child(fragment, dom::create_text_node(&selected));
+            }
+            if extract {
+                let remaining = chars[..from]
+                    .iter()
+                    .chain(chars[to..].iter())
+                    .collect::<String>();
+                dom::set_text_content(start_container, &remaining);
+                v.set_property("__ec", Value::Number(start_container as f64));
+                v.set_property("__eo", Value::Number(from as f64));
+                v.set_property("__sc", Value::Number(start_container as f64));
+                v.set_property("__so", Value::Number(from as f64));
+            }
+            return element_value(fragment);
+        }
+
+        let children = dom::children(start_container);
+        let from = start.min(children.len());
+        let to = end.min(children.len()).max(from);
+        for child in children[from..to].iter().copied() {
+            let node = if extract {
+                child
+            } else {
+                dom::clone_node(child, true)
+            };
+            dom::append_child(fragment, node);
+        }
+        if extract {
+            v.set_property("__ec", Value::Number(start_container as f64));
+            v.set_property("__eo", Value::Number(from as f64));
+            v.set_property("__sc", Value::Number(start_container as f64));
+            v.set_property("__so", Value::Number(from as f64));
+        }
+        return element_value(fragment);
+    }
+
+    range_warn_complex();
+    let range = range_to_w3cos(v);
+    let text = if extract {
+        let text = dom::with_document_mut(|doc| range.extract_contents(doc));
+        dom::touch_document();
+        text
+    } else {
+        dom::with_document(|doc| range.clone_contents(doc))
+    };
+    if !text.is_empty() {
+        dom::append_child(fragment, dom::create_text_node(&text));
+    }
+    element_value(fragment)
+}
+
+fn insert_dom_node(parent: u32, offset: usize, node: u32) {
+    let nodes = if dom::node_type(node) == 11 {
+        dom::children(node)
+    } else {
+        vec![node]
+    };
+    let mut reference = dom::children(parent).get(offset).copied();
+    for node in nodes {
+        if let Some(reference_node) = reference {
+            dom::insert_before(parent, node, reference_node);
+        } else {
+            dom::append_child(parent, node);
+        }
+        reference = dom::next_sibling(node);
+    }
+}
+
+fn range_insert_node(v: &Value, node: u32) {
+    let container = range_hidden(v, "__sc");
+    let offset = range_hidden(v, "__so") as usize;
+    if dom::node_type(container) == 3 {
+        let Some(parent) = dom::parent_node(container) else {
+            return;
+        };
+        let text = dom::get_text_content(container).unwrap_or_default();
+        let chars = text.chars().collect::<Vec<_>>();
+        let split = offset.min(chars.len());
+        let before = chars[..split].iter().collect::<String>();
+        let after = chars[split..].iter().collect::<String>();
+        dom::set_text_content(container, &before);
+        let reference = dom::next_sibling(container);
+        let after_node = dom::create_text_node(&after);
+        if let Some(reference) = reference {
+            dom::insert_before(parent, after_node, reference);
+        } else {
+            dom::append_child(parent, after_node);
+        }
+        let insertion_index = dom::children(parent)
+            .iter()
+            .position(|child| *child == after_node)
+            .unwrap_or(dom::children(parent).len());
+        insert_dom_node(parent, insertion_index, node);
+    } else {
+        insert_dom_node(container, offset, node);
+    }
+}
+
+fn set_range_around_node(v: &Value, node: u32) {
+    if let Some(parent) = dom::parent_node(node)
+        && let Some(index) = dom::children(parent)
+            .iter()
+            .position(|child| *child == node)
+    {
+        v.set_property("__sc", Value::Number(parent as f64));
+        v.set_property("__so", Value::Number(index as f64));
+        v.set_property("__ec", Value::Number(parent as f64));
+        v.set_property("__eo", Value::Number((index + 1) as f64));
+    }
 }
 
 pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
@@ -3116,14 +6824,43 @@ pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
             let v = value.clone();
             move |_, args| {
                 if let Some(n) = node_id_of(&arg(&args, 0)) {
-                    for (k, val) in [("__sc", n), ("__ec", n), ("__so", 0), ("__eo", 0)] {
-                        v.set_property(k, Value::Number(val as f64));
-                    }
+                    set_range_around_node(&v, n);
                 }
                 Value::Undefined
             }
         }),
     );
+    for (method, start_boundary, after) in [
+        ("setStartBefore", true, false),
+        ("setStartAfter", true, true),
+        ("setEndBefore", false, false),
+        ("setEndAfter", false, true),
+    ] {
+        value.set_property(
+            method,
+            func({
+                let v = value.clone();
+                move |_, args| {
+                    if let Some(node) = node_id_of(&arg(&args, 0))
+                        && let Some(parent) = dom::parent_node(node)
+                        && let Some(index) = dom::children(parent)
+                            .iter()
+                            .position(|child| *child == node)
+                    {
+                        let offset = index + usize::from(after);
+                        let (container_key, offset_key) = if start_boundary {
+                            ("__sc", "__so")
+                        } else {
+                            ("__ec", "__eo")
+                        };
+                        v.set_property(container_key, Value::Number(parent as f64));
+                        v.set_property(offset_key, Value::Number(offset as f64));
+                    }
+                    Value::Undefined
+                }
+            }),
+        );
+    }
     value.set_property(
         "selectNodeContents",
         func({
@@ -3159,11 +6896,21 @@ pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
     );
     value.set_property(
         "getBoundingClientRect",
-        func(|_, _| rect_value(w3cos_dom::DOMRect::zero())),
+        func({
+            let v = value.clone();
+            move |_, _| rect_value(union_rects(&range_client_rects(&v)))
+        }),
     );
     value.set_property(
         "getClientRects",
-        func(|_, _| js_array(vec![rect_value(w3cos_dom::DOMRect::zero())])),
+        func({
+            let v = value.clone();
+            move |_, _| {
+                crate::geometry_web::rect_list(
+                    range_client_rects(&v).into_iter().map(rect_value).collect(),
+                )
+            }
+        }),
     );
     value.set_property(
         "toString",
@@ -3179,11 +6926,7 @@ pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
         "cloneContents",
         func({
             let v = value.clone();
-            move |_, _| {
-                // Approximation: returns the text contents, not a fragment.
-                let r = range_to_w3cos(&v);
-                Value::string(&dom::with_document(|doc| r.to_string(doc)))
-            }
+            move |_, _| range_fragment(&v, false)
         }),
     );
     value.set_property(
@@ -3191,9 +6934,7 @@ pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
         func({
             let v = value.clone();
             move |_, _| {
-                let r = range_to_w3cos(&v);
-                dom::with_document_mut(|doc| r.delete_contents(doc));
-                dom::touch_document();
+                range_fragment(&v, true);
                 Value::Undefined
             }
         }),
@@ -3202,18 +6943,262 @@ pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
         "extractContents",
         func({
             let v = value.clone();
-            move |_, _| {
-                // Approximation: returns the extracted text, not a fragment.
-                let r = range_to_w3cos(&v);
-                let text = dom::with_document_mut(|doc| r.extract_contents(doc));
-                dom::touch_document();
-                Value::string(&text)
-            }
+            move |_, _| range_fragment(&v, true)
         }),
     );
     value.set_property("detach", func(|_, _| Value::Undefined));
-    value.set_property("insertNode", func(|_, _| Value::Undefined)); // gap
+    value.set_property(
+        "insertNode",
+        func({
+            let v = value.clone();
+            move |_, args| {
+                if let Some(node) = node_id_of(&arg(&args, 0)) {
+                    range_insert_node(&v, node);
+                }
+                Value::Undefined
+            }
+        }),
+    );
+    value.set_property(
+        "surroundContents",
+        func({
+            let v = value.clone();
+            move |_, args| {
+                let Some(wrapper) = node_id_of(&arg(&args, 0)) else {
+                    return Value::Undefined;
+                };
+                let fragment = range_fragment(&v, true);
+                range_insert_node(&v, wrapper);
+                if let Some(fragment) = node_id_of(&fragment) {
+                    for child in dom::children(fragment) {
+                        dom::append_child(wrapper, child);
+                    }
+                }
+                set_range_around_node(&v, wrapper);
+                Value::Undefined
+            }
+        }),
+    );
+    value.set_property(
+        "createContextualFragment",
+        func(|_, args| {
+            let fragment = dom::create_document_fragment();
+            append_html_fragment(fragment, &arg(&args, 0).to_js_string());
+            element_value(fragment)
+        }),
+    );
     w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Range"));
+    value
+}
+
+pub(crate) fn static_range_value(args: Vec<Value>) -> Value {
+    let init = arg(&args, 0);
+    let required = |name: &str| {
+        let value = init.get_property(name);
+        if value.is_undefined() {
+            w3cos_core::throw_value(Value::object(HashMap::from([
+                ("name".to_string(), Value::string("TypeError")),
+                (
+                    "message".to_string(),
+                    Value::string(&format!("StaticRange {name} is required")),
+                ),
+            ])));
+        }
+        value
+    };
+    let start_container = required("startContainer");
+    let end_container = required("endContainer");
+    let Some(sc) = node_id_of(&start_container) else {
+        w3cos_core::throw_value(Value::object(HashMap::from([
+            ("name".to_string(), Value::string("TypeError")),
+            (
+                "message".to_string(),
+                Value::string("StaticRange startContainer must be a Node"),
+            ),
+        ])));
+    };
+    let Some(ec) = node_id_of(&end_container) else {
+        w3cos_core::throw_value(Value::object(HashMap::from([
+            ("name".to_string(), Value::string("TypeError")),
+            (
+                "message".to_string(),
+                Value::string("StaticRange endContainer must be a Node"),
+            ),
+        ])));
+    };
+    let so = required("startOffset").to_u32();
+    let eo = required("endOffset").to_u32();
+
+    let value = Value::object(HashMap::from([
+        ("__sc".to_string(), Value::Number(sc as f64)),
+        ("__so".to_string(), Value::Number(so as f64)),
+        ("__ec".to_string(), Value::Number(ec as f64)),
+        ("__eo".to_string(), Value::Number(eo as f64)),
+    ]));
+    value.set_property(
+        "__w3cos_getter_startContainer",
+        func({
+            let value = value.clone();
+            move |_, _| element_or_null(Some(range_hidden(&value, "__sc")))
+        }),
+    );
+    value.set_property(
+        "__w3cos_getter_endContainer",
+        func({
+            let value = value.clone();
+            move |_, _| element_or_null(Some(range_hidden(&value, "__ec")))
+        }),
+    );
+    for (key, hidden) in [("startOffset", "__so"), ("endOffset", "__eo")] {
+        value.set_property(
+            &format!("__w3cos_getter_{key}"),
+            func({
+                let value = value.clone();
+                move |_, _| Value::Number(range_hidden(&value, hidden) as f64)
+            }),
+        );
+    }
+    value.set_property(
+        "__w3cos_getter_collapsed",
+        func({
+            let value = value.clone();
+            move |_, _| {
+                Value::Bool(
+                    range_hidden(&value, "__sc") == range_hidden(&value, "__ec")
+                        && range_hidden(&value, "__so") == range_hidden(&value, "__eo"),
+                )
+            }
+        }),
+    );
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("StaticRange"));
+    value
+}
+
+pub(crate) fn text_value(args: Vec<Value>) -> Value {
+    let data = args.first().map(Value::to_js_string).unwrap_or_default();
+    element_value(dom::create_text_node(&data))
+}
+
+pub(crate) fn comment_value(args: Vec<Value>) -> Value {
+    let data = args.first().map(Value::to_js_string).unwrap_or_default();
+    element_value(dom::create_comment(&data))
+}
+
+fn dom_exception(message: &str, name: &str) -> ! {
+    w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(message, name))
+}
+
+fn valid_xml_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch == ':' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| {
+            ch == '_' || ch == ':' || ch == '-' || ch == '.' || ch.is_ascii_alphanumeric()
+        })
+}
+
+fn create_processing_instruction_value(target: &str, data: &str) -> Value {
+    if !valid_xml_name(target) || target.eq_ignore_ascii_case("xml") {
+        dom_exception(
+            "Processing instruction target is not a valid XML name",
+            "InvalidCharacterError",
+        );
+    }
+    if data.contains("?>") {
+        dom_exception(
+            "Processing instruction data must not contain '?>'",
+            "InvalidCharacterError",
+        );
+    }
+    element_value(dom::create_processing_instruction(target, data))
+}
+
+fn create_document_type_value(name: &str, public_id: &str, system_id: &str) -> Value {
+    if !valid_xml_name(name) {
+        dom_exception(
+            "Document type name is not a valid XML name",
+            "InvalidCharacterError",
+        );
+    }
+    let node = dom::create_document_type(name);
+    set_expando(node, "publicId", Value::string(public_id));
+    set_expando(node, "systemId", Value::string(system_id));
+    element_value(node)
+}
+
+fn dom_implementation_value() -> Value {
+    let value = Value::object(HashMap::new());
+    value.set_property(
+        "createDocumentType",
+        func(|_, args| {
+            create_document_type_value(
+                &arg(&args, 0).to_js_string(),
+                &arg(&args, 1).to_js_string(),
+                &arg(&args, 2).to_js_string(),
+            )
+        }),
+    );
+    value.set_property(
+        "createDocument",
+        func(|_, args| {
+            let namespace = arg(&args, 0);
+            let qualified_name = arg(&args, 1).to_js_string();
+            if qualified_name.is_empty() {
+                dom_exception(
+                    "Empty document roots are not supported by this runtime",
+                    "NotSupportedError",
+                );
+            }
+            if !valid_xml_name(&qualified_name) {
+                dom_exception(
+                    "Document element name is not a valid XML name",
+                    "InvalidCharacterError",
+                );
+            }
+            let root = dom::create_element(&qualified_name);
+            if !namespace.is_null() {
+                set_expando(
+                    root,
+                    "namespaceURI",
+                    Value::string(&namespace.to_js_string()),
+                );
+            }
+            let document = parsed_document_value(root, "application/xml", None, None);
+            let doctype = arg(&args, 2);
+            document.set_property(
+                "doctype",
+                if node_id_of(&doctype).is_some_and(|node| dom::node_type(node) == 10) {
+                    doctype
+                } else {
+                    Value::Null
+                },
+            );
+            document
+        }),
+    );
+    value.set_property(
+        "createHTMLDocument",
+        func(|_, args| {
+            let html = dom::create_element("html");
+            let head = dom::create_element("head");
+            let body = dom::create_element("body");
+            dom::append_child(html, head);
+            dom::append_child(html, body);
+            let title = arg(&args, 0);
+            if !title.is_undefined() {
+                let title_node = dom::create_element("title");
+                dom::append_child(title_node, dom::create_text_node(&title.to_js_string()));
+                dom::append_child(head, title_node);
+            }
+            parsed_document_value(html, "text/html", Some(head), Some(body))
+        }),
+    );
+    value.set_property("hasFeature", func(|_, _| Value::Bool(true)));
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype("DOMImplementation"),
+    );
     value
 }
 
@@ -3417,25 +7402,382 @@ fn ensure_html_structure() {
     HEAD_ID.with(|h| *h.borrow_mut() = Some(head));
 }
 
-fn fonts_stub() -> Value {
-    let mut props: HashMap<String, Value> = HashMap::new();
-    props.insert("size".to_string(), Value::Number(0.0));
-    for name in [
-        "add", "delete", "clear", "forEach", "values", "keys", "entries",
-    ] {
-        props.insert(name.to_string(), func(|_, _| Value::Undefined));
+fn traversal_root(value: &Value) -> Option<u32> {
+    node_id_of(value).or_else(|| (value == &document_value()).then_some(0))
+}
+
+fn traversal_node_value(node: u32) -> Value {
+    if node == 0 {
+        document_value()
+    } else {
+        element_value(node)
     }
-    props.insert("has".to_string(), func(|_, _| Value::Bool(false)));
-    props.insert("check".to_string(), func(|_, _| Value::Bool(false)));
-    props.insert(
-        "load".to_string(),
-        func(|_, _| resolved_thenable(js_array(vec![]))),
+}
+
+fn node_filter_result(node: u32, what_to_show: u32, filter: &Value) -> u32 {
+    let node_type = dom::node_type(node);
+    let mask = (node_type > 0 && node_type <= 32)
+        .then(|| 1_u32 << (node_type - 1))
+        .unwrap_or(0);
+    if what_to_show != u32::MAX && what_to_show & mask == 0 {
+        return 3;
+    }
+    let node = traversal_node_value(node);
+    let result = if filter.is_nullish() {
+        return 1;
+    } else if filter.is_function() {
+        filter.call(Value::Undefined, vec![node])
+    } else {
+        let callback = filter.get_property("acceptNode");
+        if !callback.is_function() {
+            return 1;
+        }
+        callback.call(filter.clone(), vec![node])
+    };
+    match result.to_u32() {
+        1..=3 => result.to_u32(),
+        _ => 1,
+    }
+}
+
+fn traversal_sequence(
+    root: u32,
+    what_to_show: u32,
+    filter: &Value,
+    reject_prunes: bool,
+) -> Vec<(u32, bool)> {
+    fn visit(
+        node: u32,
+        what_to_show: u32,
+        filter: &Value,
+        reject_prunes: bool,
+        output: &mut Vec<(u32, bool)>,
+    ) {
+        let result = node_filter_result(node, what_to_show, filter);
+        output.push((node, result == 1));
+        if result == 2 && reject_prunes {
+            return;
+        }
+        for child in dom::children(node) {
+            visit(child, what_to_show, filter, reject_prunes, output);
+        }
+    }
+    let mut output = Vec::new();
+    visit(root, what_to_show, filter, reject_prunes, &mut output);
+    output
+}
+
+fn visible_child(node: u32, what_to_show: u32, filter: &Value, reverse: bool) -> Option<u32> {
+    fn find(node: u32, what_to_show: u32, filter: &Value, reverse: bool) -> Option<u32> {
+        let result = node_filter_result(node, what_to_show, filter);
+        if result == 1 {
+            return Some(node);
+        }
+        if result == 2 {
+            return None;
+        }
+        let mut children = dom::children(node);
+        if reverse {
+            children.reverse();
+        }
+        children
+            .into_iter()
+            .find_map(|child| find(child, what_to_show, filter, reverse))
+    }
+    let mut children = dom::children(node);
+    if reverse {
+        children.reverse();
+    }
+    children
+        .into_iter()
+        .find_map(|child| find(child, what_to_show, filter, reverse))
+}
+
+fn repair_iterator_reference(
+    reference: &Cell<u32>,
+    before: &Cell<bool>,
+    previous_sequence: &RefCell<Vec<u32>>,
+    sequence: &[(u32, bool)],
+) {
+    if sequence.iter().any(|(node, _)| *node == reference.get()) {
+        return;
+    }
+    let previous = previous_sequence.borrow();
+    let Some(position) = previous.iter().position(|node| *node == reference.get()) else {
+        return;
+    };
+    let is_live = |candidate: &&u32| sequence.iter().any(|(node, _)| node == *candidate);
+    let replacement = if before.get() {
+        previous[position + 1..]
+            .iter()
+            .find(is_live)
+            .map(|node| (*node, true))
+            .or_else(|| {
+                previous[..position]
+                    .iter()
+                    .rev()
+                    .find(is_live)
+                    .map(|node| (*node, false))
+            })
+    } else {
+        previous[..position]
+            .iter()
+            .rev()
+            .find(is_live)
+            .map(|node| (*node, false))
+            .or_else(|| {
+                previous[position + 1..]
+                    .iter()
+                    .find(is_live)
+                    .map(|node| (*node, true))
+            })
+    };
+    if let Some((replacement, pointer_before)) = replacement {
+        reference.set(replacement);
+        before.set(pointer_before);
+    }
+}
+
+fn traversal_value(root: u32, what_to_show: u32, filter: Value, iterator: bool) -> Value {
+    if iterator {
+        let reference = Rc::new(Cell::new(root));
+        let before = Rc::new(Cell::new(true));
+        let previous_sequence = Rc::new(RefCell::new(vec![root]));
+        let value = Value::object(HashMap::from([
+            ("root".to_string(), traversal_node_value(root)),
+            ("whatToShow".to_string(), Value::Number(what_to_show as f64)),
+            ("filter".to_string(), filter.clone()),
+        ]));
+        let next_reference = Rc::clone(&reference);
+        let next_before = Rc::clone(&before);
+        let next_previous_sequence = Rc::clone(&previous_sequence);
+        let next_filter = filter.clone();
+        value.set_property(
+            "nextNode",
+            func(move |_, _| {
+                let sequence = traversal_sequence(root, what_to_show, &next_filter, false);
+                repair_iterator_reference(
+                    &next_reference,
+                    &next_before,
+                    &next_previous_sequence,
+                    &sequence,
+                );
+                *next_previous_sequence.borrow_mut() =
+                    sequence.iter().map(|(node, _)| *node).collect();
+                let current = next_reference.get();
+                let start = sequence
+                    .iter()
+                    .position(|(node, _)| *node == current)
+                    .unwrap_or(0);
+                let candidate = sequence
+                    .iter()
+                    .enumerate()
+                    .skip(start + usize::from(!next_before.get()))
+                    .find(|(_, (_, accepted))| *accepted)
+                    .map(|(_, (node, _))| *node);
+                if let Some(candidate) = candidate {
+                    next_reference.set(candidate);
+                    next_before.set(false);
+                    traversal_node_value(candidate)
+                } else {
+                    Value::Null
+                }
+            }),
+        );
+        let previous_reference = Rc::clone(&reference);
+        let previous_before = Rc::clone(&before);
+        let previous_previous_sequence = previous_sequence;
+        let previous_filter = filter;
+        value.set_property(
+            "previousNode",
+            func(move |_, _| {
+                let sequence = traversal_sequence(root, what_to_show, &previous_filter, false);
+                repair_iterator_reference(
+                    &previous_reference,
+                    &previous_before,
+                    &previous_previous_sequence,
+                    &sequence,
+                );
+                *previous_previous_sequence.borrow_mut() =
+                    sequence.iter().map(|(node, _)| *node).collect();
+                let current = previous_reference.get();
+                let position = sequence
+                    .iter()
+                    .position(|(node, _)| *node == current)
+                    .unwrap_or(0);
+                let end = position + usize::from(!previous_before.get());
+                let candidate = sequence[..end.min(sequence.len())]
+                    .iter()
+                    .rev()
+                    .find(|(_, accepted)| *accepted)
+                    .map(|(node, _)| *node);
+                if let Some(candidate) = candidate {
+                    previous_reference.set(candidate);
+                    previous_before.set(true);
+                    traversal_node_value(candidate)
+                } else {
+                    Value::Null
+                }
+            }),
+        );
+        value.set_property("detach", func(|_, _| Value::Undefined));
+        w3cos_core::class::set_prototype_of(
+            &value,
+            &crate::dom_constructors::prototype("NodeIterator"),
+        );
+        return value;
+    }
+
+    let current = Rc::new(Cell::new(root));
+    let value = Value::object(HashMap::from([
+        ("root".to_string(), traversal_node_value(root)),
+        ("whatToShow".to_string(), Value::Number(what_to_show as f64)),
+        ("filter".to_string(), filter.clone()),
+    ]));
+    let getter_current = Rc::clone(&current);
+    value.set_property(
+        "__w3cos_getter_currentNode",
+        func(move |_, _| traversal_node_value(getter_current.get())),
     );
-    props.insert("status".to_string(), Value::string("loaded"));
-    let fonts = Value::object(props);
-    let f = fonts.clone();
-    fonts.set_property("ready", resolved_thenable(f));
-    fonts
+    let setter_current = Rc::clone(&current);
+    value.set_property(
+        "__w3cos_setter_currentNode",
+        func(move |_, args| {
+            if let Some(node) = traversal_root(&arg(&args, 0)) {
+                setter_current.set(node);
+            }
+            Value::Undefined
+        }),
+    );
+    for (name, reverse) in [("firstChild", false), ("lastChild", true)] {
+        let method_current = Rc::clone(&current);
+        let method_filter = filter.clone();
+        value.set_property(
+            name,
+            func(move |_, _| {
+                if let Some(node) =
+                    visible_child(method_current.get(), what_to_show, &method_filter, reverse)
+                {
+                    method_current.set(node);
+                    traversal_node_value(node)
+                } else {
+                    Value::Null
+                }
+            }),
+        );
+    }
+    let parent_current = Rc::clone(&current);
+    let parent_filter = filter.clone();
+    value.set_property(
+        "parentNode",
+        func(move |_, _| {
+            let mut parent = dom::parent_node(parent_current.get());
+            while let Some(node) = parent {
+                if node_filter_result(node, what_to_show, &parent_filter) == 1 {
+                    parent_current.set(node);
+                    return traversal_node_value(node);
+                }
+                if node == root {
+                    break;
+                }
+                parent = dom::parent_node(node);
+            }
+            Value::Null
+        }),
+    );
+    for (name, reverse) in [("nextSibling", false), ("previousSibling", true)] {
+        let sibling_current = Rc::clone(&current);
+        let sibling_filter = filter.clone();
+        value.set_property(
+            name,
+            func(move |_, _| {
+                let current_node = sibling_current.get();
+                let mut sibling = if reverse {
+                    dom::previous_sibling(current_node)
+                } else {
+                    dom::next_sibling(current_node)
+                };
+                while let Some(node) = sibling {
+                    let result = node_filter_result(node, what_to_show, &sibling_filter);
+                    let candidate = if result == 1 {
+                        Some(node)
+                    } else if result == 3 {
+                        visible_child(node, what_to_show, &sibling_filter, reverse)
+                    } else {
+                        None
+                    };
+                    if let Some(candidate) = candidate {
+                        sibling_current.set(candidate);
+                        return traversal_node_value(candidate);
+                    }
+                    sibling = if reverse {
+                        dom::previous_sibling(node)
+                    } else {
+                        dom::next_sibling(node)
+                    };
+                }
+                Value::Null
+            }),
+        );
+    }
+    for (name, reverse) in [("nextNode", false), ("previousNode", true)] {
+        let node_current = Rc::clone(&current);
+        let node_filter = filter.clone();
+        value.set_property(
+            name,
+            func(move |_, _| {
+                let sequence = traversal_sequence(root, what_to_show, &node_filter, true);
+                let position = sequence
+                    .iter()
+                    .position(|(node, _)| *node == node_current.get());
+                let candidate = position.and_then(|position| {
+                    if reverse {
+                        sequence[..position]
+                            .iter()
+                            .rev()
+                            .find(|(_, accepted)| *accepted)
+                    } else {
+                        sequence[position + 1..]
+                            .iter()
+                            .find(|(_, accepted)| *accepted)
+                    }
+                    .map(|(node, _)| *node)
+                });
+                if let Some(candidate) = candidate {
+                    node_current.set(candidate);
+                    traversal_node_value(candidate)
+                } else {
+                    Value::Null
+                }
+            }),
+        );
+    }
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("TreeWalker"));
+    value
+}
+
+fn node_filter_value() -> Value {
+    Value::object(HashMap::from([
+        ("FILTER_ACCEPT".to_string(), Value::Number(1.0)),
+        ("FILTER_REJECT".to_string(), Value::Number(2.0)),
+        ("FILTER_SKIP".to_string(), Value::Number(3.0)),
+        ("SHOW_ALL".to_string(), Value::Number(u32::MAX as f64)),
+        ("SHOW_ELEMENT".to_string(), Value::Number(1.0)),
+        ("SHOW_ATTRIBUTE".to_string(), Value::Number(2.0)),
+        ("SHOW_TEXT".to_string(), Value::Number(4.0)),
+        ("SHOW_CDATA_SECTION".to_string(), Value::Number(8.0)),
+        ("SHOW_ENTITY_REFERENCE".to_string(), Value::Number(16.0)),
+        ("SHOW_ENTITY".to_string(), Value::Number(32.0)),
+        (
+            "SHOW_PROCESSING_INSTRUCTION".to_string(),
+            Value::Number(64.0),
+        ),
+        ("SHOW_COMMENT".to_string(), Value::Number(128.0)),
+        ("SHOW_DOCUMENT".to_string(), Value::Number(256.0)),
+        ("SHOW_DOCUMENT_TYPE".to_string(), Value::Number(512.0)),
+        ("SHOW_DOCUMENT_FRAGMENT".to_string(), Value::Number(1024.0)),
+        ("SHOW_NOTATION".to_string(), Value::Number(2048.0)),
+    ]))
 }
 
 /// The global `document` value (memoized thread-local singleton).
@@ -3444,6 +7786,9 @@ pub fn document_value() -> Value {
         return v;
     }
     let value = build_document_value();
+    crate::view_transition_web::install_document(&value);
+    crate::fragment_directive_web::install_document(&value);
+    crate::xpath_web::install_document(&value);
     DOCUMENT_VALUE.with(|d| *d.borrow_mut() = Some(value.clone()));
     value
 }
@@ -3453,7 +7798,7 @@ fn build_document_value() -> Value {
 
     props.insert("nodeType".to_string(), Value::Number(9.0));
     props.insert("nodeName".to_string(), Value::string("#document"));
-    props.insert("hidden".to_string(), Value::Bool(false));
+    props.insert("onvisibilitychange".to_string(), Value::Null);
     props.insert("characterSet".to_string(), Value::string("UTF-8"));
     props.insert("compatMode".to_string(), Value::string("CSS1Compat"));
     props.insert("designMode".to_string(), Value::string("off"));
@@ -3462,13 +7807,37 @@ fn build_document_value() -> Value {
     props.insert("URL".to_string(), Value::string("w3cos://app"));
     props.insert("domain".to_string(), Value::string("app"));
     props.insert("referrer".to_string(), Value::string(""));
-    props.insert("fonts".to_string(), fonts_stub());
+    props.insert(
+        "fonts".to_string(),
+        crate::font_loading_web::font_face_set_value(),
+    );
+    props.insert(
+        "styleSheets".to_string(),
+        style_sheet_list_value(Rc::new(RefCell::new(Vec::new()))),
+    );
+    props.insert("adoptedStyleSheets".to_string(), js_array(vec![]));
+    props.insert("doctype".to_string(), Value::Null);
+    props.insert("implementation".to_string(), dom_implementation_value());
+    props.insert(
+        "featurePolicy".to_string(),
+        crate::compat_web::feature_policy_value(),
+    );
+    props.insert("pictureInPictureElement".to_string(), Value::Null);
+    props.insert(
+        "exitPictureInPicture".to_string(),
+        func(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
+    );
+    props.insert(
+        "timeline".to_string(),
+        crate::animations_web::document_timeline_value(),
+    );
 
     props.insert(
         "createElement".to_string(),
         func(|_, args| {
             let tag = arg(&args, 0).to_js_string().to_ascii_lowercase();
-            element_value(dom::create_element(&tag))
+            let element = element_value(dom::create_element(&tag));
+            crate::custom_elements_web::upgrade_created_element(&tag, element)
         }),
     );
     props.insert(
@@ -3480,7 +7849,14 @@ fn build_document_value() -> Value {
             let tag = arg(&args, 1).to_js_string().to_ascii_lowercase();
             let id = dom::create_element(&tag);
             set_expando(id, "namespaceURI", Value::string(&ns));
-            element_value(id)
+            let element = element_value(id);
+            if ns == "http://www.w3.org/1998/Math/MathML" {
+                w3cos_core::class::set_prototype_of(
+                    &element,
+                    &math_ml_element_class().get_property("prototype"),
+                );
+            }
+            element
         }),
     );
     props.insert(
@@ -3492,9 +7868,44 @@ fn build_document_value() -> Value {
         func(|_, args| element_value(dom::create_comment(&arg(&args, 0).to_js_string()))),
     );
     props.insert(
+        "createCDATASection".to_string(),
+        func(|_, _| {
+            dom_exception(
+                "CDATA sections are not supported in HTML documents",
+                "NotSupportedError",
+            )
+        }),
+    );
+    props.insert(
+        "createProcessingInstruction".to_string(),
+        func(|_, args| {
+            create_processing_instruction_value(
+                &arg(&args, 0).to_js_string(),
+                &arg(&args, 1).to_js_string(),
+            )
+        }),
+    );
+    props.insert(
         "createDocumentFragment".to_string(),
         func(|_, _| element_value(dom::create_document_fragment())),
     );
+    for (name, iterator) in [("createTreeWalker", false), ("createNodeIterator", true)] {
+        props.insert(
+            name.to_string(),
+            func(move |_, args| {
+                let root_value = arg(&args, 0);
+                let Some(root) = traversal_root(&root_value) else {
+                    return Value::Null;
+                };
+                let what_to_show = if arg(&args, 1).is_undefined() {
+                    u32::MAX
+                } else {
+                    arg(&args, 1).to_u32()
+                };
+                traversal_value(root, what_to_show, arg(&args, 2), iterator)
+            }),
+        );
+    }
     props.insert(
         "getElementById".to_string(),
         func(|_, args| element_or_null(dom::get_element_by_id(&arg(&args, 0).to_js_string()))),
@@ -3510,8 +7921,47 @@ fn build_document_value() -> Value {
         "querySelectorAll".to_string(),
         func(|_, args| {
             let sel = arg(&args, 0).to_js_string();
-            js_array(
+            node_list(
                 query_selector_all_scoped(None, &sel)
+                    .into_iter()
+                    .map(element_value)
+                    .collect(),
+            )
+        }),
+    );
+    props.insert(
+        "caretPositionFromPoint".to_string(),
+        func(|_, args| caret_position_from_point(farg(&args, 0), farg(&args, 1))),
+    );
+    props.insert(
+        "caretRangeFromPoint".to_string(),
+        func(|_, args| {
+            let position = caret_position_from_point(farg(&args, 0), farg(&args, 1));
+            if position.is_null() {
+                return Value::Null;
+            }
+            let Some(node) = node_id_of(&position.get_property("offsetNode")) else {
+                return Value::Null;
+            };
+            let offset = position.get_property("offset").to_u32();
+            range_value(node, offset, node, offset)
+        }),
+    );
+    props.insert(
+        "elementFromPoint".to_string(),
+        func(|_, args| {
+            element_or_null(deepest_node_at_point(
+                document_element_id(),
+                farg(&args, 0),
+                farg(&args, 1),
+            ))
+        }),
+    );
+    props.insert(
+        "elementsFromPoint".to_string(),
+        func(|_, args| {
+            Value::array(
+                deepest_node_at_point(document_element_id(), farg(&args, 0), farg(&args, 1))
                     .into_iter()
                     .map(element_value)
                     .collect(),
@@ -3522,24 +7972,37 @@ fn build_document_value() -> Value {
         "getElementsByTagName".to_string(),
         func(|_, args| {
             let tag = arg(&args, 0).to_js_string().to_ascii_lowercase();
-            js_array(
+            html_collection(move || {
                 dom::get_elements_by_tag_name(&tag)
                     .into_iter()
                     .map(element_value)
-                    .collect(),
-            )
+                    .collect()
+            })
         }),
     );
     props.insert(
         "getElementsByClassName".to_string(),
         func(|_, args| {
             let class = arg(&args, 0).to_js_string();
-            js_array(
+            html_collection(move || {
                 dom::get_elements_by_class_name(&class)
                     .into_iter()
                     .map(element_value)
-                    .collect(),
-            )
+                    .collect()
+            })
+        }),
+    );
+    props.insert(
+        "getElementsByName".to_string(),
+        func(|_, args| {
+            let name = arg(&args, 0).to_js_string();
+            live_node_list(move || {
+                dom::get_elements_by_tag_name("*")
+                    .into_iter()
+                    .filter(|node| dom::get_attribute(*node, "name").as_deref() == Some(&name))
+                    .map(element_value)
+                    .collect()
+            })
         }),
     );
     props.insert(
@@ -3548,17 +8011,38 @@ fn build_document_value() -> Value {
     );
     props.insert("getSelection".to_string(), func(|_, _| selection_value()));
     props.insert(
+        "getAnimations".to_string(),
+        func(|_, _| crate::animations_web::animations_for(None, true)),
+    );
+    props.insert(
         "execCommand".to_string(),
-        func(|_, _| Value::Bool(false)), // no clipboard command engine (gap)
+        func(|_, _| {
+            warn_host_api("document.execCommand()", "false");
+            Value::Bool(false)
+        }),
     );
     props.insert("hasFocus".to_string(), func(|_, _| Value::Bool(true)));
     props.insert(
         "adoptNode".to_string(),
-        func(|_, args| arg(&args, 0)), // single document: no-op
+        func(|_, args| {
+            let node = arg(&args, 0);
+            if let Some(id) = node_id_of(&node)
+                && let Some(parent) = dom::parent_node(id)
+            {
+                dom::remove_child(parent, id);
+            }
+            node
+        }),
     );
     props.insert(
         "importNode".to_string(),
-        func(|_, args| arg(&args, 0)), // single document: no-op
+        func(|_, args| {
+            let node = arg(&args, 0);
+            let Some(id) = node_id_of(&node) else {
+                return Value::Null;
+            };
+            element_value(dom::clone_node(id, arg(&args, 1).to_bool()))
+        }),
     );
     props.insert(
         "addEventListener".to_string(),
@@ -3639,7 +8123,13 @@ fn build_document_value() -> Value {
     );
     props.insert(
         "__w3cos_getter_visibilityState".to_string(),
-        func(|_, _| Value::string("visible")),
+        func(|_, _| DOCUMENT_VISIBILITY.with(|state| Value::string(&state.borrow()))),
+    );
+    props.insert(
+        "__w3cos_getter_hidden".to_string(),
+        func(|_, _| {
+            DOCUMENT_VISIBILITY.with(|state| Value::Bool(state.borrow().as_str() == "hidden"))
+        }),
     );
     props.insert(
         "__w3cos_getter_readyState".to_string(),
@@ -3647,35 +8137,12 @@ fn build_document_value() -> Value {
     );
     props.insert(
         "__w3cos_getter_cookie".to_string(),
-        func(|_, _| {
-            COOKIE_STORE.with(|cookies| {
-                Value::string(
-                    &cookies
-                        .borrow()
-                        .iter()
-                        .map(|(name, value)| format!("{name}={value}"))
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                )
-            })
-        }),
+        func(|_, _| Value::string(&crate::cookie_store_web::document_cookie())),
     );
     props.insert(
         "__w3cos_setter_cookie".to_string(),
         func(|_, args| {
-            let assignment = arg(&args, 0).to_js_string();
-            let pair = assignment.split(';').next().unwrap_or_default();
-            if let Some((name, value)) = pair.split_once('=') {
-                let name = name.trim().to_string();
-                let value = value.trim().to_string();
-                if !name.is_empty() {
-                    COOKIE_STORE.with(|cookies| {
-                        let mut cookies = cookies.borrow_mut();
-                        cookies.retain(|(candidate, _)| candidate != &name);
-                        cookies.push((name, value));
-                    });
-                }
-            }
+            crate::cookie_store_web::set_document_cookie(&arg(&args, 0).to_js_string());
             Value::Undefined
         }),
     );
@@ -3688,48 +8155,60 @@ fn build_document_value() -> Value {
         func(|_, _| location_value()),
     );
 
-    Value::object(props)
+    let document = Value::object(props);
+    w3cos_core::class::set_prototype_of(
+        &document,
+        &crate::dom_constructors::prototype("HTMLDocument"),
+    );
+    let prototype = crate::dom_constructors::prototype("Document");
+    for name in ["hidden", "visibilityState", "onvisibilitychange"] {
+        prototype.set_property(name, Value::Undefined);
+    }
+    document
 }
 
 // ── window ─────────────────────────────────────────────────────────────────
 
 fn resolved_thenable(result: Value) -> Value {
-    let mut props: HashMap<String, Value> = HashMap::new();
-    props.insert(
-        "then".to_string(),
-        func({
-            let r = result.clone();
-            move |_, args| {
-                let cb = arg(&args, 0);
-                if cb.is_function() {
-                    let r2 = r.clone();
-                    queue_microtask_value(func(move |_, _| {
-                        cb.call(Value::Undefined, vec![r2.clone()])
-                    }));
-                }
-                Value::Undefined
-            }
-        }),
-    );
-    props.insert("catch".to_string(), func(|_, _| Value::Undefined));
-    props.insert(
-        "finally".to_string(),
-        func(move |_, args| {
-            let cb = arg(&args, 0);
-            if cb.is_function() {
-                queue_microtask_value(func(move |_, _| cb.call(Value::Undefined, vec![])));
-            }
-            Value::Undefined
-        }),
-    );
-    Value::object(props)
+    w3cos_core::promise::resolve(vec![result])
+}
+
+fn idle_deadline_class() -> Value {
+    IDLE_DEADLINE_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = func(|_, args| idle_deadline_value(arg(&args, 0).to_bool()));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property("didTimeout", Value::Undefined);
+        prototype.set_property("timeRemaining", func(|_, _| Value::Number(0.0)));
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn idle_deadline_value(did_timeout: bool) -> Value {
+    let started = Instant::now();
+    let value = Value::object(HashMap::from([
+        ("didTimeout".to_string(), Value::Bool(did_timeout)),
+        (
+            "timeRemaining".to_string(),
+            func(move |_, _| {
+                Value::Number((50.0 - started.elapsed().as_secs_f64() * 1000.0).clamp(0.0, 50.0))
+            }),
+        ),
+    ]));
+    w3cos_core::class::set_prototype_of(&value, &idle_deadline_class().get_property("prototype"));
+    value
 }
 
 #[cfg(all(
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
-fn clipboard_read_text() -> String {
+pub(crate) fn clipboard_read_text() -> String {
     crate::clipboard::Clipboard::read_text().unwrap_or_default()
 }
 
@@ -3737,7 +8216,7 @@ fn clipboard_read_text() -> String {
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 )))]
-fn clipboard_read_text() -> String {
+pub(crate) fn clipboard_read_text() -> String {
     CLIPBOARD_FALLBACK.with(|c| c.borrow().clone())
 }
 
@@ -3745,7 +8224,7 @@ fn clipboard_read_text() -> String {
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
-fn clipboard_write_text(text: &str) {
+pub(crate) fn clipboard_write_text(text: &str) {
     let _ = crate::clipboard::Clipboard::write_text(text);
 }
 
@@ -3753,7 +8232,7 @@ fn clipboard_write_text(text: &str) {
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 )))]
-fn clipboard_write_text(text: &str) {
+pub(crate) fn clipboard_write_text(text: &str) {
     CLIPBOARD_FALLBACK.with(|c| *c.borrow_mut() = text.to_string());
 }
 
@@ -3763,46 +8242,140 @@ fn navigator_value() -> Value {
         "userAgent".to_string(),
         Value::string("W3COS/0.1 (w3cos; like Gecko)"),
     );
+    props.insert("appCodeName".to_string(), Value::string("Mozilla"));
+    props.insert("appName".to_string(), Value::string("Netscape"));
     props.insert("appVersion".to_string(), Value::string("0.1"));
     props.insert("platform".to_string(), Value::string("w3cos"));
+    props.insert("product".to_string(), Value::string("Gecko"));
+    props.insert("productSub".to_string(), Value::string("20030107"));
     props.insert("vendor".to_string(), Value::string("w3cos"));
+    props.insert("vendorSub".to_string(), Value::string(""));
+    props.insert("webdriver".to_string(), Value::Bool(false));
+    props.insert(
+        "userAgentData".to_string(),
+        crate::compat_web::navigator_ua_data_value(),
+    );
+    props.insert("doNotTrack".to_string(), Value::Null);
     props.insert("language".to_string(), Value::string("en-US"));
     props.insert(
         "languages".to_string(),
         js_array(vec![Value::string("en-US")]),
     );
-    props.insert("maxTouchPoints".to_string(), Value::Number(0.0));
+    props.insert(
+        "__w3cos_getter_maxTouchPoints".to_string(),
+        func(|_, _| Value::Number(MAX_TOUCH_POINTS.with(Cell::get) as f64)),
+    );
     props.insert("hardwareConcurrency".to_string(), Value::Number(4.0));
     props.insert("onLine".to_string(), Value::Bool(true));
     props.insert("cookieEnabled".to_string(), Value::Bool(true));
     props.insert("pdfViewerEnabled".to_string(), Value::Bool(false));
-    props.insert("sendBeacon".to_string(), func(|_, _| Value::Bool(false)));
-    props.insert("vibrate".to_string(), func(|_, _| Value::Bool(false)));
+    props.insert(
+        "plugins".to_string(),
+        crate::navigator_web::plugin_array_value(),
+    );
+    props.insert(
+        "mimeTypes".to_string(),
+        crate::navigator_web::mime_type_array_value(),
+    );
+    props.insert("javaEnabled".to_string(), func(|_, _| Value::Bool(false)));
+    props.insert(
+        "registerProtocolHandler".to_string(),
+        crate::navigator_web::register_protocol_handler_value(),
+    );
+    props.insert(
+        "requestMIDIAccess".to_string(),
+        crate::midi_web::request_midi_access_value(),
+    );
+    props.insert(
+        "requestMediaKeySystemAccess".to_string(),
+        crate::encrypted_media_web::request_media_key_system_access_value(),
+    );
+    props.insert(
+        "serviceWorker".to_string(),
+        crate::service_worker_web::service_worker_container_value(),
+    );
+    props.insert(
+        "getBattery".to_string(),
+        crate::battery_web::get_battery_value(),
+    );
+    props.insert(
+        "getGamepads".to_string(),
+        crate::gamepad_web::get_gamepads_value(),
+    );
+    props.insert("locks".to_string(), crate::locks_web::lock_manager_value());
+    props.insert(
+        "permissions".to_string(),
+        crate::permissions_web::permissions_value(),
+    );
+    props.insert(
+        "storage".to_string(),
+        crate::storage_manager_web::storage_manager_value(),
+    );
+    props.insert(
+        "storageBuckets".to_string(),
+        crate::storage_buckets_web::storage_bucket_manager_value(),
+    );
+    props.insert(
+        "userActivation".to_string(),
+        crate::user_activation_web::user_activation_value(),
+    );
+    props.insert(
+        "mediaSession".to_string(),
+        crate::media_session_web::media_session_value(),
+    );
+    props.insert(
+        "mediaCapabilities".to_string(),
+        crate::media_capabilities_web::media_capabilities_value(),
+    );
+    props.insert(
+        "credentials".to_string(),
+        crate::credentials_web::credentials_container_value(),
+    );
+    props.insert(
+        "login".to_string(),
+        crate::navigator_web::navigator_login_value(),
+    );
+    props.insert(
+        "managed".to_string(),
+        crate::navigator_web::navigator_managed_data_value(),
+    );
+    let connection = crate::network_information_web::network_information_value();
+    props.insert("connection".to_string(), connection.clone());
+    props.insert("mozConnection".to_string(), connection.clone());
+    props.insert("webkitConnection".to_string(), connection);
+    props.insert(
+        "wakeLock".to_string(),
+        crate::wake_lock_web::wake_lock_value(),
+    );
+    props.insert("canShare".to_string(), crate::web_share::can_share_value());
+    props.insert("share".to_string(), crate::web_share::share_value());
+    props.insert(
+        "setAppBadge".to_string(),
+        crate::badging_web::set_app_badge_value(),
+    );
+    props.insert(
+        "clearAppBadge".to_string(),
+        crate::badging_web::clear_app_badge_value(),
+    );
+    props.insert(
+        "sendBeacon".to_string(),
+        func(|_, _| {
+            warn_host_api("navigator.sendBeacon()", "false");
+            Value::Bool(false)
+        }),
+    );
+    props.insert(
+        "vibrate".to_string(),
+        func(|_, _| {
+            warn_host_api("navigator.vibrate()", "false");
+            Value::Bool(false)
+        }),
+    );
 
-    let mut clipboard: HashMap<String, Value> = HashMap::new();
-    clipboard.insert(
-        "readText".to_string(),
-        func(|_, _| resolved_thenable(Value::string(&clipboard_read_text()))),
+    props.insert(
+        "clipboard".to_string(),
+        crate::clipboard_web::clipboard_value(),
     );
-    clipboard.insert(
-        "writeText".to_string(),
-        func(|_, args| {
-            clipboard_write_text(&arg(&args, 0).to_js_string());
-            resolved_thenable(Value::Undefined)
-        }),
-    );
-    clipboard.insert(
-        "read".to_string(),
-        func(|_, _| resolved_thenable(crate::clipboard_web::read_items())),
-    );
-    clipboard.insert(
-        "write".to_string(),
-        func(|_, args| {
-            crate::clipboard_web::write_items(&arg(&args, 0));
-            resolved_thenable(Value::Undefined)
-        }),
-    );
-    props.insert("clipboard".to_string(), Value::object(clipboard));
     props.insert(
         "geolocation".to_string(),
         crate::geolocation_web::geolocation_value(),
@@ -3815,8 +8388,50 @@ fn navigator_value() -> Value {
         "bluetooth".to_string(),
         crate::bluetooth_web::bluetooth_value(),
     );
+    props.insert(
+        "serial".to_string(),
+        crate::device_access_web::serial_value(),
+    );
+    props.insert("hid".to_string(), crate::device_access_web::hid_value());
+    props.insert("usb".to_string(), crate::device_access_web::usb_value());
+    props.insert(
+        "keyboard".to_string(),
+        crate::window_environment_web::keyboard_value(),
+    );
+    props.insert(
+        "virtualKeyboard".to_string(),
+        crate::window_environment_web::virtual_keyboard_value(),
+    );
+    props.insert(
+        "devicePosture".to_string(),
+        crate::window_environment_web::device_posture_value(),
+    );
+    props.insert(
+        "windowControlsOverlay".to_string(),
+        crate::window_environment_web::window_controls_overlay_value(),
+    );
+    props.insert(
+        "scheduling".to_string(),
+        crate::window_environment_web::scheduling_value(),
+    );
+    props.insert(
+        "presentation".to_string(),
+        crate::presentation_web::presentation_value(),
+    );
+    props.insert("ink".to_string(), crate::experimental_web::ink_value());
+    props.insert(
+        "protectedAudience".to_string(),
+        crate::experimental_web::protected_audience_value(),
+    );
+    props.insert("gpu".to_string(), crate::webgpu_web::gpu_value());
+    props.insert("xr".to_string(), crate::webxr_web::xr_system_value());
 
-    Value::object(props)
+    let navigator = Value::object(props);
+    w3cos_core::class::set_prototype_of(
+        &navigator,
+        &crate::navigator_web::navigator_class().get_property("prototype"),
+    );
+    navigator
 }
 
 fn location_value() -> Value {
@@ -3837,15 +8452,163 @@ fn location_value() -> Value {
             func(move |_, _| Value::string(&getter())),
         );
     }
-    props.insert("ancestorOrigins".to_string(), js_array(vec![]));
-    for name in ["assign", "replace", "reload"] {
-        props.insert(name.to_string(), func(|_, _| Value::Undefined));
+    props.insert("ancestorOrigins".to_string(), dom_string_list(Vec::new()));
+    props.insert(
+        "assign".to_string(),
+        func(|_, args| {
+            crate::history::location_assign(&arg(&args, 0).to_js_string());
+            Value::Undefined
+        }),
+    );
+    props.insert(
+        "replace".to_string(),
+        func(|_, args| {
+            crate::history::location_replace(&arg(&args, 0).to_js_string());
+            Value::Undefined
+        }),
+    );
+    props.insert(
+        "reload".to_string(),
+        func(|_, _| {
+            LOCATION_RELOAD_WARNED.with(|warned| {
+                if !warned.replace(true) {
+                    eprintln!(
+                        "W3COS warning: location.reload() preserves the current native document; \
+                         host-level document reconstruction is not available"
+                    );
+                }
+            });
+            Value::Undefined
+        }),
+    );
+    for component in [
+        "href", "protocol", "host", "hostname", "port", "pathname", "search", "hash",
+    ] {
+        props.insert(
+            format!("__w3cos_setter_{component}"),
+            func(move |_, args| {
+                let value = arg(&args, 0).to_js_string();
+                if component == "href" {
+                    crate::history::location_assign(&value);
+                } else {
+                    crate::history::set_location_component(component, &value);
+                }
+                Value::Undefined
+            }),
+        );
     }
     props.insert(
         "toString".to_string(),
         func(|_, _| Value::string(&crate::history::get_href())),
     );
-    Value::object(props)
+    let value = Value::object(props);
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Location"));
+    value
+}
+
+fn dom_string_list(items: Vec<String>) -> Value {
+    let items = Rc::new(items);
+    let mut props = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        props.insert(index.to_string(), Value::string(item));
+    }
+    props.insert("length".to_string(), Value::Number(items.len() as f64));
+    let item_values = Rc::clone(&items);
+    props.insert(
+        "item".to_string(),
+        func(move |_, args| {
+            item_values
+                .get(arg(&args, 0).to_u32() as usize)
+                .map(|item| Value::string(item))
+                .unwrap_or(Value::Null)
+        }),
+    );
+    props.insert(
+        "contains".to_string(),
+        func(move |_, args| {
+            let candidate = arg(&args, 0).to_js_string();
+            Value::Bool(items.iter().any(|item| item == &candidate))
+        }),
+    );
+    let value = Value::object(props);
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype("DOMStringList"),
+    );
+    value
+}
+
+fn performance_navigation_value() -> Value {
+    let value = Value::object(HashMap::from([
+        ("type".into(), Value::Number(0.0)),
+        ("redirectCount".into(), Value::Number(0.0)),
+        ("TYPE_NAVIGATE".into(), Value::Number(0.0)),
+        ("TYPE_RELOAD".into(), Value::Number(1.0)),
+        ("TYPE_BACK_FORWARD".into(), Value::Number(2.0)),
+        ("TYPE_RESERVED".into(), Value::Number(255.0)),
+    ]));
+    value.set_property(
+        "toJSON",
+        func(|this, _| {
+            Value::object(HashMap::from([
+                ("type".into(), this.get_property("type")),
+                ("redirectCount".into(), this.get_property("redirectCount")),
+            ]))
+        }),
+    );
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype("PerformanceNavigation"),
+    );
+    value
+}
+
+fn legacy_performance_timing_fields() -> HashMap<String, Value> {
+    let origin = performance_time_origin();
+    let mut fields = HashMap::new();
+    for name in [
+        "navigationStart",
+        "fetchStart",
+        "domainLookupStart",
+        "domainLookupEnd",
+        "connectStart",
+        "connectEnd",
+        "requestStart",
+        "responseStart",
+        "responseEnd",
+        "domLoading",
+        "domInteractive",
+        "domContentLoadedEventStart",
+        "domContentLoadedEventEnd",
+        "domComplete",
+        "loadEventStart",
+        "loadEventEnd",
+    ] {
+        fields.insert(name.into(), Value::Number(origin));
+    }
+    for name in [
+        "unloadEventStart",
+        "unloadEventEnd",
+        "redirectStart",
+        "redirectEnd",
+        "secureConnectionStart",
+    ] {
+        fields.insert(name.into(), Value::Number(0.0));
+    }
+    fields
+}
+
+fn performance_timing_value() -> Value {
+    let value = Value::object(legacy_performance_timing_fields());
+    value.set_property(
+        "toJSON",
+        func(|_, _| Value::object(legacy_performance_timing_fields())),
+    );
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype("PerformanceTiming"),
+    );
+    value
 }
 
 fn performance_value() -> Value {
@@ -3854,18 +8617,253 @@ fn performance_value() -> Value {
         "now".to_string(),
         func(|_, _| Value::Number(performance_now())),
     );
-    props.insert("timeOrigin".to_string(), Value::Number(0.0));
-    for name in ["mark", "measure", "clearMarks", "clearMeasures"] {
-        props.insert(name.to_string(), func(|_, _| Value::Undefined));
-    }
-    for name in ["getEntries", "getEntriesByName", "getEntriesByType"] {
-        props.insert(name.to_string(), func(|_, _| js_array(vec![])));
-    }
-    Value::object(props)
+    props.insert(
+        "timeOrigin".to_string(),
+        Value::Number(performance_time_origin()),
+    );
+    props.insert(
+        "mark".to_string(),
+        func(|_, args| crate::observers_web::performance_mark(&args, performance_now())),
+    );
+    props.insert(
+        "measure".to_string(),
+        func(|_, args| crate::observers_web::performance_measure(&args, performance_now())),
+    );
+    props.insert(
+        "clearMarks".to_string(),
+        func(|_, args| {
+            let name = args.first().map(Value::to_js_string);
+            crate::observers_web::performance_clear("mark", name.as_deref());
+            Value::Undefined
+        }),
+    );
+    props.insert(
+        "clearMeasures".to_string(),
+        func(|_, args| {
+            let name = args.first().map(Value::to_js_string);
+            crate::observers_web::performance_clear("measure", name.as_deref());
+            Value::Undefined
+        }),
+    );
+    props.insert(
+        "getEntries".to_string(),
+        func(|_, _| crate::observers_web::performance_get_entries(None, None)),
+    );
+    props.insert(
+        "getEntriesByName".to_string(),
+        func(|_, args| {
+            let name = args.first().map(Value::to_js_string).unwrap_or_default();
+            let kind = args.get(1).map(Value::to_js_string);
+            crate::observers_web::performance_get_entries(Some(&name), kind.as_deref())
+        }),
+    );
+    props.insert(
+        "getEntriesByType".to_string(),
+        func(|_, args| {
+            let kind = args.first().map(Value::to_js_string).unwrap_or_default();
+            crate::observers_web::performance_get_entries(None, Some(&kind))
+        }),
+    );
+    props.insert(
+        "clearResourceTimings".to_string(),
+        func(|_, _| {
+            static WARNING: std::sync::Once = std::sync::Once::new();
+            WARNING.call_once(|| {
+                eprintln!(
+                    "[w3cos] warning: performance.clearResourceTimings() is a compatible no-op \
+                     until network resource timing entries are recorded"
+                );
+            });
+            Value::Undefined
+        }),
+    );
+    props.insert(
+        "setResourceTimingBufferSize".to_string(),
+        func(|_, _| {
+            static WARNING: std::sync::Once = std::sync::Once::new();
+            WARNING.call_once(|| {
+                eprintln!(
+                    "[w3cos] warning: performance.setResourceTimingBufferSize() preserves the \
+                     API shape; resource timing collection is not yet connected"
+                );
+            });
+            Value::Undefined
+        }),
+    );
+    props.insert(
+        "measureUserAgentSpecificMemory".to_string(),
+        func(|_, _| {
+            static WARNING: std::sync::Once = std::sync::Once::new();
+            WARNING.call_once(|| {
+                eprintln!(
+                    "[w3cos] warning: performance.measureUserAgentSpecificMemory() requires a \
+                     host allocator telemetry adapter"
+                );
+            });
+            w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
+                "Memory telemetry is unavailable",
+                "NotSupportedError",
+            )])
+        }),
+    );
+    props.insert("eventCounts".to_string(), event_counts_value());
+    props.insert("interactionCount".to_string(), Value::Number(0.0));
+    props.insert("memory".to_string(), Value::Undefined);
+    props.insert("navigation".to_string(), performance_navigation_value());
+    props.insert("timing".to_string(), performance_timing_value());
+    props.insert("onresourcetimingbufferfull".to_string(), Value::Null);
+    props.insert(
+        "toJSON".to_string(),
+        func(|_, _| {
+            Value::object(HashMap::from([(
+                "timeOrigin".to_string(),
+                Value::Number(performance_time_origin()),
+            )]))
+        }),
+    );
+    let value = Value::object(props);
+    crate::web_events::event_target_class().call(value.clone(), vec![]);
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Performance"));
+    value
 }
 
-fn viewport() -> (f64, f64, f64) {
+fn event_count_entries() -> Vec<(String, u64)> {
+    EVENT_COUNTS.with(|counts| {
+        EVENT_COUNT_TYPES
+            .iter()
+            .map(|event_type| {
+                (
+                    (*event_type).to_string(),
+                    counts.borrow().get(*event_type).copied().unwrap_or(0),
+                )
+            })
+            .collect()
+    })
+}
+
+fn event_counts_value() -> Value {
+    let value = Value::object(HashMap::new());
+    value.set_property(
+        "__w3cos_getter_size",
+        func(|_, _| Value::Number(EVENT_COUNT_TYPES.len() as f64)),
+    );
+    value.set_property(
+        "get",
+        func(|_, args| {
+            let event_type = arg(&args, 0).to_js_string();
+            EVENT_COUNTS.with(|counts| {
+                counts
+                    .borrow()
+                    .get(&event_type)
+                    .copied()
+                    .map(|count| Value::Number(count as f64))
+                    .unwrap_or(Value::Undefined)
+            })
+        }),
+    );
+    value.set_property(
+        "has",
+        func(|_, args| {
+            let event_type = arg(&args, 0).to_js_string();
+            Value::Bool(EVENT_COUNTS.with(|counts| counts.borrow().contains_key(&event_type)))
+        }),
+    );
+    value.set_property(
+        "keys",
+        func(|_, _| {
+            Value::array(
+                EVENT_COUNT_TYPES
+                    .iter()
+                    .map(|event_type| Value::string(event_type))
+                    .collect(),
+            )
+        }),
+    );
+    value.set_property(
+        "values",
+        func(|_, _| {
+            Value::array(
+                event_count_entries()
+                    .into_iter()
+                    .map(|(_, count)| Value::Number(count as f64))
+                    .collect(),
+            )
+        }),
+    );
+    value.set_property(
+        "entries",
+        func(|_, _| {
+            Value::array(
+                event_count_entries()
+                    .into_iter()
+                    .map(|(event_type, count)| {
+                        Value::array(vec![Value::String(event_type), Value::Number(count as f64)])
+                    })
+                    .collect(),
+            )
+        }),
+    );
+    let value_for_each = value.clone();
+    value.set_property(
+        "forEach",
+        func(move |_, args| {
+            let callback = arg(&args, 0);
+            for (event_type, count) in event_count_entries() {
+                callback.call(
+                    Value::Undefined,
+                    vec![
+                        Value::Number(count as f64),
+                        Value::String(event_type),
+                        value_for_each.clone(),
+                    ],
+                );
+            }
+            Value::Undefined
+        }),
+    );
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("EventCounts"));
+    value
+}
+
+pub(crate) fn viewport() -> (f64, f64, f64) {
     VIEWPORT.with(|v| v.get())
+}
+
+fn media_query_matches(query: &str) -> bool {
+    crate::media::parse_media_query(query)
+        .map(|cond| {
+            let (w, h, dpr) = viewport();
+            crate::media::matches_media(
+                &cond,
+                &crate::media::Viewport::new(w as f32, h as f32, dpr as f32),
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn refresh_media_query_lists() {
+    MEDIA_QUERY_LISTS.with(|lists| {
+        for list in lists.borrow().iter() {
+            let query = list.get_property("media").to_js_string();
+            let previous = list.get_property("__w3cos_last_match").to_bool();
+            let current = media_query_matches(&query);
+            if current == previous {
+                continue;
+            }
+            list.set_property("__w3cos_last_match", Value::Bool(current));
+            let event = w3cos_core::class::construct(
+                &crate::web_events::event_subclass_class("MediaQueryListEvent"),
+                vec![
+                    Value::string("change"),
+                    Value::object(HashMap::from([
+                        ("matches".into(), Value::Bool(current)),
+                        ("media".into(), Value::string(&query)),
+                    ])),
+                ],
+            );
+            list.call_method("dispatchEvent", vec![event]);
+        }
+    });
 }
 
 /// Set the viewport size reported by `window.innerWidth/innerHeight`,
@@ -3884,6 +8882,8 @@ pub fn set_viewport(width: f64, height: f64) {
             .get_property("visualViewport")
             .call_method("dispatchEvent", vec![event]);
     }
+    refresh_media_query_lists();
+    crate::observers_web::refresh_intersection_observers();
 }
 
 /// Set the devicePixelRatio reported by the window. Default 1.0.
@@ -3892,6 +8892,40 @@ pub fn set_device_pixel_ratio(dpr: f64) {
         let (w, h, _) = v.get();
         v.set((w, h, dpr));
     });
+    refresh_media_query_lists();
+}
+
+/// Update document visibility from a platform lifecycle adapter.
+pub fn set_document_visibility(state: &str) -> bool {
+    if !matches!(state, "visible" | "hidden") {
+        return false;
+    }
+    let changed = DOCUMENT_VISIBILITY.with(|current| {
+        if current.borrow().as_str() == state {
+            false
+        } else {
+            *current.borrow_mut() = state.to_string();
+            true
+        }
+    });
+    if !changed {
+        return true;
+    }
+    crate::observers_web::record_visibility_state(state, performance_now());
+    let event = w3cos_core::class::construct(
+        &crate::web_events::event_class(),
+        vec![Value::string("visibilitychange")],
+    );
+    document_value().call_method("dispatchEvent", vec![event]);
+    true
+}
+
+/// Update the live `navigator.maxTouchPoints` value reported to JavaScript.
+///
+/// Mobile hosts should replace their conservative startup fallback when the
+/// input adapter can report an exact simultaneous-contact count.
+pub fn set_max_touch_points(points: u32) {
+    MAX_TOUCH_POINTS.with(|value| value.set(points));
 }
 
 fn storage_value(persistent: bool) -> Value {
@@ -3973,7 +9007,59 @@ fn storage_value(persistent: bool) -> Value {
             })
         }),
     );
-    Value::object(props)
+    let value = Value::object(props);
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Storage"));
+    value
+}
+
+fn crypto_key_class() -> Value {
+    CRYPTO_KEY_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = func(|_, _| {
+            w3cos_core::throw_value(w3cos_core::error_instance(
+                "TypeError",
+                vec![Value::string("Illegal constructor: CryptoKey")],
+            ))
+        });
+        class.set_property("name", Value::string("CryptoKey"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in ["algorithm", "extractable", "type", "usages"] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn dom_error_class() -> Value {
+    DOM_ERROR_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = func(|this, args| {
+            this.set_property(
+                "name",
+                Value::string(&args.first().map(Value::to_js_string).unwrap_or_default()),
+            );
+            this.set_property(
+                "message",
+                Value::string(&args.get(1).map(Value::to_js_string).unwrap_or_default()),
+            );
+            Value::Undefined
+        });
+        class.set_property("name", Value::string("DOMError"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property("message", Value::Undefined);
+        prototype.set_property("name", Value::Undefined);
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
 }
 
 fn crypto_value() -> Value {
@@ -4008,33 +9094,168 @@ fn crypto_value() -> Value {
             ))
         }),
     );
-    Value::object(props)
+    props.insert("subtle".to_string(), subtle_crypto_value());
+    let value = Value::object(props);
+    w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Crypto"));
+    value
+}
+
+fn subtle_crypto_value() -> Value {
+    let mut props = HashMap::new();
+    for method in [
+        "decrypt",
+        "deriveBits",
+        "deriveKey",
+        "digest",
+        "encrypt",
+        "exportKey",
+        "generateKey",
+        "importKey",
+        "sign",
+        "unwrapKey",
+        "verify",
+        "wrapKey",
+    ] {
+        props.insert(
+            method.to_string(),
+            func(move |_, _| {
+                static WARNING: std::sync::Once = std::sync::Once::new();
+                WARNING.call_once(|| {
+                    eprintln!(
+                        "[w3cos] warning: crypto.subtle preserves the Web Crypto Promise API, \
+                         but cryptographic operations require a configured native provider"
+                    );
+                });
+                w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
+                    &format!("crypto.subtle.{method}() is unavailable"),
+                    "NotSupportedError",
+                )])
+            }),
+        );
+    }
+    let value = Value::object(props);
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &crate::dom_constructors::prototype("SubtleCrypto"),
+    );
+    value
 }
 
 fn match_media_value(query: &str) -> Value {
-    let matches = crate::media::parse_media_query(query)
-        .map(|cond| {
-            let (w, h, dpr) = viewport();
-            crate::media::matches_media(
-                &cond,
-                &crate::media::Viewport::new(w as f32, h as f32, dpr as f32),
-            )
-        })
-        .unwrap_or(false);
+    let matches = media_query_matches(query);
     let mut props: HashMap<String, Value> = HashMap::new();
-    props.insert("matches".to_string(), Value::Bool(matches));
+    let query_for_getter = query.to_string();
+    props.insert(
+        "__w3cos_getter_matches".to_string(),
+        func(move |_, _| Value::Bool(media_query_matches(&query_for_getter))),
+    );
+    props.insert("__w3cos_last_match".to_string(), Value::Bool(matches));
     props.insert("media".to_string(), Value::string(query));
     props.insert("onchange".to_string(), Value::Null);
-    for name in [
-        "addEventListener",
-        "removeEventListener",
+    let value = Value::object(props);
+    crate::web_events::event_target_class().call(value.clone(), vec![]);
+    let value_for_add = value.clone();
+    value.set_property(
         "addListener",
+        func(move |_, args| {
+            value_for_add.call_method(
+                "addEventListener",
+                vec![Value::string("change"), arg(&args, 0)],
+            );
+            Value::Undefined
+        }),
+    );
+    let value_for_remove = value.clone();
+    value.set_property(
         "removeListener",
-    ] {
-        props.insert(name.to_string(), func(|_, _| Value::Undefined));
-    }
-    props.insert("dispatchEvent".to_string(), func(|_, _| Value::Bool(false)));
-    Value::object(props)
+        func(move |_, args| {
+            value_for_remove.call_method(
+                "removeEventListener",
+                vec![Value::string("change"), arg(&args, 0)],
+            );
+            Value::Undefined
+        }),
+    );
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &media_query_list_class().get_property("prototype"),
+    );
+    MEDIA_QUERY_LISTS.with(|lists| lists.borrow_mut().push(value.clone()));
+    value
+}
+
+fn media_query_list_class() -> Value {
+    MEDIA_QUERY_LIST_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(Value::object(HashMap::from([
+                ("name".into(), Value::string("TypeError")),
+                (
+                    "message".into(),
+                    Value::string("Illegal constructor: MediaQueryList"),
+                ),
+            ])))
+        });
+        class.set_property("name", Value::string("MediaQueryList"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for method in ["addListener", "removeListener"] {
+            prototype.set_property(method, func(|_, _| Value::Undefined));
+        }
+        for property in ["matches", "media", "onchange"] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::web_events::event_target_class().get_property("prototype"),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn visual_viewport_class() -> Value {
+    VISUAL_VIEWPORT_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(Value::object(HashMap::from([
+                ("name".into(), Value::string("TypeError")),
+                (
+                    "message".into(),
+                    Value::string("Illegal constructor: VisualViewport"),
+                ),
+            ])))
+        });
+        class.set_property("name", Value::string("VisualViewport"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in [
+            "height",
+            "offsetLeft",
+            "offsetTop",
+            "onresize",
+            "onscroll",
+            "onscrollend",
+            "pageLeft",
+            "pageTop",
+            "scale",
+            "width",
+        ] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::web_events::event_target_class().get_property("prototype"),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
 }
 
 /// The global `window` value (memoized thread-local singleton).
@@ -4050,6 +9271,18 @@ pub fn window_value() -> Value {
 fn build_window_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
 
+    props.insert("document".to_string(), document_value());
+    props.insert("BarProp".to_string(), bar_prop_class());
+    for name in [
+        "locationbar",
+        "menubar",
+        "personalbar",
+        "scrollbars",
+        "statusbar",
+        "toolbar",
+    ] {
+        props.insert(name.to_string(), bar_prop_value());
+    }
     props.insert("navigator".to_string(), navigator_value());
     props.insert("location".to_string(), location_value());
     props.insert("performance".to_string(), performance_value());
@@ -4064,6 +9297,14 @@ fn build_window_value() -> Value {
         "IDBKeyRange".to_string(),
         crate::indexed_db_web::key_range_constructor_value(),
     );
+    for name in crate::indexed_db_web::IDB_INTERFACE_NAMES {
+        if *name != "IDBKeyRange" {
+            props.insert(
+                (*name).to_string(),
+                crate::indexed_db_web::interface_class(name),
+            );
+        }
+    }
     props.insert("WebSocket".to_string(), crate::websocket::websocket_class());
     props.insert(
         "EventSource".to_string(),
@@ -4073,6 +9314,17 @@ fn build_window_value() -> Value {
         "XMLHttpRequest".to_string(),
         crate::xhr::xml_http_request_class(),
     );
+    props.insert(
+        "XMLHttpRequestEventTarget".to_string(),
+        crate::xhr::xml_http_request_event_target_class(),
+    );
+    props.insert(
+        "XMLHttpRequestUpload".to_string(),
+        crate::xhr::xml_http_request_upload_class(),
+    );
+    for name in ["Image", "Audio", "Option"] {
+        props.insert(name.to_string(), legacy_element_factory_class(name));
+    }
     props.insert(
         "Notification".to_string(),
         crate::notification_web::notification_class(),
@@ -4086,15 +9338,251 @@ fn build_window_value() -> Value {
         crate::media_devices_web::media_stream_track_class(),
     );
     props.insert(
+        "MediaStreamTrackGenerator".to_string(),
+        crate::media_devices_web::media_stream_track_generator_class(),
+    );
+    props.insert(
+        "MediaStreamTrackProcessor".to_string(),
+        crate::media_devices_web::media_stream_track_processor_class(),
+    );
+    for name in [
+        "AudioPlaybackStats",
+        "MediaStreamTrackAudioStats",
+        "MediaStreamTrackVideoStats",
+    ] {
+        props.insert(
+            name.to_string(),
+            crate::media_devices_web::media_stats_class(name),
+        );
+    }
+    props.insert(
+        "MediaRecorder".to_string(),
+        crate::media_recording_web::media_recorder_class(),
+    );
+    props.insert(
+        "ImageCapture".to_string(),
+        crate::media_recording_web::image_capture_class(),
+    );
+    props.insert(
+        "CaptureController".to_string(),
+        crate::media_recording_web::capture_controller_class(),
+    );
+    props.insert(
+        "CropTarget".to_string(),
+        crate::media_recording_web::crop_target_class(),
+    );
+    props.insert(
+        "RestrictionTarget".to_string(),
+        crate::media_recording_web::restriction_target_class(),
+    );
+    props.insert(
+        "BrowserCaptureMediaStreamTrack".to_string(),
+        crate::media_recording_web::browser_capture_media_stream_track_class(),
+    );
+    props.insert(
+        "MediaSource".to_string(),
+        crate::media_source_web::media_source_class(),
+    );
+    props.insert(
+        "MediaSourceHandle".to_string(),
+        crate::media_source_web::media_source_handle_class(),
+    );
+    props.insert(
+        "SourceBuffer".to_string(),
+        crate::media_source_web::source_buffer_class(),
+    );
+    props.insert(
+        "SourceBufferList".to_string(),
+        crate::media_source_web::source_buffer_list_class(),
+    );
+    for name in [
+        "PaymentAddress",
+        "PaymentManager",
+        "PaymentRequest",
+        "PaymentResponse",
+    ] {
+        props.insert(name.to_string(), crate::payment_web::class_for(name));
+    }
+    for name in [
+        "AudioData",
+        "AudioDecoder",
+        "AudioEncoder",
+        "EncodedAudioChunk",
+        "EncodedVideoChunk",
+        "VideoColorSpace",
+        "VideoDecoder",
+        "VideoEncoder",
+        "VideoFrame",
+    ] {
+        props.insert(name.to_string(), crate::webcodecs_web::class_for(name));
+    }
+    for name in ["ImageDecoder", "ImageTrack", "ImageTrackList"] {
+        props.insert(
+            name.to_string(),
+            crate::image_decoder_web::class_for(name),
+        );
+    }
+    for (name, class) in crate::webrtc_web::classes() {
+        props.insert(name.to_string(), class);
+    }
+    for name in crate::experimental_web::INTERFACES {
+        props.insert(
+            (*name).to_string(),
+            crate::experimental_web::class_for(name),
+        );
+    }
+    for name in crate::web_transport_web::INTERFACES {
+        props.insert(
+            (*name).to_string(),
+            crate::web_transport_web::class_for(name),
+        );
+    }
+    for name in crate::webxr_web::INTERFACES {
+        props.insert(name.to_string(), crate::webxr_web::class_for(name));
+    }
+    for name in crate::webgpu_web::INTERFACES {
+        props.insert(name.to_string(), crate::webgpu_web::class_for(name));
+    }
+    for name in crate::webgl_web::INTERFACES {
+        props.insert(name.to_string(), crate::webgl_web::class_for(name));
+    }
+    for name in crate::webgpu_web::CONSTANTS {
+        props.insert(name.to_string(), crate::webgpu_web::constant_value(name));
+    }
+    props.insert(
+        "sharedStorage".to_string(),
+        crate::experimental_web::shared_storage_value(),
+    );
+    props.insert(
+        "viewport".to_string(),
+        crate::experimental_web::viewport_value(),
+    );
+    props.insert(
+        "queryLocalFonts".to_string(),
+        crate::experimental_web::query_local_fonts_value(),
+    );
+    props.insert(
+        "fetchLater".to_string(),
+        crate::experimental_web::fetch_later_value(),
+    );
+    for name in [
+        "AnalyserNode",
+        "AudioBuffer",
+        "AudioBufferSourceNode",
+        "AudioContext",
+        "AudioDestinationNode",
+        "AudioListener",
+        "AudioNode",
+        "AudioParam",
+        "AudioParamMap",
+        "AudioScheduledSourceNode",
+        "AudioSinkInfo",
+        "AudioWorklet",
+        "AudioWorkletNode",
+        "BaseAudioContext",
+        "BiquadFilterNode",
+        "ChannelMergerNode",
+        "ChannelSplitterNode",
+        "ConstantSourceNode",
+        "ConvolverNode",
+        "DelayNode",
+        "DynamicsCompressorNode",
+        "GainNode",
+        "IIRFilterNode",
+        "MediaElementAudioSourceNode",
+        "MediaStreamAudioDestinationNode",
+        "MediaStreamAudioSourceNode",
+        "OfflineAudioContext",
+        "OscillatorNode",
+        "PannerNode",
+        "PeriodicWave",
+        "ScriptProcessorNode",
+        "StereoPannerNode",
+        "WaveShaperNode",
+        "Worklet",
+    ] {
+        props.insert(name.to_string(), crate::audio_web::class_for(name));
+    }
+    props.insert(
         "MediaDeviceInfo".to_string(),
         crate::media_devices_web::media_device_info_class(),
+    );
+    props.insert(
+        "InputDeviceInfo".to_string(),
+        crate::media_devices_web::input_device_info_class(),
+    );
+    props.insert(
+        "MediaDevices".to_string(),
+        crate::media_devices_web::media_devices_class(),
+    );
+    props.insert(
+        "OverconstrainedError".to_string(),
+        crate::media_devices_web::overconstrained_error_class(),
     );
     let speech_recognition = crate::speech_web::speech_recognition_class();
     props.insert("SpeechRecognition".to_string(), speech_recognition.clone());
     props.insert("webkitSpeechRecognition".to_string(), speech_recognition);
+    let speech_grammar = crate::speech_web::speech_grammar_class();
+    props.insert("SpeechGrammar".to_string(), speech_grammar.clone());
+    props.insert("webkitSpeechGrammar".to_string(), speech_grammar);
+    let speech_grammar_list = crate::speech_web::speech_grammar_list_class();
+    props.insert("SpeechGrammarList".to_string(), speech_grammar_list.clone());
+    props.insert("webkitSpeechGrammarList".to_string(), speech_grammar_list);
+    props.insert(
+        "SpeechRecognitionPhrase".to_string(),
+        crate::speech_web::speech_recognition_phrase_class(),
+    );
+    props.insert(
+        "SpeechSynthesis".to_string(),
+        crate::speech_synthesis_web::speech_synthesis_class(),
+    );
+    props.insert(
+        "SpeechSynthesisUtterance".to_string(),
+        crate::speech_synthesis_web::speech_synthesis_utterance_class(),
+    );
+    props.insert(
+        "SpeechSynthesisVoice".to_string(),
+        crate::speech_synthesis_web::speech_synthesis_voice_class(),
+    );
+    props.insert(
+        "speechSynthesis".to_string(),
+        crate::speech_synthesis_web::speech_synthesis_value(),
+    );
     props.insert(
         "ClipboardItem".to_string(),
         crate::clipboard_web::clipboard_item_class(),
+    );
+    props.insert(
+        "Clipboard".to_string(),
+        crate::clipboard_web::clipboard_class(),
+    );
+    props.insert(
+        "DataTransferItem".to_string(),
+        crate::clipboard_web::data_transfer_item_class(),
+    );
+    props.insert(
+        "DataTransferItemList".to_string(),
+        crate::clipboard_web::data_transfer_item_list_class(),
+    );
+    props.insert(
+        "FileList".to_string(),
+        crate::clipboard_web::file_list_class(),
+    );
+    props.insert(
+        "Geolocation".to_string(),
+        crate::geolocation_web::geolocation_class(),
+    );
+    props.insert(
+        "GeolocationCoordinates".to_string(),
+        crate::geolocation_web::coordinates_class(),
+    );
+    props.insert(
+        "GeolocationPosition".to_string(),
+        crate::geolocation_web::position_class(),
+    );
+    props.insert(
+        "GeolocationPositionError".to_string(),
+        crate::geolocation_web::position_error_class(),
     );
     props.insert(
         "DataTransfer".to_string(),
@@ -4114,9 +9602,724 @@ fn build_window_value() -> Value {
         crate::worker_web::message_channel_class(),
     );
     props.insert(
+        "BroadcastChannel".to_string(),
+        crate::worker_web::broadcast_channel_class(),
+    );
+    props.insert(
+        "CustomElementRegistry".to_string(),
+        crate::custom_elements_web::custom_element_registry_class(),
+    );
+    props.insert(
+        "CustomStateSet".to_string(),
+        crate::custom_elements_web::custom_state_set_class(),
+    );
+    props.insert(
+        "ElementInternals".to_string(),
+        crate::custom_elements_web::element_internals_class(),
+    );
+    props.insert(
+        "CSSPseudoElement".to_string(),
+        crate::custom_elements_web::css_pseudo_element_class(),
+    );
+    props.insert(
+        "EditContext".to_string(),
+        crate::edit_context_web::edit_context_class(),
+    );
+    props.insert(
+        "TextFormat".to_string(),
+        crate::edit_context_web::text_format_class(),
+    );
+    props.insert(
+        "customElements".to_string(),
+        crate::custom_elements_web::custom_elements_value(),
+    );
+    props.insert("Cache".to_string(), crate::cache_web::cache_class());
+    props.insert(
+        "CacheStorage".to_string(),
+        crate::cache_web::cache_storage_class(),
+    );
+    props.insert(
+        "caches".to_string(),
+        crate::cache_web::cache_storage_value(),
+    );
+    props.insert(
+        "scheduler".to_string(),
+        crate::scheduler_web::scheduler_value(),
+    );
+    props.insert(
+        "cookieStore".to_string(),
+        crate::cookie_store_web::cookie_store_value(),
+    );
+    props.insert(
+        "CookieStore".to_string(),
+        crate::cookie_store_web::cookie_store_class(),
+    );
+    props.insert(
+        "CookieChangeEvent".to_string(),
+        crate::cookie_store_web::cookie_change_event_class(),
+    );
+    props.insert("Lock".to_string(), crate::locks_web::lock_class());
+    props.insert(
+        "LockManager".to_string(),
+        crate::locks_web::lock_manager_class(),
+    );
+    props.insert(
+        "TaskController".to_string(),
+        crate::scheduler_web::task_controller_class(),
+    );
+    props.insert(
+        "TaskSignal".to_string(),
+        crate::scheduler_web::task_signal_class(),
+    );
+    props.insert(
+        "Scheduler".to_string(),
+        crate::scheduler_web::scheduler_class(),
+    );
+    props.insert(
+        "WakeLock".to_string(),
+        crate::wake_lock_web::wake_lock_class(),
+    );
+    props.insert(
+        "WakeLockSentinel".to_string(),
+        crate::wake_lock_web::wake_lock_sentinel_class(),
+    );
+    props.insert(
+        "PermissionStatus".to_string(),
+        crate::permissions_web::permission_status_class(),
+    );
+    props.insert(
+        "Permissions".to_string(),
+        crate::permissions_web::permissions_class(),
+    );
+    props.insert(
+        "Bluetooth".to_string(),
+        crate::bluetooth_web::bluetooth_class(),
+    );
+    for name in crate::bluetooth_web::BLUETOOTH_INTERFACE_NAMES {
+        props.insert(
+            (*name).to_string(),
+            crate::bluetooth_web::interface_class(name),
+        );
+    }
+    props.insert(
+        "NetworkInformation".to_string(),
+        crate::network_information_web::network_information_class(),
+    );
+    props.insert(
+        "StorageManager".to_string(),
+        crate::storage_manager_web::storage_manager_class(),
+    );
+    props.insert(
+        "StorageBucketManager".to_string(),
+        crate::storage_buckets_web::storage_bucket_manager_class(),
+    );
+    props.insert(
+        "StorageBucket".to_string(),
+        crate::storage_buckets_web::storage_bucket_class(),
+    );
+    props.insert(
+        "UserActivation".to_string(),
+        crate::user_activation_web::user_activation_class(),
+    );
+    props.insert(
+        "MediaMetadata".to_string(),
+        crate::media_session_web::media_metadata_class(),
+    );
+    props.insert(
+        "ChapterInformation".to_string(),
+        crate::media_session_web::chapter_information_class(),
+    );
+    props.insert(
+        "MediaSession".to_string(),
+        crate::media_session_web::media_session_class(),
+    );
+    props.insert(
+        "BatteryManager".to_string(),
+        crate::battery_web::battery_manager_class(),
+    );
+    props.insert(
+        "MediaCapabilities".to_string(),
+        crate::media_capabilities_web::media_capabilities_class(),
+    );
+    props.insert(
+        "Navigator".to_string(),
+        crate::navigator_web::navigator_class(),
+    );
+    props.insert(
+        "NavigatorLogin".to_string(),
+        crate::navigator_web::navigator_login_class(),
+    );
+    props.insert(
+        "NavigatorManagedData".to_string(),
+        crate::navigator_web::navigator_managed_data_class(),
+    );
+    props.insert(
+        "Serial".to_string(),
+        crate::device_access_web::serial_class(),
+    );
+    props.insert(
+        "SerialPort".to_string(),
+        crate::device_access_web::serial_port_class(),
+    );
+    props.insert("HID".to_string(), crate::device_access_web::hid_class());
+    props.insert(
+        "HIDDevice".to_string(),
+        crate::device_access_web::hid_device_class(),
+    );
+    props.insert(
+        "HIDInputReportEvent".to_string(),
+        crate::device_access_web::hid_input_report_event_class(),
+    );
+    props.insert("USB".to_string(), crate::device_access_web::usb_class());
+    props.insert(
+        "USBDevice".to_string(),
+        crate::device_access_web::usb_device_class(),
+    );
+    for name in crate::device_access_web::USB_RECORD_NAMES {
+        props.insert(
+            (*name).to_string(),
+            crate::device_access_web::usb_record_class(name),
+        );
+    }
+    props.insert(
+        "USBConnectionEvent".to_string(),
+        crate::device_access_web::usb_connection_event_class(),
+    );
+    props.insert(
+        "Keyboard".to_string(),
+        crate::window_environment_web::keyboard_class(),
+    );
+    props.insert(
+        "KeyboardLayoutMap".to_string(),
+        crate::window_environment_web::keyboard_layout_map_class(),
+    );
+    props.insert(
+        "VirtualKeyboard".to_string(),
+        crate::window_environment_web::virtual_keyboard_class(),
+    );
+    props.insert(
+        "DevicePosture".to_string(),
+        crate::window_environment_web::device_posture_class(),
+    );
+    props.insert(
+        "WindowControlsOverlay".to_string(),
+        crate::window_environment_web::window_controls_overlay_class(),
+    );
+    props.insert(
+        "Scheduling".to_string(),
+        crate::window_environment_web::scheduling_class(),
+    );
+    props.insert(
+        "Presentation".to_string(),
+        crate::presentation_web::presentation_class(),
+    );
+    props.insert(
+        "PresentationRequest".to_string(),
+        crate::presentation_web::presentation_request_class(),
+    );
+    props.insert(
+        "PresentationAvailability".to_string(),
+        crate::presentation_web::presentation_availability_class(),
+    );
+    props.insert(
+        "PresentationConnection".to_string(),
+        crate::presentation_web::presentation_connection_class(),
+    );
+    props.insert(
+        "PresentationConnectionList".to_string(),
+        crate::presentation_web::presentation_connection_list_class(),
+    );
+    props.insert(
+        "PresentationReceiver".to_string(),
+        crate::presentation_web::presentation_receiver_class(),
+    );
+    props.insert(
+        "PresentationConnectionAvailableEvent".to_string(),
+        crate::presentation_web::presentation_connection_available_event_class(),
+    );
+    props.insert(
+        "PresentationConnectionCloseEvent".to_string(),
+        crate::presentation_web::presentation_connection_close_event_class(),
+    );
+    props.insert(
+        "IdleDetector".to_string(),
+        crate::user_mediated_web::idle_detector_class(),
+    );
+    props.insert(
+        "EyeDropper".to_string(),
+        crate::user_mediated_web::eye_dropper_class(),
+    );
+    props.insert(
+        "CloseWatcher".to_string(),
+        crate::close_watcher_web::close_watcher_class(),
+    );
+    props.insert(
+        "NDEFReader".to_string(),
+        crate::web_nfc::ndef_reader_class(),
+    );
+    props.insert(
+        "NDEFMessage".to_string(),
+        crate::web_nfc::ndef_message_class(),
+    );
+    props.insert(
+        "NDEFRecord".to_string(),
+        crate::web_nfc::ndef_record_class(),
+    );
+    props.insert(
+        "NDEFReadingEvent".to_string(),
+        crate::web_nfc::ndef_reading_event_class(),
+    );
+    props.insert("Plugin".to_string(), crate::navigator_web::plugin_class());
+    props.insert(
+        "PluginArray".to_string(),
+        crate::navigator_web::plugin_array_class(),
+    );
+    props.insert(
+        "MimeType".to_string(),
+        crate::navigator_web::mime_type_class(),
+    );
+    props.insert(
+        "MimeTypeArray".to_string(),
+        crate::navigator_web::mime_type_array_class(),
+    );
+    props.insert(
+        "MIDIAccess".to_string(),
+        crate::midi_web::midi_access_class(),
+    );
+    props.insert("MIDIPort".to_string(), crate::midi_web::midi_port_class());
+    props.insert("MIDIInput".to_string(), crate::midi_web::midi_input_class());
+    props.insert(
+        "MIDIOutput".to_string(),
+        crate::midi_web::midi_output_class(),
+    );
+    props.insert(
+        "MIDIInputMap".to_string(),
+        crate::midi_web::midi_input_map_class(),
+    );
+    props.insert(
+        "MIDIOutputMap".to_string(),
+        crate::midi_web::midi_output_map_class(),
+    );
+    props.insert(
+        "MIDIConnectionEvent".to_string(),
+        crate::midi_web::midi_connection_event_class(),
+    );
+    props.insert(
+        "MIDIMessageEvent".to_string(),
+        crate::midi_web::midi_message_event_class(),
+    );
+    props.insert(
+        "MediaKeyMessageEvent".to_string(),
+        crate::encrypted_media_web::media_key_message_event_class(),
+    );
+    props.insert(
+        "MediaKeySession".to_string(),
+        crate::encrypted_media_web::media_key_session_class(),
+    );
+    props.insert(
+        "MediaKeyStatusMap".to_string(),
+        crate::encrypted_media_web::media_key_status_map_class(),
+    );
+    props.insert(
+        "MediaKeySystemAccess".to_string(),
+        crate::encrypted_media_web::media_key_system_access_class(),
+    );
+    props.insert(
+        "MediaKeys".to_string(),
+        crate::encrypted_media_web::media_keys_class(),
+    );
+    props.insert(
+        "ServiceWorker".to_string(),
+        crate::service_worker_web::service_worker_class(),
+    );
+    props.insert(
+        "ServiceWorkerContainer".to_string(),
+        crate::service_worker_web::service_worker_container_class(),
+    );
+    props.insert(
+        "ServiceWorkerRegistration".to_string(),
+        crate::service_worker_web::service_worker_registration_class(),
+    );
+    for name in ["PushManager", "PushSubscription", "PushSubscriptionOptions"] {
+        props.insert(name.to_string(), crate::push_web::class_for(name));
+    }
+    for name in [
+        "BackgroundFetchManager",
+        "CookieStoreManager",
+        "NavigationPreloadManager",
+        "PeriodicSyncManager",
+        "SyncManager",
+    ] {
+        props.insert(
+            name.to_string(),
+            crate::service_worker_web::companion_manager_class(name),
+        );
+    }
+    for name in ["BackgroundFetchRecord", "BackgroundFetchRegistration"] {
+        props.insert(
+            name.to_string(),
+            crate::service_worker_web::background_fetch_class(name),
+        );
+    }
+    props.insert(
+        "Credential".to_string(),
+        crate::credentials_web::credential_class(),
+    );
+    props.insert(
+        "PasswordCredential".to_string(),
+        crate::credentials_web::password_credential_class(),
+    );
+    props.insert(
+        "FederatedCredential".to_string(),
+        crate::credentials_web::federated_credential_class(),
+    );
+    props.insert(
+        "CredentialsContainer".to_string(),
+        crate::credentials_web::credentials_container_class(),
+    );
+    props.insert(
+        "DigitalCredential".to_string(),
+        crate::credentials_web::digital_credential_class(),
+    );
+    props.insert(
+        "IdentityCredential".to_string(),
+        crate::credentials_web::identity_credential_class(),
+    );
+    props.insert(
+        "IdentityCredentialError".to_string(),
+        crate::credentials_web::identity_credential_error_class(),
+    );
+    props.insert(
+        "IdentityProvider".to_string(),
+        crate::credentials_web::identity_provider_class(),
+    );
+    props.insert(
+        "AuthenticatorResponse".to_string(),
+        crate::credentials_web::authenticator_response_class(),
+    );
+    props.insert(
+        "AuthenticatorAssertionResponse".to_string(),
+        crate::credentials_web::authenticator_assertion_response_class(),
+    );
+    props.insert(
+        "AuthenticatorAttestationResponse".to_string(),
+        crate::credentials_web::authenticator_attestation_response_class(),
+    );
+    props.insert(
+        "PublicKeyCredential".to_string(),
+        crate::credentials_web::public_key_credential_class(),
+    );
+    props.insert(
+        "OTPCredential".to_string(),
+        crate::credentials_web::otp_credential_class(),
+    );
+    props.insert("Gamepad".to_string(), crate::gamepad_web::gamepad_class());
+    props.insert(
+        "GamepadButton".to_string(),
+        crate::gamepad_web::gamepad_button_class(),
+    );
+    props.insert(
+        "GamepadEvent".to_string(),
+        crate::gamepad_web::gamepad_event_class(),
+    );
+    props.insert(
+        "GamepadHapticActuator".to_string(),
+        crate::gamepad_web::gamepad_haptic_actuator_class(),
+    );
+    props.insert(
+        "DeviceOrientationEvent".to_string(),
+        crate::orientation_web::device_orientation_event_class(),
+    );
+    props.insert(
+        "DeviceMotionEvent".to_string(),
+        crate::orientation_web::device_motion_event_class(),
+    );
+    props.insert(
+        "DeviceMotionEventAcceleration".to_string(),
+        crate::orientation_web::device_motion_acceleration_class(),
+    );
+    props.insert(
+        "DeviceMotionEventRotationRate".to_string(),
+        crate::orientation_web::device_motion_rotation_rate_class(),
+    );
+    props.insert("Sensor".to_string(), crate::sensors_web::sensor_class());
+    props.insert(
+        "SensorErrorEvent".to_string(),
+        crate::sensors_web::sensor_error_event_class(),
+    );
+    props.insert(
+        "Accelerometer".to_string(),
+        crate::sensors_web::accelerometer_class(),
+    );
+    props.insert(
+        "Gyroscope".to_string(),
+        crate::sensors_web::gyroscope_class(),
+    );
+    props.insert(
+        "Magnetometer".to_string(),
+        crate::sensors_web::magnetometer_class(),
+    );
+    props.insert(
+        "GravitySensor".to_string(),
+        crate::sensors_web::gravity_sensor_class(),
+    );
+    props.insert(
+        "LinearAccelerationSensor".to_string(),
+        crate::sensors_web::linear_acceleration_sensor_class(),
+    );
+    props.insert(
+        "OrientationSensor".to_string(),
+        crate::sensors_web::orientation_sensor_class(),
+    );
+    props.insert(
+        "AbsoluteOrientationSensor".to_string(),
+        crate::sensors_web::absolute_orientation_sensor_class(),
+    );
+    props.insert(
+        "RelativeOrientationSensor".to_string(),
+        crate::sensors_web::relative_orientation_sensor_class(),
+    );
+    props.insert(
+        "ReadableStream".to_string(),
+        crate::streams_web::readable_stream_class(),
+    );
+    props.insert(
+        "ReadableStreamDefaultReader".to_string(),
+        crate::streams_web::readable_stream_default_reader_class(),
+    );
+    props.insert(
+        "ReadableStreamDefaultController".to_string(),
+        crate::streams_web::readable_stream_default_controller_class(),
+    );
+    props.insert(
+        "ReadableByteStreamController".to_string(),
+        crate::streams_web::readable_byte_stream_controller_class(),
+    );
+    props.insert(
+        "ReadableStreamBYOBReader".to_string(),
+        crate::streams_web::readable_stream_byob_reader_class(),
+    );
+    props.insert(
+        "ReadableStreamBYOBRequest".to_string(),
+        crate::streams_web::readable_stream_byob_request_class(),
+    );
+    props.insert(
+        "WritableStream".to_string(),
+        crate::streams_web::writable_stream_class(),
+    );
+    props.insert(
+        "WritableStreamDefaultWriter".to_string(),
+        crate::streams_web::writable_stream_default_writer_class(),
+    );
+    props.insert(
+        "WritableStreamDefaultController".to_string(),
+        crate::streams_web::writable_stream_default_controller_class(),
+    );
+    props.insert(
+        "TransformStream".to_string(),
+        crate::streams_web::transform_stream_class(),
+    );
+    props.insert(
+        "TransformStreamDefaultController".to_string(),
+        crate::streams_web::transform_stream_default_controller_class(),
+    );
+    props.insert(
+        "CountQueuingStrategy".to_string(),
+        crate::streams_web::count_queuing_strategy_class(),
+    );
+    props.insert(
+        "ByteLengthQueuingStrategy".to_string(),
+        crate::streams_web::byte_length_queuing_strategy_class(),
+    );
+    props.insert(
+        "TextEncoderStream".to_string(),
+        crate::streams_web::text_encoder_stream_class(),
+    );
+    props.insert(
+        "TextDecoderStream".to_string(),
+        crate::streams_web::text_decoder_stream_class(),
+    );
+    props.insert(
+        "CompressionStream".to_string(),
+        crate::streams_web::compression_stream_class(),
+    );
+    props.insert(
+        "DecompressionStream".to_string(),
+        crate::streams_web::decompression_stream_class(),
+    );
+    props.insert("IdleDeadline".to_string(), idle_deadline_class());
+    props.insert(
+        "FontFace".to_string(),
+        crate::font_loading_web::font_face_class(),
+    );
+    props.insert(
+        "FontFaceSet".to_string(),
+        crate::font_loading_web::font_face_set_class(),
+    );
+    props.insert("DOMParser".to_string(), dom_parser_class());
+    props.insert("XMLSerializer".to_string(), xml_serializer_class());
+    props.insert("CSS".to_string(), css_namespace_value());
+    props.insert(
+        "Highlight".to_string(),
+        crate::highlight_web::highlight_class(),
+    );
+    props.insert(
+        "HighlightRegistry".to_string(),
+        crate::highlight_web::highlight_registry_class(),
+    );
+    for name in crate::css_typed_om_web::CLASS_NAMES {
+        props.insert(name.to_string(), crate::css_typed_om_web::class(name));
+    }
+    for name in crate::css_rules_web::CLASS_NAMES {
+        props.insert(name.to_string(), crate::css_rules_web::class(name));
+    }
+    props.insert(
+        "CSSStyleDeclaration".to_string(),
+        css_style_declaration_class(),
+    );
+    props.insert("CSSStyleSheet".to_string(), css_style_sheet_class());
+    props.insert("StyleSheet".to_string(), style_sheet_class());
+    props.insert("StyleSheetList".to_string(), style_sheet_list_class());
+    props.insert("MediaList".to_string(), media_list_class());
+    props.insert("URL".to_string(), w3cos_core::web::url_class());
+    props.insert(
+        "URLSearchParams".to_string(),
+        w3cos_core::web::url_search_params_class(),
+    );
+    props.insert(
+        "URLPattern".to_string(),
+        w3cos_core::web::url_pattern_class(),
+    );
+    props.insert("NodeFilter".to_string(), node_filter_value());
+    props.insert("NodeList".to_string(), dom_collection_class("NodeList"));
+    props.insert(
+        "HTMLCollection".to_string(),
+        dom_collection_class("HTMLCollection"),
+    );
+    for name in [
+        "DOMPointReadOnly",
+        "DOMPoint",
+        "DOMRectReadOnly",
+        "DOMRect",
+        "DOMRectList",
+        "DOMQuad",
+        "DOMMatrixReadOnly",
+        "DOMMatrix",
+    ] {
+        props.insert(name.to_string(), crate::geometry_web::class(name));
+    }
+    for name in ["SVGPoint", "SVGRect", "SVGMatrix"] {
+        props.insert(
+            name.to_string(),
+            crate::svg_values_web::geometry_alias_class(name),
+        );
+    }
+    for name in crate::svg_values_web::SVG_VALUE_CLASS_NAMES {
+        props.insert(name.to_string(), crate::svg_values_web::class(name));
+    }
+    props.insert(
         "DOMException".to_string(),
         crate::unsupported::dom_exception_class(),
     );
+    props.insert("DOMError".to_string(), dom_error_class());
+    props.insert("CryptoKey".to_string(), crypto_key_class());
+    props.insert("CaretPosition".to_string(), caret_position_class());
+    props.insert("MathMLElement".to_string(), math_ml_element_class());
+    props.insert("Window".to_string(), window_class());
+    for name in [
+        "External",
+        "DocumentPictureInPicture",
+        "FeaturePolicy",
+        "MediaError",
+        "NavigatorUAData",
+        "Origin",
+        "PictureInPictureWindow",
+        "QuotaExceededError",
+        "RadioNodeList",
+        "ReportBody",
+        "RemotePlayback",
+        "TimeRanges",
+        "WebSocketError",
+    ] {
+        props.insert(name.to_string(), crate::compat_web::class(name));
+    }
+    props.insert("external".to_string(), crate::compat_web::external_value());
+    props.insert(
+        "documentPictureInPicture".to_string(),
+        crate::compat_web::document_picture_in_picture_value(),
+    );
+    props.insert(
+        "OffscreenCanvasRenderingContext2D".to_string(),
+        crate::canvas_web::offscreen_canvas_rendering_context_2d_class(),
+    );
+    props.insert(
+        "WebKitCSSMatrix".to_string(),
+        crate::geometry_web::class("DOMMatrix"),
+    );
+    for name in [
+        "FileSystemHandle",
+        "FileSystemFileHandle",
+        "FileSystemDirectoryHandle",
+        "FileSystemObserver",
+        "FileSystemWritableFileStream",
+    ] {
+        props.insert(name.to_string(), crate::file_system_web::class_for(name));
+    }
+    for name in [
+        "TextTrack",
+        "TextTrackCue",
+        "TextTrackCueList",
+        "TextTrackList",
+        "VTTCue",
+        "VideoPlaybackQuality",
+    ] {
+        props.insert(name.to_string(), crate::text_tracks_web::class_for(name));
+    }
+    for name in [
+        "AnimationTrigger",
+        "Animation",
+        "AnimationEffect",
+        "AnimationTimeline",
+        "CSSAnimation",
+        "CSSTransition",
+        "DocumentTimeline",
+        "KeyframeEffect",
+        "ScrollTimeline",
+        "TimelineTrigger",
+        "TimelineTriggerRange",
+        "TimelineTriggerRangeList",
+        "ViewTimeline",
+    ] {
+        props.insert(name.to_string(), crate::animations_web::class_for(name));
+    }
+    props.insert(
+        "XPathEvaluator".to_string(),
+        crate::xpath_web::xpath_evaluator_class(),
+    );
+    props.insert(
+        "XPathExpression".to_string(),
+        crate::xpath_web::xpath_expression_class(),
+    );
+    props.insert(
+        "XPathResult".to_string(),
+        crate::xpath_web::xpath_result_class(),
+    );
+    props.insert(
+        "XSLTProcessor".to_string(),
+        crate::xslt_web::xslt_processor_class(),
+    );
+    for name in [
+        "Error",
+        "EvalError",
+        "RangeError",
+        "ReferenceError",
+        "SyntaxError",
+        "TypeError",
+        "URIError",
+        "AggregateError",
+    ] {
+        props.insert(name.to_string(), w3cos_core::error_class(name));
+    }
     props.insert("BigInt".to_string(), w3cos_core::bigint::bigint_class());
     props.insert(
         "WeakMap".to_string(),
@@ -4153,6 +10356,51 @@ fn build_window_value() -> Value {
             crate::unsupported::unsupported_constructor(name),
         );
     }
+    props.insert("eval".to_string(), eval_compat_value());
+    props.insert(
+        "escape".to_string(),
+        func(|_, args| Value::string(&legacy_escape(&arg(&args, 0).to_js_string()))),
+    );
+    props.insert(
+        "unescape".to_string(),
+        func(|_, args| Value::string(&legacy_unescape(&arg(&args, 0).to_js_string()))),
+    );
+    props.insert("Function".to_string(), function_compat_class());
+    props.insert("Report".to_string(), crate::reporting_web::report_class());
+    for name in ["CSPViolationReportBody", "IntegrityViolationReportBody"] {
+        props.insert(
+            name.to_string(),
+            crate::reporting_web::report_body_class(name),
+        );
+    }
+    props.insert(
+        "ReportingObserver".to_string(),
+        crate::reporting_web::reporting_observer_class(),
+    );
+    props.insert(
+        "Sanitizer".to_string(),
+        crate::sanitizer_web::sanitizer_class(),
+    );
+    props.insert(
+        "trustedTypes".to_string(),
+        crate::trusted_types_web::factory_value(),
+    );
+    for name in [
+        "TrustedHTML",
+        "TrustedScript",
+        "TrustedScriptURL",
+        "TrustedTypePolicy",
+        "TrustedTypePolicyFactory",
+    ] {
+        props.insert(
+            name.to_string(),
+            crate::trusted_types_web::trusted_class(name),
+        );
+    }
+    props.insert(
+        "reportError".to_string(),
+        crate::reporting_web::report_error_value(),
+    );
     props.insert("Headers".to_string(), crate::fetch::headers_class());
     props.insert("Request".to_string(), crate::fetch::request_class());
     props.insert("Response".to_string(), crate::fetch::response_class());
@@ -4193,6 +10441,34 @@ fn build_window_value() -> Value {
         "ImageData".to_string(),
         crate::canvas_web::image_data_class(),
     );
+    props.insert(
+        "CanvasGradient".to_string(),
+        crate::canvas_web::canvas_gradient_class(),
+    );
+    props.insert(
+        "CanvasPattern".to_string(),
+        crate::canvas_web::canvas_pattern_class(),
+    );
+    props.insert(
+        "CanvasRenderingContext2D".to_string(),
+        crate::canvas_web::canvas_rendering_context_2d_class(),
+    );
+    props.insert(
+        "ImageBitmap".to_string(),
+        crate::canvas_web::image_bitmap_class(),
+    );
+    props.insert(
+        "ImageBitmapRenderingContext".to_string(),
+        crate::canvas_web::image_bitmap_rendering_context_class(),
+    );
+    props.insert(
+        "CanvasCaptureMediaStreamTrack".to_string(),
+        crate::canvas_web::canvas_capture_media_stream_track_class(),
+    );
+    props.insert(
+        "TextMetrics".to_string(),
+        crate::canvas_web::text_metrics_class(),
+    );
     props.insert("Path2D".to_string(), crate::canvas_web::path_2d_class());
     props.insert(
         "OffscreenCanvas".to_string(),
@@ -4203,17 +10479,84 @@ fn build_window_value() -> Value {
         crate::observers_web::resize_observer_class(),
     );
     props.insert(
+        "ResizeObserverEntry".to_string(),
+        crate::observers_web::resize_observer_entry_class(),
+    );
+    props.insert(
+        "ResizeObserverSize".to_string(),
+        crate::observers_web::resize_observer_size_class(),
+    );
+    props.insert(
         "MutationObserver".to_string(),
         crate::observers_web::mutation_observer_class(),
+    );
+    props.insert(
+        "WebKitMutationObserver".to_string(),
+        crate::observers_web::mutation_observer_class(),
+    );
+    props.insert(
+        "MutationRecord".to_string(),
+        crate::observers_web::mutation_record_class(),
     );
     props.insert(
         "IntersectionObserver".to_string(),
         crate::observers_web::intersection_observer_class(),
     );
     props.insert(
+        "IntersectionObserverEntry".to_string(),
+        crate::observers_web::intersection_observer_entry_class(),
+    );
+    props.insert(
         "PerformanceObserver".to_string(),
         crate::observers_web::performance_observer_class(),
     );
+    for name in ["PerformanceEntry", "PerformanceMark", "PerformanceMeasure"] {
+        props.insert(
+            name.to_string(),
+            crate::observers_web::performance_entry_class(name),
+        );
+    }
+    props.insert(
+        "PerformanceObserverEntryList".to_string(),
+        crate::observers_web::performance_entry_list_class(),
+    );
+    props.insert(
+        "PerformanceLongTaskTiming".to_string(),
+        crate::observers_web::performance_long_task_class(),
+    );
+    props.insert(
+        "TaskAttributionTiming".to_string(),
+        crate::observers_web::task_attribution_class(),
+    );
+    props.insert(
+        "VisibilityStateEntry".to_string(),
+        crate::observers_web::visibility_state_entry_class(),
+    );
+    for name in [
+        "LargestContentfulPaint",
+        "LayoutShift",
+        "LayoutShiftAttribution",
+        "PerformanceElementTiming",
+        "PerformanceEventTiming",
+        "PerformanceLongAnimationFrameTiming",
+        "PerformanceNavigationTiming",
+        "PerformancePaintTiming",
+        "PerformanceResourceTiming",
+        "PerformanceScriptTiming",
+        "PerformanceServerTiming",
+        "PerformanceTimingConfidence",
+    ] {
+        props.insert(
+            name.to_string(),
+            crate::observers_web::performance_timeline_class(name),
+        );
+    }
+    for name in ["NotRestoredReasonDetails", "NotRestoredReasons"] {
+        props.insert(
+            name.to_string(),
+            crate::observers_web::navigation_diagnostic_class(name),
+        );
+    }
     for name in w3cos_core::binary::TYPED_ARRAY_NAMES {
         props.insert(
             (*name).to_string(),
@@ -4229,6 +10572,25 @@ fn build_window_value() -> Value {
         "EventTarget".to_string(),
         crate::web_events::event_target_class(),
     );
+    props.insert(
+        "Observable".to_string(),
+        crate::observable_web::observable_class(),
+    );
+    props.insert(
+        "Subscriber".to_string(),
+        crate::observable_web::subscriber_class(),
+    );
+    props.insert("MediaQueryList".to_string(), media_query_list_class());
+    props.insert("VisualViewport".to_string(), visual_viewport_class());
+    props.insert("Touch".to_string(), crate::web_events::touch_class());
+    props.insert(
+        "TouchList".to_string(),
+        crate::web_events::touch_list_class(),
+    );
+    props.insert(
+        "InputDeviceCapabilities".to_string(),
+        crate::web_events::input_device_capabilities_class(),
+    );
     for name in crate::web_events::EVENT_SUBCLASS_NAMES {
         props.insert(
             (*name).to_string(),
@@ -4241,6 +10603,27 @@ fn build_window_value() -> Value {
             crate::dom_constructors::constructor(name),
         );
     }
+    if let Some(document_class) = props.get("Document").cloned() {
+        document_class.set_property(
+            "parseHTML",
+            Value::function(|_, args| {
+                crate::jsdom::sanitized_document_value(&arg(&args, 0).to_js_string())
+            }),
+        );
+        document_class.set_property(
+            "parseHTMLUnsafe",
+            Value::function(|_, args| {
+                static WARNING: std::sync::Once = std::sync::Once::new();
+                WARNING.call_once(|| {
+                    eprintln!(
+                        "[w3cos] warning: Document.parseHTMLUnsafe creates inert DOM; script \
+                         execution and declarative shadow-root activation remain unavailable"
+                    );
+                });
+                crate::jsdom::unsafe_document_value(&arg(&args, 0).to_js_string())
+            }),
+        );
+    }
     props.insert("closed".to_string(), Value::Bool(false));
     props.insert("isSecureContext".to_string(), Value::Bool(true));
     props.insert("crossOriginIsolated".to_string(), Value::Bool(false));
@@ -4249,6 +10632,82 @@ fn build_window_value() -> Value {
     props.insert("status".to_string(), Value::string(""));
     props.insert("length".to_string(), Value::Number(0.0));
     props.insert("frames".to_string(), js_array(vec![]));
+    props.insert(
+        "navigation".to_string(),
+        crate::navigation_web::navigation_value(),
+    );
+    props.insert(
+        "launchQueue".to_string(),
+        crate::launch_handler_web::launch_queue_value(),
+    );
+    props.insert(
+        "LaunchQueue".to_string(),
+        crate::launch_handler_web::launch_queue_class(),
+    );
+    props.insert(
+        "LaunchParams".to_string(),
+        crate::launch_handler_web::launch_params_class(),
+    );
+    props.insert(
+        "ViewTransition".to_string(),
+        crate::view_transition_web::view_transition_class(),
+    );
+    props.insert(
+        "ViewTransitionTypeSet".to_string(),
+        crate::view_transition_web::type_set_class(),
+    );
+    props.insert(
+        "PageRevealEvent".to_string(),
+        crate::view_transition_web::page_reveal_event_class(),
+    );
+    props.insert(
+        "PageSwapEvent".to_string(),
+        crate::view_transition_web::page_swap_event_class(),
+    );
+    props.insert(
+        "BarcodeDetector".to_string(),
+        crate::barcode_detection_web::barcode_detector_class(),
+    );
+    props.insert(
+        "PressureObserver".to_string(),
+        crate::pressure_web::pressure_observer_class(),
+    );
+    props.insert(
+        "PressureRecord".to_string(),
+        crate::pressure_web::pressure_record_class(),
+    );
+    props.insert(
+        "FragmentDirective".to_string(),
+        crate::fragment_directive_web::fragment_directive_class(),
+    );
+    props.insert(
+        "Navigation".to_string(),
+        crate::navigation_web::navigation_class(),
+    );
+    props.insert(
+        "NavigationHistoryEntry".to_string(),
+        crate::navigation_web::history_entry_class(),
+    );
+    props.insert(
+        "NavigationDestination".to_string(),
+        crate::navigation_web::destination_class(),
+    );
+    props.insert(
+        "NavigateEvent".to_string(),
+        crate::navigation_web::navigate_event_class(),
+    );
+    props.insert(
+        "NavigationCurrentEntryChangeEvent".to_string(),
+        crate::navigation_web::current_entry_change_event_class(),
+    );
+    props.insert(
+        "NavigationTransition".to_string(),
+        crate::navigation_web::transition_class(),
+    );
+    props.insert(
+        "NavigationActivation".to_string(),
+        crate::navigation_web::activation_class(),
+    );
 
     // Session History API. Values are live so navigation performed by a
     // platform gesture is immediately observable by application code.
@@ -4314,71 +10773,38 @@ fn build_window_value() -> Value {
                 Value::Undefined
             }),
         );
-        props.insert("history".to_string(), Value::object(history));
+        let history = Value::object(history);
+        w3cos_core::class::set_prototype_of(
+            &history,
+            &crate::dom_constructors::prototype("History"),
+        );
+        props.insert("history".to_string(), history);
     }
 
-    // screen
-    {
-        let mut screen: HashMap<String, Value> = HashMap::new();
-        for key in ["width", "height", "availWidth", "availHeight"] {
-            let height = key.contains("eight"); // height / availHeight
-            screen.insert(
-                format!("__w3cos_getter_{key}"),
-                func(move |_, _| {
-                    let (w, h, _) = viewport();
-                    Value::Number(if height { h } else { w })
-                }),
-            );
-        }
-        screen.insert("colorDepth".to_string(), Value::Number(24.0));
-        screen.insert("pixelDepth".to_string(), Value::Number(24.0));
-        let orientation = Value::object(HashMap::from([
-            (
-                "__w3cos_getter_type".to_string(),
-                func(|_, _| SCREEN_ORIENTATION.with(|state| Value::string(&state.borrow().0))),
-            ),
-            (
-                "__w3cos_getter_angle".to_string(),
-                func(|_, _| SCREEN_ORIENTATION.with(|state| Value::Number(state.borrow().1))),
-            ),
-        ]));
-        crate::web_events::event_target_class().call(orientation.clone(), vec![]);
-        let orientation_for_lock = orientation.clone();
-        orientation.set_property(
-            "lock",
-            func(move |_, args| {
-                let requested = arg(&args, 0).to_js_string();
-                let angle = if requested.starts_with("portrait") {
-                    90.0
-                } else {
-                    0.0
-                };
-                SCREEN_ORIENTATION.with(|state| *state.borrow_mut() = (requested, angle));
-                let event = w3cos_core::class::construct(
-                    &crate::web_events::event_class(),
-                    vec![Value::string("change")],
-                );
-                orientation_for_lock.call_method("dispatchEvent", vec![event]);
-                resolved_thenable(Value::Undefined)
-            }),
-        );
-        let orientation_for_unlock = orientation.clone();
-        orientation.set_property(
-            "unlock",
-            func(move |_, _| {
-                SCREEN_ORIENTATION
-                    .with(|state| *state.borrow_mut() = ("landscape-primary".to_string(), 0.0));
-                let event = w3cos_core::class::construct(
-                    &crate::web_events::event_class(),
-                    vec![Value::string("change")],
-                );
-                orientation_for_unlock.call_method("dispatchEvent", vec![event]);
-                Value::Undefined
-            }),
-        );
-        screen.insert("orientation".to_string(), orientation);
-        props.insert("screen".to_string(), Value::object(screen));
-    }
+    props.insert(
+        "screen".to_string(),
+        crate::screen_details_web::screen_value(),
+    );
+    props.insert(
+        "getScreenDetails".to_string(),
+        func(|_, _| crate::screen_details_web::get_screen_details()),
+    );
+    props.insert(
+        "Screen".to_string(),
+        crate::screen_details_web::screen_class(),
+    );
+    props.insert(
+        "ScreenOrientation".to_string(),
+        crate::screen_details_web::screen_orientation_class(),
+    );
+    props.insert(
+        "ScreenDetailed".to_string(),
+        crate::screen_details_web::screen_detailed_class(),
+    );
+    props.insert(
+        "ScreenDetails".to_string(),
+        crate::screen_details_web::screen_details_class(),
+    );
 
     // visualViewport
     {
@@ -4392,6 +10818,9 @@ fn build_window_value() -> Value {
             func(|_, _| Value::Number(viewport().1)),
         );
         vv.insert("scale".to_string(), Value::Number(1.0));
+        vv.insert("onresize".to_string(), Value::Null);
+        vv.insert("onscroll".to_string(), Value::Null);
+        vv.insert("onscrollend".to_string(), Value::Null);
         for (name, horizontal) in [
             ("offsetLeft", true),
             ("offsetTop", false),
@@ -4408,6 +10837,10 @@ fn build_window_value() -> Value {
         }
         let viewport_value = Value::object(vv);
         crate::web_events::event_target_class().call(viewport_value.clone(), vec![]);
+        w3cos_core::class::set_prototype_of(
+            &viewport_value,
+            &visual_viewport_class().get_property("prototype"),
+        );
         props.insert("visualViewport".to_string(), viewport_value);
     }
 
@@ -4533,7 +10966,15 @@ fn build_window_value() -> Value {
         "requestIdleCallback".to_string(),
         func(|_, args| {
             let cb = arg(&args, 0);
-            Value::Number(js_set_timer(cb, 0, vec![], false) as f64)
+            let timeout = arg(&args, 1).get_property("timeout").to_number();
+            let timeout = timeout.is_finite().then_some(timeout.max(0.0));
+            let scheduled = Instant::now();
+            let callback = func(move |_, _| {
+                let did_timeout = timeout
+                    .is_some_and(|timeout| scheduled.elapsed().as_secs_f64() * 1000.0 >= timeout);
+                cb.call(Value::Undefined, vec![idle_deadline_value(did_timeout)])
+            });
+            Value::Number(js_set_timer(callback, 0, vec![], false) as f64)
         }),
     );
     props.insert(
@@ -4558,7 +10999,13 @@ fn build_window_value() -> Value {
     for name in [
         "moveTo", "moveBy", "resizeTo", "resizeBy", "focus", "blur", "print", "close", "stop",
     ] {
-        props.insert(name.to_string(), func(|_, _| Value::Undefined));
+        props.insert(
+            name.to_string(),
+            func(move |_, _| {
+                warn_host_api(name, "undefined");
+                Value::Undefined
+            }),
+        );
     }
     for name in ["scrollTo", "scroll", "scrollBy"] {
         props.insert(
@@ -4592,10 +11039,34 @@ fn build_window_value() -> Value {
             }),
         );
     }
-    props.insert("open".to_string(), func(|_, _| Value::Null));
-    props.insert("alert".to_string(), func(|_, _| Value::Undefined));
-    props.insert("confirm".to_string(), func(|_, _| Value::Bool(false)));
-    props.insert("prompt".to_string(), func(|_, _| Value::Null));
+    props.insert(
+        "open".to_string(),
+        func(|_, _| {
+            warn_host_api("window.open()", "null");
+            Value::Null
+        }),
+    );
+    props.insert(
+        "alert".to_string(),
+        func(|_, _| {
+            warn_host_api("window.alert()", "undefined");
+            Value::Undefined
+        }),
+    );
+    props.insert(
+        "confirm".to_string(),
+        func(|_, _| {
+            warn_host_api("window.confirm()", "false");
+            Value::Bool(false)
+        }),
+    );
+    props.insert(
+        "prompt".to_string(),
+        func(|_, _| {
+            warn_host_api("window.prompt()", "null");
+            Value::Null
+        }),
+    );
     props.insert(
         "addEventListener".to_string(),
         func(|_, args| {
@@ -4620,7 +11091,9 @@ fn build_window_value() -> Value {
         func(|_, args| Value::Bool(js_dispatch_event(0, arg(&args, 0)))),
     );
 
-    Value::object(props)
+    let window = Value::object(props);
+    w3cos_core::class::set_prototype_of(&window, &window_class().get_property("prototype"));
+    window
 }
 
 // ── Timers / microtasks (bridge-side stores; see module docs) ─────────────
@@ -4798,6 +11271,10 @@ pub fn reset_bridge() {
     LISTENERS.with(|l| l.borrow_mut().clear());
     NATIVELY_REGISTERED.with(|r| r.borrow_mut().clear());
     PENDING_EVENTS.with(|q| q.borrow_mut().clear());
+    ACTIVE_TOUCHES.with(|touches| touches.borrow_mut().clear());
+    ACTIVE_POINTERS.with(|pointers| pointers.borrow_mut().clear());
+    POINTER_CAPTURE.with(|capture| capture.borrow_mut().clear());
+    SHADOW_ROOTS.with(|roots| roots.borrow_mut().clear());
     CUSTOM_EVENT_TYPES.with(|m| m.borrow_mut().clear());
     CUSTOM_EVENT_NAMES.with(|m| m.borrow_mut().clear());
     MICROTASKS.with(|m| m.borrow_mut().clear());
@@ -4806,6 +11283,9 @@ pub fn reset_bridge() {
     RAF_QUEUE.with(|q| q.borrow_mut().clear());
     NEXT_RAF_ID.with(|c| c.set(1));
     VIEWPORT.with(|v| v.set((1024.0, 768.0, 1.0)));
+    DOCUMENT_VISIBILITY.with(|state| *state.borrow_mut() = "visible".to_string());
+    EVENT_COUNTS.with(|counts| *counts.borrow_mut() = initial_event_counts());
+    MEDIA_QUERY_LISTS.with(|lists| lists.borrow_mut().clear());
     ACTIVE_ELEMENT.with(|a| *a.borrow_mut() = None);
     HTML_ID.with(|h| *h.borrow_mut() = None);
     HEAD_ID.with(|h| *h.borrow_mut() = None);
@@ -4813,8 +11293,49 @@ pub fn reset_bridge() {
     SESSION_STORAGE.with(|s| s.borrow_mut().clear());
     crate::websocket::reset_js_websockets();
     crate::speech_web::reset();
+    crate::speech_synthesis_web::reset();
     crate::geolocation_web::reset();
     crate::media_devices_web::reset();
+    crate::media_session_web::reset();
+    crate::media_capabilities_web::reset();
+    crate::media_recording_web::reset();
+    crate::media_source_web::reset();
+    crate::payment_web::reset();
+    crate::webcodecs_web::reset();
+    crate::navigator_web::reset();
+    crate::midi_web::reset();
+    crate::service_worker_web::reset();
+    crate::push_web::reset();
+    crate::xslt_web::reset();
+    crate::battery_web::reset();
+    crate::gamepad_web::reset();
+    crate::orientation_web::reset();
+    crate::sensors_web::reset();
+    crate::font_loading_web::reset();
+    crate::custom_elements_web::reset();
+    crate::cache_web::reset();
+    crate::locks_web::reset();
+    crate::scheduler_web::reset();
+    crate::reporting_web::reset();
+    crate::compat_web::reset();
+    crate::text_tracks_web::reset();
+    crate::file_system_web::reset();
+    crate::animations_web::reset();
+    crate::audio_web::reset();
+    crate::image_decoder_web::reset();
+    crate::webrtc_web::reset();
+    crate::experimental_web::reset();
+    crate::web_transport_web::reset();
+    crate::webxr_web::reset();
+    crate::webgpu_web::reset();
+    crate::webgl_web::reset();
+    crate::cookie_store_web::reset();
+    crate::trusted_types_web::reset();
+    crate::user_activation_web::reset();
+    crate::observers_web::reset_resize_observers();
+    crate::observers_web::reset_mutation_observers();
+    crate::observers_web::reset_intersection_observers();
+    crate::observers_web::reset_performance_timeline();
     // DOCUMENT_VALUE / WINDOW_VALUE / SELECTION_VALUE survive on purpose:
     // their contents read all state lazily from the DOM and viewport.
 }
@@ -4839,6 +11360,41 @@ mod tests {
         doc.get_property("body")
             .call_method("appendChild", vec![el.clone()]);
         el
+    }
+
+    #[test]
+    fn trusted_native_input_updates_user_activation_during_dispatch() {
+        setup();
+        let target = create_in_body("button");
+        let target_id = node_id_of(&target).expect("button node id");
+        let activation = window_value()
+            .get_property("navigator")
+            .get_property("userActivation");
+        let observed = Rc::new(RefCell::new(Vec::<bool>::new()));
+        let observed_for_listener = Rc::clone(&observed);
+        let activation_for_listener = activation.clone();
+        target.call_method(
+            "addEventListener",
+            vec![
+                Value::string("keydown"),
+                func(move |_, args| {
+                    assert!(args[0].get_property("isTrusted").to_bool());
+                    observed_for_listener
+                        .borrow_mut()
+                        .push(activation_for_listener.get_property("isActive").to_bool());
+                    Value::Undefined
+                }),
+            ],
+        );
+
+        assert!(!activation.get_property("isActive").to_bool());
+        assert!(!activation.get_property("hasBeenActive").to_bool());
+        assert!(!dispatch_native_key(
+            target_id, "Enter", "Enter", false, false, false, false, false, true,
+        ));
+        assert_eq!(&*observed.borrow(), &[true]);
+        assert!(!activation.get_property("isActive").to_bool());
+        assert!(activation.get_property("hasBeenActive").to_bool());
     }
 
     #[test]
@@ -4916,17 +11472,298 @@ mod tests {
     }
 
     #[test]
+    fn xml_node_factories_preserve_node_shape_and_serialization() {
+        setup();
+        let window = window_value();
+        let implementation = document_value().get_property("implementation");
+        assert!(w3cos_core::class::instance_of(
+            &implementation,
+            &window.get_property("DOMImplementation")
+        ));
+
+        let xml = implementation.call_method(
+            "createDocument",
+            vec![
+                Value::string("urn:w3cos:test"),
+                Value::string("root"),
+                Value::Null,
+            ],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &xml,
+            &window.get_property("XMLDocument")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &document_value(),
+            &window.get_property("HTMLDocument")
+        ));
+        let cdata = xml.call_method("createCDATASection", vec![Value::string("a < b")]);
+        let instruction = xml.call_method(
+            "createProcessingInstruction",
+            vec![
+                Value::string("xml-stylesheet"),
+                Value::string("href=\"theme.css\""),
+            ],
+        );
+        let root = xml.get_property("documentElement");
+        root.call_method("appendChild", vec![cdata.clone()]);
+        root.call_method("appendChild", vec![instruction.clone()]);
+
+        assert_eq!(cdata.get_property("nodeType").to_number(), 4.0);
+        assert_eq!(
+            cdata.get_property("nodeName").to_js_string(),
+            "#cdata-section"
+        );
+        assert_eq!(instruction.get_property("nodeType").to_number(), 7.0);
+        assert_eq!(
+            instruction.get_property("target").to_js_string(),
+            "xml-stylesheet"
+        );
+        assert!(w3cos_core::class::instance_of(
+            &cdata,
+            &window.get_property("CDATASection")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &instruction,
+            &window.get_property("ProcessingInstruction")
+        ));
+        assert_eq!(
+            root.get_property("outerHTML").to_js_string(),
+            "<root><![CDATA[a < b]]><?xml-stylesheet href=\"theme.css\"?></root>"
+        );
+
+        let doctype = implementation.call_method(
+            "createDocumentType",
+            vec![
+                Value::string("html"),
+                Value::string("-//W3C//DTD HTML 5.0//EN"),
+                Value::string("about:legacy-compat"),
+            ],
+        );
+        assert_eq!(doctype.get_property("nodeType").to_number(), 10.0);
+        assert_eq!(doctype.get_property("name").to_js_string(), "html");
+        assert_eq!(
+            doctype.get_property("publicId").to_js_string(),
+            "-//W3C//DTD HTML 5.0//EN"
+        );
+        assert!(w3cos_core::class::instance_of(
+            &doctype,
+            &window.get_property("DocumentType")
+        ));
+    }
+
+    #[test]
+    fn legacy_element_factories_return_live_typed_html_elements() {
+        setup();
+        let window = window_value();
+        let image = w3cos_core::class::construct(
+            &window.get_property("Image"),
+            vec![Value::Number(320.0), Value::Number(180.0)],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &image,
+            &window.get_property("HTMLImageElement")
+        ));
+        assert_eq!(image.get_property("width").to_number(), 320.0);
+        assert_eq!(image.get_property("height").to_number(), 180.0);
+
+        let audio = w3cos_core::class::construct(
+            &window.get_property("Audio"),
+            vec![Value::string("tone.ogg")],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &audio,
+            &window.get_property("HTMLAudioElement")
+        ));
+        assert_eq!(audio.get_property("src").to_js_string(), "tone.ogg");
+
+        let option = w3cos_core::class::construct(
+            &window.get_property("Option"),
+            vec![
+                Value::string("Fast"),
+                Value::string("fast"),
+                Value::Bool(true),
+                Value::Bool(false),
+            ],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &option,
+            &window.get_property("HTMLOptionElement")
+        ));
+        assert_eq!(option.get_property("text").to_js_string(), "Fast");
+        assert_eq!(option.get_property("value").to_js_string(), "fast");
+        assert!(option.get_property("defaultSelected").to_bool());
+        assert!(!option.get_property("selected").to_bool());
+
+        for name in [
+            "locationbar",
+            "menubar",
+            "personalbar",
+            "scrollbars",
+            "statusbar",
+            "toolbar",
+        ] {
+            let bar = window.get_property(name);
+            assert!(w3cos_core::class::instance_of(
+                &bar,
+                &window.get_property("BarProp")
+            ));
+            assert!(!bar.get_property("visible").to_bool());
+        }
+    }
+
+    #[test]
+    fn shadow_roots_are_queryable_connected_and_obey_open_closed_modes() {
+        setup();
+        let window = window_value();
+        let document = document_value();
+        let host = create_in_body("div");
+        let root = host.call_method(
+            "attachShadow",
+            vec![Value::object(HashMap::from([
+                ("mode".to_string(), Value::string("open")),
+                ("delegatesFocus".to_string(), Value::Bool(true)),
+            ]))],
+        );
+
+        assert!(host.get_property("shadowRoot") == root);
+        assert!(root.get_property("host") == host);
+        assert_eq!(root.get_property("mode").to_js_string(), "open");
+        assert!(root.get_property("delegatesFocus").to_bool());
+        assert!(w3cos_core::class::instance_of(
+            &root,
+            &window.get_property("ShadowRoot")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &root,
+            &window.get_property("DocumentFragment")
+        ));
+
+        root.set_property(
+            "innerHTML",
+            Value::string("<button id=\"inside\">Go</button>"),
+        );
+        let button = root.call_method("querySelector", vec![Value::string("button")]);
+        assert_eq!(button.get_property("textContent").to_js_string(), "Go");
+        assert!(button.call_method("getRootNode", vec![]) == root);
+        assert!(
+            button.call_method(
+                "getRootNode",
+                vec![Value::object(HashMap::from([(
+                    "composed".to_string(),
+                    Value::Bool(true),
+                )]))],
+            ) == document
+        );
+        assert!(button.get_property("isConnected").to_bool());
+
+        let closed_host = create_in_body("section");
+        let closed_root = closed_host.call_method(
+            "attachShadow",
+            vec![Value::object(HashMap::from([(
+                "mode".to_string(),
+                Value::string("closed"),
+            )]))],
+        );
+        assert!(closed_host.get_property("shadowRoot").is_null());
+        assert_eq!(closed_root.get_property("mode").to_js_string(), "closed");
+    }
+
+    #[test]
+    fn composed_events_cross_shadow_boundary_and_retarget_to_host() {
+        setup();
+        let host = create_in_body("div");
+        let root = host.call_method(
+            "attachShadow",
+            vec![Value::object(HashMap::from([(
+                "mode".to_string(),
+                Value::string("open"),
+            )]))],
+        );
+        root.set_property("innerHTML", Value::string("<button>Go</button>"));
+        let button = root.call_method("querySelector", vec![Value::string("button")]);
+        let calls = Rc::new(RefCell::new(Vec::<String>::new()));
+
+        for (target, label) in [
+            (root.clone(), "root"),
+            (host.clone(), "host"),
+            (document_value().get_property("body"), "body"),
+        ] {
+            let calls = calls.clone();
+            let host = host.clone();
+            target.call_method(
+                "addEventListener",
+                vec![
+                    Value::string("shadow-test"),
+                    func(move |_, args| {
+                        let event = arg(&args, 0);
+                        let retargeted = event.get_property("target") == host;
+                        let path_len = event
+                            .call_method("composedPath", vec![])
+                            .get_property("length")
+                            .to_number();
+                        calls
+                            .borrow_mut()
+                            .push(format!("{label}:{retargeted}:{path_len}"));
+                        Value::Undefined
+                    }),
+                ],
+            );
+        }
+
+        let event = w3cos_core::class::construct(
+            &crate::web_events::event_class(),
+            vec![
+                Value::string("shadow-test"),
+                Value::object(HashMap::from([
+                    ("bubbles".to_string(), Value::Bool(true)),
+                    ("composed".to_string(), Value::Bool(true)),
+                ])),
+            ],
+        );
+        button.call_method("dispatchEvent", vec![event]);
+        assert_eq!(
+            calls.borrow().as_slice(),
+            ["root:false:5", "host:true:5", "body:true:5"]
+        );
+
+        calls.borrow_mut().clear();
+        let event = w3cos_core::class::construct(
+            &crate::web_events::event_class(),
+            vec![
+                Value::string("shadow-test"),
+                Value::object(HashMap::from([
+                    ("bubbles".to_string(), Value::Bool(true)),
+                    ("composed".to_string(), Value::Bool(false)),
+                ])),
+            ],
+        );
+        button.call_method("dispatchEvent", vec![event]);
+        assert_eq!(calls.borrow().as_slice(), ["root:false:2"]);
+    }
+
+    #[test]
     fn window_history_is_live_and_dispatches_popstate() {
         setup();
         let window = window_value();
         let history = window.get_property("history");
         let popstate_calls = Rc::new(Cell::new(0));
         let calls = popstate_calls.clone();
+        let states = Rc::new(RefCell::new(Vec::<String>::new()));
+        let states_for_handler = Rc::clone(&states);
         window.call_method(
             "addEventListener",
             vec![
                 Value::string("popstate"),
-                func(move |_, _| {
+                func(move |_, args| {
+                    let event = args[0].clone();
+                    assert!(w3cos_core::class::instance_of(
+                        &event,
+                        &window_value().get_property("PopStateEvent")
+                    ));
+                    states_for_handler
+                        .borrow_mut()
+                        .push(event.get_property("state").to_js_string());
                     calls.set(calls.get() + 1);
                     Value::Undefined
                 }),
@@ -4935,7 +11772,11 @@ mod tests {
 
         history.call_method(
             "pushState",
-            vec![Value::Null, Value::string(""), Value::string("/?task=42")],
+            vec![
+                Value::string("route-state"),
+                Value::string(""),
+                Value::string("/?task=42"),
+            ],
         );
         assert_eq!(
             window
@@ -4955,6 +11796,77 @@ mod tests {
             ""
         );
         assert_eq!(popstate_calls.get(), 1);
+        assert_eq!(states.borrow().as_slice(), ["null"]);
+
+        history.call_method("forward", vec![]);
+        assert_eq!(popstate_calls.get(), 2);
+        assert_eq!(states.borrow().as_slice(), ["null", "route-state"]);
+        assert_eq!(history.get_property("state").to_js_string(), "route-state");
+    }
+
+    #[test]
+    fn location_navigation_and_hashchange_are_live() {
+        setup();
+        crate::history::reset();
+        let window = window_value();
+        let location = window.get_property("location");
+        let history = window.get_property("history");
+        let hashes = Rc::new(RefCell::new(Vec::<String>::new()));
+        let hashes_for_handler = Rc::clone(&hashes);
+        window.call_method(
+            "addEventListener",
+            vec![
+                Value::string("hashchange"),
+                func(move |_, args| {
+                    let event = args[0].clone();
+                    assert!(w3cos_core::class::instance_of(
+                        &event,
+                        &window_value().get_property("HashChangeEvent")
+                    ));
+                    hashes_for_handler.borrow_mut().push(format!(
+                        "{}>{}",
+                        event.get_property("oldURL").to_js_string(),
+                        event.get_property("newURL").to_js_string()
+                    ));
+                    Value::Undefined
+                }),
+            ],
+        );
+
+        location.set_property("hash", Value::string("section"));
+        assert_eq!(location.get_property("hash").to_js_string(), "#section");
+        assert_eq!(history.get_property("length").to_number(), 2.0);
+        assert_eq!(hashes.borrow().len(), 1);
+
+        location.set_property("pathname", Value::string("orders"));
+        assert_eq!(location.get_property("pathname").to_js_string(), "/orders");
+        assert_eq!(history.get_property("length").to_number(), 3.0);
+
+        location.call_method("replace", vec![Value::string("/replaced?q=1#next")]);
+        assert_eq!(
+            location.get_property("pathname").to_js_string(),
+            "/replaced"
+        );
+        assert_eq!(location.get_property("search").to_js_string(), "?q=1");
+        assert_eq!(location.get_property("hash").to_js_string(), "#next");
+        assert_eq!(history.get_property("length").to_number(), 3.0);
+        assert_eq!(hashes.borrow().len(), 2);
+
+        location.call_method("assign", vec![Value::string("/assigned")]);
+        assert_eq!(
+            location.get_property("pathname").to_js_string(),
+            "/assigned"
+        );
+        assert_eq!(history.get_property("length").to_number(), 4.0);
+        assert_eq!(hashes.borrow().len(), 3);
+
+        location.set_property("href", Value::string("/via-href?ok=1"));
+        assert_eq!(
+            location.get_property("pathname").to_js_string(),
+            "/via-href"
+        );
+        assert_eq!(location.get_property("search").to_js_string(), "?ok=1");
+        assert_eq!(history.get_property("length").to_number(), 5.0);
     }
 
     #[test]
@@ -5062,6 +11974,235 @@ mod tests {
     }
 
     #[test]
+    fn typed_style_maps_roundtrip_values_and_update_inline_style() {
+        setup();
+        let window = window_value();
+        let div = create_in_body("div");
+        let map = div.get_property("attributeStyleMap");
+        assert!(w3cos_core::class::instance_of(
+            &map,
+            &window.get_property("StylePropertyMap")
+        ));
+
+        let width = w3cos_core::class::construct(
+            &window.get_property("CSSUnitValue"),
+            vec![Value::Number(12.0), Value::string("px")],
+        );
+        map.call_method("set", vec![Value::string("width"), width]);
+        assert_eq!(
+            div.get_property("style")
+                .get_property("width")
+                .to_js_string(),
+            "12px"
+        );
+        assert_eq!(map.get_property("size").to_number(), 1.0);
+        let stored = map.call_method("get", vec![Value::string("width")]);
+        assert!(w3cos_core::class::instance_of(
+            &stored,
+            &window.get_property("CSSUnitValue")
+        ));
+        assert_eq!(stored.get_property("value").to_number(), 12.0);
+        assert_eq!(stored.get_property("unit").to_js_string(), "px");
+
+        let computed = div.call_method("computedStyleMap", vec![]);
+        assert!(w3cos_core::class::instance_of(
+            &computed,
+            &window.get_property("StylePropertyMapReadOnly")
+        ));
+        assert_eq!(
+            computed
+                .call_method("get", vec![Value::string("width")])
+                .get_property("value")
+                .to_number(),
+            12.0
+        );
+
+        map.call_method("delete", vec![Value::string("width")]);
+        assert_eq!(map.get_property("size").to_number(), 0.0);
+        assert!(
+            map.call_method("get", vec![Value::string("width")])
+                .is_undefined()
+        );
+    }
+
+    #[test]
+    fn element_edit_context_tracks_attachment_and_detachment() {
+        setup();
+        let element = create_in_body("div");
+        let context = w3cos_core::class::construct(
+            &window_value().get_property("EditContext"),
+            vec![Value::object(HashMap::from([(
+                "text".into(),
+                Value::string("draft"),
+            )]))],
+        );
+        element.set_property("editContext", context.clone());
+        assert!(element.get_property("editContext") == context);
+        assert!(context.get_property("attachedElements").get_property("0") == element);
+        element.set_property("editContext", Value::Null);
+        assert!(element.get_property("editContext").is_null());
+        assert_eq!(
+            context
+                .get_property("attachedElements")
+                .get_property("length")
+                .to_u32(),
+            0
+        );
+    }
+
+    #[test]
+    fn css_namespace_and_constructable_stylesheets_match_cssom_shape() {
+        setup();
+        let window = window_value();
+        let css = window.get_property("CSS");
+        assert!(
+            css.call_method(
+                "supports",
+                vec![Value::string("display"), Value::string("grid")],
+            )
+            .to_bool()
+        );
+        assert!(
+            !css.call_method(
+                "supports",
+                vec![Value::string("made-up-property"), Value::string("value")],
+            )
+            .to_bool()
+        );
+        assert!(
+            css.call_method(
+                "supports",
+                vec![Value::string(
+                    "(display: grid) and (not (made-up-property: value))"
+                )],
+            )
+            .to_bool()
+        );
+        assert!(
+            css.call_method(
+                "supports",
+                vec![Value::string(
+                    "(made-up-property: value) or ((display: flex) and (color: red))"
+                )],
+            )
+            .to_bool()
+        );
+        assert!(
+            !css.call_method(
+                "supports",
+                vec![Value::string(
+                    "(display: grid) and (made-up-property: value)"
+                )],
+            )
+            .to_bool()
+        );
+        assert_eq!(
+            css.call_method("escape", vec![Value::string("0a b")])
+                .to_js_string(),
+            "\\30 a\\ b"
+        );
+
+        let element = create_in_body("div");
+        let style = element.get_property("style");
+        assert!(w3cos_core::class::instance_of(
+            &style,
+            &window.get_property("CSSStyleDeclaration")
+        ));
+
+        let sheet = w3cos_core::class::construct(&window.get_property("CSSStyleSheet"), vec![]);
+        sheet.call_method(
+            "replaceSync",
+            vec![Value::string("a { color: red; } b { display: grid; }")],
+        );
+        assert_eq!(
+            sheet
+                .get_property("cssRules")
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+        assert!(w3cos_core::class::instance_of(
+            &sheet,
+            &window.get_property("CSSStyleSheet")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &sheet,
+            &window.get_property("StyleSheet")
+        ));
+        let media = sheet.get_property("media");
+        assert!(w3cos_core::class::instance_of(
+            &media,
+            &window.get_property("MediaList")
+        ));
+        media.call_method("appendMedium", vec![Value::string("screen")]);
+        media.call_method("appendMedium", vec![Value::string("print")]);
+        assert_eq!(
+            media.get_property("mediaText").to_js_string(),
+            "screen, print"
+        );
+        assert_eq!(
+            media
+                .call_method("item", vec![Value::Number(1.0)])
+                .to_js_string(),
+            "print"
+        );
+        media.set_property("mediaText", Value::string("screen and (min-width: 1px)"));
+        assert_eq!(media.get_property("length").to_number(), 1.0);
+        let sheets = document_value().get_property("styleSheets");
+        assert!(w3cos_core::class::instance_of(
+            &sheets,
+            &window.get_property("StyleSheetList")
+        ));
+        assert_eq!(sheets.get_property("length").to_number(), 0.0);
+        assert_eq!(
+            sheets.call_method("item", vec![Value::Number(0.0)]),
+            Value::Null
+        );
+        document_value().set_property("adoptedStyleSheets", js_array(vec![sheet.clone()]));
+        assert!(
+            document_value()
+                .get_property("adoptedStyleSheets")
+                .get_property("0")
+                == sheet
+        );
+    }
+
+    #[test]
+    fn legacy_escape_and_dynamic_code_boundaries_are_browser_shaped() {
+        setup();
+        let window = window_value();
+        let source = "A B✓😀";
+        let escaped = window
+            .call_method("escape", vec![Value::string(source)])
+            .to_js_string();
+        assert_eq!(escaped, "A%20B%u2713%uD83D%uDE00");
+        assert_eq!(
+            window
+                .call_method("unescape", vec![Value::string(&escaped)])
+                .to_js_string(),
+            source
+        );
+        assert_eq!(
+            window
+                .call_method("eval", vec![Value::Number(7.0)])
+                .to_number(),
+            7.0
+        );
+        assert!(
+            window
+                .call_method("eval", vec![Value::string("1 + 1")])
+                .is_undefined()
+        );
+        let dynamic = w3cos_core::class::construct(
+            &window.get_property("Function"),
+            vec![Value::string("return 1")],
+        );
+        assert!(dynamic.is_function());
+        assert!(dynamic.call(Value::Undefined, vec![]).is_undefined());
+        assert!(window.get_property("Report").is_function());
+    }
+
+    #[test]
     fn class_list_works() {
         setup();
         let div = create_in_body("div");
@@ -5081,6 +12222,90 @@ mod tests {
         );
         // classList identity is stable.
         assert!(cl == div.get_property("classList"));
+        assert!(w3cos_core::class::instance_of(
+            &cl,
+            &window_value().get_property("DOMTokenList")
+        ));
+        let visited = Rc::new(RefCell::new(Vec::new()));
+        let callback_values = Rc::clone(&visited);
+        cl.call_method(
+            "forEach",
+            vec![func(move |_, args| {
+                callback_values
+                    .borrow_mut()
+                    .push(arg(&args, 0).to_js_string());
+                Value::Undefined
+            })],
+        );
+        assert_eq!(visited.borrow().as_slice(), ["bar"]);
+    }
+
+    #[test]
+    fn performance_event_counts_track_only_trusted_interaction_events() {
+        setup();
+        let button = create_in_body("button");
+        let counts = window_value()
+            .get_property("performance")
+            .get_property("eventCounts");
+        assert!(w3cos_core::class::instance_of(
+            &counts,
+            &window_value().get_property("EventCounts")
+        ));
+        assert_eq!(counts.get_property("size").to_u32(), 36);
+        assert_eq!(
+            counts
+                .call_method("get", vec![Value::string("click")])
+                .to_u32(),
+            0
+        );
+
+        let synthetic = w3cos_core::class::construct(
+            &crate::web_events::event_class(),
+            vec![Value::string("click")],
+        );
+        button.call_method("dispatchEvent", vec![synthetic]);
+        assert_eq!(
+            counts
+                .call_method("get", vec![Value::string("click")])
+                .to_u32(),
+            0
+        );
+
+        dispatch_native_click(node_id_of(&button).expect("button node"));
+        assert_eq!(
+            counts
+                .call_method("get", vec![Value::string("click")])
+                .to_u32(),
+            1
+        );
+    }
+
+    #[test]
+    fn dataset_is_a_live_dom_string_map() {
+        setup();
+        let div = create_in_body("div");
+        let dataset = div.get_property("dataset");
+        assert!(dataset == div.get_property("dataset"));
+        assert!(w3cos_core::class::instance_of(
+            &dataset,
+            &window_value().get_property("DOMStringMap")
+        ));
+        dataset.set_property("userId", Value::string("42"));
+        assert_eq!(
+            div.call_method("getAttribute", vec![Value::string("data-user-id")])
+                .to_js_string(),
+            "42"
+        );
+        div.call_method(
+            "setAttribute",
+            vec![Value::string("data-route-name"), Value::string("inbox")],
+        );
+        assert_eq!(dataset.get_property("routeName").to_js_string(), "inbox");
+        dataset.delete_property("userId");
+        assert!(
+            !div.call_method("hasAttribute", vec![Value::string("data-user-id")])
+                .to_bool()
+        );
     }
 
     #[test]
@@ -5190,6 +12415,58 @@ mod tests {
     }
 
     #[test]
+    fn node_lists_are_static_and_html_collections_are_live_and_named() {
+        setup();
+        let window = window_value();
+        let document = document_value();
+        let body = document.get_property("body");
+        let children = body.get_property("children");
+        let child_nodes = body.get_property("childNodes");
+        let articles = document.call_method("getElementsByTagName", vec![Value::string("article")]);
+        let initial_query =
+            document.call_method("querySelectorAll", vec![Value::string("article")]);
+
+        assert!(w3cos_core::class::instance_of(
+            &children,
+            &window.get_property("HTMLCollection")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &child_nodes,
+            &window.get_property("NodeList")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &initial_query,
+            &window.get_property("NodeList")
+        ));
+
+        let article = document.call_method("createElement", vec![Value::string("article")]);
+        article.set_property("id", Value::string("primary"));
+        body.call_method("appendChild", vec![article.clone()]);
+
+        assert_eq!(children.get_property("length").to_u32(), 1);
+        assert_eq!(child_nodes.get_property("length").to_u32(), 1);
+        assert_eq!(articles.get_property("length").to_u32(), 1);
+        assert_eq!(initial_query.get_property("length").to_u32(), 0);
+        assert!(children.call_method("namedItem", vec![Value::string("primary")]) == article);
+        assert!(articles.call_method("item", vec![Value::Number(0.0)]) == article);
+
+        let calls = Rc::new(Cell::new(0_u32));
+        let callback_calls = calls.clone();
+        document
+            .call_method("querySelectorAll", vec![Value::string("article")])
+            .call_method(
+                "forEach",
+                vec![func(move |_, args| {
+                    assert_eq!(arg(&args, 1).to_u32(), 0);
+                    callback_calls.set(callback_calls.get() + 1);
+                    Value::Undefined
+                })],
+            );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(articles.iter().count(), 1);
+    }
+
+    #[test]
     fn tree_mutation_methods() {
         setup();
         let doc = document_value();
@@ -5214,6 +12491,58 @@ mod tests {
         let removed = body.call_method("removeChild", vec![a.clone()]);
         assert!(removed == a);
         assert_eq!(dom::children(body_id).len(), 0);
+    }
+
+    #[test]
+    fn document_import_adopt_and_named_node_map_are_live() {
+        setup();
+        let doc = document_value();
+        let body = doc.get_property("body");
+        let source = doc.call_method("createElement", vec![Value::string("section")]);
+        source.call_method(
+            "setAttribute",
+            vec![Value::string("data-route"), Value::string("inbox")],
+        );
+        source.call_method(
+            "appendChild",
+            vec![doc.call_method("createTextNode", vec![Value::string("message")])],
+        );
+        body.call_method("appendChild", vec![source.clone()]);
+
+        let attributes = source.get_property("attributes");
+        let first = attributes.call_method("item", vec![Value::Number(0.0)]);
+        assert_eq!(first.get_property("name").to_js_string(), "data-route");
+        assert_eq!(first.get_property("value").to_js_string(), "inbox");
+        assert_eq!(
+            attributes
+                .call_method("getNamedItem", vec![Value::string("data-route")])
+                .get_property("value")
+                .to_js_string(),
+            "inbox"
+        );
+        assert!(
+            attributes
+                .call_method("item", vec![Value::Number(1.0)])
+                .is_null()
+        );
+
+        let imported = doc.call_method("importNode", vec![source.clone(), Value::Bool(true)]);
+        assert!(imported != source);
+        assert!(imported.get_property("parentNode").is_null());
+        assert_eq!(
+            imported.get_property("textContent").to_js_string(),
+            "message"
+        );
+        assert_eq!(
+            imported
+                .call_method("getAttribute", vec![Value::string("data-route")])
+                .to_js_string(),
+            "inbox"
+        );
+
+        let adopted = doc.call_method("adoptNode", vec![source.clone()]);
+        assert!(adopted == source);
+        assert!(source.get_property("parentNode").is_null());
     }
 
     #[test]
@@ -5323,6 +12652,187 @@ mod tests {
     }
 
     #[test]
+    fn native_touch_dispatches_pointer_and_touch_lifecycles() {
+        setup();
+        let target = create_in_body("div");
+        let target_id = node_id_of(&target).unwrap();
+        let touch_log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let primary_log = Rc::new(RefCell::new(Vec::<bool>::new()));
+
+        let primary_for_handler = Rc::clone(&primary_log);
+        target.call_method(
+            "addEventListener",
+            vec![
+                Value::string("pointerdown"),
+                func(move |_, args| {
+                    primary_for_handler
+                        .borrow_mut()
+                        .push(args[0].get_property("isPrimary").to_bool());
+                    Value::Undefined
+                }),
+            ],
+        );
+        for event_type in ["touchstart", "touchmove", "touchend", "touchcancel"] {
+            let log = Rc::clone(&touch_log);
+            let expected_target = target.clone();
+            target.call_method(
+                "addEventListener",
+                vec![
+                    Value::string(event_type),
+                    func(move |_, args| {
+                        let event = args[0].clone();
+                        let touches = event.get_property("touches");
+                        let target_touches = event.get_property("targetTouches");
+                        let changed = event.get_property("changedTouches");
+                        let changed_touch = changed.call_method("item", vec![Value::Number(0.0)]);
+                        assert!(changed_touch.get_property("target") == expected_target);
+                        assert!(w3cos_core::class::instance_of(
+                            &changed_touch,
+                            &window_value().get_property("Touch")
+                        ));
+                        assert!(w3cos_core::class::instance_of(
+                            &event,
+                            &window_value().get_property("TouchEvent")
+                        ));
+                        for list in [&touches, &target_touches, &changed] {
+                            assert!(w3cos_core::class::instance_of(
+                                list,
+                                &window_value().get_property("TouchList")
+                            ));
+                        }
+                        assert!(event.get_property("isTrusted").to_bool());
+                        log.borrow_mut().push(format!(
+                            "{}:{}:{}:{}:{}:{}",
+                            event.get_property("type").to_js_string(),
+                            touches.get_property("length").to_number(),
+                            target_touches.get_property("length").to_number(),
+                            changed.get_property("length").to_number(),
+                            changed_touch.get_property("identifier").to_number(),
+                            event.get_property("cancelable").to_bool()
+                        ));
+                        if event.get_property("type").to_js_string() == "touchmove" {
+                            event.call_method("preventDefault", vec![]);
+                        }
+                        Value::Undefined
+                    }),
+                ],
+            );
+        }
+
+        assert!(!dispatch_native_pointer(
+            target_id, "down", 10.0, 20.0, 11, "touch", 0, 1, 0.5, true, false, false, false,
+            false,
+        ));
+        assert!(!dispatch_native_pointer(
+            target_id, "down", 30.0, 40.0, 12, "touch", 0, 1, 0.7, true, false, false, false,
+            false,
+        ));
+        assert!(dispatch_native_pointer(
+            target_id, "move", 15.0, 25.0, 11, "touch", -1, 1, 0.6, true, false, false, false,
+            false,
+        ));
+        assert!(!dispatch_native_pointer(
+            target_id, "up", 15.0, 25.0, 11, "touch", 0, 0, 0.0, true, false, false, false, false,
+        ));
+        assert!(!dispatch_native_pointer(
+            target_id, "cancel", 30.0, 40.0, 12, "touch", -1, 0, 0.0, true, false, false, false,
+            false,
+        ));
+
+        assert_eq!(primary_log.borrow().as_slice(), &[true, false]);
+        assert_eq!(
+            touch_log.borrow().as_slice(),
+            &[
+                "touchstart:1:1:1:11:true",
+                "touchstart:2:2:1:12:true",
+                "touchmove:2:2:1:11:true",
+                "touchend:1:1:1:11:true",
+                "touchcancel:0:0:1:12:false",
+            ]
+        );
+    }
+
+    #[test]
+    fn pointer_capture_retargets_until_implicit_release() {
+        setup();
+        let first = create_in_body("div");
+        let second = create_in_body("div");
+        let first_id = node_id_of(&first).unwrap();
+        let second_id = node_id_of(&second).unwrap();
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+
+        let down_log = Rc::clone(&log);
+        let first_for_down = first.clone();
+        first.call_method(
+            "addEventListener",
+            vec![
+                Value::string("pointerdown"),
+                func(move |_, args| {
+                    down_log.borrow_mut().push("down".to_string());
+                    first_for_down
+                        .call_method("setPointerCapture", vec![args[0].get_property("pointerId")]);
+                    assert!(
+                        first_for_down
+                            .call_method("hasPointerCapture", vec![Value::Number(41.0)])
+                            .to_bool()
+                    );
+                    Value::Undefined
+                }),
+            ],
+        );
+        for event_type in [
+            "gotpointercapture",
+            "pointermove",
+            "pointerup",
+            "lostpointercapture",
+        ] {
+            let event_log = Rc::clone(&log);
+            let expected_target = first.clone();
+            first.call_method(
+                "addEventListener",
+                vec![
+                    Value::string(event_type),
+                    func(move |_, args| {
+                        let event = args[0].clone();
+                        assert!(event.get_property("target") == expected_target);
+                        assert_eq!(event.get_property("pointerId").to_number(), 41.0);
+                        event_log
+                            .borrow_mut()
+                            .push(event.get_property("type").to_js_string());
+                        Value::Undefined
+                    }),
+                ],
+            );
+        }
+
+        assert!(!dispatch_native_pointer(
+            first_id, "down", 1.0, 2.0, 41, "pen", 0, 1, 0.5, true, false, false, false, false,
+        ));
+        assert!(!dispatch_native_pointer(
+            second_id, "move", 20.0, 30.0, 41, "pen", -1, 1, 0.6, true, false, false, false, false,
+        ));
+        assert!(!dispatch_native_pointer(
+            second_id, "up", 20.0, 30.0, 41, "pen", 0, 0, 0.0, true, false, false, false, false,
+        ));
+
+        assert!(
+            !first
+                .call_method("hasPointerCapture", vec![Value::Number(41.0)])
+                .to_bool()
+        );
+        assert_eq!(
+            log.borrow().as_slice(),
+            &[
+                "down",
+                "gotpointercapture",
+                "pointermove",
+                "pointerup",
+                "lostpointercapture",
+            ]
+        );
+    }
+
+    #[test]
     fn submit_button_dispatches_submit_on_ancestor_form() {
         setup();
         let doc = document_value();
@@ -5372,6 +12882,8 @@ mod tests {
                 Value::string("custom-event"),
                 func(move |_, args| {
                     let ev = arg(&args, 0);
+                    assert_eq!(ev.get_property("customMarker").to_js_string(), "preserved");
+                    ev.set_property("listenerMarker", Value::Bool(true));
                     log2.borrow_mut().push(format!(
                         "child:{}:{}",
                         ev.get_property("type").to_js_string(),
@@ -5410,9 +12922,13 @@ mod tests {
         ev_props.insert("type".to_string(), Value::string("custom-event"));
         ev_props.insert("detail".to_string(), Value::string("payload"));
         ev_props.insert("bubbles".to_string(), Value::Bool(true));
+        ev_props.insert("customMarker".to_string(), Value::string("preserved"));
         let ev = Value::object(ev_props);
-        let not_canceled = child.call_method("dispatchEvent", vec![ev]).to_bool();
+        let not_canceled = child
+            .call_method("dispatchEvent", vec![ev.clone()])
+            .to_bool();
         assert!(not_canceled);
+        assert!(ev.get_property("listenerMarker").to_bool());
         // Synchronous: child (target) then parent (bubble); stopPropagation on
         // parent prevents the document listener.
         assert_eq!(
@@ -5519,6 +13035,39 @@ mod tests {
     }
 
     #[test]
+    fn idle_callback_receives_deadline_and_can_be_cancelled() {
+        setup();
+        let window = window_value();
+        let calls = Rc::new(Cell::new(0));
+        let calls_for_callback = Rc::clone(&calls);
+        window.call_method(
+            "requestIdleCallback",
+            vec![
+                func(move |_, args| {
+                    let deadline = args[0].clone();
+                    assert!(w3cos_core::class::instance_of(
+                        &deadline,
+                        &window_value().get_property("IdleDeadline")
+                    ));
+                    assert!(deadline.get_property("didTimeout").to_bool());
+                    let remaining = deadline.call_method("timeRemaining", vec![]).to_number();
+                    assert!((0.0..=50.0).contains(&remaining));
+                    calls_for_callback.set(calls_for_callback.get() + 1);
+                    Value::Undefined
+                }),
+                Value::object(HashMap::from([("timeout".to_string(), Value::Number(0.0))])),
+            ],
+        );
+        let cancelled = window.call_method(
+            "requestIdleCallback",
+            vec![func(|_, _| panic!("cancelled idle callback must not run"))],
+        );
+        window.call_method("cancelIdleCallback", vec![cancelled]);
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
     fn set_interval_repeats_and_clears() {
         setup();
         let win = window_value();
@@ -5619,7 +13168,7 @@ mod tests {
     }
 
     #[test]
-    fn microtasks_and_thenables() {
+    fn microtasks_and_resolved_web_api_promises() {
         setup();
         let win = window_value();
         let order: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
@@ -5642,6 +13191,52 @@ mod tests {
         assert!(order.borrow().is_empty());
         assert_eq!(drain_microtasks(), 2);
         assert_eq!(order.borrow().as_slice(), &[1, 2]);
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let rejected = Rc::new(Cell::new(false));
+        let promise = resolved_thenable(Value::Number(7.0));
+        let rejected_for_handler = Rc::clone(&rejected);
+        let caught = promise.call_method(
+            "catch",
+            vec![func(move |_, _| {
+                rejected_for_handler.set(true);
+                Value::Undefined
+            })],
+        );
+        assert!(caught.is_object());
+        let log_for_then = Rc::clone(&log);
+        let chained = promise.call_method(
+            "then",
+            vec![func(move |_, args| {
+                let value = arg(&args, 0).to_number();
+                log_for_then.borrow_mut().push(value);
+                Value::Number(value + 1.0)
+            })],
+        );
+        assert!(chained.is_object());
+        let log_for_finally = Rc::clone(&log);
+        let finaled = chained.call_method(
+            "finally",
+            vec![func(move |_, _| {
+                log_for_finally.borrow_mut().push(99.0);
+                Value::Undefined
+            })],
+        );
+        let log_for_tail = Rc::clone(&log);
+        assert!(
+            finaled
+                .call_method(
+                    "then",
+                    vec![func(move |_, args| {
+                        log_for_tail.borrow_mut().push(arg(&args, 0).to_number());
+                        Value::Undefined
+                    })],
+                )
+                .is_object()
+        );
+        assert_eq!(drain_microtasks(), 4);
+        assert!(!rejected.get());
+        assert_eq!(log.borrow().as_slice(), &[7.0, 99.0, 8.0]);
     }
 
     #[test]
@@ -5662,27 +13257,461 @@ mod tests {
     }
 
     #[test]
+    fn mutation_observer_batches_dom_records_with_filters_and_old_values() {
+        setup();
+        let window = window_value();
+        let document = document_value();
+        let host = create_in_body("section");
+        let delivered = Rc::new(RefCell::new(Vec::<Value>::new()));
+        let delivered_for_callback = Rc::clone(&delivered);
+        let observer = w3cos_core::class::construct(
+            &window.get_property("MutationObserver"),
+            vec![func(move |_, args| {
+                delivered_for_callback
+                    .borrow_mut()
+                    .extend(arg(&args, 0).iter());
+                Value::Undefined
+            })],
+        );
+        observer.call_method(
+            "observe",
+            vec![
+                host.clone(),
+                Value::object(HashMap::from([
+                    ("attributes".to_string(), Value::Bool(true)),
+                    ("attributeOldValue".to_string(), Value::Bool(true)),
+                    (
+                        "attributeFilter".to_string(),
+                        js_array(vec![Value::string("data-x")]),
+                    ),
+                    ("childList".to_string(), Value::Bool(true)),
+                    ("characterData".to_string(), Value::Bool(true)),
+                    ("characterDataOldValue".to_string(), Value::Bool(true)),
+                    ("subtree".to_string(), Value::Bool(true)),
+                ])),
+            ],
+        );
+
+        host.call_method(
+            "setAttribute",
+            vec![Value::string("data-x"), Value::string("one")],
+        );
+        host.call_method(
+            "setAttribute",
+            vec![Value::string("data-y"), Value::string("ignored")],
+        );
+        let child = document.call_method("createElement", vec![Value::string("span")]);
+        host.call_method("appendChild", vec![child.clone()]);
+        let text = document.call_method("createTextNode", vec![Value::string("before")]);
+        child.call_method("appendChild", vec![text.clone()]);
+        text.set_property("textContent", Value::string("after"));
+
+        assert!(delivered.borrow().is_empty());
+        assert_eq!(drain_microtasks(), 1);
+        let records = delivered.borrow();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].get_property("type").to_js_string(), "attributes");
+        assert_eq!(
+            records[0].get_property("attributeName").to_js_string(),
+            "data-x"
+        );
+        assert!(records[0].get_property("oldValue").is_null());
+        assert_eq!(records[1].get_property("type").to_js_string(), "childList");
+        assert!(w3cos_core::class::instance_of(
+            &records[1].get_property("addedNodes"),
+            &window.get_property("NodeList")
+        ));
+        assert_eq!(
+            records[3].get_property("type").to_js_string(),
+            "characterData"
+        );
+        assert_eq!(records[3].get_property("oldValue").to_js_string(), "before");
+        drop(records);
+
+        host.call_method(
+            "setAttribute",
+            vec![Value::string("data-x"), Value::string("two")],
+        );
+        let pending = observer.call_method("takeRecords", vec![]);
+        assert_eq!(pending.get_property("length").to_u32(), 1);
+        assert_eq!(
+            pending
+                .get_property("0")
+                .get_property("oldValue")
+                .to_js_string(),
+            "one"
+        );
+        assert_eq!(drain_microtasks(), 1);
+        assert_eq!(delivered.borrow().len(), 4);
+
+        observer.call_method("disconnect", vec![]);
+        host.call_method(
+            "setAttribute",
+            vec![Value::string("data-x"), Value::string("three")],
+        );
+        assert_eq!(drain_microtasks(), 0);
+        assert_eq!(
+            observer
+                .call_method("takeRecords", vec![])
+                .get_property("length")
+                .to_u32(),
+            0
+        );
+    }
+
+    #[test]
+    fn tree_walker_and_node_iterator_follow_filters_and_live_dom() {
+        setup();
+        let window = window_value();
+        let document = document_value();
+        let node_filter = window.get_property("NodeFilter");
+        assert_eq!(node_filter.get_property("FILTER_ACCEPT").to_u32(), 1);
+        assert_eq!(node_filter.get_property("FILTER_REJECT").to_u32(), 2);
+        assert_eq!(node_filter.get_property("FILTER_SKIP").to_u32(), 3);
+
+        let host = create_in_body("section");
+        let skipped = document.call_method("createElement", vec![Value::string("div")]);
+        let span = document.call_method("createElement", vec![Value::string("span")]);
+        span.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("A")])],
+        );
+        skipped.call_method("appendChild", vec![span.clone()]);
+        host.call_method("appendChild", vec![skipped]);
+        let rejected = document.call_method("createElement", vec![Value::string("aside")]);
+        let hidden = document.call_method("createElement", vec![Value::string("b")]);
+        hidden.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("H")])],
+        );
+        rejected.call_method("appendChild", vec![hidden]);
+        host.call_method("appendChild", vec![rejected]);
+        let paragraph = document.call_method("createElement", vec![Value::string("p")]);
+        paragraph.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("B")])],
+        );
+        host.call_method("appendChild", vec![paragraph.clone()]);
+
+        let filter = func(|_, args| {
+            match arg(&args, 0)
+                .get_property("tagName")
+                .to_js_string()
+                .as_str()
+            {
+                "DIV" => Value::Number(3.0),
+                "ASIDE" => Value::Number(2.0),
+                _ => Value::Number(1.0),
+            }
+        });
+        let walker = document.call_method(
+            "createTreeWalker",
+            vec![
+                host.clone(),
+                node_filter.get_property("SHOW_ELEMENT"),
+                filter,
+            ],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &walker,
+            &window.get_property("TreeWalker")
+        ));
+        assert!(walker.get_property("root") == host);
+        assert!(walker.get_property("currentNode") == host);
+        assert!(walker.call_method("nextNode", vec![]) == span);
+        assert!(walker.call_method("nextNode", vec![]) == paragraph);
+        assert!(walker.call_method("nextNode", vec![]).is_null());
+        walker.set_property("currentNode", host.clone());
+        assert!(walker.call_method("firstChild", vec![]) == span);
+        walker.set_property("currentNode", host.clone());
+        assert!(walker.call_method("lastChild", vec![]) == paragraph);
+
+        let iterator = document.call_method(
+            "createNodeIterator",
+            vec![
+                host.clone(),
+                node_filter.get_property("SHOW_TEXT"),
+                Value::Null,
+            ],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &iterator,
+            &window.get_property("NodeIterator")
+        ));
+        assert_eq!(
+            iterator
+                .call_method("nextNode", vec![])
+                .get_property("textContent")
+                .to_js_string(),
+            "A"
+        );
+        assert_eq!(
+            iterator
+                .call_method("nextNode", vec![])
+                .get_property("textContent")
+                .to_js_string(),
+            "H"
+        );
+        let text_b = iterator.call_method("nextNode", vec![]);
+        assert_eq!(text_b.get_property("textContent").to_js_string(), "B");
+        assert!(iterator.call_method("previousNode", vec![]) == text_b);
+        assert!(iterator.call_method("nextNode", vec![]) == text_b);
+
+        paragraph.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("C")])],
+        );
+        assert_eq!(
+            iterator
+                .call_method("nextNode", vec![])
+                .get_property("textContent")
+                .to_js_string(),
+            "C"
+        );
+        let tail_text = document.call_method("createTextNode", vec![Value::string("D")]);
+        host.call_method("appendChild", vec![tail_text.clone()]);
+        assert_eq!(
+            iterator
+                .call_method("previousNode", vec![])
+                .get_property("textContent")
+                .to_js_string(),
+            "C"
+        );
+        host.call_method("removeChild", vec![paragraph]);
+        assert!(iterator.call_method("nextNode", vec![]) == tail_text);
+
+        let document_iterator = document.call_method(
+            "createNodeIterator",
+            vec![document.clone(), node_filter.get_property("SHOW_DOCUMENT")],
+        );
+        assert!(document_iterator.get_property("root") == document);
+        assert!(document_iterator.call_method("nextNode", vec![]) == document);
+    }
+
+    #[test]
+    fn performance_timeline_and_observer_deliver_entries() {
+        setup();
+        let window = window_value();
+        let performance = window.get_property("performance");
+        let observer_log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log = Rc::clone(&observer_log);
+        let observer = w3cos_core::class::construct(
+            &window.get_property("PerformanceObserver"),
+            vec![func(move |_, args| {
+                let list = args[0].clone();
+                let entries = list.call_method("getEntries", vec![]);
+                log.borrow_mut().push(format!(
+                    "{}:{}:{}",
+                    entries.get_property("length").to_number(),
+                    list.call_method("getEntriesByType", vec![Value::string("mark")])
+                        .get_property("length")
+                        .to_number(),
+                    list.call_method("getEntriesByName", vec![Value::string("span")])
+                        .get_property("length")
+                        .to_number()
+                ));
+                Value::Undefined
+            })],
+        );
+        observer.call_method(
+            "observe",
+            vec![Value::object(HashMap::from([(
+                "entryTypes".to_string(),
+                js_array(vec![Value::string("mark"), Value::string("measure")]),
+            )]))],
+        );
+
+        let detail = Value::object(HashMap::from([("id".to_string(), Value::Number(7.0))]));
+        let start = performance.call_method(
+            "mark",
+            vec![
+                Value::string("start"),
+                Value::object(HashMap::from([
+                    ("startTime".to_string(), Value::Number(5.0)),
+                    ("detail".to_string(), detail.clone()),
+                ])),
+            ],
+        );
+        performance.call_method(
+            "mark",
+            vec![
+                Value::string("end"),
+                Value::object(HashMap::from([(
+                    "startTime".to_string(),
+                    Value::Number(12.0),
+                )])),
+            ],
+        );
+        let measure = performance.call_method(
+            "measure",
+            vec![
+                Value::string("span"),
+                Value::string("start"),
+                Value::string("end"),
+            ],
+        );
+        assert_eq!(start.get_property("entryType").to_js_string(), "mark");
+        assert!(!(start.get_property("detail") == detail));
+        assert_eq!(
+            start.get_property("detail").get_property("id").to_number(),
+            7.0
+        );
+        assert_eq!(measure.get_property("startTime").to_number(), 5.0);
+        assert_eq!(measure.get_property("duration").to_number(), 7.0);
+        assert!(observer_log.borrow().is_empty());
+        assert_eq!(
+            performance
+                .call_method("getEntries", vec![])
+                .get_property("length")
+                .to_number(),
+            3.0
+        );
+
+        assert_eq!(drain_microtasks(), 1);
+        assert_eq!(observer_log.borrow().as_slice(), &["3:2:1"]);
+        assert_eq!(
+            observer
+                .call_method("takeRecords", vec![])
+                .get_property("length")
+                .to_number(),
+            0.0
+        );
+
+        let buffered_count = Rc::new(Cell::new(0));
+        let buffered_for_callback = Rc::clone(&buffered_count);
+        let buffered_observer = w3cos_core::class::construct(
+            &window.get_property("PerformanceObserver"),
+            vec![func(move |_, args| {
+                buffered_for_callback.set(
+                    args[0]
+                        .call_method("getEntries", vec![])
+                        .get_property("length")
+                        .to_u32(),
+                );
+                Value::Undefined
+            })],
+        );
+        buffered_observer.call_method(
+            "observe",
+            vec![Value::object(HashMap::from([
+                ("type".to_string(), Value::string("measure")),
+                ("buffered".to_string(), Value::Bool(true)),
+            ]))],
+        );
+        assert_eq!(drain_microtasks(), 1);
+        assert_eq!(buffered_count.get(), 1);
+
+        performance.call_method("clearMarks", vec![Value::string("start")]);
+        assert_eq!(
+            performance
+                .call_method("getEntriesByType", vec![Value::string("mark")])
+                .get_property("length")
+                .to_number(),
+            1.0
+        );
+        performance.call_method("clearMeasures", vec![]);
+        assert_eq!(
+            performance
+                .call_method("getEntriesByType", vec![Value::string("measure")])
+                .get_property("length")
+                .to_number(),
+            0.0
+        );
+    }
+
+    #[test]
     fn window_viewport_and_match_media() {
         setup();
         let win = window_value();
+        let visual_viewport = win.get_property("visualViewport");
+        assert!(w3cos_core::class::instance_of(
+            &visual_viewport,
+            &win.get_property("VisualViewport")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &visual_viewport,
+            &win.get_property("EventTarget")
+        ));
+        let resize_count = Rc::new(Cell::new(0));
+        let resize_count_for_handler = Rc::clone(&resize_count);
+        visual_viewport.call_method(
+            "addEventListener",
+            vec![
+                Value::string("resize"),
+                Value::function(move |_, _| {
+                    resize_count_for_handler.set(resize_count_for_handler.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
         assert_eq!(win.get_property("innerWidth").to_number(), 1024.0);
         assert_eq!(win.get_property("innerHeight").to_number(), 768.0);
+        assert_eq!(visual_viewport.get_property("width").to_number(), 1024.0);
+        assert_eq!(visual_viewport.get_property("height").to_number(), 768.0);
+        assert!(visual_viewport.get_property("onresize").is_null());
         assert_eq!(win.get_property("devicePixelRatio").to_number(), 1.0);
         set_viewport(1440.0, 900.0);
         set_device_pixel_ratio(2.0);
         assert_eq!(win.get_property("innerWidth").to_number(), 1440.0);
+        assert_eq!(win.get_property("innerHeight").to_number(), 900.0);
+        assert_eq!(visual_viewport.get_property("width").to_number(), 1440.0);
+        assert_eq!(visual_viewport.get_property("height").to_number(), 900.0);
+        assert_eq!(resize_count.get(), 1);
         assert_eq!(win.get_property("devicePixelRatio").to_number(), 2.0);
 
         let mql = win.call_method("matchMedia", vec![Value::string("(min-width: 600px)")]);
         assert!(mql.get_property("matches").to_bool());
+        assert!(w3cos_core::class::instance_of(
+            &mql,
+            &win.get_property("MediaQueryList")
+        ));
+        let mql_prototype = win.get_property("MediaQueryList").get_property("prototype");
+        assert!(mql_prototype.get_property("addListener").is_function());
+        assert!(mql_prototype.get_property("removeListener").is_function());
+        for property in ["matches", "media", "onchange"] {
+            assert!(mql_prototype.get_property(property).is_undefined());
+        }
         let mql2 = win.call_method("matchMedia", vec![Value::string("(max-width: 600px)")]);
         assert!(!mql2.get_property("matches").to_bool());
+        let changes = Rc::new(Cell::new(0));
+        let changes_for_listener = Rc::clone(&changes);
+        mql.call_method(
+            "addListener",
+            vec![func(move |_, args| {
+                let event = arg(&args, 0);
+                assert!(!event.get_property("matches").to_bool());
+                assert_eq!(
+                    event.get_property("media").to_js_string(),
+                    "(min-width: 600px)"
+                );
+                assert!(w3cos_core::class::instance_of(
+                    &event,
+                    &window_value().get_property("MediaQueryListEvent")
+                ));
+                changes_for_listener.set(changes_for_listener.get() + 1);
+                Value::Undefined
+            })],
+        );
+        set_viewport(500.0, 900.0);
+        assert!(!mql.get_property("matches").to_bool());
+        assert!(mql2.get_property("matches").to_bool());
+        assert_eq!(changes.get(), 1);
     }
 
     #[test]
     fn window_document_and_self_references() {
         setup();
         let win = window_value();
+        assert!(w3cos_core::class::instance_of(
+            &win,
+            &win.get_property("Window")
+        ));
+        assert_eq!(
+            win.get_property("Window")
+                .get_property("PERSISTENT")
+                .to_u32(),
+            1
+        );
         let doc = win.get_property("document");
         assert!(doc == document_value());
         assert!(win.get_property("self") == win);
@@ -5690,6 +13719,11 @@ mod tests {
         assert!(doc.get_property("defaultView") == win);
         let nav = win.get_property("navigator");
         assert_eq!(nav.get_property("maxTouchPoints").to_number(), 0.0);
+        set_max_touch_points(5);
+        assert_eq!(nav.get_property("maxTouchPoints").to_number(), 5.0);
+        set_max_touch_points(2);
+        assert_eq!(nav.get_property("maxTouchPoints").to_number(), 2.0);
+        set_max_touch_points(0);
         assert_eq!(nav.get_property("language").to_js_string(), "en-US");
         let loc = win.get_property("location");
         assert_eq!(loc.get_property("href").to_js_string(), "w3cos://app/");
@@ -5718,6 +13752,357 @@ mod tests {
     }
 
     #[test]
+    fn dom_parser_and_xml_serializer_create_queryable_documents() {
+        setup();
+        let window = window_value();
+        let parser = w3cos_core::class::construct(&window.get_property("DOMParser"), vec![]);
+        assert!(w3cos_core::class::instance_of(
+            &parser,
+            &window.get_property("DOMParser")
+        ));
+        let html = parser.call_method(
+            "parseFromString",
+            vec![
+                Value::string(
+                    "<title>Inbox</title><main><article id='message'>Hello &amp; bye</article></main>",
+                ),
+                Value::string("text/html"),
+            ],
+        );
+        assert_eq!(html.get_property("nodeType").to_number(), 9.0);
+        assert_eq!(
+            html.call_method("querySelector", vec![Value::string("#message")])
+                .get_property("textContent")
+                .to_js_string(),
+            "Hello & bye"
+        );
+        assert_eq!(
+            html.get_property("documentElement")
+                .get_property("tagName")
+                .to_js_string(),
+            "HTML"
+        );
+
+        let xml = parser.call_method(
+            "parseFromString",
+            vec![
+                Value::string("<root id='r'><item>value</item></root>"),
+                Value::string("application/xml"),
+            ],
+        );
+        assert_eq!(
+            xml.get_property("documentElement")
+                .get_property("tagName")
+                .to_js_string(),
+            "ROOT"
+        );
+        assert_eq!(
+            xml.call_method("getElementById", vec![Value::string("r")])
+                .get_property("tagName")
+                .to_js_string(),
+            "ROOT"
+        );
+        let serializer =
+            w3cos_core::class::construct(&window.get_property("XMLSerializer"), vec![]);
+        assert!(w3cos_core::class::instance_of(
+            &serializer,
+            &window.get_property("XMLSerializer")
+        ));
+        assert_eq!(
+            serializer
+                .call_method("serializeToString", vec![xml])
+                .to_js_string(),
+            "<root id=\"r\"><item>value</item></root>"
+        );
+    }
+
+    #[test]
+    fn css_font_loading_api_registers_and_tracks_faces() {
+        setup();
+        let window = window_value();
+        let document = document_value();
+        let fonts = document.get_property("fonts");
+        let face = w3cos_core::class::construct(
+            &window.get_property("FontFace"),
+            vec![
+                Value::string("W3cosFixture"),
+                w3cos_core::binary::array_buffer_value(vec![0, 1, 2, 3]),
+                Value::object(HashMap::from([
+                    ("weight".to_string(), Value::string("700")),
+                    ("style".to_string(), Value::string("italic")),
+                    ("display".to_string(), Value::string("swap")),
+                ])),
+            ],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &face,
+            &window.get_property("FontFace")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &fonts,
+            &window.get_property("FontFaceSet")
+        ));
+        assert_eq!(face.get_property("status").to_js_string(), "unloaded");
+        assert!(
+            !fonts
+                .call_method("check", vec![Value::string("italic 700 12px W3cosFixture")])
+                .to_bool()
+        );
+
+        let returned = fonts.call_method("add", vec![face.clone()]);
+        assert!(returned == fonts);
+        assert_eq!(fonts.get_property("size").to_number(), 1.0);
+        assert!(fonts.call_method("has", vec![face.clone()]).to_bool());
+        assert_eq!(
+            fonts
+                .call_method("values", vec![])
+                .get_property("length")
+                .to_number(),
+            1.0
+        );
+
+        let loaded = Rc::new(Cell::new(false));
+        let loaded_for_callback = Rc::clone(&loaded);
+        face.call_method("load", vec![]).call_method(
+            "then",
+            vec![func(move |_, args| {
+                loaded_for_callback.set(args[0].get_property("status").to_js_string() == "loaded");
+                Value::Undefined
+            })],
+        );
+        drain_microtasks();
+        assert!(loaded.get());
+        assert_eq!(face.get_property("status").to_js_string(), "loaded");
+        assert!(
+            fonts
+                .call_method("check", vec![Value::string("italic 700 12px W3cosFixture")])
+                .to_bool()
+        );
+        let promise_checks = Rc::new(Cell::new(0));
+        let loaded_check = Rc::clone(&promise_checks);
+        face.get_property("loaded").call_method(
+            "then",
+            vec![func(move |_, args| {
+                assert_eq!(args[0].get_property("status").to_js_string(), "loaded");
+                loaded_check.set(loaded_check.get() + 1);
+                Value::Undefined
+            })],
+        );
+        let set_load_check = Rc::clone(&promise_checks);
+        fonts
+            .call_method("load", vec![Value::string("italic 700 12px W3cosFixture")])
+            .call_method(
+                "then",
+                vec![func(move |_, args| {
+                    assert_eq!(args[0].get_property("length").to_number(), 1.0);
+                    set_load_check.set(set_load_check.get() + 1);
+                    Value::Undefined
+                })],
+            );
+        let ready_check = Rc::clone(&promise_checks);
+        fonts.get_property("ready").call_method(
+            "then",
+            vec![func(move |_, args| {
+                assert!(w3cos_core::class::instance_of(
+                    &args[0],
+                    &window_value().get_property("FontFaceSet")
+                ));
+                ready_check.set(ready_check.get() + 1);
+                Value::Undefined
+            })],
+        );
+        drain_microtasks();
+        assert_eq!(promise_checks.get(), 3);
+
+        assert!(fonts.call_method("delete", vec![face.clone()]).to_bool());
+        assert_eq!(fonts.get_property("size").to_number(), 0.0);
+        assert!(
+            !fonts
+                .call_method("check", vec![Value::string("italic 700 12px W3cosFixture")])
+                .to_bool()
+        );
+    }
+
+    #[test]
+    fn constraint_validation_exposes_live_state_and_invalid_events() {
+        setup();
+        let document = document_value();
+        let form = document.call_method("createElement", vec![Value::string("form")]);
+        let input = document.call_method("createElement", vec![Value::string("input")]);
+        input.set_property("required", Value::Bool(true));
+        form.call_method("appendChild", vec![input.clone()]);
+        let validity = input.get_property("validity");
+        assert!(w3cos_core::class::instance_of(
+            &validity,
+            &window_value().get_property("ValidityState")
+        ));
+        assert!(input.get_property("willValidate").to_bool());
+        assert!(validity.get_property("valueMissing").to_bool());
+        assert!(!validity.get_property("valid").to_bool());
+
+        let invalid_events = Rc::new(Cell::new(0));
+        let invalid_events_for_listener = Rc::clone(&invalid_events);
+        input.call_method(
+            "addEventListener",
+            vec![
+                Value::string("invalid"),
+                func(move |_, _| {
+                    invalid_events_for_listener.set(invalid_events_for_listener.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        assert!(!form.call_method("checkValidity", vec![]).to_bool());
+        assert_eq!(invalid_events.get(), 1);
+
+        input.set_property("value", Value::string("ready"));
+        assert!(validity.get_property("valid").to_bool());
+        assert!(form.call_method("checkValidity", vec![]).to_bool());
+        input.call_method("setCustomValidity", vec![Value::string("blocked")]);
+        assert!(validity.get_property("customError").to_bool());
+        assert_eq!(
+            input.get_property("validationMessage").to_js_string(),
+            "blocked"
+        );
+        input.call_method("setCustomValidity", vec![Value::string("")]);
+        assert!(validity.get_property("valid").to_bool());
+
+        input.set_property("type", Value::string("number"));
+        input.set_property("min", Value::string("2"));
+        input.set_property("max", Value::string("8"));
+        input.set_property("step", Value::string("2"));
+        input.set_property("value", Value::string("5"));
+        assert!(validity.get_property("stepMismatch").to_bool());
+        input.set_property("value", Value::string("9"));
+        assert!(validity.get_property("rangeOverflow").to_bool());
+    }
+
+    #[test]
+    fn legacy_dom_error_and_crypto_key_have_standard_identities() {
+        setup();
+        let window = window_value();
+        let dom_error = w3cos_core::class::construct(
+            &window.get_property("DOMError"),
+            vec![Value::string("LegacyError"), Value::string("details")],
+        );
+        assert_eq!(dom_error.get_property("name").to_js_string(), "LegacyError");
+        assert_eq!(dom_error.get_property("message").to_js_string(), "details");
+        for property in ["algorithm", "extractable", "type", "usages"] {
+            assert!(
+                window
+                    .get_property("CryptoKey")
+                    .get_property("prototype")
+                    .get_property(property)
+                    .is_undefined()
+            );
+        }
+    }
+
+    #[test]
+    fn caret_position_uses_layout_hit_testing_and_text_offsets() {
+        setup();
+        let document = document_value();
+        let div = document.call_method("createElement", vec![Value::string("div")]);
+        let text = document.call_method("createTextNode", vec![Value::string("abcd")]);
+        div.call_method("appendChild", vec![text.clone()]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![div.clone()]);
+        let rect = w3cos_dom::DOMRect::new(0.0, 0.0, 100.0, 20.0);
+        let layout_nodes = [
+            document.get_property("documentElement"),
+            document.get_property("body"),
+            div.clone(),
+            text.clone(),
+        ]
+        .map(|value| NodeId::from_u32(node_id_of(&value).unwrap()));
+        dom::with_document_mut(|tree| {
+            for node in layout_nodes {
+                tree.set_layout_rect(node, rect);
+            }
+        });
+        let caret = document.call_method(
+            "caretPositionFromPoint",
+            vec![Value::Number(50.0), Value::Number(10.0)],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &caret,
+            &caret_position_class()
+        ));
+        assert!(caret.get_property("offsetNode") == text);
+        assert_eq!(caret.get_property("offset").to_number(), 2.0);
+        assert_eq!(
+            caret
+                .call_method("getClientRect", vec![])
+                .get_property("width")
+                .to_number(),
+            100.0
+        );
+    }
+
+    #[test]
+    fn element_animate_is_visible_through_element_and_document_queries() {
+        setup();
+        let document = document_value();
+        let element = document.call_method("createElement", vec![Value::string("div")]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![element.clone()]);
+        let animation = element.call_method(
+            "animate",
+            vec![
+                Value::array(vec![
+                    Value::object(HashMap::from([("opacity".into(), Value::Number(0.0))])),
+                    Value::object(HashMap::from([("opacity".into(), Value::Number(1.0))])),
+                ]),
+                Value::Number(200.0),
+            ],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &animation,
+            &window_value().get_property("Animation")
+        ));
+        assert_eq!(
+            animation.get_property("playState").to_js_string(),
+            "running"
+        );
+        assert_eq!(
+            element
+                .call_method("getAnimations", Vec::new())
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        assert_eq!(
+            document
+                .call_method("getAnimations", Vec::new())
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+    }
+
+    #[test]
+    fn mathml_namespace_creates_mathml_element_instances() {
+        setup();
+        let element = document_value().call_method(
+            "createElementNS",
+            vec![
+                Value::string("http://www.w3.org/1998/Math/MathML"),
+                Value::string("math"),
+            ],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &element,
+            &window_value().get_property("MathMLElement")
+        ));
+        assert_eq!(
+            element.get_property("namespaceURI").to_js_string(),
+            "http://www.w3.org/1998/Math/MathML"
+        );
+    }
+
+    #[test]
     fn canvas_2d_context() {
         setup();
         let doc = document_value();
@@ -5735,9 +14120,26 @@ mod tests {
 
         let ctx = canvas.call_method("getContext", vec![Value::string("2d")]);
         assert!(ctx.is_object() || ctx.is_function());
+        assert!(w3cos_core::class::instance_of(
+            &ctx,
+            &crate::canvas_web::canvas_rendering_context_2d_class()
+        ));
         assert!(ctx == canvas.call_method("getContext", vec![Value::string("2d")]));
         ctx.set_property("fillStyle", Value::string("#ff0000"));
         assert_eq!(ctx.get_property("fillStyle").to_js_string(), "#ff0000");
+        ctx.call_method(
+            "setLineDash",
+            vec![js_array(vec![Value::Number(3.0), Value::Number(2.0)])],
+        );
+        assert_eq!(
+            ctx.call_method("getLineDash", vec![])
+                .iter()
+                .map(|value| value.to_number())
+                .collect::<Vec<_>>(),
+            vec![3.0, 2.0]
+        );
+        ctx.set_property("lineDashOffset", Value::Number(1.5));
+        assert_eq!(ctx.get_property("lineDashOffset").to_number(), 1.5);
         ctx.call_method(
             "fillRect",
             vec![
@@ -5749,6 +14151,67 @@ mod tests {
         );
         let metrics = ctx.call_method("measureText", vec![Value::string("hello")]);
         assert!(metrics.get_property("width").to_number() >= 0.0);
+        assert!(w3cos_core::class::instance_of(
+            &metrics,
+            &crate::canvas_web::text_metrics_class()
+        ));
+        let gradient = ctx.call_method(
+            "createLinearGradient",
+            vec![
+                Value::Number(0.0),
+                Value::Number(0.0),
+                Value::Number(10.0),
+                Value::Number(10.0),
+            ],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &gradient,
+            &crate::canvas_web::canvas_gradient_class()
+        ));
+        gradient.call_method(
+            "addColorStop",
+            vec![Value::Number(0.5), Value::string("#f00")],
+        );
+        ctx.set_property("fillStyle", gradient);
+        let pattern = ctx.call_method(
+            "createPattern",
+            vec![canvas.clone(), Value::string("repeat-x")],
+        );
+        assert!(w3cos_core::class::instance_of(
+            &pattern,
+            &crate::canvas_web::canvas_pattern_class()
+        ));
+        let offscreen = w3cos_core::class::construct(
+            &crate::canvas_web::offscreen_canvas_class(),
+            vec![Value::Number(4.0), Value::Number(3.0)],
+        );
+        let bitmap = offscreen.call_method("transferToImageBitmap", vec![]);
+        assert!(w3cos_core::class::instance_of(
+            &bitmap,
+            &crate::canvas_web::image_bitmap_class()
+        ));
+        assert_eq!(bitmap.get_property("width").to_number(), 4.0);
+        let bitmap_context =
+            canvas.call_method("getContext", vec![Value::string("bitmaprenderer")]);
+        assert!(w3cos_core::class::instance_of(
+            &bitmap_context,
+            &crate::canvas_web::image_bitmap_rendering_context_class()
+        ));
+        bitmap_context.call_method("transferFromImageBitmap", vec![bitmap.clone()]);
+        assert!(bitmap.get_property("__w3cos_closed").to_bool());
+        let capture = canvas.call_method("captureStream", vec![Value::Number(30.0)]);
+        let capture_track = capture
+            .call_method("getVideoTracks", vec![])
+            .get_property("0");
+        assert!(w3cos_core::class::instance_of(
+            &capture_track,
+            &crate::canvas_web::canvas_capture_media_stream_track_class()
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &capture_track,
+            &crate::media_devices_web::media_stream_track_class()
+        ));
+        assert!(capture_track.get_property("canvas") == canvas);
         let img = ctx.call_method(
             "getImageData",
             vec![
@@ -5763,12 +14226,93 @@ mod tests {
             img.get_property("data").get_property("length").to_number(),
             400.0
         );
-        // Non-2d contexts are unsupported.
-        assert!(
-            canvas
-                .call_method("getContext", vec![Value::string("webgl")])
-                .is_null()
+
+        let source = doc.call_method("createElement", vec![Value::string("canvas")]);
+        source.set_property("width", Value::Number(2.0));
+        source.set_property("height", Value::Number(1.0));
+        let source_ctx = source.call_method("getContext", vec![Value::string("2d")]);
+        source_ctx.set_property("fillStyle", Value::string("#ff0000"));
+        source_ctx.call_method(
+            "fillRect",
+            vec![
+                Value::Number(0.0),
+                Value::Number(0.0),
+                Value::Number(1.0),
+                Value::Number(1.0),
+            ],
         );
+        source_ctx.set_property("fillStyle", Value::string("#0000ff"));
+        source_ctx.call_method(
+            "fillRect",
+            vec![
+                Value::Number(1.0),
+                Value::Number(0.0),
+                Value::Number(1.0),
+                Value::Number(1.0),
+            ],
+        );
+        ctx.call_method(
+            "drawImage",
+            vec![
+                source.clone(),
+                Value::Number(60.0),
+                Value::Number(0.0),
+                Value::Number(20.0),
+                Value::Number(10.0),
+            ],
+        );
+        let scaled = ctx.call_method(
+            "getImageData",
+            vec![
+                Value::Number(60.0),
+                Value::Number(0.0),
+                Value::Number(20.0),
+                Value::Number(1.0),
+            ],
+        );
+        let scaled_bytes: Vec<u32> = scaled
+            .get_property("data")
+            .iter()
+            .map(|value| value.to_u32())
+            .collect();
+        assert_eq!(&scaled_bytes[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&scaled_bytes[76..80], &[0, 0, 255, 255]);
+
+        ctx.call_method(
+            "drawImage",
+            vec![
+                source,
+                Value::Number(1.0),
+                Value::Number(0.0),
+                Value::Number(1.0),
+                Value::Number(1.0),
+                Value::Number(80.0),
+                Value::Number(0.0),
+                Value::Number(5.0),
+                Value::Number(5.0),
+            ],
+        );
+        let cropped = ctx.call_method(
+            "getImageData",
+            vec![
+                Value::Number(80.0),
+                Value::Number(0.0),
+                Value::Number(1.0),
+                Value::Number(1.0),
+            ],
+        );
+        let cropped_bytes: Vec<u32> = cropped
+            .get_property("data")
+            .iter()
+            .map(|value| value.to_u32())
+            .collect();
+        assert_eq!(cropped_bytes, [0, 0, 255, 255]);
+
+        let webgl = canvas.call_method("getContext", vec![Value::string("webgl")]);
+        assert!(w3cos_core::class::instance_of(
+            &webgl,
+            &crate::webgl_web::class_for("WebGLRenderingContext")
+        ));
     }
 
     #[test]
@@ -5798,6 +14342,103 @@ mod tests {
         let r0 = sel.call_method("getRangeAt", vec![Value::Number(0.0)]);
         assert_eq!(r0.get_property("startOffset").to_number(), 0.0);
         sel.call_method("removeAllRanges", vec![]);
+    }
+
+    #[test]
+    fn range_fragments_insert_and_surround_preserve_dom_nodes() {
+        setup();
+        let window = window_value();
+        let document = document_value();
+        let container = create_in_body("div");
+        let text = document.call_method("createTextNode", vec![Value::string("hello world")]);
+        container.call_method("appendChild", vec![text.clone()]);
+        let range = document.call_method("createRange", vec![]);
+        range.call_method("setStart", vec![text.clone(), Value::Number(0.0)]);
+        range.call_method("setEnd", vec![text.clone(), Value::Number(5.0)]);
+
+        let cloned = range.call_method("cloneContents", vec![]);
+        assert!(w3cos_core::class::instance_of(
+            &cloned,
+            &window.get_property("DocumentFragment")
+        ));
+        assert_eq!(cloned.get_property("textContent").to_js_string(), "hello");
+        assert_eq!(
+            text.get_property("textContent").to_js_string(),
+            "hello world"
+        );
+
+        let extracted = range.call_method("extractContents", vec![]);
+        assert_eq!(
+            extracted.get_property("textContent").to_js_string(),
+            "hello"
+        );
+        assert_eq!(text.get_property("textContent").to_js_string(), " world");
+        assert!(range.get_property("collapsed").to_bool());
+
+        let emphasis = document.call_method("createElement", vec![Value::string("em")]);
+        emphasis.set_property("textContent", Value::string("X"));
+        range.call_method("insertNode", vec![emphasis]);
+        assert_eq!(
+            container.get_property("textContent").to_js_string(),
+            "X world"
+        );
+
+        let host = create_in_body("section");
+        host.set_property("innerHTML", Value::string("<span>A</span><span>B</span>"));
+        let surround = document.call_method("createRange", vec![]);
+        surround.call_method("setStart", vec![host.clone(), Value::Number(0.0)]);
+        surround.call_method("setEnd", vec![host.clone(), Value::Number(2.0)]);
+        let first = host
+            .get_property("children")
+            .call_method("item", vec![Value::Number(0.0)]);
+        let second = host
+            .get_property("children")
+            .call_method("item", vec![Value::Number(1.0)]);
+        dom::with_document_mut(|doc| {
+            doc.set_layout_rect(
+                NodeId::from_u32(node_id_of(&first).unwrap()),
+                w3cos_dom::DOMRect::new(10.0, 20.0, 40.0, 10.0),
+            );
+            doc.set_layout_rect(
+                NodeId::from_u32(node_id_of(&second).unwrap()),
+                w3cos_dom::DOMRect::new(50.0, 25.0, 50.0, 25.0),
+            );
+        });
+        let client_rects = surround.call_method("getClientRects", vec![]);
+        assert_eq!(client_rects.get_property("length").to_u32(), 2);
+        assert!(w3cos_core::class::instance_of(
+            &client_rects,
+            &crate::geometry_web::class("DOMRectList")
+        ));
+        let bounds = surround.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("x").to_number(), 10.0);
+        assert_eq!(bounds.get_property("y").to_number(), 20.0);
+        assert_eq!(bounds.get_property("width").to_number(), 90.0);
+        assert_eq!(bounds.get_property("height").to_number(), 30.0);
+        let wrapper = document.call_method("createElement", vec![Value::string("strong")]);
+        surround.call_method("surroundContents", vec![wrapper.clone()]);
+        assert_eq!(
+            wrapper
+                .get_property("children")
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+        assert!(surround.get_property("startContainer") == host);
+        assert_eq!(surround.get_property("startOffset").to_u32(), 0);
+        assert_eq!(surround.get_property("endOffset").to_u32(), 1);
+
+        let contextual = surround.call_method(
+            "createContextualFragment",
+            vec![Value::string("<i>context</i>")],
+        );
+        assert_eq!(
+            contextual
+                .call_method("querySelector", vec![Value::string("i")])
+                .get_property("textContent")
+                .to_js_string(),
+            "context"
+        );
     }
 
     fn win_selection() -> Value {
@@ -5886,6 +14527,65 @@ mod tests {
     }
 
     #[test]
+    fn text_control_selection_and_set_range_text_follow_utf16_rules() {
+        setup();
+        let input = create_in_body("textarea");
+        input.set_property("value", Value::string("a😀cd"));
+
+        input.call_method(
+            "setSelectionRange",
+            vec![
+                Value::Number(1.0),
+                Value::Number(3.0),
+                Value::string("backward"),
+            ],
+        );
+        assert_eq!(input.get_property("selectionStart").to_number(), 1.0);
+        assert_eq!(input.get_property("selectionEnd").to_number(), 3.0);
+        assert_eq!(
+            input.get_property("selectionDirection").to_js_string(),
+            "backward"
+        );
+
+        input.call_method("setRangeText", vec![Value::string("XY")]);
+        assert_eq!(input.get_property("value").to_js_string(), "aXYcd");
+        assert_eq!(input.get_property("selectionStart").to_number(), 1.0);
+        assert_eq!(input.get_property("selectionEnd").to_number(), 3.0);
+        assert_eq!(
+            input.get_property("selectionDirection").to_js_string(),
+            "backward"
+        );
+
+        input.call_method(
+            "setRangeText",
+            vec![
+                Value::string("Z"),
+                Value::Number(1.0),
+                Value::Number(3.0),
+                Value::string("select"),
+            ],
+        );
+        assert_eq!(input.get_property("value").to_js_string(), "aZcd");
+        assert_eq!(input.get_property("selectionStart").to_number(), 1.0);
+        assert_eq!(input.get_property("selectionEnd").to_number(), 2.0);
+
+        input.call_method("select", vec![]);
+        assert_eq!(input.get_property("selectionStart").to_number(), 0.0);
+        assert_eq!(input.get_property("selectionEnd").to_number(), 4.0);
+
+        input.call_method(
+            "setSelectionRange",
+            vec![Value::Number(4.0), Value::Number(2.0)],
+        );
+        assert_eq!(input.get_property("selectionStart").to_number(), 2.0);
+        assert_eq!(input.get_property("selectionEnd").to_number(), 2.0);
+        assert_eq!(
+            input.get_property("selectionDirection").to_js_string(),
+            "none"
+        );
+    }
+
+    #[test]
     fn local_storage_roundtrip() {
         setup();
         let win = window_value();
@@ -5943,5 +14643,50 @@ mod tests {
         div.set_property("scrollLeft", Value::Number(7.0));
         assert_eq!(div.get_property("scrollTop").to_number(), 33.0);
         assert_eq!(div.get_property("scrollLeft").to_number(), 7.0);
+    }
+
+    #[test]
+    fn scroll_into_view_aligns_nearest_scroll_container() {
+        setup();
+        let document = document_value();
+        let container = create_in_body("div");
+        container
+            .get_property("style")
+            .set_property("overflowY", Value::string("auto"));
+        let target = document.call_method("createElement", vec![Value::string("button")]);
+        container.call_method("appendChild", vec![target.clone()]);
+        let container_id = node_id_of(&container).unwrap();
+        let target_id = node_id_of(&target).unwrap();
+        dom::with_document_mut(|document| {
+            document.set_layout_rect(
+                NodeId::from_u32(container_id),
+                w3cos_dom::DOMRect::new(0.0, 0.0, 100.0, 100.0),
+            );
+            document.set_layout_rect(
+                NodeId::from_u32(target_id),
+                w3cos_dom::DOMRect::new(0.0, 250.0, 80.0, 20.0),
+            );
+        });
+        let scroll_events = Rc::new(Cell::new(0));
+        let events_for_handler = Rc::clone(&scroll_events);
+        container.call_method(
+            "addEventListener",
+            vec![
+                Value::string("scroll"),
+                func(move |_, _| {
+                    events_for_handler.set(events_for_handler.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        target.call_method(
+            "scrollIntoView",
+            vec![Value::object(HashMap::from([
+                ("block".to_string(), Value::string("end")),
+                ("container".to_string(), Value::string("nearest")),
+            ]))],
+        );
+        assert_eq!(container.get_property("scrollTop").to_number(), 170.0);
+        assert_eq!(scroll_events.get(), 1);
     }
 }

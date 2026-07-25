@@ -138,6 +138,7 @@ thread_local! {
         RefCell::new(TransactionCoordinator::default());
     static CONNECTION_COORDINATOR: RefCell<ConnectionCoordinator> =
         RefCell::new(ConnectionCoordinator::default());
+    static IDB_CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
 
 impl Default for RequestState {
@@ -159,6 +160,204 @@ fn func(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
 
 fn arg(args: &[Value], index: usize) -> Value {
     args.get(index).cloned().unwrap_or(Value::Undefined)
+}
+
+pub const IDB_INTERFACE_NAMES: &[&str] = &[
+    "IDBFactory",
+    "IDBRequest",
+    "IDBOpenDBRequest",
+    "IDBDatabase",
+    "IDBTransaction",
+    "IDBObjectStore",
+    "IDBIndex",
+    "IDBCursor",
+    "IDBCursorWithValue",
+    "IDBKeyRange",
+    "IDBRecord",
+    "IDBVersionChangeEvent",
+];
+
+pub fn interface_class(name: &str) -> Value {
+    IDB_CLASSES.with(|classes| {
+        if let Some(class) = classes.borrow().get(name).cloned() {
+            return class;
+        }
+        let class = if name == "IDBVersionChangeEvent" {
+            Value::function(|this, args| {
+                crate::web_events::event_class().call(this.clone(), args.clone());
+                let init = args.get(1).cloned().unwrap_or_default();
+                this.set_property(
+                    "oldVersion",
+                    if init.get_property("oldVersion").is_undefined() {
+                        Value::Number(0.0)
+                    } else {
+                        init.get_property("oldVersion")
+                    },
+                );
+                this.set_property(
+                    "newVersion",
+                    if init.get_property("newVersion").is_undefined() {
+                        Value::Null
+                    } else {
+                        init.get_property("newVersion")
+                    },
+                );
+                Value::Undefined
+            })
+        } else {
+            let interface_name = name.to_string();
+            Value::function(move |_, _| {
+                w3cos_core::throw_value(w3cos_core::error_instance(
+                    "TypeError",
+                    vec![Value::string(&format!(
+                        "{interface_name} is not constructible"
+                    ))],
+                ))
+            })
+        };
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        match name {
+            "IDBRequest" | "IDBDatabase" | "IDBTransaction" => {
+                w3cos_core::class::set_prototype_of(
+                    &prototype,
+                    &crate::web_events::event_target_class().get_property("prototype"),
+                );
+            }
+            "IDBOpenDBRequest" => {
+                w3cos_core::class::set_prototype_of(
+                    &prototype,
+                    &interface_class("IDBRequest").get_property("prototype"),
+                );
+            }
+            "IDBCursorWithValue" => {
+                w3cos_core::class::set_prototype_of(
+                    &prototype,
+                    &interface_class("IDBCursor").get_property("prototype"),
+                );
+            }
+            "IDBVersionChangeEvent" => {
+                w3cos_core::class::set_prototype_of(
+                    &prototype,
+                    &crate::web_events::event_class().get_property("prototype"),
+                );
+            }
+            _ => {}
+        }
+        let members: &[&str] = match name {
+            "IDBFactory" => &["cmp", "databases", "deleteDatabase", "open"],
+            "IDBRequest" => &[
+                "error",
+                "onerror",
+                "onsuccess",
+                "readyState",
+                "result",
+                "source",
+                "transaction",
+            ],
+            "IDBOpenDBRequest" => &["onblocked", "onupgradeneeded"],
+            "IDBDatabase" => &[
+                "close",
+                "createObjectStore",
+                "deleteObjectStore",
+                "name",
+                "objectStoreNames",
+                "onabort",
+                "onclose",
+                "onerror",
+                "onversionchange",
+                "transaction",
+                "version",
+            ],
+            "IDBTransaction" => &[
+                "abort",
+                "commit",
+                "db",
+                "durability",
+                "error",
+                "mode",
+                "objectStore",
+                "objectStoreNames",
+                "onabort",
+                "oncomplete",
+                "onerror",
+            ],
+            "IDBObjectStore" => &[
+                "add",
+                "autoIncrement",
+                "clear",
+                "count",
+                "createIndex",
+                "delete",
+                "deleteIndex",
+                "get",
+                "getAll",
+                "getAllKeys",
+                "getAllRecords",
+                "getKey",
+                "index",
+                "indexNames",
+                "keyPath",
+                "name",
+                "openCursor",
+                "openKeyCursor",
+                "put",
+                "transaction",
+            ],
+            "IDBIndex" => &[
+                "count",
+                "get",
+                "getAll",
+                "getAllKeys",
+                "getAllRecords",
+                "getKey",
+                "keyPath",
+                "multiEntry",
+                "name",
+                "objectStore",
+                "openCursor",
+                "openKeyCursor",
+                "unique",
+            ],
+            "IDBCursor" => &[
+                "advance",
+                "continue",
+                "continuePrimaryKey",
+                "delete",
+                "direction",
+                "key",
+                "primaryKey",
+                "request",
+                "source",
+                "update",
+            ],
+            "IDBCursorWithValue" => &["value"],
+            "IDBKeyRange" => &["includes", "lower", "lowerOpen", "upper", "upperOpen"],
+            "IDBRecord" => &["key", "primaryKey", "value"],
+            "IDBVersionChangeEvent" => &["dataLoss", "dataLossMessage", "newVersion", "oldVersion"],
+            _ => &[],
+        };
+        for member in members {
+            prototype.set_property(member, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        classes.borrow_mut().insert(name.to_string(), class.clone());
+        class
+    })
+}
+
+fn idb_record_value(key: JsonValue, primary_key: JsonValue, value: JsonValue) -> Value {
+    let record = Value::object(HashMap::from([
+        ("key".into(), json_to_value(key)),
+        ("primaryKey".into(), json_to_value(primary_key)),
+        ("value".into(), json_to_value(value)),
+    ]));
+    set_interface_prototype(&record, "IDBRecord");
+    record
+}
+
+fn set_interface_prototype(value: &Value, name: &str) {
+    w3cos_core::class::set_prototype_of(value, &interface_class(name).get_property("prototype"));
 }
 
 fn request_value() -> (Value, Rc<RefCell<RequestState>>, ListenerMap) {
@@ -241,7 +440,9 @@ fn request_value() -> (Value, Rc<RefCell<RequestState>>, ListenerMap) {
         }),
     );
 
-    (Value::object(properties), state, listeners)
+    let value = Value::object(properties);
+    set_interface_prototype(&value, "IDBRequest");
+    (value, state, listeners)
 }
 
 fn same_callback(left: &Value, right: &Value) -> bool {
@@ -376,7 +577,21 @@ fn event_value(event_type: &str, target: &Value, details: &[(&str, Value)]) -> V
     for (key, value) in details {
         properties.insert((*key).into(), value.clone());
     }
-    Value::object(properties)
+    let value = Value::object(properties);
+    let interface = if details.iter().any(|(name, _)| *name == "oldVersion") {
+        "IDBVersionChangeEvent"
+    } else {
+        "Event"
+    };
+    if interface == "Event" {
+        w3cos_core::class::set_prototype_of(
+            &value,
+            &crate::web_events::event_class().get_property("prototype"),
+        );
+    } else {
+        set_interface_prototype(&value, interface);
+    }
+    value
 }
 
 fn fire_event(
@@ -716,7 +931,7 @@ fn versionchange_transaction_value(
     let names_database = database.clone();
     let object_store_database = database.clone();
     let object_store_upgrading = upgrading.clone();
-    Value::object(HashMap::from([
+    let value = Value::object(HashMap::from([
         ("mode".into(), Value::from("versionchange")),
         ("durability".into(), Value::from("default")),
         ("error".into(), Value::Null),
@@ -756,7 +971,9 @@ fn versionchange_transaction_value(
                 Value::Undefined
             }),
         ),
-    ]))
+    ]));
+    set_interface_prototype(&value, "IDBTransaction");
+    value
 }
 
 fn queue_delete_attempt(request: Rc<DeleteRequest>) {
@@ -848,6 +1065,7 @@ pub fn factory_value() -> Value {
             }
 
             let (request, state, listeners) = request_value();
+            set_interface_prototype(&request, "IDBOpenDBRequest");
             queue_open_attempt(Rc::new(OpenRequest {
                 name,
                 requested_version,
@@ -866,6 +1084,7 @@ pub fn factory_value() -> Value {
         func(|_, args| {
             let name = arg(&args, 0).to_js_string();
             let (request, state, listeners) = request_value();
+            set_interface_prototype(&request, "IDBOpenDBRequest");
             queue_delete_attempt(Rc::new(DeleteRequest {
                 name,
                 request: request.clone(),
@@ -881,11 +1100,11 @@ pub fn factory_value() -> Value {
     properties.insert(
         "cmp".into(),
         func(|_, args| {
-            let left = match value_to_json(&arg(&args, 0)) {
+            let left = match key_to_json(&arg(&args, 0)) {
                 Ok(value) => value,
                 Err(error) => w3cos_core::throw_value(dom_exception(&error.name, &error.message)),
             };
-            let right = match value_to_json(&arg(&args, 1)) {
+            let right = match key_to_json(&arg(&args, 1)) {
                 Ok(value) => value,
                 Err(error) => w3cos_core::throw_value(dom_exception(&error.name, &error.message)),
             };
@@ -914,56 +1133,58 @@ pub fn factory_value() -> Value {
             w3cos_core::promise::resolve(vec![Value::array(databases)])
         }),
     );
-    Value::object(properties)
+    let value = Value::object(properties);
+    set_interface_prototype(&value, "IDBFactory");
+    value
 }
 
 pub fn key_range_constructor_value() -> Value {
-    let mut properties = HashMap::new();
-    properties.insert(
+    let class = interface_class("IDBKeyRange");
+    class.set_property(
         "only".into(),
         func(|_, args| {
             let key = arg(&args, 0);
-            validate_key_range(value_to_json(&key).and_then(|key| KeyRange::only(&key)));
+            validate_key_range(key_to_json(&key).and_then(|key| KeyRange::only(&key)));
             key_range_value(key.clone(), key, false, false)
         }),
     );
-    properties.insert(
+    class.set_property(
         "lowerBound".into(),
         func(|_, args| {
             let lower = arg(&args, 0);
             let open = arg(&args, 1).to_bool();
             validate_key_range(
-                value_to_json(&lower).and_then(|key| KeyRange::lower_bound(&key, open)),
+                key_to_json(&lower).and_then(|key| KeyRange::lower_bound(&key, open)),
             );
             key_range_value(lower, Value::Undefined, open, false)
         }),
     );
-    properties.insert(
+    class.set_property(
         "upperBound".into(),
         func(|_, args| {
             let upper = arg(&args, 0);
             let open = arg(&args, 1).to_bool();
             validate_key_range(
-                value_to_json(&upper).and_then(|key| KeyRange::upper_bound(&key, open)),
+                key_to_json(&upper).and_then(|key| KeyRange::upper_bound(&key, open)),
             );
             key_range_value(Value::Undefined, upper, false, open)
         }),
     );
-    properties.insert(
+    class.set_property(
         "bound".into(),
         func(|_, args| {
             let lower = arg(&args, 0);
             let upper = arg(&args, 1);
             let lower_open = arg(&args, 2).to_bool();
             let upper_open = arg(&args, 3).to_bool();
-            validate_key_range(value_to_json(&lower).and_then(|lower| {
-                value_to_json(&upper)
+            validate_key_range(key_to_json(&lower).and_then(|lower| {
+                key_to_json(&upper)
                     .and_then(|upper| KeyRange::bound(&lower, &upper, lower_open, upper_open))
             }));
             key_range_value(lower, upper, lower_open, upper_open)
         }),
     );
-    Value::object(properties)
+    class
 }
 
 fn validate_key_range(result: indexed_db::Result<KeyRange>) {
@@ -973,13 +1194,15 @@ fn validate_key_range(result: indexed_db::Result<KeyRange>) {
 }
 
 fn key_range_value(lower: Value, upper: Value, lower_open: bool, upper_open: bool) -> Value {
-    Value::object(HashMap::from([
+    let value = Value::object(HashMap::from([
         ("__w3cos_idb_key_range".into(), Value::Bool(true)),
         ("lower".into(), lower),
         ("upper".into(), upper),
         ("lowerOpen".into(), Value::Bool(lower_open)),
         ("upperOpen".into(), Value::Bool(upper_open)),
-    ]))
+    ]));
+    set_interface_prototype(&value, "IDBKeyRange");
+    value
 }
 
 fn key_range_from_query(query: &Value) -> indexed_db::Result<Option<KeyRange>> {
@@ -993,21 +1216,21 @@ fn key_range_from_query(query: &Value) -> indexed_db::Result<Option<KeyRange>> {
         let upper_open = query.get_property("upperOpen").to_bool();
         return match (lower.is_undefined(), upper.is_undefined()) {
             (false, false) => KeyRange::bound(
-                &value_to_json(&lower)?,
-                &value_to_json(&upper)?,
+                &key_to_json(&lower)?,
+                &key_to_json(&upper)?,
                 lower_open,
                 upper_open,
             )
             .map(Some),
-            (false, true) => KeyRange::lower_bound(&value_to_json(&lower)?, lower_open).map(Some),
-            (true, false) => KeyRange::upper_bound(&value_to_json(&upper)?, upper_open).map(Some),
+            (false, true) => KeyRange::lower_bound(&key_to_json(&lower)?, lower_open).map(Some),
+            (true, false) => KeyRange::upper_bound(&key_to_json(&upper)?, upper_open).map(Some),
             (true, true) => Err(IndexedDbError {
                 name: "DataError".into(),
                 message: "A key range must have at least one bound.".into(),
             }),
         };
     }
-    KeyRange::only(&value_to_json(query)?).map(Some)
+    KeyRange::only(&key_to_json(query)?).map(Some)
 }
 
 fn key_path_from_web(value: &Value, optional: bool) -> indexed_db::Result<String> {
@@ -1231,6 +1454,7 @@ fn database_web_value(
         }),
     );
     let value = Value::object(properties);
+    set_interface_prototype(&value, "IDBDatabase");
     if let Value::Object(object) = &value {
         *connection.target.borrow_mut() = Some(Rc::downgrade(object));
     }
@@ -1293,7 +1517,7 @@ fn object_store_schema_value(
             ) {
                 w3cos_core::throw_value(dom_exception(&error.name, &error.message));
             }
-            Value::object(HashMap::from([
+            let value = Value::object(HashMap::from([
                 ("name".into(), Value::from(name)),
                 ("keyPath".into(), key_path_to_web(&key_path)),
                 (
@@ -1304,7 +1528,9 @@ fn object_store_schema_value(
                     "multiEntry".into(),
                     Value::Bool(options.get_property("multiEntry").to_bool()),
                 ),
-            ]))
+            ]));
+            set_interface_prototype(&value, "IDBIndex");
+            value
         }),
     );
     properties.insert(
@@ -1322,7 +1548,9 @@ fn object_store_schema_value(
             Value::Undefined
         }),
     );
-    Value::object(properties)
+    let value = Value::object(properties);
+    set_interface_prototype(&value, "IDBObjectStore");
+    value
 }
 
 fn transaction_web_value(
@@ -1432,6 +1660,7 @@ fn transaction_web_value(
         }),
     );
     let value = Value::object(properties);
+    set_interface_prototype(&value, "IDBTransaction");
     if let Value::Object(object) = &value {
         *transaction.target.borrow_mut() = Some(Rc::downgrade(object));
     }
@@ -1472,7 +1701,7 @@ fn object_store_value(transaction: Rc<WebTransaction>, store_name: String) -> Va
                 let key = if key.is_undefined() {
                     store.put(json)?
                 } else {
-                    store.put_with_key(json, Some(value_to_json(&key)?))?
+                    store.put_with_key(json, Some(key_to_json(&key)?))?
                 };
                 Ok(json_to_value(key))
             })
@@ -1494,7 +1723,7 @@ fn object_store_value(transaction: Rc<WebTransaction>, store_name: String) -> Va
                 let key = if key.is_undefined() {
                     store.add(json)?
                 } else {
-                    store.add_with_key(json, Some(value_to_json(&key)?))?
+                    store.add_with_key(json, Some(key_to_json(&key)?))?
                 };
                 Ok(json_to_value(key))
             })
@@ -1547,6 +1776,57 @@ fn object_store_value(transaction: Rc<WebTransaction>, store_name: String) -> Va
                         .get_all_range(range.as_ref(), limit)?
                         .into_iter()
                         .map(json_to_value)
+                        .collect(),
+                ))
+            })
+        }),
+    );
+
+    let records_transaction = transaction.clone();
+    let records_store = store_name.clone();
+    properties.insert(
+        "getAllRecords".into(),
+        func(move |_, args| {
+            let first = arg(&args, 0);
+            let dictionary = !first.get_property("query").is_undefined()
+                || !first.get_property("count").is_undefined()
+                || !first.get_property("direction").is_undefined();
+            let query = if dictionary {
+                first.get_property("query")
+            } else {
+                first.clone()
+            };
+            let count = if dictionary {
+                first.get_property("count")
+            } else {
+                arg(&args, 1)
+            };
+            let direction = if dictionary {
+                first.get_property("direction").to_js_string()
+            } else {
+                "next".to_string()
+            };
+            let transaction = records_transaction.clone();
+            let store_name = records_store.clone();
+            transaction_operation_request(transaction, move |transaction| {
+                let store = transaction.object_store(&store_name)?;
+                let range = key_range_from_query(&query)?;
+                let mut keys = store.get_all_keys_range(range.as_ref(), None)?;
+                let mut values = store.get_all_range(range.as_ref(), None)?;
+                if direction.starts_with("prev") {
+                    keys.reverse();
+                    values.reverse();
+                }
+                let limit = if count.is_undefined() {
+                    usize::MAX
+                } else {
+                    count.to_u32() as usize
+                };
+                Ok(Value::array(
+                    keys.into_iter()
+                        .zip(values)
+                        .take(limit)
+                        .map(|(key, value)| idb_record_value(key.clone(), key, value))
                         .collect(),
                 ))
             })
@@ -1672,7 +1952,9 @@ fn object_store_value(transaction: Rc<WebTransaction>, store_name: String) -> Va
             )
         }),
     );
-    Value::object(properties)
+    let value = Value::object(properties);
+    set_interface_prototype(&value, "IDBObjectStore");
+    value
 }
 
 fn cursor_request(
@@ -2088,11 +2370,20 @@ fn cursor_value(cursor: Rc<CursorState>) -> Value {
             }),
         );
     }
-    Value::object(properties)
+    let value = Value::object(properties);
+    set_interface_prototype(
+        &value,
+        if cursor.key_only {
+            "IDBCursor"
+        } else {
+            "IDBCursorWithValue"
+        },
+    );
+    value
 }
 
 fn cursor_continue_amount(cursor: &CursorState, target: &Value) -> indexed_db::Result<usize> {
-    let target = value_to_json(target)?;
+    let target = key_to_json(target)?;
     let current = &cursor.entries[cursor.position.get()].key;
     let ordering = indexed_db::compare_keys(&target, current)?;
     let reverse = cursor.direction.starts_with("prev");
@@ -2212,6 +2503,58 @@ fn index_value(transaction: Rc<WebTransaction>, store_name: String, index_name: 
         }),
     );
 
+    let records_transaction = transaction.clone();
+    let records_store = store_name.clone();
+    let records_index = index_name.clone();
+    properties.insert(
+        "getAllRecords".into(),
+        func(move |_, args| {
+            let first = arg(&args, 0);
+            let dictionary = !first.get_property("query").is_undefined()
+                || !first.get_property("count").is_undefined()
+                || !first.get_property("direction").is_undefined();
+            let query = if dictionary {
+                first.get_property("query")
+            } else {
+                first.clone()
+            };
+            let count = if dictionary {
+                first.get_property("count")
+            } else {
+                arg(&args, 1)
+            };
+            let direction = if dictionary {
+                first.get_property("direction").to_js_string()
+            } else {
+                "next".to_string()
+            };
+            let transaction = records_transaction.clone();
+            let store_name = records_store.clone();
+            let index_name = records_index.clone();
+            transaction_operation_request(transaction, move |transaction| {
+                let range = key_range_from_query(&query)?;
+                let mut records = transaction
+                    .object_store(&store_name)?
+                    .index_scan(&index_name, range.as_ref())?;
+                if direction.starts_with("prev") {
+                    records.reverse();
+                }
+                let limit = if count.is_undefined() {
+                    usize::MAX
+                } else {
+                    count.to_u32() as usize
+                };
+                Ok(Value::array(
+                    records
+                        .into_iter()
+                        .take(limit)
+                        .map(|(key, primary_key, value)| idb_record_value(key, primary_key, value))
+                        .collect(),
+                ))
+            })
+        }),
+    );
+
     let keys_transaction = transaction.clone();
     let keys_store = store_name.clone();
     let keys_index = index_name.clone();
@@ -2295,7 +2638,9 @@ fn index_value(transaction: Rc<WebTransaction>, store_name: String, index_name: 
             )
         }),
     );
-    Value::object(properties)
+    let value = Value::object(properties);
+    set_interface_prototype(&value, "IDBIndex");
+    value
 }
 
 type TransactionOperation = Box<dyn FnOnce(&Transaction) -> indexed_db::Result<Value>>;
@@ -2392,14 +2737,26 @@ fn queue_transaction_operation(
 const CLONE_TAG: &str = "\u{1f}w3cos-idb-clone";
 const DATE_TAG: &str = "\u{1f}w3cos-idb-date";
 const BINARY_TAG: &str = "\u{1f}w3cos-idb-binary";
+const MAP_TAG: &str = "\u{1f}w3cos-idb-map";
+const SET_TAG: &str = "\u{1f}w3cos-idb-set";
+const REGEXP_TAG: &str = "\u{1f}w3cos-idb-regexp";
+const BLOB_TAG: &str = "\u{1f}w3cos-idb-blob";
+const FILE_TAG: &str = "\u{1f}w3cos-idb-file";
+const BIGINT_TAG: &str = "\u{1f}w3cos-idb-bigint";
 
-fn value_to_json(value: &Value) -> indexed_db::Result<JsonValue> {
-    match value_to_json_inner(value, &mut std::collections::HashSet::new()) {
-        Err(error) if error.name == "DataCloneError" && error.message.starts_with("Cyclic") => {
-            graph_clone_to_json(value)
-        }
-        result => result,
+pub(crate) fn value_to_json(value: &Value) -> indexed_db::Result<JsonValue> {
+    match value {
+        // Records use the structured-clone graph format unconditionally for
+        // heap roots, preserving non-cyclic sharing as well as cycles. Keys use
+        // `key_to_json` below so their sortable compact representation remains
+        // available to the SQLite adapter.
+        Value::Array(_) | Value::Object(_) => graph_clone_to_json(value),
+        _ => value_to_json_inner(value, &mut std::collections::HashSet::new()),
     }
+}
+
+fn key_to_json(value: &Value) -> indexed_db::Result<JsonValue> {
+    value_to_json_inner(value, &mut std::collections::HashSet::new())
 }
 
 struct GraphCloneEncoder {
@@ -2423,6 +2780,62 @@ fn graph_clone_to_json(value: &Value) -> indexed_db::Result<JsonValue> {
 impl GraphCloneEncoder {
     fn encode(&mut self, value: &Value) -> indexed_db::Result<JsonValue> {
         match value {
+            _ if w3cos_core::binary::clone_descriptor(value).is_some() => {
+                let identity = match value {
+                    Value::Array(values) => (0, Rc::as_ptr(values) as usize),
+                    Value::Object(object) => (1, Rc::as_ptr(object) as usize),
+                    _ => unreachable!("binary descriptors are heap values"),
+                };
+                if let Some(id) = self.ids.get(&identity) {
+                    return Ok(graph_reference(*id));
+                }
+                let id = self.nodes.len();
+                self.ids.insert(identity, id);
+                self.nodes.push(JsonValue::Null);
+                self.nodes[id] = match w3cos_core::binary::clone_descriptor(value)
+                    .expect("binary descriptor checked")
+                {
+                    w3cos_core::binary::BinaryCloneDescriptor::ArrayBuffer { shared } => {
+                        JsonValue::Object(serde_json::Map::from_iter([
+                            ("kind".into(), JsonValue::String("arraybuffer".into())),
+                            ("shared".into(), JsonValue::Bool(shared)),
+                            (
+                                "bytes".into(),
+                                bytes_to_json(w3cos_core::binary::bytes_of(value)),
+                            ),
+                        ]))
+                    }
+                    w3cos_core::binary::BinaryCloneDescriptor::TypedArray {
+                        name,
+                        buffer,
+                        offset,
+                        length,
+                    } => {
+                        let buffer = self.encode(&buffer)?;
+                        JsonValue::Object(serde_json::Map::from_iter([
+                            ("kind".into(), JsonValue::String("typedarray".into())),
+                            ("name".into(), JsonValue::String(name.into())),
+                            ("buffer".into(), buffer),
+                            ("offset".into(), JsonValue::Number(offset.into())),
+                            ("length".into(), JsonValue::Number(length.into())),
+                        ]))
+                    }
+                    w3cos_core::binary::BinaryCloneDescriptor::DataView {
+                        buffer,
+                        offset,
+                        length,
+                    } => {
+                        let buffer = self.encode(&buffer)?;
+                        JsonValue::Object(serde_json::Map::from_iter([
+                            ("kind".into(), JsonValue::String("dataview".into())),
+                            ("buffer".into(), buffer),
+                            ("offset".into(), JsonValue::Number(offset.into())),
+                            ("length".into(), JsonValue::Number(length.into())),
+                        ]))
+                    }
+                };
+                Ok(graph_reference(id))
+            }
             Value::Array(values) if !w3cos_core::collections::is_typed_array(value) => {
                 let identity = (0, Rc::as_ptr(values) as usize);
                 if let Some(id) = self.ids.get(&identity) {
@@ -2441,6 +2854,142 @@ impl GraphCloneEncoder {
                     ("value".into(), JsonValue::Array(items)),
                 ]));
                 Ok(graph_reference(id))
+            }
+            Value::Object(object) if w3cos_core::web::structured_error_name(value).is_some() => {
+                let identity = (1, Rc::as_ptr(object) as usize);
+                if let Some(id) = self.ids.get(&identity) {
+                    return Ok(graph_reference(*id));
+                }
+                let id = self.nodes.len();
+                self.ids.insert(identity, id);
+                self.nodes.push(JsonValue::Null);
+                let name =
+                    w3cos_core::web::structured_error_name(value).expect("Error identity checked");
+                let cause = self.encode(&value.get_property("cause"))?;
+                let errors = self.encode(&value.get_property("errors"))?;
+                self.nodes[id] = JsonValue::Object(serde_json::Map::from_iter([
+                    ("kind".into(), JsonValue::String("error".into())),
+                    ("name".into(), JsonValue::String(name.into())),
+                    (
+                        "message".into(),
+                        JsonValue::String(value.get_property("message").to_js_string()),
+                    ),
+                    (
+                        "stack".into(),
+                        JsonValue::String(value.get_property("stack").to_js_string()),
+                    ),
+                    ("cause".into(), cause),
+                    ("errors".into(), errors),
+                ]));
+                Ok(graph_reference(id))
+            }
+            Value::Object(object)
+                if w3cos_core::class::instance_of(
+                    value,
+                    &w3cos_core::web::dom_exception_class(),
+                ) =>
+            {
+                let identity = (1, Rc::as_ptr(object) as usize);
+                if let Some(id) = self.ids.get(&identity) {
+                    return Ok(graph_reference(*id));
+                }
+                let id = self.nodes.len();
+                self.ids.insert(identity, id);
+                self.nodes
+                    .push(JsonValue::Object(serde_json::Map::from_iter([
+                        ("kind".into(), JsonValue::String("domexception".into())),
+                        (
+                            "name".into(),
+                            JsonValue::String(value.get_property("name").to_js_string()),
+                        ),
+                        (
+                            "message".into(),
+                            JsonValue::String(value.get_property("message").to_js_string()),
+                        ),
+                        (
+                            "stack".into(),
+                            JsonValue::String(value.get_property("stack").to_js_string()),
+                        ),
+                    ])));
+                Ok(graph_reference(id))
+            }
+            Value::Object(object)
+                if w3cos_core::class::instance_of(value, &w3cos_core::web::image_data_class()) =>
+            {
+                let identity = (1, Rc::as_ptr(object) as usize);
+                if let Some(id) = self.ids.get(&identity) {
+                    return Ok(graph_reference(*id));
+                }
+                let id = self.nodes.len();
+                self.ids.insert(identity, id);
+                self.nodes.push(JsonValue::Null);
+                let data = self.encode(&value.get_property("data"))?;
+                self.nodes[id] = JsonValue::Object(serde_json::Map::from_iter([
+                    ("kind".into(), JsonValue::String("imagedata".into())),
+                    ("data".into(), data),
+                    (
+                        "width".into(),
+                        JsonValue::Number(value.get_property("width").to_u32().into()),
+                    ),
+                    (
+                        "height".into(),
+                        JsonValue::Number(value.get_property("height").to_u32().into()),
+                    ),
+                    (
+                        "colorSpace".into(),
+                        JsonValue::String(value.get_property("colorSpace").to_js_string()),
+                    ),
+                ]));
+                Ok(graph_reference(id))
+            }
+            Value::Object(object)
+                if w3cos_core::collections::collection_snapshot(value).is_some() =>
+            {
+                let identity = (1, Rc::as_ptr(object) as usize);
+                if let Some(id) = self.ids.get(&identity) {
+                    return Ok(graph_reference(*id));
+                }
+                let id = self.nodes.len();
+                self.ids.insert(identity, id);
+                self.nodes.push(JsonValue::Null);
+                let snapshot = w3cos_core::collections::collection_snapshot(value)
+                    .expect("collection snapshot checked");
+                self.nodes[id] = match snapshot {
+                    w3cos_core::collections::CollectionSnapshot::Map(entries) => {
+                        let entries = entries
+                            .into_iter()
+                            .map(|(key, value)| {
+                                Ok(JsonValue::Array(vec![
+                                    self.encode(&key)?,
+                                    self.encode(&value)?,
+                                ]))
+                            })
+                            .collect::<indexed_db::Result<Vec<_>>>()?;
+                        JsonValue::Object(serde_json::Map::from_iter([
+                            ("kind".into(), JsonValue::String("map".into())),
+                            ("value".into(), JsonValue::Array(entries)),
+                        ]))
+                    }
+                    w3cos_core::collections::CollectionSnapshot::Set(values) => {
+                        let values = values
+                            .into_iter()
+                            .map(|value| self.encode(&value))
+                            .collect::<indexed_db::Result<Vec<_>>>()?;
+                        JsonValue::Object(serde_json::Map::from_iter([
+                            ("kind".into(), JsonValue::String("set".into())),
+                            ("value".into(), JsonValue::Array(values)),
+                        ]))
+                    }
+                };
+                Ok(graph_reference(id))
+            }
+            Value::Object(_)
+                if w3cos_core::bigint::get(value).is_some()
+                    || value.get_property("__w3cos_date_milliseconds").is_number()
+                    || w3cos_core::regexp::parts(value).is_some()
+                    || w3cos_core::web::blob_bytes(value).is_some() =>
+            {
+                value_to_json_inner(value, &mut std::collections::HashSet::new())
             }
             Value::Object(object)
                 if !value.get_property("__w3cos_date_milliseconds").is_number() =>
@@ -2472,6 +3021,16 @@ impl GraphCloneEncoder {
     }
 }
 
+fn bytes_to_json(bytes: Option<Vec<u8>>) -> JsonValue {
+    JsonValue::Array(
+        bytes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|byte| JsonValue::Number(byte.into()))
+            .collect(),
+    )
+}
+
 fn graph_reference(id: usize) -> JsonValue {
     JsonValue::Object(serde_json::Map::from_iter([
         (CLONE_TAG.into(), JsonValue::String("ref".into())),
@@ -2483,6 +3042,12 @@ fn value_to_json_inner(
     value: &Value,
     active: &mut std::collections::HashSet<usize>,
 ) -> indexed_db::Result<JsonValue> {
+    if w3cos_core::binary::clone_descriptor(value).is_some() {
+        return Ok(JsonValue::Object(serde_json::Map::from_iter([(
+            BINARY_TAG.into(),
+            bytes_to_json(w3cos_core::binary::bytes_of(value)),
+        )])));
+    }
     match value {
         Value::Undefined => Ok(JsonValue::Object(serde_json::Map::from_iter([(
             CLONE_TAG.into(),
@@ -2519,30 +3084,6 @@ fn value_to_json_inner(
             ),
         Value::String(value) => Ok(JsonValue::String(value.clone())),
         Value::Array(values) => {
-            if w3cos_core::collections::is_typed_array(value) {
-                let bytes = values
-                    .borrow()
-                    .iter()
-                    .map(|value| {
-                        let number = value.to_number();
-                        if !number.is_finite()
-                            || number.fract() != 0.0
-                            || !(0.0..=255.0).contains(&number)
-                        {
-                            return Err(IndexedDbError {
-                                name: "DataCloneError".into(),
-                                message: "The compact typed-array codec requires byte values."
-                                    .into(),
-                            });
-                        }
-                        Ok(JsonValue::Number(serde_json::Number::from(number as u8)))
-                    })
-                    .collect::<indexed_db::Result<Vec<_>>>()?;
-                return Ok(JsonValue::Object(serde_json::Map::from_iter([(
-                    BINARY_TAG.into(),
-                    JsonValue::Array(bytes),
-                )])));
-            }
             let pointer = Rc::as_ptr(values) as usize;
             if !active.insert(pointer) {
                 return Err(IndexedDbError {
@@ -2560,6 +3101,12 @@ fn value_to_json_inner(
             result
         }
         Value::Object(object) => {
+            if let Some(bigint) = w3cos_core::bigint::get(value) {
+                return Ok(JsonValue::Object(serde_json::Map::from_iter([(
+                    BIGINT_TAG.into(),
+                    JsonValue::String(bigint.to_string()),
+                )])));
+            }
             let date = value.get_property("__w3cos_date_milliseconds");
             if date.is_number() {
                 let milliseconds = date.to_number();
@@ -2575,6 +3122,105 @@ fn value_to_json_inner(
                         serde_json::Number::from_f64(milliseconds)
                             .expect("finite date milliseconds"),
                     ),
+                )])));
+            }
+            if let Some(snapshot) = w3cos_core::collections::collection_snapshot(value) {
+                let pointer = Rc::as_ptr(object) as usize;
+                if !active.insert(pointer) {
+                    return Err(IndexedDbError {
+                        name: "DataCloneError".into(),
+                        message: "Cyclic collection values require graph cloning.".into(),
+                    });
+                }
+                let encoded = match snapshot {
+                    w3cos_core::collections::CollectionSnapshot::Map(entries) => {
+                        let entries = entries
+                            .into_iter()
+                            .map(|(key, value)| {
+                                Ok(JsonValue::Array(vec![
+                                    value_to_json_inner(&key, active)?,
+                                    value_to_json_inner(&value, active)?,
+                                ]))
+                            })
+                            .collect::<indexed_db::Result<Vec<_>>>()?;
+                        JsonValue::Object(serde_json::Map::from_iter([(
+                            MAP_TAG.into(),
+                            JsonValue::Array(entries),
+                        )]))
+                    }
+                    w3cos_core::collections::CollectionSnapshot::Set(values) => {
+                        let values = values
+                            .into_iter()
+                            .map(|value| value_to_json_inner(&value, active))
+                            .collect::<indexed_db::Result<Vec<_>>>()?;
+                        JsonValue::Object(serde_json::Map::from_iter([(
+                            SET_TAG.into(),
+                            JsonValue::Array(values),
+                        )]))
+                    }
+                };
+                active.remove(&pointer);
+                return Ok(encoded);
+            }
+            if let Some((source, flags)) = w3cos_core::regexp::parts(value) {
+                return Ok(JsonValue::Object(serde_json::Map::from_iter([(
+                    REGEXP_TAG.into(),
+                    JsonValue::Object(serde_json::Map::from_iter([
+                        ("source".into(), JsonValue::String(source)),
+                        ("flags".into(), JsonValue::String(flags)),
+                        (
+                            "lastIndex".into(),
+                            JsonValue::Number(
+                                serde_json::Number::from_f64(
+                                    value.get_property("lastIndex").to_number(),
+                                )
+                                .unwrap_or_else(|| 0.into()),
+                            ),
+                        ),
+                    ])),
+                )])));
+            }
+            if let Some(bytes) = w3cos_core::web::blob_bytes(value) {
+                let bytes = JsonValue::Array(
+                    bytes
+                        .into_iter()
+                        .map(|byte| JsonValue::Number(byte.into()))
+                        .collect(),
+                );
+                if w3cos_core::class::instance_of(value, &w3cos_core::web::file_class()) {
+                    return Ok(JsonValue::Object(serde_json::Map::from_iter([(
+                        FILE_TAG.into(),
+                        JsonValue::Object(serde_json::Map::from_iter([
+                            ("bytes".into(), bytes),
+                            (
+                                "type".into(),
+                                JsonValue::String(value.get_property("type").to_js_string()),
+                            ),
+                            (
+                                "name".into(),
+                                JsonValue::String(value.get_property("name").to_js_string()),
+                            ),
+                            (
+                                "lastModified".into(),
+                                JsonValue::Number(
+                                    serde_json::Number::from_f64(
+                                        value.get_property("lastModified").to_number(),
+                                    )
+                                    .unwrap_or_else(|| 0.into()),
+                                ),
+                            ),
+                        ])),
+                    )])));
+                }
+                return Ok(JsonValue::Object(serde_json::Map::from_iter([(
+                    BLOB_TAG.into(),
+                    JsonValue::Object(serde_json::Map::from_iter([
+                        ("bytes".into(), bytes),
+                        (
+                            "type".into(),
+                            JsonValue::String(value.get_property("type").to_js_string()),
+                        ),
+                    ])),
                 )])));
             }
             let pointer = Rc::as_ptr(object) as usize;
@@ -2596,6 +3242,12 @@ fn value_to_json_inner(
             if cloned.contains_key(CLONE_TAG)
                 || cloned.contains_key(DATE_TAG)
                 || cloned.contains_key(BINARY_TAG)
+                || cloned.contains_key(MAP_TAG)
+                || cloned.contains_key(SET_TAG)
+                || cloned.contains_key(REGEXP_TAG)
+                || cloned.contains_key(BLOB_TAG)
+                || cloned.contains_key(FILE_TAG)
+                || cloned.contains_key(BIGINT_TAG)
             {
                 cloned = serde_json::Map::from_iter([
                     (CLONE_TAG.into(), JsonValue::String("object".into())),
@@ -2607,7 +3259,7 @@ fn value_to_json_inner(
     }
 }
 
-fn json_to_value(value: JsonValue) -> Value {
+pub(crate) fn json_to_value(value: JsonValue) -> Value {
     match value {
         JsonValue::Null => Value::Null,
         JsonValue::Bool(value) => Value::Bool(value),
@@ -2615,6 +3267,9 @@ fn json_to_value(value: JsonValue) -> Value {
         JsonValue::String(value) => Value::String(value),
         JsonValue::Array(values) => Value::array(values.into_iter().map(json_to_value).collect()),
         JsonValue::Object(mut values) => {
+            if let Some(bigint) = values.get(BIGINT_TAG).and_then(JsonValue::as_str) {
+                return w3cos_core::bigint::parse(bigint);
+            }
             if let Some(milliseconds) = values.get(DATE_TAG).and_then(JsonValue::as_f64) {
                 return w3cos_core::web::date_value(milliseconds);
             }
@@ -2626,6 +3281,66 @@ fn json_to_value(value: JsonValue) -> Value {
                         .map(|byte| Value::Number(byte as f64))
                         .collect(),
                 );
+            }
+            if let Some(entries) = values.get(MAP_TAG).and_then(JsonValue::as_array) {
+                let map =
+                    w3cos_core::class::construct(&w3cos_core::collections::map_class(), vec![]);
+                for entry in entries {
+                    if let Some(parts) = entry.as_array() {
+                        map.call_method(
+                            "set",
+                            vec![
+                                parts
+                                    .first()
+                                    .cloned()
+                                    .map(json_to_value)
+                                    .unwrap_or(Value::Undefined),
+                                parts
+                                    .get(1)
+                                    .cloned()
+                                    .map(json_to_value)
+                                    .unwrap_or(Value::Undefined),
+                            ],
+                        );
+                    }
+                }
+                return map;
+            }
+            if let Some(entries) = values.get(SET_TAG).and_then(JsonValue::as_array) {
+                let set =
+                    w3cos_core::class::construct(&w3cos_core::collections::set_class(), vec![]);
+                for entry in entries {
+                    set.call_method("add", vec![json_to_value(entry.clone())]);
+                }
+                return set;
+            }
+            if let Some(regexp) = values.get(REGEXP_TAG).and_then(JsonValue::as_object) {
+                let value = w3cos_core::regexp::create(
+                    regexp
+                        .get("source")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default(),
+                    regexp
+                        .get("flags")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default(),
+                );
+                value.set_property(
+                    "lastIndex",
+                    Value::Number(
+                        regexp
+                            .get("lastIndex")
+                            .and_then(JsonValue::as_f64)
+                            .unwrap_or(0.0),
+                    ),
+                );
+                return value;
+            }
+            if let Some(blob) = values.get(BLOB_TAG).and_then(JsonValue::as_object) {
+                return decode_blob_value(blob, false);
+            }
+            if let Some(file) = values.get(FILE_TAG).and_then(JsonValue::as_object) {
+                return decode_blob_value(file, true);
             }
             match values.get(CLONE_TAG).and_then(JsonValue::as_str) {
                 Some("graph") => return json_graph_to_value(&values),
@@ -2659,13 +3374,136 @@ fn json_graph_to_value(graph: &serde_json::Map<String, JsonValue>) -> Value {
     let Some(nodes) = graph.get("nodes").and_then(JsonValue::as_array) else {
         return Value::Undefined;
     };
-    let placeholders = nodes
+    let mut placeholders = nodes
         .iter()
         .map(|node| match node.get("kind").and_then(JsonValue::as_str) {
             Some("array") => Value::array(Vec::new()),
+            Some("arraybuffer") => {
+                let bytes = json_bytes(node.get("bytes"));
+                if node
+                    .get("shared")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false)
+                {
+                    w3cos_core::binary::shared_array_buffer_value(bytes)
+                } else {
+                    w3cos_core::binary::array_buffer_value(bytes)
+                }
+            }
+            Some("typedarray" | "dataview") => Value::Undefined,
+            Some("error") => {
+                let name = node
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("Error");
+                let value = Value::object(HashMap::from([
+                    ("name".into(), Value::string(name)),
+                    (
+                        "message".into(),
+                        Value::string(
+                            node.get("message")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or_default(),
+                        ),
+                    ),
+                    (
+                        "stack".into(),
+                        Value::string(
+                            node.get("stack")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or_default(),
+                        ),
+                    ),
+                ]));
+                w3cos_core::class::set_prototype_of(
+                    &value,
+                    &w3cos_core::error_class(name).get_property("prototype"),
+                );
+                value
+            }
+            Some("domexception") => {
+                let value = w3cos_core::web::dom_exception_instance(
+                    node.get("message")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default(),
+                    node.get("name")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("Error"),
+                );
+                value.set_property(
+                    "stack",
+                    Value::string(
+                        node.get("stack")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or_default(),
+                    ),
+                );
+                value
+            }
+            Some("imagedata") => w3cos_core::web::image_data_value(
+                Value::Undefined,
+                node.get("width")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or_default() as u32,
+                node.get("height")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or_default() as u32,
+                node.get("colorSpace")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("srgb"),
+            ),
+            Some("map") => {
+                w3cos_core::class::construct(&w3cos_core::collections::map_class(), vec![])
+            }
+            Some("set") => {
+                w3cos_core::class::construct(&w3cos_core::collections::set_class(), vec![])
+            }
             _ => Value::object(HashMap::new()),
         })
         .collect::<Vec<_>>();
+    for (index, node) in nodes.iter().enumerate() {
+        let kind = node.get("kind").and_then(JsonValue::as_str);
+        if !matches!(kind, Some("typedarray" | "dataview")) {
+            continue;
+        }
+        let buffer = node
+            .get("buffer")
+            .and_then(graph_reference_id)
+            .and_then(|id| placeholders.get(id))
+            .cloned()
+            .unwrap_or(Value::Undefined);
+        let offset = node
+            .get("offset")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or_default();
+        let length = node
+            .get("length")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or_default();
+        placeholders[index] = if kind == Some("typedarray") {
+            w3cos_core::class::construct(
+                &w3cos_core::binary::typed_array_class(
+                    node.get("name")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("Uint8Array"),
+                ),
+                vec![
+                    buffer,
+                    Value::Number(offset as f64),
+                    Value::Number(length as f64),
+                ],
+            )
+        } else {
+            w3cos_core::class::construct(
+                &w3cos_core::binary::data_view_class(),
+                vec![
+                    buffer,
+                    Value::Number(offset as f64),
+                    Value::Number(length as f64),
+                ],
+            )
+        };
+    }
     for (index, node) in nodes.iter().enumerate() {
         match node.get("kind").and_then(JsonValue::as_str) {
             Some("array") => {
@@ -2688,6 +3526,61 @@ fn json_graph_to_value(graph: &serde_json::Map<String, JsonValue>) -> Value {
                     }
                 }
             }
+            Some("error") => {
+                let cause = node
+                    .get("cause")
+                    .map(|value| json_graph_part_to_value(value, &placeholders))
+                    .unwrap_or(Value::Undefined);
+                if !cause.is_undefined() {
+                    placeholders[index].set_property("cause", cause);
+                }
+                let errors = node
+                    .get("errors")
+                    .map(|value| json_graph_part_to_value(value, &placeholders))
+                    .unwrap_or(Value::Undefined);
+                if !errors.is_undefined() {
+                    placeholders[index].set_property("errors", errors);
+                }
+            }
+            Some("imagedata") => {
+                placeholders[index].set_property(
+                    "data",
+                    node.get("data")
+                        .map(|value| json_graph_part_to_value(value, &placeholders))
+                        .unwrap_or(Value::Undefined),
+                );
+            }
+            Some("map") => {
+                if let Some(entries) = node.get("value").and_then(JsonValue::as_array) {
+                    for entry in entries {
+                        if let Some(parts) = entry.as_array() {
+                            placeholders[index].call_method(
+                                "set",
+                                vec![
+                                    parts
+                                        .first()
+                                        .map(|value| json_graph_part_to_value(value, &placeholders))
+                                        .unwrap_or(Value::Undefined),
+                                    parts
+                                        .get(1)
+                                        .map(|value| json_graph_part_to_value(value, &placeholders))
+                                        .unwrap_or(Value::Undefined),
+                                ],
+                            );
+                        }
+                    }
+                }
+            }
+            Some("set") => {
+                if let Some(values) = node.get("value").and_then(JsonValue::as_array) {
+                    for value in values {
+                        placeholders[index].call_method(
+                            "add",
+                            vec![json_graph_part_to_value(value, &placeholders)],
+                        );
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2695,6 +3588,77 @@ fn json_graph_to_value(graph: &serde_json::Map<String, JsonValue>) -> Value {
         .get("root")
         .map(|root| json_graph_part_to_value(root, &placeholders))
         .unwrap_or(Value::Undefined)
+}
+
+fn graph_reference_id(value: &JsonValue) -> Option<usize> {
+    (value.get(CLONE_TAG).and_then(JsonValue::as_str) == Some("ref"))
+        .then(|| value.get("id").and_then(JsonValue::as_u64))
+        .flatten()
+        .map(|id| id as usize)
+}
+
+fn json_bytes(value: Option<&JsonValue>) -> Vec<u8> {
+    value
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_u64)
+        .filter_map(|byte| u8::try_from(byte).ok())
+        .collect()
+}
+
+fn decode_blob_value(value: &serde_json::Map<String, JsonValue>, file: bool) -> Value {
+    let bytes = value
+        .get("bytes")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_u64)
+        .map(|byte| Value::Number(byte as f64))
+        .collect::<Vec<_>>();
+    let options = Value::object(HashMap::from([
+        (
+            "type".to_string(),
+            Value::string(
+                value
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "lastModified".to_string(),
+            Value::Number(
+                value
+                    .get("lastModified")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap_or(0.0),
+            ),
+        ),
+    ]));
+    if file {
+        w3cos_core::class::construct(
+            &w3cos_core::web::file_class(),
+            vec![
+                Value::array(vec![w3cos_core::binary::typed_array_value(bytes)]),
+                Value::string(
+                    value
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default(),
+                ),
+                options,
+            ],
+        )
+    } else {
+        w3cos_core::class::construct(
+            &w3cos_core::web::blob_class(),
+            vec![
+                Value::array(vec![w3cos_core::binary::typed_array_value(bytes)]),
+                options,
+            ],
+        )
+    }
 }
 
 fn json_graph_part_to_value(value: &JsonValue, placeholders: &[Value]) -> Value {
@@ -2720,6 +3684,209 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn storage_clone_codec_preserves_collections_regexp_blob_and_file() {
+        let map = w3cos_core::class::construct(&w3cos_core::collections::map_class(), vec![]);
+        map.call_method("set", vec![Value::string("self"), map.clone()]);
+        let shared = Value::object(HashMap::from([(
+            "value".to_string(),
+            Value::string("shared"),
+        )]));
+        let set = w3cos_core::class::construct(
+            &w3cos_core::collections::set_class(),
+            vec![Value::array(vec![Value::string("item")])],
+        );
+        let regexp = w3cos_core::regexp::create("a+", "gi");
+        regexp.set_property("lastIndex", Value::Number(3.0));
+        let blob = w3cos_core::class::construct(
+            &w3cos_core::web::blob_class(),
+            vec![
+                Value::array(vec![Value::string("blob")]),
+                Value::object(HashMap::from([(
+                    "type".to_string(),
+                    Value::string("text/plain"),
+                )])),
+            ],
+        );
+        let file = w3cos_core::class::construct(
+            &w3cos_core::web::file_class(),
+            vec![
+                Value::array(vec![Value::string("file")]),
+                Value::string("note.txt"),
+                Value::object(HashMap::from([(
+                    "lastModified".to_string(),
+                    Value::Number(123.0),
+                )])),
+            ],
+        );
+        let bigint = w3cos_core::bigint::parse("9007199254740993123456789");
+        let error = w3cos_core::class::construct(
+            &w3cos_core::error_class("TypeError"),
+            vec![Value::string("bad")],
+        );
+        error.set_property("cause", error.clone());
+        let exception = w3cos_core::web::dom_exception_instance("stopped", "AbortError");
+        let pixels = w3cos_core::class::construct(
+            &w3cos_core::binary::typed_array_class("Uint8ClampedArray"),
+            vec![Value::Number(4.0)],
+        );
+        pixels.set_property("0", Value::Number(17.0));
+        let image_data = w3cos_core::web::image_data_value(pixels, 1, 1, "display-p3");
+        let buffer = w3cos_core::class::construct(
+            &w3cos_core::binary::array_buffer_class(),
+            vec![Value::Number(12.0)],
+        );
+        let words = w3cos_core::class::construct(
+            &w3cos_core::binary::typed_array_class("Uint16Array"),
+            vec![buffer.clone(), Value::Number(2.0), Value::Number(3.0)],
+        );
+        words.set_property("0", Value::Number(0x1234 as f64));
+        let data_view = w3cos_core::class::construct(
+            &w3cos_core::binary::data_view_class(),
+            vec![buffer.clone(), Value::Number(2.0), Value::Number(6.0)],
+        );
+        let shared_buffer = w3cos_core::class::construct(
+            &w3cos_core::binary::shared_array_buffer_class(),
+            vec![Value::Number(8.0)],
+        );
+        let shared_words = w3cos_core::class::construct(
+            &w3cos_core::binary::typed_array_class("Int32Array"),
+            vec![shared_buffer.clone()],
+        );
+        shared_words.set_property("0", Value::Number(41.0));
+        let encoded = value_to_json(&Value::object(HashMap::from([
+            ("map".to_string(), map),
+            ("set".to_string(), set),
+            ("regexp".to_string(), regexp),
+            ("blob".to_string(), blob),
+            ("file".to_string(), file),
+            ("bigint".to_string(), bigint),
+            (
+                "shared".to_string(),
+                Value::array(vec![shared.clone(), shared]),
+            ),
+            ("error".to_string(), error),
+            ("exception".to_string(), exception),
+            ("imageData".to_string(), image_data),
+            ("buffer".to_string(), buffer),
+            ("words".to_string(), words),
+            ("dataView".to_string(), data_view),
+            ("sharedBuffer".to_string(), shared_buffer),
+            ("sharedWords".to_string(), shared_words),
+        ])))
+        .expect("platform values should encode");
+        let cloned = json_to_value(encoded);
+
+        let cloned_map = cloned.get_property("map");
+        assert!(w3cos_core::class::instance_of(
+            &cloned_map,
+            &w3cos_core::collections::map_class()
+        ));
+        assert_eq!(
+            cloned_map.call_method("get", vec![Value::string("self")]),
+            cloned_map
+        );
+        assert!(
+            cloned
+                .get_property("set")
+                .call_method("has", vec![Value::string("item")])
+                .to_bool()
+        );
+        let cloned_regexp = cloned.get_property("regexp");
+        assert!(w3cos_core::class::instance_of(
+            &cloned_regexp,
+            &w3cos_core::regexp::regexp_class()
+        ));
+        assert_eq!(cloned_regexp.get_property("lastIndex").to_number(), 3.0);
+        assert_eq!(
+            cloned
+                .get_property("blob")
+                .call_method("text", vec![])
+                .to_js_string(),
+            "blob"
+        );
+        let cloned_file = cloned.get_property("file");
+        assert!(w3cos_core::class::instance_of(
+            &cloned_file,
+            &w3cos_core::web::file_class()
+        ));
+        assert_eq!(cloned_file.get_property("name").to_js_string(), "note.txt");
+        assert_eq!(cloned_file.get_property("lastModified").to_number(), 123.0);
+        assert_eq!(
+            cloned_file.call_method("text", vec![]).to_js_string(),
+            "file"
+        );
+        assert_eq!(
+            w3cos_core::bigint::get(&cloned.get_property("bigint"))
+                .expect("BigInt should retain its storage-clone type")
+                .to_string(),
+            "9007199254740993123456789"
+        );
+        assert_eq!(
+            cloned.get_property("shared").get_property("0"),
+            cloned.get_property("shared").get_property("1"),
+            "non-cyclic shared references must retain identity"
+        );
+        let cloned_error = cloned.get_property("error");
+        assert!(w3cos_core::class::instance_of(
+            &cloned_error,
+            &w3cos_core::error_class("TypeError")
+        ));
+        assert_eq!(cloned_error.get_property("cause"), cloned_error);
+        assert!(w3cos_core::class::instance_of(
+            &cloned.get_property("exception"),
+            &w3cos_core::web::dom_exception_class()
+        ));
+        assert_eq!(
+            cloned.get_property("exception").get_property("code"),
+            Value::Number(20.0)
+        );
+        let cloned_image = cloned.get_property("imageData");
+        assert!(w3cos_core::class::instance_of(
+            &cloned_image,
+            &w3cos_core::web::image_data_class()
+        ));
+        assert_eq!(
+            cloned_image.get_property("colorSpace").to_js_string(),
+            "display-p3"
+        );
+        assert_eq!(
+            cloned_image
+                .get_property("data")
+                .get_property("0")
+                .to_number(),
+            17.0
+        );
+        let cloned_buffer = cloned.get_property("buffer");
+        let cloned_words = cloned.get_property("words");
+        let cloned_view = cloned.get_property("dataView");
+        assert!(w3cos_core::class::instance_of(
+            &cloned_buffer,
+            &w3cos_core::binary::array_buffer_class()
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &cloned_words,
+            &w3cos_core::binary::typed_array_class("Uint16Array")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &cloned_view,
+            &w3cos_core::binary::data_view_class()
+        ));
+        assert_eq!(cloned_words.get_property("buffer"), cloned_buffer);
+        assert_eq!(cloned_view.get_property("buffer"), cloned_buffer);
+        assert_eq!(cloned_words.get_property("byteOffset").to_number(), 2.0);
+        assert_eq!(cloned_words.get_property("length").to_number(), 3.0);
+        assert_eq!(cloned_words.get_property("0").to_number(), 0x1234 as f64);
+        let cloned_shared = cloned.get_property("sharedBuffer");
+        let cloned_shared_words = cloned.get_property("sharedWords");
+        assert!(w3cos_core::class::instance_of(
+            &cloned_shared,
+            &w3cos_core::binary::shared_array_buffer_class()
+        ));
+        assert_eq!(cloned_shared_words.get_property("buffer"), cloned_shared);
+        assert_eq!(cloned_shared_words.get_property("0").to_number(), 41.0);
     }
 
     #[test]
@@ -2788,9 +3955,22 @@ mod tests {
         let get = read_store.call_method("get", vec![Value::from("one")]);
         let count = read_store.call_method("count", vec![]);
         let keys = read_store.call_method("getAllKeys", vec![]);
-        let indexed = read_store
-            .call_method("index", vec![Value::from("by_kind")])
-            .call_method("getAll", vec![Value::from("offline")]);
+        let index = read_store.call_method("index", vec![Value::from("by_kind")]);
+        let indexed = index.call_method("getAll", vec![Value::from("offline")]);
+        let records = read_store.call_method(
+            "getAllRecords",
+            vec![Value::object(HashMap::from([
+                ("count".into(), Value::Number(1.0)),
+                ("direction".into(), Value::from("prev")),
+            ]))],
+        );
+        let indexed_records = index.call_method(
+            "getAllRecords",
+            vec![Value::object(HashMap::from([
+                ("query".into(), Value::from("offline")),
+                ("count".into(), Value::Number(1.0)),
+            ]))],
+        );
         crate::jsdom::drain_microtasks();
         assert_eq!(
             get.get_property("result")
@@ -2801,6 +3981,26 @@ mod tests {
         assert_eq!(count.get_property("result").to_u32(), 2);
         assert_eq!(keys.get_property("result").iter().count(), 2);
         assert_eq!(indexed.get_property("result").iter().count(), 2);
+        let record = records.get_property("result").get_property("0");
+        assert!(w3cos_core::class::instance_of(
+            &record,
+            &interface_class("IDBRecord")
+        ));
+        assert_eq!(record.get_property("key").to_js_string(), "two");
+        assert_eq!(record.get_property("primaryKey").to_js_string(), "two");
+        assert_eq!(
+            record
+                .get_property("value")
+                .get_property("text")
+                .to_js_string(),
+            "queued"
+        );
+        let indexed_record = indexed_records.get_property("result").get_property("0");
+        assert_eq!(indexed_record.get_property("key").to_js_string(), "offline");
+        assert_eq!(
+            indexed_record.get_property("primaryKey").to_js_string(),
+            "one"
+        );
 
         let cleanup = database.call_method(
             "transaction",

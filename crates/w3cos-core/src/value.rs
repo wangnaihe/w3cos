@@ -83,6 +83,11 @@ impl JsFunction {
         self.props.borrow().contains_key(key)
     }
 
+    /// Own property names installed on this function object.
+    pub fn keys(&self) -> Vec<String> {
+        self.props.borrow().keys().cloned().collect()
+    }
+
     /// Assign a property on the function object.
     pub fn set_property(&self, key: &str, value: Value) {
         self.props.borrow_mut().insert(key.to_string(), value);
@@ -261,7 +266,15 @@ impl Value {
                 let elems: Vec<String> = arr.borrow().iter().map(|v| v.to_js_string()).collect();
                 elems.join(",")
             }
-            Value::Object(_) => "[object Object]".into(),
+            Value::Object(_) => {
+                let to_string = self.get_property("toString");
+                if to_string.is_function()
+                    && let Value::String(value) = to_string.call(self.clone(), vec![])
+                {
+                    return value;
+                }
+                "[object Object]".into()
+            }
             Value::Function(function) => {
                 let to_string = function.get_property("toString");
                 if matches!(to_string, Value::Function(_) | Value::Object(_)) {
@@ -547,6 +560,11 @@ impl Value {
                 Value::Function(function) => function.has_own_property(&property),
                 _ => false,
             });
+        }
+        if crate::binary::is_typed_array(self)
+            && let Some(result) = crate::binary::typed_array_call_method(self, key, args.clone())
+        {
+            return result;
         }
         if let Value::Array(values) = self
             && let Some(result) = array_call_method(values, key, args.clone(), self)
@@ -854,8 +872,17 @@ impl Value {
             // host runtime's snapshot hook as a fallback for its lightweight
             // built-in Map used by compiled React/native paths.
             Value::Object(object) => {
+                if let Some(values) = crate::binary::iter_typed_array(self) {
+                    return values.into_iter();
+                }
                 if let Some(values) = crate::collections::iter_collection(self) {
                     return values.into_iter();
+                }
+                let iterable_snapshot = object.borrow().get_direct("__w3cosIterableSnapshot");
+                if iterable_snapshot.is_function() {
+                    if let Value::Array(values) = iterable_snapshot.call(self.clone(), vec![]) {
+                        return values.borrow().clone().into_iter();
+                    }
                 }
                 // Monaco's command registry stores commands in its own
                 // LinkedList implementation. Generator lowering is still a

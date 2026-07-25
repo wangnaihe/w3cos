@@ -1627,15 +1627,10 @@ impl LowerCtx {
                     };
                     // Keep builtin special-cases (native Rust constructors).
                     if let Some(name) = &callee_name {
-                        let resolved = self.resolve_name(name);
                         // Map/Set/WeakMap/WeakSet are NOT special-cased: when
                         // unshadowed they resolve (below) to the
                         // w3cos_core::collections class values and go through
                         // class::construct like any other class.
-                        if resolved == "Error" {
-                            // `Error::new` returns the struct — unwrap the Value.
-                            return format!("{resolved}::new(vec![{args}]).0");
-                        }
                         // Unshadowed globals with dedicated core constructors.
                         if !self.is_name_shadowed(name) {
                             match name.as_str() {
@@ -1657,12 +1652,16 @@ impl LowerCtx {
                                         "w3cos_core::web::url_search_params_new(vec![{args}])"
                                     );
                                 }
-                                // Error family maps onto the Error builtin
-                                // (type tags are not modeled); `Error::new`
-                                // returns the struct, so unwrap the Value.
-                                "TypeError" | "SyntaxError" | "ReferenceError" | "EvalError"
-                                | "URIError" | "AggregateError" => {
-                                    return format!("Error::new(vec![{args}]).0");
+                                "URLPattern" => {
+                                    return format!(
+                                        "w3cos_core::web::url_pattern_new(vec![{args}])"
+                                    );
+                                }
+                                "Error" | "EvalError" | "RangeError" | "ReferenceError"
+                                | "SyntaxError" | "TypeError" | "URIError" | "AggregateError" => {
+                                    return format!(
+                                        "w3cos_core::class::construct(&w3cos_core::error_class({name:?}), vec![{args}])"
+                                    );
                                 }
                                 _ => {}
                             }
@@ -2776,10 +2775,7 @@ impl LowerCtx {
             }
             let is_static = !self.known_values.contains(&name)
                 && (self.renames.iter().any(|(local, _)| local == &name)
-                    || matches!(
-                        name.as_str(),
-                        "parseInt" | "parseFloat" | "RangeError" | "Error"
-                    ));
+                    || matches!(name.as_str(), "parseInt" | "parseFloat"));
             if !is_static {
                 return format!(
                     "{callee}.call(w3cos_core::Value::Undefined, {})",
@@ -4288,17 +4284,9 @@ fn global_value_expr(name: &str) -> Option<String> {
         "undefined" => "w3cos_core::Value::Undefined".to_string(),
         "NaN" => "w3cos_core::Value::Number(f64::NAN)".to_string(),
         "Infinity" => "w3cos_core::Value::Number(f64::INFINITY)".to_string(),
-        // `Error` as a value (`class X extends Error`, `e instanceof Error` —
-        // instanceof degrades to false): a constructor function value wrapping
-        // the builtin. `new Error(...)` and `Error(...)` are special-cased
-        // elsewhere and unaffected.
-        "Error" => {
-            "w3cos_core::Value::function(|_this, __args| w3cos_core::Error::new(__args).0)"
-                .to_string()
-        }
-        "RangeError" => {
-            "w3cos_core::Value::function(|_this, __args| w3cos_core::RangeError(__args))"
-                .to_string()
+        "Error" | "EvalError" | "RangeError" | "ReferenceError" | "SyntaxError"
+        | "TypeError" | "URIError" | "AggregateError" => {
+            format!("w3cos_core::error_class({name:?})")
         }
         // `Map` as a value: the real ES6 Map class (SameValueZero identity
         // keys, insertion order, prototype-linked instances so
@@ -4327,9 +4315,10 @@ fn global_value_expr(name: &str) -> Option<String> {
             "w3cos_runtime::jsdom::window_value()".to_string()
         }
         // Property globals: read off the jsdom window singleton.
-        "navigator" | "localStorage" | "sessionStorage" | "indexedDB" | "IDBKeyRange" | "performance" | "location"
-        | "visualViewport"
-        | "screen" | "crypto" | "navigation" | "reportError" | "setImmediate"
+        "navigator" | "localStorage" | "sessionStorage" | "indexedDB" | "IDBKeyRange" | "performance" | "location" | "history"
+        | "visualViewport" | "customElements" | "caches" | "scheduler" | "cookieStore"
+        | "trustedTypes"
+        | "screen" | "crypto" | "navigation" | "launchQueue" | "reportError" | "setImmediate"
         | "MessageChannel" | "__REACT_DEVTOOLS_GLOBAL_HOOK__" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
         }
@@ -4338,8 +4327,9 @@ fn global_value_expr(name: &str) -> Option<String> {
         // goes through the normal `Value::call` path).
         "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval" | "checkDCE"
         | "requestAnimationFrame" | "cancelAnimationFrame" | "queueMicrotask"
+        | "requestIdleCallback" | "cancelIdleCallback"
         | "matchMedia" | "getComputedStyle" | "getSelection" | "scrollTo"
-        | "scrollBy" | "scroll" => {
+        | "scrollBy" | "scroll" | "getScreenDetails" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
         }
         "atob" => {
@@ -4360,6 +4350,9 @@ fn global_value_expr(name: &str) -> Option<String> {
         "Promise" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"resolve\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::resolve(__args))), (\"reject\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::reject(__args))), (\"all\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::all(__args))), (\"race\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::race(__args)))]))".to_string(),
         "JSON" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"parse\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::json::parse(__args))), (\"stringify\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::json::stringify(__args)))]))".to_string(),
         "Intl" => "w3cos_core::web::intl_value()".to_string(),
+        "URL" => "w3cos_core::web::url_class()".to_string(),
+        "URLSearchParams" => "w3cos_core::web::url_search_params_class()".to_string(),
+        "URLPattern" => "w3cos_core::web::url_pattern_class()".to_string(),
         // `arguments` — the current fn's argument list as an array value.
         // Only valid where `__args` is in scope (lowered fns/closures).
         "arguments" => "w3cos_core::Value::array(__args.clone())".to_string(),
@@ -4389,7 +4382,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         "ArrayBuffer" => "w3cos_core::binary::array_buffer_class()".to_string(),
         "DataView" => "w3cos_core::binary::data_view_class()".to_string(),
         "Uint8Array" | "Uint8ClampedArray" | "Int8Array" | "Uint16Array"
-        | "Int16Array" | "Uint32Array" | "Int32Array" | "Float32Array"
+        | "Int16Array" | "Uint32Array" | "Int32Array" | "Float16Array" | "Float32Array"
         | "Float64Array" | "BigInt64Array" | "BigUint64Array" => {
             format!("w3cos_core::binary::typed_array_class({name:?})")
         }
@@ -4402,12 +4395,22 @@ fn global_value_expr(name: &str) -> Option<String> {
         }
         "Request" | "Response" | "Headers" | "AbortController" | "AbortSignal"
         | "TextEncoder" | "TextDecoder" | "Event" | "CustomEvent" | "EventTarget"
+        | "Observable" | "Subscriber"
         | "UIEvent" | "MouseEvent" | "KeyboardEvent" | "PointerEvent" | "WheelEvent"
         | "FocusEvent" | "InputEvent" | "CompositionEvent" | "ClipboardEvent"
-        | "DragEvent" | "TouchEvent" | "AnimationEvent" | "TransitionEvent" | "ErrorEvent"
-        | "ProgressEvent"
-        | "MessageEvent"
-        | "Node" | "Element" | "HTMLElement" | "HTMLAnchorElement" | "HTMLDivElement"
+        | "DragEvent" | "Touch" | "TouchList" | "TouchEvent" | "AnimationEvent" | "TransitionEvent" | "ErrorEvent"
+        | "ProgressEvent" | "MessageEvent" | "HashChangeEvent" | "PopStateEvent"
+        | "CloseEvent" | "BlobEvent" | "SubmitEvent" | "FormDataEvent"
+        | "ToggleEvent" | "CommandEvent" | "PageTransitionEvent"
+        | "PromiseRejectionEvent" | "SecurityPolicyViolationEvent"
+        | "TrackEvent" | "MediaStreamTrackEvent" | "StorageEvent"
+        | "MediaQueryListEvent"
+        | "Node" | "Attr" | "NamedNodeMap" | "Location" | "History" | "Storage"
+        | "Performance" | "PerformanceNavigation" | "PerformanceTiming"
+        | "Crypto" | "SubtleCrypto" | "DOMStringList" | "EventCounts" | "ValidityState"
+        | "CharacterData" | "Text" | "Comment"
+        | "DOMStringMap" | "DOMTokenList"
+        | "Document" | "Element" | "HTMLElement" | "HTMLAnchorElement" | "HTMLDivElement"
         | "HTMLSpanElement" | "HTMLButtonElement" | "HTMLInputElement"
         | "HTMLTextAreaElement" | "HTMLSelectElement" | "HTMLFormElement"
         | "HTMLImageElement" | "HTMLVideoElement" | "HTMLCanvasElement" | "SVGElement"
@@ -4415,19 +4418,89 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "SVGCircleElement" | "SVGEllipseElement" | "SVGLineElement"
         | "SVGPolylineElement" | "SVGPolygonElement" | "SVGTextElement"
         | "SVGDefsElement" | "SVGUseElement"
-        | "DocumentFragment" | "Range" | "Selection"
+        | "DocumentFragment" | "AbstractRange" | "Range" | "StaticRange"
+        | "Selection" | "TreeWalker" | "NodeIterator"
         | "Blob" | "File" | "FileReader" | "FormData"
         | "ImageData" | "Path2D" | "OffscreenCanvas" | "ResizeObserver"
-        | "MutationObserver" | "IntersectionObserver" | "PerformanceObserver"
-        | "EventSource" | "XMLHttpRequest" | "Notification" | "ClipboardItem"
-        | "DataTransfer" | "Worker" | "SharedWorker" | "MessagePort"
+        | "ResizeObserverEntry" | "ResizeObserverSize"
+        | "StyleSheet" | "StyleSheetList" | "MediaList"
+        | "Geolocation" | "GeolocationCoordinates" | "GeolocationPosition"
+        | "GeolocationPositionError"
+        | "VisualViewport"
+        | "MutationObserver" | "MutationRecord" | "IntersectionObserver" | "PerformanceObserver"
+        | "IntersectionObserverEntry"
+        | "PerformanceEntry" | "PerformanceMark" | "PerformanceMeasure"
+        | "PerformanceObserverEntryList"
+        | "PerformanceLongTaskTiming" | "TaskAttributionTiming"
+        | "VisibilityStateEntry"
+        | "EventSource" | "XMLHttpRequest" | "Notification" | "Clipboard" | "ClipboardItem"
+        | "DataTransfer" | "DataTransferItem" | "DataTransferItemList" | "FileList"
+        | "Worker" | "SharedWorker" | "MessagePort" | "BroadcastChannel"
+        | "CustomElementRegistry" | "Cache" | "CacheStorage" | "Lock" | "LockManager"
+        | "TaskController" | "TaskSignal" | "Report" | "ReportingObserver"
+        | "WakeLock" | "WakeLockSentinel" | "PermissionStatus" | "NetworkInformation"
+        | "Permissions" | "MediaDevices" | "Bluetooth" | "Scheduler"
+        | "StorageManager" | "UserActivation" | "MediaMetadata" | "MediaSession"
+        | "StorageBucketManager" | "StorageBucket"
+        | "BatteryManager"
+        | "MediaCapabilities"
+        | "Navigator" | "Plugin" | "PluginArray" | "MimeType" | "MimeTypeArray"
+        | "MIDIAccess" | "MIDIPort" | "MIDIInput" | "MIDIOutput"
+        | "MIDIInputMap" | "MIDIOutputMap" | "MIDIConnectionEvent" | "MIDIMessageEvent"
+        | "MediaKeyMessageEvent" | "MediaKeySession" | "MediaKeyStatusMap"
+        | "MediaKeySystemAccess" | "MediaKeys"
+        | "ServiceWorker" | "ServiceWorkerContainer" | "ServiceWorkerRegistration"
+        | "Serial" | "SerialPort" | "HID" | "HIDDevice" | "HIDInputReportEvent"
+        | "USB" | "USBDevice" | "USBConnectionEvent"
+        | "NDEFReader" | "NDEFMessage" | "NDEFRecord" | "NDEFReadingEvent"
+        | "Keyboard" | "KeyboardLayoutMap" | "VirtualKeyboard" | "DevicePosture"
+        | "WindowControlsOverlay" | "Scheduling"
+        | "Presentation" | "PresentationRequest" | "PresentationAvailability"
+        | "PresentationConnection" | "PresentationConnectionList" | "PresentationReceiver"
+        | "PresentationConnectionAvailableEvent" | "PresentationConnectionCloseEvent"
+        | "IdleDetector" | "EyeDropper"
+        | "CloseWatcher"
+        | "Navigation" | "NavigationHistoryEntry" | "NavigateEvent"
+        | "NavigationDestination"
+        | "NavigationCurrentEntryChangeEvent" | "NavigationTransition"
+        | "NavigationActivation"
+        | "LaunchQueue" | "LaunchParams"
+        | "ViewTransition" | "ViewTransitionTypeSet"
+        | "PageRevealEvent" | "PageSwapEvent"
+        | "BarcodeDetector"
+        | "Screen" | "ScreenOrientation" | "ScreenDetailed" | "ScreenDetails"
+        | "PressureObserver" | "PressureRecord"
+        | "FragmentDirective"
+        | "Credential" | "PasswordCredential" | "FederatedCredential"
+        | "CredentialsContainer"
+        | "Gamepad" | "GamepadButton" | "GamepadEvent"
+        | "DeviceOrientationEvent" | "DeviceMotionEvent"
+        | "Sensor" | "SensorErrorEvent" | "Accelerometer" | "Gyroscope" | "Magnetometer"
+        | "CookieStore" | "CookieChangeEvent" | "Sanitizer"
+        | "TrustedHTML" | "TrustedScript" | "TrustedScriptURL"
+        | "TrustedTypePolicy" | "TrustedTypePolicyFactory"
+        | "ReadableStream" | "ReadableStreamDefaultReader"
+        | "ReadableStreamDefaultController"
+        | "WritableStream" | "WritableStreamDefaultWriter"
+        | "WritableStreamDefaultController" | "TransformStream"
+        | "TransformStreamDefaultController"
+        | "CountQueuingStrategy" | "ByteLengthQueuingStrategy"
+        | "TextEncoderStream" | "TextDecoderStream"
+        | "CompressionStream" | "DecompressionStream"
+        | "IdleDeadline" | "FontFace" | "FontFaceSet"
+        | "IDBFactory" | "IDBRequest" | "IDBOpenDBRequest" | "IDBDatabase"
+        | "IDBTransaction" | "IDBObjectStore" | "IDBIndex" | "IDBCursor"
+        | "IDBCursorWithValue" | "IDBVersionChangeEvent"
         | "SpeechRecognition" | "webkitSpeechRecognition" | "MediaStream"
         | "MediaStreamTrack" | "MediaDeviceInfo" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
         }
         "DOMException"
-        | "DOMRect" | "DOMPoint" | "DOMMatrix" | "Report" | "Function"
-        | "ShadowRoot" | "NodeList" | "CSSStyleDeclaration" | "DOMParser"
+        | "DOMRect" | "DOMRectReadOnly" | "DOMRectList" | "DOMPoint" | "DOMPointReadOnly"
+        | "DOMQuad"
+        | "DOMMatrix" | "DOMMatrixReadOnly" | "Function"
+        | "ShadowRoot" | "NodeFilter" | "NodeList" | "HTMLCollection" | "MediaQueryList"
+        | "CSSStyleDeclaration" | "DOMParser"
         | "XMLSerializer" | "CSSStyleSheet" | "eval"
         | "escape" | "unescape" | "CSS" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
@@ -4443,26 +4516,18 @@ fn global_value_expr(name: &str) -> Option<String> {
         // Symbols use collision-resistant string sentinels in the compact
         // runtime. `Symbol.for(key)` must be stable because libraries such as
         // React use the global registry for element type identity.
-        "Symbol" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"iterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_iterator\")), (\"for\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::from(format!(\"__w3cos_symbol_for:{}\", __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string()))))]))".to_string(),
+        "Symbol" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"iterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_iterator\")), (\"asyncIterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_asyncIterator\")), (\"for\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::from(format!(\"__w3cos_symbol_for:{}\", __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string()))))]))".to_string(),
         // Unimplemented builtin globals: harmless empty-object stubs keep
         // references total (`new X()` yields Undefined via construct on a
         // non-callable; `X.y` yields Undefined).
-        // URL constructors are handled at `new` sites; bare values are stubs.
-        "URL" | "URLSearchParams"
         // CommonJS/Node artifacts that appear in UMD-wrapped sources.
-        | "require" | "module" | "exports" | "process" | "global" | "Buffer" | "__dirname"
+        "require" | "module" | "exports" | "process" | "global" | "Buffer" | "__dirname"
         | "__filename"
         // AMD (`define`/`define.amd`) and Worker (`importScripts`) globals:
         // object stubs make `typeof define === "function"` guards take the
         // false branch (the correct non-AMD/non-Worker path).
         | "define" | "importScripts" => {
             "w3cos_core::Value::object(::std::collections::HashMap::new()) /* builtin stub */"
-                .to_string()
-        }
-        // Error family as bare values (`instanceof` etc. evaluates to false).
-        "TypeError" | "SyntaxError" | "ReferenceError" | "EvalError" | "URIError"
-        | "AggregateError" => {
-            "w3cos_core::Value::object(::std::collections::HashMap::new()) /* error stub */"
                 .to_string()
         }
         _ => return None,

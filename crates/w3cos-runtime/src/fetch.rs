@@ -135,6 +135,48 @@ pub fn fetch_value(arguments: Vec<Value>) -> Value {
     } else {
         init.get_property("headers")
     };
+    let base_signal = if request_like {
+        input.get_property("signal")
+    } else {
+        Value::Undefined
+    };
+    let signal = if init.get_property("signal").is_undefined() {
+        base_signal
+    } else {
+        init.get_property("signal")
+    };
+    if signal.get_property("aborted").to_bool() {
+        let reason = signal.get_property("reason");
+        let reason = if reason.is_undefined() {
+            "The operation was aborted.".to_string()
+        } else {
+            reason.to_js_string()
+        };
+        eprintln!("W3COS warning: fetch was cancelled before native I/O: {reason}");
+        return fetch_error_value(&url, "AbortError", &reason);
+    }
+    if let Some((bytes, media_type)) = w3cos_core::web::object_url_resource(&url) {
+        let headers = if media_type.is_empty() {
+            Vec::new()
+        } else {
+            vec![("content-type".into(), media_type)]
+        };
+        return response_from_bytes(
+            bytes,
+            200,
+            "OK".into(),
+            headers_value_from_list(Rc::new(RefCell::new(headers))),
+            url,
+            "basic".into(),
+        );
+    }
+    if url.starts_with("blob:w3cos/") {
+        return fetch_error_value(
+            &url,
+            "NetworkError",
+            "the object URL has been revoked or does not exist",
+        );
+    }
     let multipart = crate::form_data::serialize(&body);
     let mut options = FetchOptions {
         method: parse_method(&method.to_js_string()),
@@ -157,6 +199,11 @@ pub fn fetch_value(arguments: Vec<Value>) -> Value {
     let timeout = init.get_property("timeout");
     if timeout.is_number() {
         options.timeout_ms = Some(timeout.to_number().max(0.0) as u64);
+    } else {
+        let signal_timeout = signal.get_property("__w3cos_timeout_ms");
+        if signal_timeout.is_number() {
+            options.timeout_ms = Some(signal_timeout.to_number().max(0.0) as u64);
+        }
     }
 
     response_value(fetch(&url, options), url)
@@ -372,10 +419,27 @@ fn headers_value_from_list(list: HeaderList) -> Value {
 }
 
 pub fn headers_class() -> Value {
-    Value::function(|_, args| {
+    let class = Value::function(|_, args| {
         let init = args.first().cloned().unwrap_or(Value::Undefined);
         headers_value_from_list(collect_header_init(&init))
-    })
+    });
+    let prototype = Value::object(HashMap::from([("constructor".into(), class.clone())]));
+    for method in [
+        "append",
+        "delete",
+        "entries",
+        "forEach",
+        "get",
+        "getSetCookie",
+        "has",
+        "keys",
+        "set",
+        "values",
+    ] {
+        prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+    }
+    class.set_property("prototype", prototype);
+    class
 }
 
 fn headers_to_map(headers: &Value) -> HashMap<String, String> {
@@ -394,7 +458,33 @@ fn response_from_parts(
     url: String,
     response_type: String,
 ) -> Value {
+    response_from_bytes(
+        body.into_bytes(),
+        status,
+        status_text,
+        headers,
+        url,
+        response_type,
+    )
+}
+
+fn response_from_bytes(
+    body: Vec<u8>,
+    status: u16,
+    status_text: String,
+    headers: Value,
+    url: String,
+    response_type: String,
+) -> Value {
     let body_used = Rc::new(Cell::new(false));
+    let body_used_for_stream = Rc::clone(&body_used);
+    let body_stream = crate::streams_web::from_bytes(
+        body.clone(),
+        Value::function(move |_, _| {
+            body_used_for_stream.set(true);
+            Value::Undefined
+        }),
+    );
     let ok = (200..300).contains(&status);
     let mut props = HashMap::from([
         ("status".into(), Value::Number(status as f64)),
@@ -404,14 +494,14 @@ fn response_from_parts(
         ("url".into(), Value::from(url.clone())),
         ("type".into(), Value::from(response_type.clone())),
         ("redirected".into(), Value::Bool(false)),
-        ("body".into(), Value::Null),
+        ("body".into(), body_stream),
     ]);
     let body_used_getter = Rc::clone(&body_used);
     props.insert(
         "__w3cos_getter_bodyUsed".into(),
         Value::function(move |_, _| Value::Bool(body_used_getter.get())),
     );
-    let text_body = body.clone();
+    let text_body = String::from_utf8_lossy(&body).into_owned();
     let text_used = Rc::clone(&body_used);
     props.insert(
         "text".into(),
@@ -420,7 +510,7 @@ fn response_from_parts(
             Value::from(text_body.clone())
         }),
     );
-    let json_body = body.clone();
+    let json_body = String::from_utf8_lossy(&body).into_owned();
     let json_used = Rc::clone(&body_used);
     props.insert(
         "json".into(),
@@ -429,25 +519,20 @@ fn response_from_parts(
             w3cos_core::json::parse(vec![Value::from(json_body.clone())])
         }),
     );
-    let bytes = body.as_bytes().to_vec();
+    let bytes = body.clone();
     let bytes_used = Rc::clone(&body_used);
     props.insert(
         "arrayBuffer".into(),
         Value::function(move |_, _| {
             bytes_used.set(true);
-            Value::array(
-                bytes
-                    .iter()
-                    .map(|byte| Value::Number(*byte as f64))
-                    .collect(),
-            )
+            w3cos_core::binary::array_buffer_value(bytes.clone())
         }),
     );
     let clone_body = body;
     props.insert(
         "clone".into(),
         Value::function(move |_, _| {
-            response_from_parts(
+            response_from_bytes(
                 clone_body.clone(),
                 status,
                 status_text.clone(),
@@ -472,6 +557,17 @@ fn response_value(response: FetchResponse, url: String) -> Value {
     )));
     let body = response.text().unwrap_or_default();
     response_from_parts(body, status, status_text, headers, url, "basic".into())
+}
+
+fn fetch_error_value(url: &str, name: &str, message: &str) -> Value {
+    response_from_parts(
+        String::new(),
+        0,
+        format!("{name}: {message}"),
+        headers_value_from_list(Rc::new(RefCell::new(Vec::new()))),
+        url.to_string(),
+        "error".into(),
+    )
 }
 
 pub fn response_class() -> Value {
@@ -562,6 +658,28 @@ pub fn response_class() -> Value {
             )
         }),
     );
+    let prototype = Value::object(HashMap::from([("constructor".into(), constructor.clone())]));
+    for member in [
+        "arrayBuffer",
+        "blob",
+        "body",
+        "bodyUsed",
+        "bytes",
+        "clone",
+        "formData",
+        "headers",
+        "json",
+        "ok",
+        "redirected",
+        "status",
+        "statusText",
+        "text",
+        "type",
+        "url",
+    ] {
+        prototype.set_property(member, Value::Undefined);
+    }
+    constructor.set_property("prototype", prototype);
     constructor
 }
 
@@ -665,18 +783,56 @@ fn request_value(input: Value, init: Value) -> Value {
 }
 
 pub fn request_class() -> Value {
-    Value::function(|_, args| {
+    let class = Value::function(|_, args| {
         request_value(
             args.first().cloned().unwrap_or(Value::Undefined),
             args.get(1).cloned().unwrap_or(Value::Undefined),
         )
-    })
+    });
+    let prototype = Value::object(HashMap::from([("constructor".into(), class.clone())]));
+    for member in [
+        "arrayBuffer",
+        "blob",
+        "body",
+        "bodyUsed",
+        "bytes",
+        "cache",
+        "clone",
+        "credentials",
+        "destination",
+        "duplex",
+        "formData",
+        "headers",
+        "integrity",
+        "isHistoryNavigation",
+        "isReloadNavigation",
+        "json",
+        "keepalive",
+        "method",
+        "mode",
+        "redirect",
+        "referrer",
+        "referrerPolicy",
+        "signal",
+        "targetAddressSpace",
+        "text",
+        "url",
+    ] {
+        prototype.set_property(member, Value::Undefined);
+    }
+    class.set_property("prototype", prototype);
+    class
 }
 
 struct AbortState {
     aborted: Cell<bool>,
     reason: RefCell<Value>,
     listeners: RefCell<Vec<Value>>,
+}
+
+thread_local! {
+    static ABORT_CONTROLLER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static ABORT_SIGNAL_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 fn abort_signal_value(state: Rc<AbortState>) -> Value {
@@ -716,7 +872,19 @@ fn abort_signal_value(state: Rc<AbortState>) -> Value {
             Value::Undefined
         }),
     );
-    Value::object(props)
+    let throw_state = Rc::clone(&state);
+    props.insert(
+        "throwIfAborted".into(),
+        Value::function(move |_, _| {
+            if throw_state.aborted.get() {
+                w3cos_core::throw_value(throw_state.reason.borrow().clone());
+            }
+            Value::Undefined
+        }),
+    );
+    let signal = Value::object(props);
+    w3cos_core::class::set_prototype_of(&signal, &abort_signal_class().get_property("prototype"));
+    signal
 }
 
 fn abort_state(state: &Rc<AbortState>, signal: &Value, reason: Value) {
@@ -739,33 +907,61 @@ fn abort_state(state: &Rc<AbortState>, signal: &Value, reason: Value) {
 }
 
 pub fn abort_controller_class() -> Value {
-    Value::function(|_, _| {
-        let state = Rc::new(AbortState {
-            aborted: Cell::new(false),
-            reason: RefCell::new(Value::Undefined),
-            listeners: RefCell::new(Vec::new()),
+    ABORT_CONTROLLER_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            let state = Rc::new(AbortState {
+                aborted: Cell::new(false),
+                reason: RefCell::new(Value::Undefined),
+                listeners: RefCell::new(Vec::new()),
+            });
+            let signal = abort_signal_value(Rc::clone(&state));
+            let signal_for_abort = signal.clone();
+            let controller = Value::object(HashMap::from([
+                ("signal".into(), signal),
+                (
+                    "abort".into(),
+                    Value::function(move |_, args| {
+                        let reason = args
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| Value::from("AbortError"));
+                        abort_state(&state, &signal_for_abort, reason);
+                        Value::Undefined
+                    }),
+                ),
+            ]));
+            w3cos_core::class::set_prototype_of(
+                &controller,
+                &abort_controller_class().get_property("prototype"),
+            );
+            controller
         });
-        let signal = abort_signal_value(Rc::clone(&state));
-        let signal_for_abort = signal.clone();
-        Value::object(HashMap::from([
-            ("signal".into(), signal),
-            (
-                "abort".into(),
-                Value::function(move |_, args| {
-                    let reason = args
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| Value::from("AbortError"));
-                    abort_state(&state, &signal_for_abort, reason);
-                    Value::Undefined
-                }),
-            ),
-        ]))
+        class.set_property("name", Value::string("AbortController"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property("abort", Value::function(|_, _| Value::Undefined));
+        prototype.set_property("signal", Value::Undefined);
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
     })
 }
 
 pub fn abort_signal_class() -> Value {
-    let class = Value::function(|_, _| Value::Undefined);
+    ABORT_SIGNAL_CLASS.with(|slot| {
+    if let Some(class) = slot.borrow().clone() {
+        return class;
+    }
+    let class = Value::function(|_, _| {
+        w3cos_core::throw_value(w3cos_core::error_instance(
+            "TypeError",
+            vec![Value::string("Illegal constructor: AbortSignal")],
+        ))
+    });
+    class.set_property("name", Value::string("AbortSignal"));
     class.set_property(
         "abort",
         Value::function(|_, args| {
@@ -785,7 +981,82 @@ pub fn abort_signal_class() -> Value {
             signal
         }),
     );
+    class.set_property(
+        "timeout",
+        Value::function(|_, args| {
+            static TIMEOUT_WARNING: std::sync::Once = std::sync::Once::new();
+            TIMEOUT_WARNING.call_once(|| {
+                eprintln!(
+                    "W3COS warning: AbortSignal.timeout is enforced by fetch; \
+                     standalone signal timer delivery is not available in the synchronous AOT runtime"
+                );
+            });
+            let timeout_ms = args.first().map(Value::to_number).unwrap_or(0.0).max(0.0);
+            let state = Rc::new(AbortState {
+                aborted: Cell::new(false),
+                reason: RefCell::new(Value::Undefined),
+                listeners: RefCell::new(Vec::new()),
+            });
+            let signal = abort_signal_value(state);
+            signal.set_property("__w3cos_timeout_ms", Value::Number(timeout_ms));
+            signal
+        }),
+    );
+    class.set_property(
+        "any",
+        Value::function(|_, args| {
+            let state = Rc::new(AbortState {
+                aborted: Cell::new(false),
+                reason: RefCell::new(Value::Undefined),
+                listeners: RefCell::new(Vec::new()),
+            });
+            let signal = abort_signal_value(Rc::clone(&state));
+            let sources = args.first().cloned().unwrap_or(Value::Undefined);
+            if let Value::Array(sources) = sources {
+                for source in sources.borrow().iter().cloned() {
+                    if source.get_property("aborted").to_bool() {
+                        abort_state(&state, &signal, source.get_property("reason"));
+                        break;
+                    }
+                    let aggregate_state = Rc::clone(&state);
+                    let aggregate_signal = signal.clone();
+                    let source_for_reason = source.clone();
+                    source.call_method(
+                        "addEventListener",
+                        vec![
+                            Value::from("abort"),
+                            Value::function(move |_, _| {
+                                abort_state(
+                                    &aggregate_state,
+                                    &aggregate_signal,
+                                    source_for_reason.get_property("reason"),
+                                );
+                                Value::Undefined
+                            }),
+                        ],
+                    );
+                }
+            }
+            signal
+        }),
+    );
+    let prototype = Value::object(HashMap::new());
+    prototype.set_property("constructor", class.clone());
+    for property in ["aborted", "onabort", "reason"] {
+        prototype.set_property(property, Value::Undefined);
+    }
+    prototype.set_property(
+        "throwIfAborted",
+        Value::function(|_, _| Value::Undefined),
+    );
+    w3cos_core::class::set_prototype_of(
+        &prototype,
+        &crate::web_events::event_target_class().get_property("prototype"),
+    );
+    class.set_property("prototype", prototype);
+    *slot.borrow_mut() = Some(class.clone());
     class
+    })
 }
 
 fn build_agent(options: &FetchOptions) -> ureq::Agent {
@@ -1053,6 +1324,117 @@ mod tests {
         assert!(signal.get_property("aborted").to_bool());
         assert_eq!(signal.get_property("reason").to_js_string(), "stopped");
         assert!(called.get());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                signal.call_method("throwIfAborted", vec![]);
+            }))
+            .is_err()
+        );
+
+        let second = w3cos_core::class::construct(&abort_controller_class(), vec![]);
+        let second_signal = second.get_property("signal");
+        let abort_signal = abort_signal_class();
+        let aggregate = abort_signal.call_method(
+            "any",
+            vec![Value::array(vec![signal.clone(), second_signal])],
+        );
+        assert!(aggregate.get_property("aborted").to_bool());
+        assert_eq!(aggregate.get_property("reason").to_js_string(), "stopped");
+
+        let later = w3cos_core::class::construct(&abort_controller_class(), vec![]);
+        let propagated = abort_signal.call_method(
+            "any",
+            vec![Value::array(vec![later.get_property("signal")])],
+        );
+        assert!(!propagated.get_property("aborted").to_bool());
+        later.call_method("abort", vec![Value::from("later")]);
+        assert!(propagated.get_property("aborted").to_bool());
+        assert_eq!(propagated.get_property("reason").to_js_string(), "later");
+
+        let timeout = abort_signal.call_method("timeout", vec![Value::Number(125.0)]);
+        assert!(!timeout.get_property("aborted").to_bool());
+        assert_eq!(
+            timeout.get_property("__w3cos_timeout_ms").to_number(),
+            125.0
+        );
+    }
+
+    #[test]
+    fn request_signal_is_inherited_and_pre_aborted_fetch_skips_io() {
+        let controller = w3cos_core::class::construct(&abort_controller_class(), vec![]);
+        let signal = controller.get_property("signal");
+        let request = w3cos_core::class::construct(
+            &request_class(),
+            vec![
+                Value::from("https://network-must-not-run.invalid/"),
+                Value::object(HashMap::from([("signal".into(), signal.clone())])),
+            ],
+        );
+        controller.call_method("abort", vec![Value::from("cancelled")]);
+
+        let inherited =
+            w3cos_core::class::construct(&request_class(), vec![request.clone(), Value::Undefined]);
+        assert!(
+            inherited
+                .get_property("signal")
+                .get_property("aborted")
+                .to_bool()
+        );
+
+        let response = fetch_value(vec![inherited]);
+        assert_eq!(response.get_property("status").to_number(), 0.0);
+        assert_eq!(response.get_property("type").to_js_string(), "error");
+        assert_eq!(
+            response.get_property("statusText").to_js_string(),
+            "AbortError: cancelled"
+        );
+    }
+
+    #[test]
+    fn fetch_resolves_blob_object_urls_and_revoke_invalidates_them() {
+        let bytes = w3cos_core::binary::typed_array_value(vec![
+            Value::Number(0.0),
+            Value::Number(0xff as f64),
+            Value::Number(0x41 as f64),
+        ]);
+        let blob = w3cos_core::class::construct(
+            &w3cos_core::web::blob_class(),
+            vec![
+                Value::array(vec![bytes]),
+                Value::object(HashMap::from([(
+                    "type".into(),
+                    Value::from("application/octet-stream"),
+                )])),
+            ],
+        );
+        let url_class = w3cos_core::web::url_class();
+        let url = url_class
+            .call_method("createObjectURL", vec![blob])
+            .to_js_string();
+        let response = fetch_value(vec![Value::from(url.clone())]);
+        assert_eq!(response.get_property("status").to_u32(), 200);
+        assert_eq!(
+            response
+                .get_property("headers")
+                .call_method("get", vec![Value::from("content-type")])
+                .to_js_string(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            w3cos_core::binary::bytes_of(&response.call_method("arrayBuffer", vec![])),
+            Some(vec![0, 0xff, 0x41])
+        );
+
+        url_class.call_method("revokeObjectURL", vec![Value::from(url.clone())]);
+        let revoked = fetch_value(vec![Value::from(url)]);
+        assert_eq!(revoked.get_property("status").to_u32(), 0);
+        assert_eq!(revoked.get_property("type").to_js_string(), "error");
+        assert!(
+            revoked
+                .get_property("statusText")
+                .to_js_string()
+                .starts_with("NetworkError:")
+        );
     }
 
     #[test]

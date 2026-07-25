@@ -135,6 +135,11 @@ pub fn mobile_build(
             "--platform all is available for `mobile init` only; build android|ios|harmony|both explicitly"
         );
     }
+    if platform == "both" {
+        mobile_build(project_dir, "android", release, devtools)?;
+        mobile_build(project_dir, "ios", release, devtools)?;
+        return Ok(());
+    }
     let (_, _, entry, safe_area, interactive_widget, _) = read_app_manifest(project_dir);
     let app_tsx = project_dir.join(&entry);
     if !app_tsx.exists() {
@@ -160,16 +165,12 @@ pub fn mobile_build(
         &interactive_widget,
         &CompileOptions { devtools },
     )?;
-    apply_native_extensions(project_dir, &build_dir)?;
+    apply_native_extensions(project_dir, &build_dir, platform)?;
 
     match platform {
         "android" => build_android(project_dir, &build_dir, release)?,
         "ios" => build_ios(project_dir, &build_dir, release)?,
         "harmony" => build_harmony(project_dir, &build_dir, release)?,
-        "both" => {
-            build_android(project_dir, &build_dir, release)?;
-            build_ios(project_dir, &build_dir, release)?;
-        }
         other => bail!("unknown platform: {other} (use android|ios|harmony|both)"),
     }
 
@@ -763,9 +764,27 @@ fn safe_rust_path(value: &str) -> bool {
         })
 }
 
+fn manifest_entry_supports_platform(entry: &serde_json::Value, platform: &str) -> Result<bool> {
+    let Some(platforms) = entry.get("platforms") else {
+        return Ok(true);
+    };
+    let platforms = platforms
+        .as_array()
+        .context("manifest entry platforms must be an array")?;
+    platforms.iter().try_fold(false, |supported, value| {
+        let declared = value
+            .as_str()
+            .context("manifest entry platform must be a string")?;
+        if !matches!(declared, "android" | "ios" | "harmony") {
+            bail!("unsupported manifest entry platform: {declared}");
+        }
+        Ok(supported || declared == platform)
+    })
+}
+
 /// Adds application-owned Rust adapters after generic mobile UI code generation.
 /// W3COS only validates and wires the declared dependency + initializer.
-fn apply_native_extensions(project_dir: &Path, build_dir: &Path) -> Result<()> {
+fn apply_native_extensions(project_dir: &Path, build_dir: &Path, platform: &str) -> Result<()> {
     let Some(manifest) = manifest_json(project_dir) else {
         return Ok(());
     };
@@ -778,6 +797,9 @@ fn apply_native_extensions(project_dir: &Path, build_dir: &Path) -> Result<()> {
     let mut dependencies = String::new();
     let mut registrations = String::new();
     for extension in extensions {
+        if !manifest_entry_supports_platform(extension, platform)? {
+            continue;
+        }
         let package = extension
             .get("package")
             .and_then(|value| value.as_str())
@@ -972,6 +994,34 @@ fn write_ios_plist(
     );
     fs::write(path, content)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::manifest_entry_supports_platform;
+    use serde_json::json;
+
+    #[test]
+    fn native_manifest_entries_can_be_scoped_to_one_mobile_platform() {
+        let ios_only = json!({"platforms": ["ios"]});
+        assert!(manifest_entry_supports_platform(&ios_only, "ios").unwrap());
+        assert!(!manifest_entry_supports_platform(&ios_only, "android").unwrap());
+        assert!(!manifest_entry_supports_platform(&ios_only, "harmony").unwrap());
+        assert!(
+            manifest_entry_supports_platform(&json!({"package": "portable"}), "android").unwrap()
+        );
+    }
+
+    #[test]
+    fn native_manifest_entries_reject_unknown_platforms() {
+        let error = manifest_entry_supports_platform(&json!({"platforms": ["desktop"]}), "ios")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported manifest entry platform")
+        );
+    }
 }
 
 fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> {

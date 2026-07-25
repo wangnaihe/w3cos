@@ -236,6 +236,20 @@ pub fn event_source_class() -> Value {
         }
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
+        for (name, value) in [
+            ("CONNECTING", Value::Number(0.0)),
+            ("OPEN", Value::Number(1.0)),
+            ("CLOSED", Value::Number(2.0)),
+            ("close", Value::Undefined),
+            ("onerror", Value::Undefined),
+            ("onmessage", Value::Undefined),
+            ("onopen", Value::Undefined),
+            ("readyState", Value::Undefined),
+            ("url", Value::Undefined),
+            ("withCredentials", Value::Undefined),
+        ] {
+            prototype.set_property(name, value);
+        }
         w3cos_core::class::set_prototype_of(
             &prototype,
             &crate::web_events::event_target_class().get_property("prototype"),

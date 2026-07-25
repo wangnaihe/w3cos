@@ -60,6 +60,97 @@ pub fn replace_state(state: Option<&str>, title: &str, url: &str) {
     mark_dirty();
 }
 
+fn finish_location_navigation(old_url: String, old_hash: String) {
+    let (new_url, new_hash) = STORE.with(|store| {
+        let store = store.borrow();
+        (store.location.href(), store.location.hash().to_string())
+    });
+    if old_hash != new_hash {
+        fire_hashchange(old_url, new_url);
+    }
+}
+
+/// Navigate `window.location` to a new session-history entry.
+pub fn location_assign(url: &str) {
+    let (old_url, old_hash) = STORE.with(|store| {
+        let store = store.borrow();
+        (store.location.href(), store.location.hash().to_string())
+    });
+    push_state(None, "", url);
+    finish_location_navigation(old_url, old_hash);
+}
+
+/// Navigate `window.location` while replacing the current history entry.
+pub fn location_replace(url: &str) {
+    let (old_url, old_hash) = STORE.with(|store| {
+        let store = store.borrow();
+        (store.location.href(), store.location.hash().to_string())
+    });
+    replace_state(None, "", url);
+    finish_location_navigation(old_url, old_hash);
+}
+
+/// Set a writable Location URL component and create a navigation entry.
+pub fn set_location_component(component: &str, value: &str) {
+    let mut protocol = get_protocol();
+    let mut hostname = get_hostname();
+    let mut port = get_port();
+    let mut pathname = get_pathname();
+    let mut search = get_search();
+    let mut hash = get_hash();
+    match component {
+        "protocol" => {
+            protocol = if value.ends_with(':') {
+                value.to_string()
+            } else {
+                format!("{value}:")
+            };
+        }
+        "host" => {
+            if let Some((new_hostname, new_port)) = value.rsplit_once(':') {
+                hostname = new_hostname.to_string();
+                port = new_port.to_string();
+            } else {
+                hostname = value.to_string();
+                port.clear();
+            }
+        }
+        "hostname" => hostname = value.to_string(),
+        "port" => port = value.to_string(),
+        "pathname" => {
+            pathname = if value.starts_with('/') {
+                value.to_string()
+            } else {
+                format!("/{value}")
+            };
+        }
+        "search" => {
+            search = if value.is_empty() || value.starts_with('?') {
+                value.to_string()
+            } else {
+                format!("?{value}")
+            };
+        }
+        "hash" => {
+            hash = if value.is_empty() || value.starts_with('#') {
+                value.to_string()
+            } else {
+                format!("#{value}")
+            };
+        }
+        _ => return,
+    }
+    let authority = if port.is_empty() {
+        hostname
+    } else {
+        format!("{hostname}:{port}")
+    };
+    let target = format!("{protocol}//{authority}{pathname}{search}{hash}");
+    if target != get_href() {
+        location_assign(&target);
+    }
+}
+
 pub fn back() -> bool {
     let (navigated, state_val) = STORE.with(|s| {
         let mut store = s.borrow_mut();
@@ -185,7 +276,6 @@ pub fn can_go_back() -> bool {
     STORE.with(|s| s.borrow().history.can_go_back())
 }
 
-#[allow(dead_code)]
 fn fire_hashchange(old_url: String, new_url: String) {
     STORE.with(|s| {
         let store = s.borrow();
@@ -193,6 +283,7 @@ fn fire_hashchange(old_url: String, new_url: String) {
             handler(old_url.clone(), new_url.clone());
         }
     });
+    crate::jsdom::dispatch_native_hashchange(&old_url, &new_url);
 }
 
 /// Reset the history store (for testing or between app sessions).

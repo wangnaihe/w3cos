@@ -57,8 +57,11 @@ impl SerializedDocument {
             w3cos_dom::node::NodeType::Document => 9,
             w3cos_dom::node::NodeType::Element => 1,
             w3cos_dom::node::NodeType::Text => 3,
+            w3cos_dom::node::NodeType::CdataSection => 4,
+            w3cos_dom::node::NodeType::ProcessingInstruction => 7,
             w3cos_dom::node::NodeType::DocumentFragment => 11,
             w3cos_dom::node::NodeType::Comment => 8,
+            w3cos_dom::node::NodeType::DocumentType => 10,
         };
 
         let attrs: Vec<(String, String)> = node

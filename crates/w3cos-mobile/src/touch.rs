@@ -4,6 +4,9 @@
 //! `w3cos_dom::events` and feed the runtime hit-test pipeline.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Once;
+
+static DISPATCH_WARNING: Once = Once::new();
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct TouchPoint {
@@ -28,8 +31,14 @@ pub struct TouchEvent {
 }
 
 impl TouchEvent {
-    /// Placeholder — wired to DOM dispatch in M1 follow-up.
+    /// Compatibility placeholder for platform shells that still submit this
+    /// legacy DTO instead of using the runtime's native pointer adapter.
     pub fn dispatch(&self) {
-        let _ = self;
+        DISPATCH_WARNING.call_once(|| {
+            eprintln!(
+                "W3COS warning: w3cos-mobile TouchEvent::dispatch() is not connected to a DOM \
+                 surface; use the runtime native touch adapter for PointerEvent/TouchEvent dispatch"
+            );
+        });
     }
 }

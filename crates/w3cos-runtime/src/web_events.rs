@@ -12,6 +12,9 @@ thread_local! {
     static CUSTOM_EVENT_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static EVENT_TARGET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static EVENT_SUBCLASSES: RefCell<Option<HashMap<String, Value>>> = const { RefCell::new(None) };
+    static TOUCH_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static TOUCH_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static INPUT_DEVICE_CAPABILITIES_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 pub const EVENT_SUBCLASS_NAMES: &[&str] = &[
@@ -31,7 +34,162 @@ pub const EVENT_SUBCLASS_NAMES: &[&str] = &[
     "ErrorEvent",
     "ProgressEvent",
     "MessageEvent",
+    "HashChangeEvent",
+    "PopStateEvent",
+    "CloseEvent",
+    "BlobEvent",
+    "SubmitEvent",
+    "FormDataEvent",
+    "ToggleEvent",
+    "CommandEvent",
+    "PageTransitionEvent",
+    "PromiseRejectionEvent",
+    "SecurityPolicyViolationEvent",
+    "TrackEvent",
+    "MediaStreamTrackEvent",
+    "StorageEvent",
+    "MediaQueryListEvent",
+    "AnimationPlaybackEvent",
+    "AudioProcessingEvent",
+    "BeforeInstallPromptEvent",
+    "BeforeUnloadEvent",
+    "CharacterBoundsUpdateEvent",
+    "ClipboardChangeEvent",
+    "ContentVisibilityAutoStateChangeEvent",
+    "DocumentPictureInPictureEvent",
+    "FontFaceSetLoadEvent",
+    "GPUUncapturedErrorEvent",
+    "HIDConnectionEvent",
+    "InterestEvent",
+    "MediaEncryptedEvent",
+    "MediaStreamEvent",
+    "OfflineAudioCompletionEvent",
+    "PaymentMethodChangeEvent",
+    "PaymentRequestUpdateEvent",
+    "PictureInPictureEvent",
+    "RTCDTMFToneChangeEvent",
+    "RTCDataChannelEvent",
+    "RTCErrorEvent",
+    "RTCPeerConnectionIceErrorEvent",
+    "RTCPeerConnectionIceEvent",
+    "RTCTrackEvent",
+    "SnapEvent",
+    "SpeechRecognitionErrorEvent",
+    "SpeechRecognitionEvent",
+    "SpeechSynthesisErrorEvent",
+    "SpeechSynthesisEvent",
+    "TaskPriorityChangeEvent",
+    "TextEvent",
+    "TextFormatUpdateEvent",
+    "TextUpdateEvent",
+    "VirtualKeyboardGeometryChangeEvent",
+    "WebGLContextEvent",
+    "WindowControlsOverlayGeometryChangeEvent",
+    "XRInputSourceEvent",
+    "XRInputSourcesChangeEvent",
+    "XRLayerEvent",
+    "XRReferenceSpaceEvent",
+    "XRSessionEvent",
+    "XRVisibilityMaskChangeEvent",
 ];
+
+pub fn touch_class() -> Value {
+    TOUCH_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|this, args| {
+            let init = arg(&args, 0);
+            install_fields(
+                &this,
+                &init,
+                &[
+                    ("identifier", Value::Number(0.0)),
+                    ("target", Value::Null),
+                    ("screenX", Value::Number(0.0)),
+                    ("screenY", Value::Number(0.0)),
+                    ("clientX", Value::Number(0.0)),
+                    ("clientY", Value::Number(0.0)),
+                    ("pageX", Value::Number(0.0)),
+                    ("pageY", Value::Number(0.0)),
+                    ("radiusX", Value::Number(0.0)),
+                    ("radiusY", Value::Number(0.0)),
+                    ("rotationAngle", Value::Number(0.0)),
+                    ("force", Value::Number(0.0)),
+                ],
+            );
+            Value::Undefined
+        });
+        class.set_property("name", Value::string("Touch"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for member in [
+            "clientX",
+            "clientY",
+            "force",
+            "identifier",
+            "pageX",
+            "pageY",
+            "radiusX",
+            "radiusY",
+            "rotationAngle",
+            "screenX",
+            "screenY",
+            "target",
+        ] {
+            prototype.set_property(member, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+pub fn touch_list_class() -> Value {
+    TOUCH_LIST_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(Value::object(HashMap::from([
+                ("name".into(), Value::string("TypeError")),
+                (
+                    "message".into(),
+                    Value::string("Illegal constructor: TouchList"),
+                ),
+            ])))
+        });
+        class.set_property("name", Value::string("TouchList"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        prototype.set_property("item", Value::Undefined);
+        prototype.set_property("length", Value::Undefined);
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+pub fn touch_list_value(input: Value) -> Value {
+    if w3cos_core::class::instance_of(&input, &touch_list_class()) {
+        return input;
+    }
+    let items = input.iter().collect::<Vec<_>>();
+    let mut properties = HashMap::from([("length".to_string(), Value::Number(items.len() as f64))]);
+    for (index, item) in items.iter().enumerate() {
+        properties.insert(index.to_string(), item.clone());
+    }
+    properties.insert(
+        "item".into(),
+        Value::function(move |_, args| {
+            let index = args.first().cloned().unwrap_or_default().to_u32() as usize;
+            items.get(index).cloned().unwrap_or(Value::Null)
+        }),
+    );
+    let value = Value::object(properties);
+    w3cos_core::class::set_prototype_of(&value, &touch_list_class().get_property("prototype"));
+    value
+}
 
 #[derive(Clone)]
 struct Listener {
@@ -138,6 +296,10 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
     this.set_property(
         "composedPath",
         Value::function(|this, _| {
+            let path = this.get_property("__w3cos_path");
+            if !path.is_undefined() {
+                return path;
+            }
             let target = this.get_property("target");
             if target.is_nullish() {
                 Value::array(vec![])
@@ -193,6 +355,14 @@ fn install_fields(this: &Value, init: &Value, fields: &[(&str, Value)]) {
 }
 
 fn install_ui_fields(this: &Value, init: &Value) {
+    let source = init_value(init, "sourceCapabilities", Value::Null);
+    let source = if source.is_object()
+        && !w3cos_core::class::instance_of(&source, &input_device_capabilities_class())
+    {
+        w3cos_core::class::construct(&input_device_capabilities_class(), vec![source])
+    } else {
+        source
+    };
     install_fields(
         this,
         init,
@@ -200,8 +370,39 @@ fn install_ui_fields(this: &Value, init: &Value) {
             ("detail", Value::Number(0.0)),
             ("view", Value::Null),
             ("which", Value::Number(0.0)),
+            ("pseudoTarget", Value::Null),
         ],
     );
+    this.set_property("sourceCapabilities", source);
+}
+
+pub fn input_device_capabilities_class() -> Value {
+    INPUT_DEVICE_CAPABILITIES_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|this, args| {
+            let init = arg(&args, 0);
+            this.set_property(
+                "firesTouchEvents",
+                Value::Bool(init.get_property("firesTouchEvents").to_bool()),
+            );
+            this.set_property(
+                "pointerMovementScrolls",
+                Value::Bool(init.get_property("pointerMovementScrolls").to_bool()),
+            );
+            Value::Undefined
+        });
+        class.set_property("name", Value::string("InputDeviceCapabilities"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in ["firesTouchEvents", "pointerMovementScrolls"] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
 }
 
 fn install_modifier_fields(this: &Value, init: &Value) {
@@ -250,12 +451,19 @@ fn install_mouse_fields(this: &Value, init: &Value) {
             ("button", Value::Number(0.0)),
             ("buttons", Value::Number(0.0)),
             ("relatedTarget", Value::Null),
+            ("fromElement", Value::Null),
+            ("toElement", Value::Null),
+            ("layerX", Value::Number(0.0)),
+            ("layerY", Value::Number(0.0)),
+            ("x", Value::Number(0.0)),
+            ("y", Value::Number(0.0)),
         ],
     );
 }
 
 #[derive(Clone, Copy)]
 enum EventSubclass {
+    Generic,
     Ui,
     Mouse,
     Keyboard,
@@ -272,12 +480,40 @@ enum EventSubclass {
     Error,
     Progress,
     Message,
+    HashChange,
+    PopState,
+    Close,
+    Blob,
+    Submit,
+    FormData,
+    Toggle,
+    Command,
+    PageTransition,
+    PromiseRejection,
+    SecurityPolicyViolation,
+    Track,
+    MediaStreamTrack,
+    Storage,
+    MediaQueryList,
+}
+
+fn require_init_field(init: &Value, name: &str, event_name: &str) {
+    if init.get_property(name).is_undefined() {
+        w3cos_core::throw_value(Value::object(HashMap::from([
+            ("name".into(), Value::string("TypeError")),
+            (
+                "message".into(),
+                Value::string(&format!("{event_name} requires {name}")),
+            ),
+        ])));
+    }
 }
 
 fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
     install_event(this, args, false);
     let init = arg(args, 1);
     match kind {
+        EventSubclass::Generic => {}
         EventSubclass::Ui => install_ui_fields(this, &init),
         EventSubclass::Mouse => install_mouse_fields(this, &init),
         EventSubclass::Keyboard => {
@@ -313,8 +549,14 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
                     ("twist", Value::Number(0.0)),
                     ("pointerType", Value::string("")),
                     ("isPrimary", Value::Bool(false)),
+                    ("altitudeAngle", Value::Number(0.0)),
+                    ("azimuthAngle", Value::Number(0.0)),
+                    ("persistentDeviceId", Value::Number(0.0)),
                 ],
             );
+            for method in ["getCoalescedEvents", "getPredictedEvents"] {
+                this.set_property(method, Value::function(|_, _| Value::array(vec![])));
+            }
         }
         EventSubclass::Wheel => {
             install_mouse_fields(this, &init);
@@ -326,6 +568,9 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
                     ("deltaY", Value::Number(0.0)),
                     ("deltaZ", Value::Number(0.0)),
                     ("deltaMode", Value::Number(0.0)),
+                    ("wheelDelta", Value::Number(0.0)),
+                    ("wheelDeltaX", Value::Number(0.0)),
+                    ("wheelDeltaY", Value::Number(0.0)),
                 ],
             );
             for (name, value) in [
@@ -360,6 +605,10 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
         EventSubclass::Composition => {
             install_ui_fields(this, &init);
             install_fields(this, &init, &[("data", Value::string(""))]);
+            this.set_property(
+                "initCompositionEvent",
+                Value::function(|_, _| Value::Undefined),
+            );
         }
         EventSubclass::Clipboard => {
             install_fields(this, &init, &[("clipboardData", Value::Null)]);
@@ -380,6 +629,9 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
                     ("changedTouches", Value::array(vec![])),
                 ],
             );
+            for property in ["touches", "targetTouches", "changedTouches"] {
+                this.set_property(property, touch_list_value(this.get_property(property)));
+            }
         }
         EventSubclass::Animation => install_fields(
             this,
@@ -388,6 +640,7 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
                 ("animationName", Value::string("")),
                 ("elapsedTime", Value::Number(0.0)),
                 ("pseudoElement", Value::string("")),
+                ("pseudoTarget", Value::Null),
             ],
         ),
         EventSubclass::Transition => install_fields(
@@ -397,6 +650,7 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
                 ("propertyName", Value::string("")),
                 ("elapsedTime", Value::Number(0.0)),
                 ("pseudoElement", Value::string("")),
+                ("pseudoTarget", Value::Null),
             ],
         ),
         EventSubclass::Error => install_fields(
@@ -428,8 +682,136 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
                 ("lastEventId", Value::string("")),
                 ("source", Value::Null),
                 ("ports", Value::array(vec![])),
+                ("userActivation", Value::Null),
             ],
         ),
+        EventSubclass::HashChange => install_fields(
+            this,
+            &init,
+            &[("oldURL", Value::string("")), ("newURL", Value::string(""))],
+        ),
+        EventSubclass::PopState => {
+            install_fields(
+                this,
+                &init,
+                &[
+                    ("state", Value::Null),
+                    ("hasUAVisualTransition", Value::Bool(false)),
+                ],
+            );
+        }
+        EventSubclass::Close => install_fields(
+            this,
+            &init,
+            &[
+                ("wasClean", Value::Bool(false)),
+                ("code", Value::Number(0.0)),
+                ("reason", Value::string("")),
+            ],
+        ),
+        EventSubclass::Blob => {
+            require_init_field(&init, "data", "BlobEvent");
+            install_fields(
+                this,
+                &init,
+                &[("data", Value::Null), ("timecode", Value::Number(0.0))],
+            );
+        }
+        EventSubclass::Submit => {
+            install_fields(this, &init, &[("submitter", Value::Null)]);
+        }
+        EventSubclass::FormData => {
+            require_init_field(&init, "formData", "FormDataEvent");
+            install_fields(this, &init, &[("formData", Value::Null)]);
+        }
+        EventSubclass::Toggle => install_fields(
+            this,
+            &init,
+            &[
+                ("oldState", Value::string("")),
+                ("newState", Value::string("")),
+                ("source", Value::Null),
+            ],
+        ),
+        EventSubclass::Command => install_fields(
+            this,
+            &init,
+            &[("source", Value::Null), ("command", Value::string(""))],
+        ),
+        EventSubclass::PageTransition => {
+            install_fields(this, &init, &[("persisted", Value::Bool(false))]);
+        }
+        EventSubclass::PromiseRejection => {
+            require_init_field(&init, "promise", "PromiseRejectionEvent");
+            install_fields(
+                this,
+                &init,
+                &[("promise", Value::Undefined), ("reason", Value::Undefined)],
+            );
+        }
+        EventSubclass::SecurityPolicyViolation => install_fields(
+            this,
+            &init,
+            &[
+                ("documentURI", Value::string("")),
+                ("referrer", Value::string("")),
+                ("blockedURI", Value::string("")),
+                ("violatedDirective", Value::string("")),
+                ("effectiveDirective", Value::string("")),
+                ("originalPolicy", Value::string("")),
+                ("sourceFile", Value::string("")),
+                ("sample", Value::string("")),
+                ("disposition", Value::string("report")),
+                ("statusCode", Value::Number(0.0)),
+                ("lineNumber", Value::Number(0.0)),
+                ("columnNumber", Value::Number(0.0)),
+            ],
+        ),
+        EventSubclass::Track => {
+            install_fields(this, &init, &[("track", Value::Null)]);
+        }
+        EventSubclass::MediaStreamTrack => {
+            require_init_field(&init, "track", "MediaStreamTrackEvent");
+            install_fields(this, &init, &[("track", Value::Null)]);
+        }
+        EventSubclass::Storage => {
+            install_fields(
+                this,
+                &init,
+                &[
+                    ("key", Value::Null),
+                    ("oldValue", Value::Null),
+                    ("newValue", Value::Null),
+                    ("url", Value::string("")),
+                    ("storageArea", Value::Null),
+                ],
+            );
+            this.set_property(
+                "initStorageEvent",
+                Value::function(|this, args| {
+                    this.call_method("initEvent", args.iter().take(3).cloned().collect());
+                    for (index, name) in ["key", "oldValue", "newValue", "url", "storageArea"]
+                        .iter()
+                        .enumerate()
+                    {
+                        if let Some(value) = args.get(index + 3) {
+                            this.set_property(name, value.clone());
+                        }
+                    }
+                    Value::Undefined
+                }),
+            );
+        }
+        EventSubclass::MediaQueryList => {
+            install_fields(
+                this,
+                &init,
+                &[
+                    ("matches", Value::Bool(false)),
+                    ("media", Value::string("")),
+                ],
+            );
+        }
     }
 }
 
@@ -451,7 +833,22 @@ fn subclass_kind(name: &str) -> EventSubclass {
         "ErrorEvent" => EventSubclass::Error,
         "ProgressEvent" => EventSubclass::Progress,
         "MessageEvent" => EventSubclass::Message,
-        _ => EventSubclass::Ui,
+        "HashChangeEvent" => EventSubclass::HashChange,
+        "PopStateEvent" => EventSubclass::PopState,
+        "CloseEvent" => EventSubclass::Close,
+        "BlobEvent" => EventSubclass::Blob,
+        "SubmitEvent" => EventSubclass::Submit,
+        "FormDataEvent" => EventSubclass::FormData,
+        "ToggleEvent" => EventSubclass::Toggle,
+        "CommandEvent" => EventSubclass::Command,
+        "PageTransitionEvent" => EventSubclass::PageTransition,
+        "PromiseRejectionEvent" => EventSubclass::PromiseRejection,
+        "SecurityPolicyViolationEvent" => EventSubclass::SecurityPolicyViolation,
+        "TrackEvent" => EventSubclass::Track,
+        "MediaStreamTrackEvent" => EventSubclass::MediaStreamTrack,
+        "StorageEvent" => EventSubclass::Storage,
+        "MediaQueryListEvent" => EventSubclass::MediaQueryList,
+        _ => EventSubclass::Generic,
     }
 }
 
@@ -464,23 +861,294 @@ fn subclass_parent(name: &str) -> &'static str {
     }
 }
 
+fn generic_event_members(name: &str) -> &'static str {
+    match name {
+        "AnimationPlaybackEvent" => "currentTime timelineTime",
+        "AudioProcessingEvent" => "inputBuffer outputBuffer playbackTime",
+        "BeforeInstallPromptEvent" => "platforms prompt userChoice",
+        "BeforeUnloadEvent" => "returnValue",
+        "CharacterBoundsUpdateEvent" => "rangeEnd rangeStart",
+        "ClipboardChangeEvent" => "changeId types",
+        "ContentVisibilityAutoStateChangeEvent" => "skipped",
+        "DocumentPictureInPictureEvent" => "window",
+        "FontFaceSetLoadEvent" => "fontfaces",
+        "GPUUncapturedErrorEvent" => "error",
+        "HIDConnectionEvent" => "device",
+        "InterestEvent" => "source",
+        "MediaEncryptedEvent" => "initData initDataType",
+        "MediaStreamEvent" => "stream",
+        "OfflineAudioCompletionEvent" => "renderedBuffer",
+        "PaymentMethodChangeEvent" => "methodDetails methodName",
+        "PaymentRequestUpdateEvent" => "updateWith",
+        "PictureInPictureEvent" => "pictureInPictureWindow",
+        "RTCDTMFToneChangeEvent" => "tone",
+        "RTCDataChannelEvent" => "channel",
+        "RTCErrorEvent" => "error",
+        "RTCPeerConnectionIceErrorEvent" => "address errorCode errorText hostCandidate port url",
+        "RTCPeerConnectionIceEvent" => "candidate",
+        "RTCTrackEvent" => "receiver streams track transceiver",
+        "SnapEvent" => "snapTargetBlock snapTargetInline",
+        "SpeechRecognitionErrorEvent" => "error message",
+        "SpeechRecognitionEvent" => "resultIndex results",
+        "SpeechSynthesisErrorEvent" => "error",
+        "SpeechSynthesisEvent" => "charIndex charLength elapsedTime name utterance",
+        "TaskPriorityChangeEvent" => "previousPriority",
+        "TextEvent" => "data initTextEvent",
+        "TextFormatUpdateEvent" => "getTextFormats",
+        "TextUpdateEvent" => "selectionEnd selectionStart text updateRangeEnd updateRangeStart",
+        "WebGLContextEvent" => "statusMessage",
+        "WindowControlsOverlayGeometryChangeEvent" => "titlebarAreaRect visible",
+        "XRInputSourceEvent" => "frame inputSource",
+        "XRInputSourcesChangeEvent" => "added removed session",
+        "XRLayerEvent" => "layer",
+        "XRReferenceSpaceEvent" => "referenceSpace transform",
+        "XRSessionEvent" => "session",
+        "XRVisibilityMaskChangeEvent" => "eye index indices session vertices",
+        _ => "",
+    }
+}
+
+fn subclass_prototype_members(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    match name {
+        "UIEvent" => (
+            &["initUIEvent"],
+            &[
+                "detail",
+                "pseudoTarget",
+                "sourceCapabilities",
+                "view",
+                "which",
+            ],
+        ),
+        "MouseEvent" => (
+            &["getModifierState", "initMouseEvent"],
+            &[
+                "altKey",
+                "button",
+                "buttons",
+                "clientX",
+                "clientY",
+                "ctrlKey",
+                "fromElement",
+                "layerX",
+                "layerY",
+                "metaKey",
+                "movementX",
+                "movementY",
+                "offsetX",
+                "offsetY",
+                "pageX",
+                "pageY",
+                "relatedTarget",
+                "screenX",
+                "screenY",
+                "shiftKey",
+                "toElement",
+                "x",
+                "y",
+            ],
+        ),
+        "KeyboardEvent" => (
+            &["getModifierState", "initKeyboardEvent"],
+            &[
+                "DOM_KEY_LOCATION_LEFT",
+                "DOM_KEY_LOCATION_NUMPAD",
+                "DOM_KEY_LOCATION_RIGHT",
+                "DOM_KEY_LOCATION_STANDARD",
+                "altKey",
+                "charCode",
+                "code",
+                "ctrlKey",
+                "isComposing",
+                "key",
+                "keyCode",
+                "location",
+                "metaKey",
+                "repeat",
+                "shiftKey",
+            ],
+        ),
+        "PointerEvent" => (
+            &["getCoalescedEvents", "getPredictedEvents"],
+            &[
+                "altitudeAngle",
+                "azimuthAngle",
+                "height",
+                "isPrimary",
+                "persistentDeviceId",
+                "pointerId",
+                "pointerType",
+                "pressure",
+                "tangentialPressure",
+                "tiltX",
+                "tiltY",
+                "twist",
+                "width",
+            ],
+        ),
+        "WheelEvent" => (
+            &[],
+            &[
+                "DOM_DELTA_LINE",
+                "DOM_DELTA_PAGE",
+                "DOM_DELTA_PIXEL",
+                "deltaMode",
+                "deltaX",
+                "deltaY",
+                "deltaZ",
+                "wheelDelta",
+                "wheelDeltaX",
+                "wheelDeltaY",
+            ],
+        ),
+        "FocusEvent" => (&[], &["relatedTarget"]),
+        "InputEvent" => (
+            &["getTargetRanges"],
+            &["data", "dataTransfer", "inputType", "isComposing"],
+        ),
+        "CompositionEvent" => (&["initCompositionEvent"], &["data"]),
+        "ClipboardEvent" => (&[], &["clipboardData"]),
+        "DragEvent" => (&[], &["dataTransfer"]),
+        "TouchEvent" => (
+            &[],
+            &[
+                "altKey",
+                "changedTouches",
+                "ctrlKey",
+                "metaKey",
+                "shiftKey",
+                "targetTouches",
+                "touches",
+            ],
+        ),
+        "AnimationEvent" => (
+            &[],
+            &[
+                "animationName",
+                "elapsedTime",
+                "pseudoElement",
+                "pseudoTarget",
+            ],
+        ),
+        "TransitionEvent" => (
+            &[],
+            &[
+                "elapsedTime",
+                "propertyName",
+                "pseudoElement",
+                "pseudoTarget",
+            ],
+        ),
+        "ErrorEvent" => (&[], &["colno", "error", "filename", "lineno", "message"]),
+        "ProgressEvent" => (&[], &["lengthComputable", "loaded", "total"]),
+        "MessageEvent" => (
+            &["initMessageEvent"],
+            &[
+                "data",
+                "lastEventId",
+                "origin",
+                "ports",
+                "source",
+                "userActivation",
+            ],
+        ),
+        "HashChangeEvent" => (&[], &["newURL", "oldURL"]),
+        "PopStateEvent" => (&[], &["hasUAVisualTransition", "state"]),
+        "CloseEvent" => (&[], &["code", "reason", "wasClean"]),
+        "BlobEvent" => (&[], &["data", "timecode"]),
+        "SubmitEvent" => (&[], &["submitter"]),
+        "FormDataEvent" => (&[], &["formData"]),
+        "ToggleEvent" => (&[], &["newState", "oldState", "source"]),
+        "CommandEvent" => (&[], &["command", "source"]),
+        "PageTransitionEvent" => (&[], &["persisted"]),
+        "PromiseRejectionEvent" => (&[], &["promise", "reason"]),
+        "SecurityPolicyViolationEvent" => (
+            &[],
+            &[
+                "blockedURI",
+                "columnNumber",
+                "disposition",
+                "documentURI",
+                "effectiveDirective",
+                "lineNumber",
+                "originalPolicy",
+                "referrer",
+                "sample",
+                "sourceFile",
+                "statusCode",
+                "violatedDirective",
+            ],
+        ),
+        "TrackEvent" | "MediaStreamTrackEvent" => (&[], &["track"]),
+        "StorageEvent" => (
+            &["initStorageEvent"],
+            &["key", "newValue", "oldValue", "storageArea", "url"],
+        ),
+        "MediaQueryListEvent" => (&[], &["matches", "media"]),
+        _ => (&[], &[]),
+    }
+}
+
+fn install_prototype_members(prototype: &Value, methods: &[&str], properties: &[&str]) {
+    for method in methods {
+        let returns_array = matches!(
+            *method,
+            "getCoalescedEvents" | "getPredictedEvents" | "getTargetRanges"
+        );
+        prototype.set_property(
+            method,
+            Value::function(move |_, _| {
+                if returns_array {
+                    Value::array(vec![])
+                } else {
+                    Value::Undefined
+                }
+            }),
+        );
+    }
+    for property in properties {
+        prototype.set_property(property, Value::Undefined);
+    }
+}
+
 fn build_event_subclasses() -> HashMap<String, Value> {
     let mut constructors = HashMap::new();
     for name in EVENT_SUBCLASS_NAMES {
         let kind = subclass_kind(name);
+        let event_name = *name;
         let constructor = Value::function(move |this, args| {
             install_subclass(&this, &args, kind);
+            let init = arg(&args, 1);
+            for member in generic_event_members(event_name).split_whitespace() {
+                let value = init_value(&init, member, Value::Undefined);
+                this.set_property(member, value);
+            }
             Value::Undefined
         });
         constructor.set_property("name", Value::string(name));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", constructor.clone());
+        let (methods, properties) = subclass_prototype_members(name);
+        install_prototype_members(&prototype, methods, properties);
+        for member in generic_event_members(name).split_whitespace() {
+            prototype.set_property(member, Value::Undefined);
+        }
         constructor.set_property("prototype", prototype);
         if *name == "WheelEvent" {
             for (constant, value) in [
                 ("DOM_DELTA_PIXEL", 0.0),
                 ("DOM_DELTA_LINE", 1.0),
                 ("DOM_DELTA_PAGE", 2.0),
+            ] {
+                constructor.set_property(constant, Value::Number(value));
+            }
+        }
+        if *name == "KeyboardEvent" {
+            for (constant, value) in [
+                ("DOM_KEY_LOCATION_STANDARD", 0.0),
+                ("DOM_KEY_LOCATION_LEFT", 1.0),
+                ("DOM_KEY_LOCATION_RIGHT", 2.0),
+                ("DOM_KEY_LOCATION_NUMPAD", 3.0),
             ] {
                 constructor.set_property(constant, Value::Number(value));
             }
@@ -529,10 +1197,44 @@ fn make_event_constructor(custom: bool) -> Value {
         }
         Value::Undefined
     });
+    constructor.set_property(
+        "name",
+        Value::string(if custom { "CustomEvent" } else { "Event" }),
+    );
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", constructor.clone());
     if custom {
+        install_prototype_members(&prototype, &["initCustomEvent"], &["detail"]);
         w3cos_core::class::set_prototype_of(&prototype, &event_class().get_property("prototype"));
+    } else {
+        install_prototype_members(
+            &prototype,
+            &[
+                "composedPath",
+                "initEvent",
+                "preventDefault",
+                "stopImmediatePropagation",
+                "stopPropagation",
+            ],
+            &[
+                "AT_TARGET",
+                "BUBBLING_PHASE",
+                "CAPTURING_PHASE",
+                "NONE",
+                "bubbles",
+                "cancelBubble",
+                "cancelable",
+                "composed",
+                "currentTarget",
+                "defaultPrevented",
+                "eventPhase",
+                "returnValue",
+                "srcElement",
+                "target",
+                "timeStamp",
+                "type",
+            ],
+        );
     }
     constructor.set_property("prototype", prototype);
     for (name, value) in [
@@ -672,10 +1374,53 @@ fn make_event_target_class() -> Value {
                 Value::Bool(!event.get_property("__pd").to_bool())
             }),
         );
+        this.set_property(
+            "when",
+            Value::function(|this, args| {
+                let type_name = arg(&args, 0).to_js_string();
+                let options = arg(&args, 1);
+                crate::observable_web::observable_from_producer(Value::function(move |_, args| {
+                    let subscriber = arg(&args, 0);
+                    let subscriber_for_event = subscriber.clone();
+                    let listener = Value::function(move |_, args| {
+                        subscriber_for_event.call_method("next", vec![arg(&args, 0)]);
+                        Value::Undefined
+                    });
+                    this.call_method(
+                        "addEventListener",
+                        vec![Value::string(&type_name), listener.clone(), options.clone()],
+                    );
+                    let target = this.clone();
+                    let teardown_type = type_name.clone();
+                    subscriber.call_method(
+                        "addTeardown",
+                        vec![Value::function(move |_, _| {
+                            target.call_method(
+                                "removeEventListener",
+                                vec![Value::string(&teardown_type), listener.clone()],
+                            );
+                            Value::Undefined
+                        })],
+                    );
+                    Value::Undefined
+                }))
+            }),
+        );
         Value::Undefined
     });
+    constructor.set_property("name", Value::string("EventTarget"));
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", constructor.clone());
+    install_prototype_members(
+        &prototype,
+        &[
+            "addEventListener",
+            "dispatchEvent",
+            "removeEventListener",
+            "when",
+        ],
+        &[],
+    );
     constructor.set_property("prototype", prototype);
     constructor
 }
@@ -684,6 +1429,70 @@ fn make_event_target_class() -> Value {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn event_classes_expose_browser_prototype_members() {
+        for method in [
+            "composedPath",
+            "initEvent",
+            "preventDefault",
+            "stopImmediatePropagation",
+            "stopPropagation",
+        ] {
+            assert!(
+                event_class()
+                    .get_property("prototype")
+                    .get_property(method)
+                    .is_function()
+            );
+        }
+        for (name, method) in [
+            ("InputEvent", "getTargetRanges"),
+            ("KeyboardEvent", "getModifierState"),
+            ("MessageEvent", "initMessageEvent"),
+            ("MouseEvent", "initMouseEvent"),
+            ("PointerEvent", "getCoalescedEvents"),
+            ("StorageEvent", "initStorageEvent"),
+            ("UIEvent", "initUIEvent"),
+        ] {
+            assert!(
+                event_subclass_class(name)
+                    .get_property("prototype")
+                    .get_property(method)
+                    .is_function(),
+                "{name}.{method} should be exposed on the prototype"
+            );
+        }
+        assert!(
+            event_target_class()
+                .get_property("prototype")
+                .get_property("when")
+                .is_function()
+        );
+    }
+
+    #[test]
+    fn event_target_when_returns_observable_and_subscribes() {
+        let target = w3cos_core::class::construct(&event_target_class(), vec![]);
+        let observable = target.call_method("when", vec![Value::string("tick")]);
+        assert!(w3cos_core::class::instance_of(
+            &observable,
+            &crate::observable_web::observable_class()
+        ));
+        let calls = Rc::new(Cell::new(0));
+        let calls_for_next = Rc::clone(&calls);
+        let result = observable.call_method(
+            "subscribe",
+            vec![Value::function(move |_, _| {
+                calls_for_next.set(calls_for_next.get() + 1);
+                Value::Undefined
+            })],
+        );
+        assert!(result.is_undefined());
+        let event = w3cos_core::class::construct(&event_class(), vec![Value::string("tick")]);
+        target.call_method("dispatchEvent", vec![event]);
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn event_target_dispatches_cancelable_custom_events_and_once_listeners() {
@@ -824,6 +1633,101 @@ mod tests {
                 .get_property("length")
                 .to_number(),
             0.0
+        );
+    }
+
+    #[test]
+    fn extended_event_subclasses_validate_and_expose_standard_fields() {
+        let close = w3cos_core::class::construct(
+            &event_subclass_class("CloseEvent"),
+            vec![
+                Value::string("close"),
+                Value::object(HashMap::from([
+                    ("wasClean".into(), Value::Bool(true)),
+                    ("code".into(), Value::Number(1000.0)),
+                    ("reason".into(), Value::string("done")),
+                ])),
+            ],
+        );
+        assert!(close.get_property("wasClean").to_bool());
+        assert_eq!(close.get_property("code"), 1000.into());
+        assert_eq!(close.get_property("reason"), Value::string("done"));
+        assert!(w3cos_core::class::instance_of(&close, &event_class()));
+
+        let toggle = w3cos_core::class::construct(
+            &event_subclass_class("ToggleEvent"),
+            vec![
+                Value::string("toggle"),
+                Value::object(HashMap::from([
+                    ("oldState".into(), Value::string("closed")),
+                    ("newState".into(), Value::string("open")),
+                ])),
+            ],
+        );
+        assert_eq!(toggle.get_property("oldState"), Value::string("closed"));
+        assert_eq!(toggle.get_property("newState"), Value::string("open"));
+
+        let storage = w3cos_core::class::construct(
+            &event_subclass_class("StorageEvent"),
+            vec![Value::string("storage")],
+        );
+        storage.call_method(
+            "initStorageEvent",
+            vec![
+                Value::string("storage"),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::string("key"),
+                Value::string("old"),
+                Value::string("new"),
+                Value::string("https://example.test"),
+                Value::Null,
+            ],
+        );
+        assert_eq!(storage.get_property("key"), Value::string("key"));
+        assert_eq!(storage.get_property("newValue"), Value::string("new"));
+
+        for (name, field) in [
+            ("BlobEvent", "data"),
+            ("FormDataEvent", "formData"),
+            ("PromiseRejectionEvent", "promise"),
+            ("MediaStreamTrackEvent", "track"),
+        ] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                w3cos_core::class::construct(
+                    &event_subclass_class(name),
+                    vec![Value::string("event")],
+                )
+            }));
+            assert!(result.is_err(), "{name} should require {field}");
+        }
+    }
+
+    #[test]
+    fn ui_events_brand_source_capabilities() {
+        let event = w3cos_core::class::construct(
+            &event_subclass_class("MouseEvent"),
+            vec![
+                Value::string("click"),
+                Value::object(HashMap::from([(
+                    "sourceCapabilities".to_string(),
+                    Value::object(HashMap::from([
+                        ("firesTouchEvents".to_string(), Value::Bool(true)),
+                        ("pointerMovementScrolls".to_string(), Value::Bool(false)),
+                    ])),
+                )])),
+            ],
+        );
+        let capabilities = event.get_property("sourceCapabilities");
+        assert!(w3cos_core::class::instance_of(
+            &capabilities,
+            &input_device_capabilities_class()
+        ));
+        assert!(capabilities.get_property("firesTouchEvents").to_bool());
+        assert!(
+            !capabilities
+                .get_property("pointerMovementScrolls")
+                .to_bool()
         );
     }
 }

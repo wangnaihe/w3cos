@@ -158,7 +158,7 @@ pub fn regexp_class() -> Value {
     })
 }
 
-fn parts(value: &Value) -> Option<(String, String)> {
+pub fn parts(value: &Value) -> Option<(String, String)> {
     let source = value.get_property(SOURCE);
     if source.is_undefined() {
         return None;

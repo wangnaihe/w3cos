@@ -2393,6 +2393,10 @@ impl App {
         }
         let previous_viewport = self.viewport;
         self.viewport = viewport;
+        if previous_viewport != viewport {
+            crate::jsdom::set_device_pixel_ratio(self.scale_factor);
+            crate::jsdom::set_viewport(viewport.layout_w as f64, viewport.layout_h as f64);
+        }
 
         let w = viewport.layout_w;
         let layout_h = viewport.layout_h;
@@ -6239,6 +6243,8 @@ impl ApplicationHandler for App {
         let observer_entry_budget = 128;
         for _ in 0..observer_pass_limit {
             self.ensure_layout();
+            crate::observers_web::refresh_resize_observers();
+            crate::observers_web::refresh_intersection_observers();
             if self.resize_observer_layout_generation == Some(self.layout_generation) {
                 break;
             }

@@ -182,6 +182,22 @@ only directly declared members. Generated constructors, methods, getters, and
 setters contain named `todo!()` placeholders and are not wired into the runtime
 automatically.
 
+### Audit the live Chromium Web API surface
+
+Compare the Web API globals and constructor prototypes exposed by a locally
+installed Chrome/Chromium with the current w3cos `window`:
+
+```bash
+w3cos web-api-audit
+w3cos web-api-audit --json
+w3cos web-api-audit --fail-on-missing
+```
+
+Use `--chrome /path/to/chrome` when auto-detection is unavailable. The audit
+filters ECMAScript built-ins and event-handler properties, but intentionally
+keeps experimental browser interfaces visible so roadmap decisions do not
+mistake an omitted subsystem for conformance.
+
 ### Technology Stack
 
 

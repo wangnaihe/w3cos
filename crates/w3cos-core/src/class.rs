@@ -27,7 +27,7 @@ pub fn construct(class_value: &Value, args: Vec<Value>) -> Value {
                 set_prototype_of(&instance, &prototype);
             }
             let result = function.call(instance.clone(), args);
-            if result.is_object() || result.is_array() {
+            if result.is_object() || result.is_array() || result.is_function() {
                 result
             } else {
                 instance

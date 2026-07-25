@@ -62,20 +62,42 @@ pub fn body_id() -> u32 {
 }
 
 pub fn append_child(parent: u32, child: u32) {
+    let old_parent = parent_node(child);
+    let old_previous = previous_sibling(child);
+    let old_next = next_sibling(child);
     with_document_mut(|doc| {
         doc.append_child(NodeId::from_u32(parent), NodeId::from_u32(child));
     });
     mark_dom_dirty();
+    if let Some(old_parent) = old_parent {
+        crate::observers_web::notify_child_list(old_parent, &[], &[child], old_previous, old_next);
+    }
+    crate::observers_web::notify_child_list(
+        parent,
+        &[child],
+        &[],
+        previous_sibling(child),
+        next_sibling(child),
+    );
 }
 
 pub fn remove_child(parent: u32, child: u32) {
+    let previous = previous_sibling(child);
+    let next = next_sibling(child);
+    let was_child = parent_node(child) == Some(parent);
     with_document_mut(|doc| {
         doc.remove_child(NodeId::from_u32(parent), NodeId::from_u32(child));
     });
     mark_dom_dirty();
+    if was_child {
+        crate::observers_web::notify_child_list(parent, &[], &[child], previous, next);
+    }
 }
 
 pub fn insert_before(parent: u32, new_child: u32, ref_child: u32) {
+    let old_parent = parent_node(new_child);
+    let old_previous = previous_sibling(new_child);
+    let old_next = next_sibling(new_child);
     with_document_mut(|doc| {
         doc.insert_before(
             NodeId::from_u32(parent),
@@ -84,14 +106,34 @@ pub fn insert_before(parent: u32, new_child: u32, ref_child: u32) {
         );
     });
     mark_dom_dirty();
+    if let Some(old_parent) = old_parent {
+        crate::observers_web::notify_child_list(
+            old_parent,
+            &[],
+            &[new_child],
+            old_previous,
+            old_next,
+        );
+    }
+    crate::observers_web::notify_child_list(
+        parent,
+        &[new_child],
+        &[],
+        previous_sibling(new_child),
+        next_sibling(new_child),
+    );
 }
 
 pub fn set_attribute(node: u32, name: &str, value: &str) {
+    let old_value = get_attribute(node, name);
     with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.set_attribute(doc, name, value);
     });
     mark_dom_dirty();
+    if old_value.as_deref() != Some(value) {
+        crate::observers_web::notify_attribute(node, name, old_value.as_deref());
+    }
 }
 
 pub fn get_attribute(node: u32, name: &str) -> Option<String> {
@@ -102,11 +144,23 @@ pub fn get_attribute(node: u32, name: &str) -> Option<String> {
 }
 
 pub fn set_text_content(node: u32, text: &str) {
+    let old_text = get_text_content(node);
+    let old_children = children(node);
+    let character_data = node_type(node) == 3;
     with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.set_text_content(doc, text);
     });
     mark_dom_dirty();
+    if old_text.as_deref() == Some(text) {
+        return;
+    }
+    if character_data {
+        crate::observers_web::notify_character_data(node, old_text.as_deref());
+    } else {
+        let new_children = children(node);
+        crate::observers_web::notify_child_list(node, &new_children, &old_children, None, None);
+    }
 }
 
 pub fn get_text_content(node: u32) -> Option<String> {
@@ -117,35 +171,50 @@ pub fn get_text_content(node: u32) -> Option<String> {
 }
 
 pub fn set_style_property(node: u32, prop: &str, value: &str) {
+    let old_value = get_attribute(node, "style");
     with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.style_mut(doc).set_property(prop, value);
     });
     mark_dom_dirty();
+    let _ = (prop, value);
+    crate::observers_web::notify_attribute(node, "style", old_value.as_deref());
 }
 
 pub fn class_list_add(node: u32, class: &str) {
+    let old_value = get_attribute(node, "class");
     with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.class_list_add(doc, class);
     });
     mark_dom_dirty();
+    if get_attribute(node, "class") != old_value {
+        crate::observers_web::notify_attribute(node, "class", old_value.as_deref());
+    }
 }
 
 pub fn class_list_remove(node: u32, class: &str) {
+    let old_value = get_attribute(node, "class");
     with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.class_list_remove(doc, class);
     });
     mark_dom_dirty();
+    if get_attribute(node, "class") != old_value {
+        crate::observers_web::notify_attribute(node, "class", old_value.as_deref());
+    }
 }
 
 pub fn class_list_toggle(node: u32, class: &str) -> bool {
+    let old_value = get_attribute(node, "class");
     let result = with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.class_list_toggle(doc, class)
     });
     mark_dom_dirty();
+    if get_attribute(node, "class") != old_value {
+        crate::observers_web::notify_attribute(node, "class", old_value.as_deref());
+    }
     result
 }
 
@@ -214,6 +283,11 @@ pub fn node_count() -> usize {
 // ── Phase 1 additions ──
 
 pub fn replace_child(parent: u32, new_child: u32, old_child: u32) {
+    let previous = previous_sibling(old_child);
+    let next = next_sibling(old_child);
+    let old_parent = parent_node(new_child);
+    let old_previous = previous_sibling(new_child);
+    let old_next = next_sibling(new_child);
     with_document_mut(|doc| {
         doc.replace_child(
             NodeId::from_u32(parent),
@@ -222,6 +296,16 @@ pub fn replace_child(parent: u32, new_child: u32, old_child: u32) {
         );
     });
     mark_dom_dirty();
+    if let Some(old_parent) = old_parent {
+        crate::observers_web::notify_child_list(
+            old_parent,
+            &[],
+            &[new_child],
+            old_previous,
+            old_next,
+        );
+    }
+    crate::observers_web::notify_child_list(parent, &[new_child], &[old_child], previous, next);
 }
 
 pub fn clone_node(node: u32, deep: bool) -> u32 {
@@ -234,6 +318,18 @@ pub fn create_document_fragment() -> u32 {
 
 pub fn create_comment(text: &str) -> u32 {
     with_document_mut(|doc| doc.create_comment(text).id.as_u32())
+}
+
+pub fn create_cdata_section(text: &str) -> u32 {
+    with_document_mut(|doc| doc.create_cdata_section(text).id.as_u32())
+}
+
+pub fn create_processing_instruction(target: &str, data: &str) -> u32 {
+    with_document_mut(|doc| doc.create_processing_instruction(target, data).id.as_u32())
+}
+
+pub fn create_document_type(name: &str) -> u32 {
+    with_document_mut(|doc| doc.create_document_type(name).id.as_u32())
 }
 
 pub fn get_elements_by_tag_name(tag: &str) -> Vec<u32> {
@@ -316,11 +412,15 @@ pub fn touch_document() {
 }
 
 pub fn remove_attribute(node: u32, name: &str) {
+    let old_value = get_attribute(node, name);
     with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.remove_attribute(doc, name);
     });
     mark_dom_dirty();
+    if old_value.is_some() {
+        crate::observers_web::notify_attribute(node, name, old_value.as_deref());
+    }
 }
 
 pub fn has_attribute(node: u32, name: &str) -> bool {

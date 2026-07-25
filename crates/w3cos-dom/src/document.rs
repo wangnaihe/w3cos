@@ -101,6 +101,21 @@ impl Document {
         Element::new(id)
     }
 
+    pub fn create_cdata_section(&mut self, content: &str) -> Element {
+        let id = self.alloc_node(DomNode::new_cdata_section(NodeId(0), content));
+        Element::new(id)
+    }
+
+    pub fn create_processing_instruction(&mut self, target: &str, data: &str) -> Element {
+        let id = self.alloc_node(DomNode::new_processing_instruction(NodeId(0), target, data));
+        Element::new(id)
+    }
+
+    pub fn create_document_type(&mut self, name: &str) -> Element {
+        let id = self.alloc_node(DomNode::new_document_type(NodeId(0), name));
+        Element::new(id)
+    }
+
     pub fn body(&self) -> Element {
         Element::new(self.body_id)
     }
@@ -213,9 +228,18 @@ impl Document {
             NodeType::Text => {
                 DomNode::new_text(NodeId(0), node.text_content.as_deref().unwrap_or(""))
             }
+            NodeType::CdataSection => {
+                DomNode::new_cdata_section(NodeId(0), node.text_content.as_deref().unwrap_or(""))
+            }
+            NodeType::ProcessingInstruction => DomNode::new_processing_instruction(
+                NodeId(0),
+                node.tag.as_str(),
+                node.text_content.as_deref().unwrap_or(""),
+            ),
             NodeType::Comment => {
                 DomNode::new_comment(NodeId(0), node.text_content.as_deref().unwrap_or(""))
             }
+            NodeType::DocumentType => DomNode::new_document_type(NodeId(0), node.tag.as_str()),
             NodeType::DocumentFragment => DomNode::new_document_fragment(NodeId(0)),
             NodeType::Document => DomNode::new_element(NodeId(0), "div"),
         };
@@ -721,11 +745,11 @@ impl Document {
         self.apply_svg_presentation_style(id, &tag, &mut style);
 
         match node.node_type {
-            NodeType::Text => {
+            NodeType::Text | NodeType::CdataSection | NodeType::ProcessingInstruction => {
                 let text = node.text_content.as_deref().unwrap_or("");
                 w3cos_std::Component::text(text, style)
             }
-            NodeType::Comment => {
+            NodeType::Comment | NodeType::DocumentType => {
                 return w3cos_std::Component::column(style, vec![]);
             }
             NodeType::Element | NodeType::Document | NodeType::DocumentFragment => {
@@ -1126,6 +1150,20 @@ impl Document {
                     push_xml_escaped(out, text, false);
                 }
             }
+            NodeType::CdataSection => {
+                out.push_str("<![CDATA[");
+                out.push_str(node.text_content.as_deref().unwrap_or(""));
+                out.push_str("]]>");
+            }
+            NodeType::ProcessingInstruction => {
+                out.push_str("<?");
+                out.push_str(&node.tag.as_str());
+                if let Some(text) = node.text_content.as_deref().filter(|text| !text.is_empty()) {
+                    out.push(' ');
+                    out.push_str(text);
+                }
+                out.push_str("?>");
+            }
             NodeType::Comment => {
                 out.push_str("<!--");
                 if let Some(text) = node.text_content.as_deref() {
@@ -1267,6 +1305,11 @@ impl Document {
                 }
                 out.push_str("</");
                 out.push_str(&tag);
+                out.push('>');
+            }
+            NodeType::DocumentType => {
+                out.push_str("<!DOCTYPE ");
+                out.push_str(&node.tag.as_str());
                 out.push('>');
             }
             NodeType::Document | NodeType::DocumentFragment => {

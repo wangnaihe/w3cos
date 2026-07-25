@@ -20,6 +20,7 @@ pub fn run(builder: fn() -> Component) -> Result<()> {
 }
 
 pub fn run_from_shell() -> Result<()> {
+    crate::configure_mobile_web_capabilities();
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );

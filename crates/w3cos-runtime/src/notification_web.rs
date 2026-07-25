@@ -94,6 +94,7 @@ pub fn notification_class() -> Value {
                 },
             ),
         );
+        class.set_property("maxActions", Value::Number(2.0));
         class.set_property(
             "requestPermission",
             Value::function(|_, args| {
@@ -120,6 +121,29 @@ pub fn notification_class() -> Value {
         );
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
+        for member in [
+            "actions",
+            "badge",
+            "body",
+            "close",
+            "data",
+            "dir",
+            "icon",
+            "lang",
+            "onclick",
+            "onclose",
+            "onerror",
+            "onshow",
+            "renotify",
+            "requireInteraction",
+            "silent",
+            "tag",
+            "timestamp",
+            "title",
+            "vibrate",
+        ] {
+            prototype.set_property(member, Value::Undefined);
+        }
         w3cos_core::class::set_prototype_of(
             &prototype,
             &crate::web_events::event_target_class().get_property("prototype"),

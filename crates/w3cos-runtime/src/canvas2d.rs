@@ -344,6 +344,8 @@ pub struct ContextState {
     pub line_cap: LineCap,
     pub line_join: LineJoin,
     pub miter_limit: f32,
+    pub line_dash: Vec<f32>,
+    pub line_dash_offset: f32,
     pub global_alpha: f32,
     pub global_composite_operation: CompositeOperation,
     pub font_size: f32,
@@ -366,6 +368,8 @@ impl Default for ContextState {
             line_cap: LineCap::Butt,
             line_join: LineJoin::Miter,
             miter_limit: 10.0,
+            line_dash: Vec::new(),
+            line_dash_offset: 0.0,
             global_alpha: 1.0,
             global_composite_operation: CompositeOperation::SourceOver,
             font_size: 10.0,
@@ -451,6 +455,26 @@ impl CanvasRenderingContext2D {
     }
     pub fn set_line_width(&mut self, w: f32) {
         self.state.line_width = w;
+    }
+    pub fn set_line_dash(&mut self, mut segments: Vec<f32>) {
+        if segments
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return;
+        }
+        if segments.len() % 2 == 1 {
+            segments.extend_from_within(..);
+        }
+        self.state.line_dash = segments;
+    }
+    pub fn get_line_dash(&self) -> Vec<f32> {
+        self.state.line_dash.clone()
+    }
+    pub fn set_line_dash_offset(&mut self, offset: f32) {
+        if offset.is_finite() {
+            self.state.line_dash_offset = offset;
+        }
     }
     pub fn set_global_alpha(&mut self, a: f32) {
         self.state.global_alpha = a.clamp(0.0, 1.0);
@@ -595,20 +619,18 @@ impl CanvasRenderingContext2D {
 
     /// `ctx.strokeRect(x, y, w, h)` — draw rectangle outline.
     pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        let lw = self.state.line_width.max(1.0) as i32;
+        let lw = self.state.line_width.max(1.0);
         let (r, g, b, a) = self.state.stroke_style.to_rgba();
         let alpha = (a as f32 / 255.0 * self.state.global_alpha).clamp(0.0, 1.0);
         let [_ta, _tb, _tc, _td, tx, ty] = self.state.transform;
-        let x0 = (x + tx) as i32;
-        let y0 = (y + ty) as i32;
-        let x1 = (x + w + tx) as i32;
-        let y1 = (y + h + ty) as i32;
-        // Top / bottom
-        self.fill_rect_pixels(x0, y0, x1, y0 + lw, r, g, b, alpha);
-        self.fill_rect_pixels(x0, y1 - lw, x1, y1, r, g, b, alpha);
-        // Left / right
-        self.fill_rect_pixels(x0, y0, x0 + lw, y1, r, g, b, alpha);
-        self.fill_rect_pixels(x1 - lw, y0, x1, y1, r, g, b, alpha);
+        let x0 = x + tx;
+        let y0 = y + ty;
+        let x1 = x + w + tx;
+        let y1 = y + h + ty;
+        self.draw_line(x0, y0, x1, y0, lw, r, g, b, alpha);
+        self.draw_line(x1, y0, x1, y1, lw, r, g, b, alpha);
+        self.draw_line(x1, y1, x0, y1, lw, r, g, b, alpha);
+        self.draw_line(x0, y1, x0, y0, lw, r, g, b, alpha);
     }
 
     // ── Fill / Stroke path ────────────────────────────────────────────────
@@ -765,6 +787,90 @@ impl CanvasRenderingContext2D {
         }
     }
 
+    /// Draw an RGBA image source with nearest-neighbour sampling.
+    ///
+    /// This is the pixel backend for the 3, 5, and 9 argument `drawImage()`
+    /// overloads. Source and destination rectangles are normalized like the
+    /// HTML canvas algorithm: negative dimensions grow in the opposite
+    /// direction without flipping the image.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_image_rgba(
+        &mut self,
+        source: &[u8],
+        source_width: u32,
+        source_height: u32,
+        mut sx: f32,
+        mut sy: f32,
+        mut sw: f32,
+        mut sh: f32,
+        mut dx: f32,
+        mut dy: f32,
+        mut dw: f32,
+        mut dh: f32,
+    ) {
+        if source_width == 0
+            || source_height == 0
+            || source.len() < (source_width * source_height * 4) as usize
+            || ![sx, sy, sw, sh, dx, dy, dw, dh]
+                .into_iter()
+                .all(f32::is_finite)
+            || sw == 0.0
+            || sh == 0.0
+            || dw == 0.0
+            || dh == 0.0
+        {
+            return;
+        }
+        if sw < 0.0 {
+            sx += sw;
+            sw = -sw;
+        }
+        if sh < 0.0 {
+            sy += sh;
+            sh = -sh;
+        }
+        if dw < 0.0 {
+            dx += dw;
+            dw = -dw;
+        }
+        if dh < 0.0 {
+            dy += dh;
+            dh = -dh;
+        }
+
+        let [_a, _b, _c, _d, tx, ty] = self.state.transform;
+        let dst_x0 = (dx + tx).floor() as i32;
+        let dst_y0 = (dy + ty).floor() as i32;
+        let dst_x1 = (dx + dw + tx).ceil() as i32;
+        let dst_y1 = (dy + dh + ty).ceil() as i32;
+        for dst_y in dst_y0.max(0)..dst_y1.min(self.height as i32) {
+            let v = ((dst_y as f32 + 0.5) - (dy + ty)) / dh;
+            let source_y = (sy + v * sh).floor() as i32;
+            if source_y < 0 || source_y >= source_height as i32 {
+                continue;
+            }
+            for dst_x in dst_x0.max(0)..dst_x1.min(self.width as i32) {
+                let u = ((dst_x as f32 + 0.5) - (dx + tx)) / dw;
+                let source_x = (sx + u * sw).floor() as i32;
+                if source_x < 0 || source_x >= source_width as i32 {
+                    continue;
+                }
+                let source_index =
+                    ((source_y as u32 * source_width + source_x as u32) * 4) as usize;
+                let source_alpha =
+                    source[source_index + 3] as f32 / 255.0 * self.state.global_alpha;
+                self.blend_pixel(
+                    dst_x as u32,
+                    dst_y as u32,
+                    source[source_index],
+                    source[source_index + 1],
+                    source[source_index + 2],
+                    source_alpha.clamp(0.0, 1.0),
+                );
+            }
+        }
+    }
+
     /// `ctx.createImageData(sw, sh)` — create a blank `ImageData`.
     pub fn create_image_data(sw: u32, sh: u32) -> ImageData {
         ImageData::new(sw, sh)
@@ -850,8 +956,26 @@ impl CanvasRenderingContext2D {
             return;
         }
         let half = (lw / 2.0) as i32;
+        let pattern = self.state.line_dash.clone();
+        let pattern_length: f32 = pattern.iter().sum();
+        let segment_length = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
+            if pattern_length > 0.0 {
+                let mut position =
+                    (segment_length * t + self.state.line_dash_offset).rem_euclid(pattern_length);
+                let mut draw = true;
+                for dash in &pattern {
+                    if position < *dash {
+                        break;
+                    }
+                    position -= *dash;
+                    draw = !draw;
+                }
+                if !draw {
+                    continue;
+                }
+            }
             let px = (x0 + t * (x1 - x0)) as i32;
             let py = (y0 + t * (y1 - y0)) as i32;
             self.fill_rect_pixels(
@@ -894,6 +1018,39 @@ mod tests {
         ctx.clear_rect(0.0, 0.0, 5.0, 5.0);
         let px = ctx.get_image_data(0, 0, 1, 1);
         assert_eq!(px.data[3], 0); // transparent
+    }
+
+    #[test]
+    fn line_dash_state_and_rasterization() {
+        let mut ctx = CanvasRenderingContext2D::new(12, 5);
+        ctx.set_line_dash(vec![2.0]);
+        assert_eq!(ctx.get_line_dash(), vec![2.0, 2.0]);
+        ctx.begin_path();
+        ctx.move_to(0.0, 2.0);
+        ctx.line_to(10.0, 2.0);
+        ctx.stroke();
+
+        assert_eq!(ctx.get_image_data(0, 2, 1, 1).data[3], 255);
+        assert_eq!(ctx.get_image_data(3, 2, 1, 1).data[3], 0);
+        assert_eq!(ctx.get_image_data(5, 2, 1, 1).data[3], 255);
+    }
+
+    #[test]
+    fn draw_image_crops_scales_and_applies_global_alpha() {
+        let source = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, //
+            0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let mut ctx = CanvasRenderingContext2D::new(4, 2);
+        ctx.draw_image_rgba(&source, 2, 2, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0, 2.0);
+        assert_eq!(ctx.get_image_data(0, 0, 1, 1).data, [255, 0, 0, 255]);
+        assert_eq!(ctx.get_image_data(1, 1, 1, 1).data, [0, 0, 255, 255]);
+
+        ctx.set_global_alpha(0.5);
+        ctx.draw_image_rgba(&source, 2, 2, 1.0, 0.0, 1.0, 1.0, 2.0, 0.0, 2.0, 2.0);
+        let green = ctx.get_image_data(2, 0, 1, 1);
+        assert_eq!(&green.data[..3], &[0, 255, 0]);
+        assert!((126..=128).contains(&green.data[3]));
     }
 
     #[test]

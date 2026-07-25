@@ -4,9 +4,180 @@
 //! host owns platform discovery, permission prompts and GATT I/O through the
 //! `web-bluetooth` host module.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use w3cos_core::Value;
+
+thread_local! {
+    static BLUETOOTH_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static BLUETOOTH_INTERFACE_CLASSES: RefCell<HashMap<String, Value>> =
+        RefCell::new(HashMap::new());
+}
+
+pub const BLUETOOTH_INTERFACE_NAMES: &[&str] = &[
+    "BluetoothCharacteristicProperties",
+    "BluetoothDevice",
+    "BluetoothRemoteGATTCharacteristic",
+    "BluetoothRemoteGATTDescriptor",
+    "BluetoothRemoteGATTServer",
+    "BluetoothRemoteGATTService",
+    "BluetoothUUID",
+];
+
+fn interface_members(name: &str) -> &'static [&'static str] {
+    match name {
+        "BluetoothCharacteristicProperties" => &[
+            "authenticatedSignedWrites",
+            "broadcast",
+            "indicate",
+            "notify",
+            "read",
+            "reliableWrite",
+            "writableAuxiliaries",
+            "write",
+            "writeWithoutResponse",
+        ],
+        "BluetoothDevice" => &["gatt", "id", "name", "ongattserverdisconnected"],
+        "BluetoothRemoteGATTCharacteristic" => &[
+            "getDescriptor",
+            "getDescriptors",
+            "oncharacteristicvaluechanged",
+            "properties",
+            "readValue",
+            "service",
+            "startNotifications",
+            "stopNotifications",
+            "uuid",
+            "value",
+            "writeValue",
+            "writeValueWithResponse",
+            "writeValueWithoutResponse",
+        ],
+        "BluetoothRemoteGATTDescriptor" => {
+            &["characteristic", "readValue", "uuid", "value", "writeValue"]
+        }
+        "BluetoothRemoteGATTServer" => &[
+            "connect",
+            "connected",
+            "device",
+            "disconnect",
+            "getPrimaryService",
+            "getPrimaryServices",
+        ],
+        "BluetoothRemoteGATTService" => &[
+            "device",
+            "getCharacteristic",
+            "getCharacteristics",
+            "isPrimary",
+            "uuid",
+        ],
+        _ => &[],
+    }
+}
+
+pub fn interface_class(name: &str) -> Value {
+    BLUETOOTH_INTERFACE_CLASSES.with(|classes| {
+        if let Some(class) = classes.borrow().get(name).cloned() {
+            return class;
+        }
+        let Some(name) = BLUETOOTH_INTERFACE_NAMES
+            .iter()
+            .copied()
+            .find(|candidate| candidate == &name)
+        else {
+            return Value::Undefined;
+        };
+        let class = Value::function(move |_, _| {
+            w3cos_core::throw_value(dom_error(
+                "TypeError",
+                &format!("Illegal constructor: {name}"),
+            ))
+        });
+        class.set_property("name", Value::string(name));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for member in interface_members(name) {
+            prototype.set_property(member, Value::Undefined);
+        }
+        if matches!(
+            name,
+            "BluetoothDevice" | "BluetoothRemoteGATTCharacteristic"
+        ) {
+            w3cos_core::class::set_prototype_of(
+                &prototype,
+                &crate::web_events::event_target_class().get_property("prototype"),
+            );
+        }
+        class.set_property("prototype", prototype);
+        if name == "BluetoothUUID" {
+            for method in [
+                "canonicalUUID",
+                "getCharacteristic",
+                "getDescriptor",
+                "getService",
+            ] {
+                class.set_property(
+                    method,
+                    Value::function(move |_, args| {
+                        bluetooth_uuid(method, args.first().cloned().unwrap_or_default())
+                    }),
+                );
+            }
+        }
+        classes.borrow_mut().insert(name.to_string(), class.clone());
+        class
+    })
+}
+
+fn bluetooth_uuid(kind: &str, value: Value) -> Value {
+    let text = value.to_js_string();
+    let assigned = if let Ok(number) = text.parse::<u32>() {
+        Some(number)
+    } else {
+        match (kind, text.as_str()) {
+            ("getService", "battery_service") => Some(0x180f),
+            ("getCharacteristic", "battery_level") => Some(0x2a19),
+            ("getDescriptor", "gatt.client_characteristic_configuration")
+            | ("getDescriptor", "client_characteristic_configuration") => Some(0x2902),
+            _ => None,
+        }
+    };
+    if let Some(number) = assigned {
+        Value::string(&format!("{number:08x}-0000-1000-8000-00805f9b34fb"))
+    } else if text.contains('-') {
+        Value::string(&text.to_ascii_lowercase())
+    } else {
+        w3cos_core::throw_value(dom_error(
+            "TypeError",
+            &format!("Unknown Bluetooth UUID name: {text}"),
+        ))
+    }
+}
+
+pub fn bluetooth_class() -> Value {
+    BLUETOOTH_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(dom_error("TypeError", "Illegal constructor: Bluetooth"))
+        });
+        class.set_property("name", Value::string("Bluetooth"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in ["getAvailability", "requestDevice"] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::web_events::event_target_class().get_property("prototype"),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
 
 fn dom_error(name: &str, message: &str) -> Value {
     w3cos_core::class::construct(
@@ -49,21 +220,143 @@ fn promise(result: Result<Value, Value>) -> Value {
     }
 }
 
+fn characteristic_properties_value() -> Value {
+    let properties = Value::object(HashMap::from([
+        ("authenticatedSignedWrites".into(), Value::Bool(false)),
+        ("broadcast".into(), Value::Bool(false)),
+        ("indicate".into(), Value::Bool(false)),
+        ("notify".into(), Value::Bool(true)),
+        ("read".into(), Value::Bool(true)),
+        ("reliableWrite".into(), Value::Bool(false)),
+        ("writableAuxiliaries".into(), Value::Bool(false)),
+        ("write".into(), Value::Bool(true)),
+        ("writeWithoutResponse".into(), Value::Bool(true)),
+    ]));
+    w3cos_core::class::set_prototype_of(
+        &properties,
+        &interface_class("BluetoothCharacteristicProperties").get_property("prototype"),
+    );
+    properties
+}
+
+fn descriptor_value(
+    device_id: String,
+    service_uuid: String,
+    characteristic_uuid: String,
+    descriptor_uuid: String,
+    characteristic: Value,
+) -> Value {
+    let descriptor = Value::object(HashMap::from([
+        ("characteristic".into(), characteristic),
+        ("uuid".into(), Value::string(&descriptor_uuid)),
+        ("value".into(), Value::Null),
+    ]));
+    let read_descriptor = descriptor.clone();
+    let read_device = device_id.clone();
+    let read_service = service_uuid.clone();
+    let read_characteristic = characteristic_uuid.clone();
+    let read_uuid = descriptor_uuid.clone();
+    descriptor.set_property(
+        "readValue",
+        Value::function(move |_, _| {
+            promise(
+                host_call(
+                    "read_descriptor",
+                    Value::object(HashMap::from([
+                        ("device_id".into(), Value::string(&read_device)),
+                        ("service_uuid".into(), Value::string(&read_service)),
+                        (
+                            "characteristic_uuid".into(),
+                            Value::string(&read_characteristic),
+                        ),
+                        ("descriptor_uuid".into(), Value::string(&read_uuid)),
+                    ])),
+                )
+                .map(|response| {
+                    let view = w3cos_core::class::construct(
+                        &w3cos_core::binary::data_view_class(),
+                        vec![w3cos_core::binary::array_buffer_value(
+                            response
+                                .get_property("value")
+                                .iter()
+                                .map(|item| item.to_number().clamp(0.0, 255.0) as u8)
+                                .collect(),
+                        )],
+                    );
+                    read_descriptor.set_property("value", view.clone());
+                    view
+                }),
+            )
+        }),
+    );
+    let write_device = device_id;
+    let write_service = service_uuid;
+    let write_characteristic = characteristic_uuid;
+    let write_uuid = descriptor_uuid;
+    descriptor.set_property(
+        "writeValue",
+        Value::function(move |_, args| {
+            let Some(bytes) = args.first().and_then(w3cos_core::binary::bytes_of) else {
+                return promise(Err(dom_error(
+                    "TypeError",
+                    "GATT descriptor write requires an ArrayBuffer or ArrayBufferView",
+                )));
+            };
+            promise(
+                host_call(
+                    "write_descriptor",
+                    Value::object(HashMap::from([
+                        ("device_id".into(), Value::string(&write_device)),
+                        ("service_uuid".into(), Value::string(&write_service)),
+                        (
+                            "characteristic_uuid".into(),
+                            Value::string(&write_characteristic),
+                        ),
+                        ("descriptor_uuid".into(), Value::string(&write_uuid)),
+                        (
+                            "value".into(),
+                            Value::array(
+                                bytes
+                                    .into_iter()
+                                    .map(|byte| Value::Number(byte as f64))
+                                    .collect(),
+                            ),
+                        ),
+                    ])),
+                )
+                .map(|_| Value::Undefined),
+            )
+        }),
+    );
+    w3cos_core::class::set_prototype_of(
+        &descriptor,
+        &interface_class("BluetoothRemoteGATTDescriptor").get_property("prototype"),
+    );
+    descriptor
+}
+
 fn characteristic_value(
     device_id: String,
     service_uuid: String,
     characteristic_uuid: String,
 ) -> Value {
+    let service = Value::object(HashMap::from([
+        ("device".into(), Value::Null),
+        ("isPrimary".into(), Value::Bool(true)),
+        ("uuid".into(), Value::string(&service_uuid)),
+    ]));
+    w3cos_core::class::set_prototype_of(
+        &service,
+        &interface_class("BluetoothRemoteGATTService").get_property("prototype"),
+    );
     let value = Value::object(HashMap::from([
         ("uuid".to_string(), Value::string(&characteristic_uuid)),
-        (
-            "service".to_string(),
-            Value::object(HashMap::from([(
-                "uuid".to_string(),
-                Value::string(&service_uuid),
-            )])),
-        ),
+        ("service".to_string(), service),
+        ("properties".to_string(), characteristic_properties_value()),
+        ("value".to_string(), Value::Null),
+        ("oncharacteristicvaluechanged".to_string(), Value::Null),
     ]));
+    crate::web_events::event_target_class().call(value.clone(), vec![]);
     for method in [
         "writeValue",
         "writeValueWithResponse",
@@ -108,9 +401,10 @@ fn characteristic_value(
             }),
         );
     }
-    let read_device_id = device_id;
-    let read_service_uuid = service_uuid;
-    let read_characteristic_uuid = characteristic_uuid;
+    let read_value = value.clone();
+    let read_device_id = device_id.clone();
+    let read_service_uuid = service_uuid.clone();
+    let read_characteristic_uuid = characteristic_uuid.clone();
     value.set_property(
         "readValue",
         Value::function(move |_, _| {
@@ -131,21 +425,104 @@ fn characteristic_value(
                     .iter()
                     .map(|item| item.to_number().clamp(0.0, 255.0) as u8)
                     .collect();
-                w3cos_core::class::construct(
+                let view = w3cos_core::class::construct(
                     &w3cos_core::binary::data_view_class(),
                     vec![w3cos_core::binary::array_buffer_value(bytes)],
-                )
+                );
+                read_value.set_property("value", view.clone());
+                view
             }))
         }),
+    );
+    for method in ["startNotifications", "stopNotifications"] {
+        let notify_value = value.clone();
+        let notify_device = device_id.clone();
+        let notify_service = service_uuid.clone();
+        let notify_characteristic = characteristic_uuid.clone();
+        value.set_property(
+            method,
+            Value::function(move |_, _| {
+                promise(
+                    host_call(
+                        if method == "startNotifications" {
+                            "start_notifications"
+                        } else {
+                            "stop_notifications"
+                        },
+                        Value::object(HashMap::from([
+                            ("device_id".into(), Value::string(&notify_device)),
+                            ("service_uuid".into(), Value::string(&notify_service)),
+                            (
+                                "characteristic_uuid".into(),
+                                Value::string(&notify_characteristic),
+                            ),
+                        ])),
+                    )
+                    .map(|_| notify_value.clone()),
+                )
+            }),
+        );
+    }
+    let descriptor_characteristic = value.clone();
+    let descriptor_device = device_id.clone();
+    let descriptor_service = service_uuid.clone();
+    let descriptor_characteristic_uuid = characteristic_uuid.clone();
+    value.set_property(
+        "getDescriptor",
+        Value::function(move |_, args| {
+            let descriptor_uuid = args.first().cloned().unwrap_or_default().to_js_string();
+            if descriptor_uuid.is_empty() {
+                return promise(Err(dom_error("TypeError", "A descriptor UUID is required")));
+            }
+            promise(
+                host_call(
+                    "get_descriptor",
+                    Value::object(HashMap::from([
+                        ("device_id".into(), Value::string(&descriptor_device)),
+                        ("service_uuid".into(), Value::string(&descriptor_service)),
+                        (
+                            "characteristic_uuid".into(),
+                            Value::string(&descriptor_characteristic_uuid),
+                        ),
+                        ("descriptor_uuid".into(), Value::string(&descriptor_uuid)),
+                    ])),
+                )
+                .map(|_| {
+                    descriptor_value(
+                        descriptor_device.clone(),
+                        descriptor_service.clone(),
+                        descriptor_characteristic_uuid.clone(),
+                        descriptor_uuid,
+                        descriptor_characteristic.clone(),
+                    )
+                }),
+            )
+        }),
+    );
+    value.set_property(
+        "getDescriptors",
+        Value::function(|_, _| {
+            promise(Err(dom_error(
+                "NotSupportedError",
+                "Enumerating GATT descriptors requires a host Bluetooth adapter",
+            )))
+        }),
+    );
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &interface_class("BluetoothRemoteGATTCharacteristic").get_property("prototype"),
     );
     value
 }
 
 fn service_value(device_id: String, service_uuid: String) -> Value {
-    let value = Value::object(HashMap::from([(
-        "uuid".to_string(),
-        Value::string(&service_uuid),
-    )]));
+    let value = Value::object(HashMap::from([
+        ("device".to_string(), Value::Null),
+        ("isPrimary".to_string(), Value::Bool(true)),
+        ("uuid".to_string(), Value::string(&service_uuid)),
+    ]));
+    let characteristic_device = device_id.clone();
+    let characteristic_service = service_uuid.clone();
     value.set_property(
         "getCharacteristic",
         Value::function(move |_, args| {
@@ -157,17 +534,40 @@ fn service_value(device_id: String, service_uuid: String) -> Value {
                 )));
             }
             let payload = Value::object(HashMap::from([
-                ("device_id".to_string(), Value::string(&device_id)),
-                ("service_uuid".to_string(), Value::string(&service_uuid)),
+                (
+                    "device_id".to_string(),
+                    Value::string(&characteristic_device),
+                ),
+                (
+                    "service_uuid".to_string(),
+                    Value::string(&characteristic_service),
+                ),
                 (
                     "characteristic_uuid".to_string(),
                     Value::string(&characteristic_uuid),
                 ),
             ]));
             promise(host_call("get_characteristic", payload).map(|_| {
-                characteristic_value(device_id.clone(), service_uuid.clone(), characteristic_uuid)
+                characteristic_value(
+                    characteristic_device.clone(),
+                    characteristic_service.clone(),
+                    characteristic_uuid,
+                )
             }))
         }),
+    );
+    value.set_property(
+        "getCharacteristics",
+        Value::function(|_, _| {
+            promise(Err(dom_error(
+                "NotSupportedError",
+                "Enumerating GATT characteristics requires a host Bluetooth adapter",
+            )))
+        }),
+    );
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &interface_class("BluetoothRemoteGATTService").get_property("prototype"),
     );
     value
 }
@@ -177,22 +577,43 @@ fn gatt_server_value(device_id: String) -> Value {
         ("connected".to_string(), Value::Bool(true)),
         ("device".to_string(), Value::Null),
     ]));
+    let connect_device_id = device_id.clone();
+    value.set_property(
+        "connect",
+        Value::function(move |this, _| {
+            promise(
+                host_call(
+                    "connect",
+                    Value::object(HashMap::from([(
+                        "device_id".to_string(),
+                        Value::string(&connect_device_id),
+                    )])),
+                )
+                .map(|_| {
+                    this.set_property("connected", Value::Bool(true));
+                    this
+                }),
+            )
+        }),
+    );
     let service_device_id = device_id.clone();
     value.set_property(
         "getPrimaryService",
-        Value::function(move |_, args| {
+        Value::function(move |this, args| {
             let service_uuid = args.first().cloned().unwrap_or_default().to_js_string();
             if service_uuid.is_empty() {
                 return promise(Err(dom_error("TypeError", "A service UUID is required")));
             }
+            let device = this.get_property("device");
             let payload = Value::object(HashMap::from([
                 ("device_id".to_string(), Value::string(&service_device_id)),
                 ("service_uuid".to_string(), Value::string(&service_uuid)),
             ]));
-            promise(
-                host_call("get_primary_service", payload)
-                    .map(|_| service_value(service_device_id.clone(), service_uuid)),
-            )
+            promise(host_call("get_primary_service", payload).map(|_| {
+                let service = service_value(service_device_id.clone(), service_uuid);
+                service.set_property("device", device);
+                service
+            }))
         }),
     );
     value.set_property(
@@ -207,6 +628,19 @@ fn gatt_server_value(device_id: String) -> Value {
             Value::Undefined
         }),
     );
+    value.set_property(
+        "getPrimaryServices",
+        Value::function(|_, _| {
+            promise(Err(dom_error(
+                "NotSupportedError",
+                "Enumerating primary GATT services requires a host Bluetooth adapter",
+            )))
+        }),
+    );
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &interface_class("BluetoothRemoteGATTServer").get_property("prototype"),
+    );
     value
 }
 
@@ -219,33 +653,19 @@ fn device_value(response: &Value) -> Value {
         ("ongattserverdisconnected".to_string(), Value::Null),
     ]));
     crate::web_events::event_target_class().call(device.clone(), vec![]);
-    let gatt = Value::object(HashMap::from([
-        ("connected".to_string(), Value::Bool(false)),
-        ("device".to_string(), device.clone()),
-    ]));
-    let connect_device_id = device_id.clone();
-    let connect_device = device.clone();
-    gatt.set_property(
-        "connect",
-        Value::function(move |this, _| {
-            let payload = Value::object(HashMap::from([(
-                "device_id".to_string(),
-                Value::string(&connect_device_id),
-            )]));
-            promise(host_call("connect", payload).map(|_| {
-                let server = gatt_server_value(connect_device_id.clone());
-                server.set_property("device", connect_device.clone());
-                this.set_property("connected", Value::Bool(true));
-                server
-            }))
-        }),
-    );
+    let gatt = gatt_server_value(device_id);
+    gatt.set_property("connected", Value::Bool(false));
+    gatt.set_property("device", device.clone());
     device.set_property("gatt", gatt);
+    w3cos_core::class::set_prototype_of(
+        &device,
+        &interface_class("BluetoothDevice").get_property("prototype"),
+    );
     device
 }
 
 pub fn bluetooth_value() -> Value {
-    let bluetooth = Value::object(HashMap::new());
+    let bluetooth = w3cos_core::class::construct(&crate::web_events::event_target_class(), vec![]);
     bluetooth.set_property(
         "getAvailability",
         Value::function(|_, _| {
@@ -262,6 +682,7 @@ pub fn bluetooth_value() -> Value {
             promise(host_call("request_device", options).map(|response| device_value(&response)))
         }),
     );
+    w3cos_core::class::set_prototype_of(&bluetooth, &bluetooth_class().get_property("prototype"));
     bluetooth
 }
 
@@ -291,7 +712,27 @@ mod tests {
         );
 
         assert_eq!(device.get_property("id").to_js_string(), "ble:00:11");
+        assert!(w3cos_core::class::instance_of(
+            &device,
+            &interface_class("BluetoothDevice")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &gatt,
+            &interface_class("BluetoothRemoteGATTServer")
+        ));
         assert!(gatt.get_property("connect").is_function());
+        assert!(w3cos_core::class::instance_of(
+            &characteristic,
+            &interface_class("BluetoothRemoteGATTCharacteristic")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &characteristic.get_property("properties"),
+            &interface_class("BluetoothCharacteristicProperties")
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &characteristic.get_property("service"),
+            &interface_class("BluetoothRemoteGATTService")
+        ));
         assert!(characteristic.get_property("readValue").is_function());
         assert!(
             characteristic
@@ -302,6 +743,17 @@ mod tests {
             characteristic
                 .get_property("writeValueWithoutResponse")
                 .is_function()
+        );
+        let uuid = interface_class("BluetoothUUID");
+        assert_eq!(
+            uuid.call_method("getService", vec![Value::string("battery_service")])
+                .to_js_string(),
+            "0000180f-0000-1000-8000-00805f9b34fb"
+        );
+        assert_eq!(
+            uuid.call_method("canonicalUUID", vec![Value::Number(0x2a19 as f64)])
+                .to_js_string(),
+            "00002a19-0000-1000-8000-00805f9b34fb"
         );
     }
 }

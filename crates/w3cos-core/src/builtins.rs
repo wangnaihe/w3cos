@@ -1,6 +1,7 @@
 #![allow(non_upper_case_globals, non_snake_case)]
 
 use crate::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -37,6 +38,7 @@ impl BuiltinObject {
             (BuiltinKind::Math, "floor") => unary_math(arguments, f64::floor),
             (BuiltinKind::Math, "ceil") => unary_math(arguments, f64::ceil),
             (BuiltinKind::Math, "round") => unary_math(arguments, js_round),
+            (BuiltinKind::Math, "f16round") => unary_math(arguments, crate::binary::f16_round),
             (BuiltinKind::Math, "trunc") => unary_math(arguments, f64::trunc),
             (BuiltinKind::Math, "sqrt") => unary_math(arguments, f64::sqrt),
             (BuiltinKind::Math, "log") => unary_math(arguments, f64::ln),
@@ -96,7 +98,7 @@ impl BuiltinObject {
             (
                 BuiltinKind::Math,
                 "min" | "max" | "abs" | "floor" | "ceil" | "round" | "trunc" | "sqrt" | "log"
-                | "log2" | "exp" | "sin" | "cos" | "tan" | "pow" | "atan2" | "clz32",
+                | "log2" | "exp" | "sin" | "cos" | "tan" | "pow" | "atan2" | "clz32" | "f16round",
             ) => {
                 let builtin = *self;
                 let method = key.to_string();
@@ -229,6 +231,120 @@ pub fn RangeError(arguments: Vec<Value>) -> Value {
 
 pub fn ErrorValue(arguments: Vec<Value>) -> Value {
     arguments.first().cloned().unwrap_or(Value::Undefined)
+}
+
+const ERROR_CLASS_NAMES: &[&str] = &[
+    "Error",
+    "EvalError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "TypeError",
+    "URIError",
+    "AggregateError",
+];
+
+thread_local! {
+    static ERROR_CLASSES: RefCell<Option<HashMap<String, Value>>> = const { RefCell::new(None) };
+}
+
+fn build_error_classes() -> HashMap<String, Value> {
+    let mut classes = HashMap::new();
+    for name in ERROR_CLASS_NAMES {
+        let error_name = (*name).to_string();
+        let constructor_name = error_name.clone();
+        let constructor =
+            Value::function(move |_, arguments| error_instance(&constructor_name, arguments));
+        constructor.set_property("name", Value::string(name));
+        let prototype = Value::object(HashMap::from([
+            ("name".to_string(), Value::string(name)),
+            ("message".to_string(), Value::string("")),
+        ]));
+        prototype.set_property("constructor", constructor.clone());
+        constructor.set_property("prototype", prototype);
+        classes.insert(error_name, constructor);
+    }
+
+    let error_prototype = classes["Error"].get_property("prototype");
+    error_prototype.set_property(
+        "toString",
+        Value::function(|this, _| {
+            let name = this.get_property("name").to_js_string();
+            let message = this.get_property("message").to_js_string();
+            Value::String(if name.is_empty() {
+                message
+            } else if message.is_empty() {
+                name
+            } else {
+                format!("{name}: {message}")
+            })
+        }),
+    );
+    for name in ERROR_CLASS_NAMES
+        .iter()
+        .copied()
+        .filter(|name| *name != "Error")
+    {
+        crate::class::set_prototype_of(&classes[name].get_property("prototype"), &error_prototype);
+    }
+    classes
+}
+
+pub fn error_class(name: &str) -> Value {
+    ERROR_CLASSES.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(build_error_classes());
+        }
+        slot.borrow()
+            .as_ref()
+            .and_then(|classes| classes.get(name))
+            .cloned()
+            .unwrap_or_else(|| {
+                slot.borrow().as_ref().expect("error classes initialized")["Error"].clone()
+            })
+    })
+}
+
+pub fn error_instance(name: &str, arguments: Vec<Value>) -> Value {
+    let (message_index, options_index) = if name == "AggregateError" {
+        (1, 2)
+    } else {
+        (0, 1)
+    };
+    let message_value = arguments
+        .get(message_index)
+        .cloned()
+        .unwrap_or(Value::Undefined);
+    let message = if message_value.is_undefined() {
+        String::new()
+    } else {
+        message_value.to_js_string()
+    };
+    let value = Value::object(HashMap::from([
+        ("name".to_string(), Value::string(name)),
+        ("message".to_string(), Value::string(&message)),
+        (
+            "stack".to_string(),
+            Value::String(if message.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}: {message}")
+            }),
+        ),
+    ]));
+    if name == "AggregateError" {
+        let errors = arguments.first().cloned().unwrap_or(Value::Undefined);
+        value.set_property("errors", Value::array(errors.iter().collect()));
+    }
+    let cause = arguments
+        .get(options_index)
+        .map(|options| options.get_property("cause"))
+        .unwrap_or(Value::Undefined);
+    if !cause.is_undefined() {
+        value.set_property("cause", cause);
+    }
+    crate::class::set_prototype_of(&value, &error_class(name).get_property("prototype"));
+    value
 }
 
 pub struct Map;
@@ -450,6 +566,7 @@ struct ResizeObserverTarget {
 
 struct ResizeObserverState {
     callback: Value,
+    observer: Value,
     targets: std::collections::HashMap<u64, ResizeObserverTarget>,
 }
 
@@ -472,6 +589,7 @@ impl ResizeObserver {
                 observer_id,
                 ResizeObserverState {
                     callback: callback.clone(),
+                    observer: Value::Undefined,
                     targets: std::collections::HashMap::new(),
                 },
             );
@@ -483,6 +601,21 @@ impl ResizeObserver {
             "observe",
             Value::function(move |_, arguments| {
                 let element = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let options = arguments.get(1).cloned().unwrap_or_default();
+                let box_kind = if options.get_property("box").is_undefined() {
+                    "content-box".to_string()
+                } else {
+                    options.get_property("box").to_js_string()
+                };
+                if !matches!(
+                    box_kind.as_str(),
+                    "content-box" | "border-box" | "device-pixel-content-box"
+                ) {
+                    crate::throw_value(crate::error_instance(
+                        "TypeError",
+                        vec![Value::string("ResizeObserver box option is invalid")],
+                    ));
+                }
                 let host_id = element
                     .get_property("__w3cosHostId")
                     .to_js_string()
@@ -498,6 +631,7 @@ impl ResizeObserver {
                             .entry(observer_id)
                             .or_insert_with(|| ResizeObserverState {
                                 callback: observe_callback.clone(),
+                                observer: Value::Undefined,
                                 targets: std::collections::HashMap::new(),
                             })
                             .targets
@@ -513,6 +647,11 @@ impl ResizeObserver {
                 Value::Undefined
             }),
         );
+        RESIZE_OBSERVERS.with(|observers| {
+            if let Some(state) = observers.borrow_mut().get_mut(&observer_id) {
+                state.observer = observer.clone();
+            }
+        });
         observer.set_property(
             "unobserve",
             Value::function(move |_, arguments| {
@@ -535,7 +674,9 @@ impl ResizeObserver {
             "disconnect",
             Value::function(move |_, _| {
                 RESIZE_OBSERVERS.with(|observers| {
-                    observers.borrow_mut().remove(&observer_id);
+                    if let Some(observer) = observers.borrow_mut().get_mut(&observer_id) {
+                        observer.targets.clear();
+                    }
                 });
                 Value::Undefined
             }),
@@ -598,6 +739,10 @@ pub fn dispatch_resize_observers_bounded(
                 let content_rect = Value::object(std::collections::HashMap::from([
                     ("x".into(), Value::Number(0.0)),
                     ("y".into(), Value::Number(0.0)),
+                    ("top".into(), Value::Number(0.0)),
+                    ("left".into(), Value::Number(0.0)),
+                    ("right".into(), Value::Number(width as f64)),
+                    ("bottom".into(), Value::Number(height as f64)),
                     ("width".into(), Value::Number(width as f64)),
                     ("height".into(), Value::Number(height as f64)),
                 ]));
@@ -609,11 +754,22 @@ pub fn dispatch_resize_observers_bounded(
                         Value::array(vec![border_box.clone()]),
                     ),
                     ("contentBoxSize".into(), Value::array(vec![border_box])),
+                    (
+                        "devicePixelContentBoxSize".into(),
+                        Value::array(vec![Value::object(std::collections::HashMap::from([
+                            ("inlineSize".into(), Value::Number(width as f64)),
+                            ("blockSize".into(), Value::Number(height as f64)),
+                        ]))]),
+                    ),
                 ])));
                 remaining -= 1;
             }
             if !entries.is_empty() && observer.callback.is_function() {
-                deliveries.push((observer.callback.clone(), Value::array(entries)));
+                deliveries.push((
+                    observer.callback.clone(),
+                    observer.observer.clone(),
+                    Value::array(entries),
+                ));
             }
             if remaining == 0 {
                 break;
@@ -623,8 +779,8 @@ pub fn dispatch_resize_observers_bounded(
     });
 
     let delivered = !deliveries.is_empty();
-    for (callback, entries) in deliveries {
-        callback.call(Value::Undefined, vec![entries]);
+    for (callback, observer, entries) in deliveries {
+        callback.call(Value::Undefined, vec![entries, observer]);
     }
     (delivered, remaining == 0)
 }
@@ -774,5 +930,55 @@ mod tests {
                 .to_number(),
             26.0
         );
+    }
+
+    #[test]
+    fn error_family_has_browser_shaped_instances_and_prototypes() {
+        let cause = Value::string("root");
+        let type_error = crate::class::construct(
+            &error_class("TypeError"),
+            vec![
+                Value::string("bad input"),
+                Value::object(HashMap::from([("cause".to_string(), cause.clone())])),
+            ],
+        );
+        assert_eq!(type_error.get_property("name").to_js_string(), "TypeError");
+        assert_eq!(
+            type_error.get_property("message").to_js_string(),
+            "bad input"
+        );
+        assert!(type_error.get_property("cause") == cause);
+        assert_eq!(
+            type_error.call_method("toString", vec![]).to_js_string(),
+            "TypeError: bad input"
+        );
+        assert!(crate::class::instance_of(
+            &type_error,
+            &error_class("TypeError")
+        ));
+        assert!(crate::class::instance_of(
+            &type_error,
+            &error_class("Error")
+        ));
+
+        let aggregate = crate::class::construct(
+            &error_class("AggregateError"),
+            vec![
+                Value::array(vec![type_error.clone(), Value::string("second")]),
+                Value::string("many"),
+            ],
+        );
+        assert_eq!(
+            aggregate
+                .get_property("errors")
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+        assert!(crate::class::instance_of(
+            &aggregate,
+            &error_class("AggregateError")
+        ));
+        assert!(crate::class::instance_of(&aggregate, &error_class("Error")));
     }
 }

@@ -235,6 +235,7 @@ struct JsWebSocket {
 
 thread_local! {
     static JS_WEBSOCKETS: RefCell<Vec<JsWebSocket>> = const { RefCell::new(Vec::new()) };
+    static WEBSOCKET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 /// Standard JavaScript `WebSocket` constructor used by the ESM runtime.
@@ -242,23 +243,57 @@ thread_local! {
 /// The native worker owns transport I/O while [`poll_js_events`] delivers
 /// browser-shaped events on the JavaScript/application thread.
 pub fn websocket_class() -> Value {
-    let constructor = Value::function(|_, args| {
-        let url = args
-            .first()
-            .cloned()
-            .unwrap_or(Value::Undefined)
-            .to_js_string();
-        js_websocket_value(WebSocket::connect(url))
-    });
-    for (name, state) in [
-        ("CONNECTING", ReadyState::Connecting),
-        ("OPEN", ReadyState::Open),
-        ("CLOSING", ReadyState::Closing),
-        ("CLOSED", ReadyState::Closed),
-    ] {
-        constructor.set_property(name, Value::Number(state.as_u8() as f64));
-    }
-    constructor
+    WEBSOCKET_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let constructor = Value::function(|_, args| {
+            let url = args
+                .first()
+                .cloned()
+                .unwrap_or(Value::Undefined)
+                .to_js_string();
+            js_websocket_value(WebSocket::connect(url))
+        });
+        constructor.set_property("name", Value::string("WebSocket"));
+        for (name, state) in [
+            ("CONNECTING", ReadyState::Connecting),
+            ("OPEN", ReadyState::Open),
+            ("CLOSING", ReadyState::Closing),
+            ("CLOSED", ReadyState::Closed),
+        ] {
+            constructor.set_property(name, Value::Number(state.as_u8() as f64));
+        }
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", constructor.clone());
+        for (name, value) in [
+            ("CONNECTING", Value::Number(0.0)),
+            ("OPEN", Value::Number(1.0)),
+            ("CLOSING", Value::Number(2.0)),
+            ("CLOSED", Value::Number(3.0)),
+            ("binaryType", Value::Undefined),
+            ("bufferedAmount", Value::Undefined),
+            ("close", Value::Undefined),
+            ("extensions", Value::Undefined),
+            ("onclose", Value::Undefined),
+            ("onerror", Value::Undefined),
+            ("onmessage", Value::Undefined),
+            ("onopen", Value::Undefined),
+            ("protocol", Value::Undefined),
+            ("readyState", Value::Undefined),
+            ("send", Value::Undefined),
+            ("url", Value::Undefined),
+        ] {
+            prototype.set_property(name, value);
+        }
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::web_events::event_target_class().get_property("prototype"),
+        );
+        constructor.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(constructor.clone());
+        constructor
+    })
 }
 
 fn js_websocket_value(socket: WebSocket) -> Value {
@@ -386,6 +421,7 @@ fn js_websocket_value(socket: WebSocket) -> Value {
     );
 
     let value = Value::object(props);
+    w3cos_core::class::set_prototype_of(&value, &websocket_class().get_property("prototype"));
     JS_WEBSOCKETS.with(|bindings| {
         bindings.borrow_mut().push(JsWebSocket {
             socket,

@@ -26,6 +26,7 @@ parley = { workspace = true }
 fontdue = { workspace = true }
 anyhow = { workspace = true }
 image = { workspace = true }
+flate2 = { workspace = true }
 resvg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

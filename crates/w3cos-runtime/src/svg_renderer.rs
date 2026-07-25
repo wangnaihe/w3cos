@@ -591,7 +591,7 @@ fn node_hit_bounds(node: &resvg::usvg::Node, mode: &PointerHitMode) -> resvg::us
 fn draw_clip_group(
     group: &resvg::usvg::Group,
     transform: resvg::tiny_skia::Transform,
-    pixmap: &mut resvg::tiny_skia::PixmapMut<'_>,
+    pixmap: &mut resvg::tiny_skia::Pixmap,
 ) {
     for node in group.children() {
         match node {
@@ -604,13 +604,34 @@ fn draw_clip_group(
                     resvg::usvg::FillRule::EvenOdd => resvg::tiny_skia::FillRule::EvenOdd,
                 };
                 let paint = resvg::tiny_skia::Paint::default();
-                pixmap.fill_path(path.data(), &paint, fill_rule, transform, None);
+                pixmap
+                    .as_mut()
+                    .fill_path(path.data(), &paint, fill_rule, transform, None);
             }
             resvg::usvg::Node::Text(text) => {
                 draw_clip_group(text.flattened(), transform, pixmap);
             }
             resvg::usvg::Node::Group(group) => {
-                draw_clip_group(group, transform.pre_concat(group.transform()), pixmap);
+                let transform = transform.pre_concat(group.transform());
+                if let Some(clip) = group.clip_path() {
+                    let Some(mut layer) =
+                        resvg::tiny_skia::Pixmap::new(pixmap.width(), pixmap.height())
+                    else {
+                        continue;
+                    };
+                    draw_clip_group(group, transform, &mut layer);
+                    apply_clip_path(&mut layer, clip, transform);
+                    pixmap.draw_pixmap(
+                        0,
+                        0,
+                        layer.as_ref(),
+                        &resvg::tiny_skia::PixmapPaint::default(),
+                        resvg::tiny_skia::Transform::identity(),
+                        None,
+                    );
+                } else {
+                    draw_clip_group(group, transform, pixmap);
+                }
             }
             _ => {}
         }
@@ -629,7 +650,7 @@ fn apply_clip_path(
     draw_clip_group(
         clip.root(),
         transform.pre_concat(clip.transform()),
-        &mut clip_pixmap.as_mut(),
+        &mut clip_pixmap,
     );
     if let Some(parent_clip) = clip.clip_path() {
         apply_clip_path(&mut clip_pixmap, parent_clip, transform);
@@ -1672,6 +1693,53 @@ mod tests {
         assert_eq!(
             hit_test(source, 100, 50, &targets, 45.0, 20.0),
             Some(vec![2, 1])
+        );
+    }
+
+    #[test]
+    fn nested_group_clip_paths_intersect_in_local_coordinates() {
+        clear_cache();
+        let source = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50">
+            <defs>
+                <clipPath id="ancestor">
+                    <rect x="22" y="10" width="6" height="20"/>
+                </clipPath>
+                <clipPath id="inner" clip-path="url(#ancestor)">
+                    <rect x="20" y="10" width="10" height="20"/>
+                </clipPath>
+                <clipPath id="outer">
+                    <rect x="10" y="10" width="30" height="20"
+                        clip-path="url(#inner)"/>
+                </clipPath>
+            </defs>
+            <rect id="back" width="100" height="50"/>
+            <g clip-path="url(#outer)">
+                <rect id="front" x="0" y="0" width="50" height="40"/>
+            </g>
+        </svg>"##;
+        let targets = vec![
+            SvgEventTarget {
+                svg_id: "back".into(),
+                render_index: Some(0),
+                pointer_events: "auto".into(),
+                host_chain: vec![2, 1],
+            },
+            SvgEventTarget {
+                svg_id: "front".into(),
+                render_index: Some(1),
+                pointer_events: "auto".into(),
+                host_chain: vec![3, 1],
+            },
+        ];
+
+        assert_eq!(
+            hit_test(source, 100, 50, &targets, 25.0, 20.0),
+            Some(vec![3, 1])
+        );
+        assert_eq!(
+            hit_test(source, 100, 50, &targets, 29.0, 20.0),
+            Some(vec![2, 1]),
+            "the nested clip must be applied before its group joins the outer clip"
         );
     }
 }

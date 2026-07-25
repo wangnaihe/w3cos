@@ -1346,7 +1346,7 @@ fn extract_graph_key_path(graph: &Value, path: &str) -> Option<Value> {
     let nodes = graph.get("nodes")?.as_array()?;
     let mut current = graph.get("root")?;
     if path.is_empty() {
-        return resolve_graph_value(current, nodes).cloned();
+        return graph_value_as_key(current, nodes, &mut Vec::new());
     }
     for segment in path.split('.') {
         current = resolve_graph_value(current, nodes)?;
@@ -1357,11 +1357,82 @@ fn extract_graph_key_path(graph: &Value, path: &str) -> Option<Value> {
         };
         current = properties.get(segment)?;
     }
-    let resolved = resolve_graph_value(current, nodes)?;
-    if resolved.get("kind").is_some() {
-        None
-    } else {
-        Some(resolved.clone())
+    graph_value_as_key(current, nodes, &mut Vec::new())
+}
+
+fn graph_value_as_key(value: &Value, nodes: &[Value], visiting: &mut Vec<usize>) -> Option<Value> {
+    if value.get("\u{1f}w3cos-idb-clone").and_then(Value::as_str) == Some("ref") {
+        let id = value.get("id")?.as_u64()? as usize;
+        if visiting.contains(&id) {
+            return None;
+        }
+        visiting.push(id);
+        let result = graph_value_as_key(nodes.get(id)?, nodes, visiting);
+        visiting.pop();
+        return result;
+    }
+    match value.get("kind").and_then(Value::as_str) {
+        Some("array") => Some(Value::Array(
+            value
+                .get("value")?
+                .as_array()?
+                .iter()
+                .map(|entry| graph_value_as_key(entry, nodes, visiting))
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        Some("arraybuffer") => binary_key_from_bytes(value.get("bytes")?.as_array()?),
+        Some("typedarray") => {
+            let bytes = graph_buffer_bytes(value.get("buffer")?, nodes)?;
+            let offset = value.get("offset")?.as_u64()? as usize;
+            let length = value.get("length")?.as_u64()? as usize;
+            let width = typed_array_element_width(value.get("name")?.as_str()?)?;
+            let end = offset.checked_add(length.checked_mul(width)?)?;
+            binary_key_from_bytes(bytes.get(offset..end)?)
+        }
+        Some("dataview") => {
+            let bytes = graph_buffer_bytes(value.get("buffer")?, nodes)?;
+            let offset = value.get("offset")?.as_u64()? as usize;
+            let length = value.get("length")?.as_u64()? as usize;
+            let end = offset.checked_add(length)?;
+            binary_key_from_bytes(bytes.get(offset..end)?)
+        }
+        Some(_) => None,
+        None => Some(value.clone()),
+    }
+}
+
+fn graph_buffer_bytes<'a>(value: &'a Value, nodes: &'a [Value]) -> Option<&'a [Value]> {
+    let resolved = resolve_graph_value(value, nodes)?;
+    if resolved.get("kind").and_then(Value::as_str) != Some("arraybuffer")
+        || resolved
+            .get("shared")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    resolved.get("bytes")?.as_array().map(Vec::as_slice)
+}
+
+fn binary_key_from_bytes(bytes: &[Value]) -> Option<Value> {
+    bytes
+        .iter()
+        .all(|byte| byte.as_u64().is_some_and(|byte| byte <= u8::MAX as u64))
+        .then(|| {
+            Value::Object(serde_json::Map::from_iter([(
+                "\u{1f}w3cos-idb-binary".into(),
+                Value::Array(bytes.to_vec()),
+            )]))
+        })
+}
+
+fn typed_array_element_width(name: &str) -> Option<usize> {
+    match name {
+        "Int8Array" | "Uint8Array" | "Uint8ClampedArray" => Some(1),
+        "Int16Array" | "Uint16Array" | "Float16Array" => Some(2),
+        "Int32Array" | "Uint32Array" | "Float32Array" => Some(4),
+        "Float64Array" | "BigInt64Array" | "BigUint64Array" => Some(8),
+        _ => None,
     }
 }
 

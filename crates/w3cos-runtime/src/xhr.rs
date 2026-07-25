@@ -16,14 +16,112 @@ struct XhrState {
 
 thread_local! {
     static XHR_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static XHR_EVENT_TARGET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static XHR_UPLOAD_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 fn dispatch(target: &Value, event_type: &str) {
-    let event = w3cos_core::class::construct(
-        &crate::web_events::event_class(),
-        vec![Value::string(event_type)],
-    );
+    let event = if event_type == "readystatechange" {
+        w3cos_core::class::construct(
+            &crate::web_events::event_class(),
+            vec![Value::string(event_type)],
+        )
+    } else {
+        w3cos_core::class::construct(
+            &crate::web_events::event_subclass_class("ProgressEvent"),
+            vec![
+                Value::string(event_type),
+                Value::object(HashMap::from([
+                    ("lengthComputable".into(), Value::Bool(false)),
+                    ("loaded".into(), Value::Number(0.0)),
+                    ("total".into(), Value::Number(0.0)),
+                ])),
+            ],
+        )
+    };
     target.call_method("dispatchEvent", vec![event]);
+}
+
+pub fn xml_http_request_event_target_class() -> Value {
+    XHR_EVENT_TARGET_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(w3cos_core::error_instance(
+                "TypeError",
+                vec![Value::string(
+                    "Illegal constructor: XMLHttpRequestEventTarget",
+                )],
+            ))
+        });
+        class.set_property("name", Value::string("XMLHttpRequestEventTarget"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in [
+            "onabort",
+            "onerror",
+            "onload",
+            "onloadend",
+            "onloadstart",
+            "onprogress",
+            "ontimeout",
+        ] {
+            prototype.set_property(property, Value::Undefined);
+        }
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::web_events::event_target_class().get_property("prototype"),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+pub fn xml_http_request_upload_class() -> Value {
+    XHR_UPLOAD_CLASS.with(|slot| {
+        if let Some(class) = slot.borrow().clone() {
+            return class;
+        }
+        let class = Value::function(|_, _| {
+            w3cos_core::throw_value(w3cos_core::error_instance(
+                "TypeError",
+                vec![Value::string("Illegal constructor: XMLHttpRequestUpload")],
+            ))
+        });
+        class.set_property("name", Value::string("XMLHttpRequestUpload"));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &xml_http_request_event_target_class().get_property("prototype"),
+        );
+        class.set_property("prototype", prototype);
+        *slot.borrow_mut() = Some(class.clone());
+        class
+    })
+}
+
+fn upload_value() -> Value {
+    let value = Value::object(HashMap::new());
+    crate::web_events::event_target_class().call(value.clone(), vec![]);
+    for name in [
+        "abort",
+        "error",
+        "load",
+        "loadend",
+        "loadstart",
+        "progress",
+        "timeout",
+    ] {
+        value.set_property(&format!("on{name}"), Value::Null);
+    }
+    w3cos_core::class::set_prototype_of(
+        &value,
+        &xml_http_request_upload_class().get_property("prototype"),
+    );
+    value
 }
 
 pub fn xml_http_request_class() -> Value {
@@ -52,7 +150,7 @@ pub fn xml_http_request_class() -> Value {
             this.set_property("responseType", Value::string(""));
             this.set_property("timeout", Value::Number(0.0));
             this.set_property("withCredentials", Value::Bool(false));
-            this.set_property("upload", Value::object(HashMap::new()));
+            this.set_property("upload", upload_value());
             for name in [
                 "readystatechange",
                 "loadstart",
@@ -99,6 +197,8 @@ pub fn xml_http_request_class() -> Value {
                 "send",
                 Value::function(move |this, args| {
                     dispatch(&this, "loadstart");
+                    let upload = this.get_property("upload");
+                    dispatch(&upload, "loadstart");
                     let state = send_state.borrow();
                     let headers = w3cos_core::class::construct(
                         &crate::fetch::headers_class(),
@@ -138,7 +238,11 @@ pub fn xml_http_request_class() -> Value {
                     };
                     this.set_property("response", result);
                     send_state.borrow_mut().response_headers = response.get_property("headers");
+                    dispatch(&upload, "progress");
+                    dispatch(&upload, "load");
+                    dispatch(&upload, "loadend");
                     dispatch(&this, "readystatechange");
+                    dispatch(&this, "progress");
                     dispatch(&this, if ok { "load" } else { "error" });
                     dispatch(&this, "loadend");
                     Value::Undefined
@@ -182,12 +286,86 @@ pub fn xml_http_request_class() -> Value {
         }
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
+        for (name, value) in [
+            ("DONE", Value::Number(4.0)),
+            ("HEADERS_RECEIVED", Value::Number(2.0)),
+            ("LOADING", Value::Number(3.0)),
+            ("OPENED", Value::Number(1.0)),
+            ("UNSENT", Value::Number(0.0)),
+            ("abort", Value::Undefined),
+            ("getAllResponseHeaders", Value::Undefined),
+            ("getResponseHeader", Value::Undefined),
+            ("onreadystatechange", Value::Undefined),
+            ("open", Value::Undefined),
+            ("overrideMimeType", Value::Undefined),
+            ("readyState", Value::Undefined),
+            ("response", Value::Undefined),
+            ("responseText", Value::Undefined),
+            ("responseType", Value::Undefined),
+            ("responseURL", Value::Undefined),
+            ("responseXML", Value::Undefined),
+            ("send", Value::Undefined),
+            ("setAttributionReporting", Value::Undefined),
+            ("setPrivateToken", Value::Undefined),
+            ("setRequestHeader", Value::Undefined),
+            ("status", Value::Undefined),
+            ("statusText", Value::Undefined),
+            ("timeout", Value::Undefined),
+            ("upload", Value::Undefined),
+            ("withCredentials", Value::Undefined),
+        ] {
+            prototype.set_property(name, value);
+        }
         w3cos_core::class::set_prototype_of(
             &prototype,
-            &crate::web_events::event_target_class().get_property("prototype"),
+            &xml_http_request_event_target_class().get_property("prototype"),
         );
         class.set_property("prototype", prototype);
         *slot.borrow_mut() = Some(class.clone());
         class
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn xhr_and_upload_use_the_standard_event_target_hierarchy() {
+        let xhr = w3cos_core::class::construct(&xml_http_request_class(), vec![]);
+        let upload = xhr.get_property("upload");
+        assert!(w3cos_core::class::instance_of(
+            &xhr,
+            &xml_http_request_event_target_class()
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &upload,
+            &xml_http_request_upload_class()
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &upload,
+            &crate::web_events::event_target_class()
+        ));
+
+        let calls = Rc::new(Cell::new(0));
+        let listener_calls = Rc::clone(&calls);
+        upload.call_method(
+            "addEventListener",
+            vec![
+                Value::string("progress"),
+                Value::function(move |_, args| {
+                    assert!(w3cos_core::class::instance_of(
+                        &args[0],
+                        &crate::web_events::event_subclass_class("ProgressEvent")
+                    ));
+                    listener_calls.set(listener_calls.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        dispatch(&upload, "progress");
+        assert_eq!(calls.get(), 1);
+    }
 }

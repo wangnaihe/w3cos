@@ -30,7 +30,11 @@ W3COS must not require `w3cos.indexedDB`, an upgrade callback argument to `open`
 
 - `globalThis.indexedDB` is an `IDBFactory`; operations return `IDBRequest` / `IDBOpenDBRequest` immediately and complete through EventTarget dispatch.
 - Database identity is scoped by the W3C storage key and installed application identity, not only by a caller-controlled database name.
-- Values cross the storage boundary through the HTML structured clone algorithm. Unsupported values fail with `DataCloneError`.
+- Values cross the storage boundary through the HTML structured clone algorithm.
+  Shared/cyclic identity and supported platform prototypes are preserved,
+  including ArrayBuffer/SharedArrayBuffer backing-store identity and exact
+  TypedArray/DataView type, byte offset, and range. Unsupported values fail
+  with `DataCloneError`.
 - Keys, compound keys, key paths and `IDBKeyRange` follow the specification ordering and validation algorithms.
 - Schema mutation is only allowed inside the exclusive `versionchange` transaction created by `open`.
 - Requests inside one transaction execute in order. Overlapping `readwrite` scopes are scheduled in creation order and never observe partial writes.
@@ -60,10 +64,10 @@ The SQLite adapter uses WAL, `synchronous=FULL`, parameter binding and `BEGIN IM
 
 ## Delivery gates
 
-1. **IDB surface — baseline landed**: `globalThis.indexedDB`, asynchronous request/open-request events, version handling, upgrade transactions, object stores, indexes, ranges, cursors, connection blocking, explicit commit, durability hints, `cmp` and `databases()` execute without W3COS imports. Complete constructor/prototype identity remains open.
+1. **IDB surface — baseline landed**: `globalThis.indexedDB`, asynchronous request/open-request events, version handling, upgrade transactions, object stores, indexes, ranges, cursors, connection blocking, explicit commit, durability hints, `cmp` and `databases()` execute without W3COS imports. Standard constructor/prototype identity is present for factory, key ranges, requests, databases, transactions, stores, indexes, cursors and `IDBVersionChangeEvent`.
 2. **Atomic engine — baseline landed**: commit/abort, automatic completion, overlapping-scope creation order, queued-abort removal, request-error cancellation, failed-upgrade rollback, error propagation and open/delete `versionchange → blocked → close → resume` are tested. Exact HTML task active/inactive boundaries remain open.
 3. **SQLite backend — baseline landed**: normalized tables, WAL/FULL durability, legacy migration, storage-scope path isolation, quota fail-closed behavior, fresh-registry reopen and subprocess abrupt-termination proof are covered. Platform credential-store encryption and disk-full/corruption recovery remain open.
-4. **Keys/query/clone — baseline landed**: number, string, Date, binary and compound keys retain type and order; compound key paths, `IDBKeyRange`, unique/multiEntry indexes and request-reusing cursors are covered. Structured clone preserves undefined, special numbers, Date, binary, cyclic and shared Array/Object graphs. Map, Set, Blob, File, RegExp and cursor update/delete remain open.
+4. **Keys/query/clone — baseline landed**: number, string, Date, binary and compound keys retain type and order; compound key paths, `IDBKeyRange`, unique/multiEntry indexes, request-reusing cursors and cursor update/delete are implemented. Structured clone preserves undefined, special numbers, BigInt, Date, RegExp, binary, Blob/File metadata and bytes, Error/DOMException, ImageData, Map/Set, and cyclic/shared Array/Object/collection/Error graphs. Broader raw-WPT clone coverage remains open.
 5. **Conformance — pinned adapted subset landed**: `tests/wpt/indexeddb-subset.json` pins WPT revision `f64f3e13f0c456553639fd5c30a438204cc5dfe3` and maps 12 upstream files to JavaScript-visible Rust assertions: 12 covered, 0 failed, 0 skipped. The gate rejects missing mappings and every non-`covered` status. This is an adapted assertion subset, not a claim that the raw upstream WPT harness or the full IndexedDB suite passes.
 6. **Production hardening — in progress**: iOS build is a release gate; Android build/device, OS-level background termination, power-loss injection, encrypted-at-rest policy and disk-full/corruption recovery remain platform-specific gates.
 

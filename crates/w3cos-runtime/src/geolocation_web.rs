@@ -46,6 +46,83 @@ thread_local! {
     static PERMISSION_DENIED: Cell<bool> = const { Cell::new(false) };
     static NEXT_WATCH_ID: Cell<u32> = const { Cell::new(1) };
     static WATCHES: RefCell<Vec<Watch>> = const { RefCell::new(Vec::new()) };
+    static GEOLOCATION_CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+}
+
+fn class(name: &'static str, properties: &'static [&'static str]) -> Value {
+    GEOLOCATION_CLASSES.with(|classes| {
+        if let Some(class) = classes.borrow().get(name).cloned() {
+            return class;
+        }
+        let class = Value::function(move |_, _| {
+            w3cos_core::throw_value(Value::object(HashMap::from([
+                ("name".into(), Value::string("TypeError")),
+                (
+                    "message".into(),
+                    Value::string(&format!("Illegal constructor: {name}")),
+                ),
+            ])))
+        });
+        class.set_property("name", Value::string(name));
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("constructor", class.clone());
+        for property in properties {
+            prototype.set_property(property, Value::Undefined);
+        }
+        if name == "GeolocationPositionError" {
+            for (constant, code) in [
+                ("PERMISSION_DENIED", 1.0),
+                ("POSITION_UNAVAILABLE", 2.0),
+                ("TIMEOUT", 3.0),
+            ] {
+                class.set_property(constant, Value::Number(code));
+                prototype.set_property(constant, Value::Number(code));
+            }
+        }
+        class.set_property("prototype", prototype);
+        classes.borrow_mut().insert(name.into(), class.clone());
+        class
+    })
+}
+
+pub fn geolocation_class() -> Value {
+    class(
+        "Geolocation",
+        &["clearWatch", "getCurrentPosition", "watchPosition"],
+    )
+}
+
+pub fn coordinates_class() -> Value {
+    class(
+        "GeolocationCoordinates",
+        &[
+            "accuracy",
+            "altitude",
+            "altitudeAccuracy",
+            "heading",
+            "latitude",
+            "longitude",
+            "speed",
+            "toJSON",
+        ],
+    )
+}
+
+pub fn position_class() -> Value {
+    class("GeolocationPosition", &["coords", "timestamp", "toJSON"])
+}
+
+pub fn position_error_class() -> Value {
+    class(
+        "GeolocationPositionError",
+        &[
+            "PERMISSION_DENIED",
+            "POSITION_UNAVAILABLE",
+            "TIMEOUT",
+            "code",
+            "message",
+        ],
+    )
 }
 
 fn now_ms() -> f64 {
@@ -73,23 +150,30 @@ fn position_value(position: &GeoPosition) -> Value {
         ("heading".to_string(), nullable_number(position.heading)),
         ("speed".to_string(), nullable_number(position.speed)),
     ]));
-    Value::object(HashMap::from([
+    coords.set_property("toJSON", Value::function(|this, _| this));
+    w3cos_core::class::set_prototype_of(&coords, &coordinates_class().get_property("prototype"));
+    let value = Value::object(HashMap::from([
         ("coords".to_string(), coords),
         (
             "timestamp".to_string(),
             Value::Number(position.timestamp_ms),
         ),
-    ]))
+    ]));
+    value.set_property("toJSON", Value::function(|this, _| this));
+    w3cos_core::class::set_prototype_of(&value, &position_class().get_property("prototype"));
+    value
 }
 
 fn error_value(code: u32, message: &str) -> Value {
-    Value::object(HashMap::from([
+    let value = Value::object(HashMap::from([
         ("code".to_string(), Value::Number(code as f64)),
         ("message".to_string(), Value::string(message)),
         ("PERMISSION_DENIED".to_string(), Value::Number(1.0)),
         ("POSITION_UNAVAILABLE".to_string(), Value::Number(2.0)),
         ("TIMEOUT".to_string(), Value::Number(3.0)),
-    ]))
+    ]));
+    w3cos_core::class::set_prototype_of(&value, &position_error_class().get_property("prototype"));
+    value
 }
 
 fn option_number(options: &Value, name: &str) -> Option<f64> {
@@ -207,6 +291,7 @@ pub fn geolocation_value() -> Value {
             Value::Undefined
         }),
     );
+    w3cos_core::class::set_prototype_of(&value, &geolocation_class().get_property("prototype"));
     value
 }
 

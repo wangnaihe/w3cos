@@ -185,6 +185,12 @@ pub fn form_data_class() -> Value {
         let class = Value::function(|_, _| make_form_data());
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
+        for method in [
+            "append", "delete", "entries", "forEach", "get", "getAll", "has", "keys", "set",
+            "values",
+        ] {
+            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+        }
         class.set_property("prototype", prototype);
         *slot.borrow_mut() = Some(class.clone());
         class
