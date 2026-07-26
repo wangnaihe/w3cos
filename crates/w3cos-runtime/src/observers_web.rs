@@ -736,10 +736,10 @@ pub fn mutation_observer_class() -> Value {
             value.set_property(
                 "observe",
                 Value::function(move |_, args| {
-                    let Some(target) = args
-                        .first()
-                        .and_then(crate::jsdom::node_id_of)
-                    else {
+                    let target_value = args.first().cloned().unwrap_or_default();
+                    let Some(target) = crate::jsdom::node_id_of(&target_value).or_else(|| {
+                        (target_value == crate::jsdom::document_value()).then_some(0)
+                    }) else {
                         w3cos_core::throw_value(Value::object(HashMap::from([
                             ("name".to_string(), Value::string("TypeError")),
                             (
@@ -2367,6 +2367,28 @@ mod tests {
         ] {
             assert!(prototype.get_property(property).is_undefined());
         }
+    }
+
+    #[test]
+    fn mutation_observer_accepts_document_target() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        reset_mutation_observers();
+
+        let observer = w3cos_core::class::construct(
+            &mutation_observer_class(),
+            vec![Value::function(|_, _| Value::Undefined)],
+        );
+        observer.call_method(
+            "observe",
+            vec![
+                crate::jsdom::document_value(),
+                Value::object(HashMap::from([
+                    ("childList".into(), Value::Bool(true)),
+                    ("subtree".into(), Value::Bool(true)),
+                ])),
+            ],
+        );
     }
 
     #[test]
