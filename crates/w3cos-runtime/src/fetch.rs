@@ -90,12 +90,14 @@ pub fn fetch(url: &str, options: FetchOptions) -> FetchResponse {
     }
 }
 
-/// JavaScript-facing synchronous `fetch` facade used by the ESM AOT pipeline.
+/// JavaScript-facing `fetch` facade used by the ESM AOT pipeline.
 ///
 /// The current ESM lowering executes `await` expressions synchronously, so
-/// returning a browser-shaped `Response` value here keeps `response.ok`,
-/// `response.status`, `response.text()` and `response.json()` available to
-/// compiled application code.
+/// the returned value keeps the browser-shaped `Response` properties directly
+/// available. It is also a thenable backed by a resolved W3COS Promise so
+/// browser-style `fetch(...).then(...).catch(...).finally(...)` chains run as
+/// microtasks. Promise callbacks receive the underlying Response rather than
+/// the compatibility facade.
 pub fn fetch_value(arguments: Vec<Value>) -> Value {
     let input = arguments.first().cloned().unwrap_or(Value::Undefined);
     let init = arguments.get(1).cloned().unwrap_or(Value::Undefined);
@@ -153,7 +155,7 @@ pub fn fetch_value(arguments: Vec<Value>) -> Value {
             reason.to_js_string()
         };
         eprintln!("W3COS warning: fetch was cancelled before native I/O: {reason}");
-        return fetch_error_value(&url, "AbortError", &reason);
+        return fetch_promise_facade(fetch_error_value(&url, "AbortError", &reason));
     }
     if let Some((bytes, media_type)) = w3cos_core::web::object_url_resource(&url) {
         let headers = if media_type.is_empty() {
@@ -161,21 +163,21 @@ pub fn fetch_value(arguments: Vec<Value>) -> Value {
         } else {
             vec![("content-type".into(), media_type)]
         };
-        return response_from_bytes(
+        return fetch_promise_facade(response_from_bytes(
             bytes,
             200,
             "OK".into(),
             headers_value_from_list(Rc::new(RefCell::new(headers))),
             url,
             "basic".into(),
-        );
+        ));
     }
     if url.starts_with("blob:w3cos/") {
-        return fetch_error_value(
+        return fetch_promise_facade(fetch_error_value(
             &url,
             "NetworkError",
             "the object URL has been revoked or does not exist",
-        );
+        ));
     }
     let multipart = crate::form_data::serialize(&body);
     let mut options = FetchOptions {
@@ -206,7 +208,7 @@ pub fn fetch_value(arguments: Vec<Value>) -> Value {
         }
     }
 
-    response_value(fetch(&url, options), url)
+    fetch_promise_facade(response_value(fetch(&url, options), url))
 }
 
 type HeaderList = Rc<RefCell<Vec<(String, String)>>>;
@@ -568,6 +570,42 @@ fn fetch_error_value(url: &str, name: &str, message: &str) -> Value {
         url.to_string(),
         "error".into(),
     )
+}
+
+/// Bridge the synchronous AOT `await` lowering and the browser Promise shape.
+///
+/// The facade copies the Response's own properties for synchronous access and
+/// forwards Promise methods to a resolved promise containing the untouched
+/// Response. Keeping the fulfilled value separate prevents Promise resolution
+/// from recursively assimilating the facade's own `then` method.
+fn fetch_promise_facade(response: Value) -> Value {
+    let properties = match &response {
+        Value::Object(object) => {
+            let object = object.borrow();
+            let keys = match object.own_keys() {
+                Value::Array(keys) => keys.borrow().clone(),
+                _ => Vec::new(),
+            };
+            keys.into_iter()
+                .map(|key| {
+                    let key = key.to_js_string();
+                    let value = object.get_direct(&key);
+                    (key, value)
+                })
+                .collect()
+        }
+        _ => HashMap::new(),
+    };
+    let facade = Value::object(properties);
+    let promise = w3cos_core::promise::resolve(vec![response]);
+    for method in ["then", "catch", "finally"] {
+        let promise = promise.clone();
+        facade.set_property(
+            method,
+            Value::function(move |_, args| promise.call_method(method, args)),
+        );
+    }
+    facade
 }
 
 pub fn response_class() -> Value {
@@ -1257,6 +1295,62 @@ mod tests {
             "application/json"
         );
         assert!(response.get_property("bodyUsed").to_bool());
+    }
+
+    #[test]
+    fn fetch_promise_facade_supports_browser_promise_chains() {
+        let response = fetch_promise_facade(response_from_bytes(
+            br#"{"token":"ok"}"#.to_vec(),
+            200,
+            "OK".into(),
+            headers_value_from_list(Rc::new(RefCell::new(Vec::new()))),
+            "https://example.test/fixture".into(),
+            "basic".into(),
+        ));
+
+        assert!(response.get_property("ok").to_bool());
+        assert!(response.get_property("then").is_function());
+        assert!(response.get_property("catch").is_function());
+        assert!(response.get_property("finally").is_function());
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let then_log = Rc::clone(&log);
+        let finally_log = Rc::clone(&log);
+        response
+            .call_method(
+                "then",
+                vec![Value::function(move |_, args| {
+                    let resolved = args.first().cloned().unwrap_or(Value::Undefined);
+                    assert!(
+                        resolved.get_property("then").is_undefined(),
+                        "Promise callbacks must receive the underlying Response"
+                    );
+                    then_log.borrow_mut().push(
+                        resolved
+                            .call_method("json", vec![])
+                            .get_property("token")
+                            .to_js_string(),
+                    );
+                    Value::Undefined
+                })],
+            )
+            .call_method(
+                "catch",
+                vec![Value::function(|_, _| {
+                    panic!("fulfilled fetch must not enter catch")
+                })],
+            )
+            .call_method(
+                "finally",
+                vec![Value::function(move |_, _| {
+                    finally_log.borrow_mut().push("finally".into());
+                    Value::Undefined
+                })],
+            );
+
+        assert!(log.borrow().is_empty(), "Promise callbacks are microtasks");
+        assert_eq!(w3cos_core::promise::drain_microtasks(), 3);
+        assert_eq!(log.borrow().as_slice(), &["ok", "finally"]);
     }
 
     #[test]

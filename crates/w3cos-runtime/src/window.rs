@@ -807,6 +807,51 @@ impl SpatialGrid {
         }
         None
     }
+
+    fn query_document(
+        x: f32,
+        y: f32,
+        hit_nodes: &[HitNode],
+        parents: &[Option<usize>],
+        required_scroll_ancestor: Option<(usize, &[Option<usize>])>,
+    ) -> Option<usize> {
+        // The fast grid intentionally covers only the viewport. Layout
+        // rectangles remain in document coordinates, so after scrollTop is
+        // applied a target can be visible while still living below that grid.
+        // Scan only on that transformed-coordinate fallback instead of sizing
+        // the grid to an arbitrarily long document.
+        for priority in [2_u8, 1, 0] {
+            for hit in hit_nodes.iter().rev() {
+                if hit.is_host_target
+                    && required_scroll_ancestor.is_none_or(|(required, ancestors)| {
+                        ancestors.get(hit.index).copied().flatten() == Some(required)
+                    })
+                    && match priority {
+                        2 => hit.is_focusable,
+                        1 => hit.is_interactive,
+                        _ => true,
+                    }
+                    && x >= hit.rect.x
+                    && x <= hit.rect.x + hit.rect.width
+                    && y >= hit.rect.y
+                    && y <= hit.rect.y + hit.rect.height
+                {
+                    let mut current = Some(hit.index);
+                    while let Some(idx) = current {
+                        if hit_nodes
+                            .iter()
+                            .find(|candidate| candidate.index == idx)
+                            .is_some_and(|candidate| candidate.is_host_target)
+                        {
+                            return Some(idx);
+                        }
+                        current = parents.get(idx).copied().flatten();
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4053,13 +4098,27 @@ impl App {
             }
         }
 
-        let (lx, ly) = self.viewport_to_layout(x, y);
+        let (lx, ly, scroll_index) = self.viewport_to_layout_context(x, y);
         self.spatial_grid
             .query(lx, ly, &self.hit_nodes, &self.flat_parents)
+            .or_else(|| {
+                SpatialGrid::query_document(
+                    lx,
+                    ly,
+                    &self.hit_nodes,
+                    &self.flat_parents,
+                    scroll_index.map(|index| (index, self.scroll_ancestor.as_slice())),
+                )
+            })
             .or(direct)
     }
 
     fn viewport_to_layout(&self, x: f32, y: f32) -> (f32, f32) {
+        let (x, y, _) = self.viewport_to_layout_context(x, y);
+        (x, y)
+    }
+
+    fn viewport_to_layout_context(&self, x: f32, y: f32) -> (f32, f32, Option<usize>) {
         for (idx, rect, _) in self.scrollable_nodes.iter().rev() {
             let (sx, sy) = self.scroll_offsets.get(idx).copied().unwrap_or((0.0, 0.0));
             let visual_sy = sy - overscroll_displacement_y(&self.overscroll_states, *idx);
@@ -4067,10 +4126,10 @@ impl App {
             // an offset viewport makes adjacent fixed controls (for example a
             // composer below a feed) hit-test as scrolled content.
             if x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height {
-                return (x + sx, y + visual_sy);
+                return (x + sx, y + visual_sy, Some(*idx));
             }
         }
-        (x, y)
+        (x, y, None)
     }
 
     fn hit_test_scroll(&self, x: f32, y: f32) -> Option<usize> {
@@ -7504,6 +7563,57 @@ fn initial_scroll_target_offset(target_y: f32, scrollport_y: f32, max_y: f32) ->
 #[cfg(test)]
 mod scroll_physics_tests {
     use super::*;
+
+    #[test]
+    fn document_fallback_finds_scrolled_in_targets_below_initial_viewport() {
+        let button_rect = LayoutRect {
+            x: 24.0,
+            y: 920.0,
+            width: 120.0,
+            height: 44.0,
+        };
+        let targets = vec![
+            HitNode {
+                rect: button_rect,
+                index: 2,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: true,
+                on_click: EventAction::None,
+            },
+            HitNode {
+                rect: button_rect,
+                index: 3,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: false,
+                on_click: EventAction::None,
+            },
+            HitNode {
+                rect: button_rect,
+                index: 4,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: true,
+                on_click: EventAction::None,
+            },
+        ];
+        let grid = SpatialGrid::build(&targets, 375.0, 812.0);
+        let parents = [None; 5];
+        let scroll_ancestors = [None, None, Some(1), Some(1), None];
+
+        assert_eq!(grid.query(40.0, 940.0, &targets, &parents), None);
+        assert_eq!(
+            SpatialGrid::query_document(
+                40.0,
+                940.0,
+                &targets,
+                &parents,
+                Some((1, &scroll_ancestors)),
+            ),
+            Some(2)
+        );
+    }
 
     #[test]
     fn back_swipe_requires_an_edge_origin_and_horizontal_intent() {
