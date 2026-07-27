@@ -254,7 +254,7 @@ pub fn render_scroll_damage(
 
 /// Scroll a retained virtualized viewport after its offscreen window changes.
 ///
-/// React virtualizers replace rows at the overscan edge, outside the visible
+/// Virtualizers replace rows at the overscan edge, outside the visible
 /// viewport. The retained pixels that remain visible therefore have the same
 /// payload and can be shifted exactly like a normal scroll; the newly exposed
 /// strip is the only region that must be painted from the updated tree. A
@@ -286,7 +286,7 @@ pub fn render_scroll_content_change(
     )
 }
 
-/// Reconcile fixed React nodes whose paint payload changed during scrolling.
+/// Reconcile fixed host-tree nodes whose paint payload changed during scrolling.
 ///
 /// Virtual rows already repaint through retained scroll damage. Restricting
 /// the gesture-completion pass to exact changed-node rectangles keeps a sticky

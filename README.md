@@ -60,7 +60,7 @@ See [docs/MOBILE.md](docs/MOBILE.md).
 
 ## Example
 
-### React TSX (recommended)
+### TSX + npm ESM
 
 ```tsx
 import { useState } from "react"
@@ -70,7 +70,7 @@ function App() {
   return (
     <div style={{ gap: 20, padding: 48, alignItems: "center", backgroundColor: "#0f0f1a" }}>
       <span style={{ fontSize: 42, color: "#e94560" }}>W3C OS</span>
-      <span style={{ fontSize: 20, color: "#a0a0b0" }}>Native React TSX, compiled AOT.</span>
+      <span style={{ fontSize: 20, color: "#a0a0b0" }}>Native TSX, compiled AOT.</span>
       <button onClick={() => setCount(count + 1)}>Count: {count}</button>
     </div>
   )
@@ -81,7 +81,7 @@ export function main() {
 }
 ```
 
-The compiler lowers standard JSX, React hooks, and npm ESM dependencies directly to Rust. No JS interpreter or `<ReactAot src="…">` bridge is used.
+The compiler lowers standard JSX and npm ESM dependencies directly to Rust. Hooks are ordinary package imports; there is no framework-specific runtime path.
 
 ```bash
 $ w3cos build app.tsx -o myapp --release

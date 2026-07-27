@@ -421,7 +421,7 @@ pub fn layout_display_unchanged(old: &[FlatNodeInfo<'_>], new: &[FlatNodeInfo<'_
 /// Returns true when styles are unchanged apart from `display`.
 ///
 /// `display` has a dedicated incremental patch path. Other changes may affect
-/// Taffy geometry (for example react-window reusing a row slot with a new
+/// Taffy geometry (for example a virtualizer reusing a row slot with a new
 /// absolute `top`) and therefore require rebuilding the persistent tree.
 pub fn layout_styles_unchanged_except_display(
     old: &[FlatNodeInfo<'_>],
@@ -2242,7 +2242,7 @@ mod tests {
 
     #[test]
     fn absolute_auto_height_row_contains_taller_card() {
-        let react_style = || Style {
+        let host_tree_style = || Style {
             flex_shrink: 0.0,
             ..Style::default()
         };
@@ -2291,7 +2291,7 @@ mod tests {
                 top: WDim::Px(0.0),
                 width: WDim::Percent(100.0),
                 padding: w3cos_std::style::Edges::all(6.0),
-                ..react_style()
+                ..host_tree_style()
             },
             vec![card],
         );

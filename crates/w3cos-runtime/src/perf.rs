@@ -11,12 +11,12 @@ struct FrameSample {
     cpu_frame_us: u64,
     layout_us: u64,
     paint_us: u64,
-    react_commit_us: u64,
-    react_entry_us: u64,
-    react_host_us: u64,
-    react_builder_us: u64,
-    react_reconcile_us: u64,
-    react_drop_us: u64,
+    tree_commit_us: u64,
+    tree_entry_us: u64,
+    tree_host_us: u64,
+    tree_builder_us: u64,
+    tree_reconcile_us: u64,
+    tree_drop_us: u64,
     observer_us: u64,
     total_us: u64,
     paint_recorded: bool,
@@ -100,7 +100,7 @@ fn phase_sum_us(sample: &FrameSample) -> u64 {
     sample
         .layout_us
         .saturating_add(sample.paint_us)
-        .saturating_add(sample.react_commit_us)
+        .saturating_add(sample.tree_commit_us)
         .saturating_add(sample.observer_us)
 }
 
@@ -154,43 +154,43 @@ pub fn record_paint(elapsed: Duration) {
     }
 }
 
-pub fn record_react_commit(elapsed: Duration) {
+pub fn record_tree_commit(elapsed: Duration) {
     record_post_paint_phase(elapsed, |sample, elapsed_us| {
-        sample.react_commit_us = sample.react_commit_us.saturating_add(elapsed_us);
+        sample.tree_commit_us = sample.tree_commit_us.saturating_add(elapsed_us);
     });
 }
 
-pub fn record_react_builder(elapsed: Duration) {
-    record_react_subphase(elapsed, |sample, elapsed_us| {
-        sample.react_builder_us = sample.react_builder_us.saturating_add(elapsed_us);
+pub fn record_tree_builder(elapsed: Duration) {
+    record_tree_subphase(elapsed, |sample, elapsed_us| {
+        sample.tree_builder_us = sample.tree_builder_us.saturating_add(elapsed_us);
     });
 }
 
-pub fn record_react_entry(elapsed: Duration) {
-    record_react_subphase(elapsed, |sample, elapsed_us| {
-        sample.react_entry_us = sample.react_entry_us.saturating_add(elapsed_us);
+pub fn record_tree_entry(elapsed: Duration) {
+    record_tree_subphase(elapsed, |sample, elapsed_us| {
+        sample.tree_entry_us = sample.tree_entry_us.saturating_add(elapsed_us);
     });
 }
 
-pub fn record_react_host(elapsed: Duration) {
-    record_react_subphase(elapsed, |sample, elapsed_us| {
-        sample.react_host_us = sample.react_host_us.saturating_add(elapsed_us);
+pub fn record_tree_host(elapsed: Duration) {
+    record_tree_subphase(elapsed, |sample, elapsed_us| {
+        sample.tree_host_us = sample.tree_host_us.saturating_add(elapsed_us);
     });
 }
 
-pub fn record_react_reconcile(elapsed: Duration) {
-    record_react_subphase(elapsed, |sample, elapsed_us| {
-        sample.react_reconcile_us = sample.react_reconcile_us.saturating_add(elapsed_us);
+pub fn record_tree_reconcile(elapsed: Duration) {
+    record_tree_subphase(elapsed, |sample, elapsed_us| {
+        sample.tree_reconcile_us = sample.tree_reconcile_us.saturating_add(elapsed_us);
     });
 }
 
-pub fn record_react_drop(elapsed: Duration) {
-    record_react_subphase(elapsed, |sample, elapsed_us| {
-        sample.react_drop_us = sample.react_drop_us.saturating_add(elapsed_us);
+pub fn record_tree_drop(elapsed: Duration) {
+    record_tree_subphase(elapsed, |sample, elapsed_us| {
+        sample.tree_drop_us = sample.tree_drop_us.saturating_add(elapsed_us);
     });
 }
 
-fn record_react_subphase(elapsed: Duration, update: impl FnOnce(&mut FrameSample, u64)) {
+fn record_tree_subphase(elapsed: Duration, update: impl FnOnce(&mut FrameSample, u64)) {
     if !enabled() || !frame_in_progress() {
         return;
     }
@@ -276,12 +276,12 @@ pub fn summary_json() -> serde_json::Value {
         .unwrap_or_default();
     let layout: Vec<u64> = samples.iter().map(|s| s.layout_us).collect();
     let paint: Vec<u64> = samples.iter().map(|s| s.paint_us).collect();
-    let react_commit: Vec<u64> = samples.iter().map(|s| s.react_commit_us).collect();
-    let react_builder: Vec<u64> = samples.iter().map(|s| s.react_builder_us).collect();
-    let react_entry: Vec<u64> = samples.iter().map(|s| s.react_entry_us).collect();
-    let react_host: Vec<u64> = samples.iter().map(|s| s.react_host_us).collect();
-    let react_reconcile: Vec<u64> = samples.iter().map(|s| s.react_reconcile_us).collect();
-    let react_drop: Vec<u64> = samples.iter().map(|s| s.react_drop_us).collect();
+    let tree_commit: Vec<u64> = samples.iter().map(|s| s.tree_commit_us).collect();
+    let tree_builder: Vec<u64> = samples.iter().map(|s| s.tree_builder_us).collect();
+    let tree_entry: Vec<u64> = samples.iter().map(|s| s.tree_entry_us).collect();
+    let tree_host: Vec<u64> = samples.iter().map(|s| s.tree_host_us).collect();
+    let tree_reconcile: Vec<u64> = samples.iter().map(|s| s.tree_reconcile_us).collect();
+    let tree_drop: Vec<u64> = samples.iter().map(|s| s.tree_drop_us).collect();
     let observer: Vec<u64> = samples.iter().map(|s| s.observer_us).collect();
     let cpu_frame: Vec<u64> = samples.iter().map(|s| s.cpu_frame_us).collect();
     let total: Vec<u64> = samples.iter().map(|s| s.total_us).collect();
@@ -301,12 +301,12 @@ pub fn summary_json() -> serde_json::Value {
         },
         "layout": stats(&layout),
         "paint": stats(&paint),
-        "react_commit": stats(&react_commit),
-        "react_builder": stats(&react_builder),
-        "react_entry": stats(&react_entry),
-        "react_host": stats(&react_host),
-        "react_reconcile": stats(&react_reconcile),
-        "react_drop": stats(&react_drop),
+        "tree_commit": stats(&tree_commit),
+        "tree_builder": stats(&tree_builder),
+        "tree_entry": stats(&tree_entry),
+        "tree_host": stats(&tree_host),
+        "tree_reconcile": stats(&tree_reconcile),
+        "tree_drop": stats(&tree_drop),
         "observer": stats(&observer),
         "paint_paths": paint_paths,
         "viewport": viewport_label(),
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(summary["display_frame"]["available"], false);
 
         let before = summary["phase_sum"]["p95_ms"].as_f64().unwrap();
-        record_react_commit(Duration::from_millis(5));
+        record_tree_commit(Duration::from_millis(5));
         assert_eq!(
             summary_json()["phase_sum"]["p95_ms"].as_f64().unwrap(),
             before,

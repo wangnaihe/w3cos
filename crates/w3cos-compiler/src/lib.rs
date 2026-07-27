@@ -110,9 +110,9 @@ pub fn compile_mobile_from_file_with_options(
         .with_context(|| format!("Could not read {}", source_path.display()))?;
     if !is_ui_dsl(&ts_source) {
         let artifacts = build_esm_artifacts(source_path)?;
-        let bundle = artifacts.bundle_code.ok_or_else(|| {
-            anyhow::anyhow!("React AOT mobile entry did not produce an ESM bundle")
-        })?;
+        let bundle = artifacts
+            .bundle_code
+            .ok_or_else(|| anyhow::anyhow!("AOT mobile entry did not produce an ESM bundle"))?;
         return mobile_codegen::write_mobile_dom_project(
             &bundle,
             output_dir,
@@ -250,7 +250,7 @@ fn compile_with_source_dir(
         }
         if has_esm_bundle || !output.code.contains("fn main(") {
             if has_esm_bundle {
-                // DOM-mode bundle (no React host imports): run the entry main,
+                // DOM-mode bundle (no legacy host-module imports): run the entry main,
                 // which registers baked-in stylesheet rules and builds the DOM.
                 // W3COS_DOM_DUMP=1 additionally prints the body's outer HTML
                 // (truncated) — the headless smoke signal for DOM apps.
@@ -370,7 +370,7 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
 
 /// Opt-in web dependency bundling for framework applications. A colocated
 /// `vite.config.w3cos.ts` is the contract: Vite resolves npm/CJS packages
-/// (including the official React runtime), while native host modules remain
+/// (including third-party UI libraries), while native host modules remain
 /// external for the W3COS ESM resolver.
 fn prebundle_web_entry(entry_path: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
     if !matches!(
@@ -1543,7 +1543,7 @@ export function main() {
             main_rs.contains("ESM css rules: 2"),
             "missing css rule count: {main_rs}"
         );
-        // Non-React bundle → DOM-mode main, not the React one.
+        // Ordinary bundle → generic DOM-mode main.
         assert!(
             main_rs.contains("W3COS_DOM_OK nodes="),
             "missing DOM-mode main: {main_rs}"
@@ -1554,7 +1554,7 @@ export function main() {
         );
         assert!(
             !main_rs.contains("W3COS_AOT_RENDER_OK"),
-            "non-React bundle must not get the React main: {main_rs}"
+            "ordinary bundle must get the generic DOM main: {main_rs}"
         );
 
         let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs")).unwrap();

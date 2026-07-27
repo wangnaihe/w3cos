@@ -45,7 +45,7 @@ pub enum EventAction {
         after_signal: Option<usize>,
         after_value: i64,
     },
-    /// Event capabilities registered for one React AOT intrinsic host.
+    /// Event capabilities registered for one intrinsic host node.
     NativeHost {
         id: u64,
         click: bool,

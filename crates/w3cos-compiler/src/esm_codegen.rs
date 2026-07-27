@@ -1362,9 +1362,8 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
                     {
                         // A native W3COS application owns a real window and
                         // therefore follows the browser branch. Selecting the
-                        // fallback branch here gave browser libraries SSR
-                        // lifecycle timing (notably react-window used
-                        // useEffect instead of useLayoutEffect).
+                        // fallback branch here gives browser libraries SSR
+                        // lifecycle timing instead of browser timing.
                         let Expr::Ident(target) = condition.cons.as_ref() else {
                             unreachable!()
                         };

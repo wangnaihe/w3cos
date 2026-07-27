@@ -380,7 +380,7 @@ pub struct BundledModule {
     /// Covers both this module's own definitions and its imported bindings.
     pub local_to_bundled: Vec<(String, String)>,
     /// Imports implemented by a native AOT host ABI rather than another ESM
-    /// source module (for example React hooks and JSX runtime entry points).
+    /// source module (for example framework hooks and JSX runtime entry points).
     pub host_imports: Vec<(String, String)>,
     /// JSON/default asset imports embedded as compile-time literals.
     pub literal_imports: Vec<(String, String)>,

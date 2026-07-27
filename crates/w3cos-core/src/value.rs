@@ -57,8 +57,8 @@ impl JsFunction {
         let mut props = std::collections::HashMap::new();
         // Ordinary JavaScript function objects own a prototype object. The
         // compiler uses these Values for function declarations/constructors;
-        // ReactDOM installs `render` on `ReactDOMRoot.prototype` before
-        // constructing root instances.
+        // Libraries install methods on constructor prototypes before
+        // constructing instances.
         props.insert("prototype".to_string(), Value::object(HashMap::new()));
         Self {
             inner: Rc::new(f),
@@ -134,7 +134,7 @@ impl Value {
     /// Stable identity hash with ECMAScript `Object.is` semantics.
     ///
     /// Heap values use reference identity, while primitives use their value.
-    /// This is suitable for React-style hook dependency comparison.
+    /// This is suitable for framework hook dependency comparison.
     pub fn identity_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         if let Some(value) = crate::bigint::get(self) {
@@ -391,6 +391,23 @@ impl Value {
             Value::Function(f) => f.get_property(key),
             _ => Value::Undefined,
         }
+    }
+
+    /// Property access for a JavaScript member expression.
+    ///
+    /// Host/runtime code can use [`Value::get_property`] as a total lookup,
+    /// while compiled `value.key` / `value[key]` expressions must reject a
+    /// nullish receiver per ECMAScript `GetValue` semantics. Optional chaining
+    /// performs its nullish guard before calling the total lookup.
+    pub fn get_property_checked(&self, key: &str) -> Value {
+        if self.is_nullish() {
+            let receiver = if self.is_null() { "null" } else { "undefined" };
+            crate::throw_value(crate::js_object! {
+                "name" => "TypeError",
+                "message" => format!("Cannot read properties of {receiver} (reading '{key}')"),
+            });
+        }
+        self.get_property(key)
     }
 
     /// ECMAScript object-rest copy used by `{ picked, ...rest }`.
@@ -870,7 +887,7 @@ impl Value {
             Value::Array(values) => values.borrow().clone().into_iter(),
             // First use the standards-oriented Map/Set registry. Retain the
             // host runtime's snapshot hook as a fallback for its lightweight
-            // built-in Map used by compiled React/native paths.
+            // built-in Map used by compiled application paths.
             Value::Object(object) => {
                 if let Some(values) = crate::binary::iter_typed_array(self) {
                     return values.into_iter();
@@ -1957,6 +1974,30 @@ mod tests {
                 .to_js_string(),
             "卸货前联系我",
         );
+    }
+
+    #[test]
+    fn checked_property_access_rejects_nullish_receivers() {
+        for receiver in [Value::Undefined, Value::Null] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                receiver.get_property_checked("next")
+            }));
+            let payload = outcome.expect_err("nullish member access must throw");
+            let error = payload
+                .downcast::<PanicValue>()
+                .expect("member access throws a JavaScript value")
+                .0;
+            assert_eq!(error.get_property("name").to_js_string(), "TypeError");
+            assert!(
+                error
+                    .get_property("message")
+                    .to_js_string()
+                    .contains("reading 'next'")
+            );
+        }
+
+        let object = crate::js_object! { "next" => Value::Null };
+        assert!(object.get_property_checked("next").is_null());
     }
 
     #[test]

@@ -49,6 +49,10 @@ impl BuiltinObject {
             (BuiltinKind::Math, "tan") => unary_math(arguments, f64::tan),
             (BuiltinKind::Math, "pow") => binary_math(arguments, f64::powf),
             (BuiltinKind::Math, "atan2") => binary_math(arguments, f64::atan2),
+            (BuiltinKind::Math, "hypot") => {
+                Value::Number(arguments.iter().map(Value::to_number).fold(0.0, f64::hypot))
+            }
+            (BuiltinKind::Math, "random") => math_random(),
             (BuiltinKind::Math, "clz32") => Value::Number(
                 arguments
                     .first()
@@ -98,7 +102,8 @@ impl BuiltinObject {
             (
                 BuiltinKind::Math,
                 "min" | "max" | "abs" | "floor" | "ceil" | "round" | "trunc" | "sqrt" | "log"
-                | "log2" | "exp" | "sin" | "cos" | "tan" | "pow" | "atan2" | "clz32" | "f16round",
+                | "log2" | "exp" | "sin" | "cos" | "tan" | "pow" | "atan2" | "hypot" | "random"
+                | "clz32" | "f16round",
             ) => {
                 let builtin = *self;
                 let method = key.to_string();
@@ -116,6 +121,48 @@ impl BuiltinObject {
             _ => Value::Undefined,
         }
     }
+
+    /// Builtin facades are never nullish, so checked member access is the
+    /// ordinary property lookup. This mirrors [`Value::get_property_checked`]
+    /// for compiler-generated member expressions without changing the
+    /// facade's static Rust type.
+    pub fn get_property_checked(&self, key: &str) -> Value {
+        self.get_property(key)
+    }
+}
+
+/// ECMAScript `Math` as a first-class value.
+///
+/// Direct calls and extracted methods must share the same generic builtin
+/// implementation (`const clz32 = Math.clz32` is common in library code).
+pub fn math_value() -> Value {
+    let mut properties = HashMap::new();
+    for method in [
+        "min", "max", "abs", "floor", "ceil", "round", "f16round", "trunc", "sqrt", "log", "log2",
+        "exp", "sin", "cos", "tan", "pow", "atan2", "hypot", "random", "clz32",
+    ] {
+        properties.insert(method.to_string(), Math.get_property(method));
+    }
+    for constant in [
+        "E", "LN2", "LN10", "LOG2E", "LOG10E", "PI", "SQRT1_2", "SQRT2",
+    ] {
+        properties.insert(constant.to_string(), Math.get_property(constant));
+    }
+    Value::object(properties)
+}
+
+thread_local! {
+    static MATH_RANDOM_STATE: RefCell<u64> = const { RefCell::new(0x4d59_5df4_d0f3_3173) };
+}
+
+fn math_random() -> Value {
+    MATH_RANDOM_STATE.with(|state| {
+        let next = (*state.borrow())
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state.borrow_mut() = next;
+        Value::Number(((next >> 11) as f64) / ((1_u64 << 53) as f64))
+    })
 }
 
 fn unary_math(arguments: Vec<Value>, operation: fn(f64) -> f64) -> Value {
@@ -930,6 +977,21 @@ mod tests {
                 .to_number(),
             26.0
         );
+        let math = math_value();
+        assert_eq!(
+            math.get_property("hypot")
+                .call(
+                    Value::Undefined,
+                    vec![Value::Number(3.0), Value::Number(4.0)]
+                )
+                .to_number(),
+            5.0
+        );
+        let random = math
+            .get_property("random")
+            .call(Value::Undefined, vec![])
+            .to_number();
+        assert!((0.0..1.0).contains(&random));
     }
 
     #[test]

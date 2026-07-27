@@ -11222,7 +11222,7 @@ pub fn drain_microtasks() -> usize {
 
 /// Complete immediately runnable framework work before the first DOM snapshot.
 ///
-/// React's concurrent root schedules its initial commit through a zero-delay
+/// Framework schedulers may defer their initial commit through a zero-delay
 /// host task. Native DOM windows take their first component-tree snapshot
 /// before the platform event loop starts, so that task must get a bounded
 /// bootstrap checkpoint or the first frame contains only the empty mount node.

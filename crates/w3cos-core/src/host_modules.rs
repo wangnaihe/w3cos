@@ -1,7 +1,7 @@
 //! Framework-neutral host module registry for AOT ESM imports.
 //!
 //! The compiler emits canonical module/export paths such as
-//! `react::useState`; embedders register implementations at startup. This
+//! package-defined functions; embedders register implementations at startup. This
 //! keeps package adapters out of compiler code generation and lets a future
 //! upstream JavaScript module replace an adapter without changing the ABI.
 

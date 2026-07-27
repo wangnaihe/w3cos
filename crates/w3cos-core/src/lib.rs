@@ -18,7 +18,7 @@ pub mod web;
 pub use builtins::{
     Array, Error, ErrorValue, Map, Math, Object, RangeError, ResizeObserver, Set, console,
     dispatch_resize_observers, dispatch_resize_observers_bounded, document, error_class,
-    error_instance, parseFloat, parseInt,
+    error_instance, math_value, parseFloat, parseInt,
 };
 pub use object::JsObject;
 pub use proxy::{ProxyBuilder, ProxyHandler, proxy_class};

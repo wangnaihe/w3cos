@@ -9,7 +9,7 @@ Compile a standards-oriented Web application — TypeScript/JavaScript, DOM, CSS
 and npm dependencies — into a native desktop or mobile application without a
 browser or JavaScript VM.
 
-The primary compatibility target is the **formal ESM/React application path**.
+The primary compatibility target is the **formal ESM application path**.
 A Rust module existing in `w3cos-runtime` is necessary, but it does not make a
 Web API complete until compiled application code can call the standard
 JavaScript surface.
@@ -40,7 +40,7 @@ Status:
 | Release | Outcome | Exit gate |
 |---------|---------|-----------|
 | **R0** | Trustworthy `main` | Required tests are green and API status cannot overclaim Rust-only modules |
-| **R1** | Native Web App P0 | Formal React app has localization, network streams, voice, location, and media capture |
+| **R1** | Native Web App P0 | Formal app has localization, network streams, voice, location, and media capture |
 | **R2** | Web Platform Facade | Common browser constructors and events work from compiled ESM |
 | **R3** | Mobile Production Runtime | Android/iOS touch, IME, viewport, lifecycle, and device validation pass |
 | **R4** | npm Compatibility | Package support is driven by repeatable compatibility gates |
@@ -250,7 +250,7 @@ test.
 
 ## R1 — Native Web App P0
 
-These APIs block the current formal downstream React application and therefore
+These APIs block the current formal downstream application and therefore
 precede ecosystem breadth or migration tooling.
 
 ### R1.1 Internationalization
@@ -525,7 +525,7 @@ precede ecosystem breadth or migration tooling.
 - [ ] Pass voice capability detection and transcript delivery.
 - [ ] Pass location and camera evidence flows.
 
-**R1 exit:** the formal React application completes these flows on native
+**R1 exit:** the formal application completes these flows on native
 desktop and the applicable mobile targets using standard Web APIs.
 
 ---
@@ -805,7 +805,7 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
   `rootMargin`, threshold-crossing delivery, live refresh, queued records,
   unobserve/disconnect, DOMRect entry fields, and a warning-based geometric
   fallback for occlusion visibility tracking.
-- [x] Extend `ResizeObserver` beyond native React host ids to ordinary DOM
+- [x] Extend `ResizeObserver` beyond native host-tree ids to ordinary DOM
   elements with layout-backed content/border geometry, DPR-aware
   `devicePixelContentBoxSize`, validated box options, change deduplication, and
   compiler-generated behavior coverage.
@@ -1018,7 +1018,7 @@ framework-specific runtime paths to make individual packages pass.
 
 ### R4.2 Package gates
 
-- [x] Official React and react-dom formal application gate.
+- [x] Formal application gate using standard npm ESM dependencies.
 - [x] Monaco/CodeMirror-oriented compiler and DOM milestones.
 - [ ] Define a versioned compatibility suite for representative package
   classes:

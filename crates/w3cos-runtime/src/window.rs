@@ -146,7 +146,7 @@ const ANDROID_IME_FALLBACK_INSET: f32 = 260.0;
 /// without turning the entire Android event loop into a busy poll.
 #[cfg(target_os = "android")]
 const ANDROID_VIEWPORT_WATCHDOG_INTERVAL_MS: u64 = 250;
-const REACT_SCROLL_ANCHOR_SUPPRESSION: Duration = Duration::from_secs(2);
+const HOST_TREE_SCROLL_ANCHOR_SUPPRESSION: Duration = Duration::from_secs(2);
 
 #[cfg(any(test, target_os = "ios", target_os = "android"))]
 const BACK_SWIPE_EDGE_WIDTH: f32 = 24.0;
@@ -165,7 +165,7 @@ fn can_start_back_swipe(x: f32, can_go_back: bool) -> bool {
     x <= BACK_SWIPE_EDGE_WIDTH && can_go_back
 }
 
-/// Maximum compositor-only travel before a deferred React virtualizer update
+/// Maximum compositor-only travel before a deferred host-tree virtualizer update
 /// is committed. Blink similarly keeps scrolling on the compositor while
 /// main-thread prepaint advances often enough that the interest rect cannot
 /// be exhausted by a fast fling.
@@ -173,7 +173,7 @@ fn deferred_scroll_checkpoint_distance(viewport_extent: f32) -> f32 {
     (viewport_extent * 0.5).max(160.0)
 }
 
-fn should_restore_react_scroll_anchor(
+fn should_restore_host_tree_scroll_anchor(
     programmatic_scroll_applied: bool,
     direct_scroll_active: bool,
 ) -> bool {
@@ -466,7 +466,7 @@ impl RepaintMode {
             RepaintMode::ExternalAfterScroll { .. } => {
                 *self = RepaintMode::ScrollOnly(vec![ScrollDamage { index, delta_y }]);
             }
-            // Layout/style/React tree invalidation already requires a complete
+            // Layout/style/host-tree invalidation already requires a complete
             // repaint. A later scroll event in the same frame must not
             // downgrade it to retained framebuffer strip-copying.
             RepaintMode::Full => {}
@@ -474,7 +474,7 @@ impl RepaintMode {
     }
 }
 
-fn repaint_after_react_rebuild(current: RepaintMode) -> RepaintMode {
+fn repaint_after_host_tree_rebuild(current: RepaintMode) -> RepaintMode {
     match current {
         RepaintMode::ScrollOnly(damages) => RepaintMode::ScrollOnly(damages),
         RepaintMode::ScrollContentChanged(damages) => RepaintMode::ScrollContentChanged(damages),
@@ -505,7 +505,7 @@ fn take_repaint_for_present(
     repaint_for_present(std::mem::take(queued_repaint_mode), has_active_animations)
 }
 
-fn repaint_after_react_content_change(
+fn repaint_after_host_tree_content_change(
     current: RepaintMode,
     recent_scroll_damage: &[ScrollDamage],
 ) -> RepaintMode {
@@ -532,7 +532,7 @@ fn repaint_after_react_content_change(
     }
 }
 
-fn react_rebuild_changes_painted_content(
+fn host_tree_rebuild_changes_painted_content(
     old_flat: &[layout::FlatNodeInfo<'_>],
     new_flat: &[layout::FlatNodeInfo<'_>],
 ) -> bool {
@@ -618,7 +618,7 @@ fn react_rebuild_changes_painted_content(
         })
 }
 
-fn react_rebuild_changes_visual_output(
+fn host_tree_rebuild_changes_visual_output(
     old_flat: &[layout::FlatNodeInfo<'_>],
     new_flat: &[layout::FlatNodeInfo<'_>],
 ) -> bool {
@@ -626,15 +626,15 @@ fn react_rebuild_changes_visual_output(
         || old_flat
             .iter()
             .zip(new_flat)
-            .any(|(old, new)| react_node_changes_visual_output(old, new))
+            .any(|(old, new)| host_tree_node_changes_visual_output(old, new))
 }
 
-fn react_node_changes_visual_output(
+fn host_tree_node_changes_visual_output(
     old: &layout::FlatNodeInfo<'_>,
     new: &layout::FlatNodeInfo<'_>,
 ) -> bool {
     old.style != new.style
-        || react_rebuild_changes_painted_content(
+        || host_tree_rebuild_changes_painted_content(
             std::slice::from_ref(old),
             std::slice::from_ref(new),
         )
@@ -824,7 +824,15 @@ impl SpatialGrid {
             for hit in hit_nodes.iter().rev() {
                 if hit.is_host_target
                     && required_scroll_ancestor.is_none_or(|(required, ancestors)| {
-                        ancestors.get(hit.index).copied().flatten() == Some(required)
+                        let mut current = Some(hit.index);
+                        while let Some(index) = current {
+                            let ancestor = ancestors.get(index).copied().flatten();
+                            if ancestor == Some(required) {
+                                return true;
+                            }
+                            current = ancestor;
+                        }
+                        false
                     })
                     && match priority {
                         2 => hit.is_focusable,
@@ -852,6 +860,35 @@ impl SpatialGrid {
         }
         None
     }
+}
+
+fn hit_test_order_key(hit: &HitNode, paint_z: &[i32]) -> (i32, bool, bool, usize) {
+    (
+        paint_z.get(hit.index).copied().unwrap_or_default(),
+        hit.is_focusable,
+        hit.is_interactive,
+        hit.index,
+    )
+}
+
+fn has_scroll_transform(
+    index: usize,
+    scroll_ancestors: &[Option<usize>],
+    offsets: &HashMap<usize, (f32, f32)>,
+    overscroll_states: &HashMap<usize, OverscrollState>,
+) -> bool {
+    let mut current = scroll_ancestors.get(index).copied().flatten();
+    while let Some(ancestor) = current {
+        let (sx, sy) = offsets.get(&ancestor).copied().unwrap_or_default();
+        if sx.abs() > 0.001
+            || sy.abs() > 0.001
+            || overscroll_displacement_y(overscroll_states, ancestor).abs() > 0.001
+        {
+            return true;
+        }
+        current = scroll_ancestors.get(ancestor).copied().flatten();
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,7 +1182,7 @@ struct TextCompositionState {
 }
 
 #[derive(Clone, Debug)]
-struct ReactScrollAnchor {
+struct HostTreeScrollAnchor {
     scroll_host_id: u64,
     anchor_host_id: u64,
     visual_top: f32,
@@ -1211,15 +1248,15 @@ struct App {
     recent_scroll_damage: Vec<ScrollDamage>,
     recent_external_damage_indices: Vec<usize>,
     /// Blink-style compositor-first scrolling: present the retained scroll
-    /// frame before committing React work scheduled by the scroll event.
-    deferred_react_scroll_commit: bool,
+    /// frame before committing host-tree work scheduled by the scroll event.
+    deferred_host_tree_scroll_commit: bool,
     /// Compositor-only distance travelled per scroll host since the last
-    /// React virtual-window commit.
-    deferred_react_scroll_distance: HashMap<usize, f32>,
+    /// Host-tree virtual-window commit.
+    deferred_host_tree_scroll_distance: HashMap<usize, f32>,
     /// Blink-style scroll-anchor suppression window. ResizeObserver work can
     /// land immediately after touch end, when `touch_scroll_active` is already
     /// false but the user's just-written scroll offset is still authoritative.
-    react_scroll_anchor_suppressed_until: Option<Instant>,
+    host_tree_scroll_anchor_suppressed_until: Option<Instant>,
     /// Layout generation most recently delivered to ResizeObserver. Blink
     /// only enters the observer delivery loop after layout invalidation;
     /// polling every event-loop turn makes scrolling proportional to the
@@ -1377,9 +1414,9 @@ impl App {
             repaint_mode: RepaintMode::Full,
             recent_scroll_damage: Vec::new(),
             recent_external_damage_indices: Vec::new(),
-            deferred_react_scroll_commit: false,
-            deferred_react_scroll_distance: HashMap::new(),
-            react_scroll_anchor_suppressed_until: None,
+            deferred_host_tree_scroll_commit: false,
+            deferred_host_tree_scroll_distance: HashMap::new(),
+            host_tree_scroll_anchor_suppressed_until: None,
             resize_observer_layout_generation: None,
             #[cfg(all(feature = "gpu", feature = "cpu-render"))]
             using_gpu: true,
@@ -1525,7 +1562,7 @@ impl App {
     ///
     /// Event listeners run synchronously, but Promise reactions and
     /// `queueMicrotask` callbacks must settle before the next platform task.
-    /// Rebuild once after the queue reaches quiescence so React/DOM changes
+    /// Rebuild once after the queue reaches quiescence so DOM changes
     /// produced by those jobs are visible without requiring a second input.
     fn microtask_checkpoint(&mut self) -> usize {
         self.microtask_checkpoint_impl(true)
@@ -1904,11 +1941,11 @@ impl App {
             let old_flat = layout::pre_flatten(&old_root);
             let builder_started = Instant::now();
             self.root = builder();
-            crate::perf::record_react_builder(builder_started.elapsed());
+            crate::perf::record_tree_builder(builder_started.elapsed());
             let reconcile_started = Instant::now();
             let new_flat = layout::pre_flatten(&self.root);
             let visual_output_changed =
-                host_dirty && react_rebuild_changes_visual_output(&old_flat, &new_flat);
+                host_dirty && host_tree_rebuild_changes_visual_output(&old_flat, &new_flat);
             let stable_index_remap = build_stable_index_remap(&old_flat, &new_flat);
             let external_damage_indices = host_dirty.then(|| {
                 old_flat
@@ -1924,7 +1961,7 @@ impl App {
                                     &self.flat_parents,
                                 )
                         });
-                        (!inside_active_scroll && react_node_changes_visual_output(old, new))
+                        (!inside_active_scroll && host_tree_node_changes_visual_output(old, new))
                             .then(|| stable_index_remap.get(&old_index).copied())
                             .flatten()
                     })
@@ -1936,7 +1973,7 @@ impl App {
             remap_indexed_set(&mut self.user_scrolled_nodes, &stable_index_remap);
             remap_indexed_set(&mut self.pending_sticky_scrolls, &stable_index_remap);
             remap_indexed_map(
-                &mut self.deferred_react_scroll_distance,
+                &mut self.deferred_host_tree_scroll_distance,
                 &stable_index_remap,
             );
             if let Some(index) = self.touch_scroll_index {
@@ -1961,11 +1998,11 @@ impl App {
                 !layout::layout_shape_unchanged(&old_flat, &new_flat) || other_style_changed;
             self.needs_style_refresh = display_changed && !self.needs_tree_rebuild;
             self.repaint_mode = if visual_output_changed {
-                // A standard React virtualizer reuses the same host slots for
+                // A standard virtualizer reuses the same host slots for
                 // different rows. Once their text/image/input payload changes,
                 // framebuffer strip-copying would move pixels rendered for the
                 // previous rows and can leave duplicates or blank islands.
-                repaint_after_react_content_change(
+                repaint_after_host_tree_content_change(
                     std::mem::take(&mut self.repaint_mode),
                     &self.recent_scroll_damage,
                 )
@@ -1973,7 +2010,7 @@ impl App {
                 // A fixed-size virtual window only unmounts rows that have
                 // already left the viewport. When the retained host slots keep
                 // the same paint payload, preserve accumulated scroll damage.
-                repaint_after_react_rebuild(std::mem::take(&mut self.repaint_mode))
+                repaint_after_host_tree_rebuild(std::mem::take(&mut self.repaint_mode))
             } else {
                 // Signal/DOM work outside the host adapter is never a deferred virtual-window
                 // swap and therefore invalidates the complete frame.
@@ -1995,20 +2032,20 @@ impl App {
             self.hovered_index = None;
             self.pressed_index = None;
             self.collect_transition_animations(&old_root);
-            crate::perf::record_react_reconcile(reconcile_started.elapsed());
+            crate::perf::record_tree_reconcile(reconcile_started.elapsed());
         }
         let drop_started = Instant::now();
         drop(old_root);
-        crate::perf::record_react_drop(drop_started.elapsed());
+        crate::perf::record_tree_drop(drop_started.elapsed());
     }
 
     fn active_deferred_scroll_checkpoint_due(&self) -> bool {
-        if !self.deferred_react_scroll_commit
+        if !self.deferred_host_tree_scroll_commit
             || (!self.touch_scroll_active && self.kinetic_scroll.is_none())
         {
             return false;
         }
-        self.deferred_react_scroll_distance
+        self.deferred_host_tree_scroll_distance
             .iter()
             .any(|(index, distance)| {
                 let viewport_extent = self
@@ -2021,11 +2058,11 @@ impl App {
             })
     }
 
-    fn react_scroll_anchor_suppressed(&self) -> bool {
+    fn host_tree_scroll_anchor_suppressed(&self) -> bool {
         self.touch_scroll_active
             || self.kinetic_scroll.is_some()
             || self
-                .react_scroll_anchor_suppressed_until
+                .host_tree_scroll_anchor_suppressed_until
                 .is_some_and(|deadline| Instant::now() < deadline)
     }
 
@@ -2033,27 +2070,27 @@ impl App {
         // Keep direct manipulation on the retained compositor path for the
         // drag/fling, but advance the virtualizer's prepaint window before a
         // fast gesture can outrun its retained overscan. Multiple scroll
-        // events are still coalesced into the latest React update.
+        // events are still coalesced into the latest host-tree update.
         let active = self.touch_scroll_active || self.kinetic_scroll.is_some();
         if active && (!allow_active_checkpoint || !self.active_deferred_scroll_checkpoint_due()) {
             return;
         }
-        if !std::mem::take(&mut self.deferred_react_scroll_commit) {
+        if !std::mem::take(&mut self.deferred_host_tree_scroll_commit) {
             return;
         }
         if !host_runtime::has_pending_render() {
-            self.deferred_react_scroll_distance.clear();
+            self.deferred_host_tree_scroll_distance.clear();
             return;
         }
 
-        // Commit one coalesced React virtual-window update. The normal path
+        // Commit one coalesced host-tree virtual-window update. The normal path
         // calls this from the scroll event once the retained interest window
         // has travelled far enough; RedrawRequested remains a fallback when
         // the platform delivers paint before the next input sample.
         let commit_started = Instant::now();
         self.rebuild_if_dirty();
-        crate::perf::record_react_commit(commit_started.elapsed());
-        self.deferred_react_scroll_distance.clear();
+        crate::perf::record_tree_commit(commit_started.elapsed());
+        self.deferred_host_tree_scroll_distance.clear();
         self.request_repaint();
     }
 
@@ -2109,7 +2146,7 @@ impl App {
             host.engine.offset_of(anchor_index) - scroll_offset,
         );
         let window = host.engine.visible_window(scroll_offset, viewport_extent);
-        // A React state update rebuilds `self.root`, so this node may be a
+        // A state update rebuilds `self.root`, so this node may be a
         // fresh VirtualList containing only its row template even when the
         // retained host's visible range and offset did not change. In that
         // case we must re-inject the mounted rows and both spacers instead of
@@ -2201,14 +2238,14 @@ impl App {
                     new_node.style.position,
                     Position::Absolute | Position::Fixed
                 );
-                // React host ids are rebuilt on a state update and virtual
+                // Host-tree ids are rebuilt on a state update and virtual
                 // windows move later siblings between flat-tree indices. Only
                 // overlay-shaped nodes receive an implicit enter transition;
                 // ordinary content must provide two concrete style states.
                 if !is_side_panel && !is_overlay {
                     continue;
                 }
-                // React conditionals insert the entering subtree instead of
+                // Conditional rendering inserts the entering subtree instead of
                 // keeping a display:none wrapper around it. CSS transitions
                 // still need an initial paint value, just as a browser gets
                 // one from an enter class/keyframe before committing the
@@ -2503,7 +2540,7 @@ impl App {
                 virtual_ordinal += 1;
             }
         }
-        // React state changes can insert/remove siblings before a virtual
+        // State changes can insert/remove siblings before a virtual
         // list (for example a sticky card switching between expanded and
         // compact branches). Flat node indices then move, while the retained
         // virtual-list host still owns the authoritative scroll offset. Do
@@ -2617,7 +2654,7 @@ impl App {
             &mut self.scroll_offsets,
         );
         if virtual_heights_changed && measurement_pass < 2 {
-            // Dynamic rows are first laid out with react-window's estimate.
+            // Dynamic rows are first laid out with the virtualizer's estimate.
             // Re-materialize spacers and recompute layout before presenting
             // this frame so a newly encountered tall/short row never exposes
             // the intermediate estimated geometry for one refresh interval.
@@ -3990,6 +4027,7 @@ impl App {
 
     fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
         let flat = layout::pre_flatten(&self.root);
+        let mut visual_host_fallback = None;
         if flat
             .iter()
             .any(|node| matches!(node.style.position, w3cos_std::style::Position::Sticky))
@@ -4019,7 +4057,11 @@ impl App {
                     node.style.z_index
                 };
             }
-            hit_order.sort_by_key(|hit| paint_z[hit.index]);
+            // At the same stacking level, prefer a real control over a broad
+            // delegated-event host. Frameworks attach pointer listeners to
+            // ordinary containers too; without this tie-breaker, a container
+            // whose layout overlaps a scrolled button can absorb the tap.
+            hit_order.sort_by_key(|hit| hit_test_order_key(hit, &paint_z));
             for hit in hit_order.into_iter().rev() {
                 let (rect, clip) = match scroll_info.get(hit.index).copied().flatten() {
                     Some((sx, sy, clip)) => (
@@ -4052,7 +4094,15 @@ impl App {
                             .find(|candidate| candidate.index == idx)
                             .is_some_and(|candidate| candidate.is_host_target)
                         {
-                            return Some(idx);
+                            let target = self
+                                .hit_nodes
+                                .iter()
+                                .find(|candidate| candidate.index == idx);
+                            if target.is_some_and(|candidate| candidate.is_focusable) {
+                                return Some(idx);
+                            }
+                            visual_host_fallback.get_or_insert(idx);
+                            break;
                         }
                         current = self.flat_parents.get(idx).copied().flatten();
                     }
@@ -4064,20 +4114,12 @@ impl App {
             .spatial_grid
             .query(x, y, &self.hit_nodes, &self.flat_parents);
         if direct.is_some_and(|idx| {
-            self.scroll_ancestor
-                .get(idx)
-                .and_then(|ancestor| *ancestor)
-                .is_none_or(|ancestor| {
-                    let (sx, sy) = self
-                        .scroll_offsets
-                        .get(&ancestor)
-                        .copied()
-                        .unwrap_or((0.0, 0.0));
-                    sx.abs() <= 0.001
-                        && sy.abs() <= 0.001
-                        && overscroll_displacement_y(&self.overscroll_states, ancestor).abs()
-                            <= 0.001
-                })
+            !has_scroll_transform(
+                idx,
+                &self.scroll_ancestor,
+                &self.scroll_offsets,
+                &self.overscroll_states,
+            )
         }) {
             return direct;
         }
@@ -4099,17 +4141,21 @@ impl App {
         }
 
         let (lx, ly, scroll_index) = self.viewport_to_layout_context(x, y);
-        self.spatial_grid
-            .query(lx, ly, &self.hit_nodes, &self.flat_parents)
-            .or_else(|| {
+        scroll_index
+            .and_then(|index| {
                 SpatialGrid::query_document(
                     lx,
                     ly,
                     &self.hit_nodes,
                     &self.flat_parents,
-                    scroll_index.map(|index| (index, self.scroll_ancestor.as_slice())),
+                    Some((index, self.scroll_ancestor.as_slice())),
                 )
             })
+            .or_else(|| {
+                self.spatial_grid
+                    .query(lx, ly, &self.hit_nodes, &self.flat_parents)
+            })
+            .or(visual_host_fallback)
             .or(direct)
     }
 
@@ -4258,7 +4304,7 @@ impl App {
         changed
     }
 
-    fn dispatch_react_resize_observers(&self, max_entries: usize) -> (bool, bool) {
+    fn dispatch_resize_observers(&self, max_entries: usize) -> (bool, bool) {
         let flat = layout::pre_flatten(&self.root);
         let rects: HashMap<usize, LayoutRect> = self
             .layout_cache
@@ -4279,7 +4325,7 @@ impl App {
         w3cos_core::dispatch_resize_observers_bounded(&sizes, max_entries)
     }
 
-    fn capture_react_scroll_anchors(&self) -> Vec<ReactScrollAnchor> {
+    fn capture_host_tree_scroll_anchors(&self) -> Vec<HostTreeScrollAnchor> {
         let flat = layout::pre_flatten(&self.root);
         let rects: HashMap<usize, LayoutRect> = self
             .layout_cache
@@ -4363,7 +4409,7 @@ impl App {
                         }
                     })
                     .or(constrained)?;
-                Some(ReactScrollAnchor {
+                Some(HostTreeScrollAnchor {
                     scroll_host_id: *scroll_host_id,
                     anchor_host_id: anchor.0,
                     visual_top: anchor.1,
@@ -4372,7 +4418,7 @@ impl App {
             .collect()
     }
 
-    fn restore_react_scroll_anchors(&mut self, anchors: &[ReactScrollAnchor]) {
+    fn restore_host_tree_scroll_anchors(&mut self, anchors: &[HostTreeScrollAnchor]) {
         if anchors.is_empty() {
             return;
         }
@@ -4446,8 +4492,8 @@ impl App {
         }
         if applied.abs() > 0.001 {
             self.user_scrolled_nodes.insert(idx);
-            self.react_scroll_anchor_suppressed_until =
-                Some(Instant::now() + REACT_SCROLL_ANCHOR_SUPPRESSION);
+            self.host_tree_scroll_anchor_suppressed_until =
+                Some(Instant::now() + HOST_TREE_SCROLL_ANCHOR_SUPPRESSION);
             self.scroll_offsets.insert(idx, (ox, new_oy));
             crate::uitest::set_scroll_offset(idx, new_oy);
             let virtual_ordinal = self.virtual_scroll_indices.get(&idx).copied();
@@ -4468,9 +4514,12 @@ impl App {
                 dom::sync_scroll_offset(host_id as u32, Some(ox), Some(new_oy));
                 host_runtime::dispatch_scroll(host_id, new_oy);
                 let pending_render = host_runtime::has_pending_render();
-                self.deferred_react_scroll_commit |= pending_render;
+                self.deferred_host_tree_scroll_commit |= pending_render;
                 if pending_render {
-                    *self.deferred_react_scroll_distance.entry(idx).or_default() += applied.abs();
+                    *self
+                        .deferred_host_tree_scroll_distance
+                        .entry(idx)
+                        .or_default() += applied.abs();
                 }
             }
             if let Some(ordinal) = virtual_ordinal {
@@ -4483,7 +4532,7 @@ impl App {
                 if self.materialize_virtual_list(ordinal, viewport_extent, new_oy) {
                     self.needs_layout = true;
                     self.needs_tree_rebuild = true;
-                    self.repaint_mode = repaint_after_react_content_change(
+                    self.repaint_mode = repaint_after_host_tree_content_change(
                         std::mem::take(&mut self.repaint_mode),
                         &self.recent_scroll_damage,
                     );
@@ -4724,7 +4773,7 @@ impl App {
         if remains_active {
             self.kinetic_scroll = Some(kinetic);
             // Kinetic samples can arrive in a burst before RedrawRequested.
-            // Store the active gesture first so a React tree replacement can
+            // Store the active gesture first so a host-tree replacement can
             // remap its scroll-host index, then advance the interest window.
             if self.active_deferred_scroll_checkpoint_due() {
                 self.flush_deferred_scroll_commit(true);
@@ -4739,7 +4788,7 @@ impl App {
         // End the compositor-first phase with an explicit main-thread commit.
         // Android may coalesce all redraw requests from a short injected or
         // high-velocity gesture into one event delivered after Touch::Ended.
-        // Flushing here ensures that final event paints the current React
+        // Flushing here ensures that final event paints the current host-tree
         // interest window instead of the previous overscan window.
         self.flush_deferred_scroll_commit(false);
         if self.recent_scroll_damage.is_empty() {
@@ -4764,7 +4813,7 @@ impl App {
             .iter_mut()
             .find(|damage| damage.index == index)
         {
-            // This vector is fallback context for a React commit that lands
+            // This vector is fallback context for a host-tree commit that lands
             // after the current retained frame was presented. Keep the most
             // recent physical movement, not the whole gesture distance,
             // otherwise a long fling eventually exceeds the viewport and
@@ -6275,12 +6324,12 @@ impl ApplicationHandler for App {
         self.tick_kinetic_scroll();
         self.tick_overscroll();
 
-        // React refs/effects can enqueue follow-up work while committing. Pump
+        // DOM callbacks can enqueue follow-up work while committing. Pump
         // bounded synchronous renders to a stable tree before consuming DOM
         // requests such as element.scrollTo(); otherwise a request from an
-        // intermediate react-window render can be clamped against stale layout.
+        // intermediate virtualizer render can be clamped against stale layout.
         let mut rebuilt = false;
-        if !self.deferred_react_scroll_commit {
+        if !self.deferred_host_tree_scroll_commit {
             for _ in 0..8 {
                 if !state::is_dirty() && !host_runtime::has_pending_render() {
                     break;
@@ -6295,7 +6344,7 @@ impl ApplicationHandler for App {
         self.apply_programmatic_scroll_requests();
         // ResizeObserver delivery is layout-driven, not an event-loop poll.
         // Deliver all currently mounted rows as one callback and coalesce their
-        // state changes into one React commit. Do not synchronously chase a
+        // state changes into one host-tree commit. Do not synchronously chase a
         // resize/render feedback loop: newly mounted targets are measured on
         // the next event-loop turn.
         let observer_pass_limit = 1;
@@ -6307,33 +6356,33 @@ impl ApplicationHandler for App {
             if self.resize_observer_layout_generation == Some(self.layout_generation) {
                 break;
             }
-            let anchors = self.capture_react_scroll_anchors();
+            let anchors = self.capture_host_tree_scroll_anchors();
             let observed_generation = self.layout_generation;
             let observer_started = Instant::now();
-            let (delivered, pending) = self.dispatch_react_resize_observers(observer_entry_budget);
+            let (delivered, pending) = self.dispatch_resize_observers(observer_entry_budget);
             crate::perf::record_observer_delivery(observer_started.elapsed());
             self.resize_observer_layout_generation = (!pending).then_some(observed_generation);
             if !delivered {
                 break;
             }
             rebuilt = true;
-            // A ResizeObserver callback can dirty React again. Commit the
+            // A ResizeObserver callback can dirty the host tree again. Commit the
             // batched measurements once; follow-up work remains dirty and is
             // picked up by the next repaint turn.
             let commit_started = Instant::now();
             self.rebuild_if_dirty();
-            crate::perf::record_react_commit(commit_started.elapsed());
+            crate::perf::record_tree_commit(commit_started.elapsed());
             let programmatic_scroll_applied = self.apply_programmatic_scroll_requests();
             self.ensure_layout();
             // Blink suppresses UA anchoring while direct manipulation is
             // active as well as when script explicitly changes scrollTop.
             // Otherwise ResizeObserver delivery can restore an older visual
             // anchor over the user's latest touch/fling offset.
-            if should_restore_react_scroll_anchor(
+            if should_restore_host_tree_scroll_anchor(
                 programmatic_scroll_applied,
-                self.react_scroll_anchor_suppressed(),
+                self.host_tree_scroll_anchor_suppressed(),
             ) {
-                self.restore_react_scroll_anchors(&anchors);
+                self.restore_host_tree_scroll_anchors(&anchors);
             }
             if pending {
                 self.request_repaint();
@@ -6449,10 +6498,10 @@ impl ApplicationHandler for App {
             || has_animation_frame;
         // Android can coalesce request_redraw() with the redraw currently
         // being delivered. Keep one immediate turn alive while the renderer
-        // or React still has frame work; after it drains, static screens block
+        // or the host tree still has frame work; after it drains, static screens block
         // in ALooper again.
         let has_pending_frame_work = self.get_window().is_some()
-            && (self.deferred_react_scroll_commit
+            && (self.deferred_host_tree_scroll_commit
                 || state::is_dirty()
                 || host_runtime::has_pending_render()
                 || self.needs_layout
@@ -6835,7 +6884,7 @@ impl ApplicationHandler for App {
                 match touch.phase {
                     TouchPhase::Started => {
                         // A new finger interrupts the previous fling. Commit
-                        // its latest scroll offset and React interest window
+                        // its latest scroll offset and virtualizer interest window
                         // before starting the next gesture; dropping the
                         // kinetic state directly can strand the viewport
                         // beyond the last mounted overscan window.
@@ -6957,7 +7006,7 @@ impl ApplicationHandler for App {
                                     // Touch-move events can arrive in a burst
                                     // before winit delivers RedrawRequested.
                                     // Commit after saving the current scroll
-                                    // host so the React rebuild can remap it.
+                                    // host so the tree rebuild can remap it.
                                     if self.active_deferred_scroll_checkpoint_due() {
                                         self.flush_deferred_scroll_commit(true);
                                     }
@@ -7616,6 +7665,83 @@ mod scroll_physics_tests {
     }
 
     #[test]
+    fn document_fallback_accepts_targets_inside_nested_clip_owners() {
+        let button_rect = LayoutRect {
+            x: 24.0,
+            y: 920.0,
+            width: 120.0,
+            height: 44.0,
+        };
+        let targets = vec![HitNode {
+            rect: button_rect,
+            index: 3,
+            is_interactive: true,
+            is_host_target: true,
+            is_focusable: true,
+            on_click: EventAction::None,
+        }];
+        let parents = [None; 4];
+        // The button is clipped by node 2, which is itself inside scroll host 1.
+        let scroll_ancestors = [None, None, Some(1), Some(2)];
+
+        assert_eq!(
+            SpatialGrid::query_document(
+                40.0,
+                940.0,
+                &targets,
+                &parents,
+                Some((1, &scroll_ancestors)),
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn same_layer_hit_order_prefers_controls_over_delegated_hosts() {
+        let rect = LayoutRect {
+            x: 20.0,
+            y: 20.0,
+            width: 120.0,
+            height: 44.0,
+        };
+        let broad_host = HitNode {
+            rect,
+            index: 8,
+            is_interactive: true,
+            is_host_target: true,
+            is_focusable: false,
+            on_click: EventAction::None,
+        };
+        let button = HitNode {
+            rect,
+            index: 3,
+            is_interactive: true,
+            is_host_target: true,
+            is_focusable: true,
+            on_click: EventAction::None,
+        };
+        let paint_z = [0; 9];
+
+        assert!(
+            hit_test_order_key(&button, &paint_z)
+                > hit_test_order_key(&broad_host, &paint_z)
+        );
+    }
+
+    #[test]
+    fn nested_clip_owner_inherits_outer_scroll_transform() {
+        let scroll_ancestors = [None, None, Some(1), Some(2)];
+        let offsets = HashMap::from([(1, (0.0, 300.0)), (2, (0.0, 0.0))]);
+
+        assert!(has_scroll_transform(
+            3,
+            &scroll_ancestors,
+            &offsets,
+            &HashMap::new(),
+        ));
+    }
+
+    #[test]
     fn back_swipe_requires_an_edge_origin_and_horizontal_intent() {
         assert!(can_start_back_swipe(5.0, true));
         assert!(!can_start_back_swipe(25.0, true));
@@ -7787,15 +7913,15 @@ mod scroll_physics_tests {
         assert_eq!(deferred_scroll_checkpoint_distance(200.0), 160.0);
         assert!(
             deferred_scroll_checkpoint_distance(812.0) < 812.0,
-            "a fast fling must refresh the React interest window before it can expose a blank viewport"
+            "a fast fling must refresh the virtualizer interest window before it can expose a blank viewport"
         );
     }
 
     #[test]
     fn direct_scroll_suppresses_resize_observer_anchor_restore() {
-        assert!(should_restore_react_scroll_anchor(false, false));
-        assert!(!should_restore_react_scroll_anchor(true, false));
-        assert!(!should_restore_react_scroll_anchor(false, true));
+        assert!(should_restore_host_tree_scroll_anchor(false, false));
+        assert!(!should_restore_host_tree_scroll_anchor(true, false));
+        assert!(!should_restore_host_tree_scroll_anchor(false, true));
     }
 
     #[test]
@@ -7811,7 +7937,7 @@ mod scroll_physics_tests {
     }
 
     #[test]
-    fn react_virtual_window_content_change_requires_full_repaint() {
+    fn host_tree_virtual_window_content_change_requires_full_repaint() {
         let old_root = Component::root(vec![Component::text(
             "row-56",
             w3cos_std::style::Style::default(),
@@ -7823,11 +7949,13 @@ mod scroll_physics_tests {
 
         let old_flat = layout::pre_flatten(&old_root);
         let new_flat = layout::pre_flatten(&new_root);
-        assert!(react_rebuild_changes_painted_content(&old_flat, &new_flat));
+        assert!(host_tree_rebuild_changes_painted_content(
+            &old_flat, &new_flat
+        ));
     }
 
     #[test]
-    fn unchanged_react_host_content_keeps_scroll_damage_path() {
+    fn unchanged_host_tree_content_keeps_scroll_damage_path() {
         let old_root = Component::root(vec![Component::text(
             "row-56",
             w3cos_std::style::Style::default(),
@@ -7836,11 +7964,13 @@ mod scroll_physics_tests {
 
         let old_flat = layout::pre_flatten(&old_root);
         let new_flat = layout::pre_flatten(&new_root);
-        assert!(!react_rebuild_changes_painted_content(&old_flat, &new_flat));
+        assert!(!host_tree_rebuild_changes_painted_content(
+            &old_flat, &new_flat
+        ));
     }
 
     #[test]
-    fn remounted_react_host_with_identical_pixels_keeps_scroll_damage_path() {
+    fn remounted_host_tree_with_identical_pixels_keeps_scroll_damage_path() {
         let old_root = Component::root(vec![Component::text(
             "row-56",
             w3cos_std::style::Style::default(),
@@ -7852,7 +7982,9 @@ mod scroll_physics_tests {
 
         let old_flat = layout::pre_flatten(&old_root);
         let new_flat = layout::pre_flatten(&new_root);
-        assert!(!react_rebuild_changes_painted_content(&old_flat, &new_flat));
+        assert!(!host_tree_rebuild_changes_painted_content(
+            &old_flat, &new_flat
+        ));
     }
 
     #[test]
@@ -7873,7 +8005,9 @@ mod scroll_physics_tests {
         let old_flat = layout::pre_flatten(&old_root);
         let new_flat = layout::pre_flatten(&new_root);
         assert!(layout::layout_shape_unchanged(&old_flat, &new_flat));
-        assert!(react_rebuild_changes_painted_content(&old_flat, &new_flat));
+        assert!(host_tree_rebuild_changes_painted_content(
+            &old_flat, &new_flat
+        ));
     }
 
     #[test]
@@ -9083,7 +9217,7 @@ mod scroll_physics_tests {
     }
 
     #[test]
-    fn virtual_list_keeps_scroll_offset_when_react_flat_index_moves() {
+    fn virtual_list_keeps_scroll_offset_when_host_tree_flat_index_moves() {
         let mut list_style = w3cos_std::style::Style::default();
         list_style.height = Dimension::Px(500.0);
         list_style.overflow = w3cos_std::style::Overflow::Scroll;
@@ -9105,7 +9239,7 @@ mod scroll_physics_tests {
     }
 
     #[test]
-    fn react_rebuild_reinjects_unchanged_virtual_window_into_fresh_node() {
+    fn host_tree_rebuild_reinjects_unchanged_virtual_window_into_fresh_node() {
         let make_list = || {
             let mut style = w3cos_std::style::Style::default();
             style.height = Dimension::Px(500.0);
@@ -9124,7 +9258,7 @@ mod scroll_physics_tests {
         app.root = Component::root(vec![make_list()]);
         assert!(
             app.materialize_virtual_list(0, 500.0, 2_400.0),
-            "a fresh React node must not take the retained host's unchanged-window fast path"
+            "a fresh host-tree node must not take the retained host's unchanged-window fast path"
         );
         let flat = layout::pre_flatten(&app.root);
         assert!(flat.iter().any(|node| matches!(
@@ -9134,7 +9268,7 @@ mod scroll_physics_tests {
     }
 
     #[test]
-    fn react_rebuild_remaps_scroll_state_by_stable_tree_identity() {
+    fn host_tree_rebuild_remaps_scroll_state_by_stable_tree_identity() {
         let style = w3cos_std::style::Style::default();
         let old_root = Component::root(vec![
             Component::boxed(style.clone(), vec![]),
@@ -9163,7 +9297,7 @@ mod scroll_physics_tests {
     }
 
     #[test]
-    fn react_tree_full_repaint_is_not_downgraded_by_scroll_damage() {
+    fn host_tree_full_repaint_is_not_downgraded_by_scroll_damage() {
         let mut invalidated = RepaintMode::Full;
         invalidated.queue_scroll_damage(7, 84.0);
         assert!(matches!(invalidated, RepaintMode::Full));
@@ -9178,11 +9312,11 @@ mod scroll_physics_tests {
     }
 
     #[test]
-    fn react_virtual_content_change_preserves_pending_scroll_strip() {
+    fn host_tree_virtual_content_change_preserves_pending_scroll_strip() {
         let mut pending = RepaintMode::Clean;
         pending.queue_scroll_damage(7, 84.0);
 
-        let repaint = repaint_after_react_content_change(pending, &[]);
+        let repaint = repaint_after_host_tree_content_change(pending, &[]);
 
         assert!(matches!(
             repaint,
@@ -9208,7 +9342,7 @@ mod scroll_physics_tests {
     }
 
     #[test]
-    fn react_visual_diff_detects_style_changes_but_skips_identical_trees() {
+    fn host_tree_visual_diff_detects_style_changes_but_skips_identical_trees() {
         let base = w3cos_std::style::Style::default();
         let old_root = Component::root(vec![Component::boxed(base.clone(), vec![])]);
         let same_root = Component::root(vec![Component::boxed(base.clone(), vec![])]);
@@ -9219,13 +9353,15 @@ mod scroll_physics_tests {
         let same_flat = layout::pre_flatten(&same_root);
         let changed_flat = layout::pre_flatten(&changed_root);
 
-        assert!(!react_rebuild_changes_visual_output(&old_flat, &same_flat));
-        assert!(react_rebuild_changes_visual_output(
+        assert!(!host_tree_rebuild_changes_visual_output(
+            &old_flat, &same_flat
+        ));
+        assert!(host_tree_rebuild_changes_visual_output(
             &old_flat,
             &changed_flat
         ));
         assert!(matches!(
-            repaint_after_react_rebuild(RepaintMode::Clean),
+            repaint_after_host_tree_rebuild(RepaintMode::Clean),
             RepaintMode::Clean
         ));
     }

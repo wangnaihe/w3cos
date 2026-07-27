@@ -295,6 +295,12 @@ impl LowerCtx {
         {
             // Unshadowed JS global: jsdom bridge or a core builtin facade.
             global
+        } else if self.dynamic_values && !self.is_name_shadowed(name) {
+            // Browser bundles frequently feature-detect optional globals.
+            // Resolve every otherwise-unbound name through the Window
+            // environment record instead of maintaining package-specific
+            // allowlists in the compiler.
+            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
         } else {
             resolved
         }
@@ -1836,7 +1842,7 @@ impl LowerCtx {
                                 return "w3cos_core::Value::from(\"function\")".to_string();
                             }
                             // Native W3COS is a browser host, not an SSR environment.
-                            // Libraries such as react-window select useLayoutEffect
+                            // Browser libraries select their client-side lifecycle
                             // through `typeof window !== "undefined"`.
                             "window" => {
                                 return "w3cos_core::Value::from(\"object\")".to_string();
@@ -2819,14 +2825,14 @@ impl LowerCtx {
         if self.dynamic_values {
             return match &member.prop {
                 MemberProp::Ident(id) => {
-                    format!("{obj}.get_property({:?})", id.sym.to_string())
+                    format!("{obj}.get_property_checked({:?})", id.sym.to_string())
                 }
                 MemberProp::Computed(computed) => format!(
-                    "{obj}.get_property(&{}.to_js_string())",
+                    "{obj}.get_property_checked(&{}.to_js_string())",
                     self.lower_expr(&computed.expr)
                 ),
                 MemberProp::PrivateName(name) => {
-                    format!("{obj}.get_property({:?})", self.private_key(name))
+                    format!("{obj}.get_property_checked({:?})", self.private_key(name))
                 }
             };
         }
@@ -4288,6 +4294,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "TypeError" | "URIError" | "AggregateError" => {
             format!("w3cos_core::error_class({name:?})")
         }
+        "Math" => "w3cos_core::math_value()".to_string(),
         // `Map` as a value: the real ES6 Map class (SameValueZero identity
         // keys, insertion order, prototype-linked instances so
         // `x instanceof Map` works). `new Map(...)` resolves to the same
@@ -4307,8 +4314,9 @@ fn global_value_expr(name: &str) -> Option<String> {
         // working through plain member calls. `create` ignores the prototype
         // argument (fresh empty object); `assign` merges own enumerable
         // properties; `entries`/`getOwnPropertyNames` mirror `keys`;
-        // `freeze` is a pass-through.
-        "Object" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"keys\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"keys\", __args))), (\"values\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"values\", __args))), (\"is\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"is\", __args))), (\"create\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::object(::std::collections::HashMap::new()))), (\"getPrototypeOf\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::class::get_prototype_of(&__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))), (\"getOwnPropertyDescriptor\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let key = __args.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); w3cos_core::class::get_own_property_descriptor(&obj, &key) })), (\"defineProperty\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let key = __args.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let descriptor = __args.get(2).cloned().unwrap_or(w3cos_core::Value::Undefined); w3cos_core::class::define_property(&obj, &key, &descriptor) })), (\"freeze\".to_string(), w3cos_core::Value::function(|_this, __args| __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined))), (\"getOwnPropertyNames\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"keys\", __args))), (\"assign\".to_string(), w3cos_core::Value::function(|_this, __args| { let target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); for source in __args.iter().skip(1) { for key in w3cos_core::Object.call_method(\"keys\", vec![source.clone()]).iter() { let k = key.to_js_string(); let v = source.get_property(&k); target.set_property(&k, v); } } target })), (\"entries\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let mut out = Vec::new(); for key in w3cos_core::Object.call_method(\"keys\", vec![obj.clone()]).iter() { let k = key.to_js_string(); out.push(w3cos_core::Value::array(vec![w3cos_core::Value::from(k.clone()), obj.get_property(&k)])); } w3cos_core::Value::array(out) }))]), |_this, __args| __args.first().cloned().unwrap_or_else(|| w3cos_core::Value::object(::std::collections::HashMap::new())))"
+        // `freeze` is a pass-through. The standard prototype method remains
+        // extractable through `Object.prototype.hasOwnProperty.call(...)`.
+        "Object" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"prototype\".to_string(), w3cos_core::Value::object(::std::collections::HashMap::from([(\"hasOwnProperty\".to_string(), w3cos_core::Value::function(|__this, __args| __this.call_method(\"hasOwnProperty\", __args)))]))), (\"keys\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"keys\", __args))), (\"values\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"values\", __args))), (\"is\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"is\", __args))), (\"create\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::object(::std::collections::HashMap::new()))), (\"getPrototypeOf\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::class::get_prototype_of(&__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))), (\"getOwnPropertyDescriptor\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let key = __args.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); w3cos_core::class::get_own_property_descriptor(&obj, &key) })), (\"defineProperty\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let key = __args.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let descriptor = __args.get(2).cloned().unwrap_or(w3cos_core::Value::Undefined); w3cos_core::class::define_property(&obj, &key, &descriptor) })), (\"freeze\".to_string(), w3cos_core::Value::function(|_this, __args| __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined))), (\"getOwnPropertyNames\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"keys\", __args))), (\"assign\".to_string(), w3cos_core::Value::function(|_this, __args| { let target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); for source in __args.iter().skip(1) { for key in w3cos_core::Object.call_method(\"keys\", vec![source.clone()]).iter() { let k = key.to_js_string(); let v = source.get_property(&k); target.set_property(&k, v); } } target })), (\"entries\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let mut out = Vec::new(); for key in w3cos_core::Object.call_method(\"keys\", vec![obj.clone()]).iter() { let k = key.to_js_string(); out.push(w3cos_core::Value::array(vec![w3cos_core::Value::from(k.clone()), obj.get_property(&k)])); } w3cos_core::Value::array(out) }))]), |_this, __args| __args.first().cloned().unwrap_or_else(|| w3cos_core::Value::object(::std::collections::HashMap::new())))"
             .to_string(),
         "document" => "w3cos_runtime::jsdom::document_value()".to_string(),
         "window" | "self" | "globalThis" => {
@@ -4319,7 +4327,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "visualViewport" | "customElements" | "caches" | "scheduler" | "cookieStore"
         | "trustedTypes"
         | "screen" | "crypto" | "navigation" | "launchQueue" | "reportError" | "setImmediate"
-        | "MessageChannel" | "__REACT_DEVTOOLS_GLOBAL_HOOK__" => {
+        | "MessageChannel" => {
             format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
         }
         // Scheduling/utility globals: the jsdom window holds them as function
@@ -4514,8 +4522,8 @@ fn global_value_expr(name: &str) -> Option<String> {
         // is ignored; all other Reflect members degrade to Undefined.
         "Reflect" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"construct\".to_string(), w3cos_core::Value::function(|_this, __args| { let __target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let __ctor_args: Vec<w3cos_core::Value> = __args.get(1).map(|__a| __a.iter().collect()).unwrap_or_default(); w3cos_core::class::construct(&__target, __ctor_args) }))]))".to_string(),
         // Symbols use collision-resistant string sentinels in the compact
-        // runtime. `Symbol.for(key)` must be stable because libraries such as
-        // React use the global registry for element type identity.
+        // runtime. `Symbol.for(key)` must be stable because libraries use the
+        // global registry for cross-module identity.
         "Symbol" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"iterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_iterator\")), (\"asyncIterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_asyncIterator\")), (\"for\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::from(format!(\"__w3cos_symbol_for:{}\", __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string()))))]))".to_string(),
         // Unimplemented builtin globals: harmless empty-object stubs keep
         // references total (`new X()` yields Undefined via construct on a
@@ -5158,6 +5166,50 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_member_access_checks_nullish_receivers_but_optional_chain_does_not() {
+        let stmts = parse_stmts("const direct = value.next; const optional = value?.next;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains(".get_property_checked(\"next\")"),
+            "direct member access must preserve JavaScript TypeError semantics: {code}"
+        );
+        assert!(
+            code.contains(".is_nullish()") && code.contains(".get_property(\"next\")"),
+            "optional chaining must keep its explicit nullish guard: {code}"
+        );
+    }
+
+    #[test]
+    fn object_facade_exposes_standard_has_own_property() {
+        let stmts = parse_stmts(
+            "const hasOwnProperty = Object.prototype.hasOwnProperty; hasOwnProperty.call(value, 'key');",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains("\"prototype\".to_string()")
+                && code.contains("\"hasOwnProperty\".to_string()")
+                && code.contains("__this.call_method(\"hasOwnProperty\", __args)"),
+            "Object.prototype.hasOwnProperty must remain extractable: {code}"
+        );
+    }
+
+    #[test]
+    fn math_is_lowered_as_a_first_class_standard_builtin() {
+        let stmts = parse_stmts("const clz32 = Math.clz32; clz32(32);");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        assert!(
+            code.contains("w3cos_core::math_value().get_property_checked(\"clz32\")"),
+            "extracted Math methods must use the standard builtin facade: {code}"
+        );
+    }
+
+    #[test]
     fn dynamic_closures_capture_only_referenced_values() {
         let stmts =
             parse_stmts("const used = 1; const unused = 2; const callback = () => used + 1;");
@@ -5227,17 +5279,17 @@ mod tests {
     #[test]
     fn dynamic_lowering_reads_optional_browser_globals_from_window() {
         let stmts = parse_stmts(
-            "typeof __REACT_DEVTOOLS_GLOBAL_HOOK__; typeof navigation; typeof reportError; typeof setImmediate; typeof MessageChannel;",
+            "typeof navigation; typeof reportError; typeof setImmediate; typeof MessageChannel; typeof optionalPackageHook;",
         );
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
 
         for name in [
-            "__REACT_DEVTOOLS_GLOBAL_HOOK__",
             "navigation",
             "reportError",
             "setImmediate",
             "MessageChannel",
+            "optionalPackageHook",
         ] {
             assert!(
                 code.contains(&format!("window_value().get_property({name:?})")),
