@@ -6,8 +6,31 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+}
+
+const CLASS_NAMES: &[&str] = &[
+    "TextTrack",
+    "TextTrackCue",
+    "TextTrackCueList",
+    "TextTrackList",
+    "VTTCue",
+    "VideoPlaybackQuality",
+];
+
+fn realm_text_track_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
+fn register_text_track_value(value: &Value) {
+    register_weak_realm_object(&VALUES, value);
 }
 
 fn illegal(name: &'static str) -> Value {
@@ -19,7 +42,7 @@ fn illegal(name: &'static str) -> Value {
 
 fn build_class(name: &'static str) -> Value {
     let class = if name == "VTTCue" {
-        Value::function(|_, args| {
+        realm_text_track_function(|_, args| {
             cue_value(
                 args.first().map(Value::to_number).unwrap_or_default(),
                 args.get(1).map(Value::to_number).unwrap_or_default(),
@@ -27,12 +50,30 @@ fn build_class(name: &'static str) -> Value {
             )
         })
     } else {
-        Value::function(move |_, _| illegal(name))
+        realm_text_track_function(move |_, _| illegal(name))
     };
     class.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", class.clone());
-    let members: &[&str] = match name {
+    for member in class_members(name) {
+        prototype.set_property(member, Value::Undefined);
+    }
+    let parent = match name {
+        "TextTrack" | "TextTrackCue" | "TextTrackList" => {
+            Some(crate::web_events::event_target_class().get_property("prototype"))
+        }
+        "VTTCue" => Some(class_for("TextTrackCue").get_property("prototype")),
+        _ => None,
+    };
+    if let Some(parent) = parent {
+        w3cos_core::class::set_prototype_of(&prototype, &parent);
+    }
+    class.set_property("prototype", prototype);
+    class
+}
+
+fn class_members(name: &str) -> &'static [&'static str] {
+    match name {
         "TextTrack" => &[
             "activeCues",
             "addCue",
@@ -79,22 +120,7 @@ fn build_class(name: &'static str) -> Value {
             "totalVideoFrames",
         ],
         _ => &[],
-    };
-    for member in members {
-        prototype.set_property(member, Value::Undefined);
     }
-    let parent = match name {
-        "TextTrack" | "TextTrackCue" | "TextTrackList" => {
-            Some(crate::web_events::event_target_class().get_property("prototype"))
-        }
-        "VTTCue" => Some(class_for("TextTrackCue").get_property("prototype")),
-        _ => None,
-    };
-    if let Some(parent) = parent {
-        w3cos_core::class::set_prototype_of(&prototype, &parent);
-    }
-    class.set_property("prototype", prototype);
-    class
 }
 
 pub fn class_for(name: &'static str) -> Value {
@@ -123,7 +149,7 @@ fn cue_list_value(state: Rc<RefCell<Vec<Value>>>) -> Value {
     refresh_indexed(&list, &state.borrow(), 0);
     list.set_property(
         "getCueById",
-        Value::function(move |_, args| {
+        realm_text_track_function(move |_, args| {
             let id = args.first().map(Value::to_js_string).unwrap_or_default();
             state
                 .borrow()
@@ -137,6 +163,7 @@ fn cue_list_value(state: Rc<RefCell<Vec<Value>>>) -> Value {
         &list,
         &class_for("TextTrackCueList").get_property("prototype"),
     );
+    register_text_track_value(&list);
     list
 }
 
@@ -163,7 +190,7 @@ pub fn text_track_value(kind: &str, label: &str, language: &str) -> Value {
     let track_for_add = track.clone();
     track.set_property(
         "addCue",
-        Value::function(move |_, args| {
+        realm_text_track_function(move |_, args| {
             let cue = args.first().cloned().unwrap_or(Value::Undefined);
             let old_length = add_state.borrow().len();
             cue.set_property("track", track_for_add.clone());
@@ -179,7 +206,7 @@ pub fn text_track_value(kind: &str, label: &str, language: &str) -> Value {
     let remove_active = active_cues;
     track.set_property(
         "removeCue",
-        Value::function(move |_, args| {
+        realm_text_track_function(move |_, args| {
             let cue = args.first().cloned().unwrap_or(Value::Undefined);
             let old_length = remove_state.borrow().len();
             remove_state
@@ -192,6 +219,7 @@ pub fn text_track_value(kind: &str, label: &str, language: &str) -> Value {
         }),
     );
     w3cos_core::class::set_prototype_of(&track, &class_for("TextTrack").get_property("prototype"));
+    register_text_track_value(&track);
     track
 }
 
@@ -209,7 +237,7 @@ pub fn text_track_list_value() -> Value {
     let lookup = Rc::clone(&tracks);
     list.set_property(
         "getTrackById",
-        Value::function(move |_, args| {
+        realm_text_track_function(move |_, args| {
             let id = args.first().map(Value::to_js_string).unwrap_or_default();
             lookup
                 .borrow()
@@ -223,7 +251,7 @@ pub fn text_track_list_value() -> Value {
     let list_for_append = list.clone();
     list.set_property(
         "__w3cos_append",
-        Value::function(move |_, args| {
+        realm_text_track_function(move |_, args| {
             let track = args.first().cloned().unwrap_or(Value::Undefined);
             let index = append_state.borrow().len();
             append_state.borrow_mut().push(track.clone());
@@ -242,6 +270,7 @@ pub fn text_track_list_value() -> Value {
         &list,
         &class_for("TextTrackList").get_property("prototype"),
     );
+    register_text_track_value(&list);
     list
 }
 
@@ -277,7 +306,7 @@ pub fn cue_value(start: f64, end: f64, text: &str) -> Value {
     }
     cue.set_property(
         "getCueAsHTML",
-        Value::function({
+        realm_text_track_function({
             let text = text.to_string();
             move |_, _| {
                 let fragment = crate::jsdom::document_value()
@@ -290,6 +319,7 @@ pub fn cue_value(start: f64, end: f64, text: &str) -> Value {
         }),
     );
     w3cos_core::class::set_prototype_of(&cue, &class_for("VTTCue").get_property("prototype"));
+    register_text_track_value(&cue);
     cue
 }
 
@@ -307,11 +337,33 @@ pub fn playback_quality_value() -> Value {
         &value,
         &class_for("VideoPlaybackQuality").get_property("prototype"),
     );
+    register_text_track_value(&value);
     value
 }
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
+    VALUES.with(|values| {
+        for value in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            let length = value.get_property("length").to_u32() as usize;
+            for index in 0..length {
+                value.set_property(&index.to_string(), Value::Undefined);
+            }
+            for name in CLASS_NAMES {
+                for member in class_members(name) {
+                    value.set_property(member, Value::Undefined);
+                }
+            }
+            value.set_property("__w3cos_append", Value::Undefined);
+        }
+    });
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        disconnect_realm_class(class);
+    }
 }
 
 #[cfg(test)]
@@ -335,5 +387,36 @@ mod tests {
             1.0
         );
         assert!(cue.get_property("track").strict_eq(&track));
+    }
+
+    #[test]
+    fn tracks_cues_lists_cycles_and_classes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_track_class = class_for("TextTrack");
+        let old_cue_class = class_for("VTTCue");
+        let list = text_track_list_value();
+        let track = text_track_value("subtitles", "English", "en");
+        let cue = cue_value(1.0, 2.0, "old realm");
+        append_track(&list, track.clone());
+        track.call_method("addCue", vec![cue.clone()]);
+        let cue_list = track.get_property("cues");
+        let cue_list_weak = crate::jsdom::weak_realm_object(&cue_list);
+        drop(cue_list);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_track_class.get_property("prototype").is_undefined());
+        assert!(old_cue_class.get_property("prototype").is_undefined());
+        assert!(!old_track_class.strict_eq(&class_for("TextTrack")));
+        assert!(list.get_property("getTrackById").is_undefined());
+        assert!(list.get_property("0").is_undefined());
+        assert!(track.get_property("addCue").is_undefined());
+        assert!(track.get_property("cues").is_undefined());
+        assert!(cue.get_property("track").is_undefined());
+        assert!(cue.get_property("getCueAsHTML").is_undefined());
+        assert!(cue_list_weak.upgrade().is_none());
     }
 }

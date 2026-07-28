@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use skia_safe::canvas::SaveLayerRec;
 use skia_safe::{
     AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, FontStyle,
-    ImageFilter, ImageInfo, MaskFilter, Paint, PathBuilder, Rect, Surface, TileMode, Typeface,
-    color_filters, gradient_shader, image_filters, images, paint,
+    ImageFilter, ImageInfo, MaskFilter, Paint, PathBuilder, RRect, Rect, Surface, TileMode,
+    Typeface, color_filters, gradient_shader, image_filters, images, paint,
 };
 use w3cos_std::SvgPathCommand;
 use w3cos_std::component::ComponentKind;
@@ -33,7 +33,7 @@ thread_local! {
     /// System font matching is comparatively expensive on Apple platforms.
     /// Cache Skia typeface references for characters missing from the primary
     /// face; this does not copy the underlying system font into application memory.
-    static FONT_FALLBACK_CACHE: RefCell<HashMap<(char, u16), Option<Typeface>>> =
+    static FONT_FALLBACK_CACHE: RefCell<HashMap<(u32, char, u16), Option<Typeface>>> =
         RefCell::new(HashMap::new());
     static INTRINSIC_PRIMARY_TYPEFACE: Typeface =
         primary_typeface(INTRINSIC_FONT_BYTES).expect("Skia intrinsic font");
@@ -52,6 +52,13 @@ fn primary_typeface(font_bytes: &[u8]) -> Option<Typeface> {
         }
     }
     FontMgr::default().new_from_data(font_bytes, None)
+}
+
+fn registered_typeface(style: &Style) -> Option<(crate::font_face::LoadedFont, Typeface)> {
+    let loaded = crate::font_face::FontRegistry::global().resolve_style(style)?;
+    loaded.parsed()?;
+    let typeface = loaded.skia_typeface()?;
+    Some((loaded, typeface))
 }
 
 pub(crate) struct ReplayFrame<'a> {
@@ -409,14 +416,8 @@ fn render_node(
             &color_paint(bg, style.opacity),
         );
     }
-    if let Some(background_image) = style.background_image.as_deref() {
-        draw_background_image(
-            canvas,
-            rect,
-            style.border_radius,
-            background_image,
-            style.opacity,
-        );
+    if style.background_image.is_some() {
+        draw_background_image(canvas, rect, style.border_radius, style, style.opacity);
     }
     let has_edge_border = style.border_top_width.is_some()
         || style.border_right_width.is_some()
@@ -515,13 +516,14 @@ fn render_node(
                 style.color
             };
             let content = text_content_box(rect, style);
-            let y = text_layout::y_for_draw_text_line_centered(
+            let ink = measure_skia_text_ink_bounds(
                 text,
                 style.font_size,
-                metrics_font,
-                content.y,
-                content.height,
+                typeface,
+                style.font_weight,
+                Some(style),
             );
+            let y = content.y + (content.height - ink.height) * 0.5 - ink.top;
             let save = canvas.save();
             canvas.clip_rect(to_rect(content), None, Some(false));
             let text_width = draw_text_line(
@@ -533,7 +535,7 @@ fn render_node(
                 color,
                 style.opacity,
                 typeface,
-                style.font_weight,
+                style,
             );
             if focused {
                 let cursor_x = content.x + if value.is_empty() { 0.0 } else { text_width };
@@ -901,12 +903,23 @@ fn draw_text_in_rect(
     metrics_font: &fontdue::Font,
 ) {
     let content = text_paint_box(rect, style);
-    let layout = text_layout::retained_text_paint_layout(
+    let registry = crate::font_face::FontRegistry::global();
+    let layout = text_layout::retained_text_paint_layout_with(
         text,
         content.width,
         style.font_size,
-        metrics_font,
         style.white_space,
+        registry.cascade_cache_key(style, text) ^ 0x534b_4941_5445_5801,
+        |character| registry.style_char_advance(style, character, style.font_size, metrics_font),
+        |line| {
+            measure_skia_text_ink_bounds(
+                line,
+                style.font_size,
+                typeface,
+                style.font_weight,
+                Some(style),
+            )
+        },
     );
     if layout.lines.len() == 1 {
         let ink = measure_skia_text_ink_bounds(
@@ -914,6 +927,7 @@ fn draw_text_in_rect(
             style.font_size,
             typeface,
             style.font_weight,
+            Some(style),
         );
         draw_text_ink_in_box(canvas, content, &layout.lines[0], ink, style, typeface);
         return;
@@ -921,7 +935,13 @@ fn draw_text_in_rect(
     let line_height = style.font_size * style.line_height;
     let top = content.y + (content.height - layout.lines.len() as f32 * line_height).max(0.0) * 0.5;
     for (index, line) in layout.lines.iter().enumerate() {
-        let ink = measure_skia_text_ink_bounds(line, style.font_size, typeface, style.font_weight);
+        let ink = measure_skia_text_ink_bounds(
+            line,
+            style.font_size,
+            typeface,
+            style.font_weight,
+            Some(style),
+        );
         let x = aligned_text_x(content, effective_text_align(style), ink.left, ink.width);
         draw_text_line(
             canvas,
@@ -932,7 +952,7 @@ fn draw_text_in_rect(
             style.color,
             style.opacity,
             typeface,
-            style.font_weight,
+            style,
         );
     }
 }
@@ -946,7 +966,13 @@ fn draw_centered_text(
     _metrics_font: &fontdue::Font,
 ) {
     let content = text_paint_box(rect, style);
-    let ink = measure_skia_text_ink_bounds(text, style.font_size, typeface, style.font_weight);
+    let ink = measure_skia_text_ink_bounds(
+        text,
+        style.font_size,
+        typeface,
+        style.font_weight,
+        Some(style),
+    );
     let x = content.x + (content.width - ink.width) * 0.5 - ink.left;
     let y = content.y + (content.height - ink.height) * 0.5 - ink.top;
     draw_text_line(
@@ -958,7 +984,7 @@ fn draw_centered_text(
         style.color,
         style.opacity,
         typeface,
-        style.font_weight,
+        style,
     );
 }
 
@@ -981,7 +1007,7 @@ fn draw_text_ink_in_box(
         style.color,
         style.opacity,
         typeface,
-        style.font_weight,
+        style,
     );
 }
 
@@ -1013,23 +1039,13 @@ fn draw_text_line(
     color: w3cos_std::color::Color,
     opacity: f32,
     typeface: &Typeface,
-    font_weight: u16,
+    style: &Style,
 ) -> f32 {
     let paint = color_paint(color, opacity);
-    if text
-        .chars()
-        .all(|character| typeface.unichar_to_glyph(character as i32) != 0)
-    {
-        let mut font = Font::new(typeface.clone(), font_size);
-        font.set_embolden(font_weight >= 600);
-        canvas.draw_str(text, (x, top + font_size), &font, &paint);
-        return font.measure_str(text, Some(&paint)).0;
-    }
-
     let mut cursor_x = x;
-    for run in fallback_font_runs(text, typeface, font_weight) {
+    for run in css_font_runs(text, typeface, style) {
         let mut font = Font::new(run.typeface, font_size);
-        font.set_embolden(font_weight >= 600);
+        font.set_embolden(style.font_weight >= 600);
         canvas.draw_str(run.text, (cursor_x, top + font_size), &font, &paint);
         cursor_x += font.measure_str(run.text, Some(&paint)).0;
     }
@@ -1041,6 +1057,7 @@ fn measure_skia_text_ink_bounds(
     font_size: f32,
     typeface: &Typeface,
     font_weight: u16,
+    style: Option<&Style>,
 ) -> text_layout::InkBounds {
     let mut cursor_x = 0.0_f32;
     let mut left = f32::MAX;
@@ -1049,7 +1066,11 @@ fn measure_skia_text_ink_bounds(
     let mut bottom = f32::MIN;
     let mut saw_ink = false;
 
-    for run in fallback_font_runs(text, typeface, font_weight) {
+    let runs = style.map_or_else(
+        || fallback_font_runs(text, typeface, font_weight),
+        |style| css_font_runs(text, typeface, style),
+    );
+    for run in runs {
         let mut font = Font::new(run.typeface, font_size);
         font.set_embolden(font_weight >= 600);
         let (advance, bounds) = font.measure_str(run.text, None);
@@ -1076,10 +1097,15 @@ fn measure_skia_text_ink_bounds(
 }
 
 pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f32, f32) {
-    INTRINSIC_PRIMARY_TYPEFACE.with(|primary| {
+    let registered = registered_typeface(style);
+    INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
+        let primary = registered
+            .as_ref()
+            .map(|(_, typeface)| typeface)
+            .unwrap_or(intrinsic);
         let mut width = 0.0_f32;
         let mut line_spacing = 0.0_f32;
-        for run in fallback_font_runs(text, primary, style.font_weight) {
+        for run in css_font_runs(text, primary, style) {
             let mut font = Font::new(run.typeface, style.font_size);
             font.set_embolden(style.font_weight >= 600);
             width += font.measure_str(run.text, None).0;
@@ -1106,6 +1132,22 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
 struct FallbackFontRun<'a> {
     text: &'a str,
     typeface: Typeface,
+}
+
+fn css_font_runs<'a>(text: &'a str, primary: &Typeface, style: &Style) -> Vec<FallbackFontRun<'a>> {
+    let mut runs = Vec::new();
+    for resolved in crate::font_face::FontRegistry::global().resolve_style_runs(style, text) {
+        let run_text = &text[resolved.byte_range];
+        if let Some(typeface) = resolved.font.as_ref().and_then(|font| font.skia_typeface()) {
+            runs.push(FallbackFontRun {
+                text: run_text,
+                typeface,
+            });
+        } else {
+            runs.extend(fallback_font_runs(run_text, primary, style.font_weight));
+        }
+    }
+    runs
 }
 
 fn fallback_font_runs<'a>(
@@ -1148,7 +1190,7 @@ fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16)
         return primary.clone();
     }
 
-    let key = (character, font_weight);
+    let key = (primary.unique_id(), character, font_weight);
     let cached = FONT_FALLBACK_CACHE.with(|cache| cache.borrow().get(&key).cloned());
     let fallback = match cached {
         Some(cached) => cached,
@@ -1202,211 +1244,123 @@ fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
     }
 }
 
-#[derive(Clone, Copy)]
-struct GradientStop {
-    color: w3cos_std::color::Color,
-    position: Option<f32>,
-}
-
 fn draw_background_image(
     canvas: &Canvas,
     rect: LayoutRect,
-    radius: f32,
-    value: &str,
+    _radius: f32,
+    style: &Style,
     opacity: f32,
 ) {
     // CSS paints the first listed background on top of the following layers.
-    for layer in split_top_level(value, ',').into_iter().rev() {
-        let mut paint = Paint::default();
-        paint.set_anti_alias(true);
-        paint.set_alpha_f(opacity.clamp(0.0, 1.0));
-        let shader = if let Some(arguments) = function_arguments(layer, "linear-gradient") {
-            linear_gradient_shader(rect, arguments)
-        } else if let Some(arguments) = function_arguments(layer, "radial-gradient") {
-            radial_gradient_shader(rect, arguments)
-        } else {
-            None
-        };
-        if let Some(shader) = shader {
-            paint.set_shader(shader);
-            draw_round_rect(canvas, rect, radius, &paint);
-        }
-    }
-}
-
-fn linear_gradient_shader(rect: LayoutRect, arguments: &str) -> Option<skia_safe::Shader> {
-    let mut parts = split_top_level(arguments, ',');
-    let has_angle = parts
-        .first()
-        .is_some_and(|part| part.trim().ends_with("deg"));
-    let angle = parts
-        .first()
-        .and_then(|part| part.trim().strip_suffix("deg"))
-        .and_then(|value| value.trim().parse::<f32>().ok())
-        .unwrap_or(180.0);
-    if has_angle {
-        parts.remove(0);
-    }
-    let (colors, positions) = gradient_colors_and_positions(&parts)?;
-    let radians = angle.to_radians();
-    let direction = (radians.sin(), -radians.cos());
-    let center = (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5);
-    let extent = direction.0.abs() * rect.width * 0.5 + direction.1.abs() * rect.height * 0.5;
-    let start = (
-        center.0 - direction.0 * extent,
-        center.1 - direction.1 * extent,
-    );
-    let end = (
-        center.0 + direction.0 * extent,
-        center.1 + direction.1 * extent,
-    );
-    gradient_shader::linear(
-        (start, end),
-        colors.as_slice(),
-        positions.as_slice(),
-        TileMode::Clamp,
-        None,
-        None,
-    )
-}
-
-fn radial_gradient_shader(rect: LayoutRect, arguments: &str) -> Option<skia_safe::Shader> {
-    let mut parts = split_top_level(arguments, ',');
-    let mut center = (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5);
-    if let Some(header) = parts.first().copied()
-        && !parse_gradient_stop(header).is_some()
+    for layer in crate::background_image::background_paint_layers(style, rect)
+        .into_iter()
+        .rev()
     {
-        if let Some(at) = header.find(" at ") {
-            let coords: Vec<&str> = header[at + 4..].split_whitespace().collect();
-            if coords.len() >= 2 {
-                center.0 = rect.x + parse_percent(coords[0]).unwrap_or(0.5) * rect.width;
-                center.1 = rect.y + parse_percent(coords[1]).unwrap_or(0.5) * rect.height;
+        let clip = match &layer {
+            crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.clip,
+            crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.geometry.clip,
+        };
+        let save = canvas.save();
+        canvas.clip_rrect(
+            RRect::new_rect_xy(to_rect(clip.rect), clip.radius, clip.radius),
+            None,
+            Some(true),
+        );
+        let blend_mode = match &layer {
+            crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.blend_mode,
+            crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.blend_mode,
+        };
+        if blend_mode != crate::background_image::BackgroundBlendMode::Normal {
+            let mut layer_paint = Paint::default();
+            layer_paint.set_blend_mode(background_skia_blend(blend_mode));
+            canvas.save_layer(&SaveLayerRec::default().paint(&layer_paint));
+        }
+        match layer {
+            crate::background_image::BackgroundPaintLayer::Raster(layer) => {
+                for tile in &layer.tiles {
+                    draw_image(canvas, *tile, &layer.source, opacity);
+                }
+            }
+            crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
+                for tile in &layer.geometry.tiles {
+                    if let Some(shader) =
+                        gradient_shader_for_layer(*tile, &layer.kind, &layer.stops)
+                    {
+                        let mut paint = Paint::default();
+                        paint.set_anti_alias(true);
+                        paint.set_alpha_f(opacity.clamp(0.0, 1.0));
+                        paint.set_shader(shader);
+                        canvas.draw_rect(to_rect(*tile), &paint);
+                    }
+                }
             }
         }
-        parts.remove(0);
+        canvas.restore_to_count(save);
     }
-    let (colors, positions) = gradient_colors_and_positions(&parts)?;
-    let radius = [
-        (center.0 - rect.x).hypot(center.1 - rect.y),
-        (center.0 - (rect.x + rect.width)).hypot(center.1 - rect.y),
-        (center.0 - rect.x).hypot(center.1 - (rect.y + rect.height)),
-        (center.0 - (rect.x + rect.width)).hypot(center.1 - (rect.y + rect.height)),
-    ]
-    .into_iter()
-    .fold(0.0_f32, f32::max);
-    gradient_shader::radial(
-        center,
-        radius.max(1.0),
-        colors.as_slice(),
-        positions.as_slice(),
-        TileMode::Clamp,
-        None,
-        None,
-    )
 }
 
-fn gradient_colors_and_positions(parts: &[&str]) -> Option<(Vec<Color>, Vec<f32>)> {
-    let stops: Vec<GradientStop> = parts
-        .iter()
-        .filter_map(|part| parse_gradient_stop(part))
-        .collect();
-    if stops.len() < 2 {
-        return None;
+fn background_skia_blend(
+    mode: crate::background_image::BackgroundBlendMode,
+) -> skia_safe::BlendMode {
+    use crate::background_image::BackgroundBlendMode as Mode;
+    match mode {
+        Mode::Normal => skia_safe::BlendMode::SrcOver,
+        Mode::Multiply => skia_safe::BlendMode::Multiply,
+        Mode::Screen => skia_safe::BlendMode::Screen,
+        Mode::Overlay => skia_safe::BlendMode::Overlay,
+        Mode::Darken => skia_safe::BlendMode::Darken,
+        Mode::Lighten => skia_safe::BlendMode::Lighten,
+        Mode::ColorDodge => skia_safe::BlendMode::ColorDodge,
+        Mode::ColorBurn => skia_safe::BlendMode::ColorBurn,
+        Mode::HardLight => skia_safe::BlendMode::HardLight,
+        Mode::SoftLight => skia_safe::BlendMode::SoftLight,
+        Mode::Difference => skia_safe::BlendMode::Difference,
+        Mode::Exclusion => skia_safe::BlendMode::Exclusion,
     }
+}
+
+fn gradient_shader_for_layer(
+    rect: LayoutRect,
+    kind: &crate::background_image::GradientKind,
+    stops: &[crate::background_image::GradientStop],
+) -> Option<skia_safe::Shader> {
     let colors = stops
         .iter()
         .map(|stop| to_skia_color(stop.color, 1.0))
-        .collect();
-    let mut positions: Vec<Option<f32>> = stops.iter().map(|stop| stop.position).collect();
-    if positions.first().is_some_and(Option::is_none) {
-        positions[0] = Some(0.0);
-    }
-    let last = positions.len() - 1;
-    if positions[last].is_none() {
-        positions[last] = Some(1.0);
-    }
-    let mut anchor = 0;
-    while anchor < last {
-        let next = (anchor + 1..=last)
-            .find(|&index| positions[index].is_some())
-            .unwrap_or(last);
-        let from = positions[anchor].unwrap_or(0.0);
-        let to = positions[next].unwrap_or(1.0).max(from);
-        for index in anchor + 1..next {
-            let t = (index - anchor) as f32 / (next - anchor) as f32;
-            positions[index] = Some(from + (to - from) * t);
+        .collect::<Vec<_>>();
+    let positions = stops.iter().map(|stop| stop.position).collect::<Vec<_>>();
+    match kind {
+        crate::background_image::GradientKind::Linear { angle_degrees } => {
+            let (start, end) =
+                crate::background_image::linear_gradient_points(rect, *angle_degrees);
+            gradient_shader::linear(
+                (start, end),
+                colors.as_slice(),
+                positions.as_slice(),
+                TileMode::Clamp,
+                None,
+                None,
+            )
         }
-        anchor = next;
-    }
-    Some((colors, positions.into_iter().map(Option::unwrap).collect()))
-}
-
-fn parse_gradient_stop(value: &str) -> Option<GradientStop> {
-    let parts = split_css_whitespace(value.trim());
-    let color = w3cos_std::color::Color::from_css(parts.first()?)?;
-    let position = parts.get(1).and_then(|value| parse_percent(value));
-    Some(GradientStop { color, position })
-}
-
-fn parse_percent(value: &str) -> Option<f32> {
-    value
-        .trim()
-        .strip_suffix('%')?
-        .trim()
-        .parse::<f32>()
-        .ok()
-        .map(|value| (value / 100.0).clamp(0.0, 1.0))
-}
-
-fn function_arguments<'a>(value: &'a str, name: &str) -> Option<&'a str> {
-    value
-        .trim()
-        .strip_prefix(name)?
-        .strip_prefix('(')?
-        .strip_suffix(')')
-}
-
-fn split_top_level(value: &str, separator: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut depth = 0_u32;
-    for (index, ch) in value.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ if ch == separator && depth == 0 => {
-                parts.push(value[start..index].trim());
-                start = index + ch.len_utf8();
-            }
-            _ => {}
+        crate::background_image::GradientKind::Radial {
+            center_x,
+            center_y,
+            shape,
+        } => {
+            let (center, (radius_x, radius_y)) =
+                crate::background_image::radial_gradient_axes(rect, *center_x, *center_y, *shape);
+            let radius = radius_x.max(radius_y);
+            gradient_shader::radial(
+                center,
+                radius,
+                colors.as_slice(),
+                positions.as_slice(),
+                TileMode::Clamp,
+                None,
+                None,
+            )
         }
     }
-    parts.push(value[start..].trim());
-    parts
-}
-
-fn split_css_whitespace(value: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = None;
-    let mut depth = 0_u32;
-    for (index, ch) in value.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        if ch.is_whitespace() && depth == 0 {
-            if let Some(from) = start.take() {
-                parts.push(&value[from..index]);
-            }
-        } else if start.is_none() {
-            start = Some(index);
-        }
-    }
-    if let Some(from) = start {
-        parts.push(&value[from..]);
-    }
-    parts
 }
 
 fn draw_round_rect(canvas: &Canvas, rect: LayoutRect, radius: f32, paint: &Paint) {
@@ -1464,19 +1418,32 @@ mod tests {
     #[test]
     fn parses_layered_css_gradients_without_splitting_rgba() {
         let value = "radial-gradient(circle at 85% 8%, rgba(22, 119, 255, 0.18), transparent 34%), linear-gradient(160deg, #f7faff 0%, #eef3fb 100%)";
-        let layers = split_top_level(value, ',');
+        let style = Style {
+            background_image: Some(value.to_string()),
+            ..Style::default()
+        };
+        let layers = crate::background_image::gradient_background_layers(
+            &style,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+        );
         assert_eq!(layers.len(), 2);
-
-        let radial = function_arguments(layers[0], "radial-gradient").unwrap();
-        let radial_parts = split_top_level(radial, ',');
-        assert_eq!(radial_parts.len(), 3);
-        let stop = parse_gradient_stop(radial_parts[1]).unwrap();
-        assert_eq!(stop.color, w3cos_std::color::Color::rgba(22, 119, 255, 46));
-
-        let linear = function_arguments(layers[1], "linear-gradient").unwrap();
-        let linear_parts = split_top_level(linear, ',');
-        let (_, positions) = gradient_colors_and_positions(&linear_parts[1..]).unwrap();
-        assert_eq!(positions, vec![0.0, 1.0]);
+        assert_eq!(
+            layers[0].stops[0].color,
+            w3cos_std::color::Color::rgba(22, 119, 255, 46)
+        );
+        assert_eq!(
+            layers[1]
+                .stops
+                .iter()
+                .map(|stop| stop.position)
+                .collect::<Vec<_>>(),
+            vec![0.0, 1.0]
+        );
     }
 
     #[test]
@@ -1484,6 +1451,67 @@ mod tests {
         let mut style = Style::default();
         style.justify_content = JustifyContent::Center;
         assert_eq!(effective_text_align(&style), TextAlign::Center);
+    }
+
+    #[test]
+    fn registered_css_font_supplies_skia_typeface_and_releases_with_owner() {
+        const OWNER: u64 = 0x534b_4941_464f_4e54;
+        const FAMILY: &str = "W3COS Skia Font Test";
+        let style = Style {
+            font_family: Some(FAMILY.to_string()),
+            ..Style::default()
+        };
+        assert!(registered_typeface(&style).is_none());
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                crate::font_face::FontFace {
+                    family: FAMILY.to_string(),
+                    src: crate::font_face::FontSource::Bytes(TEST_FONT.to_vec()),
+                    ..crate::font_face::FontFace::default()
+                },
+            )
+            .expect("register Skia font");
+        let (loaded, typeface) = registered_typeface(&style).expect("registered Skia typeface");
+        assert_eq!(loaded.family, FAMILY);
+        assert_ne!(typeface.unichar_to_glyph('W' as i32), 0);
+
+        drop(loaded);
+        drop(typeface);
+        crate::font_face::FontRegistry::global().clear_owner(OWNER);
+        assert!(registered_typeface(&style).is_none());
+    }
+
+    #[test]
+    fn css_font_runs_follow_unicode_range_subsets() {
+        const OWNER: u64 = 0x534b_4941_5355_4253;
+        const FAMILY: &str = "W3COS Skia Subset Test";
+        let style = Style {
+            font_family: Some(FAMILY.to_string()),
+            ..Style::default()
+        };
+        for unicode_range in ["U+0057", "U+0030-0039"] {
+            crate::font_face::FontRegistry::global()
+                .register_for_owner(
+                    OWNER,
+                    crate::font_face::FontFace {
+                        family: FAMILY.to_string(),
+                        src: crate::font_face::FontSource::Bytes(TEST_FONT.to_vec()),
+                        unicode_range: Some(unicode_range.to_string()),
+                        ..crate::font_face::FontFace::default()
+                    },
+                )
+                .expect("register Skia subset");
+        }
+        let primary = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let runs = css_font_runs("W3W", &primary, &style);
+        assert_eq!(
+            runs.iter().map(|run| run.text).collect::<Vec<_>>(),
+            ["W", "3", "W"]
+        );
+        assert!(runs.iter().all(|run| run.typeface.unique_id() != 0));
+
+        crate::font_face::FontRegistry::global().clear_owner(OWNER);
     }
 
     #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -1507,7 +1535,7 @@ mod tests {
     #[test]
     fn skia_ink_bounds_follow_the_actual_fallback_typeface() {
         let primary = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
-        let ink = measure_skia_text_ink_bounds("✦首次入驻", 17.0, &primary, 400);
+        let ink = measure_skia_text_ink_bounds("✦首次入驻", 17.0, &primary, 400, None);
         assert!(ink.width > 0.0);
         assert!(ink.height > 0.0);
         assert!(ink.top.is_finite());

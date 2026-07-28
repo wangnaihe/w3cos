@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use crate::jsdom::realm_function;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::Message;
 use tungstenite::stream::MaybeTlsStream;
@@ -238,6 +239,10 @@ thread_local! {
     static WEBSOCKET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
+fn realm_websocket_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
 /// Standard JavaScript `WebSocket` constructor used by the ESM runtime.
 ///
 /// The native worker owns transport I/O while [`poll_js_events`] delivers
@@ -247,7 +252,7 @@ pub fn websocket_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let constructor = Value::function(|_, args| {
+        let constructor = realm_websocket_function(|_, args| {
             let url = args
                 .first()
                 .cloned()
@@ -319,23 +324,27 @@ fn js_websocket_value(socket: WebSocket) -> Value {
     let socket_for_url = socket.clone();
     props.insert(
         "__w3cos_getter_url".to_string(),
-        Value::function(move |_, _| Value::from(socket_for_url.url())),
+        realm_websocket_function(move |_, _| Value::from(socket_for_url.url())),
     );
     let socket_for_state = socket.clone();
     props.insert(
         "__w3cos_getter_readyState".to_string(),
-        Value::function(move |_, _| Value::Number(socket_for_state.ready_state().as_u8() as f64)),
+        realm_websocket_function(move |_, _| {
+            Value::Number(socket_for_state.ready_state().as_u8() as f64)
+        }),
     );
     let socket_for_buffered = socket.clone();
     props.insert(
         "__w3cos_getter_bufferedAmount".to_string(),
-        Value::function(move |_, _| Value::Number(socket_for_buffered.buffered_amount() as f64)),
+        realm_websocket_function(move |_, _| {
+            Value::Number(socket_for_buffered.buffered_amount() as f64)
+        }),
     );
 
     let socket_for_send = socket.clone();
     props.insert(
         "send".to_string(),
-        Value::function(move |this, args| {
+        realm_websocket_function(move |this, args| {
             let payload = args.first().cloned().unwrap_or(Value::Undefined);
             let result = if let Value::Array(items) = payload {
                 socket_for_send.send_binary(
@@ -357,7 +366,7 @@ fn js_websocket_value(socket: WebSocket) -> Value {
     let socket_for_close = socket.clone();
     props.insert(
         "close".to_string(),
-        Value::function(move |_, args| {
+        realm_websocket_function(move |_, args| {
             let code = args
                 .first()
                 .filter(|value| !value.is_undefined())
@@ -376,7 +385,7 @@ fn js_websocket_value(socket: WebSocket) -> Value {
     let listeners_for_add = Rc::clone(&listeners);
     props.insert(
         "addEventListener".to_string(),
-        Value::function(move |_, args| {
+        realm_websocket_function(move |_, args| {
             let event_type = args
                 .first()
                 .cloned()
@@ -396,7 +405,7 @@ fn js_websocket_value(socket: WebSocket) -> Value {
     let listeners_for_remove = Rc::clone(&listeners);
     props.insert(
         "removeEventListener".to_string(),
-        Value::function(move |_, args| {
+        realm_websocket_function(move |_, args| {
             let event_type = args
                 .first()
                 .cloned()
@@ -412,7 +421,7 @@ fn js_websocket_value(socket: WebSocket) -> Value {
     let listeners_for_dispatch = Rc::clone(&listeners);
     props.insert(
         "dispatchEvent".to_string(),
-        Value::function(move |this, args| {
+        realm_websocket_function(move |this, args| {
             let event = args.first().cloned().unwrap_or(Value::Undefined);
             let event_type = event.get_property("type").to_js_string();
             dispatch_to_handlers(&this, &listeners_for_dispatch, &event_type, event);
@@ -544,7 +553,30 @@ pub fn has_pending_js_sockets() -> bool {
 }
 
 pub(crate) fn reset_js_websockets() {
-    JS_WEBSOCKETS.with(|bindings| bindings.borrow_mut().clear());
+    let bindings = JS_WEBSOCKETS.with(|bindings| std::mem::take(&mut *bindings.borrow_mut()));
+    for binding in bindings {
+        let _ = binding.socket.close(1001, "page navigation");
+        binding.socket.poll_events();
+        binding.listeners.borrow_mut().clear();
+        for property in ["onopen", "onmessage", "onerror", "onclose"] {
+            binding.value.set_property(property, Value::Null);
+        }
+        for property in [
+            "__w3cos_getter_url",
+            "__w3cos_getter_readyState",
+            "__w3cos_getter_bufferedAmount",
+            "send",
+            "close",
+            "addEventListener",
+            "removeEventListener",
+            "dispatchEvent",
+        ] {
+            binding.value.set_property(property, Value::Undefined);
+        }
+    }
+    WEBSOCKET_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 fn worker_loop(inner: Arc<WebSocketInner>, cmd_rx: mpsc::Receiver<OutboundCommand>) {
@@ -725,6 +757,7 @@ fn push_event(inner: &Arc<WebSocketInner>, event: WebSocketEvent) {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::mpsc::TryRecvError;
     use std::time::{Duration, Instant};
     use tungstenite::accept;
 
@@ -791,5 +824,68 @@ mod tests {
         let ws = WebSocket::connect("not a url");
         let events = drain_until(&ws, |e| matches!(e, WebSocketEvent::Close { .. }));
         assert!(events.iter().any(|e| matches!(e, WebSocketEvent::Error(_))));
+    }
+
+    #[test]
+    fn javascript_socket_resources_and_methods_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_class = websocket_class();
+        let (command_tx, command_rx) = mpsc::channel();
+        let socket = WebSocket {
+            inner: Arc::new(WebSocketInner {
+                url: "ws://realm.invalid".to_string(),
+                state: AtomicU8::new(ReadyState::Open.as_u8()),
+                buffered: AtomicU32::new(0),
+                cmd_tx: Mutex::new(Some(command_tx)),
+                events: Mutex::new(VecDeque::new()),
+            }),
+        };
+        let native_socket = socket.clone();
+        let value = js_websocket_value(socket);
+        let callback_marker = Rc::new(());
+        let callback_marker_weak = Rc::downgrade(&callback_marker);
+        value.call_method(
+            "addEventListener",
+            vec![
+                Value::string("message"),
+                Value::function(move |_, _| {
+                    let _ = &callback_marker;
+                    Value::Undefined
+                }),
+            ],
+        );
+        assert!(has_pending_js_sockets());
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!has_pending_js_sockets());
+        assert!(!old_class.strict_eq(&websocket_class()));
+        assert!(
+            old_class
+                .call(Value::Undefined, vec![Value::string("ws://stale.invalid")])
+                .is_undefined()
+        );
+        assert!(
+            value
+                .call_method("send", vec![Value::string("stale")])
+                .is_undefined()
+        );
+        assert!(value.call_method("close", vec![]).is_undefined());
+        assert_eq!(native_socket.ready_state(), ReadyState::Closing);
+        match command_rx.try_recv() {
+            Ok(OutboundCommand::Close { code, reason }) => {
+                assert_eq!(code, 1001);
+                assert_eq!(reason, "page navigation");
+            }
+            Ok(OutboundCommand::Send(_)) => panic!("navigation queued a data frame"),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                panic!("navigation did not queue a close frame")
+            }
+        }
+        assert!(callback_marker_weak.upgrade().is_none());
+        reset_js_websockets();
     }
 }

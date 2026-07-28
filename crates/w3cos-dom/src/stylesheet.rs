@@ -95,6 +95,10 @@ struct Rule {
     declarations: Vec<(String, String)>,
     specificity: u32,
     order: u32,
+    /// `None` identifies process/application styles registered by native AOT.
+    /// Browser page styles use a loader-owned id so navigation can release
+    /// only that page's rules without deleting the host application's CSS.
+    owner: Option<u64>,
 }
 
 thread_local! {
@@ -104,6 +108,15 @@ thread_local! {
 /// Register a stylesheet rule. Comma-separated selector groups are split into
 /// independent rules. Unparseable selectors are ignored (never match).
 pub fn register_rule(selector: &str, declarations: &[(&str, &str)]) {
+    register_rule_with_owner(None, selector, declarations);
+}
+
+/// Register one page-owned Browser rule.
+pub fn register_rule_for_owner(owner: u64, selector: &str, declarations: &[(&str, &str)]) {
+    register_rule_with_owner(Some(owner), selector, declarations);
+}
+
+fn register_rule_with_owner(owner: Option<u64>, selector: &str, declarations: &[(&str, &str)]) {
     if declarations.is_empty() {
         return;
     }
@@ -124,8 +137,21 @@ pub fn register_rule(selector: &str, declarations: &[(&str, &str)]) {
                     .collect(),
                 specificity,
                 order,
+                owner,
             });
         }
+    });
+}
+
+/// Remove Browser rules owned by one page/loader while preserving native AOT
+/// and other page contexts.
+pub fn clear_owner(owner: u64) {
+    // Loaders can be retained by another thread-local and dropped during
+    // thread teardown after this registry has already been destroyed.
+    // Cleanup is idempotent, so a late teardown must become a no-op instead
+    // of panicking on TLS destruction order.
+    let _ = RULES.try_with(|rules| {
+        rules.borrow_mut().retain(|rule| rule.owner != Some(owner));
     });
 }
 
@@ -552,5 +578,26 @@ mod tests {
         clear_rules();
         assert!(!has_rules());
         assert_eq!(rule_count(), 0);
+    }
+
+    #[test]
+    fn clearing_page_owner_preserves_native_and_other_page_rules() {
+        setup();
+        register_rule(".native", &[("color", "native")]);
+        register_rule_for_owner(7, ".page-a", &[("color", "page-a")]);
+        register_rule_for_owner(8, ".page-b", &[("color", "page-b")]);
+
+        clear_owner(7);
+
+        assert_eq!(rule_count(), 2);
+        assert_eq!(
+            matching_declarations("div", None, &["native"], &[])[0].1,
+            "native"
+        );
+        assert!(matching_declarations("div", None, &["page-a"], &[]).is_empty());
+        assert_eq!(
+            matching_declarations("div", None, &["page-b"], &[])[0].1,
+            "page-b"
+        );
     }
 }

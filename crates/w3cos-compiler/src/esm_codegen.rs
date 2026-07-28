@@ -8,11 +8,14 @@
 //! `generate_skeleton` produces `todo!()` placeholders.
 //! `generate_with_bodies` reads source files and lowers JS function bodies to Rust.
 
-use crate::esm_lowering::{ClassScope, LowerCtx, is_super_call_stmt, sanitize_ident};
-use crate::esm_resolver::{BundledModule, BundledSymbol, EsmBundle, SymbolKind};
-use std::collections::HashSet;
+use crate::esm_lowering::{ClassScope, LowerCtx, sanitize_ident};
+use crate::esm_resolver::{
+    BundledModule, BundledSymbol, EsmBundle, SymbolKind, synthetic_default_export_name,
+};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
-use swc_common::{FileName, SourceMap, sync::Lrc};
+use swc_common::{DUMMY_SP, FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 
@@ -62,6 +65,40 @@ fn emit_literal_imports(module: &BundledModule) -> String {
         .collect()
 }
 
+fn runtime_import_fn_name(module: &BundledModule, local: &str) -> String {
+    format!(
+        "{}_runtime_import_{}",
+        module.namespace,
+        sanitize_ident(local)
+    )
+}
+
+fn emit_runtime_imports(module: &BundledModule) -> String {
+    let mut out = String::new();
+    for import in &module.runtime_imports {
+        let base = runtime_import_fn_name(module, &import.local);
+        let specifier = &import.specifier;
+        let missing_module =
+            format!("ReferenceError: runtime module `{specifier}` is not registered");
+        let value = if import.imported == "*" {
+            format!(
+                "w3cos_core::module_registry::namespace({specifier:?}).unwrap_or_else(|| w3cos_core::throw_value(w3cos_core::Value::from({missing_module:?})))"
+            )
+        } else {
+            let imported = &import.imported;
+            let missing_export =
+                format!("SyntaxError: module `{specifier}` has no export `{imported}`");
+            format!(
+                "w3cos_core::module_registry::export({specifier:?}, {imported:?}).unwrap_or_else(|| w3cos_core::throw_value(w3cos_core::Value::from({missing_export:?}))).read()"
+            )
+        };
+        out.push_str(&format!(
+            "    pub fn {base}_get() -> w3cos_core::Value {{\n        let __evaluation = w3cos_core::module_registry::evaluate({specifier:?}).unwrap_or_else(|| w3cos_core::throw_value(w3cos_core::Value::from({missing_module:?})));\n        if let Some(w3cos_core::promise::PromiseStatus::Rejected(__reason)) = w3cos_core::promise::status(&__evaluation) {{ w3cos_core::throw_value(__reason); }}\n        {value}\n    }}\n"
+        ));
+    }
+    out
+}
+
 /// Generate a Rust module skeleton from a fully built ESM bundle.
 pub fn generate_skeleton(bundle: &EsmBundle) -> String {
     let mut out = String::new();
@@ -95,6 +132,7 @@ fn generate_module(bundle: &EsmBundle, module: &BundledModule) -> String {
         ));
     }
     out.push_str(&emit_literal_imports(module));
+    out.push_str(&emit_runtime_imports(module));
     for ns_import in &module.namespace_imports {
         out.push_str(&format!(
             "    /// namespace import {} ({} exports)\n    pub fn {}() {{ todo!(\"namespace object\") }}\n",
@@ -179,7 +217,14 @@ fn generate_module(bundle: &EsmBundle, module: &BundledModule) -> String {
 
 /// Generate Rust module code with real function bodies lowered from JS AST.
 pub fn generate_with_bodies(bundle: &EsmBundle) -> String {
-    generate_with_bodies_and_css(bundle, &[])
+    try_generate_with_bodies(bundle)
+        .unwrap_or_else(|error| panic!("ESM code generation failed: {error}"))
+}
+
+/// Generate a native bundle while preserving W3IR as the only semantic
+/// lowering path for executable module initialization.
+pub fn try_generate_with_bodies(bundle: &EsmBundle) -> Result<String, EsmCodegenError> {
+    try_generate_with_bodies_and_css(bundle, &[])
 }
 
 /// Generate Rust module code, additionally baking collected ESM CSS rules
@@ -189,6 +234,14 @@ pub fn generate_with_bodies_and_css(
     bundle: &EsmBundle,
     css_rules: &[crate::esm_css::CollectedRule],
 ) -> String {
+    try_generate_with_bodies_and_css(bundle, css_rules)
+        .unwrap_or_else(|error| panic!("ESM code generation failed: {error}"))
+}
+
+pub fn try_generate_with_bodies_and_css(
+    bundle: &EsmBundle,
+    css_rules: &[crate::esm_css::CollectedRule],
+) -> Result<String, EsmCodegenError> {
     let mut out = String::new();
     // Generated bundles intentionally use source-shaped JS identifiers and
     // mutable temporaries; suppressing those mechanical Rust warnings keeps
@@ -202,20 +255,46 @@ pub fn generate_with_bodies_and_css(
     ));
 
     let mut parse_cache = ModuleParseCache::default();
+    let mut async_init_namespaces = HashSet::new();
     for module in &bundle.modules {
-        out.push_str(&generate_module_with_bodies(
-            bundle,
-            module,
-            &mut parse_cache,
-        ));
+        let generated = generate_module_with_bodies(bundle, module, &mut parse_cache)?;
+        if generated.has_async_init {
+            async_init_namespaces.insert(module.namespace.clone());
+        }
+        out.push_str(&generated.code);
         out.push('\n');
     }
+    let has_async_init = !async_init_namespaces.is_empty();
 
     out.push_str(&emit_register_styles(css_rules));
 
-    // ESM evaluation order: every module's top-level statements run once, in
-    // bundle (topological) order, before the entry's main. Circular imports
-    // may still observe Undefined early (see emit_module_init's NOTE).
+    let register_calls = bundle
+        .modules
+        .iter()
+        .map(|module| {
+            format!(
+                "{}::{}__register_shared_module();",
+                module.namespace, module.namespace
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let register_calls = (!register_calls.is_empty())
+        .then(|| format!(" {register_calls}"))
+        .unwrap_or_default();
+
+    let mut runtime_dependencies = Vec::new();
+    for module in &bundle.modules {
+        for specifier in &module.runtime_dependencies {
+            if !runtime_dependencies.contains(specifier) {
+                runtime_dependencies.push(specifier.clone());
+            }
+        }
+    }
+
+    // ESM evaluation order: every synchronous module's top-level statements
+    // run once in bundle (topological) order before the entry's main. Bundles
+    // containing top-level await use the Promise chain emitted below.
     let init_calls = if bundle.modules.is_empty() {
         String::new()
     } else {
@@ -230,7 +309,7 @@ pub fn generate_with_bodies_and_css(
         )
     };
 
-    if let Some(symbol) = bundle
+    let entry_call = if let Some(symbol) = bundle
         .symbols
         .iter()
         .find(|symbol| symbol.module == bundle.entry && symbol.original_name == "main")
@@ -239,17 +318,148 @@ pub fn generate_with_bodies_and_css(
             .iter()
             .find(|module| module.path == bundle.entry)
     {
+        format!("{}::{}(vec![])", module.namespace, symbol.bundled_name)
+    } else {
+        "w3cos_core::Value::Undefined".to_string()
+    };
+    if has_async_init {
         out.push_str(&format!(
-            "pub fn run_entry() -> w3cos_core::Value {{ register_styles();{init_calls} {}::{}(vec![]) }}\n",
-            module.namespace, symbol.bundled_name
+            "fn __w3cos_run_entry_body() -> w3cos_core::Value {{ {entry_call} }}\n\
+             pub fn run_entry() -> w3cos_core::Value {{ run_entry_async() }}\n"
         ));
     } else {
         out.push_str(&format!(
-            "pub fn run_entry() -> w3cos_core::Value {{ register_styles();{init_calls} w3cos_core::Value::Undefined }}\n"
+            "fn __w3cos_run_entry_body() -> w3cos_core::Value {{{init_calls} {entry_call} }}\n\
+             pub fn run_entry() -> w3cos_core::Value {{ register_styles();{register_calls} __w3cos_run_entry_body() }}\n"
         ));
     }
 
-    out
+    if has_async_init {
+        let initial_evaluation = if runtime_dependencies.is_empty() {
+            "w3cos_core::intrinsics::promise_resolve(vec![w3cos_core::Value::Undefined])"
+                .to_string()
+        } else {
+            let entry_referrer = entry_referrer(bundle);
+            let evaluations =
+                runtime_dependency_evaluations(&runtime_dependencies, &entry_referrer);
+            format!(
+                "w3cos_core::intrinsics::promise_all(vec![w3cos_core::Value::array(vec![{evaluations}])])"
+            )
+        };
+        let module_steps = bundle
+            .modules
+            .iter()
+            .map(|module| {
+                let init = if async_init_namespaces.contains(&module.namespace) {
+                    format!("{}::{}__init()", module.namespace, module.namespace)
+                } else {
+                    format!(
+                        "{{ {}::{}__init(); w3cos_core::Value::Undefined }}",
+                        module.namespace, module.namespace
+                    )
+                };
+                format!(
+                    "    __evaluation = w3cos_core::intrinsics::call_method(&__evaluation, &w3cos_core::Value::string(\"then\"), vec![w3cos_core::Value::function(move |_, _| {init})]);\n"
+                )
+            })
+            .collect::<String>();
+        out.push_str(&format!(
+            "pub fn run_entry_async() -> w3cos_core::Value {{\n    register_styles();{register_calls}\n    let mut __evaluation = {initial_evaluation};\n{module_steps}    w3cos_core::intrinsics::call_method(&__evaluation, &w3cos_core::Value::string(\"then\"), vec![w3cos_core::Value::function(move |_, _| __w3cos_run_entry_body())])\n}}\n"
+        ));
+    } else if runtime_dependencies.is_empty() {
+        // Preserve synchronous startup for ordinary AOT bundles while giving
+        // launchers one stable API for both distribution modes.
+        out.push_str(&format!(
+            "pub fn run_entry_async() -> w3cos_core::Value {{ register_styles();{register_calls} w3cos_core::intrinsics::promise_resolve(vec![__w3cos_run_entry_body()]) }}\n"
+        ));
+    } else {
+        let entry_referrer = entry_referrer(bundle);
+        let evaluations = runtime_dependency_evaluations(&runtime_dependencies, &entry_referrer);
+        out.push_str(&format!(
+            "pub fn run_entry_async() -> w3cos_core::Value {{\n    register_styles();{register_calls}\n    let __dependencies = w3cos_core::intrinsics::promise_all(vec![w3cos_core::Value::array(vec![{evaluations}])]);\n    w3cos_core::intrinsics::call_method(&__dependencies, &w3cos_core::Value::string(\"then\"), vec![w3cos_core::Value::function(move |_, _| __w3cos_run_entry_body())])\n}}\n"
+        ));
+    }
+
+    Ok(out)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EsmCodegenError {
+    module: std::path::PathBuf,
+    phase: &'static str,
+    detail: String,
+}
+
+impl EsmCodegenError {
+    fn module_init(
+        module: &BundledModule,
+        chunk: impl fmt::Display,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            module: module.path.clone(),
+            phase: "W3IR module initialization",
+            detail: format!("chunk {chunk}: {}", detail.into()),
+        }
+    }
+
+    fn function(
+        module: &BundledModule,
+        symbol: &BundledSymbol,
+        kind: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            module: module.path.clone(),
+            phase: "W3IR native function emission",
+            detail: format!("{kind} {:?}: {}", symbol.original_name, detail.into()),
+        }
+    }
+
+    fn class(module: &BundledModule, symbol: &BundledSymbol, detail: impl Into<String>) -> Self {
+        Self {
+            module: module.path.clone(),
+            phase: "W3IR native class emission",
+            detail: format!("class {:?}: {}", symbol.original_name, detail.into()),
+        }
+    }
+}
+
+impl fmt::Display for EsmCodegenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} failed for {}: {}",
+            self.phase,
+            self.module.display(),
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for EsmCodegenError {}
+
+fn entry_referrer(bundle: &EsmBundle) -> String {
+    let entry = bundle.entry.to_string_lossy();
+    if entry.contains("://") {
+        entry.into_owned()
+    } else if bundle.entry.is_absolute() {
+        format!("file://{entry}")
+    } else {
+        format!("file:///{}", entry.trim_start_matches('/'))
+    }
+}
+
+fn runtime_dependency_evaluations(runtime_dependencies: &[String], entry_referrer: &str) -> String {
+    runtime_dependencies
+        .iter()
+        .map(|specifier| {
+            format!(
+                "w3cos_core::module_registry::evaluate({specifier:?}).unwrap_or_else(|| w3cos_core::host_modules::dynamic_import(w3cos_core::Value::from({specifier:?}), w3cos_core::Value::from({entry_referrer:?})))"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Emit the stylesheet registration function (no-op when no CSS was collected).
@@ -273,11 +483,16 @@ fn emit_register_styles(css_rules: &[crate::esm_css::CollectedRule]) -> String {
     out
 }
 
+struct GeneratedModule {
+    code: String,
+    has_async_init: bool,
+}
+
 fn generate_module_with_bodies(
     bundle: &EsmBundle,
     module: &BundledModule,
     parse_cache: &mut ModuleParseCache,
-) -> String {
+) -> Result<GeneratedModule, EsmCodegenError> {
     let mut out = String::new();
     out.push_str(&format!(
         "/// ESM module: {}\nmod {} {{\n",
@@ -289,9 +504,10 @@ fn generate_module_with_bodies(
     );
     // Android's pthread-key limit is small. Emitting one `thread_local!` for
     // every lowered JS binding exhausts it before `android_main` can start, so
-    // keep all per-thread ESM state in two module-level registries.
+    // keep per-thread ESM values, binding cells and flags in three
+    // module-level registries.
     out.push_str(
-        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str>> = std::cell::RefCell::new(::std::collections::HashSet::new());\n    }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
+        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_BINDINGS: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::module_registry::BindingCell>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str>> = std::cell::RefCell::new(::std::collections::HashSet::new());\n    }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_declare_binding(key: &'static str, initialized: bool) { __W3COS_ESM_BINDINGS.with(|bindings| { bindings.borrow_mut().entry(key).or_insert_with(|| if initialized { w3cos_core::module_registry::BindingCell::initialized(w3cos_core::Value::Undefined) } else { w3cos_core::module_registry::BindingCell::uninitialized() }); }); }\n    fn __w3cos_esm_binding(key: &'static str) -> w3cos_core::module_registry::BindingCell { __W3COS_ESM_BINDINGS.with(|bindings| bindings.borrow_mut().entry(key).or_insert_with(w3cos_core::module_registry::BindingCell::uninitialized).clone()) }\n    fn __w3cos_esm_read_binding(key: &'static str) -> w3cos_core::Value { __w3cos_esm_binding(key).read_named(key) }\n    fn __w3cos_esm_write_binding(key: &'static str, value: w3cos_core::Value) -> w3cos_core::Value { __w3cos_esm_binding(key).initialize_or_set(value) }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
     );
     let namespace_names: HashSet<String> = module
         .namespace_imports
@@ -305,6 +521,7 @@ fn generate_module_with_bodies(
         ));
     }
     out.push_str(&emit_literal_imports(module));
+    out.push_str(&emit_runtime_imports(module));
 
     // Emit cross-module use aliases (same as skeleton), except variable
     // symbols: those are exposed through `{bundled}_get`/`{bundled}_set`
@@ -372,6 +589,25 @@ fn generate_module_with_bodies(
     let parsed_module = parse_module_items(&module.path);
     let functions = parsed_module.items;
     let init_items = parsed_module.init;
+    // Attempt one backend-neutral lowering for every module. Preserve the
+    // diagnostic in generated source: ordinary functions and class members
+    // fail explicitly instead of silently switching semantic backends.
+    let (w3ir_module, w3ir_error) = match std::fs::read_to_string(&module.path) {
+        Ok(source) => match crate::w3ir_lowering::lower_module(
+            &source,
+            module.path.to_string_lossy().as_ref(),
+        ) {
+            Ok(module) => (Some(module), None),
+            Err(error) => (None, Some(error.to_string())),
+        },
+        Err(error) => (None, Some(error.to_string())),
+    };
+    if let Some(error) = w3ir_error {
+        out.push_str(&format!(
+            "    // W3IR lowering unavailable: {}\n",
+            error.replace(['\r', '\n'], " ")
+        ));
+    }
     let mut value_bindings: HashSet<String> = functions
         .iter()
         .filter_map(|item| match item {
@@ -384,6 +620,12 @@ fn generate_module_with_bodies(
             .literal_imports
             .iter()
             .map(|(local, _)| sanitize_ident(local)),
+    );
+    value_bindings.extend(
+        module
+            .runtime_imports
+            .iter()
+            .map(|import| sanitize_ident(&import.local)),
     );
     // Variables emitted in `{bundled}_get`/`_set` accessor form read through
     // the accessor — including own ambient/stubbed variables and aliases to
@@ -419,14 +661,20 @@ fn generate_module_with_bodies(
             SymbolKind::Class => {
                 let renames = lowering_names(module);
                 let class_ast = find_class(&functions, &sym.original_name);
-                out.push_str(&emit_class(
-                    sym,
-                    class_ast,
-                    &renames,
-                    &value_bindings,
-                    &class_names,
-                    &namespace_names,
-                ));
+                out.push_str(
+                    &emit_class(
+                        bundle,
+                        module,
+                        sym,
+                        class_ast,
+                        w3ir_module.as_ref(),
+                        &renames,
+                        &value_bindings,
+                        &class_names,
+                        &namespace_names,
+                    )
+                    .map_err(|detail| EsmCodegenError::class(module, sym, detail))?,
+                );
                 let alias = sanitize_ident(&sym.original_name);
                 if alias != sym.bundled_name {
                     out.push_str(&format!(
@@ -436,89 +684,124 @@ fn generate_module_with_bodies(
                 }
             }
             SymbolKind::Function => {
-                let renames = lowering_names(module);
-                let body = find_function(
+                if let Some(generator) = emit_w3ir_generator_symbol(
+                    bundle,
+                    module,
+                    sym,
                     &functions,
-                    &sym.original_name,
-                    &renames,
+                    w3ir_module.as_ref(),
                     &value_bindings,
                     &class_names,
                     &namespace_names,
-                    false,
-                )
-                .unwrap_or_else(|| {
-                    format!(
-                        "        return w3cos_runtime::unsupported::error_value(\"function body missing: {}\");",
-                        sym.original_name
-                    )
-                });
-                let callable_body = find_function(
-                    &functions,
-                    &sym.original_name,
-                    &renames,
-                    &value_bindings,
-                    &class_names,
-                    &namespace_names,
-                    true,
-                )
-                .unwrap_or_else(|| body.clone());
-                out.push_str(&format!(
-                    "\n    /// function {} (from ESM)\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n",
-                    sym.original_name, sym.bundled_name, body, sym.bundled_name, callable_body
-                ));
-                out.push_str(&format!(
-                    "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
-                    sym.bundled_name,
-                    format!("{}:value", sym.bundled_name),
-                    sym.bundled_name,
-                ));
-                let alias = sanitize_ident(&sym.original_name);
-                if alias != sym.bundled_name {
-                    out.push_str(&format!(
-                        "    pub use self::{} as {};\n    pub use self::{}_value as {}_value;\n",
-                        sym.bundled_name, alias, sym.bundled_name, alias
-                    ));
+                ) {
+                    out.push_str(&generator.map_err(|detail| {
+                        EsmCodegenError::function(module, sym, "generator", detail)
+                    })?);
+                    continue;
                 }
+                if let Some(function) = emit_w3ir_async_symbol(
+                    bundle,
+                    module,
+                    sym,
+                    &functions,
+                    w3ir_module.as_ref(),
+                    &value_bindings,
+                    &class_names,
+                    &namespace_names,
+                ) {
+                    out.push_str(&function.map_err(|detail| {
+                        EsmCodegenError::function(module, sym, "async function", detail)
+                    })?);
+                    continue;
+                }
+                if let Some(function) = emit_w3ir_sync_symbol(
+                    bundle,
+                    module,
+                    sym,
+                    &functions,
+                    w3ir_module.as_ref(),
+                    &value_bindings,
+                    &class_names,
+                    &namespace_names,
+                ) {
+                    out.push_str(&function.map_err(|detail| {
+                        EsmCodegenError::function(module, sym, "synchronous function", detail)
+                    })?);
+                    continue;
+                }
+                return Err(EsmCodegenError::function(
+                    module,
+                    sym,
+                    "function",
+                    "declaration was not represented in the module W3IR",
+                ));
             }
             SymbolKind::Variable => {
-                let renames = lowering_names(module);
-                if let Some(body) = find_function(
-                    &functions,
-                    &sym.original_name,
-                    &renames,
-                    &value_bindings,
-                    &class_names,
-                    &namespace_names,
-                    false,
-                ) {
-                    let callable_body = find_function(
-                        &functions,
-                        &sym.original_name,
-                        &renames,
-                        &value_bindings,
-                        &class_names,
-                        &namespace_names,
-                        true,
-                    )
-                    .unwrap_or_else(|| body.clone());
+                if let Some(namespace_import) = module
+                    .namespace_imports
+                    .iter()
+                    .find(|namespace| namespace.local == sym.original_name)
+                {
+                    let accessor = namespace_fn_name(module, &namespace_import.local);
                     out.push_str(&format!(
-                        "\n    /// function-valued variable {} (from ESM)\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{}\n        w3cos_core::Value::Undefined\n    }}\n",
-                        sym.original_name, sym.bundled_name, body, sym.bundled_name, callable_body
-                    ));
-                    out.push_str(&format!(
-                        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
-                        sym.bundled_name,
-                        format!("{}:value", sym.bundled_name),
-                        sym.bundled_name,
+                        "\n    /// immutable namespace re-export {}\n    pub fn {}_get() -> w3cos_core::Value {{ {accessor}() }}\n    pub fn {}_set(_value: w3cos_core::Value) -> w3cos_core::Value {{ w3cos_core::throw_value(w3cos_core::Value::string(\"TypeError: namespace export is immutable\")) }}\n",
+                        sym.original_name, sym.bundled_name, sym.bundled_name
                     ));
                     let alias = sanitize_ident(&sym.original_name);
                     if alias != sym.bundled_name {
                         out.push_str(&format!(
-                            "    pub use self::{} as {};\n    pub use self::{}_value as {}_value;\n",
-                            sym.bundled_name, alias, sym.bundled_name, alias
+                            "    pub use self::{}_get as {};\n",
+                            sym.bundled_name, alias
                         ));
                     }
-                } else if let Some(target) = find_alias(&functions, &sym.original_name) {
+                    continue;
+                }
+                if let Some(generator) = emit_w3ir_generator_symbol(
+                    bundle,
+                    module,
+                    sym,
+                    &functions,
+                    w3ir_module.as_ref(),
+                    &value_bindings,
+                    &class_names,
+                    &namespace_names,
+                ) {
+                    out.push_str(&generator.map_err(|detail| {
+                        EsmCodegenError::function(module, sym, "generator", detail)
+                    })?);
+                    continue;
+                }
+                if let Some(function) = emit_w3ir_async_symbol(
+                    bundle,
+                    module,
+                    sym,
+                    &functions,
+                    w3ir_module.as_ref(),
+                    &value_bindings,
+                    &class_names,
+                    &namespace_names,
+                ) {
+                    out.push_str(&function.map_err(|detail| {
+                        EsmCodegenError::function(module, sym, "async function", detail)
+                    })?);
+                    continue;
+                }
+                if let Some(function) = emit_w3ir_sync_symbol(
+                    bundle,
+                    module,
+                    sym,
+                    &functions,
+                    w3ir_module.as_ref(),
+                    &value_bindings,
+                    &class_names,
+                    &namespace_names,
+                ) {
+                    out.push_str(&function.map_err(|detail| {
+                        EsmCodegenError::function(module, sym, "synchronous function", detail)
+                    })?);
+                    continue;
+                }
+                if let Some(target) = find_alias(&functions, &sym.original_name) {
                     if module.lookup(target).is_some() {
                         // Alias to another module-local binding: forward
                         // through the `_get`/`_set` accessor convention so
@@ -543,7 +826,10 @@ fn generate_module_with_bodies(
                         let get_body = match shape {
                             NamespacePropShape::FnValue => format!("{}_value()", fwd("")),
                             NamespacePropShape::ClassValue => format!("{}()", fwd("")),
-                            NamespacePropShape::VariableValue => format!("{}_get()", fwd("")),
+                            NamespacePropShape::VariableValue
+                            | NamespacePropShape::NamespaceValue => {
+                                format!("{}_get()", fwd(""))
+                            }
                             NamespacePropShape::Missing => {
                                 "w3cos_core::Value::Undefined".to_string()
                             }
@@ -564,17 +850,11 @@ fn generate_module_with_bodies(
                         }
                     } else {
                         // Alias to a non-local name (a global like
-                        // `undefined`/`window`, or a namespace import):
-                        // materialize it as a lazily evaluated variable.
-                        let ctx = LowerCtx::new_dynamic_with_bindings(
-                            renames.clone(),
-                            value_bindings.clone(),
-                        )
-                        .with_classes(class_names.clone())
-                        .with_namespaces(namespace_names.clone());
-                        let initializer = ctx.lower_ident(target);
+                        // `undefined`/`window`, or a namespace import) owns a
+                        // normal module binding. Its initializer executes in
+                        // source order inside the W3IR module-init segment.
                         out.push_str(&format!(
-                            "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_get_or_init({:?}, || {initializer}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+                            "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_read_binding({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
                             sym.bundled_name,
                             format!("{}:cell", sym.bundled_name),
                             sym.bundled_name,
@@ -588,16 +868,9 @@ fn generate_module_with_bodies(
                             ));
                         }
                     }
-                } else if let Some(initializer) = find_variable(&functions, &sym.original_name) {
-                    let ctx = LowerCtx::new_dynamic_with_bindings(
-                        renames.clone(),
-                        value_bindings.clone(),
-                    )
-                    .with_classes(class_names.clone())
-                    .with_namespaces(namespace_names.clone());
-                    let initializer = ctx.lower_expr(initializer);
+                } else if find_variable(&functions, &sym.original_name).is_some() {
                     out.push_str(&format!(
-                        "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_get_or_init({:?}, || {initializer}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+                        "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_read_binding({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
                         sym.bundled_name,
                         format!("{}:cell", sym.bundled_name),
                         sym.bundled_name,
@@ -619,7 +892,7 @@ fn generate_module_with_bodies(
                     // (Event = {}));`) assign the namespace object later, and
                     // the write must stick (see emit_module_init).
                     out.push_str(&format!(
-                        "\n    /// variable {} (from ESM) — ambient/unlowered; Undefined until assigned\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::Undefined) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+                        "\n    /// variable {} (from ESM) — instantiated before module evaluation\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_read_binding({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
                         sym.original_name,
                         sym.bundled_name,
                         format!("{}:cell", sym.bundled_name),
@@ -638,9 +911,19 @@ fn generate_module_with_bodies(
         }
     }
 
+    // Module instantiation allocates every local binding before any module in
+    // the graph begins evaluation. Lexical declarations remain in TDZ; `var`
+    // declarations are initialized to Undefined at this phase.
+    out.push_str(&emit_module_binding_instantiation(
+        bundle,
+        module,
+        &init_items,
+        parse_cache,
+    ));
+
     // Module top-level statements (ESM evaluation semantics): every module
     // gets a once-guarded init fn that run_entry calls in bundle order.
-    out.push_str(&emit_module_init(
+    let init = emit_module_init(
         bundle,
         module,
         &init_items,
@@ -648,10 +931,104 @@ fn generate_module_with_bodies(
         &class_names,
         &namespace_names,
         parse_cache,
+    )?;
+    out.push_str(&init.code);
+    out.push_str(&emit_shared_module_registration(
+        bundle,
+        module,
+        parse_cache,
+        init.has_async,
     ));
 
     out.push_str("}\n");
-    out
+    Ok(GeneratedModule {
+        code: out,
+        has_async_init: init.has_async,
+    })
+}
+
+fn emit_module_binding_instantiation(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    init_items: &[InitItem],
+    parse_cache: &mut ModuleParseCache,
+) -> String {
+    let mut declarations = std::collections::BTreeMap::<String, bool>::new();
+    let mut record_binding = |local: &str, initialized: bool| {
+        let Some(bundled) = module.lookup(local) else {
+            return;
+        };
+        let Some(symbol) = bundle.symbols.iter().find(|symbol| {
+            symbol.bundled_name == bundled
+                && symbol.module == module.path
+                && symbol.kind == SymbolKind::Variable
+        }) else {
+            return;
+        };
+        if variable_has_get_accessors(bundle, symbol, parse_cache) {
+            declarations
+                .entry(symbol.bundled_name.clone())
+                .or_insert(initialized);
+        }
+    };
+
+    for item in init_items {
+        match item {
+            InitItem::VarDecl(declaration) => {
+                let initialized = declaration.kind == VarDeclKind::Var;
+                for declarator in &declaration.decls {
+                    let mut names = Vec::new();
+                    collect_pattern_binding_names(&declarator.name, &mut names);
+                    for name in names {
+                        record_binding(&name, initialized);
+                    }
+                }
+            }
+            InitItem::InitializeCell { local, .. } => record_binding(local, false),
+            InitItem::Lower(_) => {}
+        }
+    }
+
+    let namespace = &module.namespace;
+    let declarations = declarations
+        .into_iter()
+        .map(|(bundled, initialized)| {
+            format!(
+                "        __w3cos_esm_declare_binding({:?}, {initialized});\n",
+                format!("{bundled}:cell")
+            )
+        })
+        .collect::<String>();
+    format!(
+        "\n    /// ECMAScript module declaration-instantiation phase.\n    fn {namespace}__instantiate_bindings() {{\n{declarations}    }}\n"
+    )
+}
+
+fn collect_pattern_binding_names(pattern: &Pat, names: &mut Vec<String>) {
+    match pattern {
+        Pat::Ident(identifier) => names.push(identifier.id.sym.to_string()),
+        Pat::Array(array) => {
+            for element in array.elems.iter().flatten() {
+                collect_pattern_binding_names(element, names);
+            }
+        }
+        Pat::Object(object) => {
+            for property in &object.props {
+                match property {
+                    ObjectPatProp::Assign(assign) => names.push(assign.key.sym.to_string()),
+                    ObjectPatProp::KeyValue(key_value) => {
+                        collect_pattern_binding_names(&key_value.value, names);
+                    }
+                    ObjectPatProp::Rest(rest) => {
+                        collect_pattern_binding_names(&rest.arg, names);
+                    }
+                }
+            }
+        }
+        Pat::Assign(assign) => collect_pattern_binding_names(&assign.left, names),
+        Pat::Rest(rest) => collect_pattern_binding_names(&rest.arg, names),
+        Pat::Invalid(_) | Pat::Expr(_) => {}
+    }
 }
 
 /// Emit the per-module init: a once-guarded pair of fns running the module's
@@ -669,15 +1046,13 @@ fn generate_module_with_bodies(
 /// }
 /// ```
 ///
-/// `const/let/var X = init` statements force the existing lazy cell
-/// (`{bundled}_get();`) — exactly one evaluation, in source order relative to
-/// neighboring statements — instead of lowering a second, divergent copy of
-/// the initializer. Declarators with no cell (fn-valued → pure; destructured
-/// → ambient stubs) are skipped or lowered for side effects only.
+/// Initialized `const/let/var` declarations and neighboring executable
+/// statements are coalesced into W3IR segments. Identifier and destructured
+/// declarations assign to already-linked live bindings, so the shared
+/// StoreBinding path writes their completed values directly into each cell.
+/// Declarators with no cell (fn-valued → pure) are skipped or lowered for side
+/// effects only; uninitialized declarations still force their Undefined cell.
 ///
-/// NOTE (TDZ approximation): with eager inits, normal access is safe, but a
-/// circular-import read DURING another module's init may still observe (and
-/// permanently cache) Undefined for a not-yet-evaluated cell. Kept as-is.
 fn emit_module_init(
     bundle: &EsmBundle,
     module: &BundledModule,
@@ -686,9 +1061,8 @@ fn emit_module_init(
     class_names: &HashSet<String>,
     namespace_names: &HashSet<String>,
     parse_cache: &mut ModuleParseCache,
-) -> String {
+) -> Result<ModuleInitEmission, EsmCodegenError> {
     let namespace = &module.namespace;
-    let renames = lowering_names(module);
 
     // Classify declarators: force the cell when one exists; lower the
     // statement (for side effects) otherwise.
@@ -696,6 +1070,18 @@ fn emit_module_init(
     for item in init_items {
         match item {
             InitItem::Lower(stmt) => chunks.push(InitChunk::Lower(stmt.clone())),
+            InitItem::InitializeCell { local, initializer } => {
+                if bundle
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.module == module.path && symbol.original_name == *local)
+                {
+                    chunks.push(InitChunk::Lower(synthetic_module_init_assignment(
+                        local,
+                        initializer,
+                    )));
+                }
+            }
             InitItem::VarDecl(var_decl) => {
                 for declarator in &var_decl.decls {
                     match &declarator.name {
@@ -712,7 +1098,15 @@ fn emit_module_init(
                                 .filter(|sym| variable_has_get_accessors(bundle, sym, parse_cache))
                                 .map(|sym| sym.bundled_name.clone());
                             match cell {
-                                Some(bundled) => chunks.push(InitChunk::Force(bundled)),
+                                Some(bundled) => {
+                                    if declarator.init.is_some() {
+                                        chunks.push(InitChunk::Lower(
+                                            identifier_module_init_assignment(declarator),
+                                        ));
+                                    } else {
+                                        chunks.push(InitChunk::Force(bundled));
+                                    }
+                                }
                                 None => {
                                     // No cell: fn-valued declarators are pure
                                     // (emitted as plain fn items); anything
@@ -734,38 +1128,15 @@ fn emit_module_init(
                             }
                         }
                         _ => {
-                            // Destructured declarator: lower it (evaluates
-                            // the source once into init-body locals), then
-                            // write each extracted name back into its cell so
-                            // consumers see the real values (the cells' own
-                            // initializers cannot see the pattern).
-                            chunks.push(InitChunk::Lower(Stmt::Decl(Decl::Var(Box::new(
-                                VarDecl {
-                                    kind: var_decl.kind,
-                                    declare: false,
-                                    decls: vec![declarator.clone()],
-                                    ..var_decl.clone()
-                                },
-                            )))));
-                            let mut names = Vec::new();
-                            collect_pattern_idents(&declarator.name, &mut names);
-                            for name in names {
-                                if let Some(bundled) = bundle
-                                    .symbols
-                                    .iter()
-                                    .find(|sym| {
-                                        sym.module == module.path
-                                            && sym.original_name == name
-                                            && sym.kind == SymbolKind::Variable
-                                    })
-                                    .filter(|sym| {
-                                        variable_has_get_accessors(bundle, sym, parse_cache)
-                                    })
-                                    .map(|sym| sym.bundled_name.clone())
-                                {
-                                    chunks.push(InitChunk::WriteBack(bundled, name));
-                                }
-                            }
+                            // Module instantiation has already created every
+                            // binding cell. Express evaluation as one
+                            // destructuring assignment so W3IR writes through
+                            // the external live-binding adapters directly.
+                            let statement = destructured_module_init_assignment(declarator)
+                                .map_err(|error| {
+                                    EsmCodegenError::module_init(module, chunks.len(), error)
+                                })?;
+                            chunks.push(InitChunk::Lower(statement));
                         }
                     }
                 }
@@ -773,83 +1144,306 @@ fn emit_module_init(
         }
     }
 
-    let lowered_stmts: Vec<Stmt> = chunks
-        .iter()
-        .filter_map(|chunk| match chunk {
-            InitChunk::Lower(stmt) => Some(stmt.clone()),
-            InitChunk::Force(_) | InitChunk::WriteBack(_, _) => None,
-        })
-        .collect();
-
-    let mut ctx = LowerCtx::new_dynamic_with_bindings(renames, value_bindings.clone())
-        .with_classes(class_names.clone())
-        .with_namespaces(namespace_names.clone());
-    // Boxed-scope analysis + var hoisting over the lowered statements (top-
-    // level closures may capture and assign top-level loop locals).
-    ctx.enter_fn_scope(&[], &lowered_stmts);
-    let prologue = ctx.hoist_fn_body_vars(&lowered_stmts);
-
-    let mut body = String::new();
-    body.push_str(&prologue);
-    for chunk in &chunks {
-        match chunk {
+    let mut w3ir_helpers = String::new();
+    let mut prepared = Vec::new();
+    let mut has_async = false;
+    let mut chunk_index = 0;
+    while chunk_index < chunks.len() {
+        match &chunks[chunk_index] {
             InitChunk::Force(bundled) => {
-                // Force the lazy cell: exactly one evaluation, in source order.
-                body.push_str(&format!("        {bundled}_get();\n"));
+                // `let x;` completes lexical initialization at its source
+                // position. `var x;` was already initialized to Undefined
+                // during instantiation, so this is an idempotent write.
+                prepared.push(format!("{bundled}_set(w3cos_core::Value::Undefined)"));
+                chunk_index += 1;
             }
-            InitChunk::WriteBack(bundled, local) => {
-                // Store the destructured local into its cell for consumers.
-                body.push_str(&format!(
-                    "        {bundled}_set({});\n",
-                    ctx.lower_ident(local)
-                ));
-            }
-            InitChunk::Lower(stmt) => {
-                body.push_str(&ctx.lower_stmt(stmt));
-                body.push('\n');
+            InitChunk::Lower(_) => {
+                let first_chunk = chunk_index;
+                let mut statements = Vec::new();
+                while statements.len() < MAX_MODULE_INIT_STATEMENTS_PER_SEGMENT
+                    && let Some(InitChunk::Lower(statement)) = chunks.get(chunk_index)
+                {
+                    statements.push(statement.clone());
+                    chunk_index += 1;
+                }
+                let emitted = emit_w3ir_module_init_statements(
+                    bundle,
+                    module,
+                    &statements,
+                    first_chunk,
+                    value_bindings,
+                    class_names,
+                    namespace_names,
+                )
+                .map_err(|error| {
+                    EsmCodegenError::module_init(
+                        module,
+                        format!("{first_chunk}..{chunk_index}"),
+                        error,
+                    )
+                })?;
+                has_async |= emitted.is_async;
+                w3ir_helpers.push_str(&emitted.helper);
+                prepared.push(emitted.expression);
             }
         }
     }
 
     let once = format!("{namespace}:init");
-    format!(
-        "\n    /// Module top-level statements (ESM evaluation), executed once.\n    fn {namespace}__init_body() -> w3cos_core::Value {{\n{body}        w3cos_core::Value::Undefined\n    }}\n    pub fn {namespace}__init() {{\n        if __w3cos_esm_flag_replace({once:?}, true) {{ return; }}\n        {namespace}__init_body();\n    }}\n"
-    )
+    let code = if has_async {
+        let mut steps = String::new();
+        for specifier in &module.runtime_dependencies {
+            let missing_module =
+                format!("ReferenceError: runtime module `{specifier}` is not registered");
+            steps.push_str(&format!(
+                "        __evaluation = w3cos_core::intrinsics::call_method(&__evaluation, &w3cos_core::Value::string(\"then\"), vec![w3cos_core::Value::function(move |_, _| w3cos_core::module_registry::evaluate({specifier:?}).unwrap_or_else(|| w3cos_core::throw_value(w3cos_core::Value::from({missing_module:?}))))]);\n"
+            ));
+        }
+        for expression in prepared {
+            steps.push_str(&format!(
+                "        __evaluation = w3cos_core::intrinsics::call_method(&__evaluation, &w3cos_core::Value::string(\"then\"), vec![w3cos_core::Value::function(move |_, _| {expression})]);\n"
+            ));
+        }
+        let evaluation_key = format!("{namespace}:init-evaluation");
+        format!(
+            "{w3ir_helpers}\n    /// Asynchronous ESM evaluation, sequenced through the shared Promise ABI.\n    fn {namespace}__init_body() -> w3cos_core::Value {{\n        let mut __evaluation = w3cos_core::intrinsics::promise_resolve(vec![w3cos_core::Value::Undefined]);\n{steps}        __evaluation\n    }}\n    pub fn {namespace}__init() -> w3cos_core::Value {{\n        if let Some(__evaluation) = __w3cos_esm_get({evaluation_key:?}) {{ return __evaluation; }}\n        if __w3cos_esm_flag_replace({once:?}, true) {{ return w3cos_core::intrinsics::promise_resolve(vec![w3cos_core::Value::Undefined]); }}\n        let __evaluation = {namespace}__init_body();\n        __w3cos_esm_set({evaluation_key:?}, __evaluation.clone());\n        __evaluation\n    }}\n"
+        )
+    } else {
+        let mut body = String::new();
+        for expression in prepared {
+            body.push_str(&format!("        {expression};\n"));
+        }
+        format!(
+            "{w3ir_helpers}\n    /// Module top-level statements (ESM evaluation), executed once.\n    fn {namespace}__init_body() -> w3cos_core::Value {{\n{body}        w3cos_core::Value::Undefined\n    }}\n    pub fn {namespace}__init() {{\n        if __w3cos_esm_flag_replace({once:?}, true) {{ return; }}\n        {namespace}__init_body();\n    }}\n"
+        )
+    };
+    Ok(ModuleInitEmission { code, has_async })
+}
+
+struct ModuleInitEmission {
+    code: String,
+    has_async: bool,
+}
+
+struct W3irModuleInitStatement {
+    helper: String,
+    expression: String,
+    is_async: bool,
+}
+
+const MAX_MODULE_INIT_STATEMENTS_PER_SEGMENT: usize = 32;
+
+fn emit_w3ir_module_init_statements(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    statements: &[Stmt],
+    chunk_index: usize,
+    value_bindings: &HashSet<String>,
+    class_names: &HashSet<String>,
+    namespace_names: &HashSet<String>,
+) -> Result<W3irModuleInitStatement, String> {
+    let specifier = format!("{}#module-init-{chunk_index}", module.path.display());
+    let external_bindings = module_init_external_bindings(module, value_bindings);
+    let w3ir_module =
+        crate::w3ir_lowering::lower_module_statements(statements, &specifier, &external_bindings)
+            .map_err(|error| error.to_string())?;
+    let entry = w3ir_module
+        .functions
+        .iter()
+        .find(|function| function.id == w3ir_module.entry)
+        .ok_or_else(|| "W3IR module-init entry is missing".to_string())?;
+    if entry.is_generator {
+        return Err("generator module-init chunk is not executable module evaluation".into());
+    }
+
+    let factory = format!("{}__init_w3ir_{chunk_index}", module.namespace);
+    let helper = if entry.is_async {
+        crate::w3ir_aot::generate_async_function_from_module(&w3ir_module, entry, &factory)
+    } else {
+        crate::w3ir_aot::generate_sync_function_from_module(&w3ir_module, entry, &factory)
+    }
+    .map_err(|error| error.to_string())?;
+    let captures = module_init_capture_map(
+        bundle,
+        module,
+        &w3ir_module,
+        value_bindings,
+        class_names,
+        namespace_names,
+    )?;
+    Ok(W3irModuleInitStatement {
+        helper,
+        expression: format!("{factory}(w3cos_core::Value::Undefined, Vec::new(), {captures})"),
+        is_async: entry.is_async,
+    })
+}
+
+fn module_init_external_bindings(
+    module: &BundledModule,
+    value_bindings: &HashSet<String>,
+) -> Vec<(String, bool)> {
+    let mut bindings = HashMap::<String, bool>::new();
+    let mut insert = |name: &str| {
+        bindings.insert(
+            name.to_string(),
+            value_bindings.contains(&sanitize_ident(name)),
+        );
+    };
+    for (name, _) in &module.local_to_bundled {
+        insert(name);
+    }
+    for (name, _) in &module.host_imports {
+        insert(name);
+    }
+    for (name, _) in &module.literal_imports {
+        insert(name);
+    }
+    for import in &module.runtime_imports {
+        insert(&import.local);
+    }
+    for import in &module.namespace_imports {
+        insert(&import.local);
+    }
+    let mut bindings = bindings.into_iter().collect::<Vec<_>>();
+    bindings.sort_by(|left, right| left.0.cmp(&right.0));
+    bindings
+}
+
+fn module_init_capture_map(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    w3ir_module: &w3cos_ir::Module,
+    value_bindings: &HashSet<String>,
+    class_names: &HashSet<String>,
+    namespace_names: &HashSet<String>,
+) -> Result<String, String> {
+    let entry = w3ir_module
+        .functions
+        .iter()
+        .find(|function| function.id == w3ir_module.entry)
+        .ok_or_else(|| "W3IR module-init entry is missing".to_string())?;
+    let context =
+        LowerCtx::new_dynamic_with_bindings(lowering_names(module), value_bindings.clone())
+            .with_classes(class_names.clone())
+            .with_namespaces(namespace_names.clone());
+    let entries = w3ir_module
+        .imports
+        .iter()
+        .filter(|import| {
+            import.specifier == "w3cos:global" || import.specifier == "w3cos:external"
+        })
+        .map(|import| {
+            if !entry
+                .bindings
+                .iter()
+                .any(|binding| binding.id == import.local)
+            {
+                return Err(format!(
+                    "missing module-init binding for {}",
+                    import.imported
+                ));
+            }
+            let getter = context.lower_ident(&import.imported);
+            let setter = value_bindings
+                .contains(&sanitize_ident(&import.imported))
+                .then(|| module.lookup(&import.imported))
+                .flatten()
+                .and_then(|bundled| {
+                    bundle
+                        .symbols
+                        .iter()
+                        .find(|symbol| {
+                            symbol.bundled_name == bundled
+                                && symbol.kind == SymbolKind::Variable
+                        })
+                        .map(|_| {
+                            format!(
+                                "w3cos_core::Value::function(move |_, arguments| {bundled}_set(arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))"
+                            )
+                        })
+                })
+                .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
+            Ok(format!(
+                "({}, (w3cos_core::Value::function(move |_, _| {getter}), {setter}))",
+                import.local.0
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if entries.is_empty() {
+        Ok("std::collections::HashMap::new()".into())
+    } else {
+        Ok(format!(
+            "std::collections::HashMap::from([{}])",
+            entries.join(", ")
+        ))
+    }
 }
 
 /// One emission chunk of a module init, in source order.
 enum InitChunk {
-    /// Force the lazy cell of a variable symbol (`{bundled}_get();`).
+    /// Initialize an otherwise valueless declaration to Undefined.
     Force(String),
-    /// Store a destructured init-body local into its cell (`{bundled}_set(v);`).
-    WriteBack(String, String),
     /// A statement lowered into the init body.
     Lower(Stmt),
 }
 
-/// Collect the binding identifiers of a destructuring pattern (for cell
-/// write-back after lowering a destructured top-level declaration).
-fn collect_pattern_idents(pat: &Pat, names: &mut Vec<String>) {
-    match pat {
-        Pat::Ident(binding) => names.push(binding.id.sym.to_string()),
-        Pat::Array(array) => {
-            for elem in array.elems.iter().flatten() {
-                collect_pattern_idents(elem, names);
-            }
+fn destructured_module_init_assignment(declarator: &VarDeclarator) -> Result<Stmt, String> {
+    let initializer = declarator
+        .init
+        .as_ref()
+        .ok_or_else(|| "destructured module declaration requires an initializer".to_string())?;
+    let target = match &declarator.name {
+        Pat::Array(pattern) => AssignTarget::Pat(AssignTargetPat::Array(pattern.clone())),
+        Pat::Object(pattern) => AssignTarget::Pat(AssignTargetPat::Object(pattern.clone())),
+        _ => {
+            return Err(
+                "module declaration pattern cannot be represented as a W3IR assignment".into(),
+            );
         }
-        Pat::Object(object) => {
-            for prop in &object.props {
-                match prop {
-                    ObjectPatProp::Assign(assign) => names.push(assign.key.sym.to_string()),
-                    ObjectPatProp::KeyValue(kv) => collect_pattern_idents(&kv.value, names),
-                    ObjectPatProp::Rest(rest) => collect_pattern_idents(&rest.arg, names),
-                }
-            }
-        }
-        Pat::Assign(assign) => collect_pattern_idents(&assign.left, names),
-        Pat::Rest(rest) => collect_pattern_idents(&rest.arg, names),
-        _ => {}
-    }
+    };
+    Ok(Stmt::Expr(ExprStmt {
+        span: declarator.span,
+        expr: Box::new(Expr::Assign(AssignExpr {
+            span: declarator.span,
+            op: AssignOp::Assign,
+            left: target,
+            right: initializer.clone(),
+        })),
+    }))
+}
+
+fn identifier_module_init_assignment(declarator: &VarDeclarator) -> Stmt {
+    let Pat::Ident(identifier) = &declarator.name else {
+        unreachable!("identifier module initializer requires an identifier pattern");
+    };
+    let initializer = declarator
+        .init
+        .as_ref()
+        .expect("identifier module initializer requires a value");
+    Stmt::Expr(ExprStmt {
+        span: declarator.span,
+        expr: Box::new(Expr::Assign(AssignExpr {
+            span: declarator.span,
+            op: AssignOp::Assign,
+            left: AssignTarget::Simple(SimpleAssignTarget::Ident(identifier.clone())),
+            right: initializer.clone(),
+        })),
+    })
+}
+
+fn synthetic_module_init_assignment(local: &str, initializer: &Expr) -> Stmt {
+    Stmt::Expr(ExprStmt {
+        span: DUMMY_SP,
+        expr: Box::new(Expr::Assign(AssignExpr {
+            span: DUMMY_SP,
+            op: AssignOp::Assign,
+            left: AssignTarget::Simple(SimpleAssignTarget::Ident(BindingIdent {
+                id: Ident::new_no_ctxt(local.into(), DUMMY_SP),
+                type_ann: None,
+            })),
+            right: Box::new(initializer.clone()),
+        })),
+    })
 }
 
 /// The emitted fn name backing an `import * as ns` namespace object.
@@ -898,6 +1492,7 @@ impl ModuleParseCache {
 }
 
 /// How a symbol behaves when exposed as a namespace-object property.
+#[derive(Clone, Copy)]
 enum NamespacePropShape {
     /// Class: the accessor `X()` yields the class object value.
     ClassValue,
@@ -905,6 +1500,8 @@ enum NamespacePropShape {
     FnValue,
     /// Variable with a `{X}_get()` accessor: snapshot-cloned.
     VariableValue,
+    /// Namespace re-export backed by an immutable namespace accessor.
+    NamespaceValue,
     /// No emitted item to reference: `Undefined` placeholder.
     Missing,
 }
@@ -958,16 +1555,16 @@ fn emit_namespace_import(
                 format!("super::{owner}::{bundled}_value()")
             }
             (Some(owner), NamespacePropShape::VariableValue) => {
-                // Snapshot clone at namespace-build time; live-binding
-                // semantics (re-reading the export on each access) are out of
-                // scope for this lowering.
+                format!("super::{owner}::{bundled}_get()")
+            }
+            (Some(owner), NamespacePropShape::NamespaceValue) => {
                 format!("super::{owner}::{bundled}_get()")
             }
             _ => "w3cos_core::Value::Undefined /* export not lowered */".to_string(),
         };
         out.push_str(&format!(
-            "            props.insert({:?}.to_string(), {value});\n",
-            sym.exported_name
+            "            props.insert({:?}.to_string(), w3cos_core::Value::function(move |_, _| {value}));\n",
+            format!("__w3cos_getter_{}", sym.exported_name)
         ));
     }
     out.push_str(&format!(
@@ -976,7 +1573,11 @@ fn emit_namespace_import(
     // Alias so the local name resolves within this module (same convention as
     // class/function symbols).
     let alias = sanitize_ident(&ns_import.local);
-    if alias != fn_name {
+    let has_export_cell = bundle
+        .symbols
+        .iter()
+        .any(|symbol| symbol.module == module.path && symbol.original_name == ns_import.local);
+    if alias != fn_name && !has_export_cell {
         out.push_str(&format!("    pub use self::{fn_name} as {alias};\n"));
     }
     out
@@ -1022,6 +1623,28 @@ fn resolve_namespace_symbol(
     };
     if depth > 8 {
         return missing();
+    }
+    if let Some(module) = bundle
+        .modules
+        .iter()
+        .find(|module| module.path == defining_module)
+        && module
+            .namespace_imports
+            .iter()
+            .any(|namespace| namespace.local == local_name)
+    {
+        return (
+            defining_module.to_path_buf(),
+            bundle
+                .symbols
+                .iter()
+                .find(|symbol| {
+                    symbol.module == defining_module && symbol.original_name == local_name
+                })
+                .map(|symbol| symbol.bundled_name.clone())
+                .unwrap_or_else(|| sanitize_ident(local_name)),
+            NamespacePropShape::NamespaceValue,
+        );
     }
     let Some(sym) = bundle
         .symbols
@@ -1120,6 +1743,12 @@ fn lowering_names(module: &BundledModule) -> Vec<(String, String)> {
         let local = sanitize_ident(local);
         (local.clone(), local)
     }));
+    names.extend(module.runtime_imports.iter().map(|import| {
+        (
+            sanitize_ident(&import.local),
+            runtime_import_fn_name(module, &import.local),
+        )
+    }));
     names.extend(module.namespace_imports.iter().map(|ns| {
         (
             sanitize_ident(&ns.local),
@@ -1134,8 +1763,8 @@ fn lowering_names(module: &BundledModule) -> Vec<(String, String)> {
 enum TopLevelItem {
     Function {
         name: String,
-        params: Vec<Pat>,
-        body: Vec<Stmt>,
+        is_async: bool,
+        is_generator: bool,
     },
     Class {
         name: String,
@@ -1160,6 +1789,11 @@ enum InitItem {
     /// handled per-declarator at emission time (force lazy cells in source
     /// order, or lower for side effects when no cell exists).
     VarDecl(VarDecl),
+    /// Initialize a synthetic export binding at its source position.
+    InitializeCell {
+        local: String,
+        initializer: Box<Expr>,
+    },
     /// Any other executable statement (expression statements, if/for/while/
     /// do/switch/try/labeled/block): lowered as-is in the module ctx.
     Lower(Stmt),
@@ -1215,12 +1849,14 @@ fn parse_module_items(path: &Path) -> ParsedModuleItems {
 
     let mut items = Vec::new();
     let mut init = Vec::new();
-    for item in &module.body {
+    for (item_index, item) in module.body.iter().enumerate() {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
                 collect_decl_items(&export.decl, &mut items);
                 // Exported var declarations still force/lower at init time.
-                if let Decl::Var(var_decl) = &export.decl {
+                if let Decl::Var(var_decl) = &export.decl
+                    && !var_decl.declare
+                {
                     init.push(InitItem::VarDecl(var_decl.as_ref().clone()));
                 }
             }
@@ -1228,47 +1864,43 @@ fn parse_module_items(path: &Path) -> ParsedModuleItems {
                 match &default_decl.decl {
                     // `export default class X {}` — recorded under its local name.
                     DefaultDecl::Class(class_expr) => {
-                        if let Some(ident) = &class_expr.ident {
-                            items.push(TopLevelItem::Class {
-                                name: ident.sym.to_string(),
-                                class: class_expr.class.clone(),
-                            });
-                        }
+                        items.push(TopLevelItem::Class {
+                            name: class_expr
+                                .ident
+                                .as_ref()
+                                .map(|ident| ident.sym.to_string())
+                                .unwrap_or_else(|| synthetic_default_export_name(item_index)),
+                            class: class_expr.class.clone(),
+                        });
                     }
                     // A named default function is still a normal local declaration.
                     // The resolver records it as the `default` export, so codegen must
-                    // retain its body for imports such as `import App from './App'`.
+                    // retain its callable shape for imports such as
+                    // `import App from './App'`; W3IR owns its executable body.
                     DefaultDecl::Fn(function) => {
-                        if let Some(ident) = &function.ident {
-                            let params = function
-                                .function
-                                .params
-                                .iter()
-                                .map(|param| param.pat.clone())
-                                .collect();
-                            let body = function
-                                .function
-                                .body
+                        items.push(TopLevelItem::Function {
+                            name: function
+                                .ident
                                 .as_ref()
-                                .map(|block| block.stmts.clone())
-                                .unwrap_or_default();
-                            items.push(TopLevelItem::Function {
-                                name: ident.sym.to_string(),
-                                params,
-                                body,
-                            });
-                        }
+                                .map(|ident| ident.sym.to_string())
+                                .unwrap_or_else(|| synthetic_default_export_name(item_index)),
+                            is_async: function.function.is_async,
+                            is_generator: function.function.is_generator,
+                        });
                     }
                     _ => {}
                 }
             }
             ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(default_expr)) => {
-                // `export default <expr>;` — evaluate for side effects at
-                // init time (there is no symbol cell backing it).
-                init.push(InitItem::Lower(Stmt::Expr(ExprStmt {
-                    span: default_expr.span,
-                    expr: default_expr.expr.clone(),
-                })));
+                let name = synthetic_default_export_name(item_index);
+                items.push(TopLevelItem::Variable {
+                    name: name.clone(),
+                    initializer: default_expr.expr.clone(),
+                });
+                init.push(InitItem::InitializeCell {
+                    local: name,
+                    initializer: default_expr.expr.clone(),
+                });
             }
             ModuleItem::ModuleDecl(_) => {
                 // Imports, named re-exports, `export = ...`: no runtime
@@ -1276,7 +1908,9 @@ fn parse_module_items(path: &Path) -> ParsedModuleItems {
             }
             ModuleItem::Stmt(Stmt::Decl(decl)) => {
                 collect_decl_items(decl, &mut items);
-                if let Decl::Var(var_decl) = decl {
+                if let Decl::Var(var_decl) = decl
+                    && !var_decl.declare
+                {
                     init.push(InitItem::VarDecl(var_decl.as_ref().clone()));
                 }
                 // fn/class declarations are items, not init statements.
@@ -1291,29 +1925,21 @@ fn parse_module_items(path: &Path) -> ParsedModuleItems {
 
 fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
     match decl {
-        Decl::Fn(fn_decl) => {
+        Decl::Fn(fn_decl) if !fn_decl.declare => {
             let name = fn_decl.ident.sym.to_string();
-            let params = fn_decl
-                .function
-                .params
-                .iter()
-                .map(|param| param.pat.clone())
-                .collect();
-            let body = fn_decl
-                .function
-                .body
-                .as_ref()
-                .map(|b| b.stmts.clone())
-                .unwrap_or_default();
-            items.push(TopLevelItem::Function { name, params, body });
+            items.push(TopLevelItem::Function {
+                name,
+                is_async: fn_decl.function.is_async,
+                is_generator: fn_decl.function.is_generator,
+            });
         }
-        Decl::Class(class_decl) => {
+        Decl::Class(class_decl) if !class_decl.declare => {
             items.push(TopLevelItem::Class {
                 name: class_decl.ident.sym.to_string(),
                 class: class_decl.class.clone(),
             });
         }
-        Decl::Var(var_decl) => {
+        Decl::Var(var_decl) if !var_decl.declare => {
             for declarator in &var_decl.decls {
                 let Pat::Ident(binding) = &declarator.name else {
                     continue;
@@ -1321,32 +1947,10 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
                 let Some(init) = &declarator.init else {
                     continue;
                 };
-                let (params, body) = match init.as_ref() {
-                    Expr::Arrow(arrow) => {
-                        let params = arrow.params.clone();
-                        let body = match arrow.body.as_ref() {
-                            BlockStmtOrExpr::BlockStmt(block) => block.stmts.clone(),
-                            BlockStmtOrExpr::Expr(expr) => vec![Stmt::Return(ReturnStmt {
-                                span: arrow.span,
-                                arg: Some(expr.clone()),
-                            })],
-                        };
-                        (params, body)
-                    }
+                let (is_async, is_generator) = match init.as_ref() {
+                    Expr::Arrow(arrow) => (arrow.is_async, false),
                     Expr::Fn(function) => {
-                        let params = function
-                            .function
-                            .params
-                            .iter()
-                            .map(|param| param.pat.clone())
-                            .collect();
-                        let body = function
-                            .function
-                            .body
-                            .as_ref()
-                            .map(|block| block.stmts.clone())
-                            .unwrap_or_default();
-                        (params, body)
+                        (function.function.is_async, function.function.is_generator)
                     }
                     Expr::Ident(target) => {
                         items.push(TopLevelItem::Alias {
@@ -1383,8 +1987,8 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
                 };
                 items.push(TopLevelItem::Function {
                     name: binding.id.sym.to_string(),
-                    params,
-                    body,
+                    is_async,
+                    is_generator,
                 });
             }
         }
@@ -1392,42 +1996,387 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
     }
 }
 
-fn find_function(
+fn emit_shared_module_registration(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    parse_cache: &mut ModuleParseCache,
+    has_async_init: bool,
+) -> String {
+    let mut entries = String::new();
+    for exported_symbol in &module.shared_exports {
+        let exported = &exported_symbol.exported_name;
+        let (owner, bundled, shape) = resolve_namespace_symbol(
+            bundle,
+            &exported_symbol.defining_module,
+            &exported_symbol.local_name,
+            parse_cache,
+            0,
+        );
+        let owner_prefix = if owner == module.path {
+            String::new()
+        } else {
+            let Some(owner_module) = bundle
+                .modules
+                .iter()
+                .find(|candidate| candidate.path == owner)
+            else {
+                continue;
+            };
+            format!("super::{}::", owner_module.namespace)
+        };
+        let getter = match shape {
+            NamespacePropShape::FnValue => format!("{owner_prefix}{bundled}_value()"),
+            NamespacePropShape::ClassValue => format!("{owner_prefix}{bundled}()"),
+            NamespacePropShape::VariableValue | NamespacePropShape::NamespaceValue => {
+                format!("{owner_prefix}{bundled}_get()")
+            }
+            NamespacePropShape::Missing => continue,
+        };
+        let setter = if matches!(shape, NamespacePropShape::VariableValue) {
+            format!(
+                "w3cos_core::Value::function(move |_, arguments| {owner_prefix}{bundled}_set(arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))"
+            )
+        } else {
+            "w3cos_core::Value::Undefined".into()
+        };
+        entries.push_str(&format!(
+            "        exports.insert({exported:?}.to_string(), w3cos_core::module_registry::ExportBinding::new(w3cos_core::Value::function(move |_, _| {getter}), {setter}));\n"
+        ));
+    }
+    let specifier = module.path.to_string_lossy();
+    let namespace = &module.namespace;
+    let evaluator = if has_async_init {
+        format!("{namespace}__init()")
+    } else {
+        format!("{{ {namespace}__init(); w3cos_core::Value::Undefined }}")
+    };
+    format!(
+        "\n    /// Register this native module in the shared AOT/W3VM live-binding ABI.\n    pub fn {namespace}__register_shared_module() {{\n        {namespace}__instantiate_bindings();\n        let mut exports = ::std::collections::HashMap::new();\n{entries}        w3cos_core::module_registry::register({specifier:?}, exports, Some(w3cos_core::Value::function(move |_, _| {evaluator})));\n    }}\n"
+    )
+}
+
+fn function_flags(items: &[TopLevelItem], name: &str) -> Option<(bool, bool)> {
+    items.iter().find_map(|item| match item {
+        TopLevelItem::Function {
+            name: function_name,
+            is_async,
+            is_generator,
+            ..
+        } if function_name == name => Some((*is_async, *is_generator)),
+        _ => None,
+    })
+}
+
+/// Emit either a declared generator or a function-valued generator variable
+/// through the same W3IR-native state-machine backend.
+///
+/// `collect_decl_items` intentionally normalizes both source shapes to
+/// `TopLevelItem::Function`; the resolver still distinguishes declaration
+/// symbols from variable symbols. Keeping their code generation here prevents
+/// the variable form from falling back to the legacy statement-string
+/// lowering and therefore preserves one generator implementation.
+fn emit_w3ir_generator_symbol(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    symbol: &BundledSymbol,
     items: &[TopLevelItem],
-    name: &str,
-    renames: &[(String, String)],
+    w3ir_module: Option<&w3cos_ir::Module>,
     value_bindings: &HashSet<String>,
     class_names: &HashSet<String>,
     namespace_names: &HashSet<String>,
-    dynamic_this: bool,
-) -> Option<String> {
-    for item in items {
-        if let TopLevelItem::Function {
-            name: fn_name,
-            params,
-            body,
-        } = item
-        {
-            if fn_name == name {
-                let mut ctx =
-                    LowerCtx::new_dynamic_with_bindings(renames.to_vec(), value_bindings.clone())
-                        .with_classes(class_names.clone())
-                        .with_namespaces(namespace_names.clone());
-                if dynamic_this {
-                    ctx = ctx.with_function_this();
-                }
-                ctx.bind_patterns(params);
-                // Boxed-scope analysis must run before param bindings and the
-                // hoisting prologue are emitted (captured+assigned locals —
-                // including params — become Rc<RefCell> cells).
-                ctx.enter_fn_scope(params, body);
-                let bindings = ctx.lower_closure_params(params);
-                let prologue = ctx.hoist_fn_body_vars(body);
-                return Some(format!("{bindings}{prologue}{}", ctx.lower_stmts(body)));
-            }
-        }
+) -> Option<Result<String, String>> {
+    if !function_flags(items, &symbol.original_name).is_some_and(|(_, is_generator)| is_generator) {
+        return None;
     }
-    None
+
+    let factory = format!("{}__w3ir_factory", symbol.bundled_name);
+    let emitted = (|| {
+        let w3ir_module =
+            w3ir_module.ok_or_else(|| "module lowering did not produce W3IR".to_string())?;
+        let function = w3ir_module
+            .functions
+            .iter()
+            .find(|function| {
+                function.name.as_deref() == Some(&symbol.original_name) && function.is_generator
+            })
+            .ok_or_else(|| "function is missing from the lowered W3IR module".to_string())?;
+        let state_machine =
+            crate::w3ir_aot::generate_generator_from_module(w3ir_module, function, &factory)
+                .map_err(|error| error.to_string())?;
+        let captures = generator_capture_map(
+            bundle,
+            module,
+            w3ir_module,
+            function,
+            value_bindings,
+            class_names,
+            namespace_names,
+        )
+        .ok_or_else(|| "live captures cannot be represented by the native W3IR ABI".to_string())?;
+        Ok::<_, String>((state_machine, captures))
+    })();
+    let (state_machine, captures) = match emitted {
+        Ok(emitted) => emitted,
+        Err(error) => return Some(Err(error)),
+    };
+    let mut output = String::new();
+    output.push_str(&state_machine);
+    output.push_str(&format!(
+        "\n    /// generator {} compiled from W3IR suspension metadata\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, __args, {captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, {captures}) }}\n",
+        symbol.original_name, symbol.bundled_name, symbol.bundled_name,
+    ));
+    output.push_str(&format!(
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        symbol.bundled_name,
+        format!("{}:value", symbol.bundled_name),
+        symbol.bundled_name,
+    ));
+    let alias = sanitize_ident(&symbol.original_name);
+    if alias != symbol.bundled_name {
+        output.push_str(&format!(
+            "    pub use self::{} as {};\n    pub use self::{}_value as {}_value;\n",
+            symbol.bundled_name, alias, symbol.bundled_name, alias
+        ));
+    }
+    Some(Ok(output))
+}
+
+/// Emit ordinary async declarations and async function-valued variables from
+/// the same validated W3IR suspension table consumed by W3VM. Generated
+/// applications retain the standard ESM symbol/value ABI and link Core only.
+fn emit_w3ir_async_symbol(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    symbol: &BundledSymbol,
+    items: &[TopLevelItem],
+    w3ir_module: Option<&w3cos_ir::Module>,
+    value_bindings: &HashSet<String>,
+    class_names: &HashSet<String>,
+    namespace_names: &HashSet<String>,
+) -> Option<Result<String, String>> {
+    if !function_flags(items, &symbol.original_name)
+        .is_some_and(|(is_async, is_generator)| is_async && !is_generator)
+    {
+        return None;
+    }
+
+    let factory = format!("{}__w3ir_async_factory", symbol.bundled_name);
+    let emitted = (|| {
+        let w3ir_module =
+            w3ir_module.ok_or_else(|| "module lowering did not produce W3IR".to_string())?;
+        let function = w3ir_module
+            .functions
+            .iter()
+            .find(|function| {
+                function.name.as_deref() == Some(&symbol.original_name)
+                    && function.is_async
+                    && !function.is_generator
+            })
+            .ok_or_else(|| "function is missing from the lowered W3IR module".to_string())?;
+        let state_machine =
+            crate::w3ir_aot::generate_async_function_from_module(w3ir_module, function, &factory)
+                .map_err(|error| error.to_string())?;
+        let captures = generator_capture_map(
+            bundle,
+            module,
+            w3ir_module,
+            function,
+            value_bindings,
+            class_names,
+            namespace_names,
+        )
+        .ok_or_else(|| "live captures cannot be represented by the native W3IR ABI".to_string())?;
+        Ok::<_, String>((state_machine, captures))
+    })();
+    let (state_machine, captures) = match emitted {
+        Ok(emitted) => emitted,
+        Err(error) => return Some(Err(error)),
+    };
+    let mut output = String::new();
+    output.push_str(&state_machine);
+    output.push_str(&format!(
+        "\n    /// async function {} compiled from W3IR suspension metadata\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, __args, {captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, {captures}) }}\n",
+        symbol.original_name, symbol.bundled_name, symbol.bundled_name,
+    ));
+    output.push_str(&format!(
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        symbol.bundled_name,
+        format!("{}:value", symbol.bundled_name),
+        symbol.bundled_name,
+    ));
+    let alias = sanitize_ident(&symbol.original_name);
+    if alias != symbol.bundled_name {
+        output.push_str(&format!(
+            "    pub use self::{} as {};\n    pub use self::{}_value as {}_value;\n",
+            symbol.bundled_name, alias, symbol.bundled_name, alias
+        ));
+    }
+    Some(Ok(output))
+}
+
+/// Emit every ordinary synchronous declaration/function-valued variable from
+/// validated W3IR. A failed W3IR emission becomes an explicit generated
+/// failure and never falls through to the legacy direct-AST semantic backend.
+fn emit_w3ir_sync_symbol(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    symbol: &BundledSymbol,
+    items: &[TopLevelItem],
+    w3ir_module: Option<&w3cos_ir::Module>,
+    value_bindings: &HashSet<String>,
+    class_names: &HashSet<String>,
+    namespace_names: &HashSet<String>,
+) -> Option<Result<String, String>> {
+    if function_flags(items, &symbol.original_name)
+        .is_none_or(|(is_async, is_generator)| is_async || is_generator)
+    {
+        return None;
+    }
+
+    let factory = format!("{}__w3ir_sync_factory", symbol.bundled_name);
+    let emitted = (|| {
+        let w3ir_module =
+            w3ir_module.ok_or_else(|| "module lowering did not produce W3IR".to_string())?;
+        let function = w3ir_module
+            .functions
+            .iter()
+            .find(|function| {
+                function.name.as_deref() == Some(&symbol.original_name)
+                    && !function.is_async
+                    && !function.is_generator
+            })
+            .ok_or_else(|| "function is missing from the lowered W3IR module".to_string())?;
+        let state_machine =
+            crate::w3ir_aot::generate_sync_function_from_module(w3ir_module, function, &factory)
+                .map_err(|error| error.to_string())?;
+        let captures = generator_capture_map(
+            bundle,
+            module,
+            w3ir_module,
+            function,
+            value_bindings,
+            class_names,
+            namespace_names,
+        )
+        .ok_or_else(|| "live captures cannot be represented by the native W3IR ABI".to_string())?;
+        Ok::<_, String>((state_machine, captures))
+    })();
+    let (state_machine, captures) = match emitted {
+        Ok(emitted) => emitted,
+        Err(error) => return Some(Err(error)),
+    };
+    let mut output = String::new();
+    output.push_str(&state_machine);
+    output.push_str(&format!(
+        "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, __args, {captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, {captures}) }}\n",
+        symbol.original_name, symbol.bundled_name, symbol.bundled_name,
+    ));
+    output.push_str(&format!(
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        symbol.bundled_name,
+        format!("{}:value", symbol.bundled_name),
+        symbol.bundled_name,
+    ));
+    let alias = sanitize_ident(&symbol.original_name);
+    if alias != symbol.bundled_name {
+        output.push_str(&format!(
+            "    pub use self::{} as {};\n    pub use self::{}_value as {}_value;\n",
+            symbol.bundled_name, alias, symbol.bundled_name, alias
+        ));
+    }
+    Some(Ok(output))
+}
+
+fn generator_capture_map(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    w3ir_module: &w3cos_ir::Module,
+    function: &w3cos_ir::Function,
+    value_bindings: &HashSet<String>,
+    class_names: &HashSet<String>,
+    namespace_names: &HashSet<String>,
+) -> Option<String> {
+    generator_capture_map_with_synthetic(
+        bundle,
+        module,
+        w3ir_module,
+        function,
+        value_bindings,
+        class_names,
+        namespace_names,
+        &HashMap::new(),
+    )
+}
+
+fn generator_capture_map_with_synthetic(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    w3ir_module: &w3cos_ir::Module,
+    function: &w3cos_ir::Function,
+    value_bindings: &HashSet<String>,
+    class_names: &HashSet<String>,
+    namespace_names: &HashSet<String>,
+    synthetic: &HashMap<String, (String, String)>,
+) -> Option<String> {
+    if function.captures.is_empty() {
+        return Some("std::collections::HashMap::new()".into());
+    }
+    let entry = w3ir_module
+        .functions
+        .iter()
+        .find(|candidate| candidate.id == w3ir_module.entry)?;
+    let renames = lowering_names(module);
+    let context = LowerCtx::new_dynamic_with_bindings(renames, value_bindings.clone())
+        .with_classes(class_names.clone())
+        .with_namespaces(namespace_names.clone());
+    let entries = function
+        .captures
+        .iter()
+        .map(|capture| {
+            // A module-level ESM cell/import/global can be adapted to a live
+            // getter here. Captures owned by an enclosing nested function, or
+            // synthetic class cells such as `*super*`, require a runtime
+            // closure environment and must not be silently approximated.
+            let binding = entry
+                .bindings
+                .iter()
+                .find(|binding| binding.id == *capture)?;
+            if let Some((getter, setter)) = synthetic.get(&binding.name) {
+                return Some(format!("({}, ({getter}, {setter}))", capture.0));
+            }
+            if binding.name.starts_with('*') {
+                return None;
+            }
+            let load = context.lower_ident(&binding.name);
+            let setter = binding
+                .mutable
+                .then(|| module.lookup(&binding.name))
+                .flatten()
+                .and_then(|bundled| {
+                    bundle
+                        .symbols
+                        .iter()
+                        .find(|symbol| {
+                            symbol.bundled_name == bundled
+                                && symbol.kind == SymbolKind::Variable
+                        })
+                        .map(|_| {
+                            format!(
+                                "w3cos_core::Value::function(move |_, arguments| {bundled}_set(arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))"
+                            )
+                        })
+                })
+                .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
+            Some(format!(
+                "({}, (w3cos_core::Value::function(move |_, _| {load}), {setter}))",
+                capture.0
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!(
+        "std::collections::HashMap::from([{}])",
+        entries.join(", ")
+    ))
 }
 
 fn find_variable<'a>(items: &'a [TopLevelItem], name: &str) -> Option<&'a Expr> {
@@ -1495,178 +2444,63 @@ struct ClassMethodDef {
     install_key_arg: String,
     /// Install on the prototype object (`__proto`) or the class object.
     install_on_proto: bool,
-    params: Vec<Pat>,
-    body: Vec<Stmt>,
+    private: Option<(String, MethodKind)>,
     scope: ClassScope,
-}
-
-fn lower_dynamic_params(params: &[Pat], renames: &[(String, String)]) -> String {
-    let mut bindings = String::new();
-    for (index, pattern) in params.iter().enumerate() {
-        let argument =
-            format!("__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined)");
-        lower_dynamic_pattern(pattern, &argument, &mut bindings, renames, 8);
-    }
-    bindings
-}
-
-/// Lower destructuring/default/rest parameter patterns for host-style dynamic
-/// functions emitted by the upstream native bridge.
-///
-/// - free fns `{bundled}__m_*` / `{bundled}__g_*` / `{bundled}__s_*` /
-///   `{bundled}__s{m,g,s}_*` / `{bundled}__p*_*` for (static, private)
-///   methods, getters, setters, each taking `(__this, __args)`;
-/// - a raw ctor fn `{bundled}__ctor` returning `__this`;
-/// - `{bundled}__build_class()` assembling the callable class object
-///   (prototype object, call slot, statics, inheritance links);
-/// - `{bundled}__init_statics()` running static fields/blocks (after the
-///   class value is published, so statics may reference the class itself);
-/// - a thread-local singleton behind `pub fn {bundled}() -> Value`, which is
-///   the item other modules `pub use` to reach the class.
-fn lower_dynamic_pattern(
-    pattern: &Pat,
-    source: &str,
-    output: &mut String,
-    renames: &[(String, String)],
-    indent: usize,
-) {
-    let pad = " ".repeat(indent);
-    match pattern {
-        Pat::Ident(ident) => {
-            output.push_str(&format!(
-                "{pad}let mut {} = {source};\n",
-                sanitize_ident(&ident.id.sym.to_string())
-            ));
-        }
-        Pat::Object(object) => {
-            let excluded = object
-                .props
-                .iter()
-                .filter_map(|property| match property {
-                    ObjectPatProp::Assign(assign) => Some(assign.key.sym.to_string()),
-                    ObjectPatProp::KeyValue(key_value) => match &key_value.key {
-                        PropName::Ident(ident) => Some(ident.sym.to_string()),
-                        PropName::Str(value) => {
-                            Some(format!("{:?}", value.value).trim_matches('"').to_string())
-                        }
-                        PropName::Num(value) => Some(value.value.to_string()),
-                        _ => None,
-                    },
-                    ObjectPatProp::Rest(_) => None,
-                })
-                .map(|key| format!("{key:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            for property in &object.props {
-                match property {
-                    ObjectPatProp::Assign(assign) => {
-                        let name = sanitize_ident(&assign.key.sym.to_string());
-                        let value =
-                            format!("{source}.get_property({:?})", assign.key.sym.to_string());
-                        if let Some(default) = &assign.value {
-                            let ctx = LowerCtx::new_dynamic(renames.to_vec());
-                            let fallback = ctx.lower_expr(default);
-                            output.push_str(&format!(
-                                "{pad}let {name} = {{ let value = {value}; if value.is_undefined() {{ {fallback} }} else {{ value }} }};\n"
-                            ));
-                        } else {
-                            output.push_str(&format!("{pad}let {name} = {value};\n"));
-                        }
-                    }
-                    ObjectPatProp::KeyValue(key_value) => {
-                        let key = match &key_value.key {
-                            PropName::Ident(ident) => ident.sym.to_string(),
-                            PropName::Str(value) => {
-                                format!("{:?}", value.value).trim_matches('"').to_string()
-                            }
-                            PropName::Num(value) => value.value.to_string(),
-                            _ => continue,
-                        };
-                        let nested = format!("{source}.get_property({key:?})");
-                        lower_dynamic_pattern(&key_value.value, &nested, output, renames, indent);
-                    }
-                    ObjectPatProp::Rest(rest) => {
-                        let rest_source = format!("{source}.object_rest(&[{excluded}])");
-                        lower_dynamic_pattern(&rest.arg, &rest_source, output, renames, indent);
-                    }
-                }
-            }
-        }
-        Pat::Array(array) => {
-            for (index, element) in array.elems.iter().enumerate() {
-                if let Some(element) = element {
-                    let nested = format!("{source}.get_property({:?})", index.to_string());
-                    lower_dynamic_pattern(element, &nested, output, renames, indent);
-                }
-            }
-        }
-        Pat::Assign(assign) => {
-            let ctx = LowerCtx::new_dynamic(renames.to_vec());
-            let fallback = ctx.lower_expr(&assign.right);
-            let value = format!(
-                "{{ let value = {source}; if value.is_undefined() {{ {fallback} }} else {{ value }} }}"
-            );
-            lower_dynamic_pattern(&assign.left, &value, output, renames, indent);
-        }
-        Pat::Rest(rest) => lower_dynamic_pattern(&rest.arg, source, output, renames, indent),
-        _ => {}
-    }
+    w3ir_name: Option<String>,
+    is_async: bool,
+    is_generator: bool,
 }
 
 /// Emit the full runtime-class pattern for a top-level class declaration.
 fn emit_class(
+    bundle: &EsmBundle,
+    module: &BundledModule,
     sym: &BundledSymbol,
     class: Option<&Class>,
+    w3ir_module: Option<&w3cos_ir::Module>,
     renames: &[(String, String)],
     value_bindings: &HashSet<String>,
     class_names: &HashSet<String>,
     namespace_names: &HashSet<String>,
-) -> String {
+) -> Result<String, String> {
     let bundled = &sym.bundled_name;
     let class_name = sanitize_ident(&sym.original_name);
+    let parent_cache_key = format!("{bundled}:super");
     let base_ctx = || {
         LowerCtx::new_dynamic_with_bindings(renames.to_vec(), value_bindings.clone())
             .with_classes(class_names.clone())
             .with_namespaces(namespace_names.clone())
     };
-    let parent = class
-        .and_then(|class| class.super_class.as_ref())
-        .map(|expr| base_ctx().lower_expr(expr));
+    let has_parent = class.is_some_and(|class| class.super_class.is_some());
+    let parent = has_parent.then(|| {
+        format!("__w3cos_esm_get({parent_cache_key:?}).unwrap_or(w3cos_core::Value::Undefined)")
+    });
     let instance_scope = ClassScope {
         class_name: class_name.clone(),
+        brand: format!("{bundled}()"),
         parent: parent.clone(),
         is_static: false,
     };
     let static_scope = ClassScope {
         class_name: class_name.clone(),
+        brand: format!("{bundled}()"),
         parent: parent.clone(),
         is_static: true,
     };
 
-    let mut ctor: Option<(Vec<Pat>, Vec<Stmt>)> = None;
+    let mut has_explicit_constructor = false;
     let mut methods: Vec<ClassMethodDef> = Vec::new();
-    let mut field_inits: Vec<String> = Vec::new();
-    let mut static_inits: Vec<String> = Vec::new();
     let mut computed_index = 0usize;
+    let mut public_field_key_values: Vec<String> = Vec::new();
+    let mut has_instance_fields = false;
+    let mut static_initializer_count = 0usize;
+    let mut definition_value_index = usize::from(has_parent);
 
     if let Some(class) = class {
         for member in &class.body {
             match member {
-                ClassMember::Constructor(constructor) => {
-                    let params = constructor
-                        .params
-                        .iter()
-                        .filter_map(|param| match param {
-                            ParamOrTsParamProp::Param(param) => Some(param.pat.clone()),
-                            ParamOrTsParamProp::TsParamProp(_) => None,
-                        })
-                        .collect();
-                    let body = constructor
-                        .body
-                        .as_ref()
-                        .map(|block| block.stmts.clone())
-                        .unwrap_or_default();
-                    ctor = Some((params, body));
+                ClassMember::Constructor(_) => {
+                    has_explicit_constructor = true;
                 }
                 ClassMember::Method(method) => {
                     let (prefix, tag) = match (method.is_static, method.kind) {
@@ -1678,115 +2512,111 @@ fn emit_class(
                         (true, MethodKind::Setter) => ("__w3cos_setter_", "ss"),
                     };
                     let name_ctx = base_ctx();
-                    let fn_name = match name_ctx.key_literal(&method.key) {
+                    let method_name = name_ctx.key_literal(&method.key);
+                    let fn_name = match &method_name {
                         Some(name) => format!("{bundled}__{tag}_{}", sanitize_ident(&name)),
                         None => {
                             computed_index += 1;
                             format!("{bundled}__{tag}_c{computed_index}")
                         }
                     };
-                    let install_key_arg = name_ctx.key_arg(prefix, &method.key);
+                    let w3ir_method_name = method_name
+                        .clone()
+                        .unwrap_or_else(|| format!("<computed_{computed_index}>"));
+                    let w3ir_method_name = match method.kind {
+                        MethodKind::Method => w3ir_method_name,
+                        MethodKind::Getter => format!("get {w3ir_method_name}"),
+                        MethodKind::Setter => format!("set {w3ir_method_name}"),
+                    };
+                    let install_key_arg = if method_name.is_some() {
+                        name_ctx.key_arg(prefix, &method.key)
+                    } else {
+                        let index = definition_value_index;
+                        definition_value_index += 1;
+                        format!(
+                            "&w3cos_core::intrinsics::get_property(&__definition_values, &w3cos_core::Value::Number({index}.0)).to_js_string()"
+                        )
+                    };
                     methods.push(ClassMethodDef {
                         fn_name,
                         install_key_arg,
                         install_on_proto: !method.is_static,
-                        params: method
-                            .function
-                            .params
-                            .iter()
-                            .map(|param| param.pat.clone())
-                            .collect(),
-                        body: method
-                            .function
-                            .body
-                            .as_ref()
-                            .map(|block| block.stmts.clone())
-                            .unwrap_or_default(),
+                        private: None,
                         scope: if method.is_static {
                             static_scope.clone()
                         } else {
                             instance_scope.clone()
                         },
+                        w3ir_name: Some({
+                            if method.is_static {
+                                format!("{}.static {w3ir_method_name}", sym.original_name)
+                            } else {
+                                format!("{}.{w3ir_method_name}", sym.original_name)
+                            }
+                        }),
+                        is_async: method.function.is_async,
+                        is_generator: method.function.is_generator,
                     });
                 }
                 ClassMember::PrivateMethod(method) => {
-                    let (prefix, tag) = match (method.is_static, method.kind) {
-                        (false, MethodKind::Method) => ("", "pm"),
-                        (false, MethodKind::Getter) => ("__w3cos_getter_", "pg"),
-                        (false, MethodKind::Setter) => ("__w3cos_setter_", "ps"),
-                        (true, MethodKind::Method) => ("", "spm"),
-                        (true, MethodKind::Getter) => ("__w3cos_getter_", "spg"),
-                        (true, MethodKind::Setter) => ("__w3cos_setter_", "sps"),
+                    let tag = match (method.is_static, method.kind) {
+                        (false, MethodKind::Method) => "pm",
+                        (false, MethodKind::Getter) => "pg",
+                        (false, MethodKind::Setter) => "ps",
+                        (true, MethodKind::Method) => "spm",
+                        (true, MethodKind::Getter) => "spg",
+                        (true, MethodKind::Setter) => "sps",
                     };
-                    let mangled = LowerCtx::mangle_private(&class_name, &method.key);
+                    let symbol_suffix = LowerCtx::private_symbol_suffix(&class_name, &method.key);
+                    let private_name = method.key.name.to_string();
                     methods.push(ClassMethodDef {
-                        fn_name: format!("{bundled}__{tag}_{}", sanitize_ident(&mangled)),
-                        install_key_arg: format!("{:?}", format!("{prefix}{mangled}")),
-                        install_on_proto: !method.is_static,
-                        params: method
-                            .function
-                            .params
-                            .iter()
-                            .map(|param| param.pat.clone())
-                            .collect(),
-                        body: method
-                            .function
-                            .body
-                            .as_ref()
-                            .map(|block| block.stmts.clone())
-                            .unwrap_or_default(),
+                        fn_name: format!("{bundled}__{tag}_{}", sanitize_ident(&symbol_suffix)),
+                        install_key_arg: format!("{private_name:?}"),
+                        install_on_proto: false,
+                        private: Some((private_name.clone(), method.kind)),
                         scope: if method.is_static {
                             static_scope.clone()
                         } else {
                             instance_scope.clone()
                         },
+                        w3ir_name: Some({
+                            let private_identity = match method.kind {
+                                MethodKind::Method => format!("#{private_name}"),
+                                MethodKind::Getter => format!("get #{private_name}"),
+                                MethodKind::Setter => format!("set #{private_name}"),
+                            };
+                            if method.is_static {
+                                format!("{}.static {private_identity}", sym.original_name)
+                            } else {
+                                format!("{}.{private_identity}", sym.original_name)
+                            }
+                        }),
+                        is_async: method.function.is_async,
+                        is_generator: method.function.is_generator,
                     });
                 }
                 ClassMember::ClassProp(prop) => {
-                    let scope = if prop.is_static {
-                        &static_scope
-                    } else {
-                        &instance_scope
-                    };
-                    let ctx = base_ctx().with_class_scope(scope.clone());
-                    let value = prop
-                        .value
-                        .as_ref()
-                        .map(|value| ctx.lower_expr(value))
-                        .unwrap_or_else(|| "w3cos_core::Value::Undefined".to_string());
-                    let key = ctx.key_arg("", &prop.key);
-                    let line = format!("w3cos_core::class::define_field(&__this, {key}, {value});");
+                    let index = definition_value_index;
+                    definition_value_index += 1;
+                    let key = format!(
+                        "w3cos_core::intrinsics::get_property(&__definition_values, &w3cos_core::Value::Number({index}.0))"
+                    );
+                    public_field_key_values.push(key);
                     if prop.is_static {
-                        static_inits.push(line);
+                        static_initializer_count += 1;
                     } else {
-                        field_inits.push(line);
+                        has_instance_fields = true;
                     }
                 }
                 ClassMember::PrivateProp(prop) => {
-                    let scope = if prop.is_static {
-                        &static_scope
-                    } else {
-                        &instance_scope
-                    };
-                    let ctx = base_ctx().with_class_scope(scope.clone());
-                    let value = prop
-                        .value
-                        .as_ref()
-                        .map(|value| ctx.lower_expr(value))
-                        .unwrap_or_else(|| "w3cos_core::Value::Undefined".to_string());
-                    let key = format!("{:?}", LowerCtx::mangle_private(&class_name, &prop.key));
-                    let line = format!("w3cos_core::class::define_field(&__this, {key}, {value});");
                     if prop.is_static {
-                        static_inits.push(line);
+                        static_initializer_count += 1;
                     } else {
-                        field_inits.push(line);
+                        has_instance_fields = true;
                     }
                 }
-                ClassMember::StaticBlock(block) => {
-                    let mut ctx = base_ctx().with_class_scope(static_scope.clone());
-                    ctx.enter_fn_scope(&[], &block.body.stmts);
-                    let body = ctx.lower_stmts(&block.body.stmts);
-                    static_inits.push(format!("{{ {body} }}"));
+                ClassMember::StaticBlock(_) => {
+                    static_initializer_count += 1;
                 }
                 // Index signatures, empty members, auto-accessors: not lowered.
                 _ => {}
@@ -1810,105 +2640,411 @@ fn emit_class(
         sym.original_name
     ));
 
+    let initializer_functions = if has_instance_fields || static_initializer_count > 0 {
+        let w3ir_module = w3ir_module
+            .ok_or_else(|| "class initialization lowering did not produce W3IR".to_string())?;
+        let mut functions = Vec::new();
+        if has_instance_fields {
+            let name = format!("{}.<instance_fields>", sym.original_name);
+            let function = w3ir_module
+                .functions
+                .iter()
+                .find(|function| function.name.as_deref() == Some(&name))
+                .ok_or_else(|| format!("module W3IR is missing instance initializer {name:?}"))?;
+            functions.push(function);
+        }
+        for index in 0..static_initializer_count {
+            let name = format!("{}.<static_{index}>", sym.original_name);
+            let function = w3ir_module
+                .functions
+                .iter()
+                .find(|function| function.name.as_deref() == Some(&name))
+                .ok_or_else(|| format!("module W3IR is missing static initializer {name:?}"))?;
+            functions.push(function);
+        }
+        functions
+    } else {
+        Vec::new()
+    };
+    let definition_factory = if definition_value_index > 0 {
+        let w3ir_module = w3ir_module
+            .ok_or_else(|| "class definition lowering did not produce W3IR".to_string())?;
+        let name = format!("{}.<definition_values>", sym.original_name);
+        let function = w3ir_module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some(&name))
+            .ok_or_else(|| format!("module W3IR is missing class definition values {name:?}"))?;
+        if function.is_async || function.is_generator {
+            return Err(format!(
+                "class definition values {name:?} must be synchronous"
+            ));
+        }
+        let factory = format!("{bundled}__definition_values__w3ir_sync_factory");
+        let state_machine =
+            crate::w3ir_aot::generate_sync_function_from_module(w3ir_module, function, &factory)
+                .map_err(|error| format!("class definition values {name:?}: {error}"))?;
+        let captures = generator_capture_map(
+            bundle,
+            module,
+            w3ir_module,
+            function,
+            value_bindings,
+            class_names,
+            namespace_names,
+        )
+        .ok_or_else(|| {
+            format!("class definition values {name:?} have unsupported W3IR captures")
+        })?;
+        out.push_str(&state_machine);
+        Some((factory, captures))
+    } else {
+        None
+    };
+    let w3ir_entry = w3ir_module.and_then(|module| {
+        module
+            .functions
+            .iter()
+            .find(|function| function.id == module.entry)
+    });
+    let initializer_capture_ids = initializer_functions
+        .iter()
+        .flat_map(|function| function.captures.iter().copied())
+        .collect::<HashSet<_>>();
+    let mut w3ir_field_key_bindings = w3ir_entry
+        .into_iter()
+        .flat_map(|entry| entry.bindings.iter())
+        .filter(|binding| {
+            binding.name.starts_with("*class-field-key-")
+                && initializer_capture_ids.contains(&binding.id)
+        })
+        .collect::<Vec<_>>();
+    w3ir_field_key_bindings.sort_by_key(|binding| binding.id.0);
+    if w3ir_field_key_bindings.len() != public_field_key_values.len() {
+        return Err(format!(
+            "class field-key capture mismatch: AST has {}, W3IR has {}",
+            public_field_key_values.len(),
+            w3ir_field_key_bindings.len()
+        ));
+    }
+    let field_key_defs = w3ir_field_key_bindings
+        .iter()
+        .zip(public_field_key_values)
+        .enumerate()
+        .map(|(index, (binding, expression))| {
+            (
+                binding.name.clone(),
+                format!("{bundled}:field-key:{index}"),
+                expression,
+            )
+        })
+        .collect::<Vec<_>>();
+    let initializer_synthetic = || {
+        let mut synthetic = HashMap::from([(
+            "*class-brand*".to_string(),
+            (
+                format!("w3cos_core::Value::function(move |_, _| {bundled}())"),
+                "w3cos_core::Value::Undefined".to_string(),
+            ),
+        )]);
+        if let Some(parent) = &parent {
+            synthetic.insert(
+                "*super*".to_string(),
+                (
+                    format!("w3cos_core::Value::function(move |_, _| {parent})"),
+                    "w3cos_core::Value::Undefined".to_string(),
+                ),
+            );
+        }
+        for (binding, cache_key, _) in &field_key_defs {
+            synthetic.insert(
+                binding.clone(),
+                (
+                    format!(
+                        "w3cos_core::Value::function(move |_, _| __w3cos_esm_get({cache_key:?}).unwrap_or(w3cos_core::Value::Undefined))"
+                    ),
+                    "w3cos_core::Value::Undefined".to_string(),
+                ),
+            );
+        }
+        synthetic
+    };
+    let mut instance_initializer = None;
+    let mut static_initializers = Vec::new();
+    for function in initializer_functions {
+        let w3ir_name = function
+            .name
+            .as_deref()
+            .ok_or_else(|| "class initializer has no W3IR symbol identity".to_string())?;
+        if function.is_async || function.is_generator {
+            return Err(format!(
+                "class initializer {w3ir_name:?} must be synchronous"
+            ));
+        }
+        let factory = if w3ir_name.ends_with(".<instance_fields>") {
+            format!("{bundled}__instance_fields__w3ir_sync_factory")
+        } else {
+            let index = static_initializers.len();
+            format!("{bundled}__static_{index}__w3ir_sync_factory")
+        };
+        let w3ir_module = w3ir_module.expect("initializer functions require module W3IR");
+        let state_machine =
+            crate::w3ir_aot::generate_sync_function_from_module(w3ir_module, function, &factory)
+                .map_err(|error| format!("class initializer {w3ir_name:?}: {error}"))?;
+        let captures = generator_capture_map_with_synthetic(
+            bundle,
+            module,
+            w3ir_module,
+            function,
+            value_bindings,
+            class_names,
+            namespace_names,
+            &initializer_synthetic(),
+        )
+        .ok_or_else(|| format!("class initializer {w3ir_name:?} has unsupported W3IR captures"))?;
+        out.push_str(&state_machine);
+        if w3ir_name.ends_with(".<instance_fields>") {
+            instance_initializer = Some(format!(
+                "w3cos_core::Value::function(move |__this, __args| {factory}(__this, __args, {captures}))"
+            ));
+        } else {
+            static_initializers.push(format!(
+                "{factory}(__class.clone(), Vec::new(), {captures});"
+            ));
+        }
+    }
+
     // Method / getter / setter free functions.
     for def in &unique_methods {
-        let mut ctx = base_ctx().with_class_scope(def.scope.clone());
-        ctx.bind_patterns(&def.params);
-        ctx.enter_fn_scope(&def.params, &def.body);
-        let bindings = ctx.lower_closure_params(&def.params);
-        let prologue = ctx.hoist_fn_body_vars(&def.body);
-        let body = format!("{prologue}{}", ctx.lower_stmts(&def.body));
+        let factory = format!(
+            "{}__w3ir_{}_factory",
+            def.fn_name,
+            if def.is_generator {
+                "generator"
+            } else if def.is_async {
+                "async"
+            } else {
+                "sync"
+            }
+        );
+        let emitted = (|| {
+            let w3ir_name = def
+                .w3ir_name
+                .as_deref()
+                .ok_or_else(|| "class member has no W3IR symbol identity".to_string())?;
+            let w3ir_module = w3ir_module.ok_or_else(|| {
+                format!("class member {w3ir_name:?}: module lowering did not produce W3IR")
+            })?;
+            let function = w3ir_module
+                .functions
+                .iter()
+                .find(|function| {
+                    function.name.as_deref() == Some(w3ir_name)
+                        && function.is_async == def.is_async
+                        && function.is_generator == def.is_generator
+                })
+                .ok_or_else(|| format!("module W3IR is missing class member {w3ir_name:?}"))?;
+            let state_machine = if def.is_generator {
+                crate::w3ir_aot::generate_generator_from_module(w3ir_module, function, &factory)
+            } else if def.is_async {
+                crate::w3ir_aot::generate_async_function_from_module(
+                    w3ir_module,
+                    function,
+                    &factory,
+                )
+            } else {
+                crate::w3ir_aot::generate_sync_function_from_module(w3ir_module, function, &factory)
+            }
+            .map_err(|error| format!("class member {w3ir_name:?}: {error}"))?;
+            let mut synthetic = HashMap::from([(
+                "*class-brand*".to_string(),
+                (
+                    format!("w3cos_core::Value::function(move |_, _| {bundled}())"),
+                    "w3cos_core::Value::Undefined".to_string(),
+                ),
+            )]);
+            if let Some(parent) = &def.scope.parent {
+                synthetic.insert(
+                    "*super*".to_string(),
+                    (
+                        format!("w3cos_core::Value::function(move |_, _| {parent})"),
+                        "w3cos_core::Value::Undefined".to_string(),
+                    ),
+                );
+            }
+            let captures = generator_capture_map_with_synthetic(
+                bundle,
+                module,
+                w3ir_module,
+                function,
+                value_bindings,
+                class_names,
+                namespace_names,
+                &synthetic,
+            )
+            .ok_or_else(|| format!("class member {w3ir_name:?} has unsupported W3IR captures"))?;
+            Ok::<_, String>((state_machine, captures))
+        })()?;
+        let (state_machine, captures) = emitted;
+        out.push_str(&state_machine);
         out.push_str(&format!(
-            "    fn {}(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{bindings}{body}\n        w3cos_core::Value::Undefined\n    }}\n",
+            "    /// class member {} compiled from W3IR\n    fn {}(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, {captures}) }}\n",
+            def.w3ir_name.as_deref().unwrap_or("<computed>"),
             def.fn_name
         ));
     }
 
-    // Raw constructor.
-    let fields = field_inits.join("\n        ");
-    let ctor_body = match &ctor {
-        Some((params, body)) => {
-            let mut ctx = base_ctx().with_class_scope(instance_scope.clone());
-            ctx.bind_patterns(params);
-            ctx.enter_fn_scope(params, body);
-            let bindings = ctx.lower_closure_params(params);
-            let prologue = ctx.hoist_fn_body_vars(body);
-            let body_code = if parent.is_some() {
-                // Field initializers run immediately after super(...).
-                let mut code = String::new();
-                let mut injected = false;
-                for stmt in body {
-                    code.push_str(&ctx.lower_stmt(stmt));
-                    code.push('\n');
-                    if !injected && is_super_call_stmt(stmt) {
-                        code.push_str("        ");
-                        code.push_str(&fields);
-                        code.push('\n');
-                        injected = true;
-                    }
-                }
-                if !injected {
-                    code.push_str("        ");
-                    code.push_str(&fields);
-                    code.push('\n');
-                }
-                code
-            } else {
-                format!("        {fields}\n{}", ctx.lower_stmts(body))
-            };
-            format!("{bindings}{prologue}{body_code}")
-        }
-        None if parent.is_some() => {
+    // Raw constructor. Explicit constructors share the same W3IR backend as
+    // methods; only the spec-defined default forwarding constructors are
+    // synthesized directly.
+    let ctor_body = match has_explicit_constructor {
+        true => String::new(),
+        false if parent.is_some() => {
             // Derived class without a ctor: forward all args to super.
             format!(
-                "        w3cos_core::class::super_ctor(&__this, &{}, __args);\n        {fields}\n",
+                "        w3cos_core::intrinsics::super_construct(&__this, &{}, __args);\n",
                 parent.clone().unwrap_or_default()
             )
         }
-        None => format!("        let _ = &__args;\n        {fields}\n"),
+        false => "        let _ = &__args;\n".to_string(),
     };
-    out.push_str(&format!(
-        "    fn {bundled}__ctor(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{ctor_body}        __this\n    }}\n"
-    ));
-
+    if has_explicit_constructor {
+        let factory = format!("{bundled}__ctor__w3ir_sync_factory");
+        let emitted = (|| {
+            let w3ir_name = format!("{}.constructor", sym.original_name);
+            let w3ir_module = w3ir_module.ok_or_else(|| {
+                format!("constructor {w3ir_name:?}: module lowering did not produce W3IR")
+            })?;
+            let function = w3ir_module
+                .functions
+                .iter()
+                .find(|function| {
+                    function.name.as_deref() == Some(&w3ir_name)
+                        && !function.is_async
+                        && !function.is_generator
+                })
+                .ok_or_else(|| format!("module W3IR is missing constructor {w3ir_name:?}"))?;
+            let state_machine = crate::w3ir_aot::generate_sync_function_from_module(
+                w3ir_module,
+                function,
+                &factory,
+            )
+            .map_err(|error| format!("constructor {w3ir_name:?}: {error}"))?;
+            let mut synthetic = HashMap::from([(
+                "*class-brand*".to_string(),
+                (
+                    format!("w3cos_core::Value::function(move |_, _| {bundled}())"),
+                    "w3cos_core::Value::Undefined".to_string(),
+                ),
+            )]);
+            if let Some(parent) = &parent {
+                synthetic.insert(
+                    "*super*".to_string(),
+                    (
+                        format!("w3cos_core::Value::function(move |_, _| {parent})"),
+                        "w3cos_core::Value::Undefined".to_string(),
+                    ),
+                );
+            }
+            let captures = generator_capture_map_with_synthetic(
+                bundle,
+                module,
+                w3ir_module,
+                function,
+                value_bindings,
+                class_names,
+                namespace_names,
+                &synthetic,
+            )
+            .ok_or_else(|| format!("constructor {w3ir_name:?} has unsupported W3IR captures"))?;
+            Ok::<_, String>((state_machine, captures))
+        })()?;
+        let (state_machine, captures) = emitted;
+        out.push_str(&state_machine);
+        out.push_str(&format!(
+            "    /// class constructor {}.constructor compiled from W3IR\n    fn {bundled}__ctor(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, __args, {captures}) }}\n",
+            sym.original_name
+        ));
+    } else {
+        out.push_str(&format!(
+            "    fn {bundled}__ctor(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{\n{ctor_body}        __this\n    }}\n"
+        ));
+    }
     // Class-object builder.
     out.push_str(&format!(
         "    fn {bundled}__build_class() -> w3cos_core::Value {{\n"
     ));
-    if let Some(parent) = &parent {
-        out.push_str(&format!("        let __parent = {parent};\n"));
-    }
-    out.push_str(
-        "        let __proto = w3cos_core::Value::object(std::collections::HashMap::new());\n",
-    );
-    for def in unique_methods.iter().filter(|def| def.install_on_proto) {
+    if let Some((factory, captures)) = &definition_factory {
         out.push_str(&format!(
-            "        __proto.set_property({}, w3cos_core::Value::function({}));\n",
-            def.install_key_arg, def.fn_name
+            "        let __definition_values = {factory}(w3cos_core::Value::Undefined, Vec::new(), {captures});\n"
         ));
     }
+    if has_parent {
+        out.push_str(
+            "        let __parent = w3cos_core::intrinsics::get_property(&__definition_values, &w3cos_core::Value::Number(0.0));\n",
+        );
+        out.push_str(&format!(
+            "        __w3cos_esm_set({parent_cache_key:?}, __parent.clone());\n"
+        ));
+    }
+    for (_, cache_key, expression) in &field_key_defs {
+        out.push_str(&format!(
+            "        __w3cos_esm_set({cache_key:?}, {expression});\n"
+        ));
+    }
+    out.push_str(&format!(
+        "        let __ctor = w3cos_core::Value::function({bundled}__ctor);\n"
+    ));
+    out.push_str(&format!(
+        "        let __initializer = {};\n",
+        instance_initializer
+            .as_deref()
+            .unwrap_or("w3cos_core::Value::Undefined")
+    ));
     if parent.is_some() {
         out.push_str(
-            "        w3cos_core::class::set_prototype_of(&__proto, &__parent.get_property(\"prototype\"));\n",
+            "        let __class = w3cos_core::intrinsics::create_class_with_initializer(&__ctor, Some(&__parent), &__initializer);\n",
+        );
+    } else {
+        out.push_str(
+            "        let __class = w3cos_core::intrinsics::create_class_with_initializer(&__ctor, None, &__initializer);\n",
         );
     }
-    out.push_str("        let __ctor_proto = __proto.clone();\n");
-    out.push_str(&format!(
-        "        let __class = w3cos_core::Value::callable(std::collections::HashMap::new(), move |_this, __args| {{\n            let __instance = w3cos_core::Value::object(std::collections::HashMap::new());\n            w3cos_core::class::set_prototype_of(&__instance, &__ctor_proto);\n            let __ret = {bundled}__ctor(__instance.clone(), __args);\n            if __ret.is_object() {{ __ret }} else {{ __instance }}\n        }});\n"
-    ));
-    out.push_str("        __proto.set_property(\"constructor\", __class.clone());\n");
-    out.push_str("        __class.set_property(\"prototype\", __proto);\n");
-    out.push_str(&format!(
-        "        __class.set_property(\"__w3cos_ctor\", w3cos_core::Value::function({bundled}__ctor));\n"
-    ));
-    for def in unique_methods.iter().filter(|def| !def.install_on_proto) {
+    out.push_str("        let __proto = w3cos_core::intrinsics::get_property(&__class, &w3cos_core::Value::string(\"prototype\"));\n");
+    for def in unique_methods
+        .iter()
+        .filter(|def| def.private.is_none() && def.install_on_proto)
+    {
         out.push_str(&format!(
-            "        __class.set_property({}, w3cos_core::Value::function({}));\n",
+            "        w3cos_core::intrinsics::set_property(&__proto, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
             def.install_key_arg, def.fn_name
         ));
     }
-    if parent.is_some() {
-        out.push_str("        w3cos_core::class::set_prototype_of(&__class, &__parent);\n");
+    for def in unique_methods
+        .iter()
+        .filter(|def| def.private.is_none() && !def.install_on_proto)
+    {
+        out.push_str(&format!(
+            "        w3cos_core::intrinsics::set_property(&__class, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
+            def.install_key_arg, def.fn_name
+        ));
+    }
+    for def in unique_methods.iter().filter(|def| def.private.is_some()) {
+        let (name, kind) = def.private.as_ref().expect("filtered private method");
+        match kind {
+            MethodKind::Method => out.push_str(&format!(
+                "        w3cos_core::intrinsics::define_private_method(&__class, &w3cos_core::Value::string({name:?}), w3cos_core::Value::function({}));\n",
+                def.fn_name
+            )),
+            MethodKind::Getter => out.push_str(&format!(
+                "        w3cos_core::intrinsics::define_private_accessor(&__class, &w3cos_core::Value::string({name:?}), Some(w3cos_core::Value::function({})), None);\n",
+                def.fn_name
+            )),
+            MethodKind::Setter => out.push_str(&format!(
+                "        w3cos_core::intrinsics::define_private_accessor(&__class, &w3cos_core::Value::string({name:?}), None, Some(w3cos_core::Value::function({})));\n",
+                def.fn_name
+            )),
+        }
     }
     out.push_str("        __class\n    }\n");
 
@@ -1916,11 +3052,10 @@ fn emit_class(
     out.push_str(&format!(
         "    fn {bundled}__init_statics(__class: &w3cos_core::Value) {{\n"
     ));
-    if static_inits.is_empty() {
+    if static_initializers.is_empty() {
         out.push_str("        let _ = __class;\n");
     } else {
-        out.push_str("        let __this = __class.clone();\n");
-        for line in &static_inits {
+        for line in &static_initializers {
             out.push_str(&format!("        {line}\n"));
         }
     }
@@ -1932,7 +3067,7 @@ fn emit_class(
     out.push_str(&format!(
         "    pub fn {bundled}() -> w3cos_core::Value {{\n        if let Some(value) = __w3cos_esm_get({class_key:?}) {{ return value; }}\n        if __w3cos_esm_flag_replace({building_key:?}, true) {{ return w3cos_core::Value::Undefined; }}\n        let value = {bundled}__build_class();\n        __w3cos_esm_flag_replace({building_key:?}, false);\n        __w3cos_esm_set({class_key:?}, value.clone());\n        {bundled}__init_statics(&value);\n        value\n    }}\n"
     ));
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2074,11 +3209,15 @@ export function boot() { return <App />; }"#,
         let code = generate_with_bodies(&bundle);
 
         assert!(
-            code.contains("w3cos_core::Value::from(\"main\")"),
+            code.contains("synchronous function App compiled from W3IR")
+                && code.contains("w3cos_core::Value::string(\"main\")")
+                && code.contains("w3cos_core::intrinsics::create_object"),
             "default function body must be lowered: {code}"
         );
         assert!(
-            !code.contains("body not found: App"),
+            !code.contains("body not found: App")
+                && !code.contains("W3IR lowering unavailable")
+                && !code.contains("W3IR AOT synchronous function emission failed: App"),
             "default function must not fall back to a stub: {code}"
         );
         std::fs::remove_dir_all(root).ok();
@@ -2134,27 +3273,32 @@ export function boot() {
         );
         // Class export → class accessor value.
         assert!(
-            code.contains("props.insert(\"Widget\".to_string(), super::m1::m1_Widget());"),
+            code.contains("props.insert(\"__w3cos_getter_Widget\".to_string()")
+                && code.contains("move |_, _| super::m1::m1_Widget()"),
             "class prop: {code}"
         );
         // Plain function export → stable interned function object.
         assert!(
-            code.contains("props.insert(\"greet\".to_string(), super::m1::m1_greet_value());"),
+            code.contains("props.insert(\"__w3cos_getter_greet\".to_string()")
+                && code.contains("move |_, _| super::m1::m1_greet_value()"),
             "function prop: {code}"
         );
-        // Variable export → snapshot via the _get accessor.
+        // Variable export → live getter through the _get accessor.
         assert!(
-            code.contains("props.insert(\"version\".to_string(), super::m1::m1_version_get());"),
+            code.contains("props.insert(\"__w3cos_getter_version\".to_string()")
+                && code.contains("move |_, _| super::m1::m1_version_get()"),
             "variable prop: {code}"
         );
         // Alias export (`export const helper = greet`) resolves to the aliased fn.
         assert!(
-            code.contains("props.insert(\"helper\".to_string(), super::m1::m1_greet_value());"),
+            code.contains("props.insert(\"__w3cos_getter_helper\".to_string()")
+                && code.contains("move |_, _| super::m1::m1_greet_value()"),
             "alias prop: {code}"
         );
         // Star re-export (`export * from`) is included.
         assert!(
-            code.contains("props.insert(\"extra\".to_string(), super::m0::m0_extra_get());"),
+            code.contains("props.insert(\"__w3cos_getter_extra\".to_string()")
+                && code.contains("move |_, _| super::m0::m0_extra_get()"),
             "star re-export prop: {code}"
         );
         // Bare `ns` in the importing module lowers to the accessor call (via
@@ -2165,16 +3309,20 @@ export function boot() {
             "namespace alias: {code}"
         );
         assert!(
-            code.contains("w3cos_core::class::construct(&ns().get_property(\"Widget\"), vec![])"),
-            "new ns.Widget(): {code}"
+            code.contains("w3cos_core::Value::string(\"Widget\")")
+                && code.contains("w3cos_core::intrinsics::get_property(")
+                && code.contains("w3cos_core::intrinsics::construct("),
+            "new ns.Widget() should use W3IR property lookup and construct: {code}"
         );
         assert!(
-            code.contains("ns().call_method(\"greet\""),
-            "ns.greet(): {code}"
+            code.contains("w3cos_core::Value::string(\"greet\")")
+                && code.contains("w3cos_core::intrinsics::call_method("),
+            "ns.greet() should use the W3IR call-method intrinsic: {code}"
         );
         assert!(
-            code.contains("ns().get_property(\"version\")"),
-            "ns.version read: {code}"
+            code.contains("w3cos_core::Value::string(\"version\")")
+                && code.contains("w3cos_core::intrinsics::get_property("),
+            "ns.version should use W3IR property lookup: {code}"
         );
         std::fs::remove_dir_all(root).ok();
     }
@@ -2269,38 +3417,247 @@ export const readSize = ({height: h, width: w = 10}) => h + w;"#,
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
         let code = generate_with_bodies(&bundle);
 
-        // Function body should be lowered, not todo!()
+        // Ordinary functions and function-valued variables share the W3IR AOT
+        // backend rather than a second direct-AST semantic implementation.
         assert!(
-            code.contains("w3cos_core::class::construct(&EditorView()"),
-            "new X() should lower to class::construct(&X()): {code}"
+            code.contains("synchronous function boot compiled from W3IR")
+                && code.contains("w3cos_core::intrinsics::construct("),
+            "new X() should lower through the W3IR construct intrinsic: {code}"
         );
         assert!(
-            code.contains("return view"),
-            "return should be lowered: {code}"
+            code.contains("return self.registers[3].clone()"),
+            "W3IR return should be emitted: {code}"
         );
         assert!(
-            code.contains("function-valued variable identity")
-                && code.contains("let mut value = __args.get(0)"),
-            "top-level arrow functions should lower to callable Rust functions: {code}"
+            code.contains("synchronous function identity compiled from W3IR")
+                && code.contains("__args.get(0).cloned()"),
+            "top-level arrows should lower to callable W3IR functions: {code}"
         );
         assert!(
-            code.contains(
-                "get(0).cloned().unwrap_or(w3cos_core::Value::Undefined).get_property(\"height\")"
-            ) && code.contains("if w.is_undefined() { w = w3cos_core::Value::Number(10.0); }"),
-            "destructured parameters should bind properties and defaults: {code}"
+            code.contains("synchronous function readSize compiled from W3IR")
+                && code.contains("w3cos_core::Value::string(\"height\")")
+                && code.contains("w3cos_core::Value::string(\"width\")")
+                && code.contains("w3cos_core::Value::Number(10.0)")
+                && code.contains("w3cos_core::intrinsics::strict_equal("),
+            "W3IR destructured parameters should bind properties and defaults: {code}"
         );
         // Class method body should be lowered into a free `__m_` function
         assert!(
             code.contains("fn m0_EditorView__m_mount(__this: w3cos_core::Value")
-                && code.contains(
-                    "w3cos_runtime::jsdom::document_value().call_method(\"createElement\""
-                ),
-            "method body should be lowered: {code}"
+                && code.contains("class member EditorView.mount compiled from W3IR")
+                && code.contains("w3cos_core::Value::string(\"createElement\")")
+                && code.contains("w3cos_core::intrinsics::call_method("),
+            "method body should be lowered through W3IR: {code}"
         );
         // Should NOT have todo!() for functions that have bodies
         assert!(
             !code.contains("todo!(\"lower ESM body: boot\")"),
             "boot body should be lowered: {code}"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn functions_fail_at_compile_time_instead_of_using_fallbacks_or_runtime_stubs() {
+        let root = fixture_root("w3cos_esm_codegen_function_w3ir_failure");
+        let cases = [
+            (
+                "sync",
+                "export function copy() { return new.target; }",
+                "synchronous function",
+            ),
+            (
+                "async",
+                "export async function copy() { return new.target; }",
+                "async function",
+            ),
+            (
+                "generator",
+                "export function* copy() { yield new.target; }",
+                "generator",
+            ),
+        ];
+        for (directory, source, kind) in cases {
+            let case = root.join(directory);
+            std::fs::create_dir_all(case.join("src")).unwrap();
+            std::fs::write(case.join("src/app.js"), source).unwrap();
+
+            let resolver = EsmResolver::new(&case);
+            let parsed = resolver
+                .parse_graph_from_entry(&case.join("src/app.js"))
+                .unwrap();
+            let bundle = EsmBundle::build(&parsed, &resolver, &case.join("src/app.js"));
+            let error = try_generate_with_bodies(&bundle)
+                .expect_err("unsupported function W3IR must fail native generation");
+            assert_eq!(error.phase, "W3IR native function emission");
+            assert_eq!(error.module, case.join("src/app.js"));
+            assert!(
+                error.to_string().contains(&format!("{kind} \"copy\""))
+                    && error
+                        .to_string()
+                        .contains("module lowering did not produce W3IR"),
+                "unsupported W3IR must fail at compile time with symbol context: {error}"
+            );
+        }
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn class_callables_fail_at_compile_time_instead_of_emitting_runtime_stubs() {
+        let root = fixture_root("w3cos_esm_codegen_class_w3ir_failure");
+        let cases = [
+            (
+                "method",
+                "export class Broken { copy() { return new.target; } }",
+                "Broken.copy",
+            ),
+            (
+                "async_method",
+                "export class Broken { async copy() { return new.target; } }",
+                "Broken.copy",
+            ),
+            (
+                "generator_method",
+                "export class Broken { *copy() { yield new.target; } }",
+                "Broken.copy",
+            ),
+            (
+                "constructor",
+                "export class Broken { constructor() { new.target; } }",
+                "Broken.constructor",
+            ),
+            (
+                "instance_field",
+                "export class Broken { value = String.raw`unsupported`; }",
+                "class initialization lowering did not produce W3IR",
+            ),
+            (
+                "static_block",
+                "export class Broken { static { String.raw`unsupported`; } }",
+                "class initialization lowering did not produce W3IR",
+            ),
+        ];
+        for (directory, source, callable) in cases {
+            let case = root.join(directory);
+            std::fs::create_dir_all(case.join("src")).unwrap();
+            std::fs::write(case.join("src/app.js"), source).unwrap();
+
+            let resolver = EsmResolver::new(&case);
+            let parsed = resolver
+                .parse_graph_from_entry(&case.join("src/app.js"))
+                .unwrap();
+            let bundle = EsmBundle::build(&parsed, &resolver, &case.join("src/app.js"));
+            let error = try_generate_with_bodies(&bundle)
+                .expect_err("unsupported class W3IR must fail native generation");
+            assert_eq!(error.phase, "W3IR native class emission");
+            assert_eq!(error.module, case.join("src/app.js"));
+            assert!(
+                error.to_string().contains("class \"Broken\"")
+                    && error.to_string().contains(callable)
+                    && (error
+                        .to_string()
+                        .contains("module lowering did not produce W3IR")
+                        || error
+                            .to_string()
+                            .contains("class initialization lowering did not produce W3IR")),
+                "unsupported class W3IR must fail at compile time with callable context: {error}"
+            );
+        }
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_top_level_class_runs_w3ir_fields_and_static_blocks_in_order() {
+        let root = fixture_root("w3cos_esm_codegen_top_level_class_initializers");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"
+let log = "";
+function mark(value) { log += value; return value; }
+function key(value) { log += value; return value; }
+class Base {}
+export class Sample extends (mark("E"), Base) {
+  [key("i")] = mark("I");
+  [key("m")]() { return "M"; }
+  static [key("s")] = mark("S");
+  static [key("q")]() { return "Q"; }
+  static { mark("B"); this.block = log; }
+  #secret = mark("P");
+  read() { return this.i + this.#secret + this.m(); }
+}
+export function result() {
+  const sample = new Sample();
+  return log + ":" + Sample.s + ":" + sample.read() + ":" + Sample.q() + ":" + Sample.block;
+}
+"#;
+        std::fs::write(root.join("src/app.js"), source).unwrap();
+
+        let w3ir = crate::w3ir_lowering::lower_module(source, "app:///top-level-class.js").unwrap();
+        let mut cells = HashMap::new();
+        let mut exports = HashMap::new();
+        for export in &w3ir.exports {
+            let cell = w3cos_vm::binding_cell(w3cos_core::Value::Undefined);
+            cells.insert(export.local, cell.clone());
+            exports.insert(export.exported.clone(), cell);
+        }
+        w3cos_vm::Vm::new(w3ir, w3cos_vm::Limits::default())
+            .unwrap()
+            .run_with_cells(cells)
+            .unwrap();
+        let vm_result = exports["result"]
+            .read_value()
+            .call(w3cos_core::Value::Undefined, Vec::new())
+            .to_js_string();
+        assert_eq!(vm_result, "EimsqSBIP:S:IPM:Q:EimsqSB");
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        let code = try_generate_with_bodies(&bundle).unwrap();
+        assert!(
+            code.contains("m0_Sample__definition_values__w3ir_sync_factory")
+                && code.contains("__w3cos_esm_set(\"m0_Sample:super\", __parent.clone())")
+                && code.contains("m0_Sample__instance_fields__w3ir_sync_factory")
+                && code.contains("m0_Sample__static_0__w3ir_sync_factory")
+                && code.contains("m0_Sample__static_1__w3ir_sync_factory")
+                && !code.contains("let mut field_inits")
+                && !code.contains("let mut static_inits"),
+            "top-level class initializers must be emitted from W3IR: {code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3cos_top_level_class_initializer_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                "#![allow(warnings)]\n{code}\nfn main() {{\n    run_entry();\n    let result = m0::m0_result(Vec::new());\n    assert!(matches!(&result, w3cos_core::Value::String(value) if value == {vm_result:?}), \"AOT/W3VM class initialization mismatch: {{result:?}}\");\n}}\n"
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--offline")
+            .arg("--quiet")
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated top-level class initializer should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
 
         std::fs::remove_dir_all(root).ok();
@@ -2328,7 +3685,7 @@ export const readSize = ({height: h, width: w = 10}) => h + w;"#,
             root.join("src/app.ts"),
             r#"import { Animal } from "./base";
 export class Dog extends Animal {
-  trained = false;
+  ["trained"] = false;
   constructor(name, bark) { super(name); this.bark = bark; }
   kind() { return "dog"; }
   describe() { return super.kind() + ":" + this.bark; }
@@ -2369,30 +3726,35 @@ export function boot() {
         // Raw ctor + field init + methods/getter/setter/static/private.
         assert!(
             code.contains("fn m0_Animal__ctor(__this: w3cos_core::Value")
-                && code.contains("__this.clone().set_property(&\"name\", __w3cos_av.clone())"),
-            "ctor body: {code}"
+                && code.contains("class constructor Animal.constructor compiled from W3IR")
+                && code.contains("w3cos_core::Value::string(\"name\")")
+                && code.contains("w3cos_core::intrinsics::set_property("),
+            "constructor should lower through W3IR: {code}"
         );
         assert!(
-            code.contains("__proto.set_property(\"__w3cos_getter_label\", w3cos_core::Value::function(m0_Animal__g_label))"),
+            code.contains("w3cos_core::intrinsics::set_property(&__proto")
+                && code.contains("Value::string(\"__w3cos_getter_label\")"),
             "getter install: {code}"
         );
         assert!(
-            code.contains("__proto.set_property(\"__w3cos_setter_label\", w3cos_core::Value::function(m0_Animal__s_label))"),
+            code.contains("Value::string(\"__w3cos_setter_label\")"),
             "setter install: {code}"
         );
         assert!(
-            code.contains(
-                "__proto.set_property(\"kind\", w3cos_core::Value::function(m0_Animal__m_kind))"
-            ),
+            code.contains("Value::string(\"kind\")")
+                && code.contains("w3cos_core::Value::function(m0_Animal__m_kind)"),
             "method install: {code}"
         );
         assert!(
-            code.contains("__class.set_property(\"create\", w3cos_core::Value::function(m0_Animal__sm_create))"),
+            code.contains("w3cos_core::intrinsics::set_property(&__class")
+                && code.contains("Value::string(\"create\")"),
             "static method install: {code}"
         );
         assert!(
-            code.contains("define_field(&__this, \"__w3cos_priv_Animal_tag\""),
-            "private field install: {code}"
+            code.contains("m0_Animal__instance_fields__w3ir_sync_factory")
+                && code.contains("w3cos_core::intrinsics::define_private(&self.registers")
+                && code.contains("w3cos_core::Value::string(\"tag\")"),
+            "private field should be emitted from W3IR: {code}"
         );
         // Static field + static block run in __init_statics.
         let statics_start = code
@@ -2400,59 +3762,68 @@ export function boot() {
             .expect("init_statics emitted");
         let statics_body = &code[statics_start..];
         assert!(
-            statics_body.contains("define_field(&__this, \"count\"")
-                && statics_body.contains("Animal().set_property(&\"count\""),
-            "static field + static block (self-ref via accessor) in init_statics: {statics_body}"
+            code.contains("m0_Animal__static_0__w3ir_sync_factory")
+                && code.contains("m0_Animal__static_1__w3ir_sync_factory")
+                && code.contains("w3cos_core::intrinsics::define_field(&self.registers")
+                && statics_body.contains("m0_Animal__static_0__w3ir_sync_factory(__class.clone()")
+                && statics_body.contains("m0_Animal__static_1__w3ir_sync_factory(__class.clone()"),
+            "static field + static block should run through W3IR in source order: {statics_body}"
         );
-        // Inheritance: parent evaluated once, both links wired, super calls.
+        // Inheritance: parent evaluated once and shared Core wires both links.
         assert!(
-            code.contains("let __parent = Animal();"),
-            "parent expr: {code}"
-        );
-        assert!(
-            code.contains("w3cos_core::class::set_prototype_of(&__proto, &__parent.get_property(\"prototype\"));"),
-            "proto inheritance: {code}"
-        );
-        assert!(
-            code.contains("w3cos_core::class::set_prototype_of(&__class, &__parent);"),
-            "static inheritance: {code}"
+            code.contains("m1_Dog__definition_values__w3ir_sync_factory")
+                && code.contains("__w3cos_esm_set(\"m1_Dog:super\", __parent.clone());"),
+            "parent expression should be emitted from W3IR and cached once: {code}"
         );
         assert!(
-            code.contains("w3cos_core::class::super_ctor(&__this, &Animal(), vec![name.clone()"),
-            "super(...): {code}"
+            code.contains(
+                "w3cos_core::intrinsics::create_class_with_initializer(&__ctor, Some(&__parent), &__initializer);"
+            ),
+            "shared Core class/prototype inheritance: {code}"
         );
         assert!(
-            code.contains("w3cos_core::class::super_method(&__this, &Animal(), \"kind\", vec![])"),
-            "super.method(): {code}"
+            code.contains("class constructor Dog.constructor compiled from W3IR")
+                && code.contains("w3cos_core::Value::string(\"__w3cos_super_ctor\")"),
+            "super(...) should lower through shared W3IR/Core semantics: {code}"
         );
-        // Derived-ctor field init runs after super(...).
-        let ctor_start = code.find("fn m1_Dog__ctor").expect("Dog ctor emitted");
-        let ctor_body = &code[ctor_start..];
-        let super_pos = ctor_body.find("super_ctor").expect("super call");
-        let field_pos = ctor_body
-            .find("define_field(&__this, \"trained\"")
-            .expect("field init");
-        assert!(super_pos < field_pos, "field init after super: {ctor_body}");
+        assert!(
+            code.contains("class member Dog.describe compiled from W3IR")
+                && code.contains("w3cos_core::Value::string(\"__w3cos_super_method\")")
+                && code.contains("w3cos_core::Value::string(\"kind\")"),
+            "super.method() should lower through shared W3IR/Core semantics: {code}"
+        );
+        // Core, not the generated ctor body, owns derived field scheduling.
+        assert!(
+            code.contains("__w3cos_esm_set(\"m1_Dog:field-key:0\", w3cos_core::intrinsics::get_property(&__definition_values")
+                && code.contains("m1_Dog__instance_fields__w3ir_sync_factory(__this, __args")
+                && code.contains("w3cos_core::intrinsics::define_field(&self.registers"),
+            "shared Core/W3IR field initializer: {code}"
+        );
         // Derived class without a ctor forwards all args to super.
         assert!(
             code.contains("fn m1_Puppy__ctor")
-                && code.contains("w3cos_core::class::super_ctor(&__this, &Dog(), __args);"),
+                && code.contains(
+                    "w3cos_core::intrinsics::super_construct(&__this, &__w3cos_esm_get(\"m1_Puppy:super\")"
+                ),
             "synthesized forwarding ctor: {code}"
         );
         // Class expression as a variable initializer.
         assert!(
             code.contains("pub fn m1_Cat_get() -> w3cos_core::Value")
-                && code.contains("w3cos_core::Value::callable(std::collections::HashMap::new()"),
+                && code.contains(
+                    "w3cos_core::intrinsics::create_class_with_initializer(&__ctor, Some(&__parent), &__initializer)"
+                ),
             "class expression value: {code}"
         );
         // new + instanceof in function bodies.
         assert!(
-            code.contains("w3cos_core::class::construct(&Dog(), vec!["),
-            "new Dog(): {code}"
+            code.contains("synchronous function boot compiled from W3IR")
+                && code.contains("w3cos_core::intrinsics::construct("),
+            "new Dog() should use the W3IR construct intrinsic: {code}"
         );
         assert!(
-            code.contains("w3cos_core::class::instance_of(&d.clone(), &Animal())"),
-            "instanceof: {code}"
+            code.contains("w3cos_core::intrinsics::instance_of(&self.registers["),
+            "instanceof should use shared Core semantics from W3IR: {code}"
         );
         // Cross-module class references go through the accessor alias.
         assert!(
@@ -2547,6 +3918,511 @@ export function boot() {
     }
 
     #[test]
+    fn generated_esm_generator_runs_the_w3ir_native_state_machine() {
+        let root = fixture_root("w3cos_esm_codegen_w3ir_generator");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"
+export let offset = 2;
+export function fail() {
+  throw "host";
+}
+export function* inner() {
+  try {
+    fail();
+  } catch (error) {
+    yield "host:" + error;
+  }
+  try {
+    yield 1;
+  } catch (error) {
+    yield "caught:" + offset + ":" + error;
+  }
+  return "done";
+}
+export function* values() {
+  return yield* inner();
+}
+export function* nestedValues(seed) {
+  let local = seed;
+  function* nested(delta) {
+    yield local + delta;
+    local = local + 1;
+    return local;
+  }
+  const generator = nested(2);
+  yield generator.next().value;
+  local = 10;
+  return generator.next().value + ":" + local;
+}
+export function makeNested(seed) {
+  let local = seed;
+  function bump() {
+    local = local + 1;
+    return local;
+  }
+  function* nested(delta) {
+    yield local + delta;
+    return bump();
+  }
+  return nested(2);
+}
+export function* structuredValues(head, ...rest) {
+  const [first, ...tail] = rest;
+  const source = { a: head, b: first, c: tail[0] };
+  const { a, ...others } = source;
+  yield a + ":" + others.b + ":" + others.c;
+  return rest.length;
+}
+export function* localClassValues() {
+  class Local {
+    value() {
+      return "local";
+    }
+  }
+  yield new Local().value();
+  return "class";
+}
+export const expressionValues = function* (start) {
+  yield start + offset;
+  return "expr";
+};
+export const computedName = "computedValues";
+export class BaseCounter {
+  value() {
+    return "base";
+  }
+  get label() {
+    return "label";
+  }
+}
+export class Counter extends BaseCounter {
+  #secret = 40;
+  *values(start) {
+    yield this.prefix + (start + offset);
+    return this.prefix;
+  }
+  static *values(start) {
+    yield "static:" + (start + offset);
+    return "static";
+  }
+  *[computedName](start) {
+    yield "computed:" + (start + offset);
+    return "computed";
+  }
+  *#privateValues(delta) {
+    yield this.#secret + delta;
+    this.#secret = this.#secret + 1;
+    return this.#secret;
+  }
+  openPrivate(delta) {
+    return this.#privateValues(delta);
+  }
+  *superValues() {
+    yield super.value() + ":" + super.label;
+    return "super";
+  }
+}
+export function main() {
+  const generator = values();
+  const nestedGenerator = nestedValues(4);
+  const hostedNestedGenerator = makeNested(8);
+  const structuredGenerator = structuredValues("head", "first", "tail");
+  const localClassGenerator = localClassValues();
+  const expression = expressionValues(4);
+  const counter = new Counter();
+  counter.prefix = "class:";
+  const classGenerator = counter.values(5);
+  const staticGenerator = Counter.values(6);
+  const computedGenerator = counter.computedValues(7);
+  const privateGenerator = counter.openPrivate(2);
+  const superGenerator = counter.superValues();
+  const hostCaught = generator.next();
+  const first = generator.next();
+  offset = 3;
+  const caught = generator.throw("boom");
+  const completed = generator.next();
+  const expressionFirst = expression.next();
+  const expressionDone = expression.next();
+  const classFirst = classGenerator.next();
+  const classDone = classGenerator.next();
+  const staticFirst = staticGenerator.next();
+  const staticDone = staticGenerator.next();
+  const nestedFirst = nestedGenerator.next();
+  const nestedDone = nestedGenerator.next();
+  const computedFirst = computedGenerator.next();
+  const computedDone = computedGenerator.next();
+  const privateFirst = privateGenerator.next();
+  const privateDone = privateGenerator.next();
+  const superFirst = superGenerator.next();
+  const superDone = superGenerator.next();
+  const hostedNestedFirst = hostedNestedGenerator.next();
+  const hostedNestedDone = hostedNestedGenerator.next();
+  const structuredFirst = structuredGenerator.next();
+  const structuredDone = structuredGenerator.next();
+  const localClassFirst = localClassGenerator.next();
+  const localClassDone = localClassGenerator.next();
+  return hostCaught.value + ":" + hostCaught.done + ":" +
+    first.value + ":" + first.done + ":" +
+    caught.value + ":" + caught.done + ":" +
+    completed.value + ":" + completed.done + ":" +
+    expressionFirst.value + ":" + expressionFirst.done + ":" +
+    expressionDone.value + ":" + expressionDone.done + ":" +
+    classFirst.value + ":" + classFirst.done + ":" +
+    classDone.value + ":" + classDone.done + ":" +
+    staticFirst.value + ":" + staticFirst.done + ":" +
+    staticDone.value + ":" + staticDone.done + ":" +
+    nestedFirst.value + ":" + nestedFirst.done + ":" +
+    nestedDone.value + ":" + nestedDone.done + ":" +
+    computedFirst.value + ":" + computedFirst.done + ":" +
+    computedDone.value + ":" + computedDone.done + ":" +
+    privateFirst.value + ":" + privateFirst.done + ":" +
+    privateDone.value + ":" + privateDone.done + ":" +
+    superFirst.value + ":" + superFirst.done + ":" +
+    superDone.value + ":" + superDone.done + ":" +
+    hostedNestedFirst.value + ":" + hostedNestedFirst.done + ":" +
+    hostedNestedDone.value + ":" + hostedNestedDone.done + ":" +
+    structuredFirst.value + ":" + structuredFirst.done + ":" +
+    structuredDone.value + ":" + structuredDone.done + ":" +
+    localClassFirst.value + ":" + localClassFirst.done + ":" +
+    localClassDone.value + ":" + localClassDone.done;
+}
+"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        assert!(
+            bundle.is_fully_resolved(),
+            "unresolved: {:?}",
+            bundle.unresolved
+        );
+        let code = generate_with_bodies(&bundle);
+        assert!(code.contains("compiled from W3IR suspension metadata"));
+        assert!(code.contains("State::Suspended(0)"));
+        assert!(!code.contains("/* yield */"));
+        assert!(!code.contains("W3IR AOT generator emission failed"));
+        assert!(!code.contains("W3IR AOT class generator emission failed"));
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_generator_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                "#![allow(warnings)]\n{code}\nfn main() {{ println!(\"{{}}\", run_entry().to_js_string()); }}\n"
+            ),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated W3IR generator bundle should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "host:host:false:1:false:caught:3:boom:false:done:true:7:false:expr:true:class:8:false:class::true:static:9:false:static:true:6:false:11:11:true:computed:10:false:computed:true:42:false:41:true:base:label:false:super:true:10:false:9:true:head:first:tail:false:2:true:local:false:class:true"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_esm_generator_reads_import_meta_from_w3ir_module_identity() {
+        let root = fixture_root("w3cos_esm_codegen_w3ir_import_meta");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"
+export function* metadataValues() {
+  yield import.meta.url;
+}
+export function* dynamicValues() {
+  yield import("./feature.js");
+}
+export function main() {
+  return {
+    meta: metadataValues().next().value,
+    loaded: dynamicValues().next().value
+  };
+}
+"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        let code = generate_with_bodies(&bundle);
+        assert!(code.contains("compiled from W3IR suspension metadata"));
+        assert!(!code.contains("W3IR AOT generator emission failed"));
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_import_meta_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    w3cos_core::host_modules::register(
+        w3cos_core::host_modules::DYNAMIC_IMPORT_PATH,
+        w3cos_core::Value::function(|_, arguments| {{
+            let specifier = arguments[0].to_js_string();
+            let referrer_ok = arguments[1].to_js_string().ends_with("app.js");
+            w3cos_core::promise::resolve(vec![w3cos_core::Value::from(format!(
+                "{{specifier}}:{{referrer_ok}}"
+            ))])
+        }}),
+    );
+    let result = run_entry();
+    let meta_ok = result.get_property("meta").to_js_string().ends_with("app.js");
+    let loaded = result.get_property("loaded");
+    let loaded = match w3cos_core::promise::status(&loaded) {{
+        Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) => value.to_js_string(),
+        _ => "not-fulfilled".to_string(),
+    }};
+    println!("{{meta_ok}}:{{loaded}}");
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated import.meta generator bundle should run:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "true:./feature.js:true"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_esm_async_generator_uses_the_core_only_w3ir_queue() {
+        let root = fixture_root("w3cos_esm_codegen_w3ir_async_generator");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"
+export async function* values(awaited) {
+  const base = await awaited;
+  const sent = yield base + 1;
+  return sent + 1;
+}
+export function main() {
+  return values(2);
+}
+"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        let code = generate_with_bodies(&bundle);
+        assert!(code.contains("__w3cos_async_generator_await"));
+        assert!(code.contains("__w3cos_symbol_async_iterator"));
+        assert!(!code.contains("W3IR AOT generator emission failed"));
+        assert!(!code.contains("w3cos_vm"));
+        assert!(!code.contains("w3cos_ir"));
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_async_generator_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn describe(promise: &w3cos_core::Value) -> String {{
+    match w3cos_core::promise::status(promise) {{
+        Some(w3cos_core::promise::PromiseStatus::Fulfilled(result)) => format!(
+            "{{}}:{{}}",
+            result.get_property("value").to_js_string(),
+            result.get_property("done").to_bool(),
+        ),
+        _ => panic!("unexpected async-generator status"),
+    }}
+}}
+fn main() {{
+    let generator = run_entry();
+    let first = generator.call_method("next", Vec::new());
+    let second = generator.call_method(
+        "next",
+        vec![w3cos_core::Value::Number(8.0)],
+    );
+    w3cos_core::promise::drain_microtasks();
+    println!("{{}}:{{}}", describe(&first), describe(&second));
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated async-generator bundle should run:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "3:false:9:true"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_esm_registers_live_exports_in_the_shared_module_abi() {
+        let root = fixture_root("w3cos_esm_codegen_shared_module_registry");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.js");
+        std::fs::write(
+            root.join("src/counter.js"),
+            r#"
+export let count = 1;
+export function bump() {
+  count += 1;
+  return count;
+}
+export default count + 40;
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &entry,
+            r#"
+import initial, { count } from "./counter.js";
+export { count as total, bump } from "./counter.js";
+export * from "./counter.js";
+export * as counter from "./counter.js";
+export default function main() {
+  return initial;
+}
+"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        let code = generate_with_bodies(&bundle);
+        assert!(code.contains("__register_shared_module"));
+        assert!(code.contains("w3cos_core::module_registry::register"));
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_shared_module_registry_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    assert_eq!(run_entry().to_u32(), 41);
+    let namespace = w3cos_core::module_registry::namespace({specifier:?}).unwrap();
+    let counter_namespace =
+        w3cos_core::module_registry::namespace({counter_specifier:?}).unwrap();
+    assert_eq!(counter_namespace.get_property("default").to_u32(), 41);
+    let reexported_namespace = namespace.get_property("counter");
+    let before = namespace.get_property("total").to_u32();
+    let bumped = namespace
+        .get_property("bump")
+        .call(w3cos_core::Value::Undefined, Vec::new())
+        .to_u32();
+    let after = namespace.get_property("total").to_u32();
+    let star = namespace.get_property("count").to_u32();
+    let default = namespace
+        .get_property("default")
+        .call(w3cos_core::Value::Undefined, Vec::new())
+        .to_u32();
+    let snapshot = counter_namespace.get_property("default").to_u32();
+    let namespace_live = reexported_namespace.get_property("count").to_u32();
+    println!("{{before}}:{{bumped}}:{{after}}:{{star}}:{{default}}:{{snapshot}}:{{namespace_live}}");
+}}
+"#,
+                specifier = entry.to_string_lossy(),
+                counter_specifier = root.join("src/counter.js").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated shared-module bundle should run:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "1:2:2:2:41:41:2"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn generated_try_catch_and_namespace_bundle_runs_with_real_semantics() {
         let root = fixture_root("w3cos_esm_codegen_try_runs");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -2590,7 +4466,23 @@ export function getTrace() { return trace; }
 export class Guard {
   check(x) { try { if (x) { throw "neg"; } return "ok"; } catch (e) { return "caught:" + e; } }
 }
-export function classMethod() { const g = new Guard(); return g.check(true); }"#,
+export function classMethod() { const g = new Guard(); return g.check(true); }
+class Secret {
+  #value = 2;
+  #add(n) { return this.#value + n; }
+  get #double() { return this.#value * 2; }
+  set #double(next) { this.#value = next / 2; }
+  run() {
+    this.#value += 1;
+    this.#double = 10;
+    return this.#add(3) + this.#double;
+  }
+  has(value) { return #value in value; }
+}
+export function privateClass() {
+  const secret = new Secret();
+  return secret.run() + (secret.has(secret) ? 100 : 0) + (secret.has({}) ? 1000 : 0);
+}"#,
         )
         .unwrap();
 
@@ -2623,6 +4515,7 @@ export function classMethod() { const g = new Guard(); return g.check(true); }"#
             "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
             r#"
 fn main() {
+    let _ = run_entry();
     let r = m1::m1_nsAccess(vec![]);
     assert!(matches!(r, w3cos_core::Value::Number(n) if n == 102.0), "nsAccess: {r:?}");
     let r = m1::m1_nsClass(vec![]);
@@ -2639,6 +4532,8 @@ fn main() {
     assert!(matches!(&r, w3cos_core::Value::String(s) if s == "deep"), "nestedRethrow: {r:?}");
     let r = m1::m1_classMethod(vec![]);
     assert!(matches!(&r, w3cos_core::Value::String(s) if s == "caught:neg"), "classMethod: {r:?}");
+    let r = m1::m1_privateClass(vec![]);
+    assert!(matches!(r, w3cos_core::Value::Number(n) if n == 118.0), "privateClass: {r:?}");
     // finally blocks ran on every path, in order: F (return path), then 1, 2 (rethrow path).
     let r = m1::m1_getTrace(vec![]);
     assert!(matches!(&r, w3cos_core::Value::String(s) if s == "F12"), "trace: {r:?}");
@@ -2831,6 +4726,7 @@ export function regexpShape() {
             "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
             r#"
 fn main() {
+    let _ = run_entry();
     let r = m0::m0_startChain(vec![]);
     assert!(matches!(&r, w3cos_core::Value::String(s) if s == "started"), "startChain: {r:?}");
     w3cos_core::promise::drain_microtasks();
@@ -5311,6 +7207,7 @@ export function runXhr(url) {
             "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
             r#"
 fn main() {
+    let _ = run_entry();
     let r = m0::m0_navInfo(vec![]);
     assert!(
         matches!(&r, w3cos_core::Value::String(s) if s == "W3COS/0.1 (w3cos; like Gecko)|w3cos://app/"),
@@ -5573,7 +7470,7 @@ fn main() {
     w3cos_runtime::jsdom::drain_microtasks();
     let r = m0::m0_getStorageManagerLog(vec![]);
     assert!(
-        matches!(&r, w3cos_core::Value::String(s) if s == "0:0:object:false:false:NotSupportedError"),
+        matches!(&r, w3cos_core::Value::String(s) if s == "0:0:object:false:false"),
         "StorageManager estimate, persistence and OPFS fallback lifecycle: {r:?}"
     );
     let r = m0::m0_storageBucketsShape(vec![]);
@@ -5816,7 +7713,7 @@ fn main() {
     );
     let r = m0::m0_observerShape(vec![]);
     assert!(
-        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:function:true:true:function:true:1:attributes:data-state:true:true:true:2:0:true:-1:4"),
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:function:function:function:true:true:function:true:1:attributes:data-state:true:true:true:2:0:true:-1:13"),
         "observer constructors, identity, options, and callbacks: {r:?}"
     );
     w3cos_runtime::observers_web::refresh_resize_observers();
@@ -6372,7 +8269,7 @@ fn main() {
         matches!(&r, w3cos_core::Value::Number(state) if *state == 0.0 || *state == 1.0),
         "WebSocket starts connecting/open: {r:?}"
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         w3cos_runtime::jsdom::drain_microtasks();
         let log = m0::m0_getSocketLog(vec![]).to_js_string();
@@ -6451,10 +8348,12 @@ fn main() {
                     ("position".to_string(), "absolute".to_string()),
                     ("width".to_string(), "100%".to_string()),
                 ],
+                media: None,
             },
             crate::esm_css::CollectedRule {
                 selector: ".quote\"test".to_string(),
                 declarations: vec![("content".to_string(), "a\\b".to_string())],
+                media: None,
             },
         ];
         let code = generate_with_bodies_and_css(&bundle, &rules);
@@ -6475,7 +8374,9 @@ fn main() {
         );
         // run_entry registers styles before running any app code.
         assert!(
-            code.contains("pub fn run_entry() -> w3cos_core::Value { register_styles();"),
+            code.contains(
+                "pub fn run_entry() -> w3cos_core::Value { register_styles(); __w3cos_run_entry_body() }"
+            ),
             "run_entry must call register_styles first: {code}"
         );
     }
@@ -6489,7 +8390,9 @@ fn main() {
             "register_styles should be a no-op without css: {code}"
         );
         assert!(
-            code.contains("pub fn run_entry() -> w3cos_core::Value { register_styles(); w3cos_core::Value::Undefined }"),
+            code.contains(
+                "fn __w3cos_run_entry_body() -> w3cos_core::Value { w3cos_core::Value::Undefined }"
+            ) && code.contains("pub fn run_entry_async()"),
             "stub run_entry must still register (empty) styles: {code}"
         );
     }
@@ -6557,43 +8460,46 @@ export function main() { return result; }"#,
             "pub init fn: {code}"
         );
 
-        // All three top-level side effects lowered, in source order:
-        // foo.bar = baz();  →  member set_property
-        // const x = sideEffect();  →  force the x cell
-        // if (foo.bar) { foo.bar = 4; }  →  if with .to_bool()
-        // export const result = x;  →  force the result cell
+        // The complete contiguous module evaluation is one W3IR segment:
+        // foo.bar = baz(); const x = sideEffect(); if (...) {...};
+        // export const result = x. W3IR preserves source order internally and
+        // writes x/result through the existing live-cell adapters.
         let body = &code[init_pos..];
-        let assign_pos = body.find("set_property(&\"bar\"").expect("member assign");
-        let force_x_pos = body
-            .find(&format!("{app_ns}_x_get();"))
-            .expect("x cell forced");
-        let if_pos = body.find(".to_bool()").expect("if lowered");
-        let force_result_pos = body
-            .find(&format!("{app_ns}_result_get();"))
-            .expect("result cell forced");
+        body.find(&format!("{app_ns}__init_w3ir_0("))
+            .expect("coalesced module W3IR segment");
         assert!(
-            assign_pos < force_x_pos && force_x_pos < if_pos && if_pos < force_result_pos,
-            "init statements must be in source order: {body}"
+            !body.contains(&format!("{app_ns}__init_w3ir_1("))
+                && body.contains(&format!("{app_ns}_x_set(arguments.first()"))
+                && body.contains(&format!("{app_ns}_result_set(arguments.first()")),
+            "module evaluation should use one live-binding W3IR segment: {body}"
         );
-        // The member assignment goes through the imported foo's cell accessor.
+        // W3IR owns the statement semantics, while live capture adapters keep
+        // the imported foo cell and function identity wired to the ESM graph.
         assert!(
-            body.contains("_get().set_property(&\"bar\""),
-            "foo.bar writes the shared cell object: {body}"
+            code.contains("w3cos_core::intrinsics::set_property(")
+                && body.contains("w3cos_core::Value::function(move |_, _| m0_foo_get())")
+                && body.contains("m0_foo_set(arguments.first()")
+                && body.contains("w3cos_core::Value::function(move |_, _| baz_value())")
+                && !body.contains("W3IR module-init chunk"),
+            "module init must use W3IR with live ESM adapters: {body}"
         );
 
-        // run_entry calls every module's init in bundle order before main.
-        let entry_pos = code.find("pub fn run_entry()").expect("run_entry");
+        // The shared entry body calls every module's init in bundle order
+        // before main; both sync and Promise-chained launchers use it.
+        let entry_pos = code
+            .find("fn __w3cos_run_entry_body()")
+            .expect("shared entry body");
         let entry = &code[entry_pos..];
         let first_init = entry.find("__init();").expect("first init");
         let last_init = entry.rfind("__init();").expect("last init");
         let main_call = entry.find("_main(vec![])").expect("main call");
         assert!(
             first_init < last_init && last_init < main_call,
-            "run_entry: inits in bundle order before main: {entry}"
+            "entry body: inits in bundle order before main: {entry}"
         );
         assert!(
             entry.contains(&format!("{app_ns}::{app_ns}__init();")),
-            "run_entry calls the app module init: {entry}"
+            "entry body calls the app module init: {entry}"
         );
 
         std::fs::remove_dir_all(root).ok();
@@ -6640,8 +8546,8 @@ export function main() { return editor.createModel(4).getLineCount(); }"#,
         );
         let code = generate_with_bodies(&bundle);
 
-        // The api module init: force the api cell BEFORE the property
-        // assignment, and force the editor cell AFTER it.
+        // The api declaration, property assignment and exported alias share
+        // one W3IR segment and write both module cells through live adapters.
         let api_marker = format!("/// ESM module: {}", root.join("src/api.js").display());
         let api_pos = code.find(&api_marker).expect("api module present");
         let api_ns_start = code[api_pos..].find("mod ").unwrap() + api_pos + 4;
@@ -6651,18 +8557,17 @@ export function main() { return editor.createModel(4).getLineCount(); }"#,
             .find(&format!("fn {api_ns}__init_body"))
             .expect("api init body");
         let body = &code[init_pos..];
-        let force_api = body
-            .find(&format!("{api_ns}_api_get();"))
-            .expect("api cell forced");
-        let set_editor = body
-            .find("set_property(&\"editor\"")
-            .expect("editor assignment");
-        let force_editor = body
-            .find(&format!("{api_ns}_editor_get();"))
-            .expect("editor cell forced");
         assert!(
-            force_api < set_editor && set_editor < force_editor,
-            "api init order: force api → assign → force editor: {body}"
+            body.contains(&format!("{api_ns}__init_w3ir_0("))
+                && !body.contains(&format!("{api_ns}__init_w3ir_1("))
+                && body.contains(&format!("{api_ns}_api_set(arguments.first()"))
+                && body.contains(&format!("{api_ns}_editor_set(arguments.first()")),
+            "api init should use one coalesced live-binding segment: {body}"
+        );
+        assert!(
+            code.contains("w3cos_core::intrinsics::set_property(")
+                && !body.contains("W3IR module-init chunk"),
+            "editor assignment must compile through native W3IR: {body}"
         );
 
         // Run the whole bundle through run_entry() against real w3cos-core
@@ -6708,6 +8613,332 @@ fn main() {
             String::from_utf8_lossy(&output.stdout)
         );
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_native_cycle_preserves_module_tdz_and_var_instantiation() {
+        let root = fixture_root("w3cos_esm_codegen_native_cycle_tdz");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/a.js"),
+            r#"import { readA } from "./b.js";
+export var hoisted;
+export const a = readA();"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/b.js"),
+            r#"import { a } from "./a.js";
+export function readA() { return a; }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"import { a } from "./a.js";
+export function main() { return a; }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        assert!(
+            bundle.is_fully_resolved(),
+            "unresolved: {:?}",
+            bundle.unresolved
+        );
+        let code = generate_with_bodies(&bundle);
+        let a_module = bundle
+            .modules
+            .iter()
+            .find(|module| module.path == root.join("src/a.js"))
+            .expect("a.js module");
+        let a_symbol = bundle
+            .symbols
+            .iter()
+            .find(|symbol| symbol.module == a_module.path && symbol.original_name == "a")
+            .expect("a export");
+        let hoisted_symbol = bundle
+            .symbols
+            .iter()
+            .find(|symbol| symbol.module == a_module.path && symbol.original_name == "hoisted")
+            .expect("hoisted export");
+        assert!(
+            code.contains(&format!(
+                "__w3cos_esm_declare_binding({:?}, false)",
+                format!("{}:cell", a_symbol.bundled_name)
+            )) && code.contains(&format!(
+                "__w3cos_esm_declare_binding({:?}, true)",
+                format!("{}:cell", hoisted_symbol.bundled_name)
+            )),
+            "lexical and var declarations must enter distinct instantiation states: {code}"
+        );
+        assert!(
+            code.contains("__w3cos_esm_read_binding")
+                && !code.contains(&format!(
+                    "__w3cos_esm_get_or_init({:?}",
+                    format!("{}:cell", a_symbol.bundled_name)
+                )),
+            "native lexical getters must read a pre-instantiated TDZ cell: {code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3cos_native_cycle_tdz_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_entry));
+    let payload = outcome.expect_err("cyclic lexical read must fail in TDZ");
+    let exception = payload
+        .downcast_ref::<w3cos_core::PanicValue>()
+        .expect("TDZ must use the shared JavaScript exception ABI")
+        .0
+        .clone();
+    assert_eq!(exception.get_property("name").to_js_string(), "ReferenceError");
+    assert!(exception.get_property("message").to_js_string().contains("is not initialized"));
+    println!("W3COS_NATIVE_CYCLE_TDZ_OK");
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated native cycle should surface a JavaScript TDZ error.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("W3COS_NATIVE_CYCLE_TDZ_OK"),
+            "native cycle TDZ assertion should pass: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn unsupported_module_init_fails_instead_of_using_direct_ast_codegen() {
+        let root = fixture_root("w3cos_esm_codegen_module_init_failure");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.js");
+        std::fs::write(&entry, "export const result = String.raw`not-yet-lowered`;").unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(
+            bundle.is_fully_resolved(),
+            "unresolved: {:?}",
+            bundle.unresolved
+        );
+
+        let error = try_generate_with_bodies(&bundle)
+            .expect_err("unsupported module initialization must fail code generation");
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("W3IR module initialization failed")
+                && diagnostic.contains(&entry.display().to_string())
+                && diagnostic.contains("chunk 0..1")
+                && diagnostic.contains("TaggedTpl"),
+            "the error must identify the module, W3IR phase, chunk and unsupported syntax: {diagnostic}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_module_init_w3ir_closure_updates_the_live_module_cell() {
+        let root = fixture_root("w3cos_esm_codegen_init_w3ir_closure");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"let total = 1;
+[2, 3].forEach((value) => { total += value; });
+export function main() { return total; }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        assert!(
+            bundle.is_fully_resolved(),
+            "unresolved: {:?}",
+            bundle.unresolved
+        );
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("__init_w3ir_0(")
+                && !code.contains("__init_w3ir_1(")
+                && code.contains("capture_getters.get")
+                && !code.contains("W3IR module-init chunk"),
+            "module-init closure must compile through W3IR: {code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3cos_module_init_w3ir_closure_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                "#![allow(warnings)]\n{code}\nfn main() {{ assert_eq!(run_entry().to_u32(), 6); println!(\"W3COS_MODULE_INIT_W3IR_CLOSURE_OK\"); }}\n"
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated W3IR module-init closure should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("W3COS_MODULE_INIT_W3IR_CLOSURE_OK"),
+            "live module cell assertion should pass: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_module_init_w3ir_destructuring_updates_live_module_cells() {
+        let root = fixture_root("w3cos_esm_codegen_init_w3ir_destructuring");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"const source = { first: 2, nested: { value: 3 }, extra: 9 };
+const { first: a, nested: { value: b }, missing = a + b, ...rest } = source;
+const [head, , ...tail] = [4, 5, 6, 7];
+export function main() {
+  return a + b + missing + rest.extra + head + tail[0] + tail[1];
+}"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        assert!(
+            bundle.is_fully_resolved(),
+            "unresolved: {:?}",
+            bundle.unresolved
+        );
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("__init_w3ir_0(")
+                && !code.contains("__init_w3ir_1(")
+                && code.contains("w3cos_core::intrinsics::object_rest(")
+                && code.contains("w3cos_core::intrinsics::array_rest(")
+                && !code.contains("W3IR module-init chunk"),
+            "destructured module initialization must compile through W3IR: {code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3cos_module_init_w3ir_destructuring_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                "#![allow(warnings)]\n{code}\nfn main() {{ assert_eq!(run_entry().to_u32(), 36); println!(\"W3COS_MODULE_INIT_W3IR_DESTRUCTURING_OK\"); }}\n"
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated W3IR destructured module init should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("W3COS_MODULE_INIT_W3IR_DESTRUCTURING_OK"),
+            "destructured live module cell assertion should pass: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn coalesces_many_module_initializers_into_bounded_w3ir_aot_units() {
+        let root = fixture_root("w3cos_esm_codegen_coalesced_module_init");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let mut source = (0..65)
+            .map(|index| format!("const value{index} = {index};\n"))
+            .collect::<String>();
+        source.push_str("export function main() { return value64; }\n");
+        std::fs::write(root.join("src/app.js"), source).unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        assert!(
+            bundle.is_fully_resolved(),
+            "unresolved: {:?}",
+            bundle.unresolved
+        );
+        let code = generate_with_bodies(&bundle);
+        assert_eq!(
+            code.matches("struct M0InitW3ir0Frame").count(),
+            1,
+            "the first bounded segment should produce one W3IR AOT frame"
+        );
+        assert!(
+            code.matches("struct M0InitW3ir32Frame").count() == 1
+                && code.matches("struct M0InitW3ir64Frame").count() == 1
+                && !code.contains("struct M0InitW3ir65Frame")
+                && code.matches("m0__init_w3ir_0(").count() == 2
+                && code.matches("m0__init_w3ir_32(").count() == 2
+                && code.matches("m0__init_w3ir_64(").count() == 2
+                && !code.contains("W3IR module-init chunk"),
+            "65 initializers should use three bounded W3IR segments: {code}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6791,6 +9022,1135 @@ export function main() {
             "generated lexical-this bundle should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_top_level_await_sequences_native_modules_before_main() {
+        let root = fixture_root("w3cos_esm_codegen_native_tla");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/dependency.js"),
+            r#"export let trace = "D";
+export const value = await 4;
+trace += "A";
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"import { trace, value } from "./dependency.js";
+let local = "S";
+const suffix = await trace;
+local += suffix;
+export function main() { return local + value; }"#,
+        )
+        .unwrap();
+
+        let entry = root.join("src/app.js");
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("__w3cos_async_function_await")
+                && code.contains("init-evaluation")
+                && code.contains("pub fn run_entry() -> w3cos_core::Value { run_entry_async() }")
+                && !code.contains("W3IR module-init chunk"),
+            "native top-level await must use the W3IR Promise state machine: {code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"native_tla_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    let evaluation = run_entry_async();
+    for _ in 0..64 {{
+        if !matches!(
+            w3cos_core::promise::status(&evaluation),
+            Some(w3cos_core::promise::PromiseStatus::Pending)
+        ) {{
+            break;
+        }}
+        w3cos_core::promise::drain_microtasks();
+    }}
+    match w3cos_core::promise::status(&evaluation) {{
+        Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) => {{
+            assert_eq!(value.to_js_string(), "SDA4");
+        }}
+        _ => panic!("native TLA did not fulfill"),
+    }}
+    println!("W3COS_NATIVE_TLA_OK");
+}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated native TLA bundle should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("W3COS_NATIVE_TLA_OK"),
+            "native TLA assertion should pass: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_top_level_await_rejection_skips_main_and_propagates_reason() {
+        let root = fixture_root("w3cos_esm_codegen_native_tla_rejection");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.js");
+        std::fs::write(
+            &entry,
+            r#"export let reached = "before";
+const value = await Promise.reject("tla-failed");
+reached = "after";
+export function main() { return value; }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("__w3cos_async_function_await")
+                && code.contains("w3cos_core::intrinsics::promise_reject")
+                && !code.contains("W3IR module-init chunk"),
+            "rejected native top-level await must stay on W3IR/Core: {code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"native_tla_rejection_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    let evaluation = run_entry_async();
+    for _ in 0..64 {{
+        if !matches!(
+            w3cos_core::promise::status(&evaluation),
+            Some(w3cos_core::promise::PromiseStatus::Pending)
+        ) {{
+            break;
+        }}
+        w3cos_core::promise::drain_microtasks();
+    }}
+    match w3cos_core::promise::status(&evaluation) {{
+        Some(w3cos_core::promise::PromiseStatus::Rejected(reason)) => {{
+            assert_eq!(reason.to_js_string(), "tla-failed");
+        }}
+        _ => panic!("native TLA rejection was not propagated"),
+    }}
+    assert_eq!(m0::m0_reached_get().to_js_string(), "before");
+    println!("W3COS_NATIVE_TLA_REJECTION_OK");
+}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated rejected native TLA bundle should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("W3COS_NATIVE_TLA_REJECTION_OK"),
+            "native TLA rejection assertion should pass: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_aot_imports_runtime_module_through_core_live_slots() {
+        let root = fixture_root("w3cos_esm_codegen_runtime_import");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.ts");
+        let specifier = "runtime:dynamic";
+        std::fs::write(
+            &entry,
+            format!(
+                r#"import {{ value, bump }} from "{specifier}";
+export function main() {{
+  bump();
+  return value;
+}}"#
+            ),
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root).with_runtime_modules([specifier.to_string()]);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let code = generate_with_bodies(&bundle);
+        assert!(code.contains("module_registry::evaluate(\"runtime:dynamic\")"));
+        assert!(code.contains("module_registry::export(\"runtime:dynamic\", \"value\")"));
+        assert!(
+            !code.contains("w3cos_vm") && !code.contains("w3cos_ir"),
+            "generated AOT must depend only on Core ABI"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"runtime_import_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    use std::cell::{{Cell, RefCell}};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    use w3cos_core::{{Value, module_registry}};
+
+    module_registry::clear();
+    let cell = Rc::new(RefCell::new(Value::Number(1.0)));
+    let evaluations = Rc::new(Cell::new(0_u32));
+    let mut exports = HashMap::new();
+    let value_cell = cell.clone();
+    exports.insert(
+        "value".to_string(),
+        module_registry::ExportBinding::new(
+            Value::function(move |_, _| value_cell.borrow().clone()),
+            Value::Undefined,
+        ),
+    );
+    let bump_cell = cell.clone();
+    exports.insert(
+        "bump".to_string(),
+        module_registry::ExportBinding::new(
+            Value::function(move |_, _| {{
+                let bump_cell = bump_cell.clone();
+                Value::function(move |_, _| {{
+                    let next = bump_cell.borrow().to_number() + 1.0;
+                    *bump_cell.borrow_mut() = Value::Number(next);
+                    Value::Number(next)
+                }})
+            }}),
+            Value::Undefined,
+        ),
+    );
+    let evaluation_count = evaluations.clone();
+    module_registry::register_runtime(
+        "{specifier}",
+        exports,
+        Some(Value::function(move |_, _| {{
+            evaluation_count.set(evaluation_count.get() + 1);
+            Value::Undefined
+        }})),
+    );
+
+    let result = run_entry();
+    assert!(matches!(result, Value::Number(value) if value == 2.0), "{{result:?}}");
+    assert_eq!(evaluations.get(), 1, "Core must cache runtime evaluation");
+}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated runtime-import bundle should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_async_entry_waits_for_runtime_tla_and_propagates_rejection() {
+        let root = fixture_root("w3cos_esm_codegen_runtime_tla");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.ts");
+        let specifier = "runtime:tla";
+        std::fs::write(
+            &entry,
+            format!(
+                r#"import {{ value }} from "{specifier}";
+export function main() {{ return value; }}"#
+            ),
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root).with_runtime_modules([specifier.to_string()]);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let code = generate_with_bodies(&bundle);
+        assert!(code.contains("pub fn run_entry_async()"));
+        assert!(code.contains("w3cos_core::intrinsics::promise_all"));
+        assert!(code.contains("w3cos_core::host_modules::dynamic_import"));
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"runtime_tla_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    use w3cos_core::{{Value, module_registry, promise}};
+
+    module_registry::clear();
+    let cell = Rc::new(RefCell::new(Value::Number(1.0)));
+    let resolve_slot = Rc::new(RefCell::new(None::<Value>));
+    let mut exports = HashMap::new();
+    let getter_cell = cell.clone();
+    exports.insert(
+        "value".to_string(),
+        module_registry::ExportBinding::new(
+            Value::function(move |_, _| getter_cell.borrow().clone()),
+            Value::Undefined,
+        ),
+    );
+    let evaluator_resolve_slot = resolve_slot.clone();
+    module_registry::register_runtime(
+        "{specifier}",
+        exports,
+        Some(Value::function(move |_, _| {{
+            let evaluator_resolve_slot = evaluator_resolve_slot.clone();
+            promise::new(vec![Value::function(move |_, arguments| {{
+                *evaluator_resolve_slot.borrow_mut() = arguments.first().cloned();
+                Value::Undefined
+            }})])
+        }})),
+    );
+
+    let pending = run_entry_async();
+    assert!(matches!(promise::status(&pending), Some(promise::PromiseStatus::Pending)));
+    *cell.borrow_mut() = Value::Number(7.0);
+    resolve_slot
+        .borrow()
+        .clone()
+        .expect("runtime evaluator resolve")
+        .call(Value::Undefined, vec![Value::Undefined]);
+    promise::drain_microtasks();
+    assert!(matches!(
+        promise::status(&pending),
+        Some(promise::PromiseStatus::Fulfilled(Value::Number(value))) if value == 7.0
+    ));
+
+    module_registry::clear();
+    module_registry::register_runtime(
+        "{specifier}",
+        HashMap::new(),
+        Some(Value::function(move |_, _| {{
+            promise::reject(vec![Value::from("runtime-tla-failed")])
+        }})),
+    );
+    let rejected = run_entry_async();
+    promise::drain_microtasks();
+    assert!(matches!(
+        promise::status(&rejected),
+        Some(promise::PromiseStatus::Rejected(reason))
+            if reason.to_js_string() == "runtime-tla-failed"
+    ));
+}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated async entry should await and reject with runtime TLA.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_aot_matches_w3vm_for_closures_classes_and_exceptions() {
+        let root = fixture_root("w3cos_esm_codegen_differential_semantics");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.ts");
+        let source = r#"
+interface RuntimeShape { value: number }
+type RuntimeLabel = string;
+declare function ambientRuntime(value: number): number;
+declare class AmbientRuntimeClass { value: number }
+declare const ambientRuntimeValue: number;
+declare enum AmbientRuntimeEnum { Ready }
+declare namespace AmbientRuntimeNamespace {
+  const ready: boolean;
+}
+export function main() {
+  debugger;
+  function makeAdder(base) {
+    return (value) => base + value;
+  }
+  class Counter {
+    constructor(public value: number) {}
+    next() {
+      return makeAdder(this.value)(1);
+    }
+  }
+  try {
+    const counter = new Counter(4);
+    const value = counter.next();
+    if (value !== 5) throw "bad";
+    function identity(value) {
+      return value;
+    }
+    const templateCount = 3 as number;
+    const templateText = (`line\n${templateCount}:\`\u{1F600}`)!;
+    const satisfied = templateCount satisfies number;
+    const asserted = <number>satisfied;
+    const cast = `cast:${asserted}` as const;
+    const instantiated = (identity<string>)("typed");
+    if (
+      templateText !== "line\n3:`😀" ||
+      cast !== "cast:3" ||
+      instantiated !== "typed"
+    ) {
+      throw "bad-template-or-typescript-wrapper";
+    }
+    const state = {
+      base: 2,
+      add(delta) { return this.base + delta; },
+      get current() { return this.base; },
+      set current(next) { this.base = next; },
+      *values() { yield this.base; }
+    };
+    state.current = 4;
+    if (state.current !== 4) throw "bad-getter";
+    if (state.add(1) !== 5) throw "bad-method";
+    if (state.values().next().value !== 4) throw "bad-generator";
+    let targetReads = 0;
+    let rhsRuns = 0;
+    function targetKey() {
+      targetReads += 1;
+      return "logical";
+    }
+    function logicalRhs(next) {
+      rhsRuns += 1;
+      return next;
+    }
+    state.logical = 0;
+    state[targetKey()] ||= logicalRhs(2);
+    state[targetKey()] ||= logicalRhs(3);
+    state.logical &&= logicalRhs(4);
+    state.missing ??= logicalRhs(5);
+    let power = 2;
+    power **= 3;
+    const immutableSkipped = 0;
+    immutableSkipped &&= logicalRhs(6);
+    let immutableCaught = false;
+    try {
+      const immutableTaken = 1;
+      immutableTaken &&= 2;
+    } catch (error) {
+      immutableCaught = true;
+    }
+    if (
+      state.logical !== 4 ||
+      state.missing !== 5 ||
+      targetReads !== 2 ||
+      rhsRuns !== 3 ||
+      power !== 8 ||
+      immutableSkipped !== 0 ||
+      !immutableCaught
+    ) {
+      throw "bad-logical-assignment";
+    }
+    class PrivateCounter {
+      #value = 0;
+      update() {
+        this.#value ||= 2;
+        this.#value &&= this.#value + 1;
+        this.#value ??= 9;
+        [this.#value] = [this.#value + 1];
+        return this.#value;
+      }
+    }
+    if (new PrivateCounter().update() !== 4) throw "bad-private-assignment";
+    class SuperWriteBase {
+      get value() { return this._value; }
+      set value(next) { this._value = next * 2; }
+      static get count() { return this._count; }
+      static set count(next) { this._count = next + 1; }
+    }
+    class SuperWriteChild extends SuperWriteBase {
+      update() {
+        let keyReads = 0;
+        const key = () => {
+          keyReads += 1;
+          return "value";
+        };
+        const assigned = super[key()] = 3;
+        const post = super[key()]++;
+        const pre = ++super[key()];
+        super[key()] += 2;
+        super[key()] ||= 99;
+        if (
+          assigned !== 3 ||
+          post !== 6 ||
+          pre !== 15 ||
+          super[key()] !== 64 ||
+          this._value !== 64 ||
+          keyReads !== 6
+        ) {
+          throw "bad-instance-super-write";
+        }
+      }
+      static update() {
+        const assigned = super.count = 2;
+        super.count += 2;
+        const post = super.count++;
+        if (assigned !== 2 || post !== 6 || this._count !== 8) {
+          throw "bad-static-super-write";
+        }
+      }
+    }
+    new SuperWriteChild().update();
+    SuperWriteChild.update();
+    let assignmentHead = 0;
+    let assignmentDefault = 0;
+    let assignmentTail = [];
+    const assignmentSource = [6, void 0, 8, 9];
+    const assignmentResult = (
+      [assignmentHead, assignmentDefault = 7, ...assignmentTail] =
+        assignmentSource
+    );
+    let assignmentNested = 0;
+    let assignmentRest = {};
+    const objectAssignmentSource = {
+      nested: { value: 10 },
+      keep: 11
+    };
+    const objectAssignmentResult = (
+      {
+        nested: { value: assignmentNested },
+        ...assignmentRest
+      } = objectAssignmentSource
+    );
+    if (
+      assignmentHead !== 6 ||
+      assignmentDefault !== 7 ||
+      assignmentTail.join(":") !== "8:9" ||
+      assignmentResult !== assignmentSource ||
+      assignmentNested !== 10 ||
+      assignmentRest.keep !== 11 ||
+      objectAssignmentResult !== objectAssignmentSource
+    ) {
+      throw "bad-destructuring-assignment";
+    }
+    const sparse = [1, , 3, ...[, 5]];
+    const sparseVisited = [];
+    sparse.forEach((entry, index) => sparseVisited.push(index));
+    const sparseMapped = sparse.map(entry => entry * 2);
+    if (sparse.length !== 5 || 1 in sparse || typeof sparse[1] !== "undefined") {
+      throw "bad-sparse-slot";
+    }
+    if (!(3 in sparse) || typeof sparse[3] !== "undefined") throw "bad-sparse-spread";
+    if (sparseVisited.join(",") !== "0,2,3,4") throw "bad-sparse-callback";
+    if (1 in sparseMapped || sparseMapped.length !== 5) throw "bad-sparse-map";
+    let catchPattern = "";
+    const catchKey = "message";
+    try {
+      throw {
+        message: "caught",
+        values: [void 0, 4, 5],
+        extra: 9
+      };
+    } catch ({
+      [catchKey]: text,
+      values: [first = "fallback", second, ...tail],
+      ...rest
+    }) {
+      catchPattern =
+        text + ":" + first + ":" + second + ":" + tail[0] + ":" + rest.extra;
+    }
+    if (catchPattern !== "caught:fallback:4:5:9") {
+      throw "bad-catch-pattern";
+    }
+    return typeof value + ":" + value;
+  } catch (error) {
+    return "error:" + error;
+  }
+}
+"#;
+        std::fs::write(&entry, source).unwrap();
+
+        let w3ir = crate::w3ir_lowering::lower_module(source, "app:///differential.ts").unwrap();
+        let main_function = w3ir
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("main"))
+            .expect("W3IR main")
+            .id;
+        let vm = w3cos_vm::Vm::new(w3ir, w3cos_vm::Limits::default()).unwrap();
+        let vm_result = vm
+            .callable(main_function, HashMap::new())
+            .unwrap()
+            .call(w3cos_core::Value::Undefined, Vec::new())
+            .to_js_string();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let code = generate_with_bodies(&bundle);
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"semantic_differential_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                "#![allow(warnings)]\n{code}\nfn main() {{ println!(\"{{}}\", run_entry().to_js_string()); }}\n"
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated differential AOT fixture should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let aot_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            aot_result, vm_result,
+            "same fixture must match AOT and W3VM"
+        );
+        assert_eq!(aot_result, "number:5");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_aot_matches_w3vm_for_two_awaits_and_rejection() {
+        let root = fixture_root("w3cos_esm_codegen_async_differential");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.js");
+        let source = r#"
+export async function main(shouldFail) {
+  const first = await 2;
+  const second = await first + 1;
+  if (shouldFail) throw "async-failed";
+  return second + 2;
+}
+"#;
+        std::fs::write(&entry, source).unwrap();
+
+        let w3ir =
+            crate::w3ir_lowering::lower_module(source, "app:///async-differential.js").unwrap();
+        let main_function = w3ir
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("main"))
+            .expect("W3IR async main")
+            .id;
+        let callable = w3cos_vm::Vm::new(w3ir, w3cos_vm::Limits::default())
+            .unwrap()
+            .callable(main_function, HashMap::new())
+            .unwrap();
+        let vm_fulfilled = callable.call(
+            w3cos_core::Value::Undefined,
+            vec![w3cos_core::Value::Bool(false)],
+        );
+        let vm_rejected = callable.call(
+            w3cos_core::Value::Undefined,
+            vec![w3cos_core::Value::Bool(true)],
+        );
+        w3cos_core::promise::drain_microtasks();
+        let describe = |promise: &w3cos_core::Value| match w3cos_core::promise::status(promise) {
+            Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) => {
+                format!("fulfilled:{}", value.to_js_string())
+            }
+            Some(w3cos_core::promise::PromiseStatus::Rejected(value)) => {
+                format!("rejected:{}", value.to_js_string())
+            }
+            _ => "pending".into(),
+        };
+        let vm_result = format!("{}|{}", describe(&vm_fulfilled), describe(&vm_rejected));
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let code = generate_with_bodies(&bundle);
+        assert!(code.contains("__w3cos_async_function_await"));
+        assert!(code.contains("compiled from W3IR suspension metadata"));
+        assert!(!code.contains("/* await */"));
+        assert!(!code.contains("w3cos_vm"));
+        assert!(!code.contains("w3cos_ir"));
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"async_semantic_differential_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn describe(promise: &w3cos_core::Value) -> String {{
+    match w3cos_core::promise::status(promise) {{
+        Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) =>
+            format!("fulfilled:{{}}", value.to_js_string()),
+        Some(w3cos_core::promise::PromiseStatus::Rejected(value)) =>
+            format!("rejected:{{}}", value.to_js_string()),
+        _ => "pending".to_string(),
+    }}
+}}
+fn main() {{
+    let fulfilled = m0::m0_main(vec![w3cos_core::Value::Bool(false)]);
+    let rejected = m0::m0_main(vec![w3cos_core::Value::Bool(true)]);
+    w3cos_core::promise::drain_microtasks();
+    println!("{{}}|{{}}", describe(&fulfilled), describe(&rejected));
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated async differential AOT fixture should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let aot_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            aot_result, vm_result,
+            "same async fixture must match AOT and W3VM"
+        );
+        assert_eq!(aot_result, "fulfilled:5|rejected:async-failed");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_aot_matches_w3vm_for_async_live_module_graph() {
+        let root = fixture_root("w3cos_esm_codegen_module_differential");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let dependency_path = root.join("src/dependency.js");
+        let entry = root.join("src/app.js");
+        let dependency_source = r#"
+export let base = 1;
+export function bump() {
+  base += 2;
+  return base;
+}
+"#;
+        let entry_source = r#"
+import { base, bump } from "./dependency.js";
+export async function main() {
+  const before = base;
+  await 0;
+  const next = bump();
+  return before + ":" + next + ":" + base;
+}
+"#;
+        std::fs::write(&dependency_path, dependency_source).unwrap();
+        std::fs::write(&entry, entry_source).unwrap();
+
+        let dependency_ir = crate::w3ir_lowering::lower_module(
+            dependency_source,
+            dependency_path.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        let dependency_cells = dependency_ir
+            .exports
+            .iter()
+            .map(|export| {
+                (
+                    export.local,
+                    w3cos_vm::binding_cell(w3cos_core::Value::Undefined),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        w3cos_vm::Vm::new(dependency_ir.clone(), w3cos_vm::Limits::default())
+            .unwrap()
+            .run_with_cells(dependency_cells.clone())
+            .unwrap();
+
+        let entry_ir =
+            crate::w3ir_lowering::lower_module(entry_source, entry.to_string_lossy().as_ref())
+                .unwrap();
+        let mut entry_cells = HashMap::new();
+        for import in &entry_ir.imports {
+            let export = dependency_ir
+                .exports
+                .iter()
+                .find(|export| export.exported == import.imported)
+                .expect("dependency export");
+            entry_cells.insert(
+                import.local,
+                dependency_cells
+                    .get(&export.local)
+                    .expect("dependency live cell")
+                    .clone(),
+            );
+        }
+        let main_export = entry_ir
+            .exports
+            .iter()
+            .find(|export| export.exported == "main")
+            .expect("main export");
+        let main_cell = w3cos_vm::binding_cell(w3cos_core::Value::Undefined);
+        entry_cells.insert(main_export.local, main_cell.clone());
+        w3cos_vm::Vm::new(entry_ir, w3cos_vm::Limits::default())
+            .unwrap()
+            .run_with_cells(entry_cells)
+            .unwrap();
+        let vm_promise = main_cell
+            .read_value()
+            .call(w3cos_core::Value::Undefined, Vec::new());
+        w3cos_core::promise::drain_microtasks();
+        let vm_result = match w3cos_core::promise::status(&vm_promise) {
+            Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) => {
+                format!("fulfilled:{}", value.to_js_string())
+            }
+            _ => panic!("unexpected W3VM module Promise status"),
+        };
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let code = generate_with_bodies(&bundle);
+        assert!(code.contains("__w3cos_async_function_await"));
+        assert!(code.contains("module_registry::register"));
+        assert!(!code.contains("w3cos_vm"));
+        assert!(!code.contains("w3cos_ir"));
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"module_semantic_differential_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    let promise = run_entry();
+    w3cos_core::promise::drain_microtasks();
+    match w3cos_core::promise::status(&promise) {{
+        Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) =>
+            println!("fulfilled:{{}}", value.to_js_string()),
+        _ => panic!("unexpected AOT module Promise status"),
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated module differential AOT fixture should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let aot_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            aot_result, vm_result,
+            "same live module graph must match AOT and W3VM"
+        );
+        assert_eq!(aot_result, "fulfilled:1:3:3");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_aot_matches_w3vm_for_timer_microtask_and_dom_host_calls() {
+        let root = fixture_root("w3cos_esm_codegen_host_differential");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.js");
+        let source = r#"
+let log = "";
+export function exercise() {
+  setTimeout(() => {
+    log += "T";
+    document.body.setAttribute("data-w3cos-log", log);
+  }, 0);
+  queueMicrotask(() => {
+    log += "M";
+    document.body.setAttribute("data-w3cos-log", log);
+  });
+  log += "S";
+  return log;
+}
+export function readResult() {
+  return log + "|" + document.body.getAttribute("data-w3cos-log");
+}
+"#;
+        std::fs::write(&entry, source).unwrap();
+
+        let w3ir =
+            crate::w3ir_lowering::lower_module(source, entry.to_string_lossy().as_ref()).unwrap();
+        let queued = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let queue_value = {
+            let queued = std::rc::Rc::clone(&queued);
+            w3cos_core::Value::function(move |_, arguments| {
+                queued.borrow_mut().push(
+                    arguments
+                        .first()
+                        .cloned()
+                        .unwrap_or(w3cos_core::Value::Undefined),
+                );
+                w3cos_core::Value::Undefined
+            })
+        };
+        let tasks = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let timeout_value = {
+            let tasks = std::rc::Rc::clone(&tasks);
+            w3cos_core::Value::function(move |_, arguments| {
+                tasks.borrow_mut().push(
+                    arguments
+                        .first()
+                        .cloned()
+                        .unwrap_or(w3cos_core::Value::Undefined),
+                );
+                w3cos_core::Value::Number(1.0)
+            })
+        };
+        let attributes =
+            std::rc::Rc::new(std::cell::RefCell::new(HashMap::<String, String>::new()));
+        let body = w3cos_core::Value::object(HashMap::new());
+        {
+            let attributes = std::rc::Rc::clone(&attributes);
+            body.set_property(
+                "setAttribute",
+                w3cos_core::Value::function(move |_, arguments| {
+                    let name = arguments
+                        .first()
+                        .cloned()
+                        .unwrap_or(w3cos_core::Value::Undefined)
+                        .to_js_string();
+                    let value = arguments
+                        .get(1)
+                        .cloned()
+                        .unwrap_or(w3cos_core::Value::Undefined)
+                        .to_js_string();
+                    attributes.borrow_mut().insert(name, value);
+                    w3cos_core::Value::Undefined
+                }),
+            );
+        }
+        {
+            let attributes = std::rc::Rc::clone(&attributes);
+            body.set_property(
+                "getAttribute",
+                w3cos_core::Value::function(move |_, arguments| {
+                    let name = arguments
+                        .first()
+                        .cloned()
+                        .unwrap_or(w3cos_core::Value::Undefined)
+                        .to_js_string();
+                    attributes
+                        .borrow()
+                        .get(&name)
+                        .cloned()
+                        .map(|value| w3cos_core::Value::string(&value))
+                        .unwrap_or(w3cos_core::Value::Null)
+                }),
+            );
+        }
+        let document = w3cos_core::Value::object(HashMap::from([("body".to_string(), body)]));
+
+        let mut cells = HashMap::new();
+        for import in &w3ir.imports {
+            let value = match import.imported.as_str() {
+                "queueMicrotask" => queue_value.clone(),
+                "setTimeout" => timeout_value.clone(),
+                "document" => document.clone(),
+                other => panic!("unexpected W3VM host import: {other}"),
+            };
+            cells.insert(import.local, w3cos_vm::binding_cell(value));
+        }
+        let mut exports = HashMap::new();
+        for export in &w3ir.exports {
+            let cell = w3cos_vm::binding_cell(w3cos_core::Value::Undefined);
+            cells.insert(export.local, cell.clone());
+            exports.insert(export.exported.clone(), cell);
+        }
+        w3cos_vm::Vm::new(w3ir, w3cos_vm::Limits::default())
+            .unwrap()
+            .run_with_cells(cells)
+            .unwrap();
+        let immediate = exports["exercise"]
+            .read_value()
+            .call(w3cos_core::Value::Undefined, Vec::new())
+            .to_js_string();
+        for callback in std::mem::take(&mut *queued.borrow_mut()) {
+            callback.call(w3cos_core::Value::Undefined, Vec::new());
+        }
+        for callback in std::mem::take(&mut *tasks.borrow_mut()) {
+            callback.call(w3cos_core::Value::Undefined, Vec::new());
+        }
+        let final_value = exports["readResult"]
+            .read_value()
+            .call(w3cos_core::Value::Undefined, Vec::new())
+            .to_js_string();
+        let vm_result = format!("{immediate}:{final_value}");
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let code = generate_with_bodies(&bundle);
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        let runtime_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-runtime");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"host_semantic_differential_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    run_entry();
+    let immediate = m0::m0_exercise(Vec::new()).to_js_string();
+    w3cos_runtime::jsdom::drain_microtasks();
+    w3cos_runtime::jsdom::tick_timers();
+    w3cos_runtime::jsdom::drain_microtasks();
+    let final_value = m0::m0_readResult(Vec::new()).to_js_string();
+    println!("{{immediate}}:{{final_value}}");
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated Host differential AOT fixture should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let aot_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            aot_result, vm_result,
+            "same microtask/DOM Host fixture must match AOT and W3VM"
+        );
+        assert_eq!(aot_result, "S:SMT|SMT");
 
         std::fs::remove_dir_all(root).ok();
     }

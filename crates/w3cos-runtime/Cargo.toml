@@ -12,6 +12,13 @@ cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe"]
 devtools = []
 ai-bridge = ["dep:w3cos-ai-bridge"]
+dynamic-js = [
+    "dep:w3cos-compiler",
+    "dep:w3cos-ir",
+    "dep:w3cos-vm",
+    "dep:base64",
+    "dep:wuff",
+]
 # Type-check the OHOS renderer on a non-OHOS host without pretending that the
 # host libc has target_env="ohos". Production builds do not enable this.
 ohos-check = ["skia", "skia-safe/gl"]
@@ -20,6 +27,13 @@ ohos-check = ["skia", "skia-safe/gl"]
 w3cos-std = { workspace = true }
 w3cos-dom = { workspace = true }
 w3cos-core = { workspace = true }
+w3cos-compiler = { workspace = true, optional = true }
+w3cos-ir = { workspace = true, optional = true }
+w3cos-vm = { workspace = true, optional = true }
+url = { workspace = true }
+base64 = { version = "0.22", optional = true }
+ring = "0.17"
+psl = { workspace = true }
 w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
 parley = { workspace = true }
@@ -27,6 +41,7 @@ fontdue = { workspace = true }
 anyhow = { workspace = true }
 image = { workspace = true }
 flate2 = { workspace = true }
+wuff = { workspace = true, optional = true }
 resvg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -58,6 +73,7 @@ libsqlite3-sys = { version = "0.35", features = ["bundled"] }
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 winit = { workspace = true }
 skia-safe = { version = "=0.93.1", optional = true, features = ["metal"] }
+security-framework = "3.7"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.5.2"

@@ -3515,7 +3515,7 @@ fn json_graph_to_value(graph: &serde_json::Map<String, JsonValue>) -> Value {
                     .map(|value| json_graph_part_to_value(value, &placeholders))
                     .collect::<Vec<_>>();
                 if let Value::Array(storage) = &placeholders[index] {
-                    *storage.borrow_mut() = items;
+                    storage.borrow_mut().replace_values(items);
                 }
             }
             Some("object") => {

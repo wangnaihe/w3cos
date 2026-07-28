@@ -65,7 +65,7 @@ pub fn write_mobile_dom_project(
         w3cos_runtime::dom::set_attribute(root, "id", "root");
         w3cos_runtime::dom::append_child(w3cos_runtime::dom::body_id(), root);
     }
-    crate::esm_bundle::run_entry();
+    let _ = crate::esm_bundle::run_entry_async();
 }
 "#;
     if platform == "ios" {

@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -24,7 +25,8 @@ fn illegal_class(name: &'static str) -> Value {
         if let Some(class) = classes.borrow().get(name).cloned() {
             return class;
         }
-        let class = Value::function(move |_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, _| {
             w3cos_core::throw_value(type_error(&format!("Illegal constructor: {name}")))
         });
         class.set_property("name", Value::string(name));
@@ -54,16 +56,12 @@ fn launch_params(files: Vec<Value>, target_url: &str) -> Value {
         ("files".into(), Value::array(files)),
         ("targetURL".into(), Value::string(target_url)),
     ]));
-    let prototype = launch_params_class().get_property("prototype");
-    for name in ["files", "targetURL"] {
-        prototype.set_property(name, value.get_property(name));
-    }
-    w3cos_core::class::set_prototype_of(&value, &prototype);
+    w3cos_core::class::set_prototype_of(&value, &launch_params_class().get_property("prototype"));
     value
 }
 
-fn schedule_delivery(consumer: Value, params: Value) {
-    crate::jsdom::queue_microtask_value(Value::function(move |_, _| {
+fn schedule_delivery(generation: u32, consumer: Value, params: Value) {
+    crate::jsdom::queue_microtask_value(realm_function(generation, move |_, _| {
         consumer.call(Value::Undefined, vec![params.clone()]);
         Value::Undefined
     }));
@@ -72,10 +70,11 @@ fn schedule_delivery(consumer: Value, params: Value) {
 /// Queue a native/PWA launch. Launches arriving before `setConsumer()` are
 /// retained and delivered in order once application code installs a consumer.
 pub fn enqueue_launch(files: Vec<Value>, target_url: &str) {
+    let generation = crate::jsdom::realm_generation();
     let params = launch_params(files, target_url);
     let consumer = CONSUMER.with(|consumer| consumer.borrow().clone());
     if let Some(consumer) = consumer {
-        schedule_delivery(consumer, params);
+        schedule_delivery(generation, consumer, params);
     } else {
         PENDING.with(|pending| pending.borrow_mut().push(params));
     }
@@ -86,10 +85,11 @@ pub fn launch_queue_value() -> Value {
         if let Some(queue) = slot.borrow().clone() {
             return queue;
         }
+        let generation = crate::jsdom::realm_generation();
         let queue = Value::object(HashMap::new());
         queue.set_property(
             "setConsumer",
-            Value::function(|_, args| {
+            realm_function(generation, move |_, args| {
                 let consumer = args.first().cloned().unwrap_or(Value::Undefined);
                 if !consumer.is_function() {
                     w3cos_core::throw_value(type_error(
@@ -99,7 +99,7 @@ pub fn launch_queue_value() -> Value {
                 CONSUMER.with(|slot| *slot.borrow_mut() = Some(consumer.clone()));
                 let pending = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
                 for params in pending {
-                    schedule_delivery(consumer.clone(), params);
+                    schedule_delivery(generation, consumer.clone(), params);
                 }
                 Value::Undefined
             }),
@@ -112,8 +112,20 @@ pub fn launch_queue_value() -> Value {
     })
 }
 
+pub fn reset_realm() {
+    CLASSES.with(|classes| classes.borrow_mut().clear());
+    LAUNCH_QUEUE.with(|queue| {
+        queue.borrow_mut().take();
+    });
+    CONSUMER.with(|consumer| {
+        consumer.borrow_mut().take();
+    });
+    PENDING.with(|pending| pending.borrow_mut().clear());
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -121,8 +133,7 @@ mod tests {
 
     #[test]
     fn launch_before_consumer_is_delivered_asynchronously() {
-        CONSUMER.with(|consumer| *consumer.borrow_mut() = None);
-        PENDING.with(|pending| pending.borrow_mut().clear());
+        reset_realm();
         enqueue_launch(vec![Value::string("handle")], "w3cos://app/open");
         let received = Rc::new(RefCell::new(String::new()));
         let received_for_consumer = Rc::clone(&received);
@@ -137,5 +148,94 @@ mod tests {
         assert!(received.borrow().is_empty());
         crate::jsdom::drain_microtasks();
         assert_eq!(&*received.borrow(), "w3cos://app/open");
+        reset_realm();
+    }
+
+    #[test]
+    fn launch_params_keep_instance_fields_off_the_shared_prototype() {
+        reset_realm();
+        let first = launch_params(vec![Value::string("first")], "w3cos://app/first");
+        let second = launch_params(vec![Value::string("second")], "w3cos://app/second");
+
+        assert_eq!(
+            first.get_property("targetURL").to_js_string(),
+            "w3cos://app/first"
+        );
+        assert_eq!(
+            second.get_property("targetURL").to_js_string(),
+            "w3cos://app/second"
+        );
+        let prototype = launch_params_class().get_property("prototype");
+        assert!(prototype.get_property("targetURL").is_undefined());
+        assert!(prototype.get_property("files").is_undefined());
+        reset_realm();
+    }
+
+    #[test]
+    fn queue_consumers_and_pending_launches_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_queue = launch_queue_value();
+        let old_queue_class = launch_queue_class();
+        let old_params_class = launch_params_class();
+        old_queue_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+        let stale_deliveries = Rc::new(Cell::new(0));
+        old_queue.call_method(
+            "setConsumer",
+            vec![Value::function({
+                let stale_deliveries = Rc::clone(&stale_deliveries);
+                move |_, _| {
+                    stale_deliveries.set(stale_deliveries.get() + 1);
+                    Value::Undefined
+                }
+            })],
+        );
+        enqueue_launch(vec![], "w3cos://app/stale");
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::jsdom::drain_microtasks();
+        assert_eq!(stale_deliveries.get(), 0);
+
+        let new_queue = launch_queue_value();
+        let new_queue_class = launch_queue_class();
+        let new_params_class = launch_params_class();
+        assert!(old_queue != new_queue);
+        assert!(old_queue_class != new_queue_class);
+        assert!(old_params_class != new_params_class);
+        assert!(
+            new_queue_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(
+            old_queue
+                .call_method(
+                    "setConsumer",
+                    vec![Value::function(|_, _| Value::Undefined)]
+                )
+                .is_undefined()
+        );
+
+        enqueue_launch(vec![Value::string("fresh")], "w3cos://app/fresh");
+        let received = Rc::new(RefCell::new(String::new()));
+        new_queue.call_method(
+            "setConsumer",
+            vec![Value::function({
+                let received = Rc::clone(&received);
+                move |_, args| {
+                    *received.borrow_mut() = args[0].get_property("targetURL").to_js_string();
+                    Value::Undefined
+                }
+            })],
+        );
+        crate::jsdom::drain_microtasks();
+        assert_eq!(&*received.borrow(), "w3cos://app/fresh");
+        reset_realm();
     }
 }

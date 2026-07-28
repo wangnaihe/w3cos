@@ -267,6 +267,8 @@ impl PwaManifest {
             entry,
             icon: icon_192,
             permissions: self.permissions.clone(),
+            module_aliases: std::collections::HashMap::new(),
+            runtime_modules: Vec::new(),
             window: WindowConfig {
                 title: self.name.clone().or_else(|| self.short_name.clone()),
                 frame,

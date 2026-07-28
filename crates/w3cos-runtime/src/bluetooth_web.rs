@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -88,7 +89,8 @@ pub fn interface_class(name: &str) -> Value {
         else {
             return Value::Undefined;
         };
-        let class = Value::function(move |_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, _| {
             w3cos_core::throw_value(dom_error(
                 "TypeError",
                 &format!("Illegal constructor: {name}"),
@@ -119,7 +121,7 @@ pub fn interface_class(name: &str) -> Value {
             ] {
                 class.set_property(
                     method,
-                    Value::function(move |_, args| {
+                    realm_function(generation, move |_, args| {
                         bluetooth_uuid(method, args.first().cloned().unwrap_or_default())
                     }),
                 );
@@ -160,7 +162,8 @@ pub fn bluetooth_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(dom_error("TypeError", "Illegal constructor: Bluetooth"))
         });
         class.set_property("name", Value::string("Bluetooth"));
@@ -246,6 +249,7 @@ fn descriptor_value(
     descriptor_uuid: String,
     characteristic: Value,
 ) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let descriptor = Value::object(HashMap::from([
         ("characteristic".into(), characteristic),
         ("uuid".into(), Value::string(&descriptor_uuid)),
@@ -258,7 +262,7 @@ fn descriptor_value(
     let read_uuid = descriptor_uuid.clone();
     descriptor.set_property(
         "readValue",
-        Value::function(move |_, _| {
+        realm_function(generation, move |_, _| {
             promise(
                 host_call(
                     "read_descriptor",
@@ -295,7 +299,7 @@ fn descriptor_value(
     let write_uuid = descriptor_uuid;
     descriptor.set_property(
         "writeValue",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let Some(bytes) = args.first().and_then(w3cos_core::binary::bytes_of) else {
                 return promise(Err(dom_error(
                     "TypeError",
@@ -340,6 +344,7 @@ fn characteristic_value(
     service_uuid: String,
     characteristic_uuid: String,
 ) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let service = Value::object(HashMap::from([
         ("device".into(), Value::Null),
         ("isPrimary".into(), Value::Bool(true)),
@@ -372,7 +377,7 @@ fn characteristic_value(
         let characteristic_uuid = characteristic_uuid.clone();
         value.set_property(
             method,
-            Value::function(move |_, args| {
+            realm_function(generation, move |_, args| {
                 let Some(bytes) = args.first().and_then(w3cos_core::binary::bytes_of) else {
                     return promise(Err(dom_error(
                         "TypeError",
@@ -407,7 +412,7 @@ fn characteristic_value(
     let read_characteristic_uuid = characteristic_uuid.clone();
     value.set_property(
         "readValue",
-        Value::function(move |_, _| {
+        realm_function(generation, move |_, _| {
             let payload = Value::object(HashMap::from([
                 ("device_id".to_string(), Value::string(&read_device_id)),
                 (
@@ -441,7 +446,7 @@ fn characteristic_value(
         let notify_characteristic = characteristic_uuid.clone();
         value.set_property(
             method,
-            Value::function(move |_, _| {
+            realm_function(generation, move |_, _| {
                 promise(
                     host_call(
                         if method == "startNotifications" {
@@ -469,7 +474,7 @@ fn characteristic_value(
     let descriptor_characteristic_uuid = characteristic_uuid.clone();
     value.set_property(
         "getDescriptor",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let descriptor_uuid = args.first().cloned().unwrap_or_default().to_js_string();
             if descriptor_uuid.is_empty() {
                 return promise(Err(dom_error("TypeError", "A descriptor UUID is required")));
@@ -501,7 +506,7 @@ fn characteristic_value(
     );
     value.set_property(
         "getDescriptors",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             promise(Err(dom_error(
                 "NotSupportedError",
                 "Enumerating GATT descriptors requires a host Bluetooth adapter",
@@ -516,6 +521,7 @@ fn characteristic_value(
 }
 
 fn service_value(device_id: String, service_uuid: String) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::from([
         ("device".to_string(), Value::Null),
         ("isPrimary".to_string(), Value::Bool(true)),
@@ -525,7 +531,7 @@ fn service_value(device_id: String, service_uuid: String) -> Value {
     let characteristic_service = service_uuid.clone();
     value.set_property(
         "getCharacteristic",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let characteristic_uuid = args.first().cloned().unwrap_or_default().to_js_string();
             if characteristic_uuid.is_empty() {
                 return promise(Err(dom_error(
@@ -558,7 +564,7 @@ fn service_value(device_id: String, service_uuid: String) -> Value {
     );
     value.set_property(
         "getCharacteristics",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             promise(Err(dom_error(
                 "NotSupportedError",
                 "Enumerating GATT characteristics requires a host Bluetooth adapter",
@@ -573,6 +579,7 @@ fn service_value(device_id: String, service_uuid: String) -> Value {
 }
 
 fn gatt_server_value(device_id: String) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::from([
         ("connected".to_string(), Value::Bool(true)),
         ("device".to_string(), Value::Null),
@@ -580,7 +587,7 @@ fn gatt_server_value(device_id: String) -> Value {
     let connect_device_id = device_id.clone();
     value.set_property(
         "connect",
-        Value::function(move |this, _| {
+        realm_function(generation, move |this, _| {
             promise(
                 host_call(
                     "connect",
@@ -599,7 +606,7 @@ fn gatt_server_value(device_id: String) -> Value {
     let service_device_id = device_id.clone();
     value.set_property(
         "getPrimaryService",
-        Value::function(move |this, args| {
+        realm_function(generation, move |this, args| {
             let service_uuid = args.first().cloned().unwrap_or_default().to_js_string();
             if service_uuid.is_empty() {
                 return promise(Err(dom_error("TypeError", "A service UUID is required")));
@@ -618,7 +625,7 @@ fn gatt_server_value(device_id: String) -> Value {
     );
     value.set_property(
         "disconnect",
-        Value::function(move |this, _| {
+        realm_function(generation, move |this, _| {
             let payload = Value::object(HashMap::from([(
                 "device_id".to_string(),
                 Value::string(&device_id),
@@ -630,7 +637,7 @@ fn gatt_server_value(device_id: String) -> Value {
     );
     value.set_property(
         "getPrimaryServices",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             promise(Err(dom_error(
                 "NotSupportedError",
                 "Enumerating primary GATT services requires a host Bluetooth adapter",
@@ -665,10 +672,11 @@ fn device_value(response: &Value) -> Value {
 }
 
 pub fn bluetooth_value() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let bluetooth = w3cos_core::class::construct(&crate::web_events::event_target_class(), vec![]);
     bluetooth.set_property(
         "getAvailability",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             promise(
                 host_call("get_availability", Value::object(HashMap::new()))
                     .map(|response| Value::Bool(response.get_property("available").to_bool())),
@@ -677,7 +685,7 @@ pub fn bluetooth_value() -> Value {
     );
     bluetooth.set_property(
         "requestDevice",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             let options = args.first().cloned().unwrap_or_default();
             promise(host_call("request_device", options).map(|response| device_value(&response)))
         }),
@@ -686,9 +694,20 @@ pub fn bluetooth_value() -> Value {
     bluetooth
 }
 
+pub fn reset_realm() {
+    BLUETOOTH_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    BLUETOOTH_INTERFACE_CLASSES.with(|classes| {
+        classes.borrow_mut().clear();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
     fn exposes_web_bluetooth_entry_points() {
@@ -755,5 +774,97 @@ mod tests {
                 .to_js_string(),
             "00002a19-0000-1000-8000-00805f9b34fb"
         );
+    }
+
+    #[test]
+    fn bluetooth_classes_and_host_entry_points_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_bluetooth_class = bluetooth_class();
+        let old_device_class = interface_class("BluetoothDevice");
+        let old_uuid_class = interface_class("BluetoothUUID");
+        let old_bluetooth = bluetooth_value();
+        let response = Value::object(HashMap::from([
+            ("device_id".to_string(), Value::string("ble:realm")),
+            ("name".to_string(), Value::string("Realm device")),
+        ]));
+        let old_device = device_value(&response);
+        let old_gatt = old_device.get_property("gatt");
+        let old_characteristic = characteristic_value(
+            "ble:realm".to_string(),
+            "0000180f-0000-1000-8000-00805f9b34fb".to_string(),
+            "00002a19-0000-1000-8000-00805f9b34fb".to_string(),
+        );
+        let host_calls = Rc::new(Cell::new(0_u32));
+        let host_calls_for_module = Rc::clone(&host_calls);
+        w3cos_core::host::register_host_module("web-bluetooth", move |_, _| {
+            host_calls_for_module.set(host_calls_for_module.get() + 1);
+            Value::object(HashMap::from([("available".into(), Value::Bool(true))]))
+        });
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_bluetooth_class.strict_eq(&bluetooth_class()));
+        assert!(!old_device_class.strict_eq(&interface_class("BluetoothDevice")));
+        assert!(!old_uuid_class.strict_eq(&interface_class("BluetoothUUID")));
+        assert!(
+            old_bluetooth_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(
+            old_uuid_class
+                .call_method("getService", vec![Value::string("battery_service")])
+                .is_undefined()
+        );
+        assert!(
+            old_bluetooth
+                .call_method("getAvailability", vec![])
+                .is_undefined()
+        );
+        assert!(
+            old_bluetooth
+                .call_method("requestDevice", vec![Value::object(HashMap::new())])
+                .is_undefined()
+        );
+        assert!(old_gatt.call_method("connect", vec![]).is_undefined());
+        assert!(
+            old_gatt
+                .call_method("getPrimaryService", vec![Value::string("battery_service")],)
+                .is_undefined()
+        );
+        assert!(
+            old_characteristic
+                .call_method("readValue", vec![])
+                .is_undefined()
+        );
+        assert!(
+            old_characteristic
+                .call_method(
+                    "writeValueWithResponse",
+                    vec![w3cos_core::binary::array_buffer_value(vec![1])],
+                )
+                .is_undefined()
+        );
+        assert!(
+            old_characteristic
+                .call_method("startNotifications", vec![])
+                .is_undefined()
+        );
+        assert_eq!(host_calls.get(), 0);
+
+        let fresh_bluetooth = bluetooth_value();
+        assert!(
+            fresh_bluetooth
+                .call_method("getAvailability", vec![])
+                .is_object()
+        );
+        assert_eq!(host_calls.get(), 1);
+
+        w3cos_core::host::unregister_host_module("web-bluetooth");
+        reset_realm();
     }
 }

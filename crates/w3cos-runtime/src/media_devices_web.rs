@@ -11,6 +11,8 @@ use std::sync::Once;
 
 use w3cos_core::Value;
 
+use crate::jsdom::realm_function;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaDevice {
     pub device_id: String,
@@ -45,6 +47,10 @@ thread_local! {
     static MEDIA_STATS_CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     static TRACK_GENERATORS: RefCell<HashMap<String, Rc<RefCell<TrackGeneratorState>>>> =
         RefCell::new(HashMap::new());
+}
+
+fn realm_media_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
 }
 
 fn media_stats_members(name: &str) -> &'static [&'static str] {
@@ -88,7 +94,7 @@ pub fn media_stats_class(name: &str) -> Value {
         .find(|candidate| candidate == &name) else {
             return Value::Undefined;
         };
-        let class = Value::function(move |_, _| {
+        let class = realm_media_function(move |_, _| {
             w3cos_core::throw_value(named_error(
                 "TypeError",
                 &format!("Illegal constructor: {name}"),
@@ -118,7 +124,7 @@ pub fn media_stats_value(name: &str) -> Value {
     if media_stats_members(name).contains(&"resetLatency") {
         stats.set_property(
             "resetLatency",
-            Value::function(|this, _| {
+            realm_media_function(|this, _| {
                 for member in [
                     "averageLatency",
                     "latency",
@@ -137,7 +143,7 @@ pub fn media_stats_value(name: &str) -> Value {
     let class_name = name.to_string();
     stats.set_property(
         "toJSON",
-        Value::function(move |_, _| {
+        realm_media_function(move |_, _| {
             Value::object(
                 media_stats_members(&class_name)
                     .iter()
@@ -165,7 +171,7 @@ pub fn overconstrained_error_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let class = realm_media_function(|this, args| {
             let constraint = args.first().map(Value::to_js_string).unwrap_or_default();
             let message = args.get(1).map(Value::to_js_string).unwrap_or_default();
             crate::unsupported::dom_exception_class().call(
@@ -207,7 +213,7 @@ fn simple_class(
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| Value::Undefined);
+        let class = realm_media_function(|_, _| Value::Undefined);
         class.set_property("name", Value::string(name));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -222,7 +228,7 @@ pub fn media_devices_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_media_function(|_, _| {
             w3cos_core::throw_value(named_error(
                 "TypeError",
                 "Illegal constructor: MediaDevices",
@@ -300,7 +306,7 @@ fn media_stream_track_generator_value(options: Value) -> Value {
     let write_kind = kind;
     let sink = Value::object(HashMap::from([(
         "write".into(),
-        Value::function(move |_, args| {
+        realm_media_function(move |_, args| {
             let frame = args.first().cloned().unwrap_or(Value::Undefined);
             let expected = if write_kind == "audio" {
                 crate::webcodecs_web::class_for("AudioData")
@@ -364,7 +370,7 @@ pub fn media_stream_track_generator_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_media_function(|_, args| {
             media_stream_track_generator_value(args.first().cloned().unwrap_or(Value::Undefined))
         });
         class.set_property("name", Value::string("MediaStreamTrackGenerator"));
@@ -397,7 +403,7 @@ fn media_stream_track_processor_value(options: Value) -> Value {
     let start_state = Rc::clone(&state);
     let source = Value::object(HashMap::from([(
         "start".into(),
-        Value::function(move |_, args| {
+        realm_media_function(move |_, args| {
             *start_state.controller.borrow_mut() =
                 args.first().cloned().unwrap_or(Value::Undefined);
             Value::Undefined
@@ -430,11 +436,11 @@ fn media_stream_track_processor_value(options: Value) -> Value {
         ("readable".into(), readable),
         (
             "__w3cos_getter_totalFrames".into(),
-            Value::function(move |_, _| Value::Number(total_state.total_frames.get() as f64)),
+            realm_media_function(move |_, _| Value::Number(total_state.total_frames.get() as f64)),
         ),
         (
             "__w3cos_getter_discardedFrames".into(),
-            Value::function(move |_, _| {
+            realm_media_function(move |_, _| {
                 Value::Number(discarded_state.discarded_frames.get() as f64)
             }),
         ),
@@ -451,7 +457,7 @@ pub fn media_stream_track_processor_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_media_function(|_, args| {
             media_stream_track_processor_value(args.first().cloned().unwrap_or(Value::Undefined))
         });
         class.set_property("name", Value::string("MediaStreamTrackProcessor"));
@@ -471,7 +477,7 @@ pub fn media_device_info_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_media_function(|_, _| {
             w3cos_core::throw_value(named_error(
                 "TypeError",
                 "Illegal constructor: MediaDeviceInfo",
@@ -485,7 +491,7 @@ pub fn media_device_info_class() -> Value {
         }
         prototype.set_property(
             "toJSON",
-            Value::function(|this, _| {
+            realm_media_function(|this, _| {
                 Value::object(HashMap::from([
                     ("deviceId".to_string(), this.get_property("deviceId")),
                     ("kind".to_string(), this.get_property("kind")),
@@ -505,7 +511,7 @@ pub fn input_device_info_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_media_function(|_, _| {
             w3cos_core::throw_value(named_error(
                 "TypeError",
                 "Illegal constructor: InputDeviceInfo",
@@ -516,7 +522,7 @@ pub fn input_device_info_class() -> Value {
         prototype.set_property("constructor", class.clone());
         prototype.set_property(
             "getCapabilities",
-            Value::function(|_, _| Value::object(HashMap::new())),
+            realm_media_function(|_, _| Value::object(HashMap::new())),
         );
         w3cos_core::class::set_prototype_of(
             &prototype,
@@ -558,7 +564,7 @@ pub(crate) fn track_value(kind: &str, label: &str) -> Value {
     crate::web_events::event_target_class().call(value.clone(), vec![]);
     value.set_property(
         "stop",
-        Value::function(|this, _| {
+        realm_media_function(|this, _| {
             if this.get_property("readyState").to_js_string() != "ended" {
                 this.set_property("readyState", Value::string("ended"));
                 let event = w3cos_core::class::construct(
@@ -572,7 +578,7 @@ pub(crate) fn track_value(kind: &str, label: &str) -> Value {
     );
     value.set_property(
         "clone",
-        Value::function(|this, _| {
+        realm_media_function(|this, _| {
             track_value(
                 &this.get_property("kind").to_js_string(),
                 &this.get_property("label").to_js_string(),
@@ -581,15 +587,15 @@ pub(crate) fn track_value(kind: &str, label: &str) -> Value {
     );
     value.set_property(
         "getCapabilities",
-        Value::function(|_, _| Value::object(HashMap::new())),
+        realm_media_function(|_, _| Value::object(HashMap::new())),
     );
     value.set_property(
         "getConstraints",
-        Value::function(|_, _| Value::object(HashMap::new())),
+        realm_media_function(|_, _| Value::object(HashMap::new())),
     );
     value.set_property(
         "getSettings",
-        Value::function(|this, _| {
+        realm_media_function(|this, _| {
             Value::object(HashMap::from([(
                 "deviceId".to_string(),
                 this.get_property("id"),
@@ -598,7 +604,7 @@ pub(crate) fn track_value(kind: &str, label: &str) -> Value {
     );
     value.set_property(
         "applyConstraints",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
+        realm_media_function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
     );
     w3cos_core::class::set_prototype_of(
         &value,
@@ -627,7 +633,7 @@ pub(crate) fn stream_value(tracks: Vec<Value>) -> Value {
     crate::web_events::event_target_class().call(value.clone(), vec![]);
     value.set_property(
         "__w3cos_getter_active",
-        Value::function(|this, _| {
+        realm_media_function(|this, _| {
             Value::Bool(
                 tracks_from(&this)
                     .iter()
@@ -637,12 +643,12 @@ pub(crate) fn stream_value(tracks: Vec<Value>) -> Value {
     );
     value.set_property(
         "getTracks",
-        Value::function(|this, _| Value::array(tracks_from(&this))),
+        realm_media_function(|this, _| Value::array(tracks_from(&this))),
     );
     for (method, kind) in [("getAudioTracks", "audio"), ("getVideoTracks", "video")] {
         value.set_property(
             method,
-            Value::function(move |this, _| {
+            realm_media_function(move |this, _| {
                 Value::array(
                     tracks_from(&this)
                         .into_iter()
@@ -654,7 +660,7 @@ pub(crate) fn stream_value(tracks: Vec<Value>) -> Value {
     }
     value.set_property(
         "getTrackById",
-        Value::function(|this, args| {
+        realm_media_function(|this, args| {
             let id = args.first().cloned().unwrap_or_default().to_js_string();
             tracks_from(&this)
                 .into_iter()
@@ -664,7 +670,7 @@ pub(crate) fn stream_value(tracks: Vec<Value>) -> Value {
     );
     value.set_property(
         "addTrack",
-        Value::function(|this, args| {
+        realm_media_function(|this, args| {
             let track = args.first().cloned().unwrap_or_default();
             let mut tracks = tracks_from(&this);
             if !tracks.iter().any(|existing| existing.strict_eq(&track)) {
@@ -682,7 +688,7 @@ pub(crate) fn stream_value(tracks: Vec<Value>) -> Value {
     );
     value.set_property(
         "removeTrack",
-        Value::function(|this, args| {
+        realm_media_function(|this, args| {
             let track = args.first().cloned().unwrap_or_default();
             let mut tracks = tracks_from(&this);
             let before = tracks.len();
@@ -701,7 +707,7 @@ pub(crate) fn stream_value(tracks: Vec<Value>) -> Value {
     );
     value.set_property(
         "clone",
-        Value::function(|this, _| {
+        realm_media_function(|this, _| {
             stream_value(
                 tracks_from(&this)
                     .into_iter()
@@ -719,7 +725,7 @@ pub fn media_stream_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_media_function(|_, args| {
             let tracks = args
                 .first()
                 .map(|value| value.iter().collect())
@@ -765,7 +771,7 @@ fn device_value(device: &MediaDevice) -> Value {
     ]));
     value.set_property(
         "toJSON",
-        Value::function(|this, _| {
+        realm_media_function(|this, _| {
             Value::object(HashMap::from([
                 ("deviceId".to_string(), this.get_property("deviceId")),
                 ("kind".to_string(), this.get_property("kind")),
@@ -779,7 +785,7 @@ fn device_value(device: &MediaDevice) -> Value {
         &if matches!(device.kind.as_str(), "audioinput" | "videoinput") {
             value.set_property(
                 "getCapabilities",
-                Value::function(|_, _| Value::object(HashMap::new())),
+                realm_media_function(|_, _| Value::object(HashMap::new())),
             );
             input_device_info_class().get_property("prototype")
         } else {
@@ -886,7 +892,7 @@ pub fn media_devices_value() -> Value {
     crate::web_events::event_target_class().call(value.clone(), vec![]);
     value.set_property(
         "enumerateDevices",
-        Value::function(|_, _| {
+        realm_media_function(|_, _| {
             let devices = DEVICES.with(|devices| {
                 devices
                     .borrow()
@@ -899,15 +905,15 @@ pub fn media_devices_value() -> Value {
     );
     value.set_property(
         "getUserMedia",
-        Value::function(|_, args| get_user_media(args.first().cloned().unwrap_or_default())),
+        realm_media_function(|_, args| get_user_media(args.first().cloned().unwrap_or_default())),
     );
     value.set_property(
         "getSupportedConstraints",
-        Value::function(|_, _| supported_constraints()),
+        realm_media_function(|_, _| supported_constraints()),
     );
     value.set_property(
         "getDisplayMedia",
-        Value::function(|_, args| {
+        realm_media_function(|_, args| {
             let constraints = args.first().cloned().unwrap_or(Value::Undefined);
             if constraints
                 .get_property("video")
@@ -933,7 +939,7 @@ pub fn media_devices_value() -> Value {
     );
     value.set_property(
         "selectAudioOutput",
-        Value::function(|_, _| {
+        realm_media_function(|_, _| {
             static WARNING: Once = Once::new();
             WARNING.call_once(|| {
                 eprintln!(
@@ -949,7 +955,7 @@ pub fn media_devices_value() -> Value {
     );
     value.set_property(
         "setCaptureHandleConfig",
-        Value::function(|_, _| {
+        realm_media_function(|_, _| {
             static WARNING: Once = Once::new();
             WARNING.call_once(|| {
                 eprintln!(
@@ -977,6 +983,21 @@ pub fn reset() {
     TRACK_GENERATORS.with(|generators| generators.borrow_mut().clear());
     PERMISSION_DENIED.with(|permission| permission.set(false));
     NEXT_TRACK_ID.with(|next| next.set(1));
+    for slot in [
+        &MEDIA_STREAM_CLASS,
+        &MEDIA_STREAM_TRACK_CLASS,
+        &MEDIA_DEVICE_INFO_CLASS,
+        &INPUT_DEVICE_INFO_CLASS,
+        &MEDIA_DEVICES_CLASS,
+        &OVERCONSTRAINED_ERROR_CLASS,
+        &MEDIA_STREAM_TRACK_GENERATOR_CLASS,
+        &MEDIA_STREAM_TRACK_PROCESSOR_CLASS,
+    ] {
+        slot.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+    MEDIA_STATS_CLASSES.with(|classes| classes.borrow_mut().clear());
 }
 
 #[cfg(test)]
@@ -1191,6 +1212,62 @@ mod tests {
             &*errors.borrow(),
             &["TypeError", "NotSupportedError", "NotFoundError"]
         );
+    }
+
+    #[test]
+    fn media_classes_resources_and_callbacks_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_media_class = media_devices_class();
+        let old_stream_class = media_stream_class();
+        let old_track_class = media_stream_track_class();
+        let old_stats_class = media_stats_class("MediaStreamTrackVideoStats");
+        assert!(old_media_class.strict_eq(&media_devices_class()));
+        assert!(old_stream_class.strict_eq(&media_stream_class()));
+        assert!(old_track_class.strict_eq(&media_stream_track_class()));
+        assert!(old_stats_class.strict_eq(&media_stats_class("MediaStreamTrackVideoStats")));
+
+        let media = media_devices_value();
+        let supported_constraints = media.get_property("getSupportedConstraints");
+        let track = track_value("video", "old camera");
+        let stop = track.get_property("stop");
+        let stream = stream_value(vec![track.clone()]);
+        let get_tracks = stream.get_property("getTracks");
+        let callback_marker = Rc::new(());
+        let callback_marker_weak = Rc::downgrade(&callback_marker);
+        media.set_property(
+            "ondevicechange",
+            Value::function(move |_, _| {
+                let _ = &callback_marker;
+                Value::Undefined
+            }),
+        );
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_media_class.strict_eq(&media_devices_class()));
+        assert!(!old_stream_class.strict_eq(&media_stream_class()));
+        assert!(!old_track_class.strict_eq(&media_stream_track_class()));
+        assert!(!old_stats_class.strict_eq(&media_stats_class("MediaStreamTrackVideoStats")));
+        for class in [
+            old_media_class,
+            old_stream_class,
+            old_track_class,
+            old_stats_class,
+        ] {
+            assert!(class.call(Value::Undefined, vec![]).is_undefined());
+        }
+        assert!(
+            supported_constraints
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(stop.call(track, vec![]).is_undefined());
+        assert!(get_tracks.call(stream, vec![]).is_undefined());
+        assert!(media.get_property("ondevicechange").is_null());
+        assert!(callback_marker_weak.upgrade().is_none());
     }
 
     #[test]

@@ -1,0 +1,12 @@
+[package]
+name = "w3cos-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Versioned shared JavaScript IR for W3COS AOT and dynamic execution"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

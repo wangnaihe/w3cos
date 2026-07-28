@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,7 +54,8 @@ pub fn scheduler_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(Value::object(HashMap::from([
                 ("name".into(), Value::string("TypeError")),
                 (
@@ -106,6 +108,7 @@ fn dispatch(signal: &Value, state: &TaskSignalState, event_type: &str) {
 }
 
 fn task_signal_value(state: Rc<TaskSignalState>) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let signal = Value::object(HashMap::from([
         ("onabort".into(), Value::Null),
         ("onprioritychange".into(), Value::Null),
@@ -113,22 +116,26 @@ fn task_signal_value(state: Rc<TaskSignalState>) -> Value {
     let priority_state = Rc::clone(&state);
     signal.set_property(
         "__w3cos_getter_priority",
-        Value::function(move |_, _| Value::string(priority_state.priority.get().as_str())),
+        realm_function(generation, move |_, _| {
+            Value::string(priority_state.priority.get().as_str())
+        }),
     );
     let aborted_state = Rc::clone(&state);
     signal.set_property(
         "__w3cos_getter_aborted",
-        Value::function(move |_, _| Value::Bool(aborted_state.aborted.get())),
+        realm_function(generation, move |_, _| {
+            Value::Bool(aborted_state.aborted.get())
+        }),
     );
     let reason_state = Rc::clone(&state);
     signal.set_property(
         "__w3cos_getter_reason",
-        Value::function(move |_, _| reason_state.reason.borrow().clone()),
+        realm_function(generation, move |_, _| reason_state.reason.borrow().clone()),
     );
     let add_state = Rc::clone(&state);
     signal.set_property(
         "addEventListener",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let event_type = args
                 .first()
                 .cloned()
@@ -148,7 +155,7 @@ fn task_signal_value(state: Rc<TaskSignalState>) -> Value {
     let remove_state = Rc::clone(&state);
     signal.set_property(
         "removeEventListener",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let event_type = args
                 .first()
                 .cloned()
@@ -171,7 +178,7 @@ fn task_signal_value(state: Rc<TaskSignalState>) -> Value {
     let throw_state = Rc::clone(&state);
     signal.set_property(
         "throwIfAborted",
-        Value::function(move |_, _| {
+        realm_function(generation, move |_, _| {
             if throw_state.aborted.get() {
                 w3cos_core::throw_value(throw_state.reason.borrow().clone());
             }
@@ -187,11 +194,12 @@ pub fn task_signal_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| Value::Undefined);
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| Value::Undefined);
         class.set_property("name", Value::string("TaskSignal"));
         class.set_property(
             "any",
-            Value::function(|_, args| {
+            realm_function(generation, |_, args| {
                 let signals = args
                     .first()
                     .cloned()
@@ -249,7 +257,8 @@ pub fn task_controller_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, args| {
             let options = args.first().cloned().unwrap_or(Value::Undefined);
             let priority_value = options.get_property("priority");
             let priority = if priority_value.is_undefined() {
@@ -274,11 +283,12 @@ pub fn task_controller_class() -> Value {
             let abort_state = Rc::clone(&state);
             let signal_for_priority = signal.clone();
             let priority_state = Rc::clone(&state);
+            let controller_generation = generation;
             let controller = Value::object(HashMap::from([
                 ("signal".into(), signal),
                 (
                     "abort".into(),
-                    Value::function(move |_, args| {
+                    realm_function(controller_generation, move |_, args| {
                         if abort_state.aborted.replace(true) {
                             return Value::Undefined;
                         }
@@ -290,7 +300,7 @@ pub fn task_controller_class() -> Value {
                 ),
                 (
                     "setPriority".into(),
-                    Value::function(move |_, args| {
+                    realm_function(controller_generation, move |_, args| {
                         let value = args.first().cloned().unwrap_or(Value::Undefined);
                         let Some(priority) = TaskPriority::parse(&value) else {
                             w3cos_core::throw_value(exception(
@@ -421,14 +431,17 @@ pub fn scheduler_value() -> Value {
                 );
             }
         });
+        let generation = crate::jsdom::realm_generation();
         let scheduler = Value::object(HashMap::from([
             (
                 "postTask".into(),
-                Value::function(|_, args| post_task(args)),
+                realm_function(generation, |_, args| post_task(args)),
             ),
             (
                 "yield".into(),
-                Value::function(|_, _| post_task(vec![Value::function(|_, _| Value::Undefined)])),
+                realm_function(generation, |_, _| {
+                    post_task(vec![Value::function(|_, _| Value::Undefined)])
+                }),
             ),
         ]));
         w3cos_core::class::set_prototype_of(
@@ -440,7 +453,21 @@ pub fn scheduler_value() -> Value {
     })
 }
 
-pub fn reset() {}
+pub fn reset() {
+    SCHEDULER_VALUE.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    SCHEDULER_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    TASK_CONTROLLER_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    TASK_SIGNAL_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    SCHEDULER_WARNING_EMITTED.with(|warned| warned.set(false));
+}
 
 #[cfg(test)]
 mod tests {
@@ -510,6 +537,75 @@ mod tests {
         crate::jsdom::drain_microtasks();
         assert!(!ran.get());
         assert!(rejected.get());
+    }
+
+    #[test]
+    fn scheduler_and_task_constructors_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_scheduler = scheduler_value();
+        let old_scheduler_class = scheduler_class();
+        let old_controller_class = task_controller_class();
+        let old_signal_class = task_signal_class();
+        old_scheduler_class
+            .get_property("prototype")
+            .set_property("realmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let new_scheduler = scheduler_value();
+        let new_scheduler_class = scheduler_class();
+        let new_controller_class = task_controller_class();
+        let new_signal_class = task_signal_class();
+        assert!(!old_scheduler.strict_eq(&new_scheduler));
+        assert!(!old_scheduler_class.strict_eq(&new_scheduler_class));
+        assert!(!old_controller_class.strict_eq(&new_controller_class));
+        assert!(!old_signal_class.strict_eq(&new_signal_class));
+        assert!(
+            !new_scheduler_class
+                .get_property("prototype")
+                .get_property("realmMarker")
+                .to_bool()
+        );
+
+        let stale_ran = Rc::new(Cell::new(false));
+        let stale_ran_for_task = Rc::clone(&stale_ran);
+        assert!(matches!(
+            old_scheduler.call_method(
+                "postTask",
+                vec![Value::function(move |_, _| {
+                    stale_ran_for_task.set(true);
+                    Value::Undefined
+                })],
+            ),
+            Value::Undefined
+        ));
+        assert!(matches!(
+            old_controller_class.call(Value::Undefined, vec![]),
+            Value::Undefined
+        ));
+        assert!(matches!(
+            old_signal_class.call(Value::Undefined, vec![]),
+            Value::Undefined
+        ));
+        crate::jsdom::tick_timers();
+        crate::jsdom::drain_microtasks();
+        assert!(!stale_ran.get());
+
+        let fresh_ran = Rc::new(Cell::new(false));
+        let fresh_ran_for_task = Rc::clone(&fresh_ran);
+        new_scheduler.call_method(
+            "postTask",
+            vec![Value::function(move |_, _| {
+                fresh_ran_for_task.set(true);
+                Value::Undefined
+            })],
+        );
+        crate::jsdom::tick_timers();
+        crate::jsdom::drain_microtasks();
+        assert!(fresh_ran.get());
     }
 
     #[test]

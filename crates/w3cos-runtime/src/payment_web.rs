@@ -5,9 +5,26 @@ use std::collections::HashMap;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static REQUESTS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+const CLASS_NAMES: &[&str] = &[
+    "PaymentAddress",
+    "PaymentManager",
+    "PaymentRequest",
+    "PaymentResponse",
+];
+
+fn realm_payment_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
 }
 
 fn warning() {
@@ -34,7 +51,7 @@ fn illegal(name: &'static str) -> Value {
 
 fn build_class(name: &'static str) -> Value {
     let class = if name == "PaymentRequest" {
-        Value::function(|this, args| {
+        realm_payment_function(|this, args| {
             crate::web_events::event_target_class().call(this.clone(), Vec::new());
             let methods = args.first().cloned().unwrap_or(Value::Undefined);
             let details = args.get(1).cloned().unwrap_or(Value::Undefined);
@@ -73,7 +90,7 @@ fn build_class(name: &'static str) -> Value {
             for method in ["canMakePayment", "hasEnrolledInstrument"] {
                 this.set_property(
                     method,
-                    Value::function(|_, _| {
+                    realm_payment_function(|_, _| {
                         warning();
                         w3cos_core::promise::resolve(vec![Value::Bool(false)])
                     }),
@@ -81,7 +98,7 @@ fn build_class(name: &'static str) -> Value {
             }
             this.set_property(
                 "show",
-                Value::function(|_, _| {
+                realm_payment_function(|_, _| {
                     warning();
                     w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
                         "No platform payment handler is registered",
@@ -91,22 +108,53 @@ fn build_class(name: &'static str) -> Value {
             );
             this.set_property(
                 "abort",
-                Value::function(|_, _| {
+                realm_payment_function(|_, _| {
                     w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
                         "The payment request is not being shown",
                         "InvalidStateError",
                     )])
                 }),
             );
+            register_weak_realm_object(&REQUESTS, &this);
             Value::Undefined
         })
     } else {
-        Value::function(move |_, _| illegal(name))
+        realm_payment_function(move |_, _| illegal(name))
     };
     class.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", class.clone());
-    let members: &[&str] = match name {
+    for member in class_members(name) {
+        prototype.set_property(member, Value::Undefined);
+    }
+    if matches!(name, "PaymentRequest" | "PaymentResponse") {
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::web_events::event_target_class().get_property("prototype"),
+        );
+    }
+    class.set_property("prototype", prototype);
+    if name == "PaymentRequest" {
+        class.set_property(
+            "getSecurePaymentConfirmationCapabilities",
+            realm_payment_function(|_, _| {
+                warning();
+                w3cos_core::promise::resolve(vec![Value::object(HashMap::new())])
+            }),
+        );
+        class.set_property(
+            "securePaymentConfirmationAvailability",
+            realm_payment_function(|_, _| {
+                warning();
+                w3cos_core::promise::resolve(vec![Value::string("unavailable")])
+            }),
+        );
+    }
+    class
+}
+
+fn class_members(name: &str) -> &'static [&'static str] {
+    match name {
         "PaymentAddress" => &[
             "addressLine",
             "city",
@@ -149,34 +197,7 @@ fn build_class(name: &'static str) -> Value {
             "toJSON",
         ],
         _ => &[],
-    };
-    for member in members {
-        prototype.set_property(member, Value::Undefined);
     }
-    if matches!(name, "PaymentRequest" | "PaymentResponse") {
-        w3cos_core::class::set_prototype_of(
-            &prototype,
-            &crate::web_events::event_target_class().get_property("prototype"),
-        );
-    }
-    class.set_property("prototype", prototype);
-    if name == "PaymentRequest" {
-        class.set_property(
-            "getSecurePaymentConfirmationCapabilities",
-            Value::function(|_, _| {
-                warning();
-                w3cos_core::promise::resolve(vec![Value::object(HashMap::new())])
-            }),
-        );
-        class.set_property(
-            "securePaymentConfirmationAvailability",
-            Value::function(|_, _| {
-                warning();
-                w3cos_core::promise::resolve(vec![Value::string("unavailable")])
-            }),
-        );
-    }
-    class
 }
 
 pub fn class_for(name: &'static str) -> Value {
@@ -191,7 +212,25 @@ pub fn class_for(name: &'static str) -> Value {
 }
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
+    REQUESTS.with(|requests| {
+        for request in requests
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|request| upgrade_realm_object(&request))
+        {
+            for name in CLASS_NAMES {
+                for member in class_members(name) {
+                    request.set_property(member, Value::Undefined);
+                }
+            }
+        }
+    });
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        class.set_property("getSecurePaymentConfirmationCapabilities", Value::Undefined);
+        class.set_property("securePaymentConfirmationAvailability", Value::Undefined);
+        disconnect_realm_class(class);
+    }
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -235,5 +274,35 @@ mod tests {
         }
         w3cos_core::promise::drain_microtasks();
         assert_eq!(&*values.borrow(), &["false", "NotSupportedError"]);
+    }
+
+    #[test]
+    fn requests_methods_callbacks_and_classes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_class = class_for("PaymentRequest");
+        let request = w3cos_core::class::construct(
+            &old_class,
+            vec![
+                Value::array(vec![Value::object(HashMap::from([(
+                    "supportedMethods".into(),
+                    Value::string("basic-card"),
+                )]))]),
+                Value::object(HashMap::from([(
+                    "total".into(),
+                    Value::object(HashMap::new()),
+                )])),
+            ],
+        );
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_class.get_property("prototype").is_undefined());
+        assert!(!old_class.strict_eq(&class_for("PaymentRequest")));
+        assert!(request.get_property("show").is_undefined());
+        assert!(request.get_property("abort").is_undefined());
+        assert!(request.get_property("onpaymentmethodchange").is_undefined());
     }
 }

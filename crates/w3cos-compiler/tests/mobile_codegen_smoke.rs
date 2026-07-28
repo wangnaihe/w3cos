@@ -133,7 +133,7 @@ fn mobile_harmony_writes_xcomponent_abi() {
 fn mobile_harmony_dom_writes_surface_entry() {
     let dir = tempfile::tempdir().unwrap();
     mobile_codegen::write_mobile_dom_project(
-        "pub fn run_entry() {}",
+        "pub fn run_entry_async() {}",
         dir.path(),
         "harmony",
         false,
@@ -145,6 +145,7 @@ fn mobile_harmony_dom_writes_surface_entry() {
     let lib_rs = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
     assert!(lib_rs.contains("surface_created_dom"));
     assert!(lib_rs.contains("InteractiveWidget::OverlaysContent"));
+    assert!(lib_rs.contains("let _ = crate::esm_bundle::run_entry_async();"));
     let cargo = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
     assert!(cargo.contains(r#"features = ["skia", "devtools"]"#));
 }

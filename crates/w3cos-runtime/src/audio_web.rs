@@ -11,8 +11,29 @@ use std::sync::Once;
 
 use w3cos_core::Value;
 
+use crate::jsdom::realm_function;
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static CONTEXTS: RefCell<Vec<(Value, Rc<RefCell<ContextClock>>)>> =
+        const { RefCell::new(Vec::new()) };
+    static CALLBACK_TARGETS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+}
+
+fn realm_audio_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
+fn register_context(context: &Value, clock: &Rc<RefCell<ContextClock>>) {
+    CONTEXTS.with(|contexts| {
+        contexts
+            .borrow_mut()
+            .push((context.clone(), Rc::clone(clock)));
+    });
+}
+
+fn register_callback_target(target: &Value) {
+    CALLBACK_TARGETS.with(|targets| targets.borrow_mut().push(target.clone()));
 }
 
 fn error(name: &str, message: &str) -> Value {
@@ -114,7 +135,7 @@ fn audio_buffer_value(options: Value) -> Value {
     let get_channels = Rc::clone(&channels);
     value.set_property(
         "getChannelData",
-        Value::function(move |_, args| {
+        realm_audio_function(move |_, args| {
             let channel = args.first().map(Value::to_u32).unwrap_or_default() as usize;
             get_channels
                 .get(channel)
@@ -125,7 +146,7 @@ fn audio_buffer_value(options: Value) -> Value {
     let from_channels = Rc::clone(&channels);
     value.set_property(
         "copyFromChannel",
-        Value::function(move |_, args| {
+        realm_audio_function(move |_, args| {
             let destination = args.first().cloned().unwrap_or(Value::Undefined);
             if !w3cos_core::binary::is_typed_array(&destination) {
                 throw(
@@ -150,7 +171,7 @@ fn audio_buffer_value(options: Value) -> Value {
     );
     value.set_property(
         "copyToChannel",
-        Value::function(move |_, args| {
+        realm_audio_function(move |_, args| {
             let source = args.first().cloned().unwrap_or(Value::Undefined);
             if !w3cos_core::binary::is_typed_array(&source) {
                 throw(
@@ -196,7 +217,7 @@ fn audio_param_value(default: f64, min: f64, max: f64) -> Value {
     ] {
         value.set_property(
             method,
-            Value::function(move |this, args| {
+            realm_audio_function(move |this, args| {
                 let next = args.first().map(Value::to_number).unwrap_or_default();
                 if !next.is_finite() {
                     throw("TypeError", "AudioParam automation value must be finite");
@@ -214,7 +235,7 @@ fn audio_param_value(default: f64, min: f64, max: f64) -> Value {
     }
     value.set_property(
         "setValueCurveAtTime",
-        Value::function(move |this, args| {
+        realm_audio_function(move |this, args| {
             let curve = args.first().cloned().unwrap_or(Value::Undefined);
             let values: Vec<Value> = curve.iter().collect();
             if values.is_empty() {
@@ -226,7 +247,7 @@ fn audio_param_value(default: f64, min: f64, max: f64) -> Value {
         }),
     );
     for method in ["cancelAndHoldAtTime", "cancelScheduledValues"] {
-        value.set_property(method, Value::function(|this, _| this));
+        value.set_property(method, realm_audio_function(|this, _| this));
     }
     w3cos_core::class::set_prototype_of(&value, &class_for("AudioParam").get_property("prototype"));
     value
@@ -240,7 +261,7 @@ fn audio_param_map_value(entries: Vec<(String, Value)>) -> Value {
         let method_entries = Rc::clone(&entries);
         value.set_property(
             method,
-            Value::function(move |_, _| {
+            realm_audio_function(move |_, _| {
                 iterator(
                     method_entries
                         .iter()
@@ -257,7 +278,7 @@ fn audio_param_map_value(entries: Vec<(String, Value)>) -> Value {
     let get_entries = Rc::clone(&entries);
     value.set_property(
         "get",
-        Value::function(move |_, args| {
+        realm_audio_function(move |_, args| {
             let name = args.first().map(Value::to_js_string).unwrap_or_default();
             get_entries
                 .iter()
@@ -269,7 +290,7 @@ fn audio_param_map_value(entries: Vec<(String, Value)>) -> Value {
     let has_entries = Rc::clone(&entries);
     value.set_property(
         "has",
-        Value::function(move |_, args| {
+        realm_audio_function(move |_, args| {
             let name = args.first().map(Value::to_js_string).unwrap_or_default();
             Value::Bool(has_entries.iter().any(|(candidate, _)| candidate == &name))
         }),
@@ -278,7 +299,7 @@ fn audio_param_map_value(entries: Vec<(String, Value)>) -> Value {
     let each_value = value.clone();
     value.set_property(
         "forEach",
-        Value::function(move |_, args| {
+        realm_audio_function(move |_, args| {
             let callback = args.first().cloned().unwrap_or(Value::Undefined);
             if !callback.is_function() {
                 throw("TypeError", "AudioParamMap.forEach requires a callback");
@@ -323,7 +344,7 @@ fn audio_node_value(class_name: &'static str, context: Value, inputs: u32, outpu
     let connect_connections = Rc::clone(&connections);
     value.set_property(
         "connect",
-        Value::function(move |_, args| {
+        realm_audio_function(move |_, args| {
             let destination = args.first().cloned().unwrap_or(Value::Undefined);
             let is_node = w3cos_core::class::instance_of(&destination, &class_for("AudioNode"));
             let is_param = w3cos_core::class::instance_of(&destination, &class_for("AudioParam"));
@@ -350,7 +371,7 @@ fn audio_node_value(class_name: &'static str, context: Value, inputs: u32, outpu
     let disconnect_connections = Rc::clone(&connections);
     value.set_property(
         "disconnect",
-        Value::function(move |_, args| {
+        realm_audio_function(move |_, args| {
             if let Some(destination) = args.first() {
                 disconnect_connections
                     .borrow_mut()
@@ -363,7 +384,7 @@ fn audio_node_value(class_name: &'static str, context: Value, inputs: u32, outpu
     );
     value.set_property(
         "__w3cos_getter_connectionCount",
-        Value::function(move |_, _| Value::Number(connections.borrow().len() as f64)),
+        realm_audio_function(move |_, _| Value::Number(connections.borrow().len() as f64)),
     );
     w3cos_core::class::set_prototype_of(&value, &class_for(class_name).get_property("prototype"));
     value
@@ -375,7 +396,7 @@ fn scheduled_source_value(class_name: &'static str, context: Value) -> Value {
     value.set_property("__w3cos_started", Value::Bool(false));
     value.set_property(
         "start",
-        Value::function(|this, _| {
+        realm_audio_function(|this, _| {
             if this.get_property("__w3cos_started").to_bool() {
                 throw(
                     "InvalidStateError",
@@ -395,7 +416,7 @@ fn scheduled_source_value(class_name: &'static str, context: Value) -> Value {
     );
     value.set_property(
         "stop",
-        Value::function(|this, _| {
+        realm_audio_function(|this, _| {
             if !this.get_property("__w3cos_started").to_bool() {
                 throw(
                     "InvalidStateError",
@@ -443,16 +464,16 @@ fn node_value(class_name: &'static str, context: Value, options: Value) -> Value
             let get_fft = Rc::clone(&fft_size);
             value.set_property(
                 "__w3cos_getter_fftSize",
-                Value::function(move |_, _| Value::Number(get_fft.get() as f64)),
+                realm_audio_function(move |_, _| Value::Number(get_fft.get() as f64)),
             );
             let get_bins = Rc::clone(&fft_size);
             value.set_property(
                 "__w3cos_getter_frequencyBinCount",
-                Value::function(move |_, _| Value::Number((get_bins.get() / 2) as f64)),
+                realm_audio_function(move |_, _| Value::Number((get_bins.get() / 2) as f64)),
             );
             value.set_property(
                 "__w3cos_setter_fftSize",
-                Value::function(move |_, args| {
+                realm_audio_function(move |_, args| {
                     let size = args.first().map(Value::to_u32).unwrap_or_default();
                     if !(32..=32768).contains(&size) || !size.is_power_of_two() {
                         throw(
@@ -484,7 +505,7 @@ fn node_value(class_name: &'static str, context: Value, options: Value) -> Value
             ] {
                 value.set_property(
                     method,
-                    Value::function(move |_, args| {
+                    realm_audio_function(move |_, args| {
                         let array = args.first().cloned().unwrap_or(Value::Undefined);
                         let length = array.get_property("length").to_u32();
                         for index in 0..length {
@@ -569,7 +590,7 @@ fn node_value(class_name: &'static str, context: Value, options: Value) -> Value
             value.set_property("type", option(&options, "type", Value::string("sine")));
             value.set_property(
                 "setPeriodicWave",
-                Value::function(|this, args| {
+                realm_audio_function(|this, args| {
                     let wave = args.first().cloned().unwrap_or(Value::Undefined);
                     if !w3cos_core::class::instance_of(&wave, &class_for("PeriodicWave")) {
                         throw("TypeError", "OscillatorNode requires a PeriodicWave");
@@ -638,13 +659,23 @@ fn node_value(class_name: &'static str, context: Value, options: Value) -> Value
         }
         _ => {}
     }
+    if matches!(
+        class_name,
+        "AudioBufferSourceNode"
+            | "ConstantSourceNode"
+            | "OscillatorNode"
+            | "ScriptProcessorNode"
+            | "AudioWorkletNode"
+    ) {
+        register_callback_target(&value);
+    }
     value
 }
 
 fn install_frequency_response(value: &Value) {
     value.set_property(
         "getFrequencyResponse",
-        Value::function(|_, args| {
+        realm_audio_function(|_, args| {
             let frequencies = args.first().cloned().unwrap_or(Value::Undefined);
             let magnitude = args.get(1).cloned().unwrap_or(Value::Undefined);
             let phase = args.get(2).cloned().unwrap_or(Value::Undefined);
@@ -669,7 +700,7 @@ fn install_frequency_response(value: &Value) {
 fn install_position_methods(value: &Value) {
     value.set_property(
         "setPosition",
-        Value::function(|this, args| {
+        realm_audio_function(|this, args| {
             for (index, name) in ["positionX", "positionY", "positionZ"].iter().enumerate() {
                 this.get_property(name).set_property(
                     "value",
@@ -681,7 +712,7 @@ fn install_position_methods(value: &Value) {
     );
     value.set_property(
         "setOrientation",
-        Value::function(|this, args| {
+        realm_audio_function(|this, args| {
             for (index, name) in ["orientationX", "orientationY", "orientationZ"]
                 .iter()
                 .enumerate()
@@ -741,7 +772,7 @@ fn worklet_value() -> Value {
     let value = Value::object(HashMap::new());
     value.set_property(
         "addModule",
-        Value::function(|_, _| {
+        realm_audio_function(|_, _| {
             static WARNING: Once = Once::new();
             WARNING.call_once(|| {
                 eprintln!(
@@ -832,12 +863,12 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
     let current_clock = Rc::clone(&clock);
     context.set_property(
         "__w3cos_getter_currentTime",
-        Value::function(move |_, _| Value::Number(clock_time(&current_clock.borrow()))),
+        realm_audio_function(move |_, _| Value::Number(clock_time(&current_clock.borrow()))),
     );
     let state_clock = Rc::clone(&clock);
     context.set_property(
         "__w3cos_getter_state",
-        Value::function(move |_, _| Value::string(state_clock.borrow().state)),
+        realm_audio_function(move |_, _| Value::string(state_clock.borrow().state)),
     );
     context.set_property("sampleRate", Value::Number(sample_rate));
     context.set_property("onstatechange", Value::Null);
@@ -866,7 +897,7 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
         let resume_clock = Rc::clone(&clock);
         context.set_property(
             "resume",
-            Value::function(move |this, _| {
+            realm_audio_function(move |this, _| {
                 if resume_clock.borrow().state == "closed" {
                     return w3cos_core::promise::reject(vec![error(
                         "InvalidStateError",
@@ -887,7 +918,7 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
         let suspend_clock = Rc::clone(&clock);
         context.set_property(
             "suspend",
-            Value::function(move |this, _| {
+            realm_audio_function(move |this, _| {
                 if suspend_clock.borrow().state == "closed" {
                     return w3cos_core::promise::reject(vec![error(
                         "InvalidStateError",
@@ -898,16 +929,17 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
                 w3cos_core::promise::resolve(vec![Value::Undefined])
             }),
         );
+        let close_clock = Rc::clone(&clock);
         context.set_property(
             "close",
-            Value::function(move |this, _| {
-                transition_context(&this, &clock, "closed");
+            realm_audio_function(move |this, _| {
+                transition_context(&this, &close_clock, "closed");
                 w3cos_core::promise::resolve(vec![Value::Undefined])
             }),
         );
         context.set_property(
             "setSinkId",
-            Value::function(|_, _| {
+            realm_audio_function(|_, _| {
                 static WARNING: Once = Once::new();
                 WARNING.call_once(|| {
                     eprintln!(
@@ -923,7 +955,7 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
         );
         context.set_property(
             "getOutputTimestamp",
-            Value::function(|this, _| {
+            realm_audio_function(|this, _| {
                 Value::object(HashMap::from([
                     ("contextTime".into(), this.get_property("currentTime")),
                     (
@@ -940,7 +972,7 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
         let render_clock = Rc::clone(&clock);
         context.set_property(
             "startRendering",
-            Value::function(move |this, _| {
+            realm_audio_function(move |this, _| {
                 if render_clock.borrow().state != "suspended" {
                     return w3cos_core::promise::reject(vec![error(
                         "InvalidStateError",
@@ -969,13 +1001,14 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
         );
         context.set_property(
             "resume",
-            Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
+            realm_audio_function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
         );
         context.set_property(
             "suspend",
-            Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
+            realm_audio_function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
         );
     }
+    register_context(&context, &clock);
     context
 }
 
@@ -999,7 +1032,7 @@ fn install_context_factories(context: &Value) {
     ] {
         context.set_property(
             method,
-            Value::function(move |this, args| {
+            realm_audio_function(move |this, args| {
                 let options = match method {
                     "createChannelMerger" => Value::object(HashMap::from([(
                         "numberOfInputs".into(),
@@ -1025,7 +1058,7 @@ fn install_context_factories(context: &Value) {
     }
     context.set_property(
         "createBuffer",
-        Value::function(|_, args| {
+        realm_audio_function(|_, args| {
             audio_buffer_value(Value::object(HashMap::from([
                 (
                     "numberOfChannels".into(),
@@ -1044,7 +1077,7 @@ fn install_context_factories(context: &Value) {
     );
     context.set_property(
         "createIIRFilter",
-        Value::function(|this, args| {
+        realm_audio_function(|this, args| {
             let feedforward = args.first().cloned().unwrap_or(Value::Undefined);
             let feedback = args.get(1).cloned().unwrap_or(Value::Undefined);
             if feedforward.iter().next().is_none() || feedback.iter().next().is_none() {
@@ -1065,7 +1098,7 @@ fn install_context_factories(context: &Value) {
     );
     context.set_property(
         "createPeriodicWave",
-        Value::function(|this, args| {
+        realm_audio_function(|this, args| {
             periodic_wave_value(
                 this,
                 Value::object(HashMap::from([
@@ -1083,7 +1116,7 @@ fn install_context_factories(context: &Value) {
     );
     context.set_property(
         "decodeAudioData",
-        Value::function(|_, _| {
+        realm_audio_function(|_, _| {
             static WARNING: Once = Once::new();
             WARNING.call_once(|| {
                 eprintln!(
@@ -1114,7 +1147,7 @@ fn install_media_factories(context: &Value) {
     ] {
         context.set_property(
             method,
-            Value::function(move |this, args| {
+            realm_audio_function(move |this, args| {
                 node_value(
                     class_name,
                     this,
@@ -1128,7 +1161,7 @@ fn install_media_factories(context: &Value) {
     }
     context.set_property(
         "createMediaStreamDestination",
-        Value::function(|this, _| {
+        realm_audio_function(|this, _| {
             node_value("MediaStreamAudioDestinationNode", this, Value::Undefined)
         }),
     );
@@ -1158,16 +1191,16 @@ fn node_constructor(name: &'static str, args: Vec<Value>) -> Value {
 
 fn build_class(name: &'static str) -> Value {
     let class = match name {
-        "AudioBuffer" => Value::function(|_, args| {
+        "AudioBuffer" => realm_audio_function(|_, args| {
             audio_buffer_value(args.first().cloned().unwrap_or(Value::Undefined))
         }),
-        "AudioContext" => Value::function(|_, args| {
+        "AudioContext" => realm_audio_function(|_, args| {
             context_value(
                 "AudioContext",
                 args.first().cloned().unwrap_or(Value::Undefined),
             )
         }),
-        "OfflineAudioContext" => Value::function(|_, args| {
+        "OfflineAudioContext" => realm_audio_function(|_, args| {
             let options = if args.first().is_some_and(Value::is_object) {
                 args[0].clone()
             } else {
@@ -1188,16 +1221,16 @@ fn build_class(name: &'static str) -> Value {
             };
             context_value("OfflineAudioContext", options)
         }),
-        "PeriodicWave" => Value::function(|_, args| {
+        "PeriodicWave" => realm_audio_function(|_, args| {
             periodic_wave_value(
                 args.first().cloned().unwrap_or(Value::Undefined),
                 args.get(1).cloned().unwrap_or(Value::Undefined),
             )
         }),
         name if is_constructible_node(name) => {
-            Value::function(move |_, args| node_constructor(name, args))
+            realm_audio_function(move |_, args| node_constructor(name, args))
         }
-        _ => Value::function(move |_, _| illegal(name)),
+        _ => realm_audio_function(move |_, _| illegal(name)),
     };
     class.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::new());
@@ -1461,6 +1494,34 @@ pub fn class_for(name: &'static str) -> Value {
 }
 
 pub fn reset() {
+    let callback_targets =
+        CALLBACK_TARGETS.with(|targets| std::mem::take(&mut *targets.borrow_mut()));
+    for target in callback_targets {
+        for callback in ["onended", "onaudioprocess", "onprocessorerror"] {
+            if !target.get_property(callback).is_undefined() {
+                target.set_property(callback, Value::Null);
+            }
+        }
+        for method in ["connect", "disconnect", "start", "stop"] {
+            if !target.get_property(method).is_undefined() {
+                target.set_property(method, Value::Undefined);
+            }
+        }
+    }
+    let contexts = CONTEXTS.with(|contexts| std::mem::take(&mut *contexts.borrow_mut()));
+    for (context, clock) in contexts {
+        clock.borrow_mut().state = "closed";
+        for callback in ["oncomplete", "onerror", "onsinkchange", "onstatechange"] {
+            if !context.get_property(callback).is_undefined() {
+                context.set_property(callback, Value::Null);
+            }
+        }
+        for method in ["close", "resume", "startRendering", "suspend"] {
+            if !context.get_property(method).is_undefined() {
+                context.set_property(method, Value::Undefined);
+            }
+        }
+    }
     CLASSES.with(|classes| classes.borrow_mut().clear());
 }
 
@@ -1568,5 +1629,64 @@ mod tests {
         assert!(completed.get());
         assert_eq!(rendered.borrow().get_property("duration").to_number(), 1.0);
         assert_eq!(context.get_property("state").to_js_string(), "closed");
+    }
+
+    #[test]
+    fn audio_classes_contexts_callbacks_and_graph_methods_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_context_class = class_for("AudioContext");
+        let old_buffer_class = class_for("AudioBuffer");
+        assert!(old_context_class.strict_eq(&class_for("AudioContext")));
+        let context = w3cos_core::class::construct(&old_context_class, Vec::new());
+        let oscillator = context.call_method("createOscillator", Vec::new());
+        let buffer = w3cos_core::class::construct(
+            &old_buffer_class,
+            vec![Value::object(HashMap::from([
+                ("numberOfChannels".into(), Value::Number(1.0)),
+                ("length".into(), Value::Number(1.0)),
+                ("sampleRate".into(), Value::Number(8_000.0)),
+            ]))],
+        );
+
+        let state_marker = Rc::new(());
+        let state_marker_weak = Rc::downgrade(&state_marker);
+        context.set_property(
+            "onstatechange",
+            Value::function(move |_, _| {
+                let _ = &state_marker;
+                Value::Undefined
+            }),
+        );
+        let ended_marker = Rc::new(());
+        let ended_marker_weak = Rc::downgrade(&ended_marker);
+        oscillator.set_property(
+            "onended",
+            Value::function(move |_, _| {
+                let _ = &ended_marker;
+                Value::Undefined
+            }),
+        );
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_context_class.strict_eq(&class_for("AudioContext")));
+        assert!(!old_buffer_class.strict_eq(&class_for("AudioBuffer")));
+        for class in [old_context_class, old_buffer_class] {
+            assert!(class.call(Value::Undefined, Vec::new()).is_undefined());
+        }
+        assert!(context.call_method("resume", Vec::new()).is_undefined());
+        assert!(context.get_property("onstatechange").is_null());
+        assert!(oscillator.call_method("start", Vec::new()).is_undefined());
+        assert!(oscillator.get_property("onended").is_null());
+        assert!(
+            buffer
+                .call_method("getChannelData", vec![Value::Number(0.0)])
+                .is_undefined()
+        );
+        assert!(state_marker_weak.upgrade().is_none());
+        assert!(ended_marker_weak.upgrade().is_none());
     }
 }

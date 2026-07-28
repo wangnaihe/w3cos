@@ -5,10 +5,22 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::{JsObject, ProxyBuilder, Value};
 
+#[derive(Clone)]
+struct ClipboardMimeSnapshot {
+    type_name: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct ClipboardItemSnapshot {
+    entries: Vec<ClipboardMimeSnapshot>,
+}
+
 thread_local! {
-    static CLIPBOARD_ITEMS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+    static CLIPBOARD_ITEMS: RefCell<Vec<ClipboardItemSnapshot>> = const { RefCell::new(Vec::new()) };
     static CLIPBOARD_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static CLIPBOARD_ITEM_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static DATA_TRANSFER_ITEM_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -22,7 +34,8 @@ pub fn clipboard_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(Value::object(HashMap::from([
                 ("name".into(), Value::string("TypeError")),
                 (
@@ -54,18 +67,19 @@ pub fn clipboard_class() -> Value {
 }
 
 pub fn clipboard_value() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let clipboard = w3cos_core::class::construct(&crate::web_events::event_target_class(), vec![]);
     w3cos_core::class::set_prototype_of(&clipboard, &clipboard_class().get_property("prototype"));
     clipboard.set_property("onclipboardchange", Value::Null);
     clipboard.set_property(
         "readText",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             w3cos_core::promise::resolve(vec![Value::string(&crate::jsdom::clipboard_read_text())])
         }),
     );
     clipboard.set_property(
         "writeText",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             crate::jsdom::clipboard_write_text(
                 &args.first().cloned().unwrap_or_default().to_js_string(),
             );
@@ -74,11 +88,13 @@ pub fn clipboard_value() -> Value {
     );
     clipboard.set_property(
         "read",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![read_items()])),
+        realm_function(generation, |_, _| {
+            w3cos_core::promise::resolve(vec![read_items()])
+        }),
     );
     clipboard.set_property(
         "write",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             write_items(&args.first().cloned().unwrap_or_default());
             w3cos_core::promise::resolve(vec![Value::Undefined])
         }),
@@ -87,11 +103,54 @@ pub fn clipboard_value() -> Value {
 }
 
 pub fn read_items() -> Value {
-    Value::array(CLIPBOARD_ITEMS.with(|items| items.borrow().clone()))
+    let snapshots = CLIPBOARD_ITEMS.with(|items| items.borrow().clone());
+    Value::array(
+        snapshots
+            .into_iter()
+            .map(|item| {
+                let entries = item
+                    .entries
+                    .into_iter()
+                    .map(|entry| {
+                        let blob = w3cos_core::class::construct(
+                            &crate::files::blob_class(),
+                            vec![
+                                Value::array(vec![w3cos_core::binary::array_buffer_value(
+                                    entry.bytes,
+                                )]),
+                                Value::object(HashMap::from([(
+                                    "type".to_string(),
+                                    Value::string(&entry.type_name),
+                                )])),
+                            ],
+                        );
+                        (entry.type_name, blob)
+                    })
+                    .collect::<HashMap<_, _>>();
+                w3cos_core::class::construct(&clipboard_item_class(), vec![Value::object(entries)])
+            })
+            .collect(),
+    )
 }
 
 pub fn write_items(value: &Value) {
-    CLIPBOARD_ITEMS.with(|items| *items.borrow_mut() = value.iter().collect());
+    let snapshots = value
+        .iter()
+        .map(|item| {
+            let entries = item
+                .get_property("types")
+                .iter()
+                .filter_map(|type_value| {
+                    let type_name = type_value.to_js_string();
+                    let blob = item.call_method("getType", vec![Value::string(&type_name)]);
+                    crate::files::blob_bytes(&blob)
+                        .map(|bytes| ClipboardMimeSnapshot { type_name, bytes })
+                })
+                .collect();
+            ClipboardItemSnapshot { entries }
+        })
+        .collect();
+    CLIPBOARD_ITEMS.with(|items| *items.borrow_mut() = snapshots);
 }
 
 pub fn clipboard_item_class() -> Value {
@@ -99,7 +158,8 @@ pub fn clipboard_item_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, args| {
             let input = args.first().cloned().unwrap_or_default();
             let entries = Rc::new(RefCell::new(HashMap::<String, Value>::new()));
             if let Value::Object(object) = input {
@@ -138,7 +198,7 @@ pub fn clipboard_item_class() -> Value {
             let entries_for_get = entries;
             value.set_property(
                 "getType",
-                Value::function(move |_, args| {
+                realm_function(generation, move |_, args| {
                     entries_for_get
                         .borrow()
                         .get(&args.first().cloned().unwrap_or_default().to_js_string())
@@ -159,7 +219,7 @@ pub fn clipboard_item_class() -> Value {
         });
         class.set_property(
             "supports",
-            Value::function(|_, args| {
+            realm_function(generation, |_, args| {
                 Value::Bool(
                     args.first()
                         .cloned()
@@ -189,7 +249,8 @@ fn illegal_constructor_class(
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(move |_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, _| {
             w3cos_core::throw_value(Value::object(HashMap::from([
                 ("name".into(), Value::string("TypeError")),
                 (
@@ -431,7 +492,8 @@ pub fn data_transfer_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             let entries = Rc::new(RefCell::new(Vec::<Value>::new()));
             let value = Value::object(HashMap::from([
                 ("dropEffect".to_string(), Value::string("none")),
@@ -551,12 +613,29 @@ pub fn data_transfer_class() -> Value {
     })
 }
 
+pub fn reset_realm() {
+    for class in [
+        &CLIPBOARD_CLASS,
+        &CLIPBOARD_ITEM_CLASS,
+        &DATA_TRANSFER_ITEM_CLASS,
+        &DATA_TRANSFER_ITEM_LIST_CLASS,
+        &DATA_TRANSFER_CLASS,
+        &FILE_LIST_CLASS,
+    ] {
+        class.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn clipboard_has_standard_identity_and_event_target_shape() {
+        CLIPBOARD_ITEMS.with(|items| items.borrow_mut().clear());
+        reset_realm();
         let clipboard = clipboard_value();
         assert!(w3cos_core::class::instance_of(
             &clipboard,
@@ -571,10 +650,12 @@ mod tests {
         assert!(clipboard.get_property("write").is_function());
         assert!(clipboard.get_property("writeText").is_function());
         assert!(clipboard.get_property("onclipboardchange").is_null());
+        reset_realm();
     }
 
     #[test]
     fn data_transfer_exposes_live_item_and_file_collections() {
+        reset_realm();
         let transfer = w3cos_core::class::construct(&data_transfer_class(), vec![]);
         let items = transfer.get_property("items");
         let files = transfer.get_property("files");
@@ -620,5 +701,73 @@ mod tests {
         items.call_method("clear", vec![]);
         assert_eq!(items.get_property("length").to_number(), 0.0);
         assert_eq!(files.get_property("length").to_number(), 0.0);
+        reset_realm();
+    }
+
+    #[test]
+    fn clipboard_snapshots_survive_navigation_without_retaining_old_values() {
+        CLIPBOARD_ITEMS.with(|items| items.borrow_mut().clear());
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_clipboard = clipboard_value();
+        let old_clipboard_class = clipboard_class();
+        let old_item_class = clipboard_item_class();
+        old_clipboard_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+        let old_item = w3cos_core::class::construct(
+            &old_item_class,
+            vec![Value::object(HashMap::from([(
+                "text/plain".to_string(),
+                Value::string("persisted clipboard"),
+            )]))],
+        );
+        write_items(&Value::array(vec![old_item.clone()]));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let new_clipboard = clipboard_value();
+        let new_clipboard_class = clipboard_class();
+        let new_item_class = clipboard_item_class();
+        assert!(old_clipboard != new_clipboard);
+        assert!(old_clipboard_class != new_clipboard_class);
+        assert!(old_item_class != new_item_class);
+        assert!(
+            new_clipboard_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(old_clipboard.call_method("read", vec![]).is_undefined());
+        assert!(
+            old_clipboard
+                .call_method("write", vec![Value::array(vec![])])
+                .is_undefined()
+        );
+        assert!(
+            old_item
+                .call_method("getType", vec![Value::string("text/plain")])
+                .is_undefined()
+        );
+
+        let restored = read_items();
+        let restored_item = restored.get_property("0");
+        assert!(restored_item != old_item);
+        assert!(w3cos_core::class::instance_of(
+            &restored_item,
+            &new_item_class
+        ));
+        let restored_blob = restored_item.call_method("getType", vec![Value::string("text/plain")]);
+        assert_eq!(
+            restored_blob.call_method("text", vec![]).to_js_string(),
+            "persisted clipboard"
+        );
+        assert_eq!(read_items().get_property("length").to_number(), 1.0);
+
+        CLIPBOARD_ITEMS.with(|items| items.borrow_mut().clear());
+        reset_realm();
     }
 }

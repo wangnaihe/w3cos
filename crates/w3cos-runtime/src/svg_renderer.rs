@@ -1137,6 +1137,8 @@ fn rasterize(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Option<Decode
     Some(DecodedImage {
         width,
         height,
+        intrinsic_width: width,
+        intrinsic_height: height,
         data: Arc::new(rgba),
     })
 }

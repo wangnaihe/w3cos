@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 use crate::Value;
+use crate::value::ValueIterator;
 
 const BUFFER_STATE_KEY: &str = "__w3cos_array_buffer_id";
 const SHARED_BUFFER_KEY: &str = "__w3cos_shared_array_buffer";
@@ -241,7 +242,7 @@ impl Kind {
 }
 
 struct View {
-    storage: Weak<RefCell<Vec<Value>>>,
+    storage: Weak<RefCell<crate::value::ArrayStorage>>,
     buffer: Value,
     bytes: Rc<RefCell<Vec<u8>>>,
     offset: usize,
@@ -764,15 +765,15 @@ fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
             let Some(storage) = view.storage.upgrade() else {
                 continue;
             };
-            let mut values = storage.borrow_mut();
-            values.clear();
+            let mut decoded = Vec::with_capacity(view.length);
             for index in 0..view.length {
                 let start = view.offset + index * view.kind.bytes();
                 let end = start + view.kind.bytes();
                 if end <= bytes.len() {
-                    values.push(view.kind.decode(&bytes[start..end]));
+                    decoded.push(view.kind.decode(&bytes[start..end]));
                 }
             }
+            storage.borrow_mut().replace_values(decoded);
         }
     });
 }
@@ -905,7 +906,7 @@ pub fn is_typed_array(value: &Value) -> bool {
     view_for(value).is_some()
 }
 
-pub(crate) fn iter_typed_array(value: &Value) -> Option<Vec<Value>> {
+fn typed_array_values(value: &Value) -> Option<Vec<Value>> {
     let (_, _, length, _, _) = view_for(value)?;
     Some(
         (0..length)
@@ -925,29 +926,65 @@ fn typed_array_from_values(kind: Kind, values: Vec<Value>) -> Value {
     target
 }
 
-fn typed_array_iterator(values: Vec<Value>) -> Value {
-    let values = Rc::new(values);
-    let index = Rc::new(RefCell::new(0usize));
-    let next_values = Rc::clone(&values);
-    let next_index = Rc::clone(&index);
-    Value::object(HashMap::from([(
-        "next".into(),
-        Value::function(move |_, _| {
-            let mut index = next_index.borrow_mut();
-            if let Some(value) = next_values.get(*index).cloned() {
-                *index += 1;
-                Value::object(HashMap::from([
-                    ("value".into(), value),
-                    ("done".into(), Value::Bool(false)),
-                ]))
-            } else {
-                Value::object(HashMap::from([
-                    ("value".into(), Value::Undefined),
-                    ("done".into(), Value::Bool(true)),
-                ]))
+#[derive(Clone, Copy)]
+enum TypedArrayIterationKind {
+    Keys,
+    Values,
+    Entries,
+}
+
+struct TypedArrayIterator {
+    value: Value,
+    index: usize,
+    kind: TypedArrayIterationKind,
+}
+
+impl Iterator for TypedArrayIterator {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (_, _, length, _, _) = view_for(&self.value)?;
+        if self.index >= length {
+            return None;
+        }
+        let index = self.index;
+        self.index += 1;
+        let value = match self.kind {
+            TypedArrayIterationKind::Keys => Value::from(index),
+            TypedArrayIterationKind::Values => {
+                typed_array_property(&self.value, &index.to_string()).unwrap_or(Value::Undefined)
             }
-        }),
-    )]))
+            TypedArrayIterationKind::Entries => Value::array(vec![
+                Value::from(index),
+                typed_array_property(&self.value, &index.to_string()).unwrap_or(Value::Undefined),
+            ]),
+        };
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = view_for(&self.value)
+            .map(|(_, _, length, _, _)| length.saturating_sub(self.index))
+            .unwrap_or_default();
+        (remaining, Some(remaining))
+    }
+}
+
+fn typed_array_iterator(value: &Value, kind: TypedArrayIterationKind) -> Value {
+    crate::value::iterator_object(ValueIterator::new(TypedArrayIterator {
+        value: value.clone(),
+        index: 0,
+        kind,
+    }))
+}
+
+pub(crate) fn typed_array_value_iterator(value: &Value) -> Option<ValueIterator> {
+    view_for(value)?;
+    Some(ValueIterator::new(TypedArrayIterator {
+        value: value.clone(),
+        index: 0,
+        kind: TypedArrayIterationKind::Values,
+    }))
 }
 
 fn typed_array_sort_order(left: &Value, right: &Value) -> std::cmp::Ordering {
@@ -972,7 +1009,7 @@ fn typed_array_sort_order(left: &Value, right: &Value) -> std::cmp::Ordering {
 pub(crate) fn typed_array_call_method(value: &Value, key: &str, args: Vec<Value>) -> Option<Value> {
     let (_, offset, length, kind, buffer) = view_for(value)?;
     let argument = |index: usize| args.get(index).cloned().unwrap_or(Value::Undefined);
-    let values = || iter_typed_array(value).unwrap_or_default();
+    let values = || typed_array_values(value).unwrap_or_default();
     Some(match key {
         "set" => {
             let source = argument(0).iter().collect::<Vec<_>>();
@@ -1090,15 +1127,9 @@ pub(crate) fn typed_array_call_method(value: &Value, key: &str, args: Vec<Value>
                     .collect(),
             )
         }
-        "keys" => typed_array_iterator((0..length).map(|index| Value::from(index)).collect()),
-        "values" => typed_array_iterator(values()),
-        "entries" => typed_array_iterator(
-            values()
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| Value::array(vec![Value::from(index), item]))
-                .collect(),
-        ),
+        "keys" => typed_array_iterator(value, TypedArrayIterationKind::Keys),
+        "values" => typed_array_iterator(value, TypedArrayIterationKind::Values),
+        "entries" => typed_array_iterator(value, TypedArrayIterationKind::Entries),
         "toReversed" => {
             let mut snapshot = values();
             snapshot.reverse();
@@ -1663,7 +1694,7 @@ mod tests {
             vec![Value::Number(0.0), Value::Number(2.0), Value::Number(4.0)],
         );
         assert_eq!(
-            iter_typed_array(&words).unwrap(),
+            typed_array_values(&words).unwrap(),
             vec![
                 Value::Number(7.0),
                 Value::Number(4.0),
@@ -1675,7 +1706,7 @@ mod tests {
         words.call_method("reverse", vec![]);
         words.call_method("sort", vec![]);
         assert_eq!(
-            iter_typed_array(&words).unwrap(),
+            typed_array_values(&words).unwrap(),
             vec![
                 Value::Number(4.0),
                 Value::Number(4.0),
@@ -1738,6 +1769,33 @@ mod tests {
             .downcast::<PanicValue>()
             .expect("exception should contain a JavaScript value");
         assert_eq!(error.0.get_property("name").to_js_string(), "RangeError");
+    }
+
+    #[test]
+    fn typed_array_explicit_iterators_are_live_and_self_iterable() {
+        let typed = typed_array_value(vec![Value::Number(1.0), Value::Number(2.0)]);
+        let values = typed.call_method("values", vec![]);
+        assert_eq!(
+            values.call_method("next", vec![]).get_property("value"),
+            Value::Number(1.0)
+        );
+        typed.set_property("1", Value::Number(9.0));
+        assert_eq!(
+            values.iter().next(),
+            Some(Value::Number(9.0)),
+            "iterating an iterator must continue the same live cursor"
+        );
+
+        let entries = typed.call_method("entries", vec![]);
+        typed.set_property("0", Value::Number(7.0));
+        let first = entries.call_method("next", vec![]).get_property("value");
+        assert_eq!(first.get_property("0"), Value::from(0));
+        assert_eq!(first.get_property("1"), Value::Number(7.0));
+
+        assert_eq!(
+            typed.call_method("keys", vec![]).iter().collect::<Vec<_>>(),
+            vec![Value::from(0), Value::from(1)]
+        );
     }
 
     #[test]

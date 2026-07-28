@@ -9,10 +9,20 @@ use std::collections::HashMap;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     static XR_SYSTEM: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn realm_xr_function(callback: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), callback)
 }
 
 fn arg(args: &[Value], index: usize) -> Value {
@@ -144,7 +154,7 @@ fn rigid_transform_value(position: [f64; 4], orientation: [f64; 4]) -> Value {
     ]));
     value.set_property(
         "__w3cos_getter_inverse",
-        Value::function(move |_, _| {
+        realm_xr_function(move |_, _| {
             let (inverse_position, inverse_orientation) = inverse_components(position, orientation);
             rigid_transform_value(inverse_position, inverse_orientation)
         }),
@@ -153,6 +163,7 @@ fn rigid_transform_value(position: [f64; 4], orientation: [f64; 4]) -> Value {
         &value,
         &class_for("XRRigidTransform").get_property("prototype"),
     );
+    register_weak_realm_object(&VALUES, &value);
     value
 }
 
@@ -218,6 +229,7 @@ fn construct_ray(args: Vec<Value>) -> Value {
         ("matrix".into(), matrix(ray_matrix(origin, direction))),
     ]));
     w3cos_core::class::set_prototype_of(&value, &class_for("XRRay").get_property("prototype"));
+    register_weak_realm_object(&VALUES, &value);
     value
 }
 
@@ -446,11 +458,11 @@ fn event_target(name: &str) -> bool {
 
 fn build_class(name: &'static str) -> Value {
     let constructor = match name {
-        "XRRigidTransform" => Value::function(|_, args| construct_rigid_transform(args)),
-        "XRRay" => Value::function(|_, args| construct_ray(args)),
-        _ => {
-            Value::function(move |_, _| throw("TypeError", &format!("Illegal constructor: {name}")))
-        }
+        "XRRigidTransform" => realm_xr_function(|_, args| construct_rigid_transform(args)),
+        "XRRay" => realm_xr_function(|_, args| construct_ray(args)),
+        _ => realm_xr_function(move |_, _| {
+            throw("TypeError", &format!("Illegal constructor: {name}"))
+        }),
     };
     constructor.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::from([("constructor".into(), constructor.clone())]));
@@ -471,7 +483,7 @@ fn build_class(name: &'static str) -> Value {
     if name == "XRWebGLLayer" {
         constructor.set_property(
             "getNativeFramebufferScaleFactor",
-            Value::function(|_, _| {
+            realm_xr_function(|_, _| {
                 warn_once();
                 Value::Number(1.0)
             }),
@@ -501,7 +513,7 @@ pub fn xr_system_value() -> Value {
             ("ondevicechange".into(), Value::Null),
             (
                 "isSessionSupported".into(),
-                Value::function(|_, args| {
+                realm_xr_function(|_, args| {
                     let mode = arg(&args, 0).to_js_string();
                     if !matches!(mode.as_str(), "inline" | "immersive-vr" | "immersive-ar") {
                         return w3cos_core::promise::reject(vec![error(
@@ -515,7 +527,7 @@ pub fn xr_system_value() -> Value {
             ),
             (
                 "requestSession".into(),
-                Value::function(|_, args| {
+                realm_xr_function(|_, args| {
                     if args.is_empty() {
                         return w3cos_core::promise::reject(vec![error(
                             "TypeError",
@@ -584,8 +596,35 @@ pub const INTERFACES: &[&str] = &[
 ];
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
-    XR_SYSTEM.with(|slot| *slot.borrow_mut() = None);
+    XR_SYSTEM.with(|slot| {
+        if let Some(system) = slot.borrow_mut().take() {
+            system.set_property("ondevicechange", Value::Null);
+            system.set_property("isSessionSupported", Value::Undefined);
+            system.set_property("requestSession", Value::Undefined);
+        }
+    });
+    VALUES.with(|values| {
+        for value in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for reference in [
+                "__w3cos_getter_inverse",
+                "direction",
+                "matrix",
+                "orientation",
+                "origin",
+                "position",
+            ] {
+                value.set_property(reference, Value::Undefined);
+            }
+        }
+    });
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        disconnect_realm_class(class);
+    }
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -662,5 +701,43 @@ mod tests {
                 .call_method("requestSession", vec![Value::string("immersive-vr")])
                 .is_object()
         );
+    }
+
+    #[test]
+    fn system_geometry_references_methods_and_classes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_system_class = class_for("XRSystem");
+        let old_transform_class = class_for("XRRigidTransform");
+        let system = xr_system_value();
+        let transform = w3cos_core::class::construct(&old_transform_class, vec![Value::Undefined]);
+        let position = transform.get_property("position");
+        let system_weak = crate::jsdom::weak_realm_object(&system);
+        let transform_weak = crate::jsdom::weak_realm_object(&transform);
+        let position_weak = crate::jsdom::weak_realm_object(&position);
+        drop(position);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_system_class.get_property("prototype").is_undefined());
+        assert!(old_transform_class.get_property("prototype").is_undefined());
+        assert!(!old_system_class.strict_eq(&class_for("XRSystem")));
+        assert!(system.get_property("ondevicechange").is_null());
+        assert!(
+            system
+                .call_method("isSessionSupported", vec![Value::string("inline")])
+                .is_undefined()
+        );
+        assert!(transform.get_property("position").is_undefined());
+        assert!(transform.get_property("matrix").is_undefined());
+        assert!(transform.get_property("inverse").is_undefined());
+        assert!(position_weak.upgrade().is_none());
+
+        drop(system);
+        drop(transform);
+        assert!(system_weak.upgrade().is_none());
+        assert!(transform_weak.upgrade().is_none());
     }
 }

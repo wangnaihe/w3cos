@@ -1,9 +1,11 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 /// W3C OS App manifest — describes an installed application.
 /// Loaded from `w3cos.json` in the app directory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppManifest {
     pub id: String,
     pub name: String,
@@ -12,9 +14,16 @@ pub struct AppManifest {
     pub icon: Option<String>,
     pub permissions: Vec<String>,
     pub window: WindowConfig,
+    /// Deployment-visible module URL → generated/native canonical specifier.
+    pub module_aliases: HashMap<String, String>,
+    /// ESM specifiers loaded and compiled by the runtime rather than the AOT
+    /// dependency graph. Generated code reads their exports through Core live
+    /// module slots, so both paths share one evaluator and module state.
+    pub runtime_modules: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WindowConfig {
     pub default_width: u32,
     pub default_height: u32,
@@ -49,6 +58,21 @@ impl Default for AppManifest {
             icon: None,
             permissions: Vec::new(),
             window: WindowConfig::default(),
+            module_aliases: HashMap::new(),
+            runtime_modules: Vec::new(),
+        }
+    }
+}
+
+impl AppManifest {
+    pub fn from_json(source: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(source)
+    }
+
+    /// Install deployment aliases into the Core-owned module registry.
+    pub fn install_module_aliases(&self) {
+        for (alias, canonical) in &self.module_aliases {
+            w3cos_core::module_registry::register_alias(alias, canonical);
         }
     }
 }
@@ -155,6 +179,7 @@ impl AppRegistry {
     }
 
     pub fn register(&mut self, manifest: AppManifest) {
+        manifest.install_module_aliases();
         self.apps.insert(manifest.id.clone(), manifest);
     }
 
@@ -250,5 +275,35 @@ mod tests {
         assert!(reg.get("terminal").is_some());
         assert_eq!(reg.get("files").unwrap().name, "File Manager");
         assert_eq!(reg.list().len(), 6);
+    }
+
+    #[test]
+    fn deployment_manifest_installs_module_aliases() {
+        w3cos_core::module_registry::clear();
+        w3cos_core::module_registry::register("build:///generated/main.js", HashMap::new(), None);
+        let manifest = AppManifest::from_json(
+            r#"{
+                "id": "maps",
+                "name": "Maps",
+                "version": "1.0.0",
+                "entry": "https://cdn.example.test/maps/main.js",
+                "module_aliases": {
+                    "https://cdn.example.test/maps/main.js": "build:///generated/main.js"
+                },
+                "runtime_modules": ["https://cdn.example.test/maps/plugin.js"]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.runtime_modules,
+            ["https://cdn.example.test/maps/plugin.js"]
+        );
+        let mut registry = AppRegistry::new();
+        registry.register(manifest);
+
+        assert!(w3cos_core::module_registry::contains_native(
+            "https://cdn.example.test/maps/main.js"
+        ));
+        w3cos_core::module_registry::clear();
     }
 }

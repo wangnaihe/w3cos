@@ -5,9 +5,39 @@ use std::collections::HashMap;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static COMPAT_WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+const CLASS_NAMES: &[&str] = &[
+    "External",
+    "FeaturePolicy",
+    "DocumentPictureInPicture",
+    "MediaError",
+    "Origin",
+    "NavigatorUAData",
+    "PictureInPictureWindow",
+    "QuotaExceededError",
+    "RadioNodeList",
+    "ReportBody",
+    "RemotePlayback",
+    "TimeRanges",
+    "WebSocketError",
+];
+
+fn realm_compat_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
+fn register_compat_value(value: &Value) {
+    register_weak_realm_object(&VALUES, value);
 }
 
 fn warn_once() {
@@ -31,7 +61,7 @@ fn illegal_constructor(name: &'static str) -> Value {
 
 fn build_class(name: &'static str) -> Value {
     let class = match name {
-        "QuotaExceededError" => Value::function(|_, args| {
+        "QuotaExceededError" => realm_compat_function(|_, args| {
             let message = args.first().map(Value::to_js_string).unwrap_or_default();
             let options = args.get(1).cloned().unwrap_or(Value::Undefined);
             let value = w3cos_core::web::dom_exception_instance(&message, "QuotaExceededError");
@@ -41,10 +71,11 @@ fn build_class(name: &'static str) -> Value {
                 &value,
                 &class("QuotaExceededError").get_property("prototype"),
             );
+            register_compat_value(&value);
             value
         }),
-        "Origin" => Value::function(|_, args| origin_value(args.first().cloned())),
-        "WebSocketError" => Value::function(|_, args| {
+        "Origin" => realm_compat_function(|_, args| origin_value(args.first().cloned())),
+        "WebSocketError" => realm_compat_function(|_, args| {
             let message = args.first().map(Value::to_js_string).unwrap_or_default();
             let options = args.get(1).cloned().unwrap_or(Value::Undefined);
             let value = w3cos_core::web::dom_exception_instance(&message, "WebSocketError");
@@ -60,14 +91,61 @@ fn build_class(name: &'static str) -> Value {
                 &value,
                 &class("WebSocketError").get_property("prototype"),
             );
+            register_compat_value(&value);
             value
         }),
-        _ => Value::function(move |_, _| illegal_constructor(name)),
+        _ => realm_compat_function(move |_, _| illegal_constructor(name)),
     };
     class.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", class.clone());
-    let members: &[&str] = match name {
+    for member in class_members(name) {
+        prototype.set_property(member, Value::Undefined);
+    }
+    if matches!(
+        name,
+        "DocumentPictureInPicture" | "PictureInPictureWindow" | "RemotePlayback"
+    ) {
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::web_events::event_target_class().get_property("prototype"),
+        );
+    } else if matches!(name, "QuotaExceededError" | "WebSocketError") {
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::unsupported::dom_exception_class().get_property("prototype"),
+        );
+    } else if name == "RadioNodeList" {
+        w3cos_core::class::set_prototype_of(
+            &prototype,
+            &crate::dom_constructors::prototype("NodeList"),
+        );
+    }
+    class.set_property("prototype", prototype);
+    if name == "MediaError" {
+        for (constant, value) in [
+            ("MEDIA_ERR_ABORTED", 1),
+            ("MEDIA_ERR_NETWORK", 2),
+            ("MEDIA_ERR_DECODE", 3),
+            ("MEDIA_ERR_SRC_NOT_SUPPORTED", 4),
+        ] {
+            class.set_property(constant, Value::Number(value as f64));
+            class
+                .get_property("prototype")
+                .set_property(constant, Value::Number(value as f64));
+        }
+    }
+    if name == "Origin" {
+        class.set_property(
+            "from",
+            realm_compat_function(|_, args| origin_value(args.first().cloned())),
+        );
+    }
+    class
+}
+
+fn class_members(name: &str) -> &'static [&'static str] {
+    match name {
         "External" => &["AddSearchProvider", "IsSearchProviderInstalled"],
         "FeaturePolicy" => &[
             "allowedFeatures",
@@ -108,50 +186,7 @@ fn build_class(name: &'static str) -> Value {
         "TimeRanges" => &["end", "length", "start"],
         "WebSocketError" => &["closeCode", "reason"],
         _ => &[],
-    };
-    for member in members {
-        prototype.set_property(member, Value::Undefined);
     }
-    if matches!(
-        name,
-        "DocumentPictureInPicture" | "PictureInPictureWindow" | "RemotePlayback"
-    ) {
-        w3cos_core::class::set_prototype_of(
-            &prototype,
-            &crate::web_events::event_target_class().get_property("prototype"),
-        );
-    } else if matches!(name, "QuotaExceededError" | "WebSocketError") {
-        w3cos_core::class::set_prototype_of(
-            &prototype,
-            &crate::unsupported::dom_exception_class().get_property("prototype"),
-        );
-    } else if name == "RadioNodeList" {
-        w3cos_core::class::set_prototype_of(
-            &prototype,
-            &crate::dom_constructors::prototype("NodeList"),
-        );
-    }
-    class.set_property("prototype", prototype);
-    if name == "MediaError" {
-        for (constant, value) in [
-            ("MEDIA_ERR_ABORTED", 1),
-            ("MEDIA_ERR_NETWORK", 2),
-            ("MEDIA_ERR_DECODE", 3),
-            ("MEDIA_ERR_SRC_NOT_SUPPORTED", 4),
-        ] {
-            class.set_property(constant, Value::Number(value as f64));
-            class
-                .get_property("prototype")
-                .set_property(constant, Value::Number(value as f64));
-        }
-    }
-    if name == "Origin" {
-        class.set_property(
-            "from",
-            Value::function(|_, args| origin_value(args.first().cloned())),
-        );
-    }
-    class
 }
 
 pub fn class(name: &'static str) -> Value {
@@ -189,7 +224,7 @@ fn origin_value(input: Option<Value>) -> Value {
         ("opaque".into(), Value::Bool(opaque)),
         (
             "isSameOrigin".into(),
-            Value::function({
+            realm_compat_function({
                 let serialized = serialized.clone();
                 move |_, args| {
                     Value::Bool(
@@ -201,7 +236,7 @@ fn origin_value(input: Option<Value>) -> Value {
         ),
         (
             "isSameSite".into(),
-            Value::function({
+            realm_compat_function({
                 let serialized = serialized.clone();
                 move |_, args| {
                     warn_once();
@@ -214,6 +249,7 @@ fn origin_value(input: Option<Value>) -> Value {
         ),
     ]));
     w3cos_core::class::set_prototype_of(&value, &class("Origin").get_property("prototype"));
+    register_compat_value(&value);
     value
 }
 
@@ -227,7 +263,7 @@ pub fn time_ranges_value(ranges: Vec<(f64, f64)>) -> Value {
         let ranges = std::rc::Rc::clone(&ranges);
         value.set_property(
             method,
-            Value::function(move |_, args| {
+            realm_compat_function(move |_, args| {
                 let index = args.first().map(Value::to_u32).unwrap_or_default() as usize;
                 let Some(range) = ranges.get(index) else {
                     w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
@@ -240,6 +276,7 @@ pub fn time_ranges_value(ranges: Vec<(f64, f64)>) -> Value {
         );
     }
     w3cos_core::class::set_prototype_of(&value, &class("TimeRanges").get_property("prototype"));
+    register_compat_value(&value);
     value
 }
 
@@ -247,44 +284,49 @@ pub fn external_value() -> Value {
     let value = Value::object(HashMap::from([
         (
             "AddSearchProvider".into(),
-            Value::function(|_, _| {
+            realm_compat_function(|_, _| {
                 warn_once();
                 Value::Undefined
             }),
         ),
         (
             "IsSearchProviderInstalled".into(),
-            Value::function(|_, _| {
+            realm_compat_function(|_, _| {
                 warn_once();
                 Value::Number(0.0)
             }),
         ),
     ]));
     w3cos_core::class::set_prototype_of(&value, &class("External").get_property("prototype"));
+    register_compat_value(&value);
     value
 }
 
 pub fn feature_policy_value() -> Value {
     let empty = || Value::array(Vec::new());
     let value = Value::object(HashMap::from([
-        ("features".into(), Value::function(move |_, _| empty())),
+        (
+            "features".into(),
+            realm_compat_function(move |_, _| empty()),
+        ),
         (
             "allowedFeatures".into(),
-            Value::function(|_, _| Value::array(Vec::new())),
+            realm_compat_function(|_, _| Value::array(Vec::new())),
         ),
         (
             "getAllowlistForFeature".into(),
-            Value::function(|_, _| Value::array(Vec::new())),
+            realm_compat_function(|_, _| Value::array(Vec::new())),
         ),
         (
             "allowsFeature".into(),
-            Value::function(|_, _| {
+            realm_compat_function(|_, _| {
                 warn_once();
                 Value::Bool(false)
             }),
         ),
     ]));
     w3cos_core::class::set_prototype_of(&value, &class("FeaturePolicy").get_property("prototype"));
+    register_compat_value(&value);
     value
 }
 
@@ -301,7 +343,7 @@ pub fn navigator_ua_data_value() -> Value {
     let json_value = value.clone();
     value.set_property(
         "toJSON",
-        Value::function(move |_, _| {
+        realm_compat_function(move |_, _| {
             Value::object(HashMap::from([
                 ("brands".into(), json_value.get_property("brands")),
                 ("mobile".into(), json_value.get_property("mobile")),
@@ -312,7 +354,7 @@ pub fn navigator_ua_data_value() -> Value {
     let entropy_value = value.clone();
     value.set_property(
         "getHighEntropyValues",
-        Value::function(move |_, args| {
+        realm_compat_function(move |_, args| {
             warn_once();
             let result = entropy_value.call_method("toJSON", Vec::new());
             for hint in args.first().cloned().unwrap_or(Value::Undefined).iter() {
@@ -332,6 +374,7 @@ pub fn navigator_ua_data_value() -> Value {
         &value,
         &class("NavigatorUAData").get_property("prototype"),
     );
+    register_compat_value(&value);
     value
 }
 
@@ -347,7 +390,7 @@ pub fn remote_playback_value() -> Value {
     }
     value.set_property(
         "watchAvailability",
-        Value::function(|_, args| {
+        realm_compat_function(|_, args| {
             warn_once();
             let callback = args.first().cloned().unwrap_or(Value::Undefined);
             if callback.is_function() {
@@ -358,11 +401,11 @@ pub fn remote_playback_value() -> Value {
     );
     value.set_property(
         "cancelWatchAvailability",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
+        realm_compat_function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
     );
     value.set_property(
         "prompt",
-        Value::function(|_, _| {
+        realm_compat_function(|_, _| {
             warn_once();
             w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
                 "No remote playback device is available",
@@ -371,6 +414,7 @@ pub fn remote_playback_value() -> Value {
         }),
     );
     w3cos_core::class::set_prototype_of(&value, &class("RemotePlayback").get_property("prototype"));
+    register_compat_value(&value);
     value
 }
 
@@ -380,7 +424,7 @@ pub fn document_picture_in_picture_value() -> Value {
     value.set_property("window", Value::Null);
     value.set_property(
         "requestWindow",
-        Value::function(|_, _| {
+        realm_compat_function(|_, _| {
             warn_once();
             w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
                 "Document Picture-in-Picture requires native multi-window integration",
@@ -392,11 +436,37 @@ pub fn document_picture_in_picture_value() -> Value {
         &value,
         &class("DocumentPictureInPicture").get_property("prototype"),
     );
+    register_compat_value(&value);
     value
 }
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
+    VALUES.with(|values| {
+        for value in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for name in CLASS_NAMES {
+                for member in class_members(name) {
+                    value.set_property(member, Value::Undefined);
+                }
+            }
+        }
+    });
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        for property in [
+            "from",
+            "MEDIA_ERR_ABORTED",
+            "MEDIA_ERR_NETWORK",
+            "MEDIA_ERR_DECODE",
+            "MEDIA_ERR_SRC_NOT_SUPPORTED",
+        ] {
+            class.set_property(property, Value::Undefined);
+        }
+        disconnect_realm_class(class);
+    }
     COMPAT_WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -428,5 +498,30 @@ mod tests {
                 )
                 .to_bool()
         );
+    }
+
+    #[test]
+    fn values_methods_callbacks_and_classes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_origin_class = class("Origin");
+        let old_remote_class = class("RemotePlayback");
+        let origin = origin_value(Some(Value::string("https://example.test/path")));
+        let ua = navigator_ua_data_value();
+        let remote = remote_playback_value();
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_origin_class.get_property("prototype").is_undefined());
+        assert!(old_origin_class.get_property("from").is_undefined());
+        assert!(old_remote_class.get_property("prototype").is_undefined());
+        assert!(!old_origin_class.strict_eq(&class("Origin")));
+        assert!(origin.get_property("isSameOrigin").is_undefined());
+        assert!(ua.get_property("brands").is_undefined());
+        assert!(ua.get_property("toJSON").is_undefined());
+        assert!(remote.get_property("watchAvailability").is_undefined());
+        assert!(remote.get_property("onconnect").is_undefined());
     }
 }

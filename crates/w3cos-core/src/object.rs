@@ -1,11 +1,22 @@
 #![allow(clippy::collapsible_if)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::heap::{HeapAllocation, HeapKind};
 use crate::proxy::ProxyHandler;
 use crate::value::{JsFunction, Value};
+
+#[derive(Clone)]
+pub(crate) enum PrivateElement {
+    Field(Value),
+    Method(Value),
+    Accessor {
+        getter: Option<Value>,
+        setter: Option<Value>,
+    },
+}
 
 /// A JavaScript-like dynamic object with string-keyed properties,
 /// prototype chain, and optional Proxy handler for trap interception.
@@ -21,28 +32,52 @@ pub struct JsObject {
     pub(crate) proxy_handler: Option<ProxyHandler>,
     has_getter_properties: bool,
     pub(crate) call_slot: Option<JsFunction>,
+    /// Derived-class instance initializers waiting for their corresponding
+    /// `super(...)` call to return. This is internal execution state, not an
+    /// observable JavaScript property.
+    pub(crate) pending_class_initializers: Vec<(u64, Value, Value)>,
+    /// Opaque class brands and private elements are intentionally kept out of
+    /// `properties`, so proxy traps and reflection cannot observe them.
+    pub(crate) class_brand: Option<u64>,
+    pub(crate) private_brands: HashSet<u64>,
+    pub(crate) private_elements: HashMap<(u64, String), PrivateElement>,
+    heap_allocation: HeapAllocation,
 }
 
 impl JsObject {
     pub fn new() -> Self {
+        let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         Self {
             properties: HashMap::new(),
             prototype: None,
             proxy_handler: None,
             has_getter_properties: false,
             call_slot: None,
+            pending_class_initializers: Vec::new(),
+            class_brand: None,
+            private_brands: HashSet::new(),
+            private_elements: HashMap::new(),
+            heap_allocation,
         }
     }
 
     pub fn from_map(map: HashMap<String, Value>) -> Self {
         let has_getter_properties = map.keys().any(|key| key.starts_with("__w3cos_getter_"));
-        Self {
+        let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
+        let object = Self {
             properties: map,
             prototype: None,
             proxy_handler: None,
             has_getter_properties,
             call_slot: None,
-        }
+            pending_class_initializers: Vec::new(),
+            class_brand: None,
+            private_brands: HashSet::new(),
+            private_elements: HashMap::new(),
+            heap_allocation,
+        };
+        object.refresh_heap_accounting();
+        object
     }
 
     /// Create a proxied object: `new Proxy(target_props, handler)`.
@@ -50,13 +85,21 @@ impl JsObject {
         let has_getter_properties = properties
             .keys()
             .any(|key| key.starts_with("__w3cos_getter_"));
-        Self {
+        let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
+        let object = Self {
             properties,
             prototype: None,
             proxy_handler: Some(handler),
             has_getter_properties,
             call_slot: None,
-        }
+            pending_class_initializers: Vec::new(),
+            class_brand: None,
+            private_brands: HashSet::new(),
+            private_elements: HashMap::new(),
+            heap_allocation,
+        };
+        object.refresh_heap_accounting();
+        object
     }
 
     /// Create a callable object (a JS class / constructor): plain properties
@@ -65,13 +108,21 @@ impl JsObject {
         let has_getter_properties = properties
             .keys()
             .any(|key| key.starts_with("__w3cos_getter_"));
-        Self {
+        let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
+        let object = Self {
             properties,
             prototype: None,
             proxy_handler: None,
             has_getter_properties,
             call_slot: Some(call),
-        }
+            pending_class_initializers: Vec::new(),
+            class_brand: None,
+            private_brands: HashSet::new(),
+            private_elements: HashMap::new(),
+            heap_allocation,
+        };
+        object.refresh_heap_accounting();
+        object
     }
 
     /// The call slot, if this object is callable.
@@ -120,6 +171,7 @@ impl JsObject {
             self.has_getter_properties = true;
         }
         self.properties.insert(key.to_string(), value);
+        self.refresh_heap_accounting();
     }
 
     pub fn may_have_getter_properties(&self) -> bool {
@@ -166,7 +218,10 @@ impl JsObject {
                 .keys()
                 .any(|key| key.starts_with("__w3cos_getter_"));
         }
-        removed
+        if removed {
+            self.refresh_heap_accounting();
+        }
+        true
     }
 
     /// `[[OwnKeys]]` — `Object.keys()` / `Reflect.ownKeys()`.
@@ -234,6 +289,7 @@ impl JsObject {
             let desc = desc.borrow();
             if let Some(val) = desc.properties.get("value") {
                 self.properties.insert(key.to_string(), val.clone());
+                self.refresh_heap_accounting();
             }
         }
         true
@@ -314,15 +370,50 @@ impl JsObject {
         self.proxy_handler.is_some()
     }
 
+    pub(crate) fn refresh_heap_accounting(&self) {
+        let property_bytes = self
+            .properties
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, Value)>())
+            .saturating_add(
+                self.properties
+                    .keys()
+                    .map(String::capacity)
+                    .fold(0usize, usize::saturating_add),
+            );
+        let pending_bytes = self
+            .pending_class_initializers
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(u64, Value, Value)>());
+        let private_brand_bytes = self
+            .private_brands
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>());
+        let private_element_bytes = self
+            .private_elements
+            .capacity()
+            .saturating_mul(std::mem::size_of::<((u64, String), PrivateElement)>())
+            .saturating_add(
+                self.private_elements
+                    .keys()
+                    .map(|(_, name)| name.capacity())
+                    .fold(0usize, usize::saturating_add),
+            );
+        self.heap_allocation.set_bytes(
+            std::mem::size_of::<Self>()
+                .saturating_add(property_bytes)
+                .saturating_add(pending_bytes)
+                .saturating_add(private_brand_bytes)
+                .saturating_add(private_element_bytes),
+        );
+    }
+
     /// Snapshot the raw properties as a `Value::Object` (used as `target` arg for traps).
     fn target_value(&self) -> Value {
-        let clone = JsObject {
-            properties: self.properties.clone(),
-            prototype: self.prototype.clone(),
-            proxy_handler: None,
-            has_getter_properties: self.has_getter_properties,
-            call_slot: self.call_slot.clone(),
-        };
+        let mut clone = JsObject::from_map(self.properties.clone());
+        clone.prototype = self.prototype.clone();
+        clone.has_getter_properties = self.has_getter_properties;
+        clone.call_slot = self.call_slot.clone();
         Value::Object(Rc::new(RefCell::new(clone)))
     }
 }

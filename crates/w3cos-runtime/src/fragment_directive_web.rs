@@ -74,6 +74,13 @@ pub fn install_document(document: &Value) {
         .set_property("fragmentDirective", Value::Undefined);
 }
 
+/// Release the document-scoped fragment-directive wrapper.
+pub fn reset_realm() {
+    VALUE.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

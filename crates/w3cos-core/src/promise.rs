@@ -4,9 +4,9 @@
 //! methods `then` / `catch` / `finally` (plain function values, so compiled
 //! property access finds them without prototype plumbing) plus the hidden
 //! numeric key `__w3cos_promise`. That key is an id into a thread-local
-//! registry mapping it to the shared `Rc<RefCell<PromiseState>>` — `Value`
-//! has no native-resource slot, so the state itself cannot live inside a
-//! property directly.
+//! weak registry mapping it to the shared `Rc<RefCell<PromiseState>>`.
+//! Promise methods and resolver/reaction closures own the state; the weak
+//! index lets host code recover it without retaining settled values forever.
 //!
 //! Reactions never run synchronously: settlement only enqueues reaction
 //! jobs onto the thread-local microtask queue ([`PROMISE_MICROTASKS`]),
@@ -17,15 +17,14 @@
 //! `catch_unwind` and turns the payload back into a rejection.
 //!
 //! v1 limitations: unhandled rejections are tracked as a no-op (nothing
-//! reports them), the state registry never reclaims ids of dropped
-//! promises, and `finally` does not await a promise returned from its
+//! reports them), and `finally` does not await a promise returned from its
 //! callback.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::Value;
 use crate::value::js_error;
@@ -40,19 +39,37 @@ enum PromiseState {
     Rejected(Value),
 }
 
+/// Observable settlement state for embedders that must bridge a JavaScript
+/// promise into a synchronous host API.
+#[derive(Clone)]
+pub enum PromiseStatus {
+    Pending,
+    Fulfilled(Value),
+    Rejected(Value),
+}
+
 /// A `then` subscription: the two handlers plus the state of the promise
 /// that `then` returned (settled when the matching handler runs).
 struct Reaction {
     on_fulfilled: Value,
     on_rejected: Value,
     next_state: Rc<RefCell<PromiseState>>,
+    realm_generation: u64,
+}
+
+struct MicrotaskJob {
+    callback: Value,
+    realm_generation: u64,
 }
 
 thread_local! {
-    /// Microtask queue: jobs are `Value::Function`s that run one reaction.
-    static PROMISE_MICROTASKS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+    /// Microtask queue shared by AOT and W3VM Promise reactions.
+    static PROMISE_MICROTASKS: RefCell<Vec<MicrotaskJob>> = const { RefCell::new(Vec::new()) };
+    /// Page/Realm generation. Reactions keep the generation in which `.then`
+    /// subscribed so old pending Promises cannot schedule stale page code.
+    static MICROTASK_REALM_GENERATION: Cell<u64> = const { Cell::new(0) };
     /// State registry keyed by the id stored under [`STATE_KEY`].
-    static PROMISE_STATES: RefCell<HashMap<u64, Rc<RefCell<PromiseState>>>> =
+    static PROMISE_STATES: RefCell<HashMap<u64, Weak<RefCell<PromiseState>>>> =
         RefCell::new(HashMap::new());
     static NEXT_PROMISE_ID: Cell<u64> = const { Cell::new(1) };
 }
@@ -63,7 +80,11 @@ fn register_state(state: Rc<RefCell<PromiseState>>) -> u64 {
         counter.set(id + 1);
         id
     });
-    PROMISE_STATES.with(|registry| registry.borrow_mut().insert(id, state));
+    PROMISE_STATES.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.retain(|_, state| state.strong_count() != 0);
+        registry.insert(id, Rc::downgrade(&state));
+    });
     id
 }
 
@@ -71,7 +92,8 @@ fn register_state(state: Rc<RefCell<PromiseState>>) -> u64 {
 fn state_of(value: &Value) -> Option<Rc<RefCell<PromiseState>>> {
     if let Value::Object(object) = value {
         if let Value::Number(id) = object.borrow().get_direct(STATE_KEY) {
-            return PROMISE_STATES.with(|registry| registry.borrow().get(&(id as u64)).cloned());
+            return PROMISE_STATES
+                .with(|registry| registry.borrow().get(&(id as u64)).and_then(Weak::upgrade));
         }
     }
     None
@@ -188,11 +210,21 @@ fn settle(state: &Rc<RefCell<PromiseState>>, outcome: Result<Value, Value>) {
 
 /// Enqueue one reaction run as a microtask job.
 fn schedule_reaction(reaction: Reaction, is_fulfilled: bool, value: Value) {
+    let current_generation = MICROTASK_REALM_GENERATION.with(Cell::get);
+    if reaction.realm_generation != current_generation {
+        return;
+    }
+    let realm_generation = reaction.realm_generation;
     let job = Value::function(move |_, _| {
         run_reaction(&reaction, is_fulfilled, value.clone());
         Value::Undefined
     });
-    PROMISE_MICROTASKS.with(|queue| queue.borrow_mut().push(job));
+    PROMISE_MICROTASKS.with(|queue| {
+        queue.borrow_mut().push(MicrotaskJob {
+            callback: job,
+            realm_generation,
+        })
+    });
 }
 
 /// The microtask body: invoke the matching handler (or pass the settlement
@@ -231,6 +263,7 @@ fn subscribe(
         on_fulfilled,
         on_rejected,
         next_state: next_state.clone(),
+        realm_generation: MICROTASK_REALM_GENERATION.with(Cell::get),
     };
     let settled = {
         let borrowed = state.borrow();
@@ -363,7 +396,12 @@ pub fn reject(args: Vec<Value>) -> Value {
 pub fn all(args: Vec<Value>) -> Value {
     let items = match args.first() {
         None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(items)) => items.borrow().clone(),
+        Some(Value::Array(items)) => items
+            .borrow()
+            .iter()
+            .cloned()
+            .map(crate::value::array_slot_value)
+            .collect(),
         Some(_) => {
             return reject(vec![js_error("TypeError: Promise.all expects an array")]);
         }
@@ -407,7 +445,12 @@ pub fn all(args: Vec<Value>) -> Value {
 /// `Promise.race(iterable)` — settles with the first item that settles.
 pub fn race(args: Vec<Value>) -> Value {
     let items = match args.first() {
-        Some(Value::Array(items)) => items.borrow().clone(),
+        Some(Value::Array(items)) => items
+            .borrow()
+            .iter()
+            .cloned()
+            .map(crate::value::array_slot_value)
+            .collect(),
         _ => Vec::new(),
     };
     let state = pending_state();
@@ -442,13 +485,19 @@ pub fn race(args: Vec<Value>) -> Value {
 pub fn drain_microtasks() -> usize {
     let mut ran = 0;
     loop {
-        let batch: Vec<Value> =
+        let batch: Vec<MicrotaskJob> =
             PROMISE_MICROTASKS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
         if batch.is_empty() {
             break;
         }
+        let current_generation = MICROTASK_REALM_GENERATION.with(Cell::get);
         for job in batch {
-            let _ = catch_unwind(AssertUnwindSafe(|| job.call(Value::Undefined, vec![])));
+            if job.realm_generation != current_generation {
+                continue;
+            }
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                job.callback.call(Value::Undefined, vec![])
+            }));
             ran += 1;
         }
     }
@@ -457,7 +506,38 @@ pub fn drain_microtasks() -> usize {
 
 /// Number of reaction jobs currently queued.
 pub fn queue_count() -> usize {
-    PROMISE_MICROTASKS.with(|queue| queue.borrow().len())
+    let current_generation = MICROTASK_REALM_GENERATION.with(Cell::get);
+    PROMISE_MICROTASKS.with(|queue| {
+        queue
+            .borrow()
+            .iter()
+            .filter(|job| job.realm_generation == current_generation)
+            .count()
+    })
+}
+
+/// Start a fresh page/Realm microtask generation.
+///
+/// Existing Promise states remain valid so a new Realm can subscribe to an
+/// already-settled shared AOT module Promise. Queued reactions and subscriptions
+/// created by the previous Realm can no longer execute.
+pub fn advance_realm_generation() {
+    MICROTASK_REALM_GENERATION.with(|generation| {
+        generation.set(generation.get().wrapping_add(1));
+    });
+    PROMISE_MICROTASKS.with(|queue| queue.borrow_mut().clear());
+}
+
+/// Returns the current settlement state when `value` is one of the promises
+/// owned by this runtime.
+pub fn status(value: &Value) -> Option<PromiseStatus> {
+    let state = state_of(value)?;
+    let status = match &*state.borrow() {
+        PromiseState::Pending { .. } => PromiseStatus::Pending,
+        PromiseState::Fulfilled(value) => PromiseStatus::Fulfilled(value.clone()),
+        PromiseState::Rejected(reason) => PromiseStatus::Rejected(reason.clone()),
+    };
+    Some(status)
 }
 
 #[cfg(test)]
@@ -497,6 +577,10 @@ mod tests {
             args[0].call(Value::Undefined, vec![Value::Number(42.0)]);
             Value::Undefined
         })]);
+        assert!(matches!(
+            status(&promise),
+            Some(PromiseStatus::Fulfilled(Value::Number(42.0)))
+        ));
         promise.call_method("then", vec![recorder(log.clone())]);
         // Reactions are microtasks: nothing ran yet even though `promise`
         // settled synchronously inside the executor.
@@ -693,6 +777,73 @@ mod tests {
         assert_eq!(queue_count(), 1);
         assert_eq!(drain_microtasks(), 1);
         assert_eq!(queue_count(), 0);
+    }
+
+    #[test]
+    fn realm_advance_discards_already_queued_reactions() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        resolve(vec![Value::string("stale")]).call_method("then", vec![recorder(Rc::clone(&log))]);
+        assert_eq!(queue_count(), 1);
+
+        advance_realm_generation();
+
+        assert_eq!(queue_count(), 0);
+        assert_eq!(drain_microtasks(), 0);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn old_pending_subscriptions_cannot_enqueue_after_realm_advance() {
+        let resolve_slot = Rc::new(RefCell::new(Value::Undefined));
+        let executor_slot = Rc::clone(&resolve_slot);
+        let promise = new(vec![Value::function(move |_, arguments| {
+            *executor_slot.borrow_mut() = arguments.first().cloned().unwrap_or(Value::Undefined);
+            Value::Undefined
+        })]);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        promise.call_method("then", vec![recorder(Rc::clone(&log))]);
+
+        advance_realm_generation();
+        resolve_slot
+            .borrow()
+            .call(Value::Undefined, vec![Value::string("stale")]);
+
+        assert_eq!(queue_count(), 0);
+        assert_eq!(drain_microtasks(), 0);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn new_realm_can_subscribe_to_an_already_settled_shared_promise() {
+        let shared = resolve(vec![Value::string("cached-aot")]);
+        advance_realm_generation();
+        let log = Rc::new(RefCell::new(Vec::new()));
+
+        shared.call_method("then", vec![recorder(Rc::clone(&log))]);
+
+        assert_eq!(drain_microtasks(), 1);
+        assert_eq!(log.borrow().as_slice(), &["cached-aot".to_string()]);
+    }
+
+    #[test]
+    fn dropped_promises_do_not_retain_settled_values_in_the_state_index() {
+        let marker = Rc::new(());
+        let marker_weak = Rc::downgrade(&marker);
+        {
+            let settled_marker = Rc::clone(&marker);
+            let settled_value = Value::function(move |_, _| {
+                let _ = &settled_marker;
+                Value::Undefined
+            });
+            let promise = resolve(vec![settled_value]);
+            assert!(matches!(
+                status(&promise),
+                Some(PromiseStatus::Fulfilled(Value::Function(_)))
+            ));
+        }
+        drop(marker);
+
+        assert!(marker_weak.upgrade().is_none());
     }
 
     #[test]

@@ -7,8 +7,19 @@ use std::sync::Once;
 
 use w3cos_core::Value;
 
+use crate::jsdom::realm_function;
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static CODEC_CONTROLLERS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+}
+
+fn realm_codec_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
+fn register_codec_controller(value: &Value) {
+    CODEC_CONTROLLERS.with(|controllers| controllers.borrow_mut().push(value.clone()));
 }
 
 fn type_error(message: &str) -> ! {
@@ -42,7 +53,7 @@ fn chunk_value(name: &'static str, init: Value) -> Value {
     let copy_bytes = Rc::clone(&bytes);
     value.set_property(
         "copyTo",
-        Value::function(move |_, args| {
+        realm_codec_function(move |_, args| {
             let destination = args.first().cloned().unwrap_or(Value::Undefined);
             let capacity = w3cos_core::binary::bytes_of(&destination)
                 .map(|bytes| bytes.len())
@@ -101,7 +112,7 @@ fn audio_data_value(init: Value) -> Value {
     let allocation_closed = Rc::clone(&closed);
     value.set_property(
         "allocationSize",
-        Value::function(move |_, _| {
+        realm_codec_function(move |_, _| {
             if allocation_closed.get() {
                 w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
                     "AudioData is closed",
@@ -115,7 +126,7 @@ fn audio_data_value(init: Value) -> Value {
     let copy_closed = Rc::clone(&closed);
     value.set_property(
         "copyTo",
-        Value::function(move |_, args| {
+        realm_codec_function(move |_, args| {
             if copy_closed.get() {
                 w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
                     "AudioData is closed",
@@ -149,7 +160,7 @@ fn audio_data_value(init: Value) -> Value {
     let clone_format = format.clone();
     value.set_property(
         "clone",
-        Value::function(move |_, _| {
+        realm_codec_function(move |_, _| {
             if clone_closed.get() {
                 w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
                     "AudioData is closed",
@@ -171,7 +182,7 @@ fn audio_data_value(init: Value) -> Value {
     );
     value.set_property(
         "close",
-        Value::function(move |_, _| {
+        realm_codec_function(move |_, _| {
             closed.set(true);
             Value::Undefined
         }),
@@ -263,7 +274,7 @@ fn video_frame_value(source: Value, init: Value) -> Value {
     let allocation_closed = Rc::clone(&closed);
     value.set_property(
         "allocationSize",
-        Value::function(move |_, _| {
+        realm_codec_function(move |_, _| {
             if allocation_closed.get() {
                 w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
                     "VideoFrame is closed",
@@ -277,7 +288,7 @@ fn video_frame_value(source: Value, init: Value) -> Value {
     let copy_closed = Rc::clone(&closed);
     value.set_property(
         "copyTo",
-        Value::function(move |_, args| {
+        realm_codec_function(move |_, args| {
             if copy_closed.get() {
                 return w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
                     "VideoFrame is closed",
@@ -331,7 +342,7 @@ fn video_frame_value(source: Value, init: Value) -> Value {
     let clone_format = format.clone();
     value.set_property(
         "clone",
-        Value::function(move |_, _| {
+        realm_codec_function(move |_, _| {
             if clone_closed.get() {
                 w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
                     "VideoFrame is closed",
@@ -356,7 +367,7 @@ fn video_frame_value(source: Value, init: Value) -> Value {
     );
     value.set_property(
         "close",
-        Value::function(move |_, _| {
+        realm_codec_function(move |_, _| {
             closed.set(true);
             Value::Undefined
         }),
@@ -364,7 +375,7 @@ fn video_frame_value(source: Value, init: Value) -> Value {
     let metadata_format = format;
     value.set_property(
         "metadata",
-        Value::function(move |_, _| {
+        realm_codec_function(move |_, _| {
             Value::object(HashMap::from([(
                 "format".into(),
                 Value::string(&metadata_format),
@@ -391,7 +402,7 @@ fn color_space_value(init: Value) -> Value {
     let json = value.clone();
     value.set_property(
         "toJSON",
-        Value::function(move |_, _| {
+        realm_codec_function(move |_, _| {
             Value::object(HashMap::from([
                 ("fullRange".into(), json.get_property("fullRange")),
                 ("matrix".into(), json.get_property("matrix")),
@@ -514,7 +525,7 @@ fn codec_value(kind: CodecKind, init: Value) -> Value {
     let configure_generation = Rc::clone(&generation);
     value.set_property(
         "configure",
-        Value::function(move |this, args| {
+        realm_codec_function(move |this, args| {
             if this.get_property("state").to_js_string() == "closed" {
                 w3cos_core::throw_value(codec_error(
                     "InvalidStateError",
@@ -537,7 +548,7 @@ fn codec_value(kind: CodecKind, init: Value) -> Value {
     let error_callback = error.clone();
     value.set_property(
         kind.operation(),
-        Value::function(move |this, args| {
+        realm_codec_function(move |this, args| {
             if this.get_property("state").to_js_string() != "configured" {
                 w3cos_core::throw_value(codec_error(
                     "InvalidStateError",
@@ -559,7 +570,7 @@ fn codec_value(kind: CodecKind, init: Value) -> Value {
             let generation_for_task = Rc::clone(&operation_generation);
             let callback_for_task = error_callback.clone();
             let target = this.clone();
-            crate::jsdom::queue_microtask_value(Value::function(move |_, _| {
+            crate::jsdom::queue_microtask_value(realm_codec_function(move |_, _| {
                 if generation_for_task.get() != operation_id
                     || target.get_property("state").to_js_string() == "closed"
                 {
@@ -597,7 +608,7 @@ fn codec_value(kind: CodecKind, init: Value) -> Value {
 
     value.set_property(
         "flush",
-        Value::function(move |this, _| {
+        realm_codec_function(move |this, _| {
             if this.get_property("state").to_js_string() == "closed" {
                 return w3cos_core::promise::reject(vec![codec_error(
                     "InvalidStateError",
@@ -623,7 +634,7 @@ fn codec_value(kind: CodecKind, init: Value) -> Value {
     let reset_generation = Rc::clone(&generation);
     value.set_property(
         "reset",
-        Value::function(move |this, _| {
+        realm_codec_function(move |this, _| {
             if this.get_property("state").to_js_string() == "closed" {
                 w3cos_core::throw_value(codec_error(
                     "InvalidStateError",
@@ -639,24 +650,25 @@ fn codec_value(kind: CodecKind, init: Value) -> Value {
 
     value.set_property(
         "close",
-        Value::function(move |this, _| {
+        realm_codec_function(move |this, _| {
             generation.set(generation.get().wrapping_add(1));
             this.set_property(kind.queue_property(), Value::Number(0.0));
             this.set_property("state", Value::string("closed"));
             Value::Undefined
         }),
     );
+    register_codec_controller(&value);
     value
 }
 
 fn codec_class(kind: CodecKind) -> Value {
-    let class = Value::function(move |_, args| {
+    let class = realm_codec_function(move |_, args| {
         codec_value(kind, args.first().cloned().unwrap_or(Value::Undefined))
     });
     class.set_property("name", Value::string(kind.name()));
     class.set_property(
         "isConfigSupported",
-        Value::function(move |_, args| {
+        realm_codec_function(move |_, args| {
             let config = args.first().cloned().unwrap_or(Value::Undefined);
             if let Err(error) = validate_codec_config(&config) {
                 return w3cos_core::promise::reject(vec![error]);
@@ -714,19 +726,19 @@ fn build_class(name: &'static str) -> Value {
         return codec_class(kind);
     }
     let class = match name {
-        "AudioData" => Value::function(|_, args| {
+        "AudioData" => realm_codec_function(|_, args| {
             audio_data_value(args.first().cloned().unwrap_or(Value::Undefined))
         }),
-        "VideoFrame" => Value::function(|_, args| {
+        "VideoFrame" => realm_codec_function(|_, args| {
             video_frame_value(
                 args.first().cloned().unwrap_or(Value::Undefined),
                 args.get(1).cloned().unwrap_or(Value::Undefined),
             )
         }),
-        "EncodedAudioChunk" | "EncodedVideoChunk" => Value::function(move |_, args| {
+        "EncodedAudioChunk" | "EncodedVideoChunk" => realm_codec_function(move |_, args| {
             chunk_value(name, args.first().cloned().unwrap_or(Value::Undefined))
         }),
-        "VideoColorSpace" => Value::function(|_, args| {
+        "VideoColorSpace" => realm_codec_function(|_, args| {
             color_space_value(args.first().cloned().unwrap_or(Value::Undefined))
         }),
         _ => unreachable!(),
@@ -791,6 +803,26 @@ pub fn class_for(name: &'static str) -> Value {
 }
 
 pub fn reset() {
+    let controllers =
+        CODEC_CONTROLLERS.with(|controllers| std::mem::take(&mut *controllers.borrow_mut()));
+    for object in controllers {
+        for method in ["close", "configure", "decode", "encode", "flush", "reset"] {
+            if !object.get_property(method).is_undefined() {
+                object.set_property(method, Value::Undefined);
+            }
+        }
+        if !object.get_property("state").is_undefined() {
+            object.set_property("state", Value::string("closed"));
+        }
+        for queue in ["decodeQueueSize", "encodeQueueSize"] {
+            if !object.get_property(queue).is_undefined() {
+                object.set_property(queue, Value::Number(0.0));
+            }
+        }
+        if !object.get_property("ondequeue").is_undefined() {
+            object.set_property("ondequeue", Value::Null);
+        }
+    }
     CLASSES.with(|classes| classes.borrow_mut().clear());
 }
 
@@ -983,6 +1015,103 @@ mod tests {
         assert_eq!(decoder.get_property("decodeQueueSize").to_number(), 0.0);
         assert_eq!(decoder.get_property("state").to_js_string(), "closed");
         assert_eq!(&*errors.borrow(), &["NotSupportedError"]);
+    }
+
+    #[test]
+    fn codec_classes_buffers_callbacks_and_queued_work_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_decoder_class = class_for("VideoDecoder");
+        let old_chunk_class = class_for("EncodedVideoChunk");
+        let old_audio_class = class_for("AudioData");
+        assert!(old_decoder_class.strict_eq(&class_for("VideoDecoder")));
+        assert!(old_chunk_class.strict_eq(&class_for("EncodedVideoChunk")));
+
+        let error_marker = Rc::new(());
+        let error_marker_weak = Rc::downgrade(&error_marker);
+        let decoder = w3cos_core::class::construct(
+            &old_decoder_class,
+            vec![Value::object(HashMap::from([
+                ("output".into(), Value::function(|_, _| Value::Undefined)),
+                (
+                    "error".into(),
+                    Value::function(move |_, _| {
+                        let _ = &error_marker;
+                        Value::Undefined
+                    }),
+                ),
+            ]))],
+        );
+        let dequeue_marker = Rc::new(());
+        let dequeue_marker_weak = Rc::downgrade(&dequeue_marker);
+        decoder.set_property(
+            "ondequeue",
+            Value::function(move |_, _| {
+                let _ = &dequeue_marker;
+                Value::Undefined
+            }),
+        );
+        decoder.call_method(
+            "configure",
+            vec![Value::object(HashMap::from([(
+                "codec".into(),
+                Value::string("vp09.00.10.08"),
+            )]))],
+        );
+        let chunk = w3cos_core::class::construct(
+            &old_chunk_class,
+            vec![Value::object(HashMap::from([
+                ("type".into(), Value::string("key")),
+                ("timestamp".into(), Value::Number(0.0)),
+                (
+                    "data".into(),
+                    w3cos_core::binary::typed_array_value(vec![Value::Number(7.0)]),
+                ),
+            ]))],
+        );
+        decoder.call_method("decode", vec![chunk.clone()]);
+        let audio = w3cos_core::class::construct(
+            &old_audio_class,
+            vec![Value::object(HashMap::from([
+                (
+                    "data".into(),
+                    w3cos_core::binary::typed_array_value(vec![Value::Number(1.0)]),
+                ),
+                ("format".into(), Value::string("u8")),
+                ("numberOfChannels".into(), Value::Number(1.0)),
+                ("numberOfFrames".into(), Value::Number(1.0)),
+                ("sampleRate".into(), Value::Number(8_000.0)),
+                ("timestamp".into(), Value::Number(0.0)),
+            ]))],
+        );
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_decoder_class.strict_eq(&class_for("VideoDecoder")));
+        assert!(!old_chunk_class.strict_eq(&class_for("EncodedVideoChunk")));
+        assert!(!old_audio_class.strict_eq(&class_for("AudioData")));
+        for class in [old_decoder_class, old_chunk_class, old_audio_class] {
+            assert!(class.call(Value::Undefined, vec![]).is_undefined());
+        }
+        assert_eq!(decoder.get_property("state").to_js_string(), "closed");
+        assert_eq!(decoder.get_property("decodeQueueSize").to_number(), 0.0);
+        assert!(
+            decoder
+                .call_method("decode", vec![chunk.clone()])
+                .is_undefined()
+        );
+        assert!(
+            chunk
+                .call_method("copyTo", vec![Value::Undefined])
+                .is_undefined()
+        );
+        assert!(audio.call_method("allocationSize", vec![]).is_undefined());
+        assert!(decoder.get_property("ondequeue").is_null());
+        assert!(error_marker_weak.upgrade().is_none());
+        assert!(dequeue_marker_weak.upgrade().is_none());
+        crate::jsdom::drain_microtasks();
     }
 
     #[test]

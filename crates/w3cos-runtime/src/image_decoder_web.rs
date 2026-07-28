@@ -3,15 +3,22 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use image::metadata::LoopCount;
 use image::{AnimationDecoder, ImageFormat};
 use w3cos_core::Value;
 
+use crate::jsdom::realm_function;
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static DECODERS: RefCell<Vec<Weak<DecoderState>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn realm_image_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
 }
 
 #[derive(Clone)]
@@ -21,6 +28,19 @@ struct DecodedFrame {
     rgba: Arc<Vec<u8>>,
     timestamp: f64,
     duration: Option<f64>,
+}
+
+struct DecoderState {
+    frames: RefCell<Vec<DecodedFrame>>,
+    closed: Cell<bool>,
+}
+
+fn register_decoder(state: &Rc<DecoderState>) {
+    DECODERS.with(|decoders| {
+        let mut decoders = decoders.borrow_mut();
+        decoders.retain(|decoder| decoder.strong_count() != 0);
+        decoders.push(Rc::downgrade(state));
+    });
 }
 
 fn error(name: &str, message: &str) -> Value {
@@ -187,7 +207,7 @@ fn track_list_value(track: Value) -> Value {
     let selected_track = track.clone();
     value.set_property(
         "__w3cos_getter_selectedIndex",
-        Value::function(move |_, _| {
+        realm_image_function(move |_, _| {
             Value::Number(if selected_track.get_property("selected").to_bool() {
                 0.0
             } else {
@@ -198,7 +218,7 @@ fn track_list_value(track: Value) -> Value {
     let selected_track = track;
     value.set_property(
         "__w3cos_getter_selectedTrack",
-        Value::function(move |_, _| {
+        realm_image_function(move |_, _| {
             if selected_track.get_property("selected").to_bool() {
                 selected_track.clone()
             } else {
@@ -292,11 +312,13 @@ fn decoder_value(init: Value) -> Value {
     if frames.is_empty() {
         throw("EncodingError", "ImageDecoder produced no frames");
     }
-    let frames = Rc::new(frames);
-    let closed = Rc::new(Cell::new(false));
-    let generation = Rc::new(Cell::new(0_u64));
     let track = track_value(frames.len(), repetitions);
     let tracks = track_list_value(track.clone());
+    let state = Rc::new(DecoderState {
+        frames: RefCell::new(frames),
+        closed: Cell::new(false),
+    });
+    register_decoder(&state);
     let value = Value::object(HashMap::from([
         ("complete".into(), Value::Bool(true)),
         ("tracks".into(), tracks),
@@ -306,13 +328,12 @@ fn decoder_value(init: Value) -> Value {
         "completed",
         w3cos_core::promise::resolve(vec![Value::Undefined]),
     );
-    let decode_frames = Rc::clone(&frames);
-    let decode_closed = Rc::clone(&closed);
+    let decode_state = Rc::clone(&state);
     let decode_track = track;
     value.set_property(
         "decode",
-        Value::function(move |_, args| {
-            if decode_closed.get() {
+        realm_image_function(move |_, args| {
+            if decode_state.closed.get() {
                 return w3cos_core::promise::reject(vec![error(
                     "InvalidStateError",
                     "ImageDecoder is closed",
@@ -326,7 +347,8 @@ fn decoder_value(init: Value) -> Value {
             }
             let options = args.first().cloned().unwrap_or(Value::Undefined);
             let index = options.get_property("frameIndex").to_u32() as usize;
-            let Some(frame) = decode_frames.get(index) else {
+            let frames = decode_state.frames.borrow();
+            let Some(frame) = frames.get(index) else {
                 return w3cos_core::promise::reject(vec![error(
                     "RangeError",
                     "ImageDecoder frameIndex is out of range",
@@ -338,23 +360,21 @@ fn decoder_value(init: Value) -> Value {
             ]))])
         }),
     );
-    let reset_generation = Rc::clone(&generation);
-    let reset_closed = Rc::clone(&closed);
+    let reset_state = Rc::clone(&state);
     value.set_property(
         "reset",
-        Value::function(move |_, _| {
-            if reset_closed.get() {
+        realm_image_function(move |_, _| {
+            if reset_state.closed.get() {
                 throw("InvalidStateError", "ImageDecoder is closed");
             }
-            reset_generation.set(reset_generation.get().wrapping_add(1));
             Value::Undefined
         }),
     );
     value.set_property(
         "close",
-        Value::function(move |_, _| {
-            generation.set(generation.get().wrapping_add(1));
-            closed.set(true);
+        realm_image_function(move |_, _| {
+            state.closed.set(true);
+            state.frames.borrow_mut().clear();
             Value::Undefined
         }),
     );
@@ -367,18 +387,18 @@ fn decoder_value(init: Value) -> Value {
 
 fn build_class(name: &'static str) -> Value {
     let class = match name {
-        "ImageDecoder" => Value::function(|_, args| {
+        "ImageDecoder" => realm_image_function(|_, args| {
             decoder_value(args.first().cloned().unwrap_or(Value::Undefined))
         }),
-        _ => {
-            Value::function(move |_, _| throw("TypeError", &format!("Illegal constructor: {name}")))
-        }
+        _ => realm_image_function(move |_, _| {
+            throw("TypeError", &format!("Illegal constructor: {name}"))
+        }),
     };
     class.set_property("name", Value::string(name));
     if name == "ImageDecoder" {
         class.set_property(
             "isTypeSupported",
-            Value::function(|_, args| {
+            realm_image_function(|_, args| {
                 let type_name = args.first().map(Value::to_js_string).unwrap_or_default();
                 w3cos_core::promise::resolve(vec![Value::Bool(mime_format(&type_name).is_some())])
             }),
@@ -418,6 +438,16 @@ pub fn class_for(name: &'static str) -> Value {
 }
 
 pub fn reset() {
+    DECODERS.with(|decoders| {
+        for decoder in decoders
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|state| state.upgrade())
+        {
+            decoder.closed.set(true);
+            decoder.frames.borrow_mut().clear();
+        }
+    });
     CLASSES.with(|classes| classes.borrow_mut().clear());
 }
 
@@ -500,5 +530,51 @@ mod tests {
             );
         crate::jsdom::drain_microtasks();
         assert!(supported.get());
+    }
+
+    #[test]
+    fn decoder_classes_methods_and_decoded_frames_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_decoder_class = class_for("ImageDecoder");
+        let old_track_class = class_for("ImageTrack");
+        let decoder = w3cos_core::class::construct(
+            &old_decoder_class,
+            vec![Value::object(HashMap::from([
+                (
+                    "data".into(),
+                    w3cos_core::binary::array_buffer_value(png_bytes()),
+                ),
+                ("type".into(), Value::string("image/png")),
+            ]))],
+        );
+        let tracks = decoder.get_property("tracks");
+        let state = DECODERS.with(|decoders| decoders.borrow().last().unwrap().clone());
+        assert_eq!(state.upgrade().unwrap().frames.borrow().len(), 1);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_decoder_class.strict_eq(&class_for("ImageDecoder")));
+        assert!(!old_track_class.strict_eq(&class_for("ImageTrack")));
+        assert!(
+            old_decoder_class
+                .call(Value::Undefined, Vec::new())
+                .is_undefined()
+        );
+        assert!(
+            decoder
+                .call_method("decode", vec![Value::object(HashMap::new())])
+                .is_undefined()
+        );
+        assert!(decoder.call_method("reset", Vec::new()).is_undefined());
+        assert!(tracks.get_property("selectedIndex").is_undefined());
+        let retained_state = state.upgrade().unwrap();
+        assert!(retained_state.closed.get());
+        assert!(retained_state.frames.borrow().is_empty());
+        drop(retained_state);
+        drop(decoder);
+        assert!(state.upgrade().is_none());
     }
 }

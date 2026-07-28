@@ -27,13 +27,14 @@
 //! }
 //! ```
 
+use crate::jsdom::realm_function;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use w3cos_core::Value;
 
@@ -218,12 +219,16 @@ thread_local! {
     static EVENT_SOURCE_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
+fn realm_event_source_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
 pub fn event_source_class() -> Value {
     EVENT_SOURCE_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_event_source_function(|_, args| {
             let url = args.first().cloned().unwrap_or_default().to_js_string();
             js_event_source_value(EventSource::new(url))
         });
@@ -271,17 +276,19 @@ fn js_event_source_value(source: EventSource) -> Value {
     let source_for_url = source.clone();
     value.set_property(
         "__w3cos_getter_url",
-        Value::function(move |_, _| Value::string(source_for_url.url())),
+        realm_event_source_function(move |_, _| Value::string(source_for_url.url())),
     );
     let source_for_state = source.clone();
     value.set_property(
         "__w3cos_getter_readyState",
-        Value::function(move |_, _| Value::Number(source_for_state.ready_state() as u8 as f64)),
+        realm_event_source_function(move |_, _| {
+            Value::Number(source_for_state.ready_state() as u8 as f64)
+        }),
     );
     let source_for_close = source.clone();
     value.set_property(
         "close",
-        Value::function(move |_, _| {
+        realm_event_source_function(move |_, _| {
             source_for_close.close();
             Value::Undefined
         }),
@@ -289,7 +296,7 @@ fn js_event_source_value(source: EventSource) -> Value {
     let add_listeners = Rc::clone(&listeners);
     value.set_property(
         "addEventListener",
-        Value::function(move |_, args| {
+        realm_event_source_function(move |_, args| {
             let event_type = args.first().cloned().unwrap_or_default().to_js_string();
             let listener = args.get(1).cloned().unwrap_or_default();
             if listener.is_function() {
@@ -305,7 +312,7 @@ fn js_event_source_value(source: EventSource) -> Value {
     let remove_listeners = Rc::clone(&listeners);
     value.set_property(
         "removeEventListener",
-        Value::function(move |_, args| {
+        realm_event_source_function(move |_, args| {
             let event_type = args.first().cloned().unwrap_or_default().to_js_string();
             let listener = args.get(1).cloned().unwrap_or_default();
             if let Some(items) = remove_listeners.borrow_mut().get_mut(&event_type) {
@@ -386,7 +393,40 @@ pub fn poll_js_events() -> usize {
             dispatched += dispatch_js_event(&binding, &event_type, event_value);
         }
     }
+    JS_EVENT_SOURCES.with(|sources| {
+        sources
+            .borrow_mut()
+            .retain(|binding| binding.source.ready_state() != EventSourceState::Closed);
+    });
     dispatched
+}
+
+pub fn has_pending_js_sources() -> bool {
+    JS_EVENT_SOURCES.with(|sources| !sources.borrow().is_empty())
+}
+
+pub(crate) fn reset_js_event_sources() {
+    let sources = JS_EVENT_SOURCES.with(|sources| std::mem::take(&mut *sources.borrow_mut()));
+    for binding in sources {
+        binding.source.close();
+        binding.source.poll_events();
+        binding.listeners.borrow_mut().clear();
+        for property in ["onopen", "onmessage", "onerror"] {
+            binding.value.set_property(property, Value::Null);
+        }
+        for property in [
+            "__w3cos_getter_url",
+            "__w3cos_getter_readyState",
+            "close",
+            "addEventListener",
+            "removeEventListener",
+        ] {
+            binding.value.set_property(property, Value::Undefined);
+        }
+    }
+    EVENT_SOURCE_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 // ── SSE worker thread ──────────────────────────────────────────────────────
@@ -610,5 +650,65 @@ mod tests {
         ));
         es.close();
         assert_eq!(es.ready_state(), EventSourceState::Closed);
+    }
+
+    #[test]
+    fn javascript_sources_and_methods_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_class = event_source_class();
+        let source = EventSource {
+            inner: Arc::new(EventSourceInner {
+                url: "https://realm.invalid/events".to_string(),
+                state: AtomicU8::new(EventSourceState::Open as u8),
+                events: Mutex::new(VecDeque::new()),
+                last_event_id: Mutex::new(None),
+            }),
+        };
+        let native_source = source.clone();
+        let value = js_event_source_value(source);
+        let callback_marker = Rc::new(());
+        let callback_marker_weak = Rc::downgrade(&callback_marker);
+        value.call_method(
+            "addEventListener",
+            vec![
+                Value::string("message"),
+                Value::function(move |_, _| {
+                    let _ = &callback_marker;
+                    Value::Undefined
+                }),
+            ],
+        );
+        assert!(has_pending_js_sources());
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!has_pending_js_sources());
+        assert!(!old_class.strict_eq(&event_source_class()));
+        assert!(
+            old_class
+                .call(
+                    Value::Undefined,
+                    vec![Value::string("https://stale.invalid/events")],
+                )
+                .is_undefined()
+        );
+        assert!(value.call_method("close", vec![]).is_undefined());
+        assert!(
+            value
+                .call_method(
+                    "addEventListener",
+                    vec![
+                        Value::string("message"),
+                        Value::function(|_, _| Value::Undefined),
+                    ],
+                )
+                .is_undefined()
+        );
+        assert_eq!(native_source.ready_state(), EventSourceState::Closed);
+        assert!(callback_marker_weak.upgrade().is_none());
+        reset_js_event_sources();
     }
 }

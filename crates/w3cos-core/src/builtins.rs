@@ -23,6 +23,153 @@ pub const Array: BuiltinObject = BuiltinObject(BuiltinKind::Array);
 pub const console: BuiltinObject = BuiltinObject(BuiltinKind::Console);
 pub const document: BuiltinObject = BuiltinObject(BuiltinKind::Document);
 
+pub fn object_value() -> Value {
+    let mut properties = HashMap::new();
+    for name in ["keys", "values", "is"] {
+        let method = name.to_string();
+        properties.insert(
+            name.to_string(),
+            Value::function(move |_, arguments| Object.call_method(&method, arguments)),
+        );
+    }
+    properties.insert(
+        "create".into(),
+        Value::function(|_, arguments| {
+            let object = Value::object(HashMap::new());
+            if let Some(prototype) = arguments.first()
+                && !prototype.is_null()
+            {
+                crate::class::set_prototype_of(&object, prototype);
+            }
+            object
+        }),
+    );
+    properties.insert(
+        "getPrototypeOf".into(),
+        Value::function(|_, arguments| {
+            crate::class::get_prototype_of(&arguments.first().cloned().unwrap_or(Value::Undefined))
+        }),
+    );
+    properties.insert(
+        "getOwnPropertyDescriptor".into(),
+        Value::function(|_, arguments| {
+            let object = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let key = arguments
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::Undefined)
+                .to_js_string();
+            crate::class::get_own_property_descriptor(&object, &key)
+        }),
+    );
+    properties.insert(
+        "defineProperty".into(),
+        Value::function(|_, arguments| {
+            let object = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let key = arguments
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::Undefined)
+                .to_js_string();
+            let descriptor = arguments.get(2).cloned().unwrap_or(Value::Undefined);
+            crate::class::define_property(&object, &key, &descriptor)
+        }),
+    );
+    properties.insert(
+        "freeze".into(),
+        Value::function(|_, arguments| arguments.first().cloned().unwrap_or(Value::Undefined)),
+    );
+    properties.insert(
+        "getOwnPropertyNames".into(),
+        Value::function(|_, arguments| {
+            arguments
+                .first()
+                .map(object_keys)
+                .unwrap_or_else(|| Value::array(Vec::new()))
+        }),
+    );
+    properties.insert(
+        "assign".into(),
+        Value::function(|_, arguments| {
+            let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+            for source in arguments.iter().skip(1) {
+                crate::intrinsics::copy_data_properties(&target, source);
+            }
+            target
+        }),
+    );
+    properties.insert(
+        "entries".into(),
+        Value::function(|_, arguments| {
+            let object = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let entries = object_keys(&object)
+                .iter()
+                .map(|key| {
+                    let key = key.to_js_string();
+                    Value::array(vec![Value::String(key.clone()), object.get_property(&key)])
+                })
+                .collect();
+            Value::array(entries)
+        }),
+    );
+    Value::callable(properties, |_, arguments| {
+        arguments
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Value::object(HashMap::new()))
+    })
+}
+
+pub fn array_value() -> Value {
+    let mut properties = HashMap::new();
+    properties.insert(
+        "isArray".into(),
+        Value::function(|_, arguments| Value::Bool(arguments.first().is_some_and(Value::is_array))),
+    );
+    properties.insert(
+        "from".into(),
+        Value::function(|_, arguments| {
+            let source = arguments.first().cloned().unwrap_or(Value::Undefined);
+            if source.is_iterable() {
+                Value::array(source.iter().collect())
+            } else {
+                Value::array(Vec::new())
+            }
+        }),
+    );
+    properties.insert(
+        "of".into(),
+        Value::function(|_, arguments| Value::array(arguments)),
+    );
+    Value::callable(properties, |_, arguments| {
+        if let [Value::Number(length)] = arguments.as_slice()
+            && length.is_finite()
+            && *length >= 0.0
+            && length.fract() == 0.0
+        {
+            return Value::array(
+                (0..*length as usize)
+                    .map(|_| crate::value::array_hole())
+                    .collect(),
+            );
+        }
+        Value::array(arguments)
+    })
+}
+
+pub fn json_value() -> Value {
+    Value::object(HashMap::from([
+        (
+            "parse".into(),
+            Value::function(|_, arguments| crate::json::parse(arguments)),
+        ),
+        (
+            "stringify".into(),
+            Value::function(|_, arguments| crate::json::stringify(arguments)),
+        ),
+    ]))
+}
+
 impl BuiltinObject {
     pub fn call_method(&self, key: &str, arguments: Vec<Value>) -> Value {
         match (self.0, key) {
@@ -186,7 +333,7 @@ fn js_round(value: f64) -> f64 {
     }
 }
 
-fn object_keys(value: &Value) -> Value {
+pub(crate) fn object_keys(value: &Value) -> Value {
     match value {
         Value::Object(object) => Value::array(
             object
@@ -194,6 +341,15 @@ fn object_keys(value: &Value) -> Value {
                 .keys()
                 .into_iter()
                 .map(Value::String)
+                .collect(),
+        ),
+        Value::Array(values) => Value::array(
+            values
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| !crate::value::is_array_hole(value))
+                .map(|(index, _)| Value::String(index.to_string()))
                 .collect(),
         ),
         _ => Value::array(Vec::new()),
@@ -212,6 +368,14 @@ fn object_values(value: &Value) -> Value {
                     .collect(),
             )
         }
+        Value::Array(values) => Value::array(
+            values
+                .borrow()
+                .iter()
+                .filter(|value| !crate::value::is_array_hole(value))
+                .cloned()
+                .collect(),
+        ),
         _ => Value::array(Vec::new()),
     }
 }
@@ -992,6 +1156,39 @@ mod tests {
             .call(Value::Undefined, vec![])
             .to_number();
         assert!((0.0..1.0).contains(&random));
+    }
+
+    #[test]
+    fn standard_global_facades_share_sparse_array_semantics() {
+        let array_constructor = array_value();
+        let sparse = array_constructor.call(Value::Undefined, vec![Value::Number(3.0)]);
+        sparse.set_property("1", Value::string("middle"));
+
+        let object = object_value();
+        assert_eq!(
+            object
+                .call_method("keys", vec![sparse.clone()])
+                .to_js_string(),
+            "1"
+        );
+        assert_eq!(
+            object
+                .call_method("values", vec![sparse.clone()])
+                .to_js_string(),
+            "middle"
+        );
+        assert_eq!(
+            array_constructor
+                .call_method("isArray", vec![sparse.clone()])
+                .to_bool(),
+            true
+        );
+        assert_eq!(
+            json_value()
+                .call_method("stringify", vec![sparse])
+                .to_js_string(),
+            "[null,\"middle\",null]"
+        );
     }
 
     #[test]

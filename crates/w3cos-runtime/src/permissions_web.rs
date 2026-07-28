@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -23,7 +24,8 @@ pub fn permission_status_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(error("TypeError", "Illegal constructor: PermissionStatus"))
         });
         class.set_property("name", Value::string("PermissionStatus"));
@@ -47,7 +49,8 @@ pub fn permissions_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(error("TypeError", "Illegal constructor: Permissions"))
         });
         class.set_property("name", Value::string("Permissions"));
@@ -109,10 +112,11 @@ fn permission_status(name: &str, state: &str) -> Value {
 }
 
 pub fn permissions_value() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let permissions = Value::object(HashMap::new());
     permissions.set_property(
         "query",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             let descriptor = args.first().cloned().unwrap_or(Value::Undefined);
             if !descriptor.is_object() {
                 return w3cos_core::promise::reject(vec![error(
@@ -145,6 +149,15 @@ pub fn permissions_value() -> Value {
     permissions
 }
 
+pub fn reset_realm() {
+    PERMISSIONS_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    PERMISSION_STATUS_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +166,9 @@ mod tests {
 
     #[test]
     fn query_returns_event_target_status_and_rejects_unknown_names() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let permissions = permissions_value();
         let status_slot = Rc::new(RefCell::new(Value::Undefined));
         let status_for_then = Rc::clone(&status_slot);
@@ -200,5 +216,63 @@ mod tests {
             );
         w3cos_core::promise::drain_microtasks();
         assert_eq!(&*error_name.borrow(), "TypeError");
+        reset_realm();
+    }
+
+    #[test]
+    fn classes_and_queries_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_permissions = permissions_value();
+        let old_class = permissions_class();
+        old_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_permissions = permissions_value();
+        let new_class = permissions_class();
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(
+            new_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(
+            old_permissions
+                .call_method(
+                    "query",
+                    vec![Value::object(HashMap::from([(
+                        "name".into(),
+                        Value::string("geolocation"),
+                    )]))],
+                )
+                .is_undefined()
+        );
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+
+        let state = Rc::new(RefCell::new(String::new()));
+        let state_for_then = Rc::clone(&state);
+        new_permissions
+            .call_method(
+                "query",
+                vec![Value::object(HashMap::from([(
+                    "name".into(),
+                    Value::string("geolocation"),
+                )]))],
+            )
+            .call_method(
+                "then",
+                vec![Value::function(move |_, args| {
+                    *state_for_then.borrow_mut() = args[0].get_property("state").to_js_string();
+                    Value::Undefined
+                })],
+            );
+        w3cos_core::promise::drain_microtasks();
+        assert_eq!(&*state.borrow(), "prompt");
+        reset_realm();
     }
 }

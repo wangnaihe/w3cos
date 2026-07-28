@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -40,8 +41,9 @@ fn class(
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
+        let generation = crate::jsdom::realm_generation();
         let class = if constructible {
-            Value::function(|this, _| {
+            realm_function(generation, |this, _| {
                 w3cos_core::class::set_prototype_of(
                     &this,
                     &xpath_evaluator_class().get_property("prototype"),
@@ -49,7 +51,7 @@ fn class(
                 Value::Undefined
             })
         } else {
-            Value::function(move |_, _| {
+            realm_function(generation, move |_, _| {
                 w3cos_core::throw_value(w3cos_core::error_instance(
                     "TypeError",
                     vec![Value::string(&format!("Illegal constructor: {name}"))],
@@ -69,6 +71,7 @@ fn class(
 }
 
 pub fn xpath_evaluator_class() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let class = class(
         &EVALUATOR_CLASS,
         "XPathEvaluator",
@@ -78,7 +81,7 @@ pub fn xpath_evaluator_class() -> Value {
     let prototype = class.get_property("prototype");
     prototype.set_property(
         "createExpression",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             expression_value(
                 args.first().map(Value::to_js_string).unwrap_or_default(),
                 args.get(1).cloned().unwrap_or(Value::Null),
@@ -87,11 +90,13 @@ pub fn xpath_evaluator_class() -> Value {
     );
     prototype.set_property(
         "createNSResolver",
-        Value::function(|_, args| namespace_resolver(args.first().cloned().unwrap_or_default())),
+        realm_function(generation, |_, args| {
+            namespace_resolver(args.first().cloned().unwrap_or_default())
+        }),
     );
     prototype.set_property(
         "evaluate",
-        Value::function(|_, args| evaluate_arguments(&args)),
+        realm_function(generation, |_, args| evaluate_arguments(&args)),
     );
     class
 }
@@ -136,7 +141,8 @@ pub fn xpath_result_class() -> Value {
 }
 
 fn namespace_resolver(node: Value) -> Value {
-    Value::function(move |_, args| {
+    let generation = crate::jsdom::realm_generation();
+    realm_function(generation, move |_, args| {
         let prefix = args.first().map(Value::to_js_string).unwrap_or_default();
         if prefix == "xml" {
             return Value::string("http://www.w3.org/XML/1998/namespace");
@@ -151,13 +157,14 @@ fn namespace_resolver(node: Value) -> Value {
 }
 
 fn expression_value(expression: String, resolver: Value) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::from([
         ("__w3cos_expression".into(), Value::string(&expression)),
         ("__w3cos_resolver".into(), resolver),
     ]));
     value.set_property(
         "evaluate",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let mut forwarded = vec![
                 Value::string(&expression),
                 args.first()
@@ -299,6 +306,7 @@ fn evaluate_expression(expression: &str, context: &Value) -> Evaluation {
 }
 
 fn result_value(evaluation: Evaluation, requested_type: u32) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let (result_type, nodes, number, string, boolean) = match evaluation {
         Evaluation::Nodes(nodes) => {
             let kind = if requested_type == 0 {
@@ -334,7 +342,7 @@ fn result_value(evaluation: Evaluation, requested_type: u32) -> Value {
     ]));
     value.set_property(
         "iterateNext",
-        Value::function(|this, _| {
+        realm_function(generation, |this, _| {
             let index = this.get_property("__w3cos_index").to_u32();
             let node = this
                 .get_property("__w3cos_nodes")
@@ -349,7 +357,7 @@ fn result_value(evaluation: Evaluation, requested_type: u32) -> Value {
     );
     value.set_property(
         "snapshotItem",
-        Value::function(|this, args| {
+        realm_function(generation, |this, args| {
             let node = this
                 .get_property("__w3cos_nodes")
                 .get_property(&args.first().map(Value::to_u32).unwrap_or(0).to_string());
@@ -380,6 +388,14 @@ pub fn install_document(document: &Value) {
         document.set_property(method, evaluator.get_property(method));
         crate::dom_constructors::prototype("Document")
             .set_property(method, evaluator.get_property(method));
+    }
+}
+
+pub fn reset_realm() {
+    for slot in [&EVALUATOR_CLASS, &EXPRESSION_CLASS, &RESULT_CLASS] {
+        slot.with(|slot| {
+            slot.borrow_mut().take();
+        });
     }
 }
 
@@ -427,5 +443,54 @@ mod tests {
             ],
         );
         assert_eq!(count.get_property("numberValue").to_number(), 1.0);
+    }
+
+    #[test]
+    fn evaluator_expressions_results_and_resolvers_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_evaluator_class = xpath_evaluator_class();
+        let old_expression_class = xpath_expression_class();
+        let old_result_class = xpath_result_class();
+        let document = crate::jsdom::document_value();
+        let evaluator = w3cos_core::class::construct(&old_evaluator_class, vec![]);
+        let expression = evaluator.call_method(
+            "createExpression",
+            vec![Value::string("//body"), Value::Null],
+        );
+        let result = expression.call_method(
+            "evaluate",
+            vec![document.clone(), Value::Number(7.0), Value::Null],
+        );
+        let resolver = evaluator.call_method("createNSResolver", vec![document]);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        assert!(!old_evaluator_class.strict_eq(&xpath_evaluator_class()));
+        assert!(!old_expression_class.strict_eq(&xpath_expression_class()));
+        assert!(!old_result_class.strict_eq(&xpath_result_class()));
+        assert!(
+            old_evaluator_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(expression.call_method("evaluate", vec![]).is_undefined());
+        assert!(result.call_method("snapshotItem", vec![]).is_undefined());
+        assert!(resolver.call(Value::Undefined, vec![]).is_undefined());
+        assert!(
+            w3cos_core::class::construct(&xpath_evaluator_class(), vec![])
+                .call_method(
+                    "evaluate",
+                    vec![
+                        Value::string("count(//body)"),
+                        crate::jsdom::document_value(),
+                        Value::Null,
+                        Value::Number(1.0),
+                    ],
+                )
+                .is_object()
+        );
+        reset_realm();
     }
 }

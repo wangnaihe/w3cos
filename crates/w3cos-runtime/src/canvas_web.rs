@@ -7,6 +7,7 @@ use std::sync::Once;
 use w3cos_core::Value;
 
 use crate::canvas2d::PathOp;
+use crate::jsdom::realm_function;
 
 const PATH_ID: &str = "__w3cos_path_2d_id";
 
@@ -35,7 +36,8 @@ fn illegal_canvas_class(
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(move |_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string(&format!("Illegal constructor: {name}"))],
@@ -47,7 +49,7 @@ fn illegal_canvas_class(
         for method in methods {
             prototype.set_property(
                 method,
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     static WARNING: Once = Once::new();
                     WARNING.call_once(|| {
                         eprintln!(
@@ -97,6 +99,7 @@ pub fn image_data_value(data: Value, width: u32, height: u32) -> Value {
 }
 
 pub fn canvas_gradient_class() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let class = illegal_canvas_class(
         &CANVAS_GRADIENT_CLASS,
         "CanvasGradient",
@@ -105,7 +108,7 @@ pub fn canvas_gradient_class() -> Value {
     );
     class.get_property("prototype").set_property(
         "addColorStop",
-        Value::function(|this, args| {
+        realm_function(generation, |this, args| {
             let offset = args.first().map(Value::to_number).unwrap_or(f64::NAN);
             if !(0.0..=1.0).contains(&offset) {
                 w3cos_core::throw_value(w3cos_core::error_instance(
@@ -150,6 +153,7 @@ pub fn canvas_gradient_value(kind: &str, arguments: &[Value]) -> Value {
 }
 
 pub fn canvas_pattern_class() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let class = illegal_canvas_class(
         &CANVAS_PATTERN_CLASS,
         "CanvasPattern",
@@ -158,7 +162,7 @@ pub fn canvas_pattern_class() -> Value {
     );
     class.get_property("prototype").set_property(
         "setTransform",
-        Value::function(|this, args| {
+        realm_function(generation, |this, args| {
             this.set_property(
                 "__w3cos_transform",
                 args.first().cloned().unwrap_or(Value::Undefined),
@@ -275,7 +279,8 @@ pub fn offscreen_canvas_rendering_context_2d_class() -> Value {
             return class;
         }
         let base = canvas_rendering_context_2d_class();
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string(
@@ -342,6 +347,7 @@ pub fn text_metrics_value(properties: HashMap<String, Value>) -> Value {
 }
 
 pub fn image_bitmap_class() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let class = illegal_canvas_class(
         &IMAGE_BITMAP_CLASS,
         "ImageBitmap",
@@ -350,7 +356,7 @@ pub fn image_bitmap_class() -> Value {
     );
     class.get_property("prototype").set_property(
         "close",
-        Value::function(|this, _| {
+        realm_function(generation, |this, _| {
             this.set_property("__w3cos_closed", Value::Bool(true));
             Value::Undefined
         }),
@@ -381,10 +387,11 @@ pub fn image_bitmap_rendering_context_class() -> Value {
 }
 
 pub fn image_bitmap_rendering_context_value(canvas: Value) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::from([("canvas".into(), canvas.clone())]));
     value.set_property(
         "transferFromImageBitmap",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let bitmap = args.first().cloned().unwrap_or(Value::Null);
             let context = canvas.call_method("getContext", vec![Value::string("2d")]);
             if bitmap.is_null() {
@@ -429,11 +436,12 @@ pub fn canvas_capture_media_stream_track_class() -> Value {
 }
 
 pub fn canvas_capture_media_stream_track_value(canvas: Value) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = crate::media_devices_web::track_value("video", "Canvas");
     value.set_property("canvas", canvas);
     value.set_property(
         "requestFrame",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             static WARNING: Once = Once::new();
             WARNING.call_once(|| {
                 eprintln!(
@@ -457,7 +465,8 @@ pub fn path_2d_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, args| {
             let id = NEXT_PATH_ID.with(|next| {
                 let id = next.get();
                 next.set(id + 1);
@@ -480,7 +489,7 @@ pub fn path_2d_class() -> Value {
             ] {
                 value.set_property(
                     name,
-                    Value::function(move |this, args| {
+                    realm_function(generation, move |this, args| {
                         let n = |index: usize| {
                             args.get(index).map(Value::to_number).unwrap_or(0.0) as f32
                         };
@@ -506,14 +515,14 @@ pub fn path_2d_class() -> Value {
             }
             value.set_property(
                 "closePath",
-                Value::function(|this, _| {
+                realm_function(generation, |this, _| {
                     push_path_op(&this, PathOp::ClosePath);
                     Value::Undefined
                 }),
             );
             value.set_property(
                 "addPath",
-                Value::function(|this, args| {
+                realm_function(generation, |this, args| {
                     if let Some(ops) = args.first().and_then(path_ops) {
                         for op in ops {
                             push_path_op(&this, op);
@@ -552,7 +561,8 @@ pub fn offscreen_canvas_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, args| {
             let width = args.first().map(Value::to_u32).unwrap_or(0);
             let height = args.get(1).map(Value::to_u32).unwrap_or(0);
             let canvas = crate::jsdom::document_value()
@@ -568,7 +578,7 @@ pub fn offscreen_canvas_class() -> Value {
             let offscreen = value.clone();
             value.set_property(
                 "getContext",
-                Value::function(move |_, args| {
+                realm_function(generation, move |_, args| {
                     let context = context_canvas.call_method(
                         "getContext",
                         vec![args.first().cloned().unwrap_or_default()],
@@ -586,13 +596,13 @@ pub fn offscreen_canvas_class() -> Value {
             );
             value.set_property(
                 "transferToImageBitmap",
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     image_bitmap_value(width, height, Some(canvas.clone()))
                 }),
             );
             value.set_property(
                 "convertToBlob",
-                Value::function(move |_, args| {
+                realm_function(generation, move |_, args| {
                     let options = args.first().cloned().unwrap_or_default();
                     let type_name = if options.get_property("type").is_undefined() {
                         Value::string("image/png")
@@ -631,4 +641,97 @@ pub fn offscreen_canvas_class() -> Value {
         *slot.borrow_mut() = Some(class.clone());
         class
     })
+}
+
+pub fn reset_realm() {
+    PATHS.with(|paths| paths.borrow_mut().clear());
+    NEXT_PATH_ID.with(|next| next.set(1));
+    for slot in [
+        &PATH_CLASS,
+        &OFFSCREEN_CLASS,
+        &CANVAS_GRADIENT_CLASS,
+        &CANVAS_PATTERN_CLASS,
+        &CANVAS_CONTEXT_CLASS,
+        &OFFSCREEN_CONTEXT_CLASS,
+        &IMAGE_BITMAP_CLASS,
+        &IMAGE_BITMAP_CONTEXT_CLASS,
+        &CANVAS_CAPTURE_TRACK_CLASS,
+        &TEXT_METRICS_CLASS,
+    ] {
+        slot.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canvas_objects_and_path_storage_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_path_class = path_2d_class();
+        let old_offscreen_class = offscreen_canvas_class();
+        let old_gradient_class = canvas_gradient_class();
+        let old_pattern_class = canvas_pattern_class();
+        let old_bitmap_class = image_bitmap_class();
+        let path = w3cos_core::class::construct(&old_path_class, vec![]);
+        path.call_method("moveTo", vec![Value::Number(1.0), Value::Number(2.0)]);
+        assert_eq!(path_ops(&path).unwrap().len(), 1);
+        let gradient = canvas_gradient_value("linear", &[]);
+        gradient.call_method(
+            "addColorStop",
+            vec![Value::Number(0.5), Value::string("red")],
+        );
+        let offscreen = w3cos_core::class::construct(
+            &old_offscreen_class,
+            vec![Value::Number(32.0), Value::Number(16.0)],
+        );
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        assert!(!old_path_class.strict_eq(&path_2d_class()));
+        assert!(!old_offscreen_class.strict_eq(&offscreen_canvas_class()));
+        assert!(!old_gradient_class.strict_eq(&canvas_gradient_class()));
+        assert!(!old_pattern_class.strict_eq(&canvas_pattern_class()));
+        assert!(!old_bitmap_class.strict_eq(&image_bitmap_class()));
+        assert!(old_path_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(
+            old_offscreen_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(
+            path.call_method("lineTo", vec![Value::Number(3.0), Value::Number(4.0)])
+                .is_undefined()
+        );
+        assert!(path_ops(&path).is_none());
+        assert!(
+            gradient
+                .call_method(
+                    "addColorStop",
+                    vec![Value::Number(1.0), Value::string("blue")]
+                )
+                .is_undefined()
+        );
+        assert_eq!(
+            gradient
+                .get_property("__w3cos_stops")
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        assert!(
+            offscreen
+                .call_method("getContext", vec![Value::string("2d")])
+                .is_undefined()
+        );
+        let current_path = w3cos_core::class::construct(&path_2d_class(), vec![]);
+        current_path.call_method("moveTo", vec![Value::Number(5.0), Value::Number(6.0)]);
+        assert_eq!(path_ops(&current_path).unwrap().len(), 1);
+        reset_realm();
+    }
 }

@@ -1038,7 +1038,40 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         }
         "font-style" => style.font_style = Some(value.to_string()),
         "color" => style.color = Some(value.to_string()),
-        "background" | "background-color" => style.background = Some(value.to_string()),
+        "background" => {
+            let parsed = w3cos_std::background::parse_shorthand(value);
+            style.background = Some({
+                if w3cos_std::Color::from_css(value).is_some() {
+                    value.to_string()
+                } else {
+                    let color = parsed.color.unwrap_or(w3cos_std::Color::TRANSPARENT);
+                    format!(
+                        "rgba({}, {}, {}, {})",
+                        color.r,
+                        color.g,
+                        color.b,
+                        f32::from(color.a) / 255.0
+                    )
+                }
+            });
+            style.background_image = Some(parsed.images.join(", "));
+            style.background_size = Some(parsed.sizes.join(", "));
+            style.background_position = Some(parsed.positions.join(", "));
+            style.background_repeat = Some(parsed.repeats.join(", "));
+            style.background_origin = Some(parsed.origins.join(", "));
+            style.background_clip = Some(parsed.clips.join(", "));
+            style.background_attachment = Some(parsed.attachments.join(", "));
+            style.background_blend_mode = Some("normal".to_string());
+        }
+        "background-color" => style.background = Some(value.to_string()),
+        "background-image" => style.background_image = Some(value.to_string()),
+        "background-size" => style.background_size = Some(value.to_string()),
+        "background-position" => style.background_position = Some(value.to_string()),
+        "background-repeat" => style.background_repeat = Some(value.to_string()),
+        "background-origin" => style.background_origin = Some(value.to_string()),
+        "background-clip" => style.background_clip = Some(value.to_string()),
+        "background-attachment" => style.background_attachment = Some(value.to_string()),
+        "background-blend-mode" => style.background_blend_mode = Some(value.to_string()),
         "border-radius" => style.border_radius = css_parse_px(value),
         "border-width" => style.border_width = css_parse_px(value),
         "border-top-width" => style.border_top_width = css_parse_px(value),

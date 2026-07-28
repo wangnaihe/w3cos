@@ -633,14 +633,30 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     }
     if s.background_from_signal.is_none() {
         if let Some(ref bg) = s.background {
-            if bg.contains("gradient(") {
+            if (bg.contains("gradient(") || bg.contains("url(")) && s.background_image.is_none() {
                 fields.push(format!("background_image: Some({bg:?}.to_string())"));
-            } else {
+            } else if !bg.contains("gradient(") && !bg.contains("url(") {
                 fields.push(format!(
                     "background: {}",
                     gen_color_rust(bg, "Color::TRANSPARENT")
                 ));
             }
+        }
+    }
+    if let Some(ref value) = s.background_image {
+        fields.push(format!("background_image: Some({value:?}.to_string())"));
+    }
+    for (field, value) in [
+        ("background_size", s.background_size.as_ref()),
+        ("background_position", s.background_position.as_ref()),
+        ("background_repeat", s.background_repeat.as_ref()),
+        ("background_origin", s.background_origin.as_ref()),
+        ("background_clip", s.background_clip.as_ref()),
+        ("background_attachment", s.background_attachment.as_ref()),
+        ("background_blend_mode", s.background_blend_mode.as_ref()),
+    ] {
+        if let Some(value) = value {
+            fields.push(format!("{field}: Some({value:?}.to_string())"));
         }
     }
     if let Some(br) = s.border_radius {

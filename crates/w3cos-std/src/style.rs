@@ -62,9 +62,23 @@ pub struct Style {
 
     // Visual
     pub background: Color,
-    /// Raw CSS gradient layers. Solid backgrounds continue to use `background`.
+    /// Raw CSS image/gradient layers. Solid backgrounds continue to use `background`.
     #[serde(default)]
     pub background_image: Option<String>,
+    #[serde(default)]
+    pub background_size: Option<String>,
+    #[serde(default)]
+    pub background_position: Option<String>,
+    #[serde(default)]
+    pub background_repeat: Option<String>,
+    #[serde(default)]
+    pub background_origin: Option<String>,
+    #[serde(default)]
+    pub background_clip: Option<String>,
+    #[serde(default)]
+    pub background_attachment: Option<String>,
+    #[serde(default)]
+    pub background_blend_mode: Option<String>,
     pub color: Color,
     pub font_size: f32,
     pub font_weight: u16,
@@ -188,6 +202,13 @@ impl Default for Style {
             overflow_anchor: true,
             background: Color::TRANSPARENT,
             background_image: None,
+            background_size: None,
+            background_position: None,
+            background_repeat: None,
+            background_origin: None,
+            background_clip: None,
+            background_attachment: None,
+            background_blend_mode: None,
             color: Color::WHITE,
             font_size: 16.0,
             font_weight: 400,

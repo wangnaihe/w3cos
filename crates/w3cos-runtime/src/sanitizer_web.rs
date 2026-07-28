@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -14,11 +15,12 @@ pub fn sanitizer_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, args| {
             let config = args.first().cloned().unwrap_or(Value::Undefined);
             let sanitizer = Value::object(HashMap::from([(
                 "get".into(),
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     if config.is_undefined() {
                         Value::object(HashMap::new())
                     } else {
@@ -28,7 +30,7 @@ pub fn sanitizer_class() -> Value {
             )]));
             sanitizer.set_property(
                 "sanitize",
-                Value::function(|_, args| {
+                realm_function(generation, |_, args| {
                     crate::jsdom::sanitized_fragment_value(
                         &args
                             .first()
@@ -40,7 +42,7 @@ pub fn sanitizer_class() -> Value {
             );
             sanitizer.set_property(
                 "sanitizeFor",
-                Value::function(|_, args| {
+                realm_function(generation, |_, args| {
                     let tag_name = args
                         .first()
                         .cloned()
@@ -80,6 +82,12 @@ pub fn sanitizer_class() -> Value {
         *slot.borrow_mut() = Some(class.clone());
         class
     })
+}
+
+pub fn reset_realm() {
+    SANITIZER_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 #[cfg(test)]
@@ -157,5 +165,38 @@ mod tests {
                 .call_method("getAttribute", vec![Value::string("onclick")])
                 .is_null()
         );
+    }
+
+    #[test]
+    fn sanitizer_configuration_and_fragment_methods_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_class = sanitizer_class();
+        let sanitizer = w3cos_core::class::construct(
+            &old_class,
+            vec![Value::object(HashMap::from([(
+                "comments".into(),
+                Value::Bool(false),
+            )]))],
+        );
+        assert!(sanitizer.call_method("get", vec![]).is_object());
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        assert!(!old_class.strict_eq(&sanitizer_class()));
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(sanitizer.call_method("get", vec![]).is_undefined());
+        assert!(sanitizer.call_method("sanitize", vec![]).is_undefined());
+        assert!(sanitizer.call_method("sanitizeFor", vec![]).is_undefined());
+        assert!(
+            w3cos_core::class::construct(&sanitizer_class(), vec![])
+                .call_method(
+                    "sanitizeFor",
+                    vec![Value::string("div"), Value::string("<b>current</b>")],
+                )
+                .is_object()
+        );
+        reset_realm();
     }
 }

@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -70,7 +71,8 @@ pub fn barcode_detector_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |this, args| {
             let options = args.first().cloned().unwrap_or(Value::Undefined);
             let formats = match parse_formats(&options) {
                 Ok(formats) => formats,
@@ -82,12 +84,14 @@ pub fn barcode_detector_class() -> Value {
         class.set_property("name", Value::string("BarcodeDetector"));
         class.set_property(
             "getSupportedFormats",
-            Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::array(Vec::new())])),
+            realm_function(generation, |_, _| {
+                w3cos_core::promise::resolve(vec![Value::array(Vec::new())])
+            }),
         );
         let prototype = Value::object(HashMap::from([("constructor".into(), class.clone())]));
         prototype.set_property(
             "detect",
-            Value::function(|_, args| {
+            realm_function(generation, |_, args| {
                 let source = args.first().cloned().unwrap_or(Value::Undefined);
                 if source.is_undefined() || source.is_null() {
                     return w3cos_core::promise::reject(vec![error(
@@ -110,6 +114,12 @@ pub fn barcode_detector_class() -> Value {
     })
 }
 
+pub fn reset_realm() {
+    BARCODE_DETECTOR_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -119,6 +129,9 @@ mod tests {
 
     #[test]
     fn detector_exposes_promises_and_rejects_missing_sources() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let class = barcode_detector_class();
         let detector = w3cos_core::class::construct(
             &class,
@@ -154,5 +167,47 @@ mod tests {
         );
         crate::jsdom::drain_microtasks();
         assert_eq!(&*log.borrow(), &["0", "TypeError"]);
+        reset_realm();
+    }
+
+    #[test]
+    fn detector_entry_points_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_class = barcode_detector_class();
+        let detector = w3cos_core::class::construct(&old_class, vec![]);
+        old_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_class = barcode_detector_class();
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(
+            new_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(
+            old_class
+                .get_property("getSupportedFormats")
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(
+            detector
+                .call_method("detect", vec![Value::object(HashMap::new())])
+                .is_undefined()
+        );
+        assert!(
+            w3cos_core::class::construct(&new_class, vec![])
+                .call_method("detect", vec![Value::object(HashMap::new())])
+                .is_object()
+        );
+        reset_realm();
     }
 }

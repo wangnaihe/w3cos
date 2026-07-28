@@ -10,11 +10,25 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     static SHARED_STORAGE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     static SINGLETONS: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn realm_experimental_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
+fn register_experimental_value(value: &Value) {
+    register_weak_realm_object(&VALUES, value);
 }
 
 fn arg(args: &[Value], index: usize) -> Value {
@@ -168,11 +182,12 @@ fn build_class(name: &'static str) -> Value {
         "SharedStorageAppendMethod"
         | "SharedStorageClearMethod"
         | "SharedStorageDeleteMethod"
-        | "SharedStorageSetMethod" => Value::function(move |this, args| {
+        | "SharedStorageSetMethod" => realm_experimental_function(move |this, args| {
             modifier_constructor(name, &args, &this);
+            register_experimental_value(&this);
             Value::Undefined
         }),
-        "Profiler" => Value::function(|_, args| {
+        "Profiler" => realm_experimental_function(|_, args| {
             if args.is_empty() {
                 throw("TypeError", "Profiler requires 1 argument");
             }
@@ -182,7 +197,7 @@ fn build_class(name: &'static str) -> Value {
                 "JS profiling is disabled because no host profiler adapter is configured",
             )
         }),
-        _ => Value::function(move |_, _| illegal(name)),
+        _ => realm_experimental_function(move |_, _| illegal(name)),
     };
     constructor.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::from([("constructor".into(), constructor.clone())]));
@@ -202,7 +217,7 @@ fn build_class(name: &'static str) -> Value {
     ) {
         constructor.set_property(
             "availability",
-            Value::function(move |_, args| {
+            realm_experimental_function(move |_, args| {
                 if name == "Translator" {
                     let options = arg(&args, 0);
                     if options.get_property("sourceLanguage").is_undefined()
@@ -220,7 +235,7 @@ fn build_class(name: &'static str) -> Value {
         );
         constructor.set_property(
             "create",
-            Value::function(move |_, args| {
+            realm_experimental_function(move |_, args| {
                 if name == "Translator" {
                     let options = arg(&args, 0);
                     if options.get_property("sourceLanguage").is_undefined()
@@ -260,6 +275,7 @@ fn singleton(name: &'static str, build: impl FnOnce() -> Value) -> Value {
             return value;
         }
         let value = build();
+        register_experimental_value(&value);
         values.borrow_mut().insert(name.into(), value.clone());
         value
     })
@@ -293,7 +309,7 @@ pub fn shared_storage_value() -> Value {
         let value = Value::object(HashMap::new());
         value.set_property(
             "set",
-            Value::function(|_, args| {
+            realm_experimental_function(|_, args| {
                 let key = arg(&args, 0).to_js_string();
                 let text = arg(&args, 1).to_js_string();
                 let ignore = arg(&args, 2).get_property("ignoreIfPresent").to_bool();
@@ -308,7 +324,7 @@ pub fn shared_storage_value() -> Value {
         );
         value.set_property(
             "append",
-            Value::function(|_, args| {
+            realm_experimental_function(|_, args| {
                 let key = arg(&args, 0).to_js_string();
                 let text = arg(&args, 1).to_js_string();
                 SHARED_STORAGE
@@ -318,7 +334,7 @@ pub fn shared_storage_value() -> Value {
         );
         value.set_property(
             "delete",
-            Value::function(|_, args| {
+            realm_experimental_function(|_, args| {
                 SHARED_STORAGE.with(|storage| {
                     storage.borrow_mut().remove(&arg(&args, 0).to_js_string());
                 });
@@ -327,14 +343,14 @@ pub fn shared_storage_value() -> Value {
         );
         value.set_property(
             "clear",
-            Value::function(|_, _| {
+            realm_experimental_function(|_, _| {
                 SHARED_STORAGE.with(|storage| storage.borrow_mut().clear());
                 w3cos_core::promise::resolve(vec![Value::Undefined])
             }),
         );
         value.set_property(
             "batchUpdate",
-            Value::function(|_, args| {
+            realm_experimental_function(|_, args| {
                 for method in arg(&args, 0).iter() {
                     apply_modifier(method);
                 }
@@ -344,7 +360,9 @@ pub fn shared_storage_value() -> Value {
         for operation in ["createWorklet", "run", "selectURL"] {
             value.set_property(
                 operation,
-                Value::function(move |_, _| unavailable(&format!("SharedStorage.{operation}"))),
+                realm_experimental_function(move |_, _| {
+                    unavailable(&format!("SharedStorage.{operation}"))
+                }),
             );
         }
         value.set_property("worklet", shared_storage_worklet_value());
@@ -359,7 +377,7 @@ pub fn shared_storage_worklet_value() -> Value {
         for operation in ["addModule", "run", "selectURL"] {
             value.set_property(
                 operation,
-                Value::function(move |_, _| {
+                realm_experimental_function(move |_, _| {
                     unavailable(&format!("SharedStorageWorklet.{operation}"))
                 }),
             );
@@ -374,7 +392,7 @@ pub fn ink_value() -> Value {
         let value = Value::object(HashMap::new());
         value.set_property(
             "requestPresenter",
-            Value::function(|_, _| unavailable("Ink.requestPresenter")),
+            realm_experimental_function(|_, _| unavailable("Ink.requestPresenter")),
         );
         set_prototype(&value, "Ink");
         value
@@ -386,7 +404,7 @@ pub fn protected_audience_value() -> Value {
         let value = Value::object(HashMap::new());
         value.set_property(
             "queryFeatureSupport",
-            Value::function(|_, _| {
+            realm_experimental_function(|_, _| {
                 warn_once();
                 Value::string("unsupported")
             }),
@@ -401,7 +419,7 @@ pub fn viewport_value() -> Value {
         let value = Value::object(HashMap::new());
         value.set_property(
             "__w3cos_getter_segments",
-            Value::function(|_, _| {
+            realm_experimental_function(|_, _| {
                 let (width, height, _) = crate::jsdom::viewport();
                 Value::array(vec![Value::object(HashMap::from([
                     ("x".into(), Value::Number(0.0)),
@@ -425,12 +443,21 @@ pub fn wgsl_language_features_value() -> Value {
         let value = Value::object(HashMap::new());
         value.set_property(
             "__w3cos_getter_size",
-            Value::function(|_, _| Value::Number(0.0)),
+            realm_experimental_function(|_, _| Value::Number(0.0)),
         );
-        value.set_property("has", Value::function(|_, _| Value::Bool(false)));
-        value.set_property("forEach", Value::function(|_, _| Value::Undefined));
+        value.set_property(
+            "has",
+            realm_experimental_function(|_, _| Value::Bool(false)),
+        );
+        value.set_property(
+            "forEach",
+            realm_experimental_function(|_, _| Value::Undefined),
+        );
         for operation in ["entries", "keys", "values"] {
-            value.set_property(operation, Value::function(|_, _| Value::array(Vec::new())));
+            value.set_property(
+                operation,
+                realm_experimental_function(|_, _| Value::array(Vec::new())),
+            );
         }
         value.set_property("__w3cos_symbol_iterator", value.get_property("values"));
         set_prototype(&value, "WGSLLanguageFeatures");
@@ -439,20 +466,21 @@ pub fn wgsl_language_features_value() -> Value {
 }
 
 pub fn query_local_fonts_value() -> Value {
-    Value::function(|_, _| {
+    realm_experimental_function(|_, _| {
         warn_once();
         w3cos_core::promise::resolve(vec![Value::array(Vec::new())])
     })
 }
 
 pub fn fetch_later_value() -> Value {
-    Value::function(|_, args| {
+    realm_experimental_function(|_, args| {
         if args.is_empty() {
             throw("TypeError", "fetchLater requires 1 argument");
         }
         warn_once();
         let value = Value::object(HashMap::from([("activated".into(), Value::Bool(false))]));
         set_prototype(&value, "FetchLaterResult");
+        register_experimental_value(&value);
         value
     })
 }
@@ -485,9 +513,38 @@ pub const INTERFACES: &[&str] = &[
 ];
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
-    SHARED_STORAGE.with(|storage| storage.borrow_mut().clear());
     SINGLETONS.with(|values| values.borrow_mut().clear());
+    VALUES.with(|values| {
+        for value in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for name in INTERFACES {
+                for member in prototype_members(name) {
+                    value.set_property(member, Value::Undefined);
+                }
+            }
+            for reference in [
+                "__w3cos_getter_segments",
+                "__w3cos_getter_size",
+                "__w3cos_ignore_if_present",
+                "__w3cos_key",
+                "__w3cos_kind",
+                "__w3cos_symbol_iterator",
+                "__w3cos_value",
+            ] {
+                value.set_property(reference, Value::Undefined);
+            }
+        }
+    });
+    SHARED_STORAGE.with(|storage| storage.borrow_mut().clear());
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        class.set_property("availability", Value::Undefined);
+        class.set_property("create", Value::Undefined);
+        disconnect_realm_class(class);
+    }
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -542,5 +599,32 @@ mod tests {
             &result,
             &class_for("FetchLaterResult")
         ));
+    }
+
+    #[test]
+    fn singletons_modifiers_results_methods_and_classes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_storage_class = class_for("SharedStorage");
+        let old_model_class = class_for("LanguageModel");
+        let storage = shared_storage_value();
+        let modifier = w3cos_core::class::construct(
+            &class_for("SharedStorageSetMethod"),
+            vec![Value::string("key"), Value::string("value")],
+        );
+        let result = fetch_later_value().call(Value::Undefined, vec![Value::string("/ping")]);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_storage_class.get_property("prototype").is_undefined());
+        assert!(old_model_class.get_property("prototype").is_undefined());
+        assert!(old_model_class.get_property("create").is_undefined());
+        assert!(!old_storage_class.strict_eq(&class_for("SharedStorage")));
+        assert!(storage.get_property("set").is_undefined());
+        assert!(storage.get_property("worklet").is_undefined());
+        assert!(modifier.get_property("__w3cos_key").is_undefined());
+        assert!(result.get_property("activated").is_undefined());
     }
 }

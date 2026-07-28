@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use crate::Value;
 
+pub const DYNAMIC_IMPORT_PATH: &str = "w3cos/module::dynamicImport";
+
 thread_local! {
     static EXPORTS: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
@@ -31,6 +33,24 @@ pub fn call(path: &str, arguments: Vec<Value>) -> Value {
         .filter(Value::is_function)
         .map(|implementation| implementation.call(Value::Undefined, arguments))
         .unwrap_or(Value::Undefined)
+}
+
+/// Invoke the embedder's AOT module loader.
+///
+/// The adapter receives `(specifier, referrer)` and must return a Promise (or
+/// a value that the embedder intentionally exposes as its result). Keeping
+/// this hook in Core lets ordinary AOT artifacts support `import()` without
+/// linking the browser loader, compiler, W3IR, or W3VM.
+pub fn dynamic_import(specifier: Value, referrer: Value) -> Value {
+    let implementation = EXPORTS.with(|exports| exports.borrow().get(DYNAMIC_IMPORT_PATH).cloned());
+    match implementation {
+        Some(implementation) if implementation.is_callable() => {
+            implementation.call(Value::Undefined, vec![specifier, referrer])
+        }
+        _ => crate::promise::reject(vec![Value::string(
+            "TypeError: dynamic import requires an AOT module-loader adapter",
+        )]),
+    }
 }
 
 pub fn clear() {
@@ -56,6 +76,40 @@ mod tests {
             call("demo::sum", vec![Value::Number(2.0), Value::Number(3.0)]).to_number(),
             5.0
         );
+        clear();
+    }
+
+    #[test]
+    fn dynamic_import_uses_the_optional_core_host_adapter() {
+        clear();
+        let missing = dynamic_import(
+            Value::string("./missing.js"),
+            Value::string("app:///entry.js"),
+        );
+        assert!(matches!(
+            crate::promise::status(&missing),
+            Some(crate::promise::PromiseStatus::Rejected(_))
+        ));
+
+        register(
+            DYNAMIC_IMPORT_PATH,
+            Value::function(|_, arguments| {
+                crate::promise::resolve(vec![Value::from(format!(
+                    "{}@{}",
+                    arguments[0].to_js_string(),
+                    arguments[1].to_js_string()
+                ))])
+            }),
+        );
+        let loaded = dynamic_import(
+            Value::string("./feature.js"),
+            Value::string("app:///entry.js"),
+        );
+        assert!(matches!(
+            crate::promise::status(&loaded),
+            Some(crate::promise::PromiseStatus::Fulfilled(value))
+                if value.to_js_string() == "./feature.js@app:///entry.js"
+        ));
         clear();
     }
 }

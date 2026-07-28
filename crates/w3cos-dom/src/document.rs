@@ -34,6 +34,11 @@ pub struct Document {
     id_index: HashMap<Atom, NodeId>,
     class_index: HashMap<Atom, Vec<NodeId>>,
     tag_index: HashMap<Atom, Vec<NodeId>>,
+    // The selected responsive-image source used by component lowering. This
+    // is rendering state rather than a reflected HTML attribute: `img.src`
+    // must continue to expose the author-provided fallback while `currentSrc`
+    // reports the selected `srcset`/`picture` candidate.
+    image_render_sources: HashMap<NodeId, String>,
     // Selection state
     selection: Selection,
 }
@@ -52,6 +57,7 @@ impl Document {
             id_index: HashMap::new(),
             class_index: HashMap::new(),
             tag_index: HashMap::new(),
+            image_render_sources: HashMap::new(),
             selection: Selection::new(),
         };
 
@@ -66,6 +72,7 @@ impl Document {
             next_sibling: None,
             prev_sibling: None,
             attributes: Vec::new(),
+            attribute_namespaces: Vec::new(),
             class_list: Vec::new(),
         });
 
@@ -221,6 +228,7 @@ impl Document {
             NodeType::Element => {
                 let mut n = DomNode::new_element(NodeId(0), &node.tag.as_str());
                 n.attributes = node.attributes.clone();
+                n.attribute_namespaces = node.attribute_namespaces.clone();
                 n.class_list = node.class_list.clone();
                 n.text_content = node.text_content.clone();
                 n
@@ -410,6 +418,7 @@ impl Document {
 
     /// Free a node slot for reuse. Does NOT unlink from tree — call remove_child first.
     pub fn free_node(&mut self, id: NodeId) {
+        self.image_render_sources.remove(&id);
         if let Some(node) = &self.nodes[id.0 as usize] {
             let tag = node.tag;
             // Remove from tag index
@@ -463,6 +472,17 @@ impl Document {
         self.nodes[id.0 as usize]
             .as_ref()
             .expect("accessing freed node")
+    }
+
+    /// Set the renderer-facing source selected for an `<img>` element without
+    /// mutating its reflected `src` attribute.
+    pub fn set_image_render_source(&mut self, id: NodeId, source: Option<&str>) {
+        if let Some(source) = source {
+            self.image_render_sources.insert(id, source.to_string());
+        } else {
+            self.image_render_sources.remove(&id);
+        }
+        self.mark_dirty(id);
     }
 
     pub fn get_node_mut(&mut self, id: NodeId) -> &mut DomNode {
@@ -954,13 +974,39 @@ impl Document {
                         w3cos_std::Component::button(label, style)
                     }
                     "img" => {
-                        let src = node
-                            .attributes
-                            .iter()
-                            .find(|(k, _)| k.as_str() == "src")
-                            .map(|(_, v)| v.as_str())
+                        let src = self
+                            .image_render_sources
+                            .get(&id)
+                            .map(String::as_str)
+                            .or_else(|| {
+                                node.attributes
+                                    .iter()
+                                    .find(|(k, _)| k.as_str() == "src")
+                                    .map(|(_, v)| v.as_str())
+                            })
                             .unwrap_or("");
-                        w3cos_std::Component::image(src, style)
+                        let mut image_style = style;
+                        if matches!(image_style.width, w3cos_std::style::Dimension::Auto)
+                            && let Some(width) = node
+                                .attributes
+                                .iter()
+                                .find(|(key, _)| key.as_str() == "width")
+                                .and_then(|(_, value)| value.parse::<f32>().ok())
+                                .filter(|value| *value >= 0.0)
+                        {
+                            image_style.width = w3cos_std::style::Dimension::Px(width);
+                        }
+                        if matches!(image_style.height, w3cos_std::style::Dimension::Auto)
+                            && let Some(height) = node
+                                .attributes
+                                .iter()
+                                .find(|(key, _)| key.as_str() == "height")
+                                .and_then(|(_, value)| value.parse::<f32>().ok())
+                                .filter(|value| *value >= 0.0)
+                        {
+                            image_style.height = w3cos_std::style::Dimension::Px(height);
+                        }
+                        w3cos_std::Component::image(src, image_style)
                     }
                     "input" | "textarea" => {
                         let placeholder = node
@@ -1921,5 +1967,52 @@ fn push_xml_escaped(out: &mut String, value: &str, attribute: bool) {
             '\'' if attribute => out.push_str("&apos;"),
             _ => out.push(character),
         }
+    }
+}
+
+#[cfg(test)]
+mod image_component_tests {
+    use super::*;
+    use w3cos_std::component::ComponentKind;
+    use w3cos_std::style::Dimension;
+
+    #[test]
+    fn image_width_and_height_attributes_become_layout_hints() {
+        let mut document = Document::new();
+        let image = document.create_element("img");
+        image.set_attribute(&mut document, "src", "hero.png");
+        image.set_attribute(&mut document, "width", "320");
+        image.set_attribute(&mut document, "height", "180");
+        document.body().append_child(&mut document, image);
+
+        let tree = document.to_component_tree();
+        let image = tree.children.first().expect("image component");
+        assert!(matches!(
+            image.kind,
+            ComponentKind::Image { ref src } if src == "hero.png"
+        ));
+        assert_eq!(image.style.width, Dimension::Px(320.0));
+        assert_eq!(image.style.height, Dimension::Px(180.0));
+    }
+
+    #[test]
+    fn responsive_image_render_source_does_not_mutate_the_src_attribute() {
+        let mut document = Document::new();
+        let image = document.create_element("img");
+        image.set_attribute(&mut document, "src", "fallback.png");
+        document.set_image_render_source(image.id, Some("hero-2x.png"));
+        document.body().append_child(&mut document, image);
+
+        let tree = document.to_component_tree();
+        let component = tree.children.first().expect("image component");
+        assert!(matches!(
+            component.kind,
+            ComponentKind::Image { ref src } if src == "hero-2x.png"
+        ));
+        assert_eq!(
+            image.get_attribute(&document, "src"),
+            Some("fallback.png"),
+            "responsive selection must remain internal rendering state"
+        );
     }
 }

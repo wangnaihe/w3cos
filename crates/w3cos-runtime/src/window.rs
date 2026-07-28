@@ -6493,6 +6493,7 @@ impl ApplicationHandler for App {
             crate::jsdom::has_pending_animation_frame(),
         );
         let has_animations = !self.animations.is_empty()
+            || crate::image_loader::has_active_animations()
             || self.kinetic_scroll.is_some()
             || !self.overscroll_states.is_empty()
             || has_animation_frame;
@@ -7722,10 +7723,7 @@ mod scroll_physics_tests {
         };
         let paint_z = [0; 9];
 
-        assert!(
-            hit_test_order_key(&button, &paint_z)
-                > hit_test_order_key(&broad_host, &paint_z)
-        );
+        assert!(hit_test_order_key(&button, &paint_z) > hit_test_order_key(&broad_host, &paint_z));
     }
 
     #[test]

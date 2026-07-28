@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -28,7 +29,8 @@ pub fn close_watcher_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |this, args| {
             crate::web_events::event_target_class().call(this.clone(), vec![]);
             this.set_property("oncancel", Value::Null);
             this.set_property("onclose", Value::Null);
@@ -38,7 +40,7 @@ pub fn close_watcher_class() -> Value {
             let this_for_close = this.clone();
             this.set_property(
                 "__closeWatcherClose",
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     if active_for_close.replace(false) {
                         this_for_close.call_method("dispatchEvent", vec![event("close", false)]);
                     }
@@ -50,7 +52,7 @@ pub fn close_watcher_class() -> Value {
             let this_for_request = this.clone();
             this.set_property(
                 "__closeWatcherRequestClose",
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     if !active_for_request.get() {
                         return Value::Undefined;
                     }
@@ -67,7 +69,7 @@ pub fn close_watcher_class() -> Value {
             let active_for_destroy = active;
             this.set_property(
                 "__closeWatcherDestroy",
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     active_for_destroy.set(false);
                     Value::Undefined
                 }),
@@ -87,7 +89,7 @@ pub fn close_watcher_class() -> Value {
                         "addEventListener",
                         vec![
                             Value::string("abort"),
-                            Value::function(move |_, _| {
+                            realm_function(generation, move |_, _| {
                                 this_for_abort.call_method("__closeWatcherDestroy", vec![])
                             }),
                             Value::object(HashMap::from([("once".into(), Value::Bool(true))])),
@@ -104,15 +106,21 @@ pub fn close_watcher_class() -> Value {
             ("onclose".into(), Value::Null),
             (
                 "requestClose".into(),
-                Value::function(|this, _| this.call_method("__closeWatcherRequestClose", vec![])),
+                realm_function(generation, |this, _| {
+                    this.call_method("__closeWatcherRequestClose", vec![])
+                }),
             ),
             (
                 "close".into(),
-                Value::function(|this, _| this.call_method("__closeWatcherClose", vec![])),
+                realm_function(generation, |this, _| {
+                    this.call_method("__closeWatcherClose", vec![])
+                }),
             ),
             (
                 "destroy".into(),
-                Value::function(|this, _| this.call_method("__closeWatcherDestroy", vec![])),
+                realm_function(generation, |this, _| {
+                    this.call_method("__closeWatcherDestroy", vec![])
+                }),
             ),
         ]));
         w3cos_core::class::set_prototype_of(
@@ -125,12 +133,21 @@ pub fn close_watcher_class() -> Value {
     })
 }
 
+pub fn reset_realm() {
+    CLOSE_WATCHER_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn request_close_is_cancelable_then_closes_once() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let watcher = w3cos_core::class::construct(&close_watcher_class(), vec![]);
         let cancels = Rc::new(Cell::new(0));
         let closes = Rc::new(Cell::new(0));
@@ -159,10 +176,14 @@ mod tests {
         watcher.call_method("requestClose", vec![]);
         watcher.call_method("close", vec![]);
         assert_eq!(closes.get(), 1);
+        reset_realm();
     }
 
     #[test]
     fn abort_signal_destroys_without_close_event() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let controller =
             w3cos_core::class::construct(&crate::fetch::abort_controller_class(), vec![]);
         let watcher = w3cos_core::class::construct(
@@ -184,5 +205,65 @@ mod tests {
         controller.call_method("abort", vec![]);
         watcher.call_method("requestClose", vec![]);
         assert_eq!(closes.get(), 0);
+        reset_realm();
+    }
+
+    #[test]
+    fn class_and_lifecycle_callbacks_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_class = close_watcher_class();
+        old_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+        let controller =
+            w3cos_core::class::construct(&crate::fetch::abort_controller_class(), vec![]);
+        let old_watcher = w3cos_core::class::construct(
+            &old_class,
+            vec![Value::object(HashMap::from([(
+                "signal".into(),
+                controller.get_property("signal"),
+            )]))],
+        );
+        let old_events = Rc::new(Cell::new(0));
+        let old_events_for_handler = Rc::clone(&old_events);
+        old_watcher.set_property(
+            "onclose",
+            Value::function(move |_, _| {
+                old_events_for_handler.set(old_events_for_handler.get() + 1);
+                Value::Undefined
+            }),
+        );
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_class = close_watcher_class();
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(
+            new_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        old_watcher.call_method("requestClose", vec![]);
+        old_watcher.call_method("close", vec![]);
+        controller.call_method("abort", vec![]);
+        assert_eq!(old_events.get(), 0);
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+
+        let new_watcher = w3cos_core::class::construct(&new_class, vec![]);
+        let new_events = Rc::new(Cell::new(0));
+        let new_events_for_handler = Rc::clone(&new_events);
+        new_watcher.set_property(
+            "onclose",
+            Value::function(move |_, _| {
+                new_events_for_handler.set(new_events_for_handler.get() + 1);
+                Value::Undefined
+            }),
+        );
+        new_watcher.call_method("requestClose", vec![]);
+        assert_eq!(new_events.get(), 1);
+        reset_realm();
     }
 }

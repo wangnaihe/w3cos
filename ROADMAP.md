@@ -58,7 +58,13 @@ suite is red.
 - [x] Fix `w3cos-runtime --test w3c_feature_matrix`
   `dom_to_component_tree_smoke`.
 - [x] Fix `w3cos-compiler` `generated_bundle_runs_jsdom_globals`.
-- [ ] Make the required compiler/runtime suites part of the default CI gate.
+- [x] Make the CodeMirror diagnostic compile reuse the workspace target with
+  offline dependency resolution and a renderer-free runtime dependency, so
+  registry/Skia availability cannot replace the expected ESM-lowering
+  diagnostic with a CI infrastructure failure.
+- [x] Make the required compiler/runtime suites explicit blocking steps in the
+  default CI gate (`w3cos-compiler --lib --tests` and
+  `w3cos-runtime --lib --tests`).
 - [x] Add a compiled-JavaScript API-surface test that checks `typeof`,
   constructor calls, callbacks/events, and failure behavior.
 - [x] Add a `.d.ts`-driven `web-api-skeleton` tool that generates reviewable
@@ -331,9 +337,16 @@ precede ecosystem breadth or migration tooling.
   remains pending with a warning.
 - [x] Expose the Cookie Store API (`cookieStore`, `CookieStore`,
   `CookieChangeEvent`) with Promise-based get/getAll/set/delete, asynchronous
-  change events, and a shared session backend with `document.cookie`.
-  Persistence, partitioning, expiry and service-worker delivery remain
-  pending with a warning.
+  change events, and a shared persistent-capable backend with `document.cookie`.
+  Cookie
+  selection now matches request host/domain, path and secure scheme; network
+  `HttpOnly` cookies remain request-visible but hidden from script, and
+  `Max-Age`/RFC `Expires` support expiry/deletion. Domain attributes are checked
+  against the Mozilla Public Suffix List, and module subresource requests enforce
+  schemeful-site Strict/Lax/None delivery. Storage quotas, the encrypted
+  profile-partitioning contract, and an Apple Keychain protector are implemented;
+  the remaining platform credential-store protectors, full Cookie Store option
+  fidelity and service-worker delivery remain pending with a warning.
 - [x] Expose the Sanitizer API (`Sanitizer`, `Element.setHTML()`,
   `Document.parseHTML()`) over an inert parser that removes active elements,
   inline event handlers, and `javascript:` URLs. Explicit `setHTMLUnsafe()` /
@@ -689,7 +702,8 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 - [x] Add `StyleSheet`, `StyleSheetList`, and `MediaList` identities,
   CSSStyleSheet inheritance, live media text/item mutation, indexed empty
   document sheet discovery, and complete the existing CSSStyleSheet prototype
-  surface. Discovering authored `<style>`/`<link>` sheets remains parser work.
+  surface. Authored `<style>`/`<link>` discovery and population is completed by
+  the Browser subresource loader in Phase 3.6.
 - [x] Make writable `Location` properties and `assign()`/`replace()` update
   session history, and dispatch trusted `HashChangeEvent`/`PopStateEvent`
   subclasses during navigation. `reload()` remains a warning-only host hook
@@ -707,8 +721,9 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 - [x] Connect the CSS Font Loading API to the native registry: `FontFace`
   descriptors/status/`load()`/`loaded`, `FontFaceSet` add/delete/clear/check/
   load/iteration/ready, ArrayBuffer and local/file sources, constructor
-  identity, and reset behavior. Network font URLs reject with an explicit
-  one-time host-adapter warning.
+  identity, and reset behavior. Dynamic Browser documents route network font
+  URLs through the shared Browser transport; ordinary AOT without an active
+  Browser document rejects them with an explicit one-time host-adapter warning.
 - [x] Replace the `scrollIntoView()` no-op with scroll-container discovery,
   boolean/options overloads, block/inline start/center/end/nearest alignment,
   `container: nearest`, viewport fallback, and scroll events. Smooth behavior
@@ -1068,19 +1083,20 @@ generic JavaScript/Web-platform coverage.
 
 ## Intentionally Unsupported or Deferred
 
-- ⛔ `eval()` and arbitrary runtime code generation: incompatible with the AOT
-  and security model.
+- 📋 `eval()` and arbitrary runtime code generation remain disabled in the
+  AOT path; they may be enabled only inside the future capability-scoped W3VM
+  after heap limits, execution budgets, cancellation, and page isolation land.
 - ⚠️ Writable `innerHTML` and explicit unsafe parsing create inert markup and
   never execute scripts; use the implemented Sanitizer / `setHTML()` /
   `Document.parseHTML()` path for active-content and unsafe-attribute removal.
-- ⛔ Runtime CommonJS `require()`: dependencies must be statically resolved or
-  bundled.
-- ⛔ Service Workers until an offline/background execution and permission model
-  is designed. Local-first storage does not require Service Workers.
-- ⛔ WebRTC until a real product/package gate justifies the media, networking,
-  permission, and security surface.
-- 📋 Dynamic `import()` may be considered as statically known AOT chunks; fully
-  arbitrary runtime module loading is out of scope.
+- ⛔ Runtime CommonJS `require()`: dependencies must be statically resolved,
+  bundled, or migrated to the standard ESM loader.
+- 📋 Service Worker execution is deferred until the W3VM background execution,
+  lifecycle, storage, and permission model is designed.
+- 📋 Real WebRTC networking remains deferred until the native ICE/DTLS/SRTP/
+  SCTP adapters and their permission/security gates exist.
+- 📋 Dynamic `import()` remains statically resolved in the AOT path and is
+  planned for arbitrary runtime modules through W3IR/W3VM.
 - 📋 Escape-analysis optimization is performance work and must not precede
   correctness or Web API conformance.
 
@@ -1097,3 +1113,1789 @@ When completing a roadmap item:
 Downstream applications may supply conformance cases, but product names,
 business semantics, and application-specific native modules do not belong in
 W3COS.
+
+## Phase 3.5 — Unified AOT + Dynamic JavaScript Runtime
+
+### Architecture invariants
+- [ ] One JavaScript semantic core for both execution modes: `Value`, object/array semantics, prototype chain, property access, calls, exceptions, Promise, and Web API coercions must not be implemented twice
+- [ ] One object heap / GC and stable handle model shared by AOT code, dynamically loaded code, Host functions, and DOM `NodeId` wrappers
+- [x] One `Callable` ABI covering native AOT functions, W3 bytecode functions,
+  and Rust Host functions, with calls allowed in every direction. W3VM
+  callables use the existing `Value::Function` ABI and conformance tests cover
+  Host → VM and VM → Host calls plus Host exceptions entering VM catch regions.
+- [ ] One Realm, module registry, microtask queue, timer/event loop, DOM implementation, and Web API implementation per page context
+- [x] Two execution backends only: native AOT for build-time-known modules and
+  W3VM for runtime-loaded modules. CI rejects compiler/W3IR/W3VM linkage in
+  ordinary AOT, confines runtime lowering to the single script adapter, and
+  rejects file-source interpretation or runtime compilation fallback.
+- [x] Route browser JavaScript by resolved URL protocol inside the single
+  `ScriptLoader`: `http:`/`https:` and inline/runtime-created sources use the
+  existing SWC → W3IR → W3VM path, while `file:` resolves only to a
+  build-time-compiled native AOT record in the shared Core module registry.
+  File URLs automatically alias their decoded local build path, so generated
+  modules do not need a second registration format. Missing AOT records fail
+  explicitly instead of reading source, invoking `rustc`, or falling back to
+  W3VM. Classic scripts, ESM entries, static dependencies, and dynamic imports
+  share this protocol gate; focused tests cover routing, one-time AOT
+  evaluation, namespace exports, invalid source bypass, and missing-record
+  rejection, while CI pins the boundary.
+- [x] Ordinary AOT applications do not ship SWC, the compiler, or W3VM;
+  `w3cos-runtime` links them only behind the explicit `dynamic-js` feature,
+  verified by default/no-default-feature dependency-tree checks.
+
+### W3IR semantic layer
+- [x] Define versioned W3IR for constants, lexical scopes, closures, control flow, property operations, function/class construction, exceptions, async/await, and module operations
+  - [x] Land the dependency-light `w3cos-ir` format-v1 foundation with typed
+    function/block/register identities, constants, property/call/construct/
+    await/control-flow instructions, and pre-execution structural validation.
+  - [x] Add lexical environments, closures/classes, exception regions,
+    module records/imports/exports, source locations, and async suspension
+    metadata, with validation of references, control-flow termination,
+    registers, captures, exception handlers and suspension points.
+  - [x] Advance the serialized format through v17 for backend-neutral unary
+    `typeof`/negation/bitwise-not, arithmetic/comparison/shift/bitwise/
+    exponentiation/`in` operators, explicit property deletion, a validated
+    rest-parameter call-frame binding, and array/object destructuring-rest
+    plus lexical-cell refresh, `CopyDataProperties`, incremental
+    array-element/iterable append, and materialized call/method/construct
+    argument instructions.
+    Persistent compiled-cache keys carry the format version, so older artifacts
+    cannot execute as current modules.
+- [x] Extract shared runtime intrinsics (`add`, `get_property`, `set_property`,
+  `call`, `construct`, `await_value`, etc.) from the former direct Rust
+  lowering path
+  - [x] Establish the backend-neutral `w3cos_core::intrinsics` ABI for addition,
+    arithmetic/comparison coercion, dynamic property reads/writes, aggregate
+    creation, calls and construction; migrate ordinary AOT binary addition
+    through the shared entry point.
+  - [x] Migrate remaining arithmetic/comparison, property/update, call,
+    construct and Promise/await lowering, then prevent backends from bypassing
+    the intrinsic layer for JavaScript semantics.
+    - [x] Route every binary operator emitted by the remaining direct-AST
+      module/class initialization path through `w3cos_core::intrinsics`.
+      W3VM and the native W3IR emitter now also share the same `logical_not`
+      and `instance_of` entry points for inequality and `instanceof`, with a
+      compiler guard that rejects reintroducing direct `Value::js_*` binary
+      calls in module initialization.
+    - [x] Route the remaining direct-AST module/class peripheral property
+      reads, writes and deletion, updates, calls, construction, destructuring,
+      fields and private-member installation through `w3cos_core::intrinsics`.
+      Compiler guards reject direct `Value` and class semantic bypasses in
+      module initialization and class assembly.
+    - [x] Put `super` dispatch, Promise construction/combinators and
+      PromiseResolve-based await assimilation behind the same Core intrinsic
+      ABI. Direct-AST ESM, native W3IR async/generator state machines and W3VM
+      now reuse those entry points; generated-code and VM source guards reject
+      direct Promise/class bypasses.
+- [ ] Make the native AOT backend generate code from W3IR and call the same runtime intrinsics used by W3VM
+- [x] Migrate existing SWC → Rust lowering incrementally to SWC → W3IR → Rust;
+  remove long-lived direct AST → Rust semantic paths. Native code generation
+  still reads AST declarations for module/class structure and symbol naming,
+  but executable JavaScript expressions and bodies enter validated W3IR.
+  - [x] Compile supported synchronous ESM evaluation statements directly from
+    their parsed SWC AST into W3IR and then native Core-only AOT helpers.
+    Existing ESM cells/imports enter W3IR as explicit external live bindings;
+    getter/setter adapters propagate through nested closures, verified by a
+    generated module-init callback that mutates a live export from `1` to `6`.
+    - [x] Represent object/array module-level destructuring as W3IR assignments
+      to the already-linked live bindings, eliminating the init-local plus
+      codegen-only write-back path. A generated native fixture covers nested
+      defaults, object/array rest and seven live cells with result `36`.
+  - [x] Represent asynchronous module evaluation with the existing W3IR
+    ordinary-async native state machine and Core Promise/module-registry ABI.
+    Native modules cache their evaluation Promise; the bundle entry sequences
+    modules in topological order before `main`. Executed fixtures cover
+    identifier initializers containing top-level await across two modules
+    (`SDA4`) and rejection propagation that skips later statements and `main`.
+  - [x] Coalesce adjacent synchronous identifier/destructuring initialization
+    and executable statements into bounded W3IR AOT segments. Segments contain
+    at most 32 statements, prune unused external bindings before AOT emission,
+    and therefore avoid both per-declarator helpers and quadratic capture
+    adapters; a 65-initializer fixture produces exactly three frames.
+  - [x] Replace pre-evaluation lazy identifier getter initializers with
+    Core-owned module binding cells. Native registration now performs a
+    distinct declaration-instantiation phase: `var` begins as `undefined`,
+    lexical declarations remain uninitialized until their source-ordered W3IR
+    assignment, live getters never initialize on read, and cyclic TDZ reads
+    throw a standard `ReferenceError`. An executed A ↔ B native fixture covers
+    the cycle and the shared JavaScript exception ABI.
+  - [x] Remove the direct-AST semantic fallback and empty diagnostic
+    placeholders for residual module-init segments. Native generation now has
+    a fallible W3IR-only API; failures identify the module, phase, bounded
+    chunk and lowering cause, propagate through the production compiler, and
+    cannot downgrade to the legacy transpiler or emit a partial bundle. CI
+    guards the boundary and executed tests cover both supported pure-W3IR
+    modules and an explicitly rejected tagged-template initializer.
+  - [x] Remove the residual direct-AST function-body emitter and generated
+    runtime-error stubs for ordinary synchronous, async and generator symbols.
+    All three callable shapes now either emit from validated module W3IR or
+    fail native generation immediately with module, callable kind, symbol and
+    backend cause; production compilation propagates the same typed diagnostic.
+    TypeScript ambient function/class/variable declarations are erased during
+    resolver and codegen collection instead of becoming phantom runtime
+    symbols. CI forbids restoring the old emitters/stub strings, and focused
+    tests cover all three failure shapes plus ambient erasure.
+  - [x] Remove class method/getter/setter/constructor runtime W3IR failure
+    stubs. Explicit class callables now require matching sync, async or
+    generator W3IR plus supported native capture mapping, and fail native
+    compilation with module/class/member context instead of deferring an
+    unsupported path to application startup. Spec-defined default constructors
+    remain generated directly.
+  - [x] Generate top-level native class public/private field values and static
+    blocks from the same W3IR synthetic initializer functions consumed by
+    W3VM. Field keys are evaluated once at class definition and cached by their
+    verified W3IR capture identities; instance initialization still runs
+    through the shared Core class scheduler, while static fields and blocks run
+    in source order after the class binding becomes visible. Unsupported field
+    or static-block lowering now fails native compilation instead of returning
+    to direct AST bodies. This left `extends` and computed member/key evaluation
+    as the final executable class expressions outside W3IR.
+  - [x] Move the remaining top-level native class `extends`, public field keys
+    and computed public method/accessor keys into a source-ordered W3IR
+    definition-values function. Native class assembly consumes and caches
+    those results instead of calling the AST expression emitter. W3VM now also
+    prepares field and method keys in their shared source order before class
+    creation, fixing the former field-first ordering. A source-identical
+    executed AOT/W3VM fixture covers inheritance, interleaved field/method
+    keys, static initialization, private fields and observable ordering.
+    Remaining AST ownership is structural class/member assembly only.
+- [x] Add differential conformance tests: the same fixture must produce equivalent results under AOT and W3VM
+  - [x] Add the first executable differential fixture covering Host calls,
+    dynamic property writes/reads and ECMAScript addition through the exact
+    same intrinsic functions.
+  - [x] Expand the fixture corpus across coercion, control flow, closures,
+    exceptions, classes, Promise/async and modules.
+    - [x] Execute one source-identical ESM fixture through generated native AOT
+      and W3VM, covering captured nested closures, local class construction
+      and method dispatch, branch/strict comparison, `throw`/`catch`, `typeof`
+      and chained ECMAScript addition. Both backends produce `number:5`.
+    - [x] Generate ordinary async AOT functions from validated W3IR suspension
+      metadata, as already done for generators. Core-only native frames retain
+      registers and lexical cells across fulfillment/rejection, resume the
+      recorded blocks, recursively create captured nested async functions, and
+      settle through the shared Promise/microtask engine. A source-identical
+      two-`await` fixture now returns `5` in both generated AOT and W3VM and
+      propagates `throw` as the same rejected Promise; a second differential
+      exercises rejected awaited input and a captured nested async closure.
+    - [x] Execute a source-identical two-module graph through generated AOT and
+      W3VM. The async importer suspends between two reads while a dependency
+      function mutates an exported live cell; both backends fulfill with
+      `1:3:3`, proving import capture, Promise resumption and post-mutation live
+      binding reads share semantics.
+    - [x] Execute a source-identical timer, microtask and DOM Host-call fixture
+      through generated AOT and W3VM. An injected VM Host and the real AOT
+      jsdom host both preserve synchronous `S`, microtask `M`, following task
+      `T`, captured lexical mutation and `document.body` attribute
+      round-tripping as `S:SMT|SMT`.
+- [x] Version W3IR/bytecode and reject incompatible modules before execution;
+  current-format serialization round-trips and unknown versions fail
+  validation.
+
+### W3VM dynamic execution
+- [ ] Implement bytecode generation, verifier, operand stack, call frames, lexical environments, closures, `this`, and prototype lookup
+  - [x] Implement the initial register interpreter, structural verifier, call
+    frames, lexical cells, live closure captures, `this` plumbing, branches,
+    calls and property operations.
+  - [x] Lower initial SWC function expressions and arrow callbacks with
+    identifier parameters, return/expression bodies, and transitive live
+    lexical captures into `CreateClosure`.
+  - [x] Lower initial real CFG for `if`/`else`, `while`, unlabeled
+    `break`/`continue`, block shadowing, and function-scoped `var` hoisting
+    into W3IR `Branch`/`Jump`.
+  - [x] Extend that CFG to classic `for` and `do...while`, prefix/postfix
+    identifier/member updates, arithmetic/exponent/logical compound
+    assignments, parenthesized and comma expressions. `&&=`, `||=` and `??=`
+    reuse the same backend-neutral branches as their expression forms, evaluate
+    identifier/public/private targets once, and skip the right operand when
+    required; an immutable binding throws only if its write branch is reached.
+    `++`/`--` use numeric coercion rather than addition
+    concatenation, while `typeof` calls the shared Core value semantic through
+    W3IR and W3VM.
+  - [x] Lower `switch` with strict case comparison, default selection and
+    source-order fall-through. One ordered control-target stack preserves
+    switch `break`, loop `break`, and loop `continue` when the constructs are
+    nested. Bitwise/shift expressions and compound assignments use shared Core
+    Int32/Uint32 coercion through W3IR v4.
+  - [x] Hoist direct function declarations before script, module and nested
+    function-body evaluation; exported declarations use the same W3IR module
+    path, and identifier parameters support left-to-right default evaluation.
+  - [x] Lower fixed object/array destructured parameters, nested/default
+    patterns and final rest parameters. W3IR v5 carries the rest binding in the
+    function ABI and W3VM creates its array in the shared call frame.
+  - [x] Lower array rest elements and object rest properties through W3IR v6
+    `ArrayRest`/`ObjectRest`; W3VM delegates slicing and excluded-key copying to
+    the same Core intrinsics available to AOT code.
+  - [x] Implement `for (let/const ...)` per-iteration environments through
+    W3IR v7 `RefreshBinding`. W3VM replaces the current frame cell before the
+    first condition and each update, so initializer closures retain the
+    declaration cell while body closures retain their own iteration cell;
+    `continue` follows the same refresh/update block.
+  - [x] Route direct computed and named member calls through W3IR v8
+    `CallMethod`. W3VM delegates Array/String built-ins and ordinary Host
+    receiver calls to the existing Core method semantic, so dynamic scripts
+    do not need a second prototype-method implementation.
+  - [x] Refresh nested block and switch lexical cells on every entry using the
+    existing W3IR `RefreshBinding`, so closures retain values from repeated
+    loop/switch evaluations. Block/switch function declarations are
+    predeclared as lexical bindings and initialized at scope entry.
+  - [x] Lower nested array/object destructuring for `var`, `let`, `const`,
+    classic `for` initializers and exported declarations using the same
+    `GetProperty`, `ArrayRest` and `ObjectRest` instructions as parameter
+    patterns. Defaults initialize left-to-right against predeclared cells, so
+    later bindings retain TDZ behavior, and destructured exports create one
+    live module binding per bound name.
+  - [x] Route array/object destructuring reassignment expressions through those
+    same W3IR pattern writes. Nested defaults/rest, computed keys, identifier,
+    public-member and private-field targets preserve source order and return
+    the original right-hand value in W3VM and generated native AOT.
+  - [x] Lower ordinary template literals as ordered W3IR `Add` chains so cooked
+    escapes and interpolation coercion use the same Core semantics in W3VM and
+    native AOT. Runtime-erased TypeScript `as`, angle-bracket assertion,
+    non-null, const assertion, `satisfies`, and instantiation wrappers lower
+    their inner expression through that same path.
+  - [x] Erase TypeScript `interface`, type aliases, ambient
+    function/class/variable declarations, and ambient enum/namespace
+    declarations before W3IR binding and export construction. Declarations
+    with runtime behavior (`enum`, namespace and `using`) remain explicit
+    lowering errors instead of silently diverging between W3VM and AOT.
+    Type-only imports, exports and re-exports also stay out of the runtime
+    module-request graph.
+  - [x] Lower synchronous `for...of` over the shared Core iterator protocol
+    into existing W3IR `CallMethod`/property/branch instructions. Declaration
+    and assignment heads support nested patterns and member targets;
+    `let`/`const` cells refresh per iteration; Unicode strings use the same
+    immutable iterator snapshot as AOT, while arrays, typed arrays, Map and Set
+    share Core's live `ValueIterator` across AOT and W3IR. Array length changes
+    and typed-array writes to unvisited indices are observed at each step;
+    Map/Set deletions are skipped, later additions are visited, and
+    delete-then-reinsert entries are visited again; and
+    `break`, explicit `return`, and explicit `throw` perform the iterator
+    `return()` hook when present. Nested abrupt completion closes iterators
+    from inner to outer; an existing throw completion wins over close-hook
+    failures, while a close failure replaces a return completion. Expression
+    and Host-call failures inside the loop body now enter existing W3IR
+    `ExceptionRegion` handlers and follow the same close-and-rethrow path;
+    return cleanup runs in an unprotected block so hooks execute exactly once.
+    Shared Core protocol bridges now require callable iterator, `next`, and
+    `return` methods plus object-valued iterator/step/close results. Iterator
+    step failures do not spuriously close; a non-callable `return` GetMethod
+    failure overrides an existing throw, while call/result failures preserve
+    that throw as required by IteratorClose completion priority. AOT
+    `Value::iter` and W3IR iterator acquisition now use the same custom
+    `Symbol.iterator` validation and step driver, and Core-created iterator
+    objects are themselves iterable. TypedArray default iteration and explicit
+    `values` / `keys` / `entries` now also use that shared live iterator-object
+    path instead of maintaining a separate snapshot implementation.
+  - [x] Lower `for-await-of` through the same W3IR loop CFG and W3VM async
+    frames used by ordinary `await`: Core performs validated async-iterator
+    acquisition with synchronous-iterator fallback, W3IR awaits both `next`
+    results and yielded values, and break/return/throw paths await the shared
+    async IteratorClose chain with JavaScript completion priority.
+  - [x] Lower labeled blocks, multi-label loops, and labeled `break` /
+    `continue` to explicit W3IR CFG targets. Targets record their iterator
+    depth so transfers across nested synchronous or asynchronous `for-of`
+    loops close exactly the iterators they leave while keeping the destination
+    iterator open for `continue`.
+  - [x] Lower Annex B branch-level function declarations for non-strict
+    classic scripts through the existing function-scoped `var`,
+    `CreateClosure`, and `StoreBinding` path. Bindings hoist as `undefined` and
+    only the selected `if` / `else` branch installs its closure; strict scripts,
+    strict nested functions, and ESM reject the legacy form explicitly.
+  - [x] Preserve parameter-list TDZ and left-to-right initialization by routing
+    raw call arguments into hidden ABI cells, then initializing visible
+    identifier, default, destructured, and rest bindings through the existing
+    lexical-cell instructions. Earlier defaults and closures can observe later
+    initialization, while reads or writes of a later parameter during an
+    earlier default raise `ReferenceError`.
+  - [x] Lower `for-in` through a shared Core `for_in_keys` snapshot and the
+    same W3IR iterator CFG used by `for-of`; AOT calls the same intrinsic.
+    `var`, per-iteration `let` / `const`, assignment/member heads, closures,
+    and abrupt cleanup share one binding/iterator implementation. Core walks
+    the prototype chain once, suppresses shadowed duplicate keys, and protects
+    against malformed prototype cycles for both execution modes.
+  - [x] Execute W3IR v11 `CreateClass` and both AOT class emitters through the
+    same Core class builder instead of backend-owned object models. Classic
+    scripts and named/default ESM exports support class declarations and
+    expressions, captured constructors, instance/static methods, ordinary and
+    arrow lexical `this`, `new`, `instanceof`, prototype/static inheritance,
+    explicit/default derived constructors, `super(...)`, and instance `super`
+    method/property reads. Instance/static getters and setters, including
+    computed names, use the same Core accessor convention as AOT. Static
+    `super` method/property access preserves the derived receiver through
+    ordinary methods and lexical arrow closures. Instance/static `super`
+    property writes, arithmetic/logical compound assignments, and prefix/
+    postfix updates now use one W3IR assignment target plus Core get/set
+    bridges; computed keys evaluate once and setters retain the derived
+    receiver in W3VM and native AOT.
+  - [x] Schedule public instance fields through a separate initializer closure
+    passed by W3IR/W3VM and both AOT emitters to the same Core class builder.
+    Base fields run before the constructor body; derived fields run immediately
+    after their own `super(...)` returns, including default constructors and
+    multilevel inheritance. `DefineField` bypasses prototype setters, computed
+    keys are captured at class definition, and static fields initialize the
+    class object once. Static blocks share the ordered class-initialization
+    sequence with static fields and preserve block lexical scope, class-bound
+    `this`, and static `super`.
+  - [x] Give runtime-parsed classes real unobservable private brands and slots
+    in the shared Core object model. W3IR v12 defines private field, method,
+    accessor, get/set and brand-check operations; W3VM delegates every one to
+    Core. Base/derived brands install at the same `super(...)` boundaries as
+    public fields, private calls preserve their receiver, and private state is
+    absent from ordinary properties, proxy traps and reflection keys.
+  - [x] Migrate both AOT emitters from legacy string-mangled private properties
+    to the same Core private operations. Top-level and captured class
+    expressions share field/method/accessor/brand-check behavior with W3VM;
+    generated Rust runs the same compound-update, receiver and accessor
+    fixture, while Core tests cover inheritance, wrong-brand failure and
+    reflection invisibility.
+  - [x] Complete generators and remaining control flow.
+    - [x] Advance W3IR to v13 with validated generator suspension metadata and
+      `Yield` / `YieldDelegate` operations. W3VM now creates lazy resumable
+      generator frames using the shared Core `Value` and iterator protocol;
+      `next(value)`, `throw`, `return`, `yield*`, nested `try` / `catch` /
+      `finally`, iterator-close on loop exit and finalizers that yield preserve
+      JavaScript completion behavior. Browser-loaded scripts execute the same
+      path without runtime Rust compilation.
+    - [x] Run async generators on the same W3IR v13 suspension metadata and
+      W3VM Promise/microtask queue. `next` / `throw` / `return` requests queue
+      in order; awaited expressions, yielded thenables and return completions
+      resume through one preserved frame; async `yield*` forwards delegated
+      completions with synchronous-iterator fallback; and `for-await-of`
+      awaits values plus IteratorClose. Compiler, direct-VM and browser-loaded
+      script fixtures cover these paths.
+    - [x] Generate native AOT generator state machines from the same W3IR v13
+      suspension metadata, then add AOT/W3VM differential fixtures before
+      declaring generator support complete.
+      - [x] Emit top-level synchronous ESM `function*` bodies as native Rust
+        state machines directly from validated W3IR blocks and suspension
+        records. Generated applications link Core only, use live getter/setter
+        adapters for captured ESM cells, and preserve `next` / `throw` /
+        `return`, yielding finalizers, Host exception re-entry and synchronous
+        `yield*`. An executed AOT/W3VM differential fixture covers completion
+        injection, while the full ESM AOT fixture covers live captures,
+        delegated throws and Core-only linkage.
+      - [x] Route top-level function-valued generator variables, including
+        anonymous `const value = function* () {}` forms, and public
+        literal-named instance/static class generator methods through the same
+        W3IR AOT emitter. Stable W3IR identities distinguish static and
+        instance members; executed Core-only fixtures cover live module
+        captures, dynamic `this`, parameters and same-key static/instance
+        methods.
+      - [x] Emit nested generator factories created inside an AOT generator
+        from W3IR `CreateClosure`, with `Rc<RefCell>` binding cells shared
+        through the existing capture-adapter ABI. A Core-only differential
+        fixture proves bidirectional outer/inner local writes across
+        suspension against W3VM; unsupported ordinary nested closures are
+        rejected rather than approximated.
+      - [x] Emit computed, private and `super`-capturing class generator
+        methods. Computed members receive stable source-order W3IR identities;
+        class brand and parent cells use explicit immutable capture adapters;
+        private field get/set/brand checks use the same Core intrinsics as
+        W3VM. A Core-only execution fixture covers computed lookup, private
+        mutation, and instance `super` method/getter dispatch.
+      - [x] Emit non-async ordinary W3IR functions that create and return
+        nested generators through a synchronous Core-only block runner. The
+        escaping generator retains the host invocation's live local cells;
+        modules are lowered once opportunistically so selection does not
+        require a second syntax heuristic.
+      - [x] Generalize the closure graph emitter to mixed synchronous and
+        generator functions. Escaping ordinary helpers and nested generators
+        share the same factory ABI and live cells; an executed Core-only
+        fixture covers a generator calling an ordinary captured helper after
+        its host invocation has returned. Async closure nodes remain explicit
+        failures.
+      - [x] Complete the Core-backed W3IR object/class surface in the AOT
+        runner: rest parameters, array/object rest, class creation and
+        initializer wiring, private method/accessor definition, fields and
+        brand operations. Executed fixtures cover destructuring/rest and a
+        local class whose ordinary method closure is called from a generator.
+      - [x] Emit `import.meta.url` from the validated W3IR module identity; a
+        dedicated small Core-only fixture verifies the generated URL without
+        inflating the larger state-machine fixture's test-thread stack.
+      - [x] Route AOT W3IR `DynamicImport` through the optional
+        `w3cos/module::dynamicImport` Core host adapter with `(specifier,
+        referrer)` arguments. Missing adapters return a rejected Promise;
+        configured adapters preserve Core-only linkage and are verified by the
+        same generated fixture as `import.meta`.
+      - [x] Emit async-generator Promise request queues directly from the same
+        W3IR suspension records. Core-only generated frames serialize
+        `next`/`return`/`throw`, adopt awaited and yielded thenables, resume
+        rejection blocks, await completion values, and forward async `yield*`
+        including delegated return/finalizer paths. Direct AOT/W3VM
+        differential fixtures cover queued await/yield/completion and nested
+        async delegation; an executed ESM fixture verifies selection of the
+        native W3IR factory without linking W3VM or W3IR.
+      - [x] Route every top-level ordinary synchronous ESM function
+        declaration, function-valued variable and arrow-valued variable
+        through the Core-only W3IR AOT runner. Missing module/function
+        lowering is an explicit generated failure and never silently selects
+        the legacy direct-AST semantic backend.
+      - [x] Route explicit top-level class constructors plus public/private,
+        static/instance methods and accessors through W3IR AOT. Accessor and
+        method identities encode kind/static/private distinctions; only
+        specification-defined default constructors remain synthesized
+        directly.
+      - [x] Extend the shared W3IR expression surface used by ordinary AOT and
+        W3VM with optional member/call chains (including receiver preservation
+        and skipped argument evaluation), RegExp and BigInt literals, BigInt
+        unary negation/bitwise-not, exponentiation, `in`, `delete`, named
+        default function declarations, object/array/call/construct spread,
+        sparse array holes across property presence, enumeration, callbacks,
+        JSON and spread iteration,
+        object-literal methods/getters/setters (including generator methods),
+        BigInt property keys, TypeScript constructor parameter properties with
+        base/derived initializer ordering, short-circuit logical assignments,
+        array/object destructuring reassignment, instance/static `super`
+        property assignment and update targets, ordinary template literals,
+        runtime-erased TypeScript expressions and type-only/ambient
+        declarations, and JSX element/fragment values including ordered
+        spread attributes.
+        Compiler, VM and generated browser/Core fixtures exercise the same
+        `CopyDataProperties`/other intrinsics and Promise constructor facade.
+        Dynamic Realms also resolve the standard Object, Array, Math and JSON
+        facades from Core when the host window does not override them, keeping
+        browser globals on the same semantics as ordinary AOT.
+- [x] Implement exceptions, Promise/microtask integration, async/await suspension, and Host-call re-entry
+  - [x] Implement `throw`, protected catch regions and Host-call exception
+    re-entry.
+  - [x] Expose the shared core `Promise` constructor/static methods to the page
+    Realm; W3VM closures run as `then` reactions on the existing microtask
+    queue, including `Promise.resolve` and `new Promise`.
+  - [x] Run the shared microtask checkpoint after dynamic script evaluation;
+    native window task turns already drain the same Promise/queueMicrotask
+    queues.
+  - [x] Implement W3IR `Await` suspension with resumable W3VM frames, preserved
+    registers/lexical cells, shared Promise adoption, and async rejection
+    routing. Dynamic-script tests cover multiple awaits and rejected awaits.
+  - [x] Materialize `try` / `catch` / `finally` completion paths in W3IR and
+    expand exception-region coverage across suspended W3VM frames. Normal
+    completion, `return`, `throw`, labeled/unlabeled `break` / `continue`,
+    Promise rejection and Host-call exceptions execute finalizers in order;
+    a finalizer's own abrupt completion overrides the pending one. Browser
+    dynamic-script tests cover `await` in both the protected body and
+    finalizer, while compiler fixtures cover nested finalizers and captured
+    compound/update assignments.
+  - [x] Lower identifier, array and object catch bindings through the same
+    W3IR lexical cells and destructuring operations used by declarations and
+    parameters. Nested defaults, computed keys and rest bindings preserve
+    catch-scope TDZ and execute unchanged in W3VM, generated native AOT and
+    browser-loaded scripts. Binding TDZ and immutable-write failures use
+    Core-created standard Error values and enter the same catch regions in
+    both backends instead of escaping W3VM as host errors.
+- [x] Implement mixed-module linking: AOT modules may import/call bytecode modules and bytecode modules may import/call AOT modules
+  - [x] Implement the initial runtime ESM linker for bytecode module graphs:
+    URL resolution, source/module caches, named/default/namespace imports,
+    local and named re-exports, live lexical cells, live namespace getters,
+    dependency-order evaluation, and cycle-safe instantiation all execute
+    through the same W3VM and Core `Value` ABI.
+  - [x] Add a Core-owned module-record ABI whose exports are live
+    getter/setter `Value` pairs, keeping compiler, W3IR and W3VM types out of
+    the boundary. Generated AOT modules register direct function/class/variable
+    exports before evaluation; W3VM import slots can read registered AOT cells;
+    runtime bytecode records register their own live exports and evaluator in
+    the same registry. Graph discovery, linking and evaluation skip network
+    fetches for registered AOT records. Executed fixtures cover generated AOT
+    live mutation plus bytecode → AOT and AOT-style → bytecode calls.
+  - [x] Extend the shared record adapter across named aliases, named default
+    declarations and star re-exports. The AOT bundle now retains each module's
+    resolved public surface and registers cross-module live cells; bytecode
+    star records enumerate/read native Core exports without forwarding
+    `default`. Executed fixtures cover aliased/star AOT registration and a
+    bytecode barrel forwarding a mutating AOT binding. Core also owns chained
+    specifier aliases, so a deployment/CDN URL resolves to the same registered
+    live record instead of duplicating module state; the mixed linker fixture
+    exercises that path. Anonymous default expressions and anonymous
+    function/class declarations now receive stable synthetic AOT cells;
+    executed coverage verifies default-expression snapshot semantics across an
+    actual default import and the shared registry. Namespace re-exports use
+    immutable synthetic cells whose namespace properties remain live; the same
+    executed barrel fixture covers `export * as ns`.
+  - [x] Route native and bytecode entry evaluation through one Core record
+    state machine. Successful, rejected and pending evaluations are cached;
+    active mixed-graph back edges reuse the already-instantiated live cells
+    without awaiting their own Promise. A real W3VM module and registered AOT
+    evaluator form an executed AOT → bytecode → AOT SCC and each evaluates
+    exactly once.
+  - [x] Populate canonical aliases from deployment metadata and redirect-final
+    URLs. `AppManifest.module_aliases` is deserialized and installed when an
+    app enters the registry; HTTP request/final module URLs now alias one Core
+    record rather than registering duplicate evaluation state. The redirect
+    fixture proves both URLs evaluate once.
+  - [x] Lower manifest-declared runtime-only ESM imports in generated AOT
+    modules into Core registry live slots. The compiler reads
+    `runtime_modules` from `w3cos.app.json`/`w3cos.json`, excludes those
+    specifiers from the static source graph, and generates named/default/
+    namespace accessors plus side-effect evaluation through the public Core
+    ABI. An executed generated-AOT fixture calls a runtime function, observes
+    its mutated live export, and proves Core evaluates the runtime record once
+    without linking W3VM or W3IR into the AOT binary.
+  - [x] Add a Promise-shaped generated AOT entry that starts every declared
+    runtime dependency through the existing Core dynamic-import adapter,
+    waits for their cached Core evaluation Promises, and only then runs AOT
+    module initialization and `main`. Generated desktop and mobile DOM
+    launchers use this entry; ordinary all-AOT bundles still execute
+    synchronously inside an already-fulfilled Promise. `ScriptLoader`
+    installs the weak page-scoped adapter to reuse its existing fetch,
+    redirect/import-map, SWC → W3IR → W3VM and live-module path. Executed
+    fixtures cover pending top-level `await`, live export visibility,
+    rejection propagation, automatic adapter loading and missing-loader
+    failure without introducing another evaluator or scheduler.
+- [x] Add runtime bytecode cache keyed by resolved URL, ETag/Last-Modified or
+  content hash, W3IR version, and compile options
+  - [x] Add the shared in-memory classic-script/ESM cache keyed by resolved
+    URL/specifier, verified source digest/length, W3IR format version, and
+    compile mode.
+    It removes duplicate module lowering between graph discovery and
+    instantiation and survives page Realm teardown without preserving module
+    evaluation state.
+  - [x] Bound the in-memory cache by configurable entry and estimated resident
+    byte budgets, evict least-recently-used entries, and expose hit/miss,
+    eviction, entry, and byte counters.
+  - [x] Persist compiled W3IR in an embedder-owned application-private cache
+    directory using atomically replaced artifacts, exact source/key checks,
+    W3IR structural validation, bounded cleanup, and persistent-cache
+    telemetry. Invalid artifacts fall back to the same lowering path.
+  - [x] Integrate ETag/Last-Modified conditional requests for synchronous and
+    task-pump classic scripts plus ESM graphs. The script adapter now consumes
+    an atomically persisted, application-private generic browser response entry
+    containing status, binary body, safe headers, validators and `Vary`
+    metadata; 304 responses merge current metadata, re-run existing
+    redirect/CORS/MIME/source-limit checks, and reuse the same W3IR/W3VM path
+    without downloading the body. Changed 200 responses replace source and
+    W3IR, corrupt sidecars fall back to an unconditional fetch, same-origin
+    redirects revalidate only when the final URL is unchanged, cross-origin
+    redirect validators are not forwarded, sensitive response headers are not
+    persisted, `Cache-Control: no-store` responses remove any prior artifact,
+    and the script adapter conservatively bypasses responses with `Vary`.
+    Generic consumers can key and verify the named request-header dimensions.
+    Shared disk budgets prune response and W3IR artifacts together, and public
+    counters expose candidates, misses, 304 hits, refreshes, writes, evictions,
+    and errors.
+- [x] Start with an interpreter; defer JIT until profiling proves it necessary.
+- [ ] Add heap limits, instruction/time budgets, cancellation, and deterministic cleanup for untrusted page code
+  - [x] Add instruction and call-depth limits plus a reusable cancellation
+    token.
+  - [x] Add shared Core heap accounting for objects, arrays and functions,
+    including container-capacity growth, per-page ownership, live/peak and
+    allocation diagnostics. W3VM enters the same owner scope for synchronous
+    execution, async continuations and generator resumes, exposes the snapshot,
+    and enforces a configurable estimated live-byte cap (64 MiB by default).
+    Native AOT and Host code use these same allocation tickets when entering a
+    page owner; opaque Rust closure captures and external native resources
+    remain explicitly outside the estimate.
+  - [x] Add a configurable cumulative active wall-clock deadline shared by
+    synchronous frames, async continuations and sync/async generator resumes.
+    The default budget is five seconds, embedders can disable it with `None`,
+    and time suspended at `await`/`yield` boundaries is excluded so network,
+    timer and host waits do not consume page execution time. Exhaustion remains
+    an uncatchable VM termination and is enforced by `ScriptPolicy`.
+  - [x] On navigation and loader destruction, cooperatively cancel every
+    retained runtime-module VM, unregister its requested/final URL records and
+    aliases from the shared Core module registry, and preserve native/AOT
+    providers. Suspended top-level-await continuations now reject instead of
+    resuming stale page code.
+  - [x] Advance the shared Core Promise microtask Realm generation during
+    bridge reset, after cancelling retained W3VMs. Navigation now drops queued
+    microtasks, timers and animation-frame callbacks, and old pending Promise
+    subscriptions cannot re-enqueue stale page callbacks when they settle
+    later. A new Realm can still subscribe to a cached settled native/AOT
+    module Promise, preserving the shared module cache and single scheduler.
+  - [x] Treat memoized `document`, `window` and `Selection` wrappers as
+    Realm-owned rather than process-thread singletons. Reset now releases their
+    object graphs after subsystem teardown, rebuilds fresh identities on
+    demand, clears scroll/fullscreen state, and recreates mutable nested
+    Navigation, Screen, window-environment, FragmentDirective and active
+    ViewTransition wrappers without carrying authored expandos into the next
+    document.
+  - [x] Advance a DOM-bridge Realm generation before recycling document node
+    ids. Externally retained element proxies, live collections, node-owned
+    style/dataset/canvas facades and previously retrieved DOM methods now
+    become inert instead of reading or mutating a same-numbered node in the
+    next document. Reset also rebuilds the core DOM constructor/prototype graph
+    and local jsdom class caches so authored prototype mutations do not cross
+    navigation.
+  - [x] Rebuild the Custom Elements registry, `ElementInternals`,
+    `CustomStateSet` and `CSSPseudoElement` constructor/prototype graphs on
+    Realm reset. Definitions and pending `whenDefined()` waiters are released,
+    while externally retained registry methods and constructors are guarded by
+    the shared DOM-bridge generation so they cannot query or register elements
+    in the next document.
+  - [x] Rebuild the process-local Cache API and Prioritized Task Scheduling
+    singleton/constructor graphs on Realm reset. The shared DOM-bridge
+    generation now makes externally retained `Cache`, `CacheStorage`,
+    `Scheduler`, `TaskController` and `TaskSignal` methods inert, preventing old
+    pages from mutating the next page's cache namespace or injecting work into
+    its timer and Promise queues.
+  - [x] Rebuild Web Locks and CSS Custom Highlight singleton/constructor
+    graphs on Realm reset. Lock request ids and asynchronous release/abort
+    paths now carry the shared DOM-bridge generation, so stale signals and
+    completions cannot cancel or release next-page locks; retained Highlight
+    and Registry methods cannot preserve or act on old Range graphs.
+  - [x] Make Clipboard and Launch Handler state Realm-safe. Clipboard payloads
+    now survive navigation as typed byte snapshots and are rehydrated into
+    fresh `ClipboardItem`/`Blob` wrappers instead of retaining old JS values;
+    stale Clipboard and LaunchQueue methods are generation-guarded, old
+    consumers and pending launch values are released on reset, and
+    `LaunchParams` no longer writes per-instance fields onto its shared
+    prototype.
+  - [x] Rebuild Permissions, Credential Management and CloseWatcher
+    constructor/prototype graphs on Realm reset. Retained entry methods,
+    watcher lifecycle callbacks and abort listeners are guarded by the shared
+    generation, so old documents cannot query current permission state,
+    construct credentials in the next Realm or dispatch stale close/cancel
+    handlers.
+  - [x] Rebuild StorageManager, Storage Buckets, Wake Lock and Network
+    Information JS object graphs on Realm reset. Storage bucket metadata keeps
+    its storage lifetime while stale managers and bucket wrappers cannot
+    enumerate, delete or mutate it; old wake-lock sentinels cannot dispatch
+    release events, and authored constructor/prototype mutations do not cross
+    navigation.
+  - [x] Rebuild Compute Pressure, Presentation and Barcode Detection
+    constructor/prototype graphs on Realm reset. Page teardown drops pressure
+    observers and queued delivery, while generation-guarded constructors,
+    request methods and detector entry points keep retained objects from
+    invoking callbacks or creating work in a later document.
+  - [x] Rebuild Notification, User Activation and EditContext object graphs on
+    Realm reset. Retained notification constructors and permission callbacks
+    cannot trigger host work, activation getters cannot observe a later
+    document's trusted-input state, and stale editing models cannot mutate text
+    or dispatch events after navigation.
+  - [x] Rebuild IdleDetector, EyeDropper, Observable and Subscriber object
+    graphs on Realm reset. Host idle-state delivery releases old detectors,
+    retained screen-sampling and subscription entry points become inert, and
+    teardown clears subscriber callback/teardown references so old producers
+    cannot re-enter a later page.
+  - [x] Make ResizeObserver, MutationObserver and IntersectionObserver delivery
+    Realm-owned. Navigation rebuilds constructors and entry prototypes, cancels
+    pending records, releases callback/target graphs, and makes retained
+    observer methods inert before a later document becomes active.
+  - [x] Make PerformanceObserver and performance-timeline object graphs
+    Realm-owned. Navigation cancels pending entry delivery, releases observer
+    callbacks and buffered records, rebuilds timeline/entry/diagnostic classes,
+    and prevents retained entry-list or serialization functions from entering
+    the next page.
+  - [x] Make Worker, SharedWorker, MessagePort, MessageChannel and
+    BroadcastChannel resources Realm-owned. Navigation terminates native
+    workers, closes and detaches port/channel graphs, cancels queued broadcast
+    delivery, releases event callbacks, and rebuilds all exposed constructors.
+  - [x] Make Canvas Web object graphs Realm-owned. Navigation rebuilds
+    OffscreenCanvas, Path2D, gradient, pattern, bitmap, context, capture-track
+    and text-metrics classes, clears retained path storage, and makes stale
+    drawing/resource methods inert.
+  - [x] Make XPath and Sanitizer objects Realm-owned. Navigation rebuilds
+    evaluator/expression/result and sanitizer classes, and prevents retained
+    namespace resolvers, DOM result iterators, configurations or fragment
+    creation methods from operating on the next document.
+  - [x] Make Web Bluetooth object graphs Realm-owned. Navigation rebuilds the
+    Bluetooth, device, UUID and GATT interface classes, while retained
+    discovery, connection, service, characteristic, descriptor and
+    notification methods can no longer invoke the platform adapter.
+  - [x] Make WHATWG Streams object graphs Realm-owned. Navigation rebuilds the
+    readable, writable, transform, text-codec, compression and queuing-strategy
+    classes; clears queued chunks, pending reads, sources, sinks and tee
+    coordination; and disables retained readers, writers, controllers, async
+    iterators and pipe/tee Promise pumps.
+  - [x] Make WebSocket, EventSource, and XMLHttpRequest network object graphs
+    Realm-owned. Navigation requests WebSocket closure, marks EventSource
+    handles closed, clears network listeners and XHR response/upload graphs,
+    rebuilds their constructors, and makes retained network methods inert in
+    later Realms. EventSource also participates in pending-work/deadline polling.
+  - [x] Make the shared Web Events graph Realm-owned. Navigation rebuilds
+    Event, CustomEvent, EventTarget, Touch and all event-subclass constructors,
+    clears registered listeners and callable `on*` handlers, and makes retained
+    event/target/observable methods inert before the next document runs.
+  - [x] Make the shared Fetch object graph Realm-owned without duplicating its
+    transport. Navigation rebuilds stable Headers, Request, Response,
+    AbortController and AbortSignal constructors, releases abort listeners and
+    handlers, cancels stale signal state, and makes retained body/header/request
+    methods inert while AOT, XHR and W3VM continue sharing one Fetch pipeline.
+  - [x] Make media-capture facades Realm-owned while retaining one native-adapter
+    boundary. Navigation rebuilds MediaDevices, MediaStream, MediaStreamTrack,
+    processor/generator, device-info, constraint-error and stats constructors,
+    releases page callbacks and generator registrations, and makes retained
+    capture/stream/track methods inert.
+  - [x] Make WebRTC signaling and media graphs Realm-owned without adding a
+    second transport. Navigation rebuilds peer/data-channel/RTP/ICE/DTLS/SCTP
+    constructors, releases EventTarget handlers, queued negotiation work,
+    signaling descriptions, tracks, streams, workers and encoded-stream
+    references, disconnects the complete constructor/prototype graph, and makes
+    retained connection, channel, sender, receiver, transceiver and stats
+    methods inert while preserving the single native-adapter boundary.
+  - [x] Make Service Worker compatibility and companion-manager objects
+    Realm-owned without introducing a placeholder execution backend.
+    Navigation rebuilds the container, registration, worker, Background Fetch,
+    Cookie Store, navigation-preload and sync classes, releases container event
+    handlers plus manager promise/method references, disconnects all ten
+    constructor/prototype graphs, and makes retained registration/discovery
+    methods inert.
+  - [x] Make WebCodecs controllers and media containers Realm-owned while
+    preserving one native codec-adapter boundary. Navigation cancels queued
+    codec work, releases output/error/dequeue callbacks, closes registered
+    controllers, rebuilds codec/data/chunk classes, and makes stale frame,
+    chunk and controller methods inert without retaining completed media
+    buffers until navigation.
+  - [x] Make Web Audio constructors, contexts and graph operations Realm-owned
+    while preserving one native audio-device/decoder/worklet adapter boundary.
+    Navigation closes registered contexts, releases context and processor/source
+    callbacks, rebuilds the constructor graph, and makes stale buffer, context
+    and node methods inert without retaining ordinary buffers or graph nodes
+    until navigation.
+  - [x] Make ImageDecoder, ImageTrack and ImageTrackList Realm-owned while
+    preserving the existing native image-codec boundary. Navigation closes
+    weakly registered decoders, releases decoded frame storage, rebuilds the
+    constructor graph, and makes stale decoder and track methods inert without
+    extending decoder or image-buffer lifetimes through the registry.
+  - [x] Make MediaSource, SourceBuffer, SourceBufferList and handles Realm-owned
+    while preserving one host media-pipeline boundary. Navigation weakly finds
+    live objects, clears appended bytes and event callbacks, closes sources,
+    empties buffer lists, breaks self-capturing method cycles, rebuilds the
+    constructor graph, and makes stale mutation methods inert.
+  - [x] Make MediaRecorder, ImageCapture, CaptureController and capture-target
+    constructors Realm-owned while preserving one host codec/capture-adapter
+    boundary. Navigation weakly finds live recorders and controllers, returns
+    recorders to inactive, releases streams/tracks and event callbacks, breaks
+    self-capturing methods, rebuilds classes, and makes stale capture operations
+    inert through shared Realm teardown helpers.
+  - [x] Make Animation, Effect, Timeline, Trigger and range-list objects
+    Realm-owned while preserving one compositor integration boundary.
+    Navigation cancels active registrations, releases target/source references
+    and playback callbacks, breaks method/list/promise cycles, rebuilds classes,
+    and makes stale animation operations inert. The Promise state index is weak,
+    so settled values are retained only by live promises, resolvers or reactions.
+  - [x] Make Custom Element registries, ElementInternals, CustomStateSet and
+    CSSPseudoElement wrappers Realm-owned. Navigation releases definitions,
+    pending `whenDefined()` resolvers, DOM/form/pseudo references and
+    self-capturing methods, disconnects constructor/prototype graphs, and makes
+    every retained operation from the old page inert.
+  - [x] Make XSLTProcessor instances Realm-owned while retaining one explicit
+    host-adapter boundary for real stylesheet execution. Navigation releases
+    stylesheet and parameter values, breaks instance-method cycles, disconnects
+    the class graph, and makes retained processors inert.
+  - [x] Make WebGL 1/2 contexts and resource wrappers Realm-owned while
+    preserving one future GLSL-to-wgpu compositor adapter boundary. Navigation
+    releases canvas/state closures, marks resources deleted, clears shader
+    source, disconnects every WebGL constructor/prototype graph, and makes stale
+    context operations inert.
+  - [x] Make XRSystem, XRRigidTransform and XRRay wrappers Realm-owned while
+    preserving one native XR device/compositor adapter boundary. Navigation
+    releases capability callbacks and geometry object graphs, disconnects the
+    WebXR class hierarchy, and prevents retained page objects from issuing
+    session or geometry operations.
+  - [x] Make WebSocketStream and WebTransport lifecycle/stream wrappers
+    Realm-owned while preserving one native streaming-network adapter boundary.
+    Navigation releases stream and promise references, invalidates transport
+    methods, disconnects the constructor/prototype graphs, and prevents retained
+    page objects from initiating transport operations.
+  - [x] Make WebGPU roots, adapters, devices, queues, buffers, encoders, shader
+    modules and support objects Realm-owned while retaining the existing single
+    `wgpu` host adapter. Navigation invalidates every GPU method, releases
+    descriptor/object graphs, explicitly unmaps and destroys registered native
+    buffers, drops pending command resources, and disconnects the complete
+    WebGPU constructor/prototype graph.
+  - [x] Make File System Access handles, writable streams, observers and
+    directory iterators Realm-owned while retaining one runtime-local OPFS
+    storage implementation. Navigation invalidates every filesystem operation,
+    releases captured paths/write buffers/iterator entries, disconnects all
+    five constructor/prototype graphs, and prevents stale page handles from
+    mutating files after a Realm transition.
+  - [x] Make Payment Request and Push capability objects Realm-owned while
+    retaining one future platform-adapter boundary for each service. Navigation
+    invalidates payment/show/abort and push subscription operations, releases
+    event callbacks, disconnects all seven constructor/prototype graphs, and
+    prevents retained page objects from initiating user- or platform-mediated
+    actions.
+  - [x] Make Text Track, cue, cue-list, track-list and playback-quality objects
+    Realm-owned. Navigation clears indexed entries, breaks track/cue/list
+    cycles, releases cue-rendering closures and event handlers, and disconnects
+    all six constructor/prototype graphs.
+  - [x] Make experimental and small compatibility surfaces Realm-owned without
+    inventing privileged browser services. Navigation releases Shared Storage,
+    worklet, viewport, WGSL, AI-capability, Origin, UA-data, remote-playback and
+    picture-in-picture object graphs, clears process-local page state, and
+    disconnects all cached constructors while retaining explicit host-adapter
+    rejection boundaries.
+  - [ ] Complete Realm-owned teardown for remaining mutable Web API
+    constructor/prototype graphs and page-scoped host resources, then replace
+    the current `Rc` lifetime accounting with the planned cycle-collecting
+    shared heap/stable-handle model.
+
+### Delivery gates and provisional effort
+- [x] **Gate A — Dynamic JS proof:** fetch an external script over HTTP, parse
+  with SWC, lower to validated W3IR, execute in W3VM without rustc, and mutate
+  the real W3COS jsdom document. The route is capability-scoped behind
+  `dynamic-js` and covered by the default CI workflow.
+- [ ] **Gate B — Unified runtime MVP (6–10 cumulative person-months):** W3IR + W3VM + native backend share semantics; closures, exceptions, Promise, timers, ESM, DOM Host calls, and bytecode cache pass differential tests
+- [ ] **Gate C — Real map SDK (10–16 cumulative person-months):** a dynamically loaded map SDK initializes, loads chunks/resources, renders, and handles pointer/touch/zoom interactions
+- [ ] Re-estimate Gate C if the selected SDK path requires production WebGL, Blob Worker, or other missing browser subsystems (provisional cumulative range: 16–24 person-months)
+
+## Phase 3.6 — Native Browser and Dynamic Web Loading
+
+### Static parse / reader mode
+- [ ] Replace the trusted-fragment parser with a standards-oriented HTML5 document parser and tree builder
+  - [x] Add an initial incremental Browser document tokenizer/tree builder that
+    accepts arbitrary chunk boundaries across tags, quoted attributes,
+    comments, entities and raw/RCDATA elements; reuses the live DOM; applies
+    basic head/body insertion, implied paragraph/list end tags, table row/body
+    insertion and foster parenting; and exposes explicit EOF/resume progress
+    to the browser task pump.
+  - [x] Add the next tree-builder compatibility layer: active-formatting
+    reconstruction and the common misnested adoption-agency path; inert
+    `template.content` fragments; SVG/MathML namespace propagation, integration
+    points and HTML breakouts; and doctype-driven standards/quirks selection.
+  - [x] Scope table insertion and foster parenting to the active template,
+    maintain nested template insertion-mode state, prevent end tags from
+    escaping template boundaries, add implicit `colgroup` plus cell/caption
+    formatting markers, and apply the HTML foreign-content SVG/MathML tag and
+    attribute adjustments with foreign CDATA support.
+  - [x] Implement the adoption-agency furthest-block path: bounded outer and
+    inner loops, special-node discovery, active/open-list replacement,
+    intermediate and formatting clones, child reparenting, bookmark updates,
+    and foster/template-aware insertion of the repaired subtree.
+  - [x] Route Browser fragment parsing through the same incremental tree
+    builder used by document navigation. `innerHTML`, `insertAdjacentHTML`,
+    `setHTML`, `setHTMLUnsafe`, DOMParser fragments and range-created markup now
+    share formatting repair, templates, table modes and foreign-content rules;
+    fragment scripts remain inert and the sanitized entry points filter active
+    elements, event handlers and `javascript:` URL attributes in that path.
+  - [x] Complete doctype compatibility selection with the current HTML
+    standards/limited-quirks/quirks public- and system-identifier table,
+    preserve the three-state result for parser diagnostics, and expose a
+    recovery-error counter with checkpoints for malformed/late doctypes,
+    missing doctypes, unmatched end tags, invalid HTML self-closing flags,
+    ignored declarations and unterminated comments/foreign CDATA.
+  - [x] Start the feature-neutral parser extraction with always-compiled
+    doctype token interpretation/compatibility selection plus a shared inert
+    fragment policy for active elements, unsafe attributes and HTML void
+    elements. The tree builder now talks to script execution only through a
+    four-method `ParserScriptHost`; Browser adapts the existing `ScriptLoader`
+    and fragments use an inert host. Parser progress, insertion/template modes,
+    namespaces, active formatting entries and the complete streaming parser
+    state are now also always-compiled types. Ordinary AOT and Browser builds
+    compile and test this foundation without pulling the dynamic compiler or
+    W3VM into AOT. The single parser implementation's constructors,
+    write/finish/resume lifecycle, tokenizer drive loop, raw/RCDATA handling,
+    text insertion, doctype checkpoints, start/end-tag paths, table/template
+    scope, SVG/MathML integration, active formatting/adoption repair, foster
+    insertion and script checkpoints now all live in the always-compiled
+    `html_tree_builder`. All inert fragment entry points use that same parser in
+    Browser and ordinary AOT builds; the former non-`dynamic-js` fragment
+    fallback has been removed. Feature-neutral regression tests now execute the
+    same document parser in both configurations for compatibility modes,
+    table/template scoping, adoption repair and SVG/MathML adjustment. Direct
+    template `col`, `tr` and `td`/`th` tokens also create their required implicit
+    `colgroup`, `tbody` and `tr` wrappers. SVG/MathML parsing now retains the
+    required XLink, XML and XMLNS namespace/prefix/local-name identity in the
+    shared DOM attribute store, and the same metadata backs `get`, `set`, `has`
+    and `removeAttributeNS` plus `NamedNodeMap` lookup.
+  - [ ] Complete the HTML5 insertion-mode surface (remaining table,
+    adoption-agency scope/error edge cases, the remaining template-mode token
+    rules, and complete tokenizer/tree-builder parse-error coverage).
+- [x] Add `DocumentLoader`: navigation lifecycle, redirects, MIME/charset handling, cancellation, relative URL resolution, and error pages
+  - Top-level GET runs on the background Fetch transport with a bounded body,
+    manually followed redirects, final-URL/history propagation, sensitive
+    header stripping and redirect-hop Cookie Store rematching under safe
+    top-level SameSite rules.
+  - HTML/XHTML and escaped plain-text documents feed the incremental live-DOM
+    parser; transport charset, BOM and early `<meta charset>` select UTF-8,
+    UTF-16 or Windows-1252 decoding. Unsupported MIME/charset and network/HTTP
+    failures render a script-free error document.
+  - Response headers and bounded body chunks cross the worker channel
+    independently. After at most the 1024-byte charset sniff window, incremental
+    UTF-8/UTF-16/Windows-1252 decoding feeds the live parser before network EOF;
+    split code points and cancellation remain safe.
+  - Navigation replacement cooperatively cancels both the document request and
+    its page script graph, so a late stale response cannot mutate the new
+    document. Relative scripts resolve from the final redirected document URL,
+    then reuse the shared Cookie/Fetch/W3IR/W3VM path.
+- [ ] Load `<style>`, `<link rel="stylesheet">`, images, fonts, and other supported subresources into the existing DOM/CSS/layout/render pipeline
+  - [x] Load authored and dynamically inserted `<style>` plus HTTP(S)
+    `<link rel="stylesheet">` through one Browser subresource path. Runtime
+    source reuses the compiler's tolerant ESM CSS parser/normalizer and the
+    existing DOM stylesheet registry; page-owner ids let navigation remove
+    Browser rules without deleting native AOT rules.
+  - [x] Preserve parser DOM source order, expose each installed sheet through
+    the element's `sheet` property and the live `document.styleSheets` list,
+    update computed style through the existing layout/render registry, dispatch
+    `load`/`error`, and hold the document `load` lifecycle until external CSS
+    settles. Dynamic insertion/mutation and removal use the existing DOM pump,
+    cancellation and navigation teardown.
+  - [x] Reuse the existing background Fetch transport, Cookie Store snapshot
+    and response updates, referrer policy, CORS credentials modes, SRI
+    validation, source-size bound, strict `text/css` MIME validation and
+    final-redirect URL propagation. `crossorigin` sheets validate final CORS
+    permission before installation.
+  - [x] Participate in the shared persistent Browser HTTP response cache with
+    request-origin/credentials/mode partitioning, exact Fetch-generated request
+    headers for `Vary`, ETag/Last-Modified conditional requests, safe `304`
+    merging, `no-store`, bounded/pruned storage and the existing cache counters.
+    No second network stack, cache, CSS parser, DOM registry, layout engine or
+    execution engine is introduced.
+  - [x] Replace loaded `<style>` text and `link.href` without retaining stale
+    rules, cancel superseded requests, honor live `disabled`/re-enable and
+    removal, keep `sheet` plus `document.styleSheets` synchronized, and rebuild
+    the same page-owned CSS registry in current DOM order so mutation time
+    cannot change cascade order.
+  - [x] Preserve enclosing and nested `@media` conditions through the shared
+    tolerant compiler parser, combine them on flattened rules, and activate both
+    rule-level conditions and element `media` attributes against the existing
+    live viewport/`matchMedia` state. Viewport and DPR changes rebuild the same
+    page-owned registry while inactive sheets remain visible through
+    `document.styleSheets`.
+  - [x] Resolve leading `@import` dependencies from external and inline
+    stylesheets through the same background Fetch, Cookie, CORS, integrity,
+    referrer and persistent-cache path. Recursive graphs preserve depth-first
+    cascade order and inherited media conditions, hold document load completion,
+    skip failed branches, and bound cycles, depth, import count and aggregate
+    source bytes without introducing another CSS parser or loader.
+  - [x] Parse ordered `@font-face` sources and descriptors in the shared
+    compiler CSS pipeline, then load HTTP(S) TTF/OTF/WOFF/WOFF2 sources through the same
+    Browser Fetch, Cookie, CORS, referrer and persistent-cache path. Unsupported
+    formats and unavailable `local()` candidates fall through in authored
+    order; MIME, source-size and font decoding are validated before registration.
+    Page/stylesheet owner ids release registered bytes on mutation, removal,
+    navigation and loader teardown, and font work holds document load completion.
+    Compressed web fonts are decoded once at the shared `FontRegistry` boundary;
+    the HTTP cache retains the original representation while layout and all
+    renderers consume the same canonical sfnt bytes. The pure-Rust decoder is
+    linked only by `dynamic-js`, so ordinary AOT artifacts do not inherit its
+    Brotli/WOFF code.
+  - [x] Resolve registered CSS family stacks, weights and styles through the
+    existing `FontRegistry` in shared text measurement plus CPU, Vello/GPU and
+    Skia rendering. Font identity participates in retained layout, shaped-text,
+    glyph and display-chunk cache keys; owner teardown restores fallback metrics
+    and releases parsed/typeface data instead of retaining a second font cache.
+  - [x] Enforce CSS `unicode-range` bounds and actual cmap coverage while
+    resolving each character through the authored family/style/weight stack.
+    Sibling subset faces from one stylesheet remain registered together; shared
+    layout, wrapping, ink bounds, input cursor advancement, CPU rasterization,
+    Vello glyph runs and Skia typeface runs consume the same resolved spans.
+    Retained measurement and Vello display-chunk identities hash only the subset
+    faces used by the text, so adding an unrelated subset does not invalidate
+    existing runs. Browser coverage loads disjoint WOFF2/TTF subsets over the
+    shared HTTP path, verifies mixed-run metrics and releases both with their
+    stylesheet owner.
+  - [x] Defer `@font-face` work while its nested media conditions or owning
+    `<style>`/`<link>` `media` attribute do not match. Viewport and DPR changes
+    activate newly eligible faces through the existing stylesheet graph, Fetch,
+    cache and `FontRegistry` owner path without replaying stylesheet load events
+    or blocking the document's initial completion; removal and navigation also
+    discard deferred faces.
+  - [x] Make `document.fonts` a real `EventTarget` and drive truthful
+    `loading`/`loaded` status, per-cycle `ready` promises and
+    `loading`/`loadingdone`/`loadingerror` events from both programmatic
+    `FontFace.load()` and the shared stylesheet graph. Concurrent loads keep
+    native and JS readiness pending until the final cycle settles; cancellation
+    closes the cycle as an error instead of leaving readiness stuck.
+  - [x] Expose stylesheet-backed `@font-face` rules as stable, CSS-connected
+    `FontFace` identities in `document.fonts` and loading-event `fontfaces`.
+    Parsed descriptors and per-face status follow the same stylesheet
+    fetch/registry graph; `delete()`/`clear()` preserve CSS-connected faces,
+    while owner removal/navigation releases them and cancelled loads become
+    failed event entries.
+  - [x] Route programmatic HTTP(S) `FontFace` sources through the shared
+    Browser Fetch/CORS/Cookie/cache transport. Relative URLs resolve against
+    the active document, font requests omit credentials, enforce response MIME
+    and decoded-size limits, reuse ETag revalidation, then register canonical
+    sfnt bytes through the same `FontRegistry` used by CSS and native callers.
+  - [x] Add text/glyph-demand font loading. Stylesheet `@font-face`
+    declarations and stable `document.fonts` identities are registered without
+    downloading their sources. The shared `FontRegistry` requests only faces
+    matching the text's family, weight, style and `unicode-range` when layout
+    first resolves font runs; `FontFace.load()` and
+    `FontFaceSet.load(font, text)` enter the same demand gate. Media-inactive
+    demand remains deferred, unused subsets stay `unloaded`, and activated
+    faces retain the existing Browser Fetch/CORS/cache, lifecycle, owner
+    cleanup and native font registry path.
+  - [x] Load HTTP(S) raster `<img>` resources through the shared Browser
+    Fetch/Cookie/CORS/referrer/cache transport, decode them with the existing
+    `image` codecs at the Browser task checkpoint, and publish the result into the one
+    `image_loader` cache already consumed by CPU, GPU and Skia renderers.
+    Parser-authored images hold the document `load` lifecycle; dynamic and
+    detached `Image()` sources use the same cancellable loader without becoming
+    document blockers. `complete`, `currentSrc`, `naturalWidth`,
+    `naturalHeight`, `decode()`, load/error EventTarget delivery, decoded-size
+    layout invalidation, HTML width/height hints and auto-size aspect-ratio
+    propagation are covered by end-to-end tests; source mutation and navigation
+    cleanup reuse the loader's cancellation path. Paint is reserved while
+    Browser fetch is pending or failed, preventing a second renderer-owned
+    synchronous network request.
+  - [x] Add responsive raster `srcset`/`sizes`/`<picture>` selection on the
+    existing image pipeline. Density and width descriptors use the live
+    viewport/DPR plus ordered `sizes` media conditions; `<source>` selection
+    honors tree order, media and decoder-supported MIME types before falling
+    back to the `<img>`. Attribute, source-tree, viewport and DPR changes queue
+    reselection through the same cancellable Browser loader. The selected
+    renderer source is internal Document state, so reflected `src` remains the
+    author fallback while `currentSrc` exposes the fetched URL. Physical pixels
+    stay in the shared decoder cache and density-corrected intrinsic dimensions
+    drive `naturalWidth`/`naturalHeight` and layout. Unit and HTTP end-to-end
+    tests cover candidate choice, property reflection, mutation scheduling,
+    shared caching and final component rendering.
+  - [x] Load raster CSS `background-image: url(...)` layers through the same
+    Browser Fetch/Cookie/referrer/HTTP-cache transport and the same decoded
+    `image_loader` cache used by `<img>` and all CPU, GPU and Skia renderers.
+    Inline declarations resolve from the document; every external or imported
+    stylesheet fragment absolutizes its own relative URLs before entering the
+    shared CSS registry. Dynamic style changes are discovered by the regular
+    document pump, pending/failed sources remain reserved against synchronous
+    renderer fetch fallback, navigation cancels outstanding work, and unit plus
+    HTTP end-to-end tests cover layered URL parsing, fragment-base resolution,
+    decoding and cache publication.
+  - [x] Keep `<img>` and CSS raster backgrounds on one Browser image-request
+    implementation for Fetch headers, Cookie updates, CORS, HTTP revalidation,
+    MIME/source limits, decoding and cache publication. Their coordinators only
+    retain consumer-specific DOM lifecycle behavior. Both request classes now
+    participate in pump deadlines and navigation/cancellation cleanup; removing
+    the final CSS consumer cancels its pending request and permits a later
+    re-added URL to retry.
+  - [x] Add the shared raster-background placement model used by CPU, GPU and
+    Skia: multiple URL layers, intrinsic/explicit/percentage size, `cover`,
+    `contain`, common position forms, `repeat`/`no-repeat`/`repeat-x`/
+    `repeat-y`/`round`/`space`, and border/padding/content origin plus
+    rectangular clip boxes. DOM CSSOM and the compiler expand the same shared
+    `background` shorthand parser into the same Style fields, avoiding
+    renderer- or mode-specific parsing.
+  - [x] Complete the shared advanced background geometry subset: rounded
+    `border-radius` clipping for border/padding/content clips, edge-offset
+    three/four-token positions, and linear/radial gradient layer
+    size/position/repeat/origin/clip parity. Gradient parsing and geometry now
+    live beside raster placement and feed CPU, GPU and Skia paint adapters
+    without a renderer-specific CSS model.
+  - [x] Complete `background-attachment`, blend modes, repeating-gradient and
+    directional/shape gradient syntax, and the remaining shorthand/cascade
+    edge cases. Attachment, per-layer blend selection, double-position stops,
+    repeating expansion and direction/shape normalization now live in the one
+    shared background model. CPU, Vello and Skia consume that model; shorthand
+    resets attachment and blend longhands according to CSS cascade semantics.
+  - [x] Add SVG image documents, lazy-loading policy, animation scheduling and
+    remaining supported subresources. SVG bytes rasterize through resvg into
+    the shared image cache, GIF frames advance through the normal window frame
+    scheduler, and native `loading=lazy` uses a viewport prefetch band without
+    delaying document load. Images, CSS images, stylesheets/imports and fonts
+    continue to share the Browser Fetch/Cookie/cache cancellation pipeline.
+
+### Current unattended implementation batch
+- [x] Step 1 — Extend the one serialized Style model and one shared shorthand
+  parser with raster background image/size/position/repeat/origin/clip fields.
+- [x] Step 2 — Route DOM CSSOM and ahead-of-time compiler declarations through
+  that shared model and parser.
+- [x] Step 3 — Compute raster layer geometry once and consume it from CPU, GPU
+  and Skia renderers.
+- [x] Step 4 — Consolidate Browser `<img>` and CSS background network
+  validation/cache/decode behavior while retaining separate consumer lifecycle
+  notifications.
+- [x] Step 5 — Handle active-source mutation, cancellation, navigation teardown
+  and retry eligibility without renderer-owned network fallback.
+- [x] Step 6 — At the batch boundary, run one unified acceptance pass: format
+  and diff checks; DOM, compiler and default/dynamic runtime suites; targeted
+  HTTP Browser coverage; AOT/dynamic dependency boundaries; release-size audit.
+  The pass completed with DOM 131/131, compiler 438/438 plus all available
+  integration suites, default runtime 727/727, dynamic runtime 901/901 and the
+  map-style loader fixture 1/1. The two dependency boundaries and size policy
+  also passed; only pre-existing environment-specific tests remain ignored.
+
+### Current unattended advanced-background batch
+- [x] Step 1 — Promote background clip from a rectangle to shared rounded
+  border/padding/content geometry and consume it from CPU, GPU and Skia.
+- [x] Step 2 — Resolve CSS three/four-token named-edge positions centrally,
+  including inward pixel and percentage offsets.
+- [x] Step 3 — Move linear/radial gradient parsing, normalized stops and tile
+  geometry into the same background layer model used by raster images.
+- [x] Step 4 — Paint the shared gradient description through software CPU
+  sampling, Vello gradient brushes and Skia shaders while preserving CSS layer
+  order and shared size/position/repeat/origin/clip behavior.
+- [x] Step 5 — At the batch boundary, run the unified default/dynamic runtime,
+  DOM/compiler, map compatibility, dependency-boundary and release-size
+  acceptance pass. The final pass completed with DOM 131/131, compiler 438/438
+  plus all available integration suites, default runtime 732/732 and dynamic
+  runtime 906/906 (one environment-specific unit remains ignored in each),
+  and the map-style fixture 1/1. Both dependency boundaries passed. Stripped
+  probes remain 6,083,264 bytes for AOT and 7,148,896 bytes for Browser:
+  a 1,065,632-byte (17.52%) increment, within the fixed and regression budgets.
+
+- [x] Implement anchors, URL bar, reload, back/forward history, downloads, and
+  a visible script-disabled reader mode. `BrowserController` is UI-neutral and
+  reuses DocumentLoader/session history; same-document fragments scroll without
+  reloading, downloads return sanitized names plus bytes to the shell, and
+  reader mode keeps CSS/images networking while policy-disabling all scripts.
+- [x] Run parsing, image decoding, and page DOM work outside the privileged
+  shell capability domain. `BrowserPageDomain` constructs the loader, parser,
+  decoders, Realm and thread-local DOM inside a dedicated page worker; the
+  shell receives only typed navigation/download events and immutable Component
+  snapshots, with no live DOM, VM or arbitrary filesystem handle crossing the
+  boundary.
+
+### Current unattended Browser-completion batch
+- [x] Step 1 — Extend shared CSS/style/compiler/DOM inputs for attachment and
+  blend longhands plus shorthand reset semantics.
+- [x] Step 2 — Normalize repeating/directional/shape gradients and blend each
+  background layer through the common CPU/Vello/Skia paint description.
+- [x] Step 3 — Decode SVG image documents and animated GIF frames in the shared
+  cache, schedule animated repaint, and add non-load-blocking lazy images.
+- [x] Step 4 — Add the shared Browser controller for address/navigation,
+  anchors, downloads and explicit script-disabled reader mode.
+- [x] Step 5 — Add the typed per-page capability domain so privileged shells do
+  not own page parser, decoder, Realm or live DOM state.
+- [x] Step 6 — Run the consolidated test, dependency-boundary and stripped-size
+  acceptance pass and record its exact evidence here. Formatting and diff
+  checks passed; DOM completed 132/132 and compiler completed 438/438. The
+  default runtime completed 735/735 plus API 28/28, CodeMirror 11/11 and the
+  feature matrix 21/21; the dynamic Browser runtime completed 913/913 plus the
+  same integration suites and the map-style loader fixture 1/1. One
+  environment-specific native-wgpu test remains explicitly ignored in each
+  runtime configuration. Both AOT and dynamic-JavaScript dependency boundaries
+  passed. The stripped probes are 6,083,280 bytes for ordinary AOT and
+  8,162,944 bytes for Browser, a 2,079,664-byte (34.19%) increment; both the
+  fixed product budget and the 50% regression gate passed.
+
+### Dynamic script and module loading
+- [x] Support parser-inserted `<script src>`, inline scripts, `async`, `defer`, and ordered execution
+  - [x] Fetch classic external scripts on background workers without blocking
+    the browser task pump. Parser-discovered scripts fetch concurrently but
+    enter W3IR/W3VM in document order; explicit parser `async` and dynamically
+    inserted scripts execute in fetch-completion order, while
+    `script.async = false` joins the ordered queue.
+  - [x] Add streaming-parser lifecycle checkpoints (`begin_document_parse`,
+    incremental script scans and `finish_document_parse`) without introducing
+    another execution engine. `readyState` now advances through loading,
+    interactive and complete; parser `defer` scripts use a distinct ordered
+    EOF queue, non-async modules start at EOF, `DOMContentLoaded` waits for
+    defer/module evaluation including top-level await, and `load` additionally
+    waits for async scripts. Failures and removed elements release their
+    lifecycle blockers.
+  - [x] Pause token-by-token tree building immediately after a parser-inserted,
+    non-async/non-defer external classic script and resume at the exact buffered
+    token after its shared transport and W3IR/W3VM execution settle. Parser DOM
+    insertions are distinguished from dynamically inserted scripts without a
+    second loader or evaluator.
+- [x] Support dynamically created `<script>` elements, `load`/`error` events,
+  JSONP callbacks, and script removal/cancellation semantics
+  - The standard `HTMLScriptElement` loading properties (`src`, `type`,
+    `async`, `defer`, `noModule`, `crossOrigin`, `integrity`,
+    `referrerPolicy`, and `text`) reflect through the shared DOM attribute/text
+    store. Connecting an empty script no longer marks it started: a later
+    `src` or inline-text mutation reschedules the existing document script pump
+    and enters the same SWC → W3IR → W3VM path exactly once.
+  - [x] Apply the module-capable script preparation rules to `nomodule` and
+    JavaScript MIME types. Classic `nomodule` elements are claimed without
+    fetching or evaluating, removing the attribute later cannot restart them,
+    module scripts ignore `nomodule`, and script-element MIME essence matching
+    handles ASCII case, surrounding whitespace, and legacy JavaScript aliases.
+    Parameterized element `type` values remain inert data blocks, while fetched
+    response `Content-Type` parsing accepts parameters before the same alias
+    table and W3VM path.
+- [ ] Support ESM module graphs, dynamic `import()`, import maps, module namespaces, circular dependencies, and top-level await
+  - [x] Add the initial static ESM graph path for inline/fetched
+    `<script type="module">`, exact and prefix import-map entries, resolved URL
+    caching, live imports/re-exports and module namespaces, and cycle-safe
+    instantiation/evaluation.
+  - [x] Lower dynamic `import()` to W3IR and resolve it through the same module
+    registry; the existing Core Promise delivers the live namespace on the
+    shared microtask queue. `import.meta.url` is populated from the canonical
+    module record URL.
+  - [x] Lower top-level await through the same W3IR suspension metadata and
+    make dependency/module evaluation Promise-based. Importers and dynamic
+    `import()` wait for settlement, rejected awaits fail the graph, and
+    strongly connected graphs do not await their own evaluation promise.
+  - [x] Implement `export *` as W3IR module metadata resolved by the same live
+    binding registry. Default exports are excluded, direct exports override
+    star exports, ambiguous names fail named imports and are omitted from
+    module namespaces.
+  - [x] Resolve global and scoped import maps with canonical URL-like keys,
+    longest matching scope, parent-scope fallback, and deterministic longest
+    specifier-prefix selection.
+  - [x] Preserve `null` import-map targets as blocking mappings so they stop
+    scope/global fallback, and merge multiple pre-instantiation DOM import maps
+    without overriding entries registered by an earlier map.
+  - [x] Expose Promise-returning source/URL module entry points and make DOM
+    module-script `load`/`error` follow final graph evaluation, including
+    pending and rejected top-level await. Synchronous embedding calls are now
+    adapters over that same evaluation Promise.
+  - [x] Fetch and buffer complete external module graphs on background workers,
+    deduplicate source requests by canonical URL, advance graph acquisition
+    from the browser task pump, and instantiate/evaluate only through the
+    existing W3IR/W3VM module registry. Releasing the final loader handle
+    cooperatively rejects pending graph Promises and discards worker results.
+  - [x] Merge import maps installed after module resolution begins while
+    preserving every successful `(referrer, specifier) → URL` decision already
+    observed by the loader. New bare names and scopes become available to later
+    graphs, but an incoming exact/prefix/blocking rule is skipped when it would
+    change a prior resolution; earlier map entries still win deterministically.
+  - [x] Bind module graph fetches to the attached document origin, or the first
+    standalone module origin, and require a matching or wildcard
+    `Access-Control-Allow-Origin` response for cross-origin ESM sources.
+  - [x] Emit the initiating page's `Origin` header for every ESM CORS request
+    and for classic scripts that opt into `crossorigin`, including redirect
+    hops; classic no-CORS GETs omit it. Cross-origin redirect responses must
+    pass the same credential-aware CORS check as final responses before their
+    `Location` is followed.
+  - [x] Propagate the Fetch transport's final redirect URL and redirected flag,
+    run module CORS checks against that final origin, and alias requested/final
+    URLs in the shared source and module registries. Relative imports,
+    `import.meta.url`, and module identity therefore use the final URL.
+  - [x] Partition the shared Cookie Store by page URL scope and implement the
+    module default `same-origin` credentials baseline: same-origin module
+    requests send matching Cookie headers and accept `Set-Cookie`, including
+    request-only `HttpOnly`; cross-origin module requests receive no page
+    cookies.
+  - [x] Add graph-inherited ESM `omit` / `same-origin` / `include` credential
+    modes on the same module loader. DOM module scripts map
+    `crossorigin="use-credentials"` to `include`; static dependencies and W3VM
+    dynamic imports inherit the first module-map fetch mode. `omit` neither
+    sends nor stores cookies, while `include` rematches and updates the shared
+    Cookie Store across origins.
+  - [x] Enforce credentialed module CORS: cross-origin `include` responses
+    require an exact `Access-Control-Allow-Origin` plus
+    `Access-Control-Allow-Credentials: true`, so wildcard origins cannot
+    authorize credentialed modules. Persistent HTTP validator/body entries are
+    partitioned by credentials mode and retain both CORS response headers.
+  - [x] Match session cookies by host-only/validated Domain, Path and Secure
+    rules, derive default paths from response URLs, order request cookies by
+    path specificity, and implement `Max-Age` expiry/deletion without adding a
+    second loader-side cookie implementation.
+  - [x] Parse RFC 6265 cookie dates across IMF-fixdate, obsolete RFC 850, and
+    ANSI C `asctime` forms; apply `Max-Age` precedence over `Expires`, delete
+    already-expired cookies, expose absolute expiry and parsed Strict/Lax/None
+    values through Cookie Store, and reject `SameSite=None` without `Secure`.
+    Page writes, response `Set-Cookie`, and redirect-chain snapshots all use the
+    same parser.
+  - [x] Add an embedder-owned persistent Cookie jar without forking the browser
+    loader backend. Future-expiry cookies are stored in a versioned, atomically
+    replaced JSON file; session cookies remain memory-only, expired/invalid
+    records are pruned on load, deletion is durable, and corrupt files fail
+    closed without replacing the live jar. Navigation now resets only the
+    document URL context and rematches the same jar for the next Realm. Android
+    binds this jar to its internal application data directory; other embedders
+    opt in by supplying their profile directory.
+  - [x] Enforce Cookie SameSite request context in the shared module transport.
+    Schemeful sites use Mozilla PSL registrable domains (with IP/localhost
+    handling); Strict and Lax cookies stay on same-site subresources, cross-site
+    safe top-level navigation admits Lax, and `None` still requires `Secure`.
+    The initiating document site remains fixed across redirects and W3VM
+    dynamic imports. Domain attributes targeting public suffixes such as
+    `co.uk` are rejected, and invalid non-host-only persisted records are
+    pruned on load.
+  - [x] Route DOM classic scripts through the same manual-redirect Cookie
+    transport as ESM. Classic scripts without `crossorigin` use credentialed
+    no-CORS semantics; `anonymous` uses same-origin credentials plus CORS, and
+    `use-credentials` requires exact credentialed CORS. Redirect and final
+    `Set-Cookie` values—including repeated headers on one response—update the
+    shared jar before a retry, while in-memory deduplication and persistent HTTP
+    cache entries are partitioned by classic fetch mode.
+  - [x] Enforce `Cross-Origin-Resource-Policy` for classic no-CORS responses.
+    `same-origin`, PSL-based `same-site` (including the secure-response rule),
+    and `cross-origin` are evaluated against the initiating page; CORS-mode
+    classic scripts continue to use CORS permission instead of opaque-response
+    CORP checks.
+  - [x] Enforce initial-fetch Subresource Integrity for classic and module
+    script elements with SHA-256/384/512, strongest-algorithm selection,
+    multiple candidate digests, base64/base64url forms, and forward-compatible
+    unsupported-token handling. Classic cache/dedup keys include integrity
+    metadata; module consumers validate independently while sharing fetched
+    source bytes and the same W3IR/W3VM graph path. Cross-origin classic SRI
+    requires a CORS-enabled response.
+  - [x] Propagate script-element `referrerpolicy` through classic requests,
+    static module dependencies, dynamic imports, retries and redirects. The
+    shared transport implements all eight standard policy values, strips URL
+    credentials/fragments, defaults to `strict-origin-when-cross-origin`, lets
+    redirect responses tighten the next hop, and partitions in-flight
+    deduplication where request referrers differ.
+  - [x] Follow module redirects in the background module transport with a
+    per-chain snapshot of the same Cookie Store. Each same-page-origin hop
+    regenerates its Cookie header for the target URL, cross-origin hops strip
+    Cookie/Authorization, and same-origin redirect `Set-Cookie` uses the same
+    parser to affect the immediately following hop before returning to the
+    authoritative Store.
+  - [x] Enforce strict JavaScript MIME validation for fetched ESM sources,
+    including case-insensitive parameterized MIME values, before parsing or
+    inserting source into the shared module cache.
+  - [x] Enforce Fetch `X-Content-Type-Options: nosniff` for classic external
+    scripts on the existing response-validation path. A missing or non-
+    JavaScript `Content-Type` dispatches `error` without compiling, executing,
+    or caching the body; a new element can retry the same URL, while classic
+    responses without `nosniff` preserve the web-compatible MIME-sniffing path.
+    Synchronous embedding calls use the same check, 304 revalidation retains
+    the security header, and the HTTP source-cache schema invalidates
+    pre-enforcement artifacts.
+  - [x] Move classic external script fetches onto the same browser task pump,
+    deduplicate concurrent requests by URL, dispatch per-element `load`/`error`,
+    and leave failed responses uncached so a newly inserted element can retry.
+  - [x] Bind document reset/navigation to the active loader lifecycle: discard
+    pending classic-script responses without firing stale element callbacks,
+    reject pending module-graph Promises through the shared microtask queue, and
+    clear page-scoped source/module/import-map state before a new Realm attaches.
+  - [x] Add one configurable bounded retry state machine shared by classic and
+    ESM fetches. Default behavior remains one attempt; opt-in retries cover
+    transport failures and 408/425/429/500/502/503/504, apply capped
+    exponential backoff plus delta-seconds/IMF-fixdate `Retry-After`, preserve
+    URL deduplication, refresh module cookies per attempt, expose outcome
+    counters, publish retry deadlines to the event loop, and cancel scheduled
+    retries on navigation without executing stale code.
+  - [x] Cancel claimed script elements when direct removal, subtree removal,
+    replacement, text-content clearing, or navigation disconnects them.
+    Classic subscribers are pruned independently from URL-deduplicated fetches,
+    cancelled ordered entries leave explicit tombstones so later scripts cannot
+    deadlock, and guarded ESM graph reactions suppress evaluation and callbacks.
+    Reinserted claimed elements remain one-shot.
+  - [x] Discover scripts when a detached subtree or `DocumentFragment` becomes
+    connected. Detached scripts are never claimed or executed by the document
+    scan; attaching their containing subtree reschedules the same loader pump
+    and preserves dynamically inserted script ordering semantics.
+  - [x] Cooperatively interrupt the existing classic/ESM fetch workers without
+    introducing a second network stack. One shared atomic cancellation token is
+    checked before requests, after response headers, around every 16 KiB body
+    read, and at every manually followed ESM redirect hop. Navigation, loader
+    release, the last classic subscriber, and an orphaned module graph signal
+    the same task; shared URL/graph consumers retain their transport. Blocking
+    system calls observe cancellation when I/O returns or the configured timeout
+    expires, so a platform-specific hard socket abort remains an optional
+    latency optimization rather than a correctness dependency.
+  - [x] Model lexical initialization and temporal-dead-zone state in the shared
+    W3IR/W3VM binding cells. Declaration-time `InitializeBinding` is distinct
+    from assignment, reads and writes before `let`/`const` initialization raise
+    `ReferenceError`, module namespace getters preserve the same guard, and
+    cyclic ESM graphs reject rather than exposing a synthetic `undefined`.
+    The W3IR format version invalidates older persistent bytecode artifacts.
+  - [x] Cache failed ESM evaluation outcomes on the shared module record.
+    Repeated static loads and later dynamic imports now reuse the original
+    rejected evaluation promise without executing module bodies again. Cyclic
+    graphs retain depth-first dependency order, and an async cyclic dependency
+    does not prevent a later sibling dependency from starting evaluation.
+  - [x] Track ESM strongly connected component cycle roots through weak module
+    record links. Future static loads and dynamic imports of any cycle member
+    adopt the root settlement and original rejection even when that member's
+    body finished first; the cycle-root links themselves do not add strong
+    ownership cycles. Evaluation settlement is projected separately onto the
+    specifically requested module namespace, so successful member loads do not
+    expose the root namespace.
+  - [x] Preserve `InnerModuleEvaluation` readiness order across shared async
+    dependencies and cycles. Modules whose dependencies completed
+    synchronously now enter W3VM immediately instead of taking an extra
+    `Promise.all` microtask hop; an evaluating cycle member retains its own
+    in-DFS Promise while later external evaluation still adopts the cycle-root
+    settlement. The ECMAScript asynchronous cyclic graph shape
+    `A → {B,C}`, `B → D`, `C → {D,E}`, `D → A` is covered with independently
+    controlled top-level-await settlement.
+  - [x] Preserve the synchronous-abrupt versus asynchronous-rejection boundary
+    during module evaluation. A synchronously rejected dependency now stops DFS
+    before later sibling modules execute and W3VM-thrown JavaScript values
+    reach the graph rejection unchanged. In the asynchronous cyclic graph
+    above, a rejecting `C` still rejects root `A` immediately while sibling `B`
+    remains pending; later settlement of `B` cannot execute `A` or replace the
+    cycle root's original error, and evaluating any cycle member reuses it.
+  - [x] Integrate streaming-parser EOF with the ordered deferred-script queue.
+    Parser-inserted non-async module graphs now begin fetching while parsing,
+    but evaluation waits for `interactive` and only the ready head of the
+    document-order queue may start; a later inline or cached module cannot
+    overtake an earlier network graph. Graph settlement and element removal
+    wake the same queue, while module evaluation and top-level await remain
+    `DOMContentLoaded`/`load` blockers through the existing lifecycle sets.
+  - [x] Harden CORS singleton-header and redirect validation on the shared
+    classic/ESM transport. Repeated HTTP response fields are combined before
+    permission checks, so duplicate `Access-Control-Allow-Origin` or
+    `Access-Control-Allow-Credentials` cannot be accepted by last-value
+    overwrite. Document, classic-script and ESM URLs and redirect targets are
+    restricted to credential-free HTTP(S); ambiguous duplicate `Location`
+    fields are rejected before a target is contacted. Once a redirect crosses
+    an origin boundary, an author `Authorization` header stays stripped even if
+    a later hop returns to the original origin.
+  - [x] Bound the shared session/persistent Cookie Store without introducing a
+    loader-private jar. Name/value pairs over 4096 bytes are rejected; the
+    oldest entries are evicted above 180 cookies per registrable site or 3000
+    globally. The same limits apply while loading persisted profiles, mutating
+    the authoritative jar, and following redirect-chain snapshots.
+  - [x] Add an encrypted multi-profile persistence contract to that same jar.
+    Profile identifiers map to isolated path-safe directories and are bound to
+    a versioned protected envelope; the embedder supplies a
+    `CookiePersistenceProtector` backed by its platform credential store.
+    Plaintext downgrade, profile-envelope substitution, oversized files and
+    corrupt/unauthenticated ciphertext fail before replacing live Cookie state.
+  - [x] Provide an Apple Keychain protector for macOS/iOS. Each profile receives
+    a random AES-256-GCM key stored as a generic-password item; cookie files use
+    random nonces and authenticate the profile identifier as associated data.
+  - [ ] Wire platform protectors to Android Keystore, Windows DPAPI and Linux
+    Secret Service, and complete remaining redirect/CORS edge cases.
+- [x] Route the initial runtime `ScriptLoader` through SWC → W3IR → W3VM and
+  never invoke `rustc` during loading. Unsupported syntax fails explicitly
+  while the lowering surface is expanded.
+  - [x] Enforce that architecture in CI: ordinary AOT excludes compiler/W3IR/
+    W3VM/SWC; the dynamic browser feature requires compiler, W3IR and W3VM;
+    only `dynamic_script.rs` may consume them; classic and module sources retain
+    one lowering entry each and exactly the shared W3VM construction sites.
+- [x] Share Fetch/cache/module state with the page Realm while enforcing origin and credential rules
+  - [x] Expose the same runtime `fetch_value` implementation to W3VM through
+    the live page `window`; relative Request URLs resolve against the loader's
+    active document URL instead of requiring a separate VM-side network API.
+  - [x] Route page Fetch and script loading through the same manual redirect
+    transport, URL-matched Cookie snapshot, credential modes and CORS
+    validator. Redirect cookies are rematched on the next hop, accepted
+    response cookies update the shared Cookie Store, forbidden cookie headers
+    stay hidden, cross-origin response headers are CORS-filtered, and
+    POST-to-GET redirects discard body-specific headers.
+  - [x] Enforce page Fetch `cors`, `same-origin` and `no-cors` modes plus
+    `follow`, `error` and `manual` redirect modes on that shared transport.
+    Non-simple cross-origin requests perform and validate OPTIONS preflight;
+    failed preflight never sends the actual request, while no-CORS responses
+    use opaque filtering.
+  - [x] Add a request-origin, target-origin and credentials-partitioned CORS
+    preflight cache. `Access-Control-Max-Age` is capped at two hours, zero-age
+    responses are not retained, expired entries are removed on lookup, and an
+    LRU ceiling of 128 entries prevents unbounded page-controlled growth.
+  - [x] Route page Fetch HTTP cache policy through the loader's persistent
+    cache state and complete in-flight Abort cancellation semantics without
+    adding a second transport.
+    - [x] Replace the UTF-8/script-mode-specific sidecar with one generic binary
+      browser response cache carrying status, validators, sanitized headers,
+      `Vary` request metadata and caller-defined partition keys. Script loading
+      consumes it through an adapter, and the shared budget prunes response and
+      compiled W3IR artifacts without creating a second cache implementation.
+    - [x] Connect page Fetch to that cache for safe GET/follow responses using
+      request-origin, target-origin, credentials and request-mode partitions.
+      Default/no-cache requests conditionally revalidate validators;
+      no-store/reload/force-cache/only-if-cached select their corresponding
+      read/write behavior. `Vary` compares the effective request headers while
+      persisting only SHA-256 value digests, cache failures fall back to the
+      network response, redirects and cross-origin opaque responses bypass
+      storage, and CORS is rechecked before either cached or refreshed bytes
+      become visible. The Response bridge now preserves binary bodies instead
+      of forcing network bytes through UTF-8.
+    - [x] Complete in-flight Abort cancellation through the shared sender.
+      Page Fetch runs the existing redirect/Cookie/CORS sender on a cancellable
+      worker while its synchronous Realm facade pumps timers and microtasks.
+      `AbortController.abort()` and `AbortSignal.timeout()` therefore return an
+      AbortError/TimeoutError while waiting for response headers or body bytes;
+      the shared cancellation token stops later redirect and body work. A
+      platform I/O call may still finish at its configured transport timeout,
+      but it no longer blocks the page Realm from observing cancellation.
+      The completion path runs the same timer/microtask checkpoint before
+      classifying a transport result, so an AbortSignal and transport timeout
+      becoming ready in one turn deterministically report the signal reason.
+      The CORS preflight cache is process-shared and remains partitioned by
+      request origin, target origin and credentials across those workers.
+
+### Browser compatibility and security
+- [ ] Implement origin model, CORS, CSP baseline, Cookie jar, storage partitioning, secure-context checks, and URL scheme policy
+- [x] Isolate tabs/pages into sandboxed processes or equivalent capability
+  domains; `BrowserPageDomain` creates a dedicated worker-owned Realm/DOM and
+  exposes only typed commands and immutable render snapshots, so the shared
+  W3IR/W3VM implementation does not imply a shared global VM instance.
+- [ ] Add process/Realm crash containment, memory limits, navigation cancellation, and watchdog termination
+- [ ] Add compatibility suites for DOM/HTML/CSS/ECMAScript plus real-site smoke tests
+- [ ] Keep W3COS applications native-AOT by default; document the browser as the isolated dynamic-content exception
+
+### Real map SDK acceptance matrix
+- [x] Dynamic loader: script injection, JSONP, chunk loading, module caching, and retry behavior
+  - CI now runs a standalone map-style compatibility fixture that serves an
+    external bootstrap, a dotted-name JSONP callback and a secondary chunk.
+    The bootstrap is evaluated only through SWC → W3IR → W3VM, performs its own
+    DOM script injection, receives load/error lifecycle events and exposes an
+    initialized SDK factory on the real page window.
+  - Runtime W3IR lowering now represents `&&`, `||`, `??`, conditional
+    expressions and `!`/unary plus/minus/void with existing backend-neutral
+    branches, moves and arithmetic. It also covers classic `for`/`do...while`,
+    `++`/`--`, arithmetic/exponent compound assignments, short-circuit
+    `&&=`/`||=`/`??=` with single-evaluation member targets,
+    parentheses/comma expressions and shared-Core `typeof`, plus `switch`
+    fall-through and signed/unsigned bitwise/shift operations. Direct function
+    declarations hoist through the same path, while object/array destructuring,
+    defaults, inner rest patterns, reassignment targets and final rest
+    parameters use the W3IR/W3VM function ABI and shared Core intrinsics.
+    Ordinary template interpolation also uses shared W3IR addition/coercion;
+    derived-class `super` writes/updates use the same Core receiver-aware
+    accessor bridges as native AOT, including computed targets and logical
+    short-circuiting. `debugger;` is a backend-neutral no-op when no debugging
+    transport is attached, so development-flavored third-party chunks do not
+    require a browser-only evaluator.
+    `for (let ...)` loader closures receive W3VM-managed per-iteration cells.
+    This expands common minified loader syntax without adding an evaluator or
+    browser-only semantic path.
+  - Initial `ScriptLoader::execute_pending_document_scripts` scans newly inserted classic scripts in document order, resolves relative URLs, shares the SWC → W3IR → W3VM path, invokes load/error callbacks, and reuses fetched source
+  - An attached loader automatically schedules direct `<script>` insertions on the shared microtask queue, claims each element before evaluation to make nested script injection re-entrant safe, and requires no second execution engine
+  - External JSONP can invoke a callback registered on the real window with nested object/array payloads; aggregate creation uses the same core intrinsics in AOT and W3VM
+  - W3VM closures can escape into the shared host timer and microtask queues and later re-enter with live lexical captures
+  - Static ESM graphs now share resolved URL/source/module caches, live lexical
+    cells, cycle-safe instantiation, namespace getters, and exact/prefix import
+    maps; dynamically inserted `type="module"` scripts use this path.
+  - Module evaluation now adopts W3VM top-level-await Promises, delays
+    importers, propagates rejection, and lets dynamic import expose a namespace
+    only after asynchronous evaluation succeeds. The synchronous embedding API
+    explicitly reports a still-pending host await instead of marking the module
+    evaluated.
+  - DOM module scripts subscribe to that evaluation Promise: `load` waits for
+    the whole graph and top-level await, while parse/link/evaluation rejection
+    dispatches `error`.
+  - Barrel modules can forward non-default live bindings with `export *`;
+    direct-export precedence and ambiguous-star behavior are resolved inside
+    the shared module registry.
+  - Import-map resolution now supports scoped maps, parent-scope fallback,
+    URL-like remapping, deterministic longest-prefix matching, blocking `null`
+    targets, and first-registration-wins merging for multiple maps installed
+    before module instantiation.
+  - External ESM graphs now fetch without blocking the DOM task pump, share
+    canonical-URL in-flight requests, handle cyclic discovery, and delay
+    script `load` until graph evaluation. Loader release provides cooperative
+    cancellation without maintaining a second execution path.
+  - Import maps merge both before and after graph resolution starts. The loader
+    records successful referrer/specifier resolutions and admits each late
+    mapping only when replaying those decisions produces the same URLs, while
+    still making previously unresolved names available to later graphs.
+  - External ESM responses now enforce a page-origin CORS baseline: same-origin
+    loads pass directly and cross-origin sources require a matching or wildcard
+    allow-origin header.
+  - CORS-mode script requests now send the initiating page `Origin` across the
+    redirect chain. The shared transport rejects an unauthorized cross-origin
+    redirect before opening its target, while classic no-CORS scripts retain
+    browser-shaped GET behavior without an `Origin` header.
+  - Redirected Fetch responses expose their final URL. Module graphs check CORS
+    against the final origin and use that URL for caching, relative dependency
+    resolution, and `import.meta.url`.
+  - The page Cookie Store is URL-matched. External ESM uses the default
+    same-origin credentials behavior, including Domain/Path/Secure/HttpOnly/
+    Max-Age-aware Cookie/Set-Cookie flow without leaking page cookies to
+    cross-origin module requests.
+  - Module graphs also support explicit omit/include credentials.
+    `crossorigin="use-credentials"` selects include for DOM modules, and the
+    graph mode is inherited by static dependencies and W3VM dynamic imports.
+    Credentialed cross-origin responses require exact allow-origin and
+    allow-credentials headers; wildcard authorization is rejected. Module-map
+    consumers share the first fetch mode, while persistent HTTP cache artifacts
+    are partitioned by mode.
+  - Cookie expiry now accepts RFC 6265's current and legacy HTTP-date shapes,
+    observes `Max-Age` precedence, and is shared by page state and redirect
+    snapshots. Cookie Store exposes expiry and SameSite values, while insecure
+    `SameSite=None` assignments are rejected.
+  - Module subresource cookies now use the initiating page's fixed schemeful
+    site across static dependencies, redirects, retries and W3VM dynamic
+    imports. Mozilla PSL eTLD+1 matching distinguishes same-site cross-origin
+    requests from true cross-site requests; Strict/Lax cookies are suppressed
+    in the latter, and Domain attributes cannot target a public suffix.
+  - DOM classic scripts now share the ESM Cookie/redirect transport rather than
+    maintaining a second client path. Default, anonymous and use-credentials
+    modes apply their distinct credential/CORS rules, consume response cookies,
+    preserve repeated final/redirect `Set-Cookie` headers across retries, and
+    cannot share source-cache entries across credential modes.
+  - Classic no-CORS responses now honor `Cross-Origin-Resource-Policy`,
+    including registrable-domain `same-site` matching and secure transport
+    constraints; classic CORS requests remain governed by CORS.
+  - External classic and module elements now enforce Subresource Integrity
+    before execution. Mismatched consumers dispatch `error`; a later consumer
+    with a valid digest can reuse already fetched source without bypassing its
+    own integrity check.
+  - Classic and module graph requests now compute `Referer` from the initiating
+    document or importing module under the element's inherited referrer policy;
+    redirect-provided policy is applied before following the next location.
+  - Module redirect hops now rematch cookies from an immutable page-store
+    snapshot instead of trusting ureq's header forwarding. The per-chain copy
+    applies same-origin redirect `Set-Cookie` before the next request through
+    the same parser used by the main Store. A target-path cookie
+    can appear only after the redirect reaches that path, while a cross-origin
+    target receives no page Cookie or Authorization header.
+  - Network ESM accepts recognized JavaScript MIME types and rejects missing,
+    plain-text, HTML, or other response types before W3IR lowering.
+  - Classic external scripts fetch off-thread through the browser task pump.
+    Parser-discovered scripts preserve document order despite out-of-order
+    responses, dynamic scripts default to completion-order execution, concurrent
+    identical URLs share one response, and failures dispatch `error` without
+    poisoning a later element retry.
+  - Document reset/navigation now cancels the page loader cooperatively. Late
+    classic responses cannot execute against the replacement document, pending
+    module graph Promises reject, and the old page's loader registries are
+    cleared.
+  - Classic and ESM transport/status retries now share an opt-in bounded policy,
+    deduplicated request chain, Retry-After/backoff scheduling, event-loop
+    deadlines, navigation cancellation, and telemetry. Every successful retry
+    still lowers and executes only through W3IR/W3VM.
+  - Removing a claimed classic or module script, including through an ancestor
+    subtree, now cancels only that element subscription. Shared classic URL
+    fetches retain live subscribers, ordered-script cancellation cannot block
+    later execution, and a removed module element cannot enter W3VM or dispatch
+    stale lifecycle callbacks.
+  - Scripts assembled inside a detached subtree or `DocumentFragment` stay
+    inert until that subtree is connected. The insertion hook then discovers
+    descendant scripts and schedules them through the same document loader.
+  - Classic and ESM fetches now use cancellation handles on the existing
+    background transport. Body buffering and manually followed ESM redirects
+    stop cooperatively, orphaned graphs release unreferenced fetches, shared
+    consumers remain live, and dynamic classic scripts retain true network
+    completion order even when several worker results are collected in one
+    event-loop turn. A blocking platform I/O call still exits at its normal
+    completion or timeout boundary.
+  - Persistent response cookies now survive process reload through the same
+    URL-matched Cookie Store used by document, ESM and redirect requests.
+    Session cookies do not reach disk, navigation preserves the jar, and
+    deletion remains deleted after reload.
+  - W3VM page code now resolves `fetch` from the same live `window` surface as
+    AOT code and can issue document-relative requests through the existing
+    runtime Fetch implementation. Page Fetch and script loads now also share
+    redirect, Cookie credential and CORS response-filtering primitives; no
+    VM-specific network client or duplicate CORS policy is introduced. Page
+    Request modes, redirect modes and CORS preflight layer policy onto the same
+    sender instead of forking another HTTP implementation. Page Fetch also
+    consumes the same generic binary response/validator cache as script loads,
+    partitioned by origin, credentials and mode while preserving `Vary`.
+    In-flight page requests now use that sender on a cancellable worker while
+    the Realm pumps timers/microtasks, so AbortController and
+    AbortSignal.timeout interrupt both header and body waits without a second
+    network stack.
+  - Full HTML5 insertion modes, descendant-module integrity metadata,
+    platform credential-store hookups and remaining CORS edge cases remain.
+- [ ] Web platform: Promise/microtasks, Fetch/CORS, URL APIs, observers, timers, storage, and DOM mutation
+- [ ] Rendering/input: Canvas 2D, CSS transforms/positioning/z-index, image tiles, Pointer/Wheel/Touch events, resize, and high-DPI scaling
+- [ ] Evaluate WebGL and Worker/Blob URL requirements against the chosen SDK configuration; implement only from measured blockers
+- [x] Define three acceptance levels with evidence requirements:
+  - **Level 1 — loader succeeds:** bootstrap, JSONP/chunks, cache/retry and
+    lifecycle events complete without a second engine. The hermetic CI fixture
+    passes this level; the selected vendor SDK remains a separate Gate C run.
+  - **Level 2 — SDK initializes:** the loaded graph publishes its documented
+    factory and can create an instance against a real DOM container. The
+    hermetic CI fixture passes this level; vendor API/configuration acceptance
+    is still pending.
+  - **Level 3 — fully interactive:** rendered tiles plus pointer, touch, wheel
+    zoom, resize and high-DPI behavior pass screenshot/input assertions on the
+    selected vendor SDK. This level remains pending and must not be inferred
+    from the loader fixture.
+
+## Phase 3.7 — Runtime Distribution and Binary Size
+
+### W3COS OS shared-runtime model
+- [ ] Define a stable versioned W3COS application ABI for DOM, layout/render, W3 core semantics, W3VM, networking, storage, windowing, and standard components
+- [ ] Install one system copy of the runtime, renderer, fonts, decoders, compiler service (if present), and dynamic JS support
+- [ ] Package OS-native applications as AOT business code + metadata + resources + shared-runtime references
+- [ ] Support ABI compatibility negotiation and side-by-side runtime versions where an in-place upgrade is unsafe
+- [ ] Initial size targets excluding application assets: simple OS-linked app ≤1 MB; normal OS-linked app ≤5 MB
+
+### Standalone iOS/Android model
+- [ ] Produce capability-driven runtime feature sets; applications link only the APIs and subsystems reachable from their manifest/build graph
+- [ ] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
+- [ ] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
+- [ ] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+- [x] Keep compiler/SWC/W3VM out of ordinary AOT applications; include parser + W3VM only for Browser or explicitly dynamic targets
+  - `scripts/check-aot-dependency-boundary.sh` enforces the default runtime boundary in CI
+  - `dynamic-js` is an explicit opt-in runtime feature
+  - Browser-only WOFF/WOFF2 and Brotli decoding follows the same feature
+    boundary and is absent from the ordinary AOT dependency graph
+- [ ] Use Android App Bundles / ABI splits and measure the iOS App Store device slice rather than universal simulator artifacts
+- [ ] Initial stripped, uncompressed, per-ABI targets excluding application assets: minimal AOT UI ≤20 MB; complete single-renderer runtime ≤60 MB; Browser dynamic runtime ≤120 MB
+
+### Release-size engineering
+- [x] Add size-focused release profile (`opt-level = "z"`, LTO, one codegen unit, `panic = "abort"`, symbol stripping)
+  - Platform-specific linker dead-code elimination still requires validation in each Apple/Android packaging pipeline
+- [x] Measure strip separately from feature removal: stripping removes symbols but not renderer code, decoders, embedded fonts, or application assets
+  - The policy and distinction are documented in `docs/distribution-size.md`
+- [ ] Add CI size reports for executable text/data, embedded resources, native libraries, per-ABI package size, and compressed download size
+  - [x] `w3cos-size-audit` emits the common versioned JSON report. CI now builds,
+    runs and audits real stripped ordinary-AOT and dynamic-browser linkage
+    probes instead of measuring the audit tool itself, then uploads both reports.
+    The Browser probe uses the same-runner AOT size as a baseline and fails when
+    dynamic linkage adds more than 50%, avoiding cross-architecture absolute
+    baseline noise.
+  - [x] The current arm64 macOS linkage probes measure 6,083,264 bytes for
+    ordinary DOM/jsdom AOT, including the shared page `fetch` implementation,
+    and 7,148,896 bytes for a probe that incrementally
+    parses HTML and executes SWC → W3IR → W3VM while retaining the network
+    loader, WOFF/WOFF2 decoder and configurable persistent-cache/retry path, a
+    1,065,632-byte (17.52%) dynamic increment.
+  - Product gates still need Android ABI-split and iOS App Store device-slice artifacts
+- [ ] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
+- [ ] Track the current full-runtime Monaco artifact as a baseline (about 172 MB unstripped / 120 MB fully stripped on arm64 macOS); replace it with reproducible per-feature baselines
+- [ ] Verify that standalone W3COS applications remain materially smaller than shipping a complete Chromium stack; treat a regression toward Chromium-class size as an architecture issue, not something `strip` alone will fix
+
+## Phase 4 — Operating System ✅ (core done)
+- [x] w3cos-shell crate: native desktop shell binary (taskbar, icons, system tray)
+- [x] Boot pipeline: S99w3cos init → framebuffer detect → w3cos-shell fullscreen
+- [x] GitHub Actions build-iso.yml: auto-build ISO on version tag push
+- [x] Buildroot post-build: installs w3cos-shell + CLI + example apps
+- [x] QEMU script: --download flag, KVM detect, SSH forwarding
+- [x] Bootable ISO (Buildroot) available on GitHub Releases (#20)
+- [x] W3C OS as system shell (replaces desktop environment)
+- [ ] AI system agent with privileged APIs
+- [ ] Package manager for W3C OS applications
+- [ ] Multi-device sync protocol
+- [ ] App store / registry
+
+## Phase 4.1 — Standard Native Shell
+
+### Current-shell hardening
+- [ ] Replace the current single-signal, in-process app switcher with the real `AppRegistry`, `WindowManager`, compositor, and process/application lifecycle
+- [ ] Move Files, Terminal, Settings, Browser, Editor, and AI Agent out of static shell demo builders into registered system applications
+- [ ] Make title-bar controls functional: close, minimize, maximize/restore, move, resize, focus, z-order, modal ownership, and fullscreen
+- [ ] Add window snapping, multi-workspace/virtual-desktop support, task switching, app grouping, launch activation, and session restore
+- [ ] Add process supervision: launch, readiness, crash UI, restart, hang detection, resource limits, and clean shutdown
+- [ ] Persist shell state separately from application state; recover safely after shell or app crashes
+
+### Standard shell service protocol
+- [ ] Define a versioned `w3cos.shell` protocol over typed IPC; the Shell UI consumes services and must not own authoritative app/process/window state
+- [ ] Define stable models for `AppIdentity`, `WindowRef`, `LaunchRequest`, `DeepLink`, `FileOpenRequest`, `ShellCommand`, `Notification`, `Progress`, and `ActionOutcome`
+- [ ] Add command registry and global shortcut routing; applications declare commands, labels, accelerators, availability, and permission requirements
+- [ ] Implement command palette/global search over installed apps, windows, files, settings, commands, and explicitly exposed application content
+- [ ] Implement app/file associations, default applications, `openExternal`, `showItemInFolder`, share/open-with, and drag/drop routing
+- [ ] Turn the existing menu, dialog, notification, manifest, IPC, and multi-window data models into Shell-consumed services with end-to-end tests
+- [ ] Add notification center with grouped history, action buttons, progress updates, quiet mode, badge counts, and per-app preferences
+- [ ] Add real system tray/status services for time, locale, network, battery/power, audio, input method, accessibility, and background activity
+
+### Desktop session and system UX
+- [ ] Add login/session bootstrap, lock screen, screen blanking, suspend, restart, shutdown, and privileged confirmation surfaces
+- [ ] Add persistent Settings for display/scale, theme, locale, keyboard, accessibility, notifications, privacy, permissions, networking, and default apps
+- [ ] Add clipboard history as an opt-in protected service; redact secrets and allow applications to disable history for sensitive content
+- [ ] Add accessibility-first keyboard navigation, focus rings, screen-reader announcements, high contrast, reduced motion, and scalable shell chrome
+- [ ] Add multi-display geometry, per-display scale, work areas, hot-plug handling, and window placement recovery
+- [ ] Keep desktop Shell, mobile Shell, and ordinary app chrome separate while sharing protocol models, permissions, notification, command, context, and AI surfaces
+
+### Platform Shell hosts
+- [ ] Extract a platform-neutral `w3cos-shell-core` containing Shell state machines, typed protocols, command/notification/context models, session persistence, and AI surfaces without direct Win32, Cocoa, UIKit, Android, Wayland, or X11 dependencies
+- [ ] **Linux system Shell:** own the full desktop session from login to compositor, application processes, taskbar/workspaces, notifications, power/session controls, Wayland-first input/output, and X11 compatibility where required
+- [ ] **Windows desktop host:** implement Win32 window lifecycle, taskbar/tray, jump lists, notifications, file associations, protocol activation, global shortcuts, multi-display/DPI, accessibility, and optional kiosk/custom-shell mode; do not require replacing Explorer for normal applications
+- [ ] **macOS desktop host:** implement NSApplication/NSWindow lifecycle, global menu bar, Dock, notifications, file/protocol activation, Spaces/fullscreen behavior, permissions, Retina scaling, accessibility, and standard app sandbox integration; treat it as an application host rather than replacing Finder/loginwindow
+- [ ] **Android mobile host:** keep a single-application Activity shell with Surface lifecycle, edge-to-edge/safe areas, system bars, back/navigation intents, deep links/share, runtime permissions, notifications, IME, accessibility, background/foreground lifecycle, and process recreation
+- [ ] **iOS/iPadOS mobile host:** keep a single-application UIKit shell with Scene lifecycle, safe areas, status bar/home indicator, deep links/share, permissions, notifications, IME, accessibility, background/foreground lifecycle, state restoration, and iPad multi-window where the app opts in
+- [ ] Keep platform hosts thin: native code owns OS lifecycle/surfaces/permissions, while layout, DOM, commands, context, AI sessions, and portable Shell presentation remain in shared W3COS code
+- [ ] Define a versioned Host ABI for surface creation, input, insets, lifecycle, notifications, permissions, dialogs, clipboard, file/protocol activation, power/session capabilities, and accessibility
+- [ ] Add per-platform capability discovery so unsupported operations fail explicitly instead of being rendered as working Shell controls
+- [ ] Add build and smoke-test matrices for Linux x86_64/ARM64, Windows x86_64/ARM64, macOS arm64/x86_64 where supported, Android ABI splits, and iOS device/simulator slices
+
+### Standard Shell delivery gates
+- [ ] **Shell M1:** launch two separately registered applications, move/resize/focus/minimize/close them, and restore the session after Shell restart
+- [ ] **Shell M2:** command palette, notifications, menus/dialogs, deep links, file associations, system tray, and Settings operate through typed Shell services
+- [ ] **Shell M3:** lock/power/session recovery, accessibility, multi-display, crash containment, and process supervision pass ISO/QEMU and native desktop tests
+- [ ] **Shell M4:** the same neutral command, notification, context, permission, and AI-session fixtures pass through Linux, Windows, macOS, Android, and iOS Host adapters with declared capability differences
+- [ ] Remove static/mocked CPU, memory, network, battery, clock, and browser content from the production Shell path once their real services land
+
+## Phase 4.2 — AI-Native Shell Services
+
+### Upstream/downstream boundary
+- [ ] Keep W3COS generic: upstream only neutral Shell/AI contracts, services, surfaces, and fixtures; product scenarios, business cards, policies, and authoritative write paths remain downstream
+- [ ] Promote a downstream pattern upstream only after it has a neutral name, no domain fields, a versioned contract, permission semantics, and a generic conformance fixture
+- [ ] Provide adapters so downstream products can keep their existing Portable UI/action contracts while targeting standard W3COS Shell services
+- [ ] Do not copy a product Shell into `w3cos-shell`; extract reusable context, input, action, feedback, task, and notification primitives
+
+### Unified context, intent, and action contracts
+- [ ] Define `ShellContextSnapshot`: active app/window, route, focused control, selection, compact accessibility tree, user-visible object references, locale, device posture, and freshness
+- [ ] Make context capability-scoped, redacted, user-inspectable, and revocable; applications explicitly declare what may be exposed to agents
+- [ ] Define one `ShellIntent`/command path used by humans, keyboard shortcuts, application UI, voice input, and AI agents
+- [ ] Define structured action lifecycle: propose → preflight → permission check → impact summary → confirmation → execute → outcome → feedback/transition
+- [ ] Carry stable action/operation IDs, idempotency keys, cancellation, retry policy, progress, source/target references, and human-readable failure information
+- [ ] Distinguish in-place updates, result feedback, related-object creation, app/window navigation, and explicit handoff; AI must not silently change the user's primary focus
+- [ ] Route authoritative writes back to the owning application/service; Shell and AI surfaces orchestrate but do not become a second business write path
+
+### Global AI interaction surfaces
+- [ ] Add a summonable global AI bar with text input plus capability-gated voice, clipboard, file, screenshot/OCR, camera, and selection attachments
+- [ ] Provide a neutral, inspectable Shell context header with source/freshness indicators
+- [ ] Add an Agent panel/task center for active and background sessions, progress, pause/resume/cancel, pending questions, failures, results, and cross-app handoffs
+- [ ] Add a reusable Portable result/action surface for neutral cards, confirmations, impact summaries, progress, retry, and auditable outcomes
+- [ ] Add recommendation surfaces with accept/dismiss/why controls; recommendations never execute privileged or destructive actions without policy and confirmation
+- [ ] Unify transient Toast, inline feedback, result cards, notification-center entries, and persistent task history through an explicit presentation policy
+- [ ] Make the same AI session reachable from desktop panel, mobile full-screen/sheet presentation, notification action, and application-embedded surface without duplicating session state
+
+### Permission, approval, evidence, and audit
+- [ ] Replace coarse global AI booleans with capability grants scoped by agent, app, window/document, selector/resource, operation, duration, and data sensitivity
+- [ ] Add a system permission/approval broker with allow-once, allow-for-session, persistent grant, deny, revoke, and administrator policy
+- [ ] Require impact preview and explicit confirmation for destructive, financial, identity, credential, process, filesystem, device, and cross-app actions
+- [ ] Record an append-only action receipt containing actor, intent, target, permission decision, confirmation, operation ID, outcome, and user-visible evidence references
+- [ ] Never expose hidden chain-of-thought, raw secrets, unrestricted DOM dumps, or cross-application data in Shell UI, notifications, logs, or agent context
+- [ ] Add rate limits, budgets, cancellation, background-execution indicators, emergency stop, and visible control whenever an agent is acting
+
+### AI-Native Shell delivery gates
+- [ ] **AI Shell M1:** summon the AI bar, inspect/revoke shared context, propose a neutral read-only command, and render its structured result
+- [ ] **AI Shell M2:** complete a permissioned cross-app flow with preflight, confirmation, progress, cancellation, outcome, notification, and audit receipt
+- [ ] **AI Shell M3:** run the same neutral fixture through desktop Shell, mobile Shell, and a downstream adapter with equivalent action and permission semantics
+- [ ] Add adversarial tests for prompt/content injection, stale context, confused deputy, hidden-window access, permission escalation, replay, duplicate execution, and sensitive-data leakage

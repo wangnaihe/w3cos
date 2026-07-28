@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -24,7 +25,8 @@ pub fn pressure_record_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(error("TypeError", "Illegal constructor: PressureRecord"))
         });
         class.set_property("name", Value::string("PressureRecord"));
@@ -34,7 +36,7 @@ pub fn pressure_record_class() -> Value {
         }
         prototype.set_property(
             "toJSON",
-            Value::function(|this, _| {
+            realm_function(generation, |this, _| {
                 Value::object(HashMap::from([
                     ("source".into(), this.get_property("source")),
                     ("state".into(), this.get_property("state")),
@@ -72,7 +74,8 @@ fn schedule_delivery(observer: Value) {
         return;
     }
     observer.set_property("__w3cos_scheduled", Value::Bool(true));
-    crate::jsdom::queue_microtask_value(Value::function(move |_, _| {
+    let generation = crate::jsdom::realm_generation();
+    crate::jsdom::queue_microtask_value(realm_function(generation, move |_, _| {
         observer.set_property("__w3cos_scheduled", Value::Bool(false));
         let records = take_records(&observer);
         if records.get_property("length").to_number() > 0.0 {
@@ -89,7 +92,8 @@ pub fn pressure_observer_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |this, args| {
             let callback = args.first().cloned().unwrap_or(Value::Undefined);
             if !callback.is_function() {
                 w3cos_core::throw_value(error(
@@ -119,7 +123,7 @@ pub fn pressure_observer_class() -> Value {
         let prototype = Value::object(HashMap::from([("constructor".into(), class.clone())]));
         prototype.set_property(
             "observe",
-            Value::function(|this, args| {
+            realm_function(generation, |this, args| {
                 let source = args
                     .first()
                     .cloned()
@@ -147,7 +151,7 @@ pub fn pressure_observer_class() -> Value {
         );
         prototype.set_property(
             "unobserve",
-            Value::function(|this, args| {
+            realm_function(generation, |this, args| {
                 let source = args
                     .first()
                     .cloned()
@@ -164,7 +168,7 @@ pub fn pressure_observer_class() -> Value {
         );
         prototype.set_property(
             "disconnect",
-            Value::function(|this, _| {
+            realm_function(generation, |this, _| {
                 this.set_property("__w3cos_sources", Value::array(Vec::new()));
                 this.set_property("__w3cos_records", Value::array(Vec::new()));
                 Value::Undefined
@@ -172,12 +176,22 @@ pub fn pressure_observer_class() -> Value {
         );
         prototype.set_property(
             "takeRecords",
-            Value::function(|this, _| take_records(&this)),
+            realm_function(generation, |this, _| take_records(&this)),
         );
         class.set_property("prototype", prototype);
         *slot.borrow_mut() = Some(class.clone());
         class
     })
+}
+
+pub fn reset_realm() {
+    PRESSURE_OBSERVER_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    PRESSURE_RECORD_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    OBSERVERS.with(|observers| observers.borrow_mut().clear());
 }
 
 /// Inject a platform pressure reading. Returns false for unknown sources or
@@ -220,7 +234,9 @@ mod tests {
 
     #[test]
     fn host_records_are_batched_and_delivered_asynchronously() {
-        OBSERVERS.with(|observers| observers.borrow_mut().clear());
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let log = Rc::new(RefCell::new(Vec::new()));
         let log_for_callback = Rc::clone(&log);
         let observer = w3cos_core::class::construct(
@@ -248,5 +264,52 @@ mod tests {
                 .to_number(),
             0.0
         );
+        reset_realm();
+    }
+
+    #[test]
+    fn observers_and_pending_delivery_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let deliveries = Rc::new(RefCell::new(0));
+        let deliveries_for_callback = Rc::clone(&deliveries);
+        let observer = w3cos_core::class::construct(
+            &pressure_observer_class(),
+            vec![Value::function(move |_, _| {
+                *deliveries_for_callback.borrow_mut() += 1;
+                Value::Undefined
+            })],
+        );
+        observer.call_method("observe", vec![Value::string("cpu")]);
+        assert!(update_pressure("cpu", "serious", 42.0));
+        let old_class = pressure_observer_class();
+        old_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::jsdom::drain_microtasks();
+        assert_eq!(*deliveries.borrow(), 0);
+        assert!(
+            observer
+                .call_method("observe", vec![Value::string("cpu")])
+                .is_undefined()
+        );
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(update_pressure("cpu", "critical", 43.0));
+        crate::jsdom::drain_microtasks();
+        assert_eq!(*deliveries.borrow(), 0);
+
+        let new_class = pressure_observer_class();
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(
+            new_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        reset_realm();
     }
 }

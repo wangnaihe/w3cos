@@ -5,6 +5,11 @@ use std::collections::HashMap;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, realm_function, register_weak_realm_object, reset_realm_class,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static MEDIA_RECORDER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static IMAGE_CAPTURE_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -13,6 +18,13 @@ thread_local! {
     static RESTRICTION_TARGET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static BROWSER_CAPTURE_TRACK_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+    static MEDIA_RECORDERS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static IMAGE_CAPTURES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static CAPTURE_CONTROLLERS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+}
+
+fn realm_recording_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
 }
 
 fn warning() {
@@ -73,7 +85,7 @@ pub fn media_recorder_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let class = realm_recording_function(|this, args| {
             crate::web_events::event_target_class().call(this.clone(), Vec::new());
             let stream = args.first().cloned().unwrap_or(Value::Undefined);
             if !w3cos_core::class::instance_of(
@@ -109,7 +121,7 @@ pub fn media_recorder_class() -> Value {
             let start_target = this.clone();
             this.set_property(
                 "start",
-                Value::function(move |_, args| {
+                realm_recording_function(move |_, args| {
                     if start_target.get_property("state").to_js_string() != "inactive" {
                         invalid_state("MediaRecorder is already recording");
                     }
@@ -124,7 +136,7 @@ pub fn media_recorder_class() -> Value {
             let pause_target = this.clone();
             this.set_property(
                 "pause",
-                Value::function(move |_, _| {
+                realm_recording_function(move |_, _| {
                     if pause_target.get_property("state").to_js_string() != "recording" {
                         invalid_state("MediaRecorder is not recording");
                     }
@@ -136,7 +148,7 @@ pub fn media_recorder_class() -> Value {
             let resume_target = this.clone();
             this.set_property(
                 "resume",
-                Value::function(move |_, _| {
+                realm_recording_function(move |_, _| {
                     if resume_target.get_property("state").to_js_string() != "paused" {
                         invalid_state("MediaRecorder is not paused");
                     }
@@ -148,7 +160,7 @@ pub fn media_recorder_class() -> Value {
             let request_target = this.clone();
             this.set_property(
                 "requestData",
-                Value::function(move |_, _| {
+                realm_recording_function(move |_, _| {
                     if request_target.get_property("state").to_js_string() == "inactive" {
                         invalid_state("MediaRecorder is inactive");
                     }
@@ -166,7 +178,7 @@ pub fn media_recorder_class() -> Value {
             let stop_target = this.clone();
             this.set_property(
                 "stop",
-                Value::function(move |_, _| {
+                realm_recording_function(move |_, _| {
                     if stop_target.get_property("state").to_js_string() == "inactive" {
                         invalid_state("MediaRecorder is inactive");
                     }
@@ -183,12 +195,13 @@ pub fn media_recorder_class() -> Value {
                     Value::Undefined
                 }),
             );
+            register_weak_realm_object(&MEDIA_RECORDERS, &this);
             Value::Undefined
         });
         class.set_property("name", Value::string("MediaRecorder"));
         class.set_property(
             "isTypeSupported",
-            Value::function(|_, args| {
+            realm_recording_function(|_, args| {
                 let mime_type = args.first().map(Value::to_js_string).unwrap_or_default();
                 if !mime_type.is_empty() {
                     warning();
@@ -234,7 +247,7 @@ pub fn image_capture_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let class = realm_recording_function(|this, args| {
             let track = args.first().cloned().unwrap_or(Value::Undefined);
             if !w3cos_core::class::instance_of(
                 &track,
@@ -247,7 +260,7 @@ pub fn image_capture_class() -> Value {
             for method in ["getPhotoCapabilities", "getPhotoSettings"] {
                 this.set_property(
                     method,
-                    Value::function(|_, _| {
+                    realm_recording_function(|_, _| {
                         warning();
                         w3cos_core::promise::resolve(vec![Value::object(HashMap::new())])
                     }),
@@ -255,14 +268,14 @@ pub fn image_capture_class() -> Value {
             }
             this.set_property(
                 "takePhoto",
-                Value::function(|_, _| {
+                realm_recording_function(|_, _| {
                     warning();
                     w3cos_core::promise::resolve(vec![empty_blob("image/png")])
                 }),
             );
             this.set_property(
                 "grabFrame",
-                Value::function(|_, _| {
+                realm_recording_function(|_, _| {
                     warning();
                     w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
                         "No native video frame provider is registered",
@@ -270,6 +283,7 @@ pub fn image_capture_class() -> Value {
                     )])
                 }),
             );
+            register_weak_realm_object(&IMAGE_CAPTURES, &this);
             Value::Undefined
         });
         class.set_property("name", Value::string("ImageCapture"));
@@ -298,12 +312,13 @@ fn element_target_class(
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class =
-            Value::function(move |_, _| type_error(&format!("Illegal constructor: {name}")));
+        let class = realm_recording_function(move |_, _| {
+            type_error(&format!("Illegal constructor: {name}"))
+        });
         class.set_property("name", Value::string(name));
         class.set_property(
             "fromElement",
-            Value::function(move |_, args| {
+            realm_recording_function(move |_, args| {
                 let element = args.first().cloned().unwrap_or(Value::Undefined);
                 if element.get_property("nodeType").to_u32() != 1 {
                     return w3cos_core::promise::reject(vec![w3cos_core::error_instance(
@@ -344,7 +359,7 @@ pub fn capture_controller_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, _| {
+        let class = realm_recording_function(|this, _| {
             crate::web_events::event_target_class().call(this.clone(), Vec::new());
             this.set_property("zoomLevel", Value::Number(100.0));
             this.set_property("onzoomlevelchange", Value::Null);
@@ -357,7 +372,7 @@ pub fn capture_controller_class() -> Value {
             ] {
                 this.set_property(
                     method,
-                    Value::function(|_, _| {
+                    realm_recording_function(|_, _| {
                         warning();
                         w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
                             "Display capture control requires a host adapter",
@@ -368,11 +383,12 @@ pub fn capture_controller_class() -> Value {
             }
             this.set_property(
                 "getSupportedZoomLevels",
-                Value::function(|_, _| {
+                realm_recording_function(|_, _| {
                     warning();
                     w3cos_core::promise::resolve(vec![Value::array(Vec::new())])
                 }),
             );
+            register_weak_realm_object(&CAPTURE_CONTROLLERS, &this);
             Value::Undefined
         });
         class.set_property("name", Value::string("CaptureController"));
@@ -405,7 +421,7 @@ pub fn browser_capture_media_stream_track_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_recording_function(|_, _| {
             type_error("Illegal constructor: BrowserCaptureMediaStreamTrack")
         });
         class.set_property("name", Value::string("BrowserCaptureMediaStreamTrack"));
@@ -425,6 +441,71 @@ pub fn browser_capture_media_stream_track_class() -> Value {
 }
 
 pub fn reset() {
+    MEDIA_RECORDERS.with(|recorders| {
+        for recorder in recorders
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|recorder| upgrade_realm_object(&recorder))
+        {
+            recorder.set_property("state", Value::string("inactive"));
+            recorder.set_property("stream", Value::Undefined);
+            for callback in [
+                "ondataavailable",
+                "onerror",
+                "onpause",
+                "onresume",
+                "onstart",
+                "onstop",
+            ] {
+                recorder.set_property(callback, Value::Null);
+            }
+            for method in ["pause", "requestData", "resume", "start", "stop"] {
+                recorder.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    IMAGE_CAPTURES.with(|captures| {
+        for capture in captures
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|capture| upgrade_realm_object(&capture))
+        {
+            capture.set_property("track", Value::Undefined);
+            for method in [
+                "getPhotoCapabilities",
+                "getPhotoSettings",
+                "grabFrame",
+                "takePhoto",
+            ] {
+                capture.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    CAPTURE_CONTROLLERS.with(|controllers| {
+        for controller in controllers
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|controller| upgrade_realm_object(&controller))
+        {
+            controller.set_property("onzoomlevelchange", Value::Null);
+            for method in [
+                "decreaseZoomLevel",
+                "forwardWheel",
+                "getSupportedZoomLevels",
+                "increaseZoomLevel",
+                "resetZoomLevel",
+                "setFocusBehavior",
+            ] {
+                controller.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    reset_realm_class(&MEDIA_RECORDER_CLASS);
+    reset_realm_class(&IMAGE_CAPTURE_CLASS);
+    reset_realm_class(&CAPTURE_CONTROLLER_CLASS);
+    reset_realm_class(&CROP_TARGET_CLASS);
+    reset_realm_class(&RESTRICTION_TARGET_CLASS);
+    reset_realm_class(&BROWSER_CAPTURE_TRACK_CLASS);
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -481,5 +562,67 @@ mod tests {
             &target.borrow(),
             &crop_target_class()
         ));
+    }
+
+    #[test]
+    fn recorder_capture_controller_callbacks_and_tracks_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_recorder_class = media_recorder_class();
+        let old_capture_class = image_capture_class();
+        let old_controller_class = capture_controller_class();
+        let stream = crate::media_devices_web::stream_value(Vec::new());
+        let stream_weak = crate::jsdom::weak_realm_object(&stream);
+        let recorder = w3cos_core::class::construct(&old_recorder_class, vec![stream.clone()]);
+        drop(stream);
+        let track = crate::media_devices_web::track_value("video", "camera");
+        let capture = w3cos_core::class::construct(&old_capture_class, vec![track]);
+        let controller = w3cos_core::class::construct(&old_controller_class, Vec::new());
+
+        let recorder_marker = std::rc::Rc::new(());
+        let recorder_marker_weak = std::rc::Rc::downgrade(&recorder_marker);
+        recorder.set_property(
+            "ondataavailable",
+            Value::function(move |_, _| {
+                let _ = &recorder_marker;
+                Value::Undefined
+            }),
+        );
+        let controller_marker = std::rc::Rc::new(());
+        let controller_marker_weak = std::rc::Rc::downgrade(&controller_marker);
+        controller.set_property(
+            "onzoomlevelchange",
+            Value::function(move |_, _| {
+                let _ = &controller_marker;
+                Value::Undefined
+            }),
+        );
+        recorder.call_method("start", Vec::new());
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_recorder_class.strict_eq(&media_recorder_class()));
+        assert!(!old_capture_class.strict_eq(&image_capture_class()));
+        assert!(!old_controller_class.strict_eq(&capture_controller_class()));
+        for class in [old_recorder_class, old_capture_class, old_controller_class] {
+            assert!(class.call(Value::Undefined, Vec::new()).is_undefined());
+        }
+        assert_eq!(recorder.get_property("state").to_js_string(), "inactive");
+        assert!(recorder.get_property("stream").is_undefined());
+        assert!(recorder.get_property("ondataavailable").is_null());
+        assert!(recorder.call_method("start", Vec::new()).is_undefined());
+        assert!(capture.get_property("track").is_undefined());
+        assert!(capture.call_method("takePhoto", Vec::new()).is_undefined());
+        assert!(controller.get_property("onzoomlevelchange").is_null());
+        assert!(
+            controller
+                .call_method("increaseZoomLevel", Vec::new())
+                .is_undefined()
+        );
+        assert!(stream_weak.upgrade().is_none());
+        assert!(recorder_marker_weak.upgrade().is_none());
+        assert!(controller_marker_weak.upgrade().is_none());
     }
 }

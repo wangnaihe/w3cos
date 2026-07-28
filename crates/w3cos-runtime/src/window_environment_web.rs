@@ -408,6 +408,20 @@ pub fn set_input_pending(pending: bool) {
     INPUT_PENDING.with(|state| state.set(pending));
 }
 
+/// Release mutable EventTarget wrappers owned by the current Window Realm.
+/// Host input/posture state remains available to seed replacements.
+pub fn reset_realm() {
+    VIRTUAL_KEYBOARD.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    DEVICE_POSTURE.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    WINDOW_CONTROLS_OVERLAY.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

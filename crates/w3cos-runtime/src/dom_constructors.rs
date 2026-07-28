@@ -195,6 +195,16 @@ thread_local! {
     static CONSTRUCTORS: RefCell<Option<HashMap<String, Value>>> = const { RefCell::new(None) };
 }
 
+/// Release constructor/prototype identities owned by the discarded Realm.
+///
+/// Besides matching browser identity semantics, rebuilding the graph prevents
+/// authored prototype mutations from leaking across document navigation.
+pub fn reset_realm() {
+    CONSTRUCTORS.with(|constructors| {
+        constructors.borrow_mut().take();
+    });
+}
+
 fn parent_name(name: &str) -> Option<&'static str> {
     match name {
         "Document" | "Element" | "CharacterData" | "Attr" => Some("Node"),

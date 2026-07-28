@@ -6,10 +6,102 @@
 //! `"prototype"`. These helpers implement construction, `instanceof`, and
 //! `super` semantics on top of that representation.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Value;
+use crate::object::PrivateElement;
+
+static NEXT_PRIVATE_BRAND: AtomicU64 = AtomicU64::new(1);
+
+/// Builds the shared runtime representation used by both generated AOT code
+/// and W3VM class instructions.
+pub fn create_class(constructor: &Value, super_class: Option<&Value>) -> Value {
+    create_class_with_initializer(constructor, super_class, &Value::Undefined)
+}
+
+/// Builds a class with a separate instance-field initializer closure.
+///
+/// Base initializers run immediately before the user constructor. Derived
+/// initializers are queued privately on the instance and run when that
+/// class's `super(...)` call returns. A stack preserves the ECMAScript order
+/// across multiple inheritance levels without exposing backend-specific
+/// scheduling to AOT code or W3VM.
+pub fn create_class_with_initializer(
+    constructor: &Value,
+    super_class: Option<&Value>,
+    initializer: &Value,
+) -> Value {
+    let brand_id = NEXT_PRIVATE_BRAND.fetch_add(1, Ordering::Relaxed);
+    let class_cell = Rc::new(RefCell::new(Value::Undefined));
+    let prototype = Value::object(HashMap::new());
+    if let Some(parent) = super_class {
+        set_prototype_of(&prototype, &parent.get_property("prototype"));
+    }
+
+    let raw_constructor = if constructor.is_undefined() {
+        if let Some(parent) = super_class {
+            let parent = parent.clone();
+            Value::function(move |this_value, arguments| {
+                super_ctor(&this_value, &parent, arguments);
+                this_value
+            })
+        } else {
+            Value::function(|this_value, _| this_value)
+        }
+    } else {
+        constructor.clone()
+    };
+    let raw_constructor = if super_class.is_some() {
+        let user_constructor = raw_constructor;
+        let initializer = initializer.clone();
+        let class_cell = class_cell.clone();
+        Value::function(move |this_value, arguments| {
+            queue_class_initializer(
+                &this_value,
+                brand_id,
+                class_cell.borrow().clone(),
+                initializer.clone(),
+            );
+            user_constructor.call(this_value, arguments)
+        })
+    } else {
+        let user_constructor = raw_constructor;
+        let initializer = initializer.clone();
+        let class_cell = class_cell.clone();
+        Value::function(move |this_value, arguments| {
+            install_private_brand(&this_value, brand_id);
+            if !initializer.is_undefined() {
+                initializer.call(this_value.clone(), vec![class_cell.borrow().clone()]);
+            }
+            user_constructor.call(this_value, arguments)
+        })
+    };
+    let call_constructor = raw_constructor.clone();
+    let instance_prototype = prototype.clone();
+    let class = Value::callable(HashMap::new(), move |_this, arguments| {
+        let instance = Value::object(HashMap::new());
+        set_prototype_of(&instance, &instance_prototype);
+        let result = call_constructor.call(instance.clone(), arguments);
+        if result.is_object() { result } else { instance }
+    });
+    prototype.set_property("constructor", class.clone());
+    class.set_property("prototype", prototype);
+    class.set_property("__w3cos_ctor", raw_constructor);
+    if let Some(parent) = super_class {
+        set_prototype_of(&class, parent);
+    }
+    if let Value::Object(object) = &class {
+        let mut object = object.borrow_mut();
+        object.class_brand = Some(brand_id);
+        object.private_brands.insert(brand_id);
+        object.refresh_heap_accounting();
+    }
+    *class_cell.borrow_mut() = class.clone();
+    class
+}
 
 /// `new X(...)` — invoke the class object's call slot.
 ///
@@ -70,7 +162,185 @@ pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
 pub fn super_ctor(this: &Value, parent_class: &Value, args: Vec<Value>) -> Value {
     let ctor = parent_class.get_property("__w3cos_ctor");
     ctor.call(this.clone(), args);
+    run_pending_class_initializer(this);
     this.clone()
+}
+
+fn queue_class_initializer(this: &Value, brand: u64, class: Value, initializer: Value) {
+    if let Value::Object(object) = this {
+        let mut object = object.borrow_mut();
+        object
+            .pending_class_initializers
+            .push((brand, class, initializer));
+        object.refresh_heap_accounting();
+    }
+}
+
+fn run_pending_class_initializer(this: &Value) {
+    let pending = match this {
+        Value::Object(object) => object.borrow_mut().pending_class_initializers.pop(),
+        _ => None,
+    };
+    if let Some((brand, class, initializer)) = pending {
+        install_private_brand(this, brand);
+        if !initializer.is_undefined() {
+            initializer.call(this.clone(), vec![class]);
+        }
+    }
+}
+
+fn install_private_brand(receiver: &Value, brand: u64) {
+    if let Value::Object(object) = receiver {
+        let mut object = object.borrow_mut();
+        object.private_brands.insert(brand);
+        object.refresh_heap_accounting();
+    }
+}
+
+fn brand_id(brand: &Value) -> Option<u64> {
+    match brand {
+        Value::Object(object) => object.borrow().class_brand,
+        _ => None,
+    }
+}
+
+fn require_private_brand(receiver: &Value, brand: &Value, name: &str) -> u64 {
+    let Some(brand_id) = brand_id(brand) else {
+        private_brand_error(name)
+    };
+    let has_brand = match receiver {
+        Value::Object(object) => object.borrow().private_brands.contains(&brand_id),
+        _ => false,
+    };
+    if !has_brand {
+        private_brand_error(name);
+    }
+    brand_id
+}
+
+fn private_brand_error(name: &str) -> ! {
+    crate::throw_value(crate::error_instance(
+        "TypeError",
+        vec![Value::string(&format!(
+            "Cannot access private member #{name} on an object whose class did not declare it"
+        ))],
+    ))
+}
+
+/// Installs a private field in an object's unobservable internal slot table.
+pub fn define_private_field(receiver: &Value, brand: &Value, name: &str, value: Value) {
+    let brand_id = require_private_brand(receiver, brand, name);
+    if let Value::Object(object) = receiver {
+        let mut object = object.borrow_mut();
+        object
+            .private_elements
+            .insert((brand_id, name.to_string()), PrivateElement::Field(value));
+        object.refresh_heap_accounting();
+    }
+}
+
+/// Installs a shared private method on the class brand object.
+pub fn define_private_method(brand: &Value, name: &str, method: Value) {
+    let brand_id = require_private_brand(brand, brand, name);
+    if let Value::Object(object) = brand {
+        let mut object = object.borrow_mut();
+        object
+            .private_elements
+            .insert((brand_id, name.to_string()), PrivateElement::Method(method));
+        object.refresh_heap_accounting();
+    }
+}
+
+/// Installs or completes a shared private accessor pair.
+pub fn define_private_accessor(
+    brand: &Value,
+    name: &str,
+    getter: Option<Value>,
+    setter: Option<Value>,
+) {
+    let brand_id = require_private_brand(brand, brand, name);
+    if let Value::Object(object) = brand {
+        let mut object = object.borrow_mut();
+        let key = (brand_id, name.to_string());
+        let (old_getter, old_setter) = match object.private_elements.remove(&key) {
+            Some(PrivateElement::Accessor { getter, setter }) => (getter, setter),
+            _ => (None, None),
+        };
+        object.private_elements.insert(
+            key,
+            PrivateElement::Accessor {
+                getter: getter.or(old_getter),
+                setter: setter.or(old_setter),
+            },
+        );
+        object.refresh_heap_accounting();
+    }
+}
+
+fn private_element(receiver: &Value, brand: &Value, brand_id: u64, name: &str) -> PrivateElement {
+    let key = (brand_id, name.to_string());
+    if let Value::Object(object) = receiver {
+        if let Some(element) = object.borrow().private_elements.get(&key) {
+            return element.clone();
+        }
+    }
+    if let Value::Object(object) = brand {
+        if let Some(element) = object.borrow().private_elements.get(&key) {
+            return element.clone();
+        }
+    }
+    private_brand_error(name)
+}
+
+pub fn get_private(receiver: &Value, brand: &Value, name: &str) -> Value {
+    let brand_id = require_private_brand(receiver, brand, name);
+    match private_element(receiver, brand, brand_id, name) {
+        PrivateElement::Field(value) | PrivateElement::Method(value) => value,
+        PrivateElement::Accessor {
+            getter: Some(getter),
+            ..
+        } => getter.call(receiver.clone(), Vec::new()),
+        PrivateElement::Accessor { getter: None, .. } => private_brand_error(name),
+    }
+}
+
+pub fn set_private(receiver: &Value, brand: &Value, name: &str, value: Value) -> Value {
+    let brand_id = require_private_brand(receiver, brand, name);
+    let key = (brand_id, name.to_string());
+    if let Value::Object(object) = receiver {
+        let is_field = matches!(
+            object.borrow().private_elements.get(&key),
+            Some(PrivateElement::Field(_))
+        );
+        if is_field {
+            let mut object = object.borrow_mut();
+            object
+                .private_elements
+                .insert(key, PrivateElement::Field(value.clone()));
+            object.refresh_heap_accounting();
+            return value;
+        }
+    }
+    match private_element(receiver, brand, brand_id, name) {
+        PrivateElement::Accessor {
+            setter: Some(setter),
+            ..
+        } => {
+            setter.call(receiver.clone(), vec![value.clone()]);
+            value
+        }
+        _ => private_brand_error(name),
+    }
+}
+
+pub fn has_private(receiver: &Value, brand: &Value) -> bool {
+    let Some(brand_id) = brand_id(brand) else {
+        return false;
+    };
+    match receiver {
+        Value::Object(object) => object.borrow().private_brands.contains(&brand_id),
+        _ => false,
+    }
 }
 
 /// `super.method(...)` in an instance method: look up `name` on the parent
@@ -79,7 +349,7 @@ pub fn super_ctor(this: &Value, parent_class: &Value, args: Vec<Value>) -> Value
 /// super methods; keep total).
 pub fn super_method(this: &Value, parent_class: &Value, name: &str, args: Vec<Value>) -> Value {
     let prototype = parent_class.get_property("prototype");
-    let method = prototype.get_property(name);
+    let method = get_with_receiver(&prototype, this, name);
     if method.is_undefined() {
         return Value::Undefined;
     }
@@ -91,17 +361,70 @@ pub fn super_method(this: &Value, parent_class: &Value, name: &str, args: Vec<Va
 /// current receiver.
 pub fn super_get(this: &Value, parent_class: &Value, name: &str) -> Value {
     let prototype = parent_class.get_property("prototype");
-    match &prototype {
+    get_with_receiver(&prototype, this, name)
+}
+
+/// `super.prop = value` in an instance method: begin setter lookup at the
+/// parent prototype while preserving the current instance as receiver.
+pub fn super_set(this: &Value, parent_class: &Value, name: &str, value: Value) -> Value {
+    let prototype = parent_class.get_property("prototype");
+    set_with_receiver(&prototype, this, name, value)
+}
+
+/// `super.method(...)` inside a static member: resolve from the parent class
+/// object while preserving the derived class as the JavaScript receiver.
+pub fn static_super_method(
+    this: &Value,
+    parent_class: &Value,
+    name: &str,
+    args: Vec<Value>,
+) -> Value {
+    let method = get_with_receiver(parent_class, this, name);
+    if method.is_undefined() {
+        return Value::Undefined;
+    }
+    method.call(this.clone(), args)
+}
+
+/// `super.prop` inside a static member, including inherited static getters.
+pub fn static_super_get(this: &Value, parent_class: &Value, name: &str) -> Value {
+    get_with_receiver(parent_class, this, name)
+}
+
+/// `super.prop = value` inside a static member: begin setter lookup at the
+/// parent class object while preserving the derived class as receiver.
+pub fn static_super_set(this: &Value, parent_class: &Value, name: &str, value: Value) -> Value {
+    set_with_receiver(parent_class, this, name, value)
+}
+
+fn get_with_receiver(target: &Value, receiver: &Value, name: &str) -> Value {
+    match target {
         Value::Object(object) => {
-            let direct = object.borrow().get(name, this);
+            let direct = object.borrow().get(name, receiver);
             if !direct.is_undefined() {
                 return direct;
             }
-            let getter = object.borrow().get(&format!("__w3cos_getter_{name}"), this);
-            getter.call(this.clone(), vec![])
+            let getter = object
+                .borrow()
+                .get(&format!("__w3cos_getter_{name}"), receiver);
+            getter.call(receiver.clone(), vec![])
         }
         _ => Value::Undefined,
     }
+}
+
+fn set_with_receiver(target: &Value, receiver: &Value, name: &str, value: Value) -> Value {
+    if let Value::Object(object) = target {
+        let setter = object
+            .borrow()
+            .get(&format!("__w3cos_setter_{name}"), receiver);
+        if !setter.is_undefined() {
+            setter.call(receiver.clone(), vec![value.clone()]);
+            return value;
+        }
+    }
+    define_field(receiver, name, value.clone());
+    value
 }
 
 /// Define an own data property directly, bypassing the setter convention.
@@ -151,6 +474,114 @@ pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
 mod tests {
     use super::*;
     use crate::Value;
+
+    #[test]
+    fn shared_class_builder_wires_constructor_prototype_and_inheritance() {
+        let parent_ctor = Value::function(|this_value, arguments| {
+            this_value.set_property(
+                "value",
+                arguments.first().cloned().unwrap_or(Value::Undefined),
+            );
+            this_value
+        });
+        let parent = create_class(&parent_ctor, None);
+        parent.get_property("prototype").set_property(
+            "read",
+            Value::function(|this_value, _| this_value.get_property("value")),
+        );
+
+        let child = create_class(&Value::Undefined, Some(&parent));
+        let instance = construct(&child, vec![Value::Number(7.0)]);
+        assert_eq!(instance.call_method("read", Vec::new()), Value::Number(7.0));
+        assert!(instance_of(&instance, &child));
+        assert!(instance_of(&instance, &parent));
+        assert!(
+            child
+                .get_property("prototype")
+                .get_property("constructor")
+                .strict_eq(&child)
+        );
+    }
+
+    #[test]
+    fn shared_initializer_scheduler_preserves_multilevel_field_order() {
+        use std::cell::RefCell;
+
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let a_field_order = Rc::clone(&order);
+        let a_fields = Value::function(move |this_value, _| {
+            a_field_order.borrow_mut().push("a-field");
+            define_field(&this_value, "a", Value::Number(1.0));
+            Value::Undefined
+        });
+        let a_ctor_order = Rc::clone(&order);
+        let a_ctor = Value::function(move |this_value, _| {
+            a_ctor_order.borrow_mut().push("a-ctor");
+            this_value
+        });
+        let a = create_class_with_initializer(&a_ctor, None, &a_fields);
+
+        let b_field_order = Rc::clone(&order);
+        let b_fields = Value::function(move |this_value, _| {
+            b_field_order.borrow_mut().push("b-field");
+            define_field(&this_value, "b", Value::Number(2.0));
+            Value::Undefined
+        });
+        let b_ctor_order = Rc::clone(&order);
+        let a_for_b = a.clone();
+        let b_ctor = Value::function(move |this_value, arguments| {
+            super_ctor(&this_value, &a_for_b, arguments);
+            b_ctor_order.borrow_mut().push("b-ctor");
+            this_value
+        });
+        let b = create_class_with_initializer(&b_ctor, Some(&a), &b_fields);
+
+        let c_field_order = Rc::clone(&order);
+        let c_fields = Value::function(move |this_value, _| {
+            c_field_order.borrow_mut().push("c-field");
+            define_field(&this_value, "c", Value::Number(3.0));
+            Value::Undefined
+        });
+        let c = create_class_with_initializer(&Value::Undefined, Some(&b), &c_fields);
+        let instance = construct(&c, Vec::new());
+
+        assert_eq!(
+            *order.borrow(),
+            vec!["a-field", "a-ctor", "b-field", "b-ctor", "c-field"]
+        );
+        assert_eq!(instance.get_property("a"), Value::Number(1.0));
+        assert_eq!(instance.get_property("b"), Value::Number(2.0));
+        assert_eq!(instance.get_property("c"), Value::Number(3.0));
+    }
+
+    #[test]
+    fn static_super_access_preserves_the_derived_class_receiver() {
+        let parent = create_class(&Value::Undefined, None);
+        parent.set_property(
+            "__w3cos_getter_label",
+            Value::function(|this_value, _| this_value.get_property("marker")),
+        );
+        parent.set_property(
+            "describe",
+            Value::function(|this_value, _| {
+                Value::String(format!(
+                    "{}!",
+                    this_value.get_property("marker").to_js_string()
+                ))
+            }),
+        );
+        let child = create_class(&Value::Undefined, Some(&parent));
+        child.set_property("marker", Value::string("child"));
+
+        assert_eq!(
+            static_super_get(&child, &parent, "label"),
+            Value::string("child")
+        );
+        assert_eq!(
+            static_super_method(&child, &parent, "describe", Vec::new()),
+            Value::string("child!")
+        );
+    }
 
     #[test]
     fn call_slot_makes_object_callable() {
@@ -302,6 +733,35 @@ mod tests {
     }
 
     #[test]
+    fn super_set_honors_parent_setter_with_derived_receiver() {
+        let parent_proto = Value::object(HashMap::new());
+        parent_proto.set_property(
+            "__w3cos_setter_size",
+            Value::function(|this, args| {
+                define_field(
+                    &this,
+                    "_size",
+                    args.first()
+                        .cloned()
+                        .unwrap_or(Value::Undefined)
+                        .js_mul(&Value::Number(2.0)),
+                );
+                Value::Undefined
+            }),
+        );
+        let parent = Value::object(HashMap::new());
+        parent.set_property("prototype", parent_proto);
+
+        let this = Value::object(HashMap::new());
+        assert_eq!(
+            super_set(&this, &parent, "size", Value::Number(21.0)).to_number(),
+            21.0
+        );
+        assert_eq!(this.get_property("_size").to_number(), 42.0);
+        assert!(this.get_property("size").is_undefined());
+    }
+
+    #[test]
     fn setter_convention_routes_through_setter_and_getter_reads_back() {
         let proto = Value::object(HashMap::new());
         proto.set_property(
@@ -342,6 +802,46 @@ mod tests {
         // Own data property now shadows the setter for later plain sets.
         obj.set_property("x", Value::Number(5.0));
         assert_eq!(obj.get_property("x").to_number(), 5.0);
+    }
+
+    #[test]
+    fn private_slots_are_branded_inherited_and_invisible_to_reflection() {
+        let base_fields = Value::function(|this, arguments| {
+            define_private_field(&this, &arguments[0], "base", Value::Number(1.0));
+            Value::Undefined
+        });
+        let base = create_class_with_initializer(&Value::Undefined, None, &base_fields);
+        let child_fields = Value::function(|this, arguments| {
+            define_private_field(&this, &arguments[0], "child", Value::Number(2.0));
+            Value::Undefined
+        });
+        let child = create_class_with_initializer(&Value::Undefined, Some(&base), &child_fields);
+        let instance = construct(&child, Vec::new());
+
+        assert_eq!(get_private(&instance, &base, "base"), Value::Number(1.0));
+        assert_eq!(get_private(&instance, &child, "child"), Value::Number(2.0));
+        assert!(has_private(&instance, &base));
+        assert!(has_private(&instance, &child));
+        let Value::Object(object) = &instance else {
+            panic!("constructed value should be an object");
+        };
+        assert_eq!(object.borrow().own_keys().to_js_string(), "");
+    }
+
+    #[test]
+    fn private_access_rejects_an_object_with_the_wrong_brand() {
+        let fields = Value::function(|this, arguments| {
+            define_private_field(&this, &arguments[0], "secret", Value::Number(1.0));
+            Value::Undefined
+        });
+        let owner = create_class_with_initializer(&Value::Undefined, None, &fields);
+        let foreign = construct(&create_class(&Value::Undefined, None), Vec::new());
+
+        let thrown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            get_private(&foreign, &owner, "secret")
+        }));
+        assert!(thrown.is_err());
+        assert!(!has_private(&foreign, &owner));
     }
 
     /// Semantics proof for the esm_codegen class-factory pattern.

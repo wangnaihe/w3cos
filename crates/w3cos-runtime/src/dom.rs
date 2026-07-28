@@ -20,8 +20,15 @@ pub fn with_document_mut<R>(f: impl FnOnce(&mut Document) -> R) -> R {
     DOCUMENT.with(|d| f(&mut d.borrow_mut()))
 }
 
-fn mark_dom_dirty() {
+pub(crate) fn mark_dom_dirty() {
     DOM_DIRTY.with(|d| *d.borrow_mut() = true);
+}
+
+pub(crate) fn set_image_render_source(node: u32, source: Option<&str>) {
+    with_document_mut(|document| {
+        document.set_image_render_source(NodeId::from_u32(node), source);
+    });
+    mark_dom_dirty();
 }
 
 pub fn is_document_dirty() -> bool {
@@ -79,6 +86,10 @@ pub fn append_child(parent: u32, child: u32) {
         previous_sibling(child),
         next_sibling(child),
     );
+    #[cfg(feature = "dynamic-js")]
+    crate::dynamic_script::notify_node_inserted(child);
+    #[cfg(feature = "dynamic-js")]
+    crate::dynamic_script::notify_script_mutated(parent);
 }
 
 pub fn remove_child(parent: u32, child: u32) {
@@ -91,6 +102,10 @@ pub fn remove_child(parent: u32, child: u32) {
     mark_dom_dirty();
     if was_child {
         crate::observers_web::notify_child_list(parent, &[], &[child], previous, next);
+        #[cfg(feature = "dynamic-js")]
+        crate::dynamic_script::notify_node_removed(child);
+        #[cfg(feature = "dynamic-js")]
+        crate::dynamic_script::notify_script_mutated(parent);
     }
 }
 
@@ -122,6 +137,10 @@ pub fn insert_before(parent: u32, new_child: u32, ref_child: u32) {
         previous_sibling(new_child),
         next_sibling(new_child),
     );
+    #[cfg(feature = "dynamic-js")]
+    crate::dynamic_script::notify_node_inserted(new_child);
+    #[cfg(feature = "dynamic-js")]
+    crate::dynamic_script::notify_script_mutated(parent);
 }
 
 pub fn set_attribute(node: u32, name: &str, value: &str) {
@@ -133,6 +152,57 @@ pub fn set_attribute(node: u32, name: &str, value: &str) {
     mark_dom_dirty();
     if old_value.as_deref() != Some(value) {
         crate::observers_web::notify_attribute(node, name, old_value.as_deref());
+        #[cfg(feature = "dynamic-js")]
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "src"
+                | "href"
+                | "rel"
+                | "type"
+                | "media"
+                | "disabled"
+                | "integrity"
+                | "referrerpolicy"
+                | "crossorigin"
+                | "srcset"
+                | "sizes"
+        ) {
+            crate::dynamic_script::notify_script_mutated(node);
+        }
+    }
+}
+
+pub fn set_attribute_ns(node: u32, namespace: Option<&str>, qualified_name: &str, value: &str) {
+    let namespace = namespace.filter(|namespace| !namespace.is_empty());
+    let (prefix, local_name) = qualified_name
+        .split_once(':')
+        .map_or((None, qualified_name), |(prefix, local_name)| {
+            (Some(prefix), local_name)
+        });
+    set_attribute_ns_parts(node, namespace, qualified_name, prefix, local_name, value);
+}
+
+pub(crate) fn set_attribute_ns_parts(
+    node: u32,
+    namespace: Option<&str>,
+    qualified_name: &str,
+    prefix: Option<&str>,
+    local_name: &str,
+    value: &str,
+) {
+    let old_value = get_attribute_ns(node, namespace, local_name);
+    with_document_mut(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.set_attribute_ns(doc, namespace, qualified_name, prefix, local_name, value);
+    });
+    mark_dom_dirty();
+    if old_value.as_deref() != Some(value) {
+        crate::observers_web::notify_attribute(node, qualified_name, old_value.as_deref());
+        #[cfg(feature = "dynamic-js")]
+        if namespace.is_none() && matches!(local_name.to_ascii_lowercase().as_str(), "src" | "type")
+        {
+            crate::dynamic_script::notify_script_mutated(node);
+        }
     }
 }
 
@@ -140,6 +210,15 @@ pub fn get_attribute(node: u32, name: &str) -> Option<String> {
     with_document(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.get_attribute(doc, name).map(|s| s.to_string())
+    })
+}
+
+pub fn get_attribute_ns(node: u32, namespace: Option<&str>, local_name: &str) -> Option<String> {
+    let namespace = namespace.filter(|namespace| !namespace.is_empty());
+    with_document(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.get_attribute_ns(doc, namespace, local_name)
+            .map(str::to_string)
     })
 }
 
@@ -152,6 +231,10 @@ pub fn set_text_content(node: u32, text: &str) {
         el.set_text_content(doc, text);
     });
     mark_dom_dirty();
+    #[cfg(feature = "dynamic-js")]
+    for child in &old_children {
+        crate::dynamic_script::notify_node_removed(*child);
+    }
     if old_text.as_deref() == Some(text) {
         return;
     }
@@ -161,6 +244,8 @@ pub fn set_text_content(node: u32, text: &str) {
         let new_children = children(node);
         crate::observers_web::notify_child_list(node, &new_children, &old_children, None, None);
     }
+    #[cfg(feature = "dynamic-js")]
+    crate::dynamic_script::notify_script_mutated(node);
 }
 
 pub fn get_text_content(node: u32) -> Option<String> {
@@ -306,6 +391,11 @@ pub fn replace_child(parent: u32, new_child: u32, old_child: u32) {
         );
     }
     crate::observers_web::notify_child_list(parent, &[new_child], &[old_child], previous, next);
+    #[cfg(feature = "dynamic-js")]
+    {
+        crate::dynamic_script::notify_node_removed(old_child);
+        crate::dynamic_script::notify_node_inserted(new_child);
+    }
 }
 
 pub fn clone_node(node: u32, deep: bool) -> u32 {
@@ -420,6 +510,52 @@ pub fn remove_attribute(node: u32, name: &str) {
     mark_dom_dirty();
     if old_value.is_some() {
         crate::observers_web::notify_attribute(node, name, old_value.as_deref());
+        #[cfg(feature = "dynamic-js")]
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "src"
+                | "href"
+                | "rel"
+                | "type"
+                | "media"
+                | "disabled"
+                | "integrity"
+                | "referrerpolicy"
+                | "crossorigin"
+                | "srcset"
+                | "sizes"
+        ) {
+            crate::dynamic_script::notify_script_mutated(node);
+        }
+    }
+}
+
+pub fn remove_attribute_ns(node: u32, namespace: Option<&str>, local_name: &str) {
+    let namespace = namespace.filter(|namespace| !namespace.is_empty());
+    let previous = get_attribute_ns(node, namespace, local_name);
+    let qualified_name = with_document(|doc| {
+        let node = doc.get_node(NodeId::from_u32(node));
+        node.attribute_namespaces
+            .iter()
+            .find(|attribute| {
+                attribute
+                    .namespace
+                    .as_ref()
+                    .map(|value| value.as_str())
+                    .as_deref()
+                    == namespace
+                    && attribute.local_name.as_str() == local_name
+            })
+            .map(|attribute| attribute.qualified_name.as_str())
+            .unwrap_or_else(|| local_name.to_string())
+    });
+    let removed = with_document_mut(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.remove_attribute_ns(doc, namespace, local_name)
+    });
+    if removed {
+        mark_dom_dirty();
+        crate::observers_web::notify_attribute(node, &qualified_name, previous.as_deref());
     }
 }
 
@@ -428,6 +564,10 @@ pub fn has_attribute(node: u32, name: &str) -> bool {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.get_attribute(doc, name).is_some()
     })
+}
+
+pub fn has_attribute_ns(node: u32, namespace: Option<&str>, local_name: &str) -> bool {
+    get_attribute_ns(node, namespace, local_name).is_some()
 }
 
 pub fn class_name(node: u32) -> String {

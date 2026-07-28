@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use skrifa::MetadataProvider;
 use vello::kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
 use vello::peniko::{
-    Blob, Color, Fill, FontData, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
+    Blob, Color, Fill, FontData, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
 };
 use vello::{Glyph, Scene};
 use w3cos_std::SvgPathCommand;
@@ -26,7 +26,7 @@ use crate::layout::LayoutRect;
 // ---------------------------------------------------------------------------
 
 pub struct GlyphCache {
-    entries: HashMap<(char, u32), GlyphEntry>,
+    entries: HashMap<(u64, char, u32), GlyphEntry>,
     display_chunks: HashMap<u64, CachedDisplayChunk>,
     display_chunk_bytes: usize,
     display_chunk_clock: u64,
@@ -79,7 +79,9 @@ impl GlyphCache {
         glyph_metrics: &skrifa::metrics::GlyphMetrics,
         fontdue_font: &fontdue::Font,
     ) -> GlyphEntry {
-        let key = (ch, Self::quantize(font_size));
+        let mut font_hasher = DefaultHasher::new();
+        fontdue_font.hash(&mut font_hasher);
+        let key = (font_hasher.finish(), ch, Self::quantize(font_size));
         *self.entries.entry(key).or_insert_with(|| {
             if let Some(glyph_id) = charmap.map(ch) {
                 let advance = glyph_metrics
@@ -256,6 +258,14 @@ fn display_chunk_key(kind: &ComponentKind, style: &Style, width: f32, height: f3
     let mut hasher = DefaultHasher::new();
     serde_json::to_vec(kind).ok()?.hash(&mut hasher);
     serde_json::to_vec(style).ok()?.hash(&mut hasher);
+    let text = match kind {
+        ComponentKind::Text { content } => content.as_str(),
+        ComponentKind::Button { label } => label.as_str(),
+        _ => "",
+    };
+    crate::font_face::FontRegistry::global()
+        .cascade_cache_key(style, text)
+        .hash(&mut hasher);
     width.to_bits().hash(&mut hasher);
     height.to_bits().hash(&mut hasher);
     Some(hasher.finish())
@@ -345,6 +355,11 @@ fn render_node_gpu_layer(
 pub fn make_font_data(font_bytes: &'static [u8]) -> FontData {
     let blob = Blob::new(Arc::new(font_bytes.to_vec()));
     FontData::new(blob, 0)
+}
+
+fn make_owned_font_data(font_bytes: Arc<Vec<u8>>) -> FontData {
+    let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> = font_bytes;
+    FontData::new(Blob::new(bytes), 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -467,7 +482,6 @@ fn render_node(
     if style.opacity <= 0.0 {
         return;
     }
-
     let has_clip = clip_rect.is_some();
     if let Some(cr) = clip_rect {
         let clip_shape = Rect::new(
@@ -560,6 +574,45 @@ fn render_node(
     if bg.a > 0 {
         draw_rect(scene, rect, bg, style.border_radius, dpi);
     }
+    for layer in crate::background_image::background_paint_layers(style, rect)
+        .into_iter()
+        .rev()
+    {
+        let clip = match &layer {
+            crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.clip,
+            crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.geometry.clip,
+        };
+        let clip_shape = RoundedRect::new(
+            clip.rect.x as f64,
+            clip.rect.y as f64,
+            (clip.rect.x + clip.rect.width) as f64,
+            (clip.rect.y + clip.rect.height) as f64,
+            clip.radius as f64,
+        );
+        scene.push_layer(
+            Fill::NonZero,
+            background_mix(match &layer {
+                crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.blend_mode,
+                crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.blend_mode,
+            }),
+            1.0,
+            dpi,
+            &clip_shape,
+        );
+        match layer {
+            crate::background_image::BackgroundPaintLayer::Raster(layer) => {
+                for tile in layer.tiles {
+                    draw_image_source(scene, tile, &layer.source);
+                }
+            }
+            crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
+                for tile in layer.geometry.tiles {
+                    draw_gradient(scene, tile, &layer.kind, &layer.stops, opacity, dpi);
+                }
+            }
+        }
+        scene.pop_layer();
+    }
 
     if style.border_width > 0.0 && style.border_color.a > 0 {
         let border = node_color(style.border_color, opacity, color_chain);
@@ -598,26 +651,14 @@ fn render_node(
                 text_color,
                 font_data,
                 font,
+                style,
                 glyph_cache,
                 dpi,
             );
         }
         ComponentKind::Image { src } => {
-            if let Some(decoded) = crate::image_loader::get_or_load(src) {
-                let blob = Blob::new(decoded.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
-                let image_data = ImageData {
-                    data: blob,
-                    format: ImageFormat::Rgba8,
-                    alpha_type: ImageAlphaType::Alpha,
-                    width: decoded.width,
-                    height: decoded.height,
-                };
-                let image_brush = ImageBrush::new(image_data);
-                let scale_x = rect.width as f64 / decoded.width as f64;
-                let scale_y = rect.height as f64 / decoded.height as f64;
-                let transform = Affine::translate((rect.x as f64, rect.y as f64))
-                    * Affine::scale_non_uniform(scale_x, scale_y);
-                scene.draw_image(image_brush.as_ref(), transform);
+            if crate::image_loader::get_or_load(src).is_some() {
+                draw_image_source(scene, rect, src);
             } else {
                 let placeholder_bg = if bg.a == 0 {
                     AppColor::rgb(40, 40, 50)
@@ -648,6 +689,7 @@ fn render_node(
                     text_color,
                     font_data,
                     font,
+                    style,
                     glyph_cache,
                     dpi,
                 );
@@ -676,13 +718,13 @@ fn render_node(
                 height: (rect.height - border * 2.0 - padding.top - padding.bottom).max(0.0),
             };
             let text_x = content.x;
-            let text_y = crate::text_layout::y_for_draw_text_line_centered(
+            let ink = crate::font_face::FontRegistry::global().measure_style_ink_bounds(
+                style,
                 display_text,
                 style.font_size,
                 font,
-                content.y,
-                content.height,
             );
+            let text_y = content.y + (content.height - ink.height) * 0.5 - ink.top;
             draw_text(
                 scene,
                 text_x,
@@ -692,6 +734,7 @@ fn render_node(
                 text_color_final,
                 font_data,
                 font,
+                style,
                 glyph_cache,
                 dpi,
             );
@@ -704,6 +747,7 @@ fn render_node(
                     text_color,
                     font_data,
                     font,
+                    style,
                     glyph_cache,
                     dpi,
                 );
@@ -773,6 +817,44 @@ fn render_node(
     }
 }
 
+fn background_mix(mode: crate::background_image::BackgroundBlendMode) -> vello::peniko::Mix {
+    use crate::background_image::BackgroundBlendMode as Mode;
+    match mode {
+        Mode::Normal => vello::peniko::Mix::Normal,
+        Mode::Multiply => vello::peniko::Mix::Multiply,
+        Mode::Screen => vello::peniko::Mix::Screen,
+        Mode::Overlay => vello::peniko::Mix::Overlay,
+        Mode::Darken => vello::peniko::Mix::Darken,
+        Mode::Lighten => vello::peniko::Mix::Lighten,
+        Mode::ColorDodge => vello::peniko::Mix::ColorDodge,
+        Mode::ColorBurn => vello::peniko::Mix::ColorBurn,
+        Mode::HardLight => vello::peniko::Mix::HardLight,
+        Mode::SoftLight => vello::peniko::Mix::SoftLight,
+        Mode::Difference => vello::peniko::Mix::Difference,
+        Mode::Exclusion => vello::peniko::Mix::Exclusion,
+    }
+}
+
+fn draw_image_source(scene: &mut Scene, rect: LayoutRect, src: &str) {
+    let Some(decoded) = crate::image_loader::get_or_load(src) else {
+        return;
+    };
+    let blob = Blob::new(decoded.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
+    let image_data = ImageData {
+        data: blob,
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::Alpha,
+        width: decoded.width,
+        height: decoded.height,
+    };
+    let image_brush = ImageBrush::new(image_data);
+    let scale_x = rect.width as f64 / decoded.width as f64;
+    let scale_y = rect.height as f64 / decoded.height as f64;
+    let transform = Affine::translate((rect.x as f64, rect.y as f64))
+        * Affine::scale_non_uniform(scale_x, scale_y);
+    scene.draw_image(image_brush.as_ref(), transform);
+}
+
 fn svg_bez_path(rect: LayoutRect, commands: &[SvgPathCommand]) -> BezPath {
     let mut path = BezPath::new();
     for command in commands {
@@ -840,6 +922,45 @@ fn draw_rect(scene: &mut Scene, r: LayoutRect, color: AppColor, radius: f32, dpi
     }
 }
 
+fn draw_gradient(
+    scene: &mut Scene,
+    rect: LayoutRect,
+    kind: &crate::background_image::GradientKind,
+    stops: &[crate::background_image::GradientStop],
+    opacity: f32,
+    dpi: Affine,
+) {
+    let stops = stops
+        .iter()
+        .map(|stop| (stop.position, color_to_vello(stop.color)))
+        .collect::<Vec<_>>();
+    let gradient = match kind {
+        crate::background_image::GradientKind::Linear { angle_degrees } => {
+            let (start, end) =
+                crate::background_image::linear_gradient_points(rect, *angle_degrees);
+            Gradient::new_linear(start, end).with_stops(stops.as_slice())
+        }
+        crate::background_image::GradientKind::Radial {
+            center_x,
+            center_y,
+            shape,
+        } => {
+            let (center, (radius_x, radius_y)) =
+                crate::background_image::radial_gradient_axes(rect, *center_x, *center_y, *shape);
+            let radius = radius_x.max(radius_y);
+            Gradient::new_radial(center, radius).with_stops(stops.as_slice())
+        }
+    }
+    .multiply_alpha(opacity.clamp(0.0, 1.0));
+    let shape = Rect::new(
+        rect.x as f64,
+        rect.y as f64,
+        (rect.x + rect.width) as f64,
+        (rect.y + rect.height) as f64,
+    );
+    scene.fill(Fill::NonZero, dpi, &gradient, None, &shape);
+}
+
 fn draw_border(
     scene: &mut Scene,
     r: LayoutRect,
@@ -880,16 +1001,18 @@ fn draw_text_centered_in_rect(
     color: AppColor,
     font_data: &FontData,
     fontdue_font: &fontdue::Font,
+    style: &Style,
     glyph_cache: &mut GlyphCache,
     dpi: Affine,
 ) {
-    let text_w: f32 = text
-        .chars()
-        .map(|ch| fontdue_font.metrics(ch, font_size).advance_width)
-        .sum();
-    let text_h = font_size * 1.2;
-    let x = rect.x + (rect.width - text_w).max(0.0) * 0.5;
-    let y = rect.y + (rect.height - text_h).max(0.0) * 0.5;
+    let ink = crate::font_face::FontRegistry::global().measure_style_ink_bounds(
+        style,
+        text,
+        font_size,
+        fontdue_font,
+    );
+    let x = rect.x + (rect.width - ink.width).max(0.0) * 0.5 - ink.left;
+    let y = rect.y + (rect.height - ink.height).max(0.0) * 0.5 - ink.top;
     draw_text(
         scene,
         x,
@@ -899,6 +1022,7 @@ fn draw_text_centered_in_rect(
         color,
         font_data,
         fontdue_font,
+        style,
         glyph_cache,
         dpi,
     );
@@ -914,6 +1038,7 @@ fn draw_text(
     color: AppColor,
     font_data: &FontData,
     fontdue_font: &fontdue::Font,
+    style: &Style,
     glyph_cache: &mut GlyphCache,
     dpi: Affine,
 ) {
@@ -921,11 +1046,52 @@ fn draw_text(
         return;
     }
 
+    let runs = crate::font_face::FontRegistry::global().resolve_style_runs(style, text);
+    let mut cursor_x = x;
+    for run in runs {
+        let run_text = &text[run.byte_range];
+        let parsed = run
+            .font
+            .as_ref()
+            .and_then(crate::font_face::LoadedFont::parsed);
+        let owned_data = parsed.as_ref().and_then(|_| {
+            run.font
+                .as_ref()
+                .map(|font| make_owned_font_data(font.data.clone()))
+        });
+        cursor_x += draw_text_run(
+            scene,
+            cursor_x,
+            y,
+            run_text,
+            font_size,
+            color,
+            owned_data.as_ref().unwrap_or(font_data),
+            parsed.as_deref().unwrap_or(fontdue_font),
+            glyph_cache,
+            dpi,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_run(
+    scene: &mut Scene,
+    x: f32,
+    y: f32,
+    text: &str,
+    font_size: f32,
+    color: AppColor,
+    font_data: &FontData,
+    fontdue_font: &fontdue::Font,
+    glyph_cache: &mut GlyphCache,
+    dpi: Affine,
+) -> f32 {
     let vc = color_to_vello(color);
     let font_ref = skrifa::FontRef::from_index(font_data.data.as_ref().as_ref(), 0);
     let font_ref = match font_ref {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => return 0.0,
     };
     let charmap = font_ref.charmap();
     let glyph_metrics = font_ref.glyph_metrics(
@@ -958,6 +1124,7 @@ fn draw_text(
             .brush(vc)
             .draw(Fill::NonZero, glyphs.into_iter());
     }
+    cursor_x - x
 }
 
 fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
@@ -1015,21 +1182,19 @@ fn draw_text_in_rect(
 ) {
     let content = text_paint_box(rect, style);
     let line_h = style.font_size * style.line_height;
-    let layout = crate::text_layout::retained_text_paint_layout(
+    let registry = crate::font_face::FontRegistry::global();
+    let layout = crate::text_layout::retained_text_paint_layout_with(
         text,
         content.width,
         style.font_size,
-        font,
         style.white_space,
+        registry.cascade_cache_key(style, text) ^ 0x4750_5554_4558_5401,
+        |character| registry.style_char_advance(style, character, style.font_size, font),
+        |line| registry.measure_style_ink_bounds(style, line, style.font_size, font),
     );
     let lines = &layout.lines;
     let block_h = if lines.len() == 1 {
-        crate::text_layout::single_line_content_height(
-            &lines[0],
-            style.font_size,
-            style.line_height,
-            font,
-        )
+        registry.style_single_line_content_height(style, &lines[0], font)
     } else {
         lines.len() as f32 * line_h
     };
@@ -1057,6 +1222,7 @@ fn draw_text_in_rect(
             color,
             font_data,
             font,
+            style,
             glyph_cache,
             dpi,
         );
@@ -1070,9 +1236,10 @@ fn draw_blinking_cursor(
     text: &str,
     font_size: f32,
     color: AppColor,
-    font_data: &FontData,
+    _font_data: &FontData,
     fontdue_font: &fontdue::Font,
-    glyph_cache: &mut GlyphCache,
+    style: &Style,
+    _glyph_cache: &mut GlyphCache,
     dpi: Affine,
 ) {
     let ms = SystemTime::now()
@@ -1083,22 +1250,10 @@ fn draw_blinking_cursor(
         return;
     }
 
-    let font_ref = skrifa::FontRef::from_index(font_data.data.as_ref().as_ref(), 0);
-    let font_ref = match font_ref {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    let charmap = font_ref.charmap();
-    let glyph_metrics = font_ref.glyph_metrics(
-        skrifa::instance::Size::new(font_size),
-        skrifa::instance::LocationRef::default(),
-    );
-
     let mut cursor_x = content.x;
-    for ch in text.chars() {
-        let entry =
-            glyph_cache.lookup_or_insert(ch, font_size, &charmap, &glyph_metrics, fontdue_font);
-        cursor_x += entry.advance;
+    let registry = crate::font_face::FontRegistry::global();
+    for character in text.chars() {
+        cursor_x += registry.style_char_advance(style, character, font_size, fontdue_font);
     }
 
     let cursor_w = 2.0f32.max(font_size * 0.1);
@@ -1159,5 +1314,95 @@ mod tests {
             display_chunk_key(&second, &style, 180.0, 24.0).unwrap()
         );
         assert_ne!(key, display_chunk_key(&first, &style, 181.0, 24.0).unwrap());
+    }
+
+    #[test]
+    fn display_chunk_key_tracks_registered_font_lifecycle() {
+        const OWNER: u64 = 0x4750_5546_4f4e_54;
+        const FAMILY: &str = "W3COS GPU Font Test";
+        let style = Style {
+            font_family: Some(FAMILY.to_string()),
+            ..Style::default()
+        };
+        let text = ComponentKind::Text {
+            content: "cache identity".to_string(),
+        };
+        let fallback = display_chunk_key(&text, &style, 180.0, 24.0).unwrap();
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                crate::font_face::FontFace {
+                    family: FAMILY.to_string(),
+                    src: crate::font_face::FontSource::Bytes(
+                        include_bytes!("../assets/Inter-Regular.ttf").to_vec(),
+                    ),
+                    ..crate::font_face::FontFace::default()
+                },
+            )
+            .expect("register GPU font");
+        let registered = display_chunk_key(&text, &style, 180.0, 24.0).unwrap();
+        assert_ne!(registered, fallback);
+
+        crate::font_face::FontRegistry::global().clear_owner(OWNER);
+        assert_eq!(
+            display_chunk_key(&text, &style, 180.0, 24.0).unwrap(),
+            fallback
+        );
+    }
+
+    #[test]
+    fn display_chunk_key_tracks_only_subsets_used_by_the_text() {
+        const OWNER: u64 = 0x4750_5553_5542_5345;
+        const FAMILY: &str = "W3COS GPU Subset Test";
+        let style = Style {
+            font_family: Some(FAMILY.to_string()),
+            ..Style::default()
+        };
+        let mixed = ComponentKind::Text {
+            content: "W3W".to_string(),
+        };
+        let only_w = ComponentKind::Text {
+            content: "WWW".to_string(),
+        };
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                crate::font_face::FontFace {
+                    family: FAMILY.to_string(),
+                    src: crate::font_face::FontSource::Bytes(
+                        include_bytes!("../assets/Inter-Regular.ttf").to_vec(),
+                    ),
+                    unicode_range: Some("U+0057".to_string()),
+                    ..crate::font_face::FontFace::default()
+                },
+            )
+            .expect("register W subset");
+        let mixed_before = display_chunk_key(&mixed, &style, 180.0, 24.0).unwrap();
+        let only_w_before = display_chunk_key(&only_w, &style, 180.0, 24.0).unwrap();
+
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                crate::font_face::FontFace {
+                    family: FAMILY.to_string(),
+                    src: crate::font_face::FontSource::Bytes(
+                        include_bytes!("../assets/Inter-Regular.ttf").to_vec(),
+                    ),
+                    unicode_range: Some("U+0030-0039".to_string()),
+                    ..crate::font_face::FontFace::default()
+                },
+            )
+            .expect("register digit subset");
+
+        assert_ne!(
+            display_chunk_key(&mixed, &style, 180.0, 24.0).unwrap(),
+            mixed_before
+        );
+        assert_eq!(
+            display_chunk_key(&only_w, &style, 180.0, 24.0).unwrap(),
+            only_w_before,
+            "an unused subset must not invalidate unrelated retained text"
+        );
+        crate::font_face::FontRegistry::global().clear_owner(OWNER);
     }
 }

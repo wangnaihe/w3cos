@@ -7,8 +7,22 @@ use std::sync::Once;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+}
+
+fn realm_rtc_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
+fn register_rtc_value(value: &Value) {
+    register_weak_realm_object(&VALUES, value);
 }
 
 const NAMES: &[&str] = &[
@@ -93,12 +107,13 @@ fn session_description_value(init: Value) -> Value {
     let json = value.clone();
     value.set_property(
         "toJSON",
-        Value::function(move |_, _| copy_fields(&json, &["type", "sdp"])),
+        realm_rtc_function(move |_, _| copy_fields(&json, &["type", "sdp"])),
     );
     w3cos_core::class::set_prototype_of(
         &value,
         &class_for("RTCSessionDescription").get_property("prototype"),
     );
+    register_rtc_value(&value);
     value
 }
 
@@ -149,7 +164,7 @@ fn ice_candidate_value(init: Value) -> Value {
     let json = value.clone();
     value.set_property(
         "toJSON",
-        Value::function(move |_, _| {
+        realm_rtc_function(move |_, _| {
             copy_fields(
                 &json,
                 &["candidate", "sdpMLineIndex", "sdpMid", "usernameFragment"],
@@ -160,6 +175,7 @@ fn ice_candidate_value(init: Value) -> Value {
         &value,
         &class_for("RTCIceCandidate").get_property("prototype"),
     );
+    register_rtc_value(&value);
     value
 }
 
@@ -179,6 +195,7 @@ fn rtc_error_value(init: Value, message: Value) -> Value {
         value.set_property(name, nullable(&init, name));
     }
     w3cos_core::class::set_prototype_of(&value, &class_for("RTCError").get_property("prototype"));
+    register_rtc_value(&value);
     value
 }
 
@@ -190,7 +207,7 @@ fn stats_report_value(entries: Vec<(String, Value)>) -> Value {
         let method_entries = Rc::clone(&entries);
         value.set_property(
             method,
-            Value::function(move |_, _| {
+            realm_rtc_function(move |_, _| {
                 let values = method_entries
                     .iter()
                     .map(|(key, entry)| match projection {
@@ -206,7 +223,7 @@ fn stats_report_value(entries: Vec<(String, Value)>) -> Value {
     let get_entries = Rc::clone(&entries);
     value.set_property(
         "get",
-        Value::function(move |_, args| {
+        realm_rtc_function(move |_, args| {
             let key = args.first().map(Value::to_js_string).unwrap_or_default();
             get_entries
                 .iter()
@@ -218,7 +235,7 @@ fn stats_report_value(entries: Vec<(String, Value)>) -> Value {
     let has_entries = Rc::clone(&entries);
     value.set_property(
         "has",
-        Value::function(move |_, args| {
+        realm_rtc_function(move |_, args| {
             let key = args.first().map(Value::to_js_string).unwrap_or_default();
             Value::Bool(has_entries.iter().any(|(candidate, _)| candidate == &key))
         }),
@@ -227,7 +244,7 @@ fn stats_report_value(entries: Vec<(String, Value)>) -> Value {
     let each_value = value.clone();
     value.set_property(
         "forEach",
-        Value::function(move |_, args| {
+        realm_rtc_function(move |_, args| {
             let callback = args.first().cloned().unwrap_or(Value::Undefined);
             if !callback.is_function() {
                 throw("TypeError", "RTCStatsReport.forEach requires a callback");
@@ -246,16 +263,19 @@ fn stats_report_value(entries: Vec<(String, Value)>) -> Value {
         &value,
         &class_for("RTCStatsReport").get_property("prototype"),
     );
+    register_rtc_value(&value);
     value
 }
 
 fn encoded_streams_value() -> Value {
     let transform =
         w3cos_core::class::construct(&crate::streams_web::transform_stream_class(), Vec::new());
-    Value::object(HashMap::from([
+    let value = Value::object(HashMap::from([
         ("readable".into(), transform.get_property("readable")),
         ("writable".into(), transform.get_property("writable")),
-    ]))
+    ]));
+    register_rtc_value(&value);
+    value
 }
 
 fn dtmf_sender_value(track: Value) -> Value {
@@ -266,7 +286,7 @@ fn dtmf_sender_value(track: Value) -> Value {
     value.set_property("__w3cos_track", track);
     value.set_property(
         "insertDTMF",
-        Value::function(|_, _| {
+        realm_rtc_function(|_, _| {
             static WARNING: Once = Once::new();
             WARNING.call_once(|| {
                 eprintln!(
@@ -284,6 +304,7 @@ fn dtmf_sender_value(track: Value) -> Value {
         &value,
         &class_for("RTCDTMFSender").get_property("prototype"),
     );
+    register_rtc_value(&value);
     value
 }
 
@@ -329,7 +350,7 @@ fn data_channel_value(label: String, init: Value) -> Value {
     }
     value.set_property(
         "send",
-        Value::function(|this, _| {
+        realm_rtc_function(|this, _| {
             if this.get_property("readyState").to_js_string() != "open" {
                 throw(
                     "InvalidStateError",
@@ -348,7 +369,7 @@ fn data_channel_value(label: String, init: Value) -> Value {
     );
     value.set_property(
         "close",
-        Value::function(|this, _| {
+        realm_rtc_function(|this, _| {
             let state = this.get_property("readyState").to_js_string();
             if state == "closed" || state == "closing" {
                 return Value::Undefined;
@@ -364,6 +385,7 @@ fn data_channel_value(label: String, init: Value) -> Value {
         &value,
         &class_for("RTCDataChannel").get_property("prototype"),
     );
+    register_rtc_value(&value);
     value
 }
 
@@ -401,13 +423,13 @@ fn rtp_sender_value(track: Value, streams: Vec<Value>) -> Value {
     value.set_property("__w3cos_streams", Value::array(streams));
     value.set_property(
         "getParameters",
-        Value::function(|this, _| {
+        realm_rtc_function(|this, _| {
             w3cos_core::web::structured_clone(vec![this.get_property("__w3cos_parameters")])
         }),
     );
     value.set_property(
         "setParameters",
-        Value::function(|this, args| {
+        realm_rtc_function(|this, args| {
             let parameters = args.first().cloned().unwrap_or(Value::Undefined);
             if !parameters.is_object() {
                 return w3cos_core::promise::reject(vec![error(
@@ -421,7 +443,7 @@ fn rtp_sender_value(track: Value, streams: Vec<Value>) -> Value {
     );
     value.set_property(
         "replaceTrack",
-        Value::function(|this, args| {
+        realm_rtc_function(|this, args| {
             let track = args.first().cloned().unwrap_or(Value::Null);
             if !track.is_null()
                 && !w3cos_core::class::instance_of(
@@ -440,23 +462,26 @@ fn rtp_sender_value(track: Value, streams: Vec<Value>) -> Value {
     );
     value.set_property(
         "setStreams",
-        Value::function(|this, args| {
+        realm_rtc_function(|this, args| {
             this.set_property("__w3cos_streams", Value::array(args));
             Value::Undefined
         }),
     );
     value.set_property(
         "getStats",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![stats_report_value(Vec::new())])),
+        realm_rtc_function(|_, _| {
+            w3cos_core::promise::resolve(vec![stats_report_value(Vec::new())])
+        }),
     );
     value.set_property(
         "createEncodedStreams",
-        Value::function(|_, _| encoded_streams_value()),
+        realm_rtc_function(|_, _| encoded_streams_value()),
     );
     w3cos_core::class::set_prototype_of(
         &value,
         &class_for("RTCRtpSender").get_property("prototype"),
     );
+    register_rtc_value(&value);
     value
 }
 
@@ -471,7 +496,7 @@ fn rtp_receiver_value(track: Value) -> Value {
     ]));
     value.set_property(
         "getParameters",
-        Value::function(|_, _| {
+        realm_rtc_function(|_, _| {
             Value::object(HashMap::from([
                 ("codecs".into(), Value::array(Vec::new())),
                 ("encodings".into(), Value::array(Vec::new())),
@@ -481,20 +506,23 @@ fn rtp_receiver_value(track: Value) -> Value {
         }),
     );
     for method in ["getContributingSources", "getSynchronizationSources"] {
-        value.set_property(method, Value::function(|_, _| Value::array(Vec::new())));
+        value.set_property(method, realm_rtc_function(|_, _| Value::array(Vec::new())));
     }
     value.set_property(
         "getStats",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![stats_report_value(Vec::new())])),
+        realm_rtc_function(|_, _| {
+            w3cos_core::promise::resolve(vec![stats_report_value(Vec::new())])
+        }),
     );
     value.set_property(
         "createEncodedStreams",
-        Value::function(|_, _| encoded_streams_value()),
+        realm_rtc_function(|_, _| encoded_streams_value()),
     );
     w3cos_core::class::set_prototype_of(
         &value,
         &class_for("RTCRtpReceiver").get_property("prototype"),
     );
+    register_rtc_value(&value);
     value
 }
 
@@ -519,7 +547,7 @@ fn transceiver_value(track: Value, kind: String, init: Value, streams: Vec<Value
     ]));
     value.set_property(
         "setCodecPreferences",
-        Value::function(|this, args| {
+        realm_rtc_function(|this, args| {
             this.set_property(
                 "__w3cos_codec_preferences",
                 args.first()
@@ -531,7 +559,7 @@ fn transceiver_value(track: Value, kind: String, init: Value, streams: Vec<Value
     );
     value.set_property(
         "getHeaderExtensionsToNegotiate",
-        Value::function(|this, _| {
+        realm_rtc_function(|this, _| {
             let extensions = this.get_property("__w3cos_header_extensions");
             if extensions.is_undefined() {
                 Value::array(Vec::new())
@@ -542,7 +570,7 @@ fn transceiver_value(track: Value, kind: String, init: Value, streams: Vec<Value
     );
     value.set_property(
         "setHeaderExtensionsToNegotiate",
-        Value::function(|this, args| {
+        realm_rtc_function(|this, args| {
             this.set_property(
                 "__w3cos_header_extensions",
                 args.first()
@@ -554,11 +582,11 @@ fn transceiver_value(track: Value, kind: String, init: Value, streams: Vec<Value
     );
     value.set_property(
         "getNegotiatedHeaderExtensions",
-        Value::function(|_, _| Value::array(Vec::new())),
+        realm_rtc_function(|_, _| Value::array(Vec::new())),
     );
     value.set_property(
         "stop",
-        Value::function(|this, _| {
+        realm_rtc_function(|this, _| {
             this.set_property("stopped", Value::Bool(true));
             this.set_property("currentDirection", Value::Null);
             this.set_property("direction", Value::string("stopped"));
@@ -569,6 +597,7 @@ fn transceiver_value(track: Value, kind: String, init: Value, streams: Vec<Value
         &value,
         &class_for("RTCRtpTransceiver").get_property("prototype"),
     );
+    register_rtc_value(&value);
     value
 }
 
@@ -641,7 +670,7 @@ fn peer_connection_value(configuration: Value) -> Value {
 
     connection.set_property(
         "createOffer",
-        Value::function(|this, _| {
+        realm_rtc_function(|this, _| {
             if this.get_property("signalingState").to_js_string() == "closed" {
                 return w3cos_core::promise::reject(vec![error(
                     "InvalidStateError",
@@ -653,7 +682,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     );
     connection.set_property(
         "createAnswer",
-        Value::function(|this, _| {
+        realm_rtc_function(|this, _| {
             if this.get_property("signalingState").to_js_string() != "have-remote-offer" {
                 return w3cos_core::promise::reject(vec![error(
                     "InvalidStateError",
@@ -667,7 +696,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     let set_local = Rc::clone(&local_description);
     connection.set_property(
         "setLocalDescription",
-        Value::function(move |this, args| {
+        realm_rtc_function(move |this, args| {
             if this.get_property("signalingState").to_js_string() == "closed" {
                 return w3cos_core::promise::reject(vec![error(
                     "InvalidStateError",
@@ -711,7 +740,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     let set_remote = Rc::clone(&remote_description);
     connection.set_property(
         "setRemoteDescription",
-        Value::function(move |this, args| {
+        realm_rtc_function(move |this, args| {
             if this.get_property("signalingState").to_js_string() == "closed" {
                 return w3cos_core::promise::reject(vec![error(
                     "InvalidStateError",
@@ -739,7 +768,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     let add_candidates = Rc::clone(&candidates);
     connection.set_property(
         "addIceCandidate",
-        Value::function(move |this, args| {
+        realm_rtc_function(move |this, args| {
             if this.get_property("signalingState").to_js_string() == "closed" {
                 return w3cos_core::promise::reject(vec![error(
                     "InvalidStateError",
@@ -763,7 +792,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     let add_senders = Rc::clone(&senders);
     connection.set_property(
         "addTrack",
-        Value::function(move |this, args| {
+        realm_rtc_function(move |this, args| {
             let track = args.first().cloned().unwrap_or(Value::Undefined);
             if !w3cos_core::class::instance_of(
                 &track,
@@ -780,7 +809,7 @@ fn peer_connection_value(configuration: Value) -> Value {
             }
             let sender = rtp_sender_value(track, args.iter().skip(1).cloned().collect());
             add_senders.borrow_mut().push(sender.clone());
-            crate::jsdom::queue_microtask_value(Value::function(move |_, _| {
+            crate::jsdom::queue_microtask_value(realm_rtc_function(move |_, _| {
                 dispatch(&this, "negotiationneeded");
                 Value::Undefined
             }));
@@ -790,7 +819,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     let remove_senders = Rc::clone(&senders);
     connection.set_property(
         "removeTrack",
-        Value::function(move |this, args| {
+        realm_rtc_function(move |this, args| {
             let sender = args.first().cloned().unwrap_or(Value::Undefined);
             if !remove_senders
                 .borrow()
@@ -813,7 +842,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     let transceiver_senders = Rc::clone(&senders);
     connection.set_property(
         "addTransceiver",
-        Value::function(move |this, args| {
+        realm_rtc_function(move |this, args| {
             let source = args.first().cloned().unwrap_or(Value::Undefined);
             let init = args.get(1).cloned().unwrap_or(Value::Undefined);
             let (track, kind) = if source.is_string() {
@@ -854,14 +883,14 @@ fn peer_connection_value(configuration: Value) -> Value {
     ] {
         connection.set_property(
             method,
-            Value::function(move |_, _| Value::array(values.borrow().clone())),
+            realm_rtc_function(move |_, _| Value::array(values.borrow().clone())),
         );
     }
 
     let create_channels = Rc::clone(&channels);
     connection.set_property(
         "createDataChannel",
-        Value::function(move |this, args| {
+        realm_rtc_function(move |this, args| {
             if this.get_property("signalingState").to_js_string() == "closed" {
                 throw("InvalidStateError", "RTCPeerConnection is closed");
             }
@@ -881,7 +910,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     let add_local_streams = Rc::clone(&local_streams);
     connection.set_property(
         "addStream",
-        Value::function(move |this, args| {
+        realm_rtc_function(move |this, args| {
             let stream = args.first().cloned().unwrap_or(Value::Undefined);
             if !w3cos_core::class::instance_of(
                 &stream,
@@ -903,7 +932,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     let remove_local_streams = Rc::clone(&local_streams);
     connection.set_property(
         "removeStream",
-        Value::function(move |this, args| {
+        realm_rtc_function(move |this, args| {
             let stream = args.first().cloned().unwrap_or(Value::Undefined);
             remove_local_streams
                 .borrow_mut()
@@ -918,28 +947,32 @@ fn peer_connection_value(configuration: Value) -> Value {
     ] {
         connection.set_property(
             method,
-            Value::function(move |_, _| Value::array(streams.borrow().clone())),
+            realm_rtc_function(move |_, _| Value::array(streams.borrow().clone())),
         );
     }
 
     connection.set_property(
         "createDTMFSender",
-        Value::function(|_, args| dtmf_sender_value(args.first().cloned().unwrap_or(Value::Null))),
+        realm_rtc_function(|_, args| {
+            dtmf_sender_value(args.first().cloned().unwrap_or(Value::Null))
+        }),
     );
     connection.set_property(
         "getStats",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![stats_report_value(Vec::new())])),
+        realm_rtc_function(|_, _| {
+            w3cos_core::promise::resolve(vec![stats_report_value(Vec::new())])
+        }),
     );
     let get_configuration = Rc::clone(&configuration);
     connection.set_property(
         "getConfiguration",
-        Value::function(move |_, _| {
+        realm_rtc_function(move |_, _| {
             w3cos_core::web::structured_clone(vec![get_configuration.borrow().clone()])
         }),
     );
     connection.set_property(
         "setConfiguration",
-        Value::function(move |_, args| {
+        realm_rtc_function(move |_, args| {
             let next = args
                 .first()
                 .cloned()
@@ -953,7 +986,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     );
     connection.set_property(
         "restartIce",
-        Value::function(|_, _| {
+        realm_rtc_function(|_, _| {
             static WARNING: Once = Once::new();
             WARNING.call_once(|| {
                 eprintln!(
@@ -968,7 +1001,7 @@ fn peer_connection_value(configuration: Value) -> Value {
     let close_transceivers = Rc::clone(&transceivers);
     connection.set_property(
         "close",
-        Value::function(move |this, _| {
+        realm_rtc_function(move |this, _| {
             if this.get_property("signalingState").to_js_string() == "closed" {
                 return Value::Undefined;
             }
@@ -991,6 +1024,7 @@ fn peer_connection_value(configuration: Value) -> Value {
         &connection,
         &class_for("RTCPeerConnection").get_property("prototype"),
     );
+    register_rtc_value(&connection);
     connection
 }
 
@@ -1013,52 +1047,53 @@ fn script_transform_value(worker: Value, options: Value) -> Value {
         &value,
         &class_for("RTCRtpScriptTransform").get_property("prototype"),
     );
+    register_rtc_value(&value);
     value
 }
 
 fn build_class(name: &'static str) -> Value {
     let class = match name {
-        "RTCIceCandidate" => Value::function(|_, args| {
+        "RTCIceCandidate" => realm_rtc_function(|_, args| {
             ice_candidate_value(
                 args.first()
                     .cloned()
                     .unwrap_or_else(|| Value::object(HashMap::new())),
             )
         }),
-        "RTCPeerConnection" => Value::function(|_, args| {
+        "RTCPeerConnection" => realm_rtc_function(|_, args| {
             peer_connection_value(
                 args.first()
                     .cloned()
                     .unwrap_or_else(|| Value::object(HashMap::new())),
             )
         }),
-        "RTCRtpScriptTransform" => Value::function(|_, args| {
+        "RTCRtpScriptTransform" => realm_rtc_function(|_, args| {
             script_transform_value(
                 args.first().cloned().unwrap_or(Value::Undefined),
                 args.get(1).cloned().unwrap_or(Value::Undefined),
             )
         }),
-        "RTCSessionDescription" => Value::function(|_, args| {
+        "RTCSessionDescription" => realm_rtc_function(|_, args| {
             session_description_value(
                 args.first()
                     .cloned()
                     .unwrap_or_else(|| Value::object(HashMap::new())),
             )
         }),
-        "RTCError" => Value::function(|_, args| {
+        "RTCError" => realm_rtc_function(|_, args| {
             rtc_error_value(
                 args.first().cloned().unwrap_or(Value::Undefined),
                 args.get(1).cloned().unwrap_or(Value::string("")),
             )
         }),
-        _ => Value::function(move |_, _| illegal(name)),
+        _ => realm_rtc_function(move |_, _| illegal(name)),
     };
     class.set_property("name", Value::string(name));
     match name {
         "RTCPeerConnection" => {
             class.set_property(
                 "generateCertificate",
-                Value::function(|_, _| {
+                realm_rtc_function(|_, _| {
                     static WARNING: Once = Once::new();
                     WARNING.call_once(|| {
                         eprintln!(
@@ -1076,7 +1111,7 @@ fn build_class(name: &'static str) -> Value {
         "RTCRtpReceiver" | "RTCRtpSender" => {
             class.set_property(
                 "getCapabilities",
-                Value::function(|_, args| {
+                realm_rtc_function(|_, args| {
                     capabilities(&args.first().map(Value::to_js_string).unwrap_or_default())
                 }),
             );
@@ -1301,7 +1336,39 @@ pub fn classes() -> Vec<(&'static str, Value)> {
 }
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
+    VALUES.with(|values| {
+        for value in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for name in NAMES {
+                for member in prototype_members(name) {
+                    value.set_property(member, Value::Undefined);
+                }
+            }
+            for reference in [
+                "__w3cos_codec_preferences",
+                "__w3cos_header_extensions",
+                "__w3cos_options",
+                "__w3cos_parameters",
+                "__w3cos_streams",
+                "__w3cos_symbol_iterator",
+                "__w3cos_track",
+                "__w3cos_worker",
+                "readable",
+                "writable",
+            ] {
+                value.set_property(reference, Value::Undefined);
+            }
+        }
+    });
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        class.set_property("generateCertificate", Value::Undefined);
+        class.set_property("getCapabilities", Value::Undefined);
+        disconnect_realm_class(class);
+    }
 }
 
 #[cfg(test)]
@@ -1392,5 +1459,73 @@ mod tests {
         );
         channel.call_method("close", Vec::new());
         assert_eq!(channel.get_property("readyState").to_js_string(), "closed");
+    }
+
+    #[test]
+    fn rtc_classes_resources_callbacks_and_microtasks_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_peer_class = class_for("RTCPeerConnection");
+        let old_channel_class = class_for("RTCDataChannel");
+        let old_description_class = class_for("RTCSessionDescription");
+        assert!(old_peer_class.strict_eq(&class_for("RTCPeerConnection")));
+        assert!(old_channel_class.strict_eq(&class_for("RTCDataChannel")));
+
+        let connection =
+            w3cos_core::class::construct(&old_peer_class, vec![Value::object(HashMap::new())]);
+        let create_offer = connection.get_property("createOffer");
+        let close_connection = connection.get_property("close");
+        let callback_marker = Rc::new(());
+        let callback_marker_weak = Rc::downgrade(&callback_marker);
+        connection.set_property(
+            "onnegotiationneeded",
+            Value::function(move |_, _| {
+                let _ = &callback_marker;
+                Value::Undefined
+            }),
+        );
+        let track = crate::media_devices_web::track_value("audio", "old microphone");
+        connection.call_method("addTrack", vec![track]);
+        let channel = connection.call_method("createDataChannel", vec![Value::string("old")]);
+        let close_channel = channel.get_property("close");
+        let description = w3cos_core::class::construct(
+            &old_description_class,
+            vec![Value::object(HashMap::from([
+                ("type".into(), Value::string("offer")),
+                ("sdp".into(), Value::string("v=0\r\n")),
+            ]))],
+        );
+        let to_json = description.get_property("toJSON");
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_peer_class.strict_eq(&class_for("RTCPeerConnection")));
+        assert!(!old_channel_class.strict_eq(&class_for("RTCDataChannel")));
+        assert!(!old_description_class.strict_eq(&class_for("RTCSessionDescription")));
+        for class in [&old_peer_class, &old_channel_class, &old_description_class] {
+            assert!(class.get_property("prototype").is_undefined());
+            assert!(class.call(Value::Undefined, vec![]).is_undefined());
+        }
+        assert!(create_offer.call(connection.clone(), vec![]).is_undefined());
+        assert!(
+            close_connection
+                .call(connection.clone(), vec![])
+                .is_undefined()
+        );
+        assert!(connection.get_property("signalingState").is_undefined());
+        assert!(connection.get_property("createOffer").is_undefined());
+        assert!(close_channel.call(channel.clone(), vec![]).is_undefined());
+        assert!(channel.get_property("readyState").is_undefined());
+        assert!(channel.get_property("close").is_undefined());
+        assert!(to_json.call(description, vec![]).is_undefined());
+        assert!(
+            connection
+                .get_property("onnegotiationneeded")
+                .is_undefined()
+        );
+        assert!(callback_marker_weak.upgrade().is_none());
+        crate::jsdom::drain_microtasks();
     }
 }

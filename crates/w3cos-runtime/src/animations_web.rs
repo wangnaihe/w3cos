@@ -6,10 +6,24 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     static ANIMATIONS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+    static ANIMATION_INSTANCES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static EFFECTS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static TIMELINES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static TRIGGERS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static RANGE_LISTS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn realm_animation_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
 }
 
 fn warn_renderer() {
@@ -39,27 +53,27 @@ fn type_error(message: &str) -> ! {
 
 fn build_class(name: &'static str) -> Value {
     let class = match name {
-        "Animation" => Value::function(|_, args| {
+        "Animation" => realm_animation_function(|_, args| {
             animation_value(
                 args.first().cloned().unwrap_or(Value::Null),
                 args.get(1).cloned().unwrap_or_else(document_timeline_value),
             )
         }),
-        "KeyframeEffect" => Value::function(|_, args| {
+        "KeyframeEffect" => realm_animation_function(|_, args| {
             keyframe_effect_value(
                 args.first().cloned().unwrap_or(Value::Null),
                 args.get(1).cloned().unwrap_or(Value::Undefined),
                 args.get(2).cloned().unwrap_or(Value::Undefined),
             )
         }),
-        "DocumentTimeline" => Value::function(|_, args| {
+        "DocumentTimeline" => realm_animation_function(|_, args| {
             let origin_time = args
                 .first()
                 .map(|options| options.get_property("originTime").to_number())
                 .unwrap_or_default();
             timeline_value("DocumentTimeline", Value::Null, "", origin_time)
         }),
-        "ScrollTimeline" => Value::function(|_, args| {
+        "ScrollTimeline" => realm_animation_function(|_, args| {
             let options = args.first().cloned().unwrap_or(Value::Undefined);
             timeline_value(
                 "ScrollTimeline",
@@ -68,7 +82,7 @@ fn build_class(name: &'static str) -> Value {
                 0.0,
             )
         }),
-        "ViewTimeline" => Value::function(|_, args| {
+        "ViewTimeline" => realm_animation_function(|_, args| {
             let options = args.first().cloned().unwrap_or(Value::Undefined);
             let value = timeline_value(
                 "ViewTimeline",
@@ -81,10 +95,10 @@ fn build_class(name: &'static str) -> Value {
             value.set_property("endOffset", Value::Null);
             value
         }),
-        "TimelineTrigger" => Value::function(|_, args| {
+        "TimelineTrigger" => realm_animation_function(|_, args| {
             timeline_trigger_value(args.first().cloned().unwrap_or(Value::Undefined))
         }),
-        _ => Value::function(move |_, _| illegal(name)),
+        _ => realm_animation_function(move |_, _| illegal(name)),
     };
     class.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::new());
@@ -210,7 +224,7 @@ fn timeline_trigger_range_list_value(ranges: Rc<Vec<Value>>) -> Value {
     let item_ranges = Rc::clone(&ranges);
     list.set_property(
         "item",
-        Value::function(move |_, args| {
+        realm_animation_function(move |_, args| {
             item_ranges
                 .get(args.first().map(Value::to_u32).unwrap_or_default() as usize)
                 .cloned()
@@ -221,7 +235,7 @@ fn timeline_trigger_range_list_value(ranges: Rc<Vec<Value>>) -> Value {
         let iterator_ranges = Rc::clone(&ranges);
         list.set_property(
             method,
-            Value::function(move |_, _| {
+            realm_animation_function(move |_, _| {
                 let values = iterator_ranges
                     .iter()
                     .enumerate()
@@ -239,7 +253,7 @@ fn timeline_trigger_range_list_value(ranges: Rc<Vec<Value>>) -> Value {
     let each_list = list.clone();
     list.set_property(
         "forEach",
-        Value::function(move |_, args| {
+        realm_animation_function(move |_, args| {
             let callback = args.first().cloned().unwrap_or(Value::Undefined);
             if !callback.is_function() {
                 type_error("TimelineTriggerRangeList.forEach requires a callback");
@@ -262,6 +276,7 @@ fn timeline_trigger_range_list_value(ranges: Rc<Vec<Value>>) -> Value {
         &list,
         &class_for("TimelineTriggerRangeList").get_property("prototype"),
     );
+    register_weak_realm_object(&RANGE_LISTS, &list);
     list
 }
 
@@ -299,7 +314,7 @@ fn timeline_trigger_value(input: Value) -> Value {
     let add_associations = Rc::clone(&associations);
     trigger.set_property(
         "addAnimation",
-        Value::function(move |_, args| {
+        realm_animation_function(move |_, args| {
             if args.len() < 2 {
                 type_error("AnimationTrigger.addAnimation requires an animation and entry action");
             }
@@ -333,7 +348,7 @@ fn timeline_trigger_value(input: Value) -> Value {
     let get_associations = Rc::clone(&associations);
     trigger.set_property(
         "getAnimations",
-        Value::function(move |_, _| {
+        realm_animation_function(move |_, _| {
             Value::array(
                 get_associations
                     .borrow()
@@ -346,7 +361,7 @@ fn timeline_trigger_value(input: Value) -> Value {
 
     trigger.set_property(
         "removeAnimation",
-        Value::function(move |_, args| {
+        realm_animation_function(move |_, args| {
             let animation = args.first().cloned().unwrap_or(Value::Undefined);
             associations
                 .borrow_mut()
@@ -358,6 +373,7 @@ fn timeline_trigger_value(input: Value) -> Value {
         &trigger,
         &class_for("TimelineTrigger").get_property("prototype"),
     );
+    register_weak_realm_object(&TRIGGERS, &trigger);
     trigger
 }
 
@@ -376,7 +392,7 @@ fn timeline_value(name: &'static str, source: Value, axis: &str, origin_time: f6
     let value = Value::object(HashMap::from([
         (
             "__w3cos_getter_currentTime".into(),
-            Value::function(move |_, _| {
+            realm_animation_function(move |_, _| {
                 Value::Number(crate::jsdom::performance_now() - origin_time)
             }),
         ),
@@ -390,6 +406,7 @@ fn timeline_value(name: &'static str, source: Value, axis: &str, origin_time: f6
         value.set_property("source", source);
     }
     w3cos_core::class::set_prototype_of(&value, &class_for(name).get_property("prototype"));
+    register_weak_realm_object(&TIMELINES, &value);
     value
 }
 
@@ -472,12 +489,12 @@ pub fn keyframe_effect_value(target: Value, keyframes: Value, options: Value) ->
     let get_frames = Rc::clone(&frames);
     effect.set_property(
         "getKeyframes",
-        Value::function(move |_, _| Value::array(get_frames.borrow().clone())),
+        realm_animation_function(move |_, _| Value::array(get_frames.borrow().clone())),
     );
     let set_frames = Rc::clone(&frames);
     effect.set_property(
         "setKeyframes",
-        Value::function(move |_, args| {
+        realm_animation_function(move |_, args| {
             *set_frames.borrow_mut() = args
                 .first()
                 .cloned()
@@ -491,12 +508,12 @@ pub fn keyframe_effect_value(target: Value, keyframes: Value, options: Value) ->
     let get_timing = Rc::clone(&timing);
     effect.set_property(
         "getTiming",
-        Value::function(move |_, _| timing_copy(&get_timing.borrow())),
+        realm_animation_function(move |_, _| timing_copy(&get_timing.borrow())),
     );
     let computed_timing = Rc::clone(&timing);
     effect.set_property(
         "getComputedTiming",
-        Value::function(move |_, _| {
+        realm_animation_function(move |_, _| {
             let value = timing_copy(&computed_timing.borrow());
             let duration = value.get_property("duration").to_number();
             let iterations = value.get_property("iterations").to_number();
@@ -511,7 +528,7 @@ pub fn keyframe_effect_value(target: Value, keyframes: Value, options: Value) ->
     let update_timing = timing;
     effect.set_property(
         "updateTiming",
-        Value::function(move |_, args| {
+        realm_animation_function(move |_, args| {
             let update = args.first().cloned().unwrap_or(Value::Undefined);
             let current = update_timing.borrow().clone();
             for name in [
@@ -537,6 +554,7 @@ pub fn keyframe_effect_value(target: Value, keyframes: Value, options: Value) ->
         &effect,
         &class_for("KeyframeEffect").get_property("prototype"),
     );
+    register_weak_realm_object(&EFFECTS, &effect);
     effect
 }
 
@@ -586,7 +604,7 @@ pub fn animation_value(effect: Value, timeline: Value) -> Value {
         let value = animation.clone();
         animation.set_property(
             method,
-            Value::function(move |_, _| {
+            realm_animation_function(move |_, _| {
                 value.set_property("playState", Value::string(state));
                 if method == "reverse" {
                     value.set_property(
@@ -602,7 +620,7 @@ pub fn animation_value(effect: Value, timeline: Value) -> Value {
     let cancel_value = animation.clone();
     animation.set_property(
         "cancel",
-        Value::function(move |_, _| {
+        realm_animation_function(move |_, _| {
             cancel_value.set_property("playState", Value::string("idle"));
             cancel_value.set_property("currentTime", Value::Null);
             dispatch(&cancel_value, "cancel");
@@ -612,7 +630,7 @@ pub fn animation_value(effect: Value, timeline: Value) -> Value {
     let finish_value = animation.clone();
     animation.set_property(
         "finish",
-        Value::function(move |_, _| {
+        realm_animation_function(move |_, _| {
             finish_value.set_property("playState", Value::string("finished"));
             finish_value.set_property("overallProgress", Value::Number(1.0));
             dispatch(&finish_value, "finish");
@@ -622,7 +640,7 @@ pub fn animation_value(effect: Value, timeline: Value) -> Value {
     let update_rate = animation.clone();
     animation.set_property(
         "updatePlaybackRate",
-        Value::function(move |_, args| {
+        realm_animation_function(move |_, args| {
             update_rate.set_property(
                 "playbackRate",
                 Value::Number(args.first().map(Value::to_number).unwrap_or(1.0)),
@@ -632,16 +650,17 @@ pub fn animation_value(effect: Value, timeline: Value) -> Value {
     );
     animation.set_property(
         "commitStyles",
-        Value::function(|_, _| {
+        realm_animation_function(|_, _| {
             warn_renderer();
             Value::Undefined
         }),
     );
-    animation.set_property("persist", Value::function(|_, _| Value::Undefined));
+    animation.set_property("persist", realm_animation_function(|_, _| Value::Undefined));
     w3cos_core::class::set_prototype_of(
         &animation,
         &class_for("Animation").get_property("prototype"),
     );
+    register_weak_realm_object(&ANIMATION_INSTANCES, &animation);
     animation
 }
 
@@ -671,8 +690,96 @@ pub fn animations_for(node: Option<u32>, subtree: bool) -> Value {
 }
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
     ANIMATIONS.with(|animations| animations.borrow_mut().clear());
+    ANIMATION_INSTANCES.with(|animations| {
+        for animation in animations
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|animation| upgrade_realm_object(&animation))
+        {
+            animation.set_property("playState", Value::string("idle"));
+            animation.set_property("pending", Value::Bool(false));
+            for callback in ["oncancel", "onfinish", "onremove"] {
+                animation.set_property(callback, Value::Null);
+            }
+            for reference in ["effect", "finished", "ready", "timeline"] {
+                animation.set_property(reference, Value::Undefined);
+            }
+            for method in [
+                "cancel",
+                "commitStyles",
+                "finish",
+                "pause",
+                "persist",
+                "play",
+                "reverse",
+                "updatePlaybackRate",
+            ] {
+                animation.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    EFFECTS.with(|effects| {
+        for effect in effects
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|effect| upgrade_realm_object(&effect))
+        {
+            effect.set_property("target", Value::Undefined);
+            for method in [
+                "getComputedTiming",
+                "getKeyframes",
+                "getTiming",
+                "setKeyframes",
+                "updateTiming",
+            ] {
+                effect.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    TIMELINES.with(|timelines| {
+        for timeline in timelines
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|timeline| upgrade_realm_object(&timeline))
+        {
+            timeline.set_property("source", Value::Undefined);
+            timeline.set_property("subject", Value::Undefined);
+            timeline.set_property("__w3cos_getter_currentTime", Value::Undefined);
+        }
+    });
+    TRIGGERS.with(|triggers| {
+        for trigger in triggers
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|trigger| upgrade_realm_object(&trigger))
+        {
+            trigger.set_property("ranges", Value::Undefined);
+            for method in ["addAnimation", "getAnimations", "removeAnimation"] {
+                trigger.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    RANGE_LISTS.with(|lists| {
+        for list in lists
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|list| upgrade_realm_object(&list))
+        {
+            let length = list.get_property("length").to_u32();
+            for index in 0..length {
+                list.set_property(&index.to_string(), Value::Undefined);
+            }
+            list.set_property("length", Value::Number(0.0));
+            for method in ["entries", "forEach", "item", "keys", "values"] {
+                list.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        disconnect_realm_class(class);
+    }
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -709,6 +816,94 @@ mod tests {
             animation.get_property("playState").to_js_string(),
             "finished"
         );
+    }
+
+    #[test]
+    fn animations_effects_timelines_triggers_and_callbacks_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_animation_class = class_for("Animation");
+        let old_effect_class = class_for("KeyframeEffect");
+        let old_trigger_class = class_for("TimelineTrigger");
+        let target = Value::object(HashMap::new());
+        let target_weak = crate::jsdom::weak_realm_object(&target);
+        let effect = keyframe_effect_value(
+            target.clone(),
+            Value::array(vec![Value::object(HashMap::from([(
+                "opacity".into(),
+                Value::Number(0.0),
+            )]))]),
+            Value::Number(100.0),
+        );
+        drop(target);
+        let timeline = document_timeline_value();
+        let animation = animation_value(effect.clone(), timeline.clone());
+        let trigger = w3cos_core::class::construct(
+            &old_trigger_class,
+            vec![Value::array(vec![Value::object(HashMap::from([(
+                "timeline".into(),
+                timeline,
+            )]))])],
+        );
+        trigger.call_method(
+            "addAnimation",
+            vec![animation.clone(), Value::string("play")],
+        );
+        let ranges = trigger.get_property("ranges");
+        let animation_weak = crate::jsdom::weak_realm_object(&animation);
+        let effect_weak = crate::jsdom::weak_realm_object(&effect);
+        let trigger_weak = crate::jsdom::weak_realm_object(&trigger);
+        let ranges_weak = crate::jsdom::weak_realm_object(&ranges);
+
+        let finish_marker = Rc::new(());
+        let finish_marker_weak = Rc::downgrade(&finish_marker);
+        animation.set_property(
+            "onfinish",
+            Value::function(move |_, _| {
+                let _ = &finish_marker;
+                Value::Undefined
+            }),
+        );
+        animation.call_method("play", Vec::new());
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_animation_class.strict_eq(&class_for("Animation")));
+        assert!(!old_effect_class.strict_eq(&class_for("KeyframeEffect")));
+        assert!(!old_trigger_class.strict_eq(&class_for("TimelineTrigger")));
+        for class in [old_animation_class, old_effect_class, old_trigger_class] {
+            assert!(class.call(Value::Undefined, Vec::new()).is_undefined());
+        }
+        assert_eq!(animation.get_property("playState").to_js_string(), "idle");
+        assert!(animation.get_property("effect").is_undefined());
+        assert!(animation.get_property("timeline").is_undefined());
+        assert!(animation.get_property("ready").is_undefined());
+        assert!(animation.get_property("finished").is_undefined());
+        assert!(animation.get_property("onfinish").is_null());
+        assert!(animation.call_method("play", Vec::new()).is_undefined());
+        assert!(effect.get_property("target").is_undefined());
+        assert!(effect.call_method("getTiming", Vec::new()).is_undefined());
+        assert!(trigger.get_property("ranges").is_undefined());
+        assert!(
+            trigger
+                .call_method("getAnimations", Vec::new())
+                .is_undefined()
+        );
+        assert_eq!(ranges.get_property("length").to_number(), 0.0);
+        assert!(ranges.call_method("item", Vec::new()).is_undefined());
+        assert!(target_weak.upgrade().is_none());
+        assert!(finish_marker_weak.upgrade().is_none());
+
+        drop(animation);
+        drop(effect);
+        drop(trigger);
+        drop(ranges);
+        assert!(animation_weak.upgrade().is_none());
+        assert!(effect_weak.upgrade().is_none());
+        assert!(trigger_weak.upgrade().is_none());
+        assert!(ranges_weak.upgrade().is_none());
     }
 
     #[test]

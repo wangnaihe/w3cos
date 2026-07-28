@@ -10,6 +10,7 @@ default = ["scss"]
 scss = ["grass"]
 
 [dependencies]
+w3cos-ir = { workspace = true }
 w3cos-std = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -21,3 +22,5 @@ grass = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+w3cos-core = { workspace = true }
+w3cos-vm = { workspace = true }

@@ -6,6 +6,11 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, realm_function, register_weak_realm_object, reset_realm_class,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static DEFINITIONS: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     static WAITERS: RefCell<HashMap<String, Vec<Value>>> = RefCell::new(HashMap::new());
@@ -15,6 +20,9 @@ thread_local! {
     static ELEMENT_INTERNALS_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static CUSTOM_STATE_SET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static CSS_PSEUDO_ELEMENT_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static ELEMENT_INTERNALS_VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static CUSTOM_STATE_SET_VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static CSS_PSEUDO_ELEMENT_VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
 }
 
 const ARIA_STRING_MEMBERS: &[&str] = &[
@@ -81,12 +89,22 @@ fn exception(name: &str, message: &str) -> Value {
     ]))
 }
 
+fn realm_is_current(generation: u32) -> bool {
+    crate::jsdom::realm_generation() == generation
+}
+
+fn realm_custom_elements_function(
+    callback: impl Fn(Value, Vec<Value>) -> Value + 'static,
+) -> Value {
+    realm_function(crate::jsdom::realm_generation(), callback)
+}
+
 pub fn custom_state_set_class() -> Value {
     CUSTOM_STATE_SET_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_custom_elements_function(|_, _| {
             w3cos_core::throw_value(exception(
                 "TypeError",
                 "Illegal constructor: CustomStateSet",
@@ -113,7 +131,7 @@ fn custom_state_set_value() -> Value {
     let add_value = value.clone();
     value.set_property(
         "add",
-        Value::function(move |_, args| {
+        realm_custom_elements_function(move |_, args| {
             let state = args.first().cloned().unwrap_or_default().to_js_string();
             if !state.starts_with("--") || state.len() <= 2 {
                 w3cos_core::throw_value(exception(
@@ -128,7 +146,7 @@ fn custom_state_set_value() -> Value {
     let clear_states = Rc::clone(&states);
     value.set_property(
         "clear",
-        Value::function(move |_, _| {
+        realm_custom_elements_function(move |_, _| {
             clear_states.borrow_mut().clear();
             Value::Undefined
         }),
@@ -136,7 +154,7 @@ fn custom_state_set_value() -> Value {
     let delete_states = Rc::clone(&states);
     value.set_property(
         "delete",
-        Value::function(move |_, args| {
+        realm_custom_elements_function(move |_, args| {
             Value::Bool(
                 delete_states
                     .borrow_mut()
@@ -147,7 +165,7 @@ fn custom_state_set_value() -> Value {
     let has_states = Rc::clone(&states);
     value.set_property(
         "has",
-        Value::function(move |_, args| {
+        realm_custom_elements_function(move |_, args| {
             Value::Bool(
                 has_states
                     .borrow()
@@ -158,13 +176,15 @@ fn custom_state_set_value() -> Value {
     let size_states = Rc::clone(&states);
     value.set_property(
         "__w3cos_getter_size",
-        Value::function(move |_, _| Value::Number(size_states.borrow().len() as f64)),
+        realm_custom_elements_function(
+            move |_, _| Value::Number(size_states.borrow().len() as f64),
+        ),
     );
     for method in ["keys", "values", "entries"] {
         let iterator_states = Rc::clone(&states);
         value.set_property(
             method,
-            Value::function(move |_, _| {
+            realm_custom_elements_function(move |_, _| {
                 let entries = iterator_states
                     .borrow()
                     .iter()
@@ -184,7 +204,7 @@ fn custom_state_set_value() -> Value {
     let each_value = value.clone();
     value.set_property(
         "forEach",
-        Value::function(move |_, args| {
+        realm_custom_elements_function(move |_, args| {
             let callback = args.first().cloned().unwrap_or(Value::Undefined);
             if !callback.is_function() {
                 w3cos_core::throw_value(exception(
@@ -210,6 +230,7 @@ fn custom_state_set_value() -> Value {
         &value,
         &custom_state_set_class().get_property("prototype"),
     );
+    register_weak_realm_object(&CUSTOM_STATE_SET_VALUES, &value);
     value
 }
 
@@ -218,7 +239,7 @@ pub fn element_internals_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_custom_elements_function(|_, _| {
             w3cos_core::throw_value(exception(
                 "TypeError",
                 "Illegal constructor: ElementInternals",
@@ -323,7 +344,7 @@ pub fn element_internals_value(element: Value, node: u32) -> Value {
     let validity_internals = internals.clone();
     internals.set_property(
         "setValidity",
-        Value::function(move |_, args| {
+        realm_custom_elements_function(move |_, args| {
             let flags = args.first().cloned().unwrap_or(Value::Undefined);
             let message = args
                 .get(1)
@@ -363,7 +384,7 @@ pub fn element_internals_value(element: Value, node: u32) -> Value {
         }),
     );
     let check_element = element.clone();
-    let check = Value::function(move |_, _| {
+    let check = realm_custom_elements_function(move |_, _| {
         let valid = !check_element
             .get_property("__w3cos_internals_invalid")
             .to_bool();
@@ -382,7 +403,7 @@ pub fn element_internals_value(element: Value, node: u32) -> Value {
     internals.set_property("checkValidity", check.clone());
     internals.set_property(
         "reportValidity",
-        Value::function(move |this, _| {
+        realm_custom_elements_function(move |this, _| {
             static WARNING: std::sync::Once = std::sync::Once::new();
             WARNING.call_once(|| {
                 eprintln!(
@@ -396,7 +417,7 @@ pub fn element_internals_value(element: Value, node: u32) -> Value {
     let form_element = element;
     internals.set_property(
         "setFormValue",
-        Value::function(move |_, args| {
+        realm_custom_elements_function(move |_, args| {
             form_element.set_property(
                 "__w3cos_form_value",
                 args.first().cloned().unwrap_or(Value::Null),
@@ -412,6 +433,7 @@ pub fn element_internals_value(element: Value, node: u32) -> Value {
         &internals,
         &element_internals_class().get_property("prototype"),
     );
+    register_weak_realm_object(&ELEMENT_INTERNALS_VALUES, &internals);
     internals
 }
 
@@ -420,7 +442,7 @@ pub fn css_pseudo_element_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_custom_elements_function(|_, _| {
             w3cos_core::throw_value(exception(
                 "TypeError",
                 "Illegal constructor: CSSPseudoElement",
@@ -454,7 +476,7 @@ pub fn css_pseudo_element_value(element: Value, parent: Value, pseudo_type: Stri
     let nested_parent = value.clone();
     value.set_property(
         "pseudo",
-        Value::function(move |_, args| {
+        realm_custom_elements_function(move |_, args| {
             css_pseudo_element_value(
                 nested_element.clone(),
                 nested_parent.clone(),
@@ -466,6 +488,7 @@ pub fn css_pseudo_element_value(element: Value, parent: Value, pseudo_type: Stri
         &value,
         &css_pseudo_element_class().get_property("prototype"),
     );
+    register_weak_realm_object(&CSS_PSEUDO_ELEMENT_VALUES, &value);
     value
 }
 
@@ -603,7 +626,14 @@ pub fn custom_element_registry_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| custom_elements_value());
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_custom_elements_function(move |_, _| {
+            if realm_is_current(generation) {
+                custom_elements_value()
+            } else {
+                Value::Undefined
+            }
+        });
         class.set_property("name", Value::string("CustomElementRegistry"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -628,10 +658,19 @@ pub fn custom_elements_value() -> Value {
         if let Some(registry) = slot.borrow().clone() {
             return registry;
         }
+        let generation = crate::jsdom::realm_generation();
+        let define_generation = generation;
+        let get_generation = generation;
+        let get_name_generation = generation;
+        let when_defined_generation = generation;
+        let upgrade_generation = generation;
         let registry = Value::object(HashMap::from([
             (
                 "define".into(),
-                Value::function(|_, args| {
+                realm_custom_elements_function(move |_, args| {
+                    if !realm_is_current(define_generation) {
+                        return Value::Undefined;
+                    }
                     let name = args
                         .first()
                         .cloned()
@@ -679,7 +718,10 @@ pub fn custom_elements_value() -> Value {
             ),
             (
                 "get".into(),
-                Value::function(|_, args| {
+                realm_custom_elements_function(move |_, args| {
+                    if !realm_is_current(get_generation) {
+                        return Value::Undefined;
+                    }
                     let name = args
                         .first()
                         .cloned()
@@ -692,7 +734,10 @@ pub fn custom_elements_value() -> Value {
             ),
             (
                 "getName".into(),
-                Value::function(|_, args| {
+                realm_custom_elements_function(move |_, args| {
+                    if !realm_is_current(get_name_generation) {
+                        return Value::Undefined;
+                    }
                     let constructor = args.first().cloned().unwrap_or(Value::Undefined);
                     DEFINITIONS
                         .with(|definitions| {
@@ -705,7 +750,10 @@ pub fn custom_elements_value() -> Value {
             ),
             (
                 "whenDefined".into(),
-                Value::function(|_, args| {
+                realm_custom_elements_function(move |_, args| {
+                    if !realm_is_current(when_defined_generation) {
+                        return Value::Undefined;
+                    }
                     let name = args
                         .first()
                         .cloned()
@@ -722,22 +770,30 @@ pub fn custom_elements_value() -> Value {
                     {
                         return w3cos_core::promise::resolve(vec![constructor]);
                     }
-                    w3cos_core::promise::new(vec![Value::function(move |_, args| {
-                        let resolve = args.first().cloned().unwrap_or(Value::Undefined);
-                        WAITERS.with(|waiters| {
-                            waiters
-                                .borrow_mut()
-                                .entry(name.clone())
-                                .or_default()
-                                .push(resolve);
-                        });
-                        Value::Undefined
+                    w3cos_core::promise::new(vec![realm_custom_elements_function({
+                        move |_, args| {
+                            if !realm_is_current(when_defined_generation) {
+                                return Value::Undefined;
+                            }
+                            let resolve = args.first().cloned().unwrap_or(Value::Undefined);
+                            WAITERS.with(|waiters| {
+                                waiters
+                                    .borrow_mut()
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .push(resolve);
+                            });
+                            Value::Undefined
+                        }
                     })])
                 }),
             ),
             (
                 "upgrade".into(),
-                Value::function(|_, args| {
+                realm_custom_elements_function(move |_, args| {
+                    if !realm_is_current(upgrade_generation) {
+                        return Value::Undefined;
+                    }
                     LIFECYCLE_WARNING_EMITTED.with(|warned| {
                         if !warned.replace(true) {
                             eprintln!(
@@ -752,9 +808,13 @@ pub fn custom_elements_value() -> Value {
                 }),
             ),
         ]));
+        let initialize_generation = generation;
         registry.set_property(
             "initialize",
-            Value::function(|_, _| {
+            realm_custom_elements_function(move |_, _| {
+                if !realm_is_current(initialize_generation) {
+                    return Value::Undefined;
+                }
                 static WARNING: std::sync::Once = std::sync::Once::new();
                 WARNING.call_once(|| {
                     eprintln!(
@@ -777,6 +837,79 @@ pub fn custom_elements_value() -> Value {
 pub fn reset() {
     DEFINITIONS.with(|definitions| definitions.borrow_mut().clear());
     WAITERS.with(|waiters| waiters.borrow_mut().clear());
+    REGISTRY_VALUE.with(|slot| {
+        if let Some(registry) = slot.borrow_mut().take() {
+            for method in [
+                "define",
+                "get",
+                "getName",
+                "initialize",
+                "upgrade",
+                "whenDefined",
+            ] {
+                registry.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    ELEMENT_INTERNALS_VALUES.with(|values| {
+        for internals in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for reference in ["form", "labels", "shadowRoot", "states", "validity"] {
+                internals.set_property(reference, Value::Undefined);
+            }
+            for member in ARIA_ELEMENT_MEMBERS {
+                internals.set_property(member, Value::Undefined);
+            }
+            for method in [
+                "checkValidity",
+                "reportValidity",
+                "setFormValue",
+                "setValidity",
+            ] {
+                internals.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    CUSTOM_STATE_SET_VALUES.with(|values| {
+        for states in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for method in [
+                "__w3cos_getter_size",
+                "add",
+                "clear",
+                "delete",
+                "entries",
+                "forEach",
+                "has",
+                "keys",
+                "values",
+            ] {
+                states.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    CSS_PSEUDO_ELEMENT_VALUES.with(|values| {
+        for pseudo in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for reference in ["element", "parent", "pseudo"] {
+                pseudo.set_property(reference, Value::Undefined);
+            }
+        }
+    });
+    reset_realm_class(&REGISTRY_CLASS);
+    reset_realm_class(&ELEMENT_INTERNALS_CLASS);
+    reset_realm_class(&CUSTOM_STATE_SET_CLASS);
+    reset_realm_class(&CSS_PSEUDO_ELEMENT_CLASS);
+    LIFECYCLE_WARNING_EMITTED.with(|warned| *warned.borrow_mut() = false);
 }
 
 #[cfg(test)]
@@ -833,6 +966,123 @@ mod tests {
             .get_property("body")
             .call_method("appendChild", vec![element.clone()]);
         assert!(element.get_property("connected").to_bool());
+    }
+
+    #[test]
+    fn registry_and_constructor_are_realm_owned() {
+        reset();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_registry = custom_elements_value();
+        let old_class = custom_element_registry_class();
+        old_class
+            .get_property("prototype")
+            .set_property("realmMarker", Value::Bool(true));
+        let old_constructor = Value::function(|_, _| Value::Undefined);
+        old_registry.call_method("define", vec![Value::string("old-widget"), old_constructor]);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let new_registry = custom_elements_value();
+        let new_class = custom_element_registry_class();
+        assert!(!old_registry.strict_eq(&new_registry));
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(
+            !new_class
+                .get_property("prototype")
+                .get_property("realmMarker")
+                .to_bool()
+        );
+        assert!(matches!(
+            new_registry.call_method("get", vec![Value::string("old-widget")]),
+            Value::Undefined
+        ));
+
+        let stale_constructor = Value::function(|_, _| Value::Undefined);
+        old_registry.call_method(
+            "define",
+            vec![Value::string("stale-widget"), stale_constructor],
+        );
+        assert!(matches!(
+            new_registry.call_method("get", vec![Value::string("stale-widget")]),
+            Value::Undefined
+        ));
+        assert!(matches!(
+            old_class.call(Value::Undefined, vec![]),
+            Value::Undefined
+        ));
+        assert!(old_class.get_property("prototype").is_undefined());
+        assert!(old_registry.get_property("define").is_undefined());
+
+        let fresh_constructor = Value::function(|_, _| Value::Undefined);
+        new_registry.call_method(
+            "define",
+            vec![Value::string("fresh-widget"), fresh_constructor.clone()],
+        );
+        assert!(
+            new_registry
+                .call_method("get", vec![Value::string("fresh-widget")])
+                .strict_eq(&fresh_constructor)
+        );
+    }
+
+    #[test]
+    fn internals_state_sets_and_pseudo_elements_are_realm_owned() {
+        reset();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_internals_class = element_internals_class();
+        let old_states_class = custom_state_set_class();
+        let old_pseudo_class = css_pseudo_element_class();
+        let element = crate::jsdom::document_value()
+            .call_method("createElement", vec![Value::string("x-internals")]);
+        let element_weak = crate::jsdom::weak_realm_object(&element);
+        let internals = element.call_method("attachInternals", Vec::new());
+        let states = internals.get_property("states");
+        states.call_method("add", vec![Value::string("--busy")]);
+        let pseudo = element.call_method("pseudo", vec![Value::string("::before")]);
+        let internals_weak = crate::jsdom::weak_realm_object(&internals);
+        let states_weak = crate::jsdom::weak_realm_object(&states);
+        let pseudo_weak = crate::jsdom::weak_realm_object(&pseudo);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_internals_class.get_property("prototype").is_undefined());
+        assert!(old_states_class.get_property("prototype").is_undefined());
+        assert!(old_pseudo_class.get_property("prototype").is_undefined());
+        assert!(internals.get_property("form").is_undefined());
+        assert!(internals.get_property("states").is_undefined());
+        assert!(
+            internals
+                .call_method("checkValidity", Vec::new())
+                .is_undefined()
+        );
+        assert!(states.get_property("size").is_undefined());
+        assert!(
+            states
+                .call_method("add", vec![Value::string("--stale")])
+                .is_undefined()
+        );
+        assert!(pseudo.get_property("element").is_undefined());
+        assert!(pseudo.get_property("parent").is_undefined());
+        assert!(
+            pseudo
+                .call_method("pseudo", vec![Value::string("::marker")])
+                .is_undefined()
+        );
+
+        drop(element);
+        drop(internals);
+        drop(states);
+        drop(pseudo);
+        assert!(element_weak.upgrade().is_none());
+        assert!(internals_weak.upgrade().is_none());
+        assert!(states_weak.upgrade().is_none());
+        assert!(pseudo_weak.upgrade().is_none());
     }
 
     #[test]

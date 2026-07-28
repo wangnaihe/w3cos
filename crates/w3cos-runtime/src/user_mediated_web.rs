@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -60,14 +61,15 @@ pub fn idle_detector_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |this, _| {
             crate::web_events::event_target_class().call(this.clone(), vec![]);
             this.set_property("userState", Value::Null);
             this.set_property("screenState", Value::Null);
             this.set_property("onchange", Value::Null);
             this.set_property(
                 "start",
-                Value::function(|this, args| idle_start(this, args)),
+                realm_function(generation, |this, args| idle_start(this, args)),
             );
             IDLE_DETECTORS.with(|detectors| detectors.borrow_mut().push(this));
             Value::Undefined
@@ -75,7 +77,7 @@ pub fn idle_detector_class() -> Value {
         class.set_property("name", Value::string("IdleDetector"));
         class.set_property(
             "requestPermission",
-            Value::function(|_, _| {
+            realm_function(generation, |_, _| {
                 if !IDLE_PERMISSION.with(Cell::get) {
                     warn_idle();
                 }
@@ -95,7 +97,7 @@ pub fn idle_detector_class() -> Value {
             ("onchange".into(), Value::Null),
             (
                 "start".into(),
-                Value::function(|this, args| idle_start(this, args)),
+                realm_function(generation, |this, args| idle_start(this, args)),
             ),
         ]));
         w3cos_core::class::set_prototype_of(
@@ -113,7 +115,8 @@ pub fn eye_dropper_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let open = Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let open = realm_function(generation, |_, args| {
             let signal = args
                 .first()
                 .cloned()
@@ -135,7 +138,7 @@ pub fn eye_dropper_class() -> Value {
             )])
         });
         let open_for_instance = open.clone();
-        let class = Value::function(move |this, _| {
+        let class = realm_function(generation, move |this, _| {
             this.set_property("open", open_for_instance.clone());
             Value::Undefined
         });
@@ -148,6 +151,16 @@ pub fn eye_dropper_class() -> Value {
         *slot.borrow_mut() = Some(class.clone());
         class
     })
+}
+
+pub fn reset_realm() {
+    IDLE_DETECTOR_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    EYE_DROPPER_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    IDLE_DETECTORS.with(|detectors| detectors.borrow_mut().clear());
 }
 
 pub fn set_idle_permission(granted: bool) {
@@ -188,6 +201,9 @@ mod tests {
 
     #[test]
     fn idle_detector_permission_and_host_updates_are_explicit() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         set_idle_permission(false);
         let detector = w3cos_core::class::construct(&idle_detector_class(), vec![]);
         let log = Rc::new(RefCell::new(Vec::new()));
@@ -224,10 +240,14 @@ mod tests {
             Value::string("locked")
         );
         set_idle_permission(false);
+        reset_realm();
     }
 
     #[test]
     fn eye_dropper_rejects_without_host_sampler() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let name = Rc::new(RefCell::new(String::new()));
         let name_for_handler = Rc::clone(&name);
         w3cos_core::class::construct(&eye_dropper_class(), vec![])
@@ -241,5 +261,37 @@ mod tests {
             );
         crate::jsdom::drain_microtasks();
         assert_eq!(&*name.borrow(), "NotSupportedError");
+        reset_realm();
+    }
+
+    #[test]
+    fn host_updates_and_entry_points_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        set_idle_permission(true);
+        let old_idle_class = idle_detector_class();
+        let old_eye_class = eye_dropper_class();
+        let detector = w3cos_core::class::construct(&old_idle_class, vec![]);
+        detector.call_method("start", vec![]);
+        crate::jsdom::drain_microtasks();
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_idle_class = idle_detector_class();
+        let new_eye_class = eye_dropper_class();
+        assert!(!old_idle_class.strict_eq(&new_idle_class));
+        assert!(!old_eye_class.strict_eq(&new_eye_class));
+        assert!(old_idle_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(old_eye_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(detector.call_method("start", vec![]).is_undefined());
+        update_idle_state("idle", "locked");
+        assert_eq!(detector.get_property("userState"), Value::string("active"));
+        assert_eq!(
+            detector.get_property("screenState"),
+            Value::string("unlocked")
+        );
+        set_idle_permission(false);
+        reset_realm();
     }
 }

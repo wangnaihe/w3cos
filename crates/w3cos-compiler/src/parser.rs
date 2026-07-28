@@ -106,6 +106,14 @@ pub struct StyleDecl {
     pub font_weight: Option<u16>,
     pub color: Option<String>,
     pub background: Option<String>,
+    pub background_image: Option<String>,
+    pub background_size: Option<String>,
+    pub background_position: Option<String>,
+    pub background_repeat: Option<String>,
+    pub background_origin: Option<String>,
+    pub background_clip: Option<String>,
+    pub background_attachment: Option<String>,
+    pub background_blend_mode: Option<String>,
     pub border_radius: Option<f32>,
     pub border_width: Option<f32>,
     pub border_color: Option<String>,
@@ -1273,8 +1281,48 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                             }
                         }
                     } else {
-                        style.background = Some(v);
+                        let parsed = w3cos_std::background::parse_shorthand(&v);
+                        style.background = Some(if w3cos_std::Color::from_css(&v).is_some() {
+                            v.clone()
+                        } else {
+                            let color = parsed.color.unwrap_or(w3cos_std::Color::TRANSPARENT);
+                            format!(
+                                "rgba({}, {}, {}, {})",
+                                color.r,
+                                color.g,
+                                color.b,
+                                f32::from(color.a) / 255.0
+                            )
+                        });
+                        style.background_image = Some(parsed.images.join(", "));
+                        style.background_size = Some(parsed.sizes.join(", "));
+                        style.background_position = Some(parsed.positions.join(", "));
+                        style.background_repeat = Some(parsed.repeats.join(", "));
+                        style.background_origin = Some(parsed.origins.join(", "));
+                        style.background_clip = Some(parsed.clips.join(", "));
+                        style.background_attachment = Some(parsed.attachments.join(", "));
+                        style.background_blend_mode = Some("normal".to_string());
                     }
+                }
+                "backgroundImage" | "background_image" => {
+                    style.background_image = Some(unquote(val))
+                }
+                "backgroundSize" | "background_size" => style.background_size = Some(unquote(val)),
+                "backgroundPosition" | "background_position" => {
+                    style.background_position = Some(unquote(val))
+                }
+                "backgroundRepeat" | "background_repeat" => {
+                    style.background_repeat = Some(unquote(val))
+                }
+                "backgroundOrigin" | "background_origin" => {
+                    style.background_origin = Some(unquote(val))
+                }
+                "backgroundClip" | "background_clip" => style.background_clip = Some(unquote(val)),
+                "backgroundAttachment" | "background_attachment" => {
+                    style.background_attachment = Some(unquote(val))
+                }
+                "backgroundBlendMode" | "background_blend_mode" => {
+                    style.background_blend_mode = Some(unquote(val))
                 }
                 "transition" => style.transition = Some(unquote(val)),
                 _ => {}

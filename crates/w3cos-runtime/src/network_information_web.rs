@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -15,7 +16,8 @@ pub fn network_information_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(Value::object(HashMap::from([
                 ("name".into(), Value::string("TypeError")),
                 (
@@ -69,12 +71,21 @@ pub fn network_information_value() -> Value {
     information
 }
 
+pub fn reset_realm() {
+    NETWORK_INFORMATION_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn snapshot_has_standard_identity_and_event_target_shape() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let information = network_information_value();
         assert!(w3cos_core::class::instance_of(
             &information,
@@ -89,5 +100,34 @@ mod tests {
         assert_eq!(information.get_property("rtt").to_number(), 0.0);
         assert!(!information.get_property("saveData").to_bool());
         assert!(information.get_property("addEventListener").is_function());
+        reset_realm();
+    }
+
+    #[test]
+    fn constructor_and_prototype_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_class = network_information_class();
+        old_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_class = network_information_class();
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(
+            new_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(w3cos_core::class::instance_of(
+            &network_information_value(),
+            &new_class
+        ));
+        reset_realm();
     }
 }

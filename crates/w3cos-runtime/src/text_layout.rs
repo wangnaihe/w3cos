@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use w3cos_std::style::{Style, WhiteSpace};
@@ -12,6 +13,7 @@ const TEXT_PAINT_CACHE_CAPACITY: usize = 4096;
 struct TextPaintKey {
     text: String,
     max_width: u32,
+    font: u64,
     font_size: u32,
     white_space: u8,
 }
@@ -475,6 +477,21 @@ pub fn wrap_text_font(
     lines
 }
 
+pub fn wrap_text_with_char_width(
+    text: &str,
+    max_width: f32,
+    white_space: WhiteSpace,
+    char_width: impl FnMut(char) -> f32,
+) -> Vec<String> {
+    if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
+        return vec![text.to_string()];
+    }
+    if max_width <= 1.0 {
+        return vec![text.to_string()];
+    }
+    wrap_greedy(text, max_width, char_width)
+}
+
 pub fn retained_text_paint_layout(
     text: &str,
     max_width: f32,
@@ -482,9 +499,32 @@ pub fn retained_text_paint_layout(
     font: &fontdue::Font,
     white_space: WhiteSpace,
 ) -> Rc<TextPaintLayout> {
+    let mut font_hasher = DefaultHasher::new();
+    font.hash(&mut font_hasher);
+    retained_text_paint_layout_with(
+        text,
+        max_width,
+        font_size,
+        white_space,
+        font_hasher.finish(),
+        |character| char_advance(character, font_size, font),
+        |line| measure_text_ink_bounds(line, font_size, font, 0.0, 0.0),
+    )
+}
+
+pub fn retained_text_paint_layout_with(
+    text: &str,
+    max_width: f32,
+    font_size: f32,
+    white_space: WhiteSpace,
+    font_identity: u64,
+    char_width: impl FnMut(char) -> f32,
+    mut measure_ink: impl FnMut(&str) -> InkBounds,
+) -> Rc<TextPaintLayout> {
     let key = TextPaintKey {
         text: text.to_owned(),
         max_width: max_width.to_bits(),
+        font: font_identity,
         font_size: font_size.to_bits(),
         white_space: white_space_key(white_space),
     };
@@ -492,11 +532,8 @@ pub fn retained_text_paint_layout(
         return cached;
     }
 
-    let lines = wrap_text_font(text, max_width, font_size, font, white_space);
-    let ink_bounds = lines
-        .iter()
-        .map(|line| measure_text_ink_bounds(line, font_size, font, 0.0, 0.0))
-        .collect();
+    let lines = wrap_text_with_char_width(text, max_width, white_space, char_width);
+    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
     let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
     TEXT_PAINT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();

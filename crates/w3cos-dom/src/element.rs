@@ -56,6 +56,8 @@ impl Element {
         }
         let atom_name = Atom::intern(name);
         let node = doc.get_node_mut(self.id);
+        node.attribute_namespaces
+            .retain(|attribute| attribute.qualified_name != atom_name);
         if let Some(attr) = node.attributes.iter_mut().find(|(k, _)| *k == atom_name) {
             if name == "id" {
                 let old_val = attr.1.clone();
@@ -74,6 +76,25 @@ impl Element {
         doc.mark_dirty(self.id);
     }
 
+    pub fn set_attribute_ns(
+        &self,
+        doc: &mut Document,
+        namespace: Option<&str>,
+        qualified_name: &str,
+        prefix: Option<&str>,
+        local_name: &str,
+        value: &str,
+    ) {
+        doc.get_node_mut(self.id).set_attribute_ns(
+            namespace,
+            qualified_name,
+            prefix,
+            local_name,
+            value,
+        );
+        doc.mark_dirty(self.id);
+    }
+
     pub fn get_attribute<'a>(&self, doc: &'a Document, name: &str) -> Option<&'a str> {
         let atom_name = Atom::intern(name);
         doc.get_node(self.id)
@@ -81,6 +102,16 @@ impl Element {
             .iter()
             .find(|(k, _)| *k == atom_name)
             .map(|(_, v)| v.as_str())
+    }
+
+    pub fn get_attribute_ns<'a>(
+        &self,
+        doc: &'a Document,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> Option<&'a str> {
+        doc.get_node(self.id)
+            .get_attribute_ns(namespace, local_name)
     }
 
     pub fn remove_attribute(&self, doc: &mut Document, name: &str) {
@@ -91,10 +122,26 @@ impl Element {
             }
         }
         let atom_name = Atom::intern(name);
-        doc.get_node_mut(self.id)
-            .attributes
-            .retain(|(k, _)| *k != atom_name);
+        let node = doc.get_node_mut(self.id);
+        node.attributes.retain(|(k, _)| *k != atom_name);
+        node.attribute_namespaces
+            .retain(|attribute| attribute.qualified_name != atom_name);
         doc.mark_dirty(self.id);
+    }
+
+    pub fn remove_attribute_ns(
+        &self,
+        doc: &mut Document,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> bool {
+        let removed = doc
+            .get_node_mut(self.id)
+            .remove_attribute_ns(namespace, local_name);
+        if removed {
+            doc.mark_dirty(self.id);
+        }
+        removed
     }
 
     pub fn class_list_add(&self, doc: &mut Document, class: &str) {
@@ -250,6 +297,9 @@ impl Element {
 
     pub fn set_class_name(&self, doc: &mut Document, name: &str) {
         let node = doc.get_node_mut(self.id);
+        let class_attr = Atom::intern("class");
+        node.attribute_namespaces
+            .retain(|attribute| attribute.qualified_name != class_attr);
         let old_classes: Vec<Atom> = std::mem::take(&mut node.class_list);
         for class in old_classes {
             doc.remove_from_class_index(self.id, &class);
@@ -257,7 +307,6 @@ impl Element {
         for class in name.split_whitespace() {
             self.class_list_add(doc, class);
         }
-        let class_attr = Atom::intern("class");
         let node = doc.get_node_mut(self.id);
         if let Some((_, value)) = node
             .attributes

@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -43,7 +44,8 @@ fn cached_class(name: &'static str, build: impl FnOnce() -> Value) -> Value {
 
 fn illegal_event_target_class(name: &'static str, members: &[(&str, Value)]) -> Value {
     cached_class(name, || {
-        let class = Value::function(move |_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, _| {
             w3cos_core::throw_value(error("TypeError", &format!("Illegal constructor: {name}")))
         });
         class.set_property("name", Value::string(name));
@@ -131,7 +133,8 @@ fn request_urls(value: Value) -> Result<Vec<Value>, Value> {
 
 pub fn presentation_request_class() -> Value {
     cached_class("PresentationRequest", || {
-        let class = Value::function(|this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |this, args| {
             let urls = match request_urls(args.first().cloned().unwrap_or(Value::Undefined)) {
                 Ok(urls) => urls,
                 Err(reason) => w3cos_core::throw_value(reason),
@@ -141,18 +144,20 @@ pub fn presentation_request_class() -> Value {
             this.set_property("onconnectionavailable", Value::Null);
             this.set_property(
                 "getAvailability",
-                Value::function(|_, _| {
+                realm_function(generation, |_, _| {
                     warn_unavailable();
                     w3cos_core::promise::resolve(vec![availability_value()])
                 }),
             );
             this.set_property(
                 "start",
-                Value::function(|_, _| rejected_connection("PresentationRequest.start")),
+                realm_function(generation, |_, _| {
+                    rejected_connection("PresentationRequest.start")
+                }),
             );
             this.set_property(
                 "reconnect",
-                Value::function(|_, args| {
+                realm_function(generation, |_, args| {
                     let id = args.first().cloned().unwrap_or(Value::Undefined);
                     if id.is_undefined() || id.is_null() || id.to_js_string().trim().is_empty() {
                         return w3cos_core::promise::reject(vec![error(
@@ -171,18 +176,20 @@ pub fn presentation_request_class() -> Value {
             ("onconnectionavailable".into(), Value::Null),
             (
                 "getAvailability".into(),
-                Value::function(|_, _| {
+                realm_function(generation, |_, _| {
                     warn_unavailable();
                     w3cos_core::promise::resolve(vec![availability_value()])
                 }),
             ),
             (
                 "start".into(),
-                Value::function(|_, _| rejected_connection("PresentationRequest.start")),
+                realm_function(generation, |_, _| {
+                    rejected_connection("PresentationRequest.start")
+                }),
             ),
             (
                 "reconnect".into(),
-                Value::function(|_, args| {
+                realm_function(generation, |_, args| {
                     let id = args.first().cloned().unwrap_or(Value::Undefined);
                     if id.is_undefined() || id.is_null() || id.to_js_string().trim().is_empty() {
                         return w3cos_core::promise::reject(vec![error(
@@ -204,6 +211,7 @@ pub fn presentation_request_class() -> Value {
 }
 
 pub fn presentation_connection_class() -> Value {
+    let generation = crate::jsdom::realm_generation();
     illegal_event_target_class(
         "PresentationConnection",
         &[
@@ -215,11 +223,14 @@ pub fn presentation_connection_class() -> Value {
             ("onclose", Value::Null),
             ("onterminate", Value::Null),
             ("onmessage", Value::Null),
-            ("close", Value::function(|_, _| Value::Undefined)),
-            ("terminate", Value::function(|_, _| Value::Undefined)),
+            ("close", realm_function(generation, |_, _| Value::Undefined)),
+            (
+                "terminate",
+                realm_function(generation, |_, _| Value::Undefined),
+            ),
             (
                 "send",
-                Value::function(|_, _| {
+                realm_function(generation, |_, _| {
                     w3cos_core::throw_value(error(
                         "InvalidStateError",
                         "PresentationConnection is not connected",
@@ -252,7 +263,8 @@ pub fn presentation_receiver_class() -> Value {
 
 fn event_class(name: &'static str, fields: &'static [&'static str]) -> Value {
     cached_class(name, || {
-        let class = Value::function(move |this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |this, args| {
             crate::web_events::event_class().call(this.clone(), args.clone());
             let init = args.get(1).cloned().unwrap_or(Value::Undefined);
             for field in fields {
@@ -275,6 +287,10 @@ fn event_class(name: &'static str, fields: &'static [&'static str]) -> Value {
     })
 }
 
+pub fn reset_realm() {
+    CLASSES.with(|classes| classes.borrow_mut().clear());
+}
+
 pub fn presentation_connection_available_event_class() -> Value {
     event_class("PresentationConnectionAvailableEvent", &["connection"])
 }
@@ -290,6 +306,9 @@ mod tests {
 
     #[test]
     fn availability_is_false_and_connection_requests_fail_explicitly() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let request = w3cos_core::class::construct(
             &presentation_request_class(),
             vec![Value::string("https://example.test/presentation")],
@@ -328,5 +347,53 @@ mod tests {
             &*log.borrow(),
             &["true:false", "NotFoundError", "TypeError", "NotFoundError"]
         );
+        reset_realm();
+    }
+
+    #[test]
+    fn constructors_and_request_methods_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_class = presentation_request_class();
+        let old_event_class = presentation_connection_close_event_class();
+        let request = w3cos_core::class::construct(
+            &old_class,
+            vec![Value::string("https://example.test/presentation")],
+        );
+        old_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_class = presentation_request_class();
+        let new_event_class = presentation_connection_close_event_class();
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(!old_event_class.strict_eq(&new_event_class));
+        assert!(
+            new_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(
+            old_event_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        for method in ["getAvailability", "start", "reconnect"] {
+            assert!(request.call_method(method, vec![]).is_undefined());
+        }
+        assert!(
+            w3cos_core::class::construct(
+                &new_class,
+                vec![Value::string("https://example.test/presentation")]
+            )
+            .call_method("getAvailability", vec![])
+            .is_object()
+        );
+        reset_realm();
     }
 }

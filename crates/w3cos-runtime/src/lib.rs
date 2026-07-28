@@ -1,9 +1,15 @@
 pub mod animations_web;
 pub mod audio_web;
+mod background_image;
 pub mod badging_web;
 pub mod barcode_detection_web;
 pub mod battery_web;
 pub mod bluetooth_web;
+#[cfg(feature = "dynamic-js")]
+pub mod browser_controller;
+pub(crate) mod browser_http_cache;
+#[cfg(feature = "dynamic-js")]
+pub mod browser_page_domain;
 pub mod cache_web;
 pub mod canvas2d;
 pub mod canvas_web;
@@ -27,6 +33,8 @@ pub mod devtools;
 pub mod dialog;
 pub mod dom;
 pub mod dom_constructors;
+#[cfg(feature = "dynamic-js")]
+pub mod dynamic_script;
 pub mod edit_context_web;
 pub mod encrypted_media_web;
 pub mod eventsource;
@@ -56,8 +64,13 @@ pub mod gpu_filter;
 pub mod harmony;
 pub mod highlight_web;
 pub mod history;
-pub mod image_loader;
+mod html_compat;
+mod html_fragment_policy;
+mod html_parser_host;
+mod html_parser_state;
+mod html_tree_builder;
 pub mod image_decoder_web;
+pub mod image_loader;
 pub mod indexed_db;
 mod indexed_db_sqlite;
 pub mod indexed_db_web;
@@ -149,14 +162,14 @@ pub mod wake_lock_web;
 pub mod web_events;
 pub mod web_nfc;
 pub mod web_share;
-pub mod webcodecs_web;
-pub mod webgpu_web;
-pub mod webgl_web;
-mod webgl_constants_generated;
 pub mod web_transport_web;
+pub mod webcodecs_web;
+mod webgl_constants_generated;
+pub mod webgl_web;
+pub mod webgpu_web;
 pub mod webrtc_web;
-pub mod webxr_web;
 pub mod websocket;
+pub mod webxr_web;
 pub mod worker;
 pub mod worker_web;
 pub mod xhr;
@@ -246,6 +259,11 @@ pub fn run_app_on_android_dom(
     if let Some(data_dir) = android_app.internal_data_path() {
         storage::set_base_dir(data_dir.join("w3cos").join("storage"));
         indexed_db::set_base_dir(data_dir.join("w3cos").join("indexeddb"));
+        if let Err(error) =
+            cookie_store_web::set_persistence_dir(data_dir.join("w3cos").join("cookies"))
+        {
+            eprintln!("[w3cos] warning: failed to load persistent cookies: {error}");
+        }
     }
     window::run_dom_android(android_app, setup)
 }

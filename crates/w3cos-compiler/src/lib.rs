@@ -13,6 +13,8 @@ pub mod scope_analysis;
 pub mod style_matcher;
 pub mod ts_transpiler;
 pub mod ts_types;
+pub mod w3ir_aot;
+pub mod w3ir_lowering;
 pub mod web_api_skeleton;
 pub mod web_codegen;
 
@@ -203,6 +205,13 @@ fn compile_with_source_dir(
                         artifacts.bundle_code,
                         artifacts.has_entry_main,
                     ),
+                    Err(error)
+                        if error
+                            .downcast_ref::<esm_codegen::EsmCodegenError>()
+                            .is_some() =>
+                    {
+                        return Err(error);
+                    }
                     Err(err) => (
                         format!("//! ESM graph: unresolved ({err})\n\n"),
                         None,
@@ -255,7 +264,7 @@ fn compile_with_source_dir(
                 // W3COS_DOM_DUMP=1 additionally prints the body's outer HTML
                 // (truncated) — the headless smoke signal for DOM apps.
                 main_rs.push_str(
-                    "\nfn setup_dom() {\n    if w3cos_runtime::dom::get_element_by_id(\"root\").is_none() {\n        let root = w3cos_runtime::dom::create_element(\"div\");\n        w3cos_runtime::dom::set_attribute(root, \"id\", \"root\");\n        w3cos_runtime::dom::append_child(w3cos_runtime::dom::body_id(), root);\n    }\n    esm_bundle::run_entry();\n}\n\nfn main() {\n    if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() {\n        if let Err(error) = w3cos_runtime::run_app_dom(setup_dom) {\n            eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\");\n        }\n    } else {\n        setup_dom();\n        for _ in 0..16 {\n            w3cos_runtime::jsdom::drain_microtasks();\n            w3cos_runtime::jsdom::tick_timers();\n        }\n        println!(\"W3COS_DOM_OK nodes={}\", w3cos_runtime::dom::node_count());\n        if std::env::var_os(\"W3COS_DOM_DUMP\").is_some() {\n            let html = w3cos_runtime::dom::outer_html(w3cos_runtime::dom::body_id());\n            let truncated: String = html.chars().take(8000).collect();\n            println!(\"W3COS_DOM_DUMP_BEGIN\\n{truncated}\\nW3COS_DOM_DUMP_END\");\n        }\n    }\n}\n",
+                    "\nfn setup_dom() {\n    if w3cos_runtime::dom::get_element_by_id(\"root\").is_none() {\n        let root = w3cos_runtime::dom::create_element(\"div\");\n        w3cos_runtime::dom::set_attribute(root, \"id\", \"root\");\n        w3cos_runtime::dom::append_child(w3cos_runtime::dom::body_id(), root);\n    }\n    let _ = esm_bundle::run_entry_async();\n}\n\nfn main() {\n    if std::env::var_os(\"W3COS_AOT_WINDOW\").is_some() {\n        if let Err(error) = w3cos_runtime::run_app_dom(setup_dom) {\n            eprintln!(\"W3COS_AOT_WINDOW_ERROR {error:#}\");\n        }\n    } else {\n        setup_dom();\n        for _ in 0..16 {\n            w3cos_runtime::jsdom::drain_microtasks();\n            w3cos_runtime::jsdom::tick_timers();\n        }\n        println!(\"W3COS_DOM_OK nodes={}\", w3cos_runtime::dom::node_count());\n        if std::env::var_os(\"W3COS_DOM_DUMP\").is_some() {\n            let html = w3cos_runtime::dom::outer_html(w3cos_runtime::dom::body_id());\n            let truncated: String = html.chars().take(8000).collect();\n            println!(\"W3COS_DOM_DUMP_BEGIN\\n{truncated}\\nW3COS_DOM_DUMP_END\");\n        }\n    }\n}\n",
                 );
             } else {
                 main_rs.push_str("\nfn main() {}\n");
@@ -294,7 +303,9 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
             .parent()
             .unwrap_or_else(|| std::path::Path::new(".")),
     );
-    let resolver = esm_resolver::EsmResolver::new(project_root);
+    let runtime_modules = load_runtime_modules(&project_root)?;
+    let resolver = esm_resolver::EsmResolver::new(project_root)
+        .with_runtime_modules(runtime_modules.iter().cloned());
     let graph = resolver.build_graph_from_entry(entry_path)?;
     let parsed = resolver.parse_graph_from_entry(entry_path)?;
     // The manifest may reference an entry through `../` segments. Use the
@@ -314,6 +325,12 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
     diagnostics.push_str(&format!("//! ESM modules: {}\n", graph.nodes.len()));
     diagnostics.push_str(&format!("//! ESM imports: {}\n", parsed.total_imports()));
     diagnostics.push_str(&format!("//! ESM exports: {}\n", parsed.total_exports()));
+    if !runtime_modules.is_empty() {
+        diagnostics.push_str(&format!(
+            "//! ESM runtime modules: {}\n",
+            runtime_modules.join(", ")
+        ));
+    }
     let packages = graph.package_names();
     if !packages.is_empty() {
         diagnostics.push_str(&format!("//! ESM packages: {}\n", packages.join(", ")));
@@ -349,9 +366,9 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
 
     // Only generate bundle code if there are symbols to compile.
     let bundle_code = if bundle.symbol_count() > 0 {
-        Some(esm_codegen::generate_with_bodies_and_css(
+        Some(esm_codegen::try_generate_with_bodies_and_css(
             &bundle, &css.rules,
-        ))
+        )?)
     } else {
         None
     };
@@ -462,13 +479,51 @@ fn prebundle_web_entry(entry_path: &std::path::Path) -> Result<Option<std::path:
 fn find_project_root(start: &std::path::Path) -> std::path::PathBuf {
     let mut dir = start.to_path_buf();
     loop {
-        if dir.join("package.json").exists() || dir.join("node_modules").exists() {
+        if dir.join("package.json").exists()
+            || dir.join("node_modules").exists()
+            || dir.join("w3cos.app.json").exists()
+            || dir.join("w3cos.json").exists()
+        {
             return dir;
         }
         if !dir.pop() {
             return start.to_path_buf();
         }
     }
+}
+
+fn load_runtime_modules(project_root: &std::path::Path) -> Result<Vec<String>> {
+    for name in ["w3cos.app.json", "w3cos.json"] {
+        let path = project_root.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("Could not read {}", path.display()))?;
+        let manifest: serde_json::Value = serde_json::from_str(&source)
+            .with_context(|| format!("Invalid JSON manifest {}", path.display()))?;
+        let Some(runtime_modules) = manifest.get("runtime_modules") else {
+            return Ok(Vec::new());
+        };
+        let runtime_modules = runtime_modules.as_array().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} field `runtime_modules` must be an array of ESM specifier strings",
+                path.display()
+            )
+        })?;
+        return runtime_modules
+            .iter()
+            .map(|specifier| {
+                specifier.as_str().map(str::to_string).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} field `runtime_modules` must contain only strings",
+                        path.display()
+                    )
+                })
+            })
+            .collect();
+    }
+    Ok(Vec::new())
 }
 
 fn resolve_css_imports(
@@ -1190,11 +1245,23 @@ console.log("view", view);
         compile(ts, &dir).expect("source should transpile to a diagnostic Rust project");
         let cargo_toml_path = dir.join("Cargo.toml");
         let mut cargo_toml = std::fs::read_to_string(&cargo_toml_path).unwrap();
+        cargo_toml = cargo_toml.replacen(
+            "w3cos-runtime = { path = ",
+            "w3cos-runtime = { default-features = false, path = ",
+            1,
+        );
         cargo_toml.push_str("\n[workspace]\n");
         std::fs::write(&cargo_toml_path, cargo_toml).unwrap();
 
+        // This is a diagnostic compile of generated source, not a dependency
+        // download test. Reuse the workspace artifacts and force offline
+        // resolution so mirror availability cannot turn the expected source
+        // diagnostic into an unrelated registry or Skia failure.
+        let target_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
         let output = std::process::Command::new("cargo")
             .arg("check")
+            .arg("--offline")
+            .env("CARGO_TARGET_DIR", &target_dir)
             .current_dir(&dir)
             .output()
             .expect("cargo check should run");
@@ -1246,7 +1313,9 @@ console.log("view", view);
             "document should map to the jsdom bridge: {bundle_rs}"
         );
         assert!(
-            bundle_rs.contains("w3cos_runtime::jsdom::window_value().get_property(\"setTimeout\")"),
+            bundle_rs.contains(
+                "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value()"
+            ) && bundle_rs.contains("Value::string(\"setTimeout\")"),
             "setTimeout should map to the jsdom window: {bundle_rs}"
         );
         // The fake builtin document must not be imported in generated modules.
@@ -1414,8 +1483,9 @@ export function keymap() {}"#,
             "classes should use the runtime class-factory pattern: {bundle_rs}"
         );
         assert!(
-            bundle_rs.contains("w3cos_core::class::construct(&EditorView()"),
-            "new EditorView() should lower to class::construct: {bundle_rs}"
+            bundle_rs.contains("synchronous function boot compiled from W3IR")
+                && bundle_rs.contains("w3cos_core::intrinsics::construct("),
+            "new EditorView() should lower through the W3IR construct intrinsic: {bundle_rs}"
         );
         assert!(
             bundle_rs.contains("EditorView"),
@@ -1431,8 +1501,9 @@ export function keymap() {}"#,
         );
         // Function bodies should be lowered, not todo!()
         assert!(
-            bundle_rs
-                .contains("w3cos_runtime::jsdom::document_value().call_method(\"createElement\""),
+            bundle_rs.contains("class member EditorView.mount compiled from W3IR")
+                && bundle_rs.contains("w3cos_core::intrinsics::call_method(")
+                && bundle_rs.contains("w3cos_core::Value::string(\"createElement\")"),
             "method body should be lowered: {bundle_rs}"
         );
         assert!(
@@ -1511,6 +1582,31 @@ export function keymap() {}"#,
     }
 
     #[test]
+    fn esm_compile_propagates_w3ir_module_init_failure() {
+        let root = std::env::temp_dir().join("w3cos_esm_w3ir_failure");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.js");
+        std::fs::write(&entry, "export const result = String.raw`not-yet-lowered`;").unwrap();
+
+        let out = root.join("build");
+        let error = compile_from_file(&entry, &out)
+            .expect_err("the production compiler must reject unsupported W3IR module init");
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("W3IR module initialization failed")
+                && diagnostic.contains(&entry.display().to_string())
+                && diagnostic.contains("TaggedTpl"),
+            "production diagnostic must preserve the module and W3IR cause: {diagnostic}"
+        );
+        assert!(
+            !out.join("src/esm_bundle.rs").exists(),
+            "a failed W3IR lowering must not emit a partial or fallback bundle"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn esm_css_import_baked_into_bundle_and_dom_main() {
         let root = std::env::temp_dir().join("w3cos_esm_css_dom_main");
         let _ = std::fs::remove_dir_all(&root);
@@ -1573,8 +1669,13 @@ export function main() {
             "descendant selector text must survive: {bundle_rs}"
         );
         assert!(
-            bundle_rs.contains("pub fn run_entry() -> w3cos_core::Value { register_styles();"),
-            "run_entry must register styles first: {bundle_rs}"
+            bundle_rs.contains("pub fn run_entry_async() -> w3cos_core::Value"),
+            "bundle must expose the unified Promise-shaped launcher: {bundle_rs}"
+        );
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains("let _ = esm_bundle::run_entry_async();"),
+            "generated app must use the Promise-shaped launcher: {main_rs}"
         );
 
         let cargo_toml = std::fs::read_to_string(out.join("Cargo.toml")).unwrap();
@@ -1665,8 +1766,11 @@ createRoot(document.getElementById("root")!).render(App());"#,
         );
         let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs")).unwrap();
         assert!(
-            bundle_rs.contains("createRoot(vec!") && bundle_rs.contains("m0__init();"),
-            "top-level Web bootstrap must execute through module init: {bundle_rs}"
+            bundle_rs.contains("__init_w3ir_0(")
+                && bundle_rs.contains("createRoot_value()")
+                && bundle_rs.contains("w3cos_core::intrinsics::call(")
+                && bundle_rs.contains("m0__init();"),
+            "top-level Web bootstrap must execute through native W3IR module init: {bundle_rs}"
         );
         assert!(
             !bundle_rs.contains("host_modules::call(\"react"),
@@ -1678,6 +1782,45 @@ createRoot(document.getElementById("root")!).render(App());"#,
             1,
             "a path containing `..` must not create a phantom duplicate entry module: {bundle_rs}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn compiler_reads_and_validates_manifest_runtime_modules() {
+        let root = std::env::temp_dir().join("w3cos_manifest_runtime_modules");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("w3cos.app.json"),
+            r#"{"runtime_modules":["runtime:maps","https://cdn.example.test/plugin.js"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_project_root(&root.join("src")),
+            root,
+            "the manifest itself defines the project root"
+        );
+        assert_eq!(
+            load_runtime_modules(&root).unwrap(),
+            [
+                "runtime:maps".to_string(),
+                "https://cdn.example.test/plugin.js".to_string()
+            ]
+        );
+
+        std::fs::write(
+            root.join("w3cos.app.json"),
+            r#"{"runtime_modules":"runtime:maps"}"#,
+        )
+        .unwrap();
+        assert!(
+            load_runtime_modules(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("must be an array")
+        );
+
         std::fs::remove_dir_all(&root).ok();
     }
 }

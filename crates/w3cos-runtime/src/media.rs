@@ -54,6 +54,8 @@ pub enum SizeClass {
 /// A CSS @media query condition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MediaCondition {
+    Always,
+    Never,
     MinWidth(f32),
     MaxWidth(f32),
     MinHeight(f32),
@@ -92,6 +94,8 @@ pub enum ContainerCondition {
 /// Evaluate a @media condition against the current viewport.
 pub fn matches_media(condition: &MediaCondition, viewport: &Viewport) -> bool {
     match condition {
+        MediaCondition::Always => true,
+        MediaCondition::Never => false,
         MediaCondition::MinWidth(w) => viewport.width >= *w,
         MediaCondition::MaxWidth(w) => viewport.width <= *w,
         MediaCondition::MinHeight(h) => viewport.height >= *h,
@@ -129,25 +133,133 @@ pub fn matches_container(condition: &ContainerCondition, width: f32, height: f32
 ///   (orientation: portrait)
 ///   (min-width: 600px) and (max-width: 1024px)
 pub fn parse_media_query(query: &str) -> Option<MediaCondition> {
-    let query = query.trim();
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return Some(MediaCondition::Always);
+    }
+    parse_media_expression(&query)
+}
 
-    if query.contains(") and (") {
-        let parts: Vec<&str> = query.split(") and (").collect();
-        let conditions: Vec<MediaCondition> = parts
-            .iter()
-            .filter_map(|p| {
-                let clean = p.trim_matches(|c| c == '(' || c == ')');
-                parse_single_condition(clean)
-            })
-            .collect();
-        if conditions.is_empty() {
+fn parse_media_expression(query: &str) -> Option<MediaCondition> {
+    if let Some(inner) = strip_outer_parentheses(query)
+        && parse_single_condition(inner).is_none()
+    {
+        return parse_media_expression(inner);
+    }
+    let alternatives = split_media_top_level(query, ',')
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(parse_media_alternative)
+        .collect::<Option<Vec<_>>>()?;
+    match alternatives.as_slice() {
+        [] => None,
+        [condition] => Some(condition.clone()),
+        _ => Some(MediaCondition::Or(alternatives)),
+    }
+}
+
+fn parse_media_alternative(query: &str) -> Option<MediaCondition> {
+    let (negated, query) = query
+        .strip_prefix("not ")
+        .map(|query| (true, query.trim()))
+        .unwrap_or((false, query));
+    let query = query.strip_prefix("only ").unwrap_or(query).trim();
+    let conditions = split_media_and(query)
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(parse_media_term)
+        .collect::<Option<Vec<_>>>()?;
+    let condition = match conditions.as_slice() {
+        [] => return None,
+        [condition] => condition.clone(),
+        _ => MediaCondition::And(conditions),
+    };
+    Some(if negated {
+        MediaCondition::Not(Box::new(condition))
+    } else {
+        condition
+    })
+}
+
+fn parse_media_term(term: &str) -> Option<MediaCondition> {
+    match term {
+        "all" | "screen" => return Some(MediaCondition::Always),
+        "print" | "speech" => return Some(MediaCondition::Never),
+        _ => {}
+    }
+    if let Some(clean) = strip_outer_parentheses(term) {
+        return parse_single_condition(clean).or_else(|| parse_media_expression(clean));
+    }
+    parse_single_condition(term.trim())
+}
+
+fn strip_outer_parentheses(query: &str) -> Option<&str> {
+    let query = query.trim();
+    if !query.starts_with('(') || !query.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0_i32;
+    for (index, byte) in query.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 && index + 1 != query.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        if depth < 0 {
             return None;
         }
-        return Some(MediaCondition::And(conditions));
     }
+    (depth == 0).then(|| query[1..query.len() - 1].trim())
+}
 
-    let clean = query.trim_matches(|c: char| c == '(' || c == ')');
-    parse_single_condition(clean)
+fn split_media_top_level(query: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0_i32;
+    let mut start = 0;
+    for (index, character) in query.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            _ if character == separator && depth == 0 => {
+                parts.push(&query[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&query[start..]);
+    parts
+}
+
+fn split_media_and(query: &str) -> Vec<&str> {
+    let bytes = query.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0_i32;
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        if depth == 0 && bytes[index..].starts_with(b" and ") {
+            parts.push(&query[start..index]);
+            index += " and ".len();
+            start = index;
+            continue;
+        }
+        index += 1;
+    }
+    parts.push(&query[start..]);
+    parts
 }
 
 fn parse_single_condition(s: &str) -> Option<MediaCondition> {
@@ -288,6 +400,32 @@ mod tests {
     fn parse_color_scheme() {
         let cond = parse_media_query("(prefers-color-scheme: dark)").unwrap();
         assert!(matches_media(&cond, &desktop()));
+    }
+
+    #[test]
+    fn parses_media_types_query_lists_and_not() {
+        let responsive =
+            parse_media_query("screen and (min-width: 800px), (orientation: portrait)").unwrap();
+        assert!(matches_media(&responsive, &desktop()));
+        assert!(matches_media(&responsive, &phone()));
+        assert!(matches_media(&responsive, &tablet()));
+        assert!(!matches_media(
+            &responsive,
+            &Viewport::new(700.0, 500.0, 1.0)
+        ));
+
+        assert!(matches_media(
+            &parse_media_query("not print").unwrap(),
+            &desktop()
+        ));
+        assert!(!matches_media(
+            &parse_media_query("print").unwrap(),
+            &desktop()
+        ));
+        assert!(matches_media(
+            &parse_media_query("only screen").unwrap(),
+            &desktop()
+        ));
     }
 
     #[test]

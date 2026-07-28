@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -54,7 +55,8 @@ pub fn highlight_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |this, args| {
             if args.iter().any(|range| !abstract_range(range)) {
                 type_error("Highlight entries must implement AbstractRange");
             }
@@ -63,7 +65,7 @@ pub fn highlight_class() -> Value {
             this.set_property("type", Value::string("highlight"));
             this.set_property(
                 "add",
-                Value::function({
+                realm_function(generation, {
                     let ranges = Rc::clone(&ranges);
                     move |this, args| {
                         let range = arg(&args, 0);
@@ -79,7 +81,7 @@ pub fn highlight_class() -> Value {
             );
             this.set_property(
                 "clear",
-                Value::function({
+                realm_function(generation, {
                     let ranges = Rc::clone(&ranges);
                     move |_, _| {
                         ranges.borrow_mut().clear();
@@ -89,7 +91,7 @@ pub fn highlight_class() -> Value {
             );
             this.set_property(
                 "delete",
-                Value::function({
+                realm_function(generation, {
                     let ranges = Rc::clone(&ranges);
                     move |_, args| {
                         let range = arg(&args, 0);
@@ -102,7 +104,7 @@ pub fn highlight_class() -> Value {
             );
             this.set_property(
                 "has",
-                Value::function({
+                realm_function(generation, {
                     let ranges = Rc::clone(&ranges);
                     move |_, args| {
                         Value::Bool(ranges.borrow().iter().any(|item| item == &arg(&args, 0)))
@@ -112,7 +114,7 @@ pub fn highlight_class() -> Value {
             for name in ["keys", "values"] {
                 this.set_property(
                     name,
-                    Value::function({
+                    realm_function(generation, {
                         let ranges = Rc::clone(&ranges);
                         move |_, _| range_array(&ranges.borrow())
                     }),
@@ -120,7 +122,7 @@ pub fn highlight_class() -> Value {
             }
             this.set_property(
                 "entries",
-                Value::function({
+                realm_function(generation, {
                     let ranges = Rc::clone(&ranges);
                     move |_, _| {
                         Value::array(
@@ -135,7 +137,7 @@ pub fn highlight_class() -> Value {
             );
             this.set_property(
                 "forEach",
-                Value::function({
+                realm_function(generation, {
                     let ranges = Rc::clone(&ranges);
                     move |this, args| {
                         let callback = arg(&args, 0);
@@ -154,14 +156,14 @@ pub fn highlight_class() -> Value {
             );
             this.set_property(
                 "__w3cos_getter_size",
-                Value::function({
+                realm_function(generation, {
                     let ranges = Rc::clone(&ranges);
                     move |_, _| Value::Number(ranges.borrow().len() as f64)
                 }),
             );
             this.set_property(
                 "__w3cos_ranges_snapshot",
-                Value::function({
+                realm_function(generation, {
                     let ranges = Rc::clone(&ranges);
                     move |_, _| range_array(&ranges.borrow())
                 }),
@@ -188,7 +190,10 @@ pub fn highlight_registry_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| type_error("Illegal constructor: HighlightRegistry"));
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
+            type_error("Illegal constructor: HighlightRegistry")
+        });
         class.set_property("name", Value::string("HighlightRegistry"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -218,11 +223,12 @@ pub fn highlight_registry_value() -> Value {
         if let Some(value) = slot.borrow().clone() {
             return value;
         }
+        let generation = crate::jsdom::realm_generation();
         let entries = Rc::new(RefCell::new(HashMap::<String, Value>::new()));
         let value = Value::object(HashMap::new());
         value.set_property(
             "set",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |this, args| {
                     let name = arg(&args, 0).to_js_string();
@@ -238,7 +244,7 @@ pub fn highlight_registry_value() -> Value {
         );
         value.set_property(
             "get",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |_, args| {
                     entries
@@ -251,7 +257,7 @@ pub fn highlight_registry_value() -> Value {
         );
         value.set_property(
             "has",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |_, args| {
                     Value::Bool(entries.borrow().contains_key(&arg(&args, 0).to_js_string()))
@@ -260,7 +266,7 @@ pub fn highlight_registry_value() -> Value {
         );
         value.set_property(
             "delete",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |_, args| {
                     let removed = entries
@@ -276,7 +282,7 @@ pub fn highlight_registry_value() -> Value {
         );
         value.set_property(
             "clear",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |_, _| {
                     if !entries.borrow().is_empty() {
@@ -289,7 +295,7 @@ pub fn highlight_registry_value() -> Value {
         );
         value.set_property(
             "keys",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |_, _| {
                     Value::array(
@@ -304,14 +310,14 @@ pub fn highlight_registry_value() -> Value {
         );
         value.set_property(
             "values",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |_, _| Value::array(entries.borrow().values().cloned().collect())
             }),
         );
         value.set_property(
             "entries",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |_, _| {
                     Value::array(
@@ -328,7 +334,7 @@ pub fn highlight_registry_value() -> Value {
         );
         value.set_property(
             "forEach",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |this, args| {
                     let callback = arg(&args, 0);
@@ -347,7 +353,7 @@ pub fn highlight_registry_value() -> Value {
         );
         value.set_property(
             "highlightsFromPoint",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |_, args| {
                     let x = arg(&args, 0).to_number();
@@ -384,7 +390,7 @@ pub fn highlight_registry_value() -> Value {
         );
         value.set_property(
             "__w3cos_getter_size",
-            Value::function({
+            realm_function(generation, {
                 let entries = Rc::clone(&entries);
                 move |_, _| Value::Number(entries.borrow().len() as f64)
             }),
@@ -396,6 +402,18 @@ pub fn highlight_registry_value() -> Value {
         *slot.borrow_mut() = Some(value.clone());
         value
     })
+}
+
+pub fn reset() {
+    HIGHLIGHT_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    HIGHLIGHT_REGISTRY_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    HIGHLIGHT_REGISTRY.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 #[cfg(test)]
@@ -421,5 +439,65 @@ mod tests {
                 .call_method("delete", vec![Value::string("search-result")])
                 .to_bool()
         );
+    }
+
+    #[test]
+    fn highlights_and_registry_are_realm_owned() {
+        reset();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_range = crate::jsdom::range_value(0, 0, 0, 0);
+        let old_class = highlight_class();
+        let old_registry_class = highlight_registry_class();
+        let old_highlight = w3cos_core::class::construct(&old_class, vec![old_range.clone()]);
+        let old_registry = highlight_registry_value();
+        old_registry.call_method(
+            "set",
+            vec![Value::string("old-result"), old_highlight.clone()],
+        );
+        old_registry_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let new_class = highlight_class();
+        let new_registry_class = highlight_registry_class();
+        let new_registry = highlight_registry_value();
+        assert!(old_class != new_class);
+        assert!(old_registry_class != new_registry_class);
+        assert!(old_registry != new_registry);
+        assert!(
+            new_registry_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert_eq!(new_registry.get_property("size").to_number(), 0.0);
+        assert!(
+            old_registry
+                .call_method("get", vec![Value::string("old-result")])
+                .is_undefined()
+        );
+        assert!(
+            old_highlight
+                .call_method("has", vec![old_range])
+                .is_undefined()
+        );
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+
+        let new_range = crate::jsdom::range_value(0, 0, 0, 0);
+        let new_highlight = w3cos_core::class::construct(&new_class, vec![new_range.clone()]);
+        assert!(new_highlight.call_method("has", vec![new_range]).to_bool());
+        new_registry.call_method(
+            "set",
+            vec![Value::string("new-result"), new_highlight.clone()],
+        );
+        assert!(
+            new_registry.call_method("get", vec![Value::string("new-result")]) == new_highlight
+        );
+        reset();
     }
 }

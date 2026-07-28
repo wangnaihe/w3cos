@@ -1,6 +1,8 @@
 # W3C OS — Mobile (Android / iOS)
 
-RN-like **shell + AOT app** for iOS and Android. **Generic platform only** — product apps live in downstream repos (e.g. aiNativeTms `apps/logidesk-native/`).
+RN-like **shell + AOT app** for iOS and Android. **Generic platform only** —
+product applications and business-specific integrations live in downstream
+repositories.
 
 ## Quick start
 
@@ -41,11 +43,11 @@ See [templates/ios/README.md](../templates/ios/README.md).
 | M4 | W3C Geolocation / getUserMedia | 📋 |
 | M5 | Device IPA + Play Store pipeline | 📋 |
 
-## Downstream (aiNativeTms)
+## Downstream integration
 
 ```bash
-cd apps/logidesk-native
-./build-mobile.sh both    # after w3cos CLI built
+cd path/to/application
+w3cos mobile build --platform both --release
 ```
 
-Bump `vendor/w3cos` submodule when mobile APIs change.
+Pin and update the application's W3COS dependency when mobile APIs change.

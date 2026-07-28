@@ -609,6 +609,14 @@ pub fn navigation_value() -> Value {
     })
 }
 
+/// Release the EventTarget wrapper owned by the current document Realm while
+/// preserving the browsing context's navigation-entry state.
+pub fn reset_realm() {
+    NAVIGATION.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

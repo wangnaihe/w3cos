@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -86,13 +87,16 @@ pub fn credential_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(error("TypeError", "Illegal constructor: Credential"))
         });
         class.set_property("name", Value::string("Credential"));
         class.set_property(
             "isConditionalMediationAvailable",
-            Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::Bool(false)])),
+            realm_function(generation, |_, _| {
+                w3cos_core::promise::resolve(vec![Value::Bool(false)])
+            }),
         );
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -109,7 +113,8 @@ pub fn password_credential_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |this, args| {
             let init = args.first().cloned().unwrap_or(Value::Undefined);
             if !init.is_object() {
                 w3cos_core::throw_value(error(
@@ -148,7 +153,8 @@ pub fn federated_credential_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |this, args| {
             let init = args.first().cloned().unwrap_or(Value::Undefined);
             if !init.is_object() {
                 w3cos_core::throw_value(error(
@@ -188,7 +194,8 @@ pub fn credentials_container_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(error(
                 "TypeError",
                 "Illegal constructor: CredentialsContainer",
@@ -198,7 +205,7 @@ pub fn credentials_container_class() -> Value {
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for method in ["create", "get", "preventSilentAccess", "store"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_function(generation, |_, _| Value::Undefined));
         }
         class.set_property("prototype", prototype);
         *slot.borrow_mut() = Some(class.clone());
@@ -216,7 +223,8 @@ fn illegal_class(
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(move |_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, _| {
             w3cos_core::throw_value(error("TypeError", &format!("Illegal constructor: {name}")))
         });
         class.set_property("name", Value::string(name));
@@ -293,13 +301,14 @@ pub fn public_key_credential_class() -> Value {
             ],
             Some(credential_class().get_property("prototype")),
         );
+        let generation = crate::jsdom::realm_generation();
         for method in [
             "isConditionalMediationAvailable",
             "isUserVerifyingPlatformAuthenticatorAvailable",
         ] {
             class.set_property(
                 method,
-                Value::function(|_, _| {
+                realm_function(generation, |_, _| {
                     warn_secure_store();
                     w3cos_core::promise::resolve(vec![Value::Bool(false)])
                 }),
@@ -307,7 +316,7 @@ pub fn public_key_credential_class() -> Value {
         }
         class.set_property(
             "getClientCapabilities",
-            Value::function(|_, _| {
+            realm_function(generation, |_, _| {
                 warn_secure_store();
                 w3cos_core::promise::resolve(vec![Value::object(HashMap::new())])
             }),
@@ -318,7 +327,9 @@ pub fn public_key_credential_class() -> Value {
         ] {
             class.set_property(
                 method,
-                Value::function(|_, args| args.first().cloned().unwrap_or(Value::Undefined)),
+                realm_function(generation, |_, args| {
+                    args.first().cloned().unwrap_or(Value::Undefined)
+                }),
             );
         }
         for method in [
@@ -328,7 +339,7 @@ pub fn public_key_credential_class() -> Value {
         ] {
             class.set_property(
                 method,
-                Value::function(|_, _| {
+                realm_function(generation, |_, _| {
                     warn_secure_store();
                     w3cos_core::promise::resolve(vec![Value::Undefined])
                 }),
@@ -349,9 +360,10 @@ pub fn digital_credential_class() -> Value {
             &["data", "protocol", "toJSON"],
             Some(credential_class().get_property("prototype")),
         );
+        let generation = crate::jsdom::realm_generation();
         class.set_property(
             "userAgentAllowsProtocol",
-            Value::function(|_, args| {
+            realm_function(generation, |_, args| {
                 let protocol = args.first().cloned().unwrap_or_default().to_js_string();
                 if protocol.trim().is_empty() {
                     return w3cos_core::promise::reject(vec![error(
@@ -378,9 +390,12 @@ pub fn identity_credential_class() -> Value {
             &["configURL", "isAutoSelected", "token"],
             Some(credential_class().get_property("prototype")),
         );
+        let generation = crate::jsdom::realm_generation();
         class.set_property(
             "disconnect",
-            Value::function(|_, _| unavailable_identity_operation("IdentityCredential.disconnect")),
+            realm_function(generation, |_, _| {
+                unavailable_identity_operation("IdentityCredential.disconnect")
+            }),
         );
         class
     })
@@ -391,7 +406,8 @@ pub fn identity_credential_error_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |this, args| {
             let message = args.first().map(Value::to_js_string).unwrap_or_default();
             let options = args.get(1).cloned().unwrap_or(Value::Undefined);
             crate::unsupported::dom_exception_class().call(
@@ -435,7 +451,8 @@ pub fn identity_provider_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(error("TypeError", "Illegal constructor: IdentityProvider"))
         });
         class.set_property("name", Value::string("IdentityProvider"));
@@ -445,7 +462,7 @@ pub fn identity_provider_class() -> Value {
         for method in ["close", "getUserInfo", "resolve"] {
             class.set_property(
                 method,
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     unavailable_identity_operation(&format!("IdentityProvider.{method}"))
                 }),
             );
@@ -456,6 +473,7 @@ pub fn identity_provider_class() -> Value {
 }
 
 pub fn credentials_container_value() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let container = Value::object(HashMap::new());
     w3cos_core::class::set_prototype_of(
         &container,
@@ -463,7 +481,7 @@ pub fn credentials_container_value() -> Value {
     );
     container.set_property(
         "get",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             let options = args.first().cloned().unwrap_or(Value::Undefined);
             if options.is_object()
                 && (!options.get_property("publicKey").is_undefined()
@@ -481,7 +499,7 @@ pub fn credentials_container_value() -> Value {
     );
     container.set_property(
         "create",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             let options = args.first().cloned().unwrap_or(Value::Undefined);
             if !options.is_object() {
                 return w3cos_core::promise::reject(vec![error(
@@ -510,7 +528,7 @@ pub fn credentials_container_value() -> Value {
     );
     container.set_property(
         "store",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             let credential = args.first().cloned().unwrap_or(Value::Undefined);
             if !w3cos_core::class::instance_of(&credential, &credential_class()) {
                 return w3cos_core::promise::reject(vec![error(
@@ -527,12 +545,34 @@ pub fn credentials_container_value() -> Value {
     );
     container.set_property(
         "preventSilentAccess",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             warn_secure_store();
             w3cos_core::promise::resolve(vec![Value::Undefined])
         }),
     );
     container
+}
+
+pub fn reset_realm() {
+    for slot in [
+        &CREDENTIAL_CLASS,
+        &PASSWORD_CREDENTIAL_CLASS,
+        &FEDERATED_CREDENTIAL_CLASS,
+        &CREDENTIALS_CONTAINER_CLASS,
+        &AUTHENTICATOR_RESPONSE_CLASS,
+        &AUTHENTICATOR_ASSERTION_RESPONSE_CLASS,
+        &AUTHENTICATOR_ATTESTATION_RESPONSE_CLASS,
+        &PUBLIC_KEY_CREDENTIAL_CLASS,
+        &OTP_CREDENTIAL_CLASS,
+        &DIGITAL_CREDENTIAL_CLASS,
+        &IDENTITY_CREDENTIAL_CLASS,
+        &IDENTITY_CREDENTIAL_ERROR_CLASS,
+        &IDENTITY_PROVIDER_CLASS,
+    ] {
+        slot.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
 }
 
 #[cfg(test)]
@@ -696,5 +736,81 @@ mod tests {
             );
         w3cos_core::promise::drain_microtasks();
         assert_eq!(&*rejected.borrow(), "NotSupportedError");
+    }
+
+    #[test]
+    fn classes_and_container_entry_points_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_container = credentials_container_value();
+        let old_container_class = credentials_container_class();
+        let old_password_class = password_credential_class();
+        let old_public_key_class = public_key_credential_class();
+        let old_identity_provider_class = identity_provider_class();
+        old_password_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_container = credentials_container_value();
+        let new_container_class = credentials_container_class();
+        let new_password_class = password_credential_class();
+        assert!(!old_container_class.strict_eq(&new_container_class));
+        assert!(!old_password_class.strict_eq(&new_password_class));
+        assert!(
+            new_password_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(
+            old_container
+                .call_method("preventSilentAccess", vec![])
+                .is_undefined()
+        );
+        assert!(
+            old_password_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(
+            old_public_key_class
+                .call_method("getClientCapabilities", vec![])
+                .is_undefined()
+        );
+        assert!(
+            old_identity_provider_class
+                .call_method("getUserInfo", vec![])
+                .is_undefined()
+        );
+
+        let created = Rc::new(RefCell::new(Value::Undefined));
+        let created_for_then = Rc::clone(&created);
+        new_container
+            .call_method(
+                "create",
+                vec![Value::object(HashMap::from([(
+                    "password".into(),
+                    Value::object(HashMap::from([
+                        ("id".into(), Value::string("new-realm")),
+                        ("password".into(), Value::string("secret")),
+                    ])),
+                )]))],
+            )
+            .call_method(
+                "then",
+                vec![Value::function(move |_, args| {
+                    *created_for_then.borrow_mut() = args[0].clone();
+                    Value::Undefined
+                })],
+            );
+        w3cos_core::promise::drain_microtasks();
+        assert!(w3cos_core::class::instance_of(
+            &created.borrow(),
+            &new_password_class
+        ));
+        reset_realm();
     }
 }

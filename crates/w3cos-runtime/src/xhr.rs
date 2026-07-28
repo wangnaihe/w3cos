@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 #[derive(Default)]
@@ -18,6 +19,22 @@ thread_local! {
     static XHR_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static XHR_EVENT_TARGET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static XHR_UPLOAD_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static XHR_INSTANCES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+}
+
+fn realm_xhr_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
+fn install_realm_event_target(value: &Value) {
+    crate::web_events::event_target_class().call(value.clone(), vec![]);
+    for method_name in ["addEventListener", "removeEventListener", "dispatchEvent"] {
+        let method = value.get_property(method_name);
+        value.set_property(
+            method_name,
+            realm_xhr_function(move |this, args| method.call(this, args)),
+        );
+    }
 }
 
 fn dispatch(target: &Value, event_type: &str) {
@@ -47,7 +64,7 @@ pub fn xml_http_request_event_target_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_xhr_function(|_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string(
@@ -84,7 +101,7 @@ pub fn xml_http_request_upload_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_xhr_function(|_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string("Illegal constructor: XMLHttpRequestUpload")],
@@ -105,7 +122,7 @@ pub fn xml_http_request_upload_class() -> Value {
 
 fn upload_value() -> Value {
     let value = Value::object(HashMap::new());
-    crate::web_events::event_target_class().call(value.clone(), vec![]);
+    install_realm_event_target(&value);
     for name in [
         "abort",
         "error",
@@ -129,8 +146,8 @@ pub fn xml_http_request_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, _| {
-            crate::web_events::event_target_class().call(this.clone(), vec![]);
+        let class = realm_xhr_function(|this, _| {
+            install_realm_event_target(&this);
             let state = Rc::new(RefCell::new(XhrState::default()));
             for (name, value) in [
                 ("UNSENT", 0.0),
@@ -167,7 +184,7 @@ pub fn xml_http_request_class() -> Value {
             let open_state = Rc::clone(&state);
             this.set_property(
                 "open",
-                Value::function(move |this, args| {
+                realm_xhr_function(move |this, args| {
                     let mut state = open_state.borrow_mut();
                     state.method = args
                         .first()
@@ -184,7 +201,7 @@ pub fn xml_http_request_class() -> Value {
             let header_state = Rc::clone(&state);
             this.set_property(
                 "setRequestHeader",
-                Value::function(move |_, args| {
+                realm_xhr_function(move |_, args| {
                     header_state.borrow_mut().request_headers.push((
                         args.first().cloned().unwrap_or_default().to_js_string(),
                         args.get(1).cloned().unwrap_or_default().to_js_string(),
@@ -195,7 +212,7 @@ pub fn xml_http_request_class() -> Value {
             let send_state = Rc::clone(&state);
             this.set_property(
                 "send",
-                Value::function(move |this, args| {
+                realm_xhr_function(move |this, args| {
                     dispatch(&this, "loadstart");
                     let upload = this.get_property("upload");
                     dispatch(&upload, "loadstart");
@@ -251,7 +268,7 @@ pub fn xml_http_request_class() -> Value {
             let get_header_state = Rc::clone(&state);
             this.set_property(
                 "getResponseHeader",
-                Value::function(move |_, args| {
+                realm_xhr_function(move |_, args| {
                     get_header_state
                         .borrow()
                         .response_headers
@@ -260,12 +277,15 @@ pub fn xml_http_request_class() -> Value {
             );
             this.set_property(
                 "getAllResponseHeaders",
-                Value::function(|_, _| Value::string("")),
+                realm_xhr_function(|_, _| Value::string("")),
             );
-            this.set_property("overrideMimeType", Value::function(|_, _| Value::Undefined));
+            this.set_property(
+                "overrideMimeType",
+                realm_xhr_function(|_, _| Value::Undefined),
+            );
             this.set_property(
                 "abort",
-                Value::function(|this, _| {
+                realm_xhr_function(|this, _| {
                     this.set_property("readyState", Value::Number(0.0));
                     this.set_property("status", Value::Number(0.0));
                     dispatch(&this, "abort");
@@ -273,6 +293,7 @@ pub fn xml_http_request_class() -> Value {
                     Value::Undefined
                 }),
             );
+            XHR_INSTANCES.with(|instances| instances.borrow_mut().push(this));
             Value::Undefined
         });
         for (name, value) in [
@@ -326,6 +347,60 @@ pub fn xml_http_request_class() -> Value {
     })
 }
 
+pub fn reset_realm() {
+    let instances = XHR_INSTANCES.with(|instances| std::mem::take(&mut *instances.borrow_mut()));
+    for instance in instances {
+        for property in [
+            "onreadystatechange",
+            "onloadstart",
+            "onprogress",
+            "onabort",
+            "onerror",
+            "onload",
+            "ontimeout",
+            "onloadend",
+        ] {
+            instance.set_property(property, Value::Null);
+        }
+        let upload = instance.get_property("upload");
+        for property in [
+            "onabort",
+            "onerror",
+            "onload",
+            "onloadend",
+            "onloadstart",
+            "onprogress",
+            "ontimeout",
+        ] {
+            upload.set_property(property, Value::Null);
+        }
+        for method in ["addEventListener", "removeEventListener", "dispatchEvent"] {
+            upload.set_property(method, Value::Undefined);
+        }
+        for method in [
+            "open",
+            "setRequestHeader",
+            "send",
+            "getResponseHeader",
+            "getAllResponseHeaders",
+            "overrideMimeType",
+            "abort",
+            "addEventListener",
+            "removeEventListener",
+            "dispatchEvent",
+        ] {
+            instance.set_property(method, Value::Undefined);
+        }
+        instance.set_property("response", Value::Null);
+        instance.set_property("upload", Value::Null);
+    }
+    for slot in [&XHR_CLASS, &XHR_EVENT_TARGET_CLASS, &XHR_UPLOAD_CLASS] {
+        slot.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +442,70 @@ mod tests {
         );
         dispatch(&upload, "progress");
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn xhr_resources_and_methods_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_xhr_class = xml_http_request_class();
+        let old_event_target_class = xml_http_request_event_target_class();
+        let old_upload_class = xml_http_request_upload_class();
+        let xhr = w3cos_core::class::construct(&old_xhr_class, vec![]);
+        let upload = xhr.get_property("upload");
+
+        let xhr_marker = Rc::new(());
+        let xhr_marker_weak = Rc::downgrade(&xhr_marker);
+        xhr.call_method(
+            "addEventListener",
+            vec![
+                Value::string("readystatechange"),
+                Value::function(move |_, _| {
+                    let _ = &xhr_marker;
+                    Value::Undefined
+                }),
+            ],
+        );
+        let upload_marker = Rc::new(());
+        let upload_marker_weak = Rc::downgrade(&upload_marker);
+        upload.call_method(
+            "addEventListener",
+            vec![
+                Value::string("progress"),
+                Value::function(move |_, _| {
+                    let _ = &upload_marker;
+                    Value::Undefined
+                }),
+            ],
+        );
+        xhr.call_method(
+            "open",
+            vec![
+                Value::string("GET"),
+                Value::string("https://realm.invalid/data"),
+            ],
+        );
+        assert_eq!(xhr.get_property("readyState").to_u32(), 1);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_xhr_class.strict_eq(&xml_http_request_class()));
+        assert!(!old_event_target_class.strict_eq(&xml_http_request_event_target_class()));
+        assert!(!old_upload_class.strict_eq(&xml_http_request_upload_class()));
+        assert!(old_xhr_class.call(Value::Undefined, vec![]).is_undefined());
+        for method in ["open", "abort", "dispatchEvent"] {
+            assert!(xhr.call_method(method, vec![]).is_undefined());
+        }
+        assert!(upload.call_method("dispatchEvent", vec![]).is_undefined());
+        assert!(xhr.get_property("upload").is_null());
+        assert!(xhr.get_property("response").is_null());
+        assert!(xhr_marker_weak.upgrade().is_none());
+        assert!(upload_marker_weak.upgrade().is_none());
+
+        let fresh = w3cos_core::class::construct(&xml_http_request_class(), vec![]);
+        assert!(fresh.get_property("open").is_function());
+        reset_realm();
     }
 }

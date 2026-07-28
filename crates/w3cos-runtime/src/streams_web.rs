@@ -3,8 +3,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 struct PendingRead {
@@ -63,8 +64,38 @@ thread_local! {
     static TEXT_DECODER_STREAM_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static COMPRESSION_STREAM_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static DECOMPRESSION_STREAM_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static READABLE_STATES: RefCell<Vec<Weak<RefCell<ReadableState>>>> =
+        const { RefCell::new(Vec::new()) };
+    static WRITABLE_STATES: RefCell<Vec<Weak<RefCell<WritableState>>>> =
+        const { RefCell::new(Vec::new()) };
+    static TEE_STATES: RefCell<Vec<Weak<RefCell<TeeState>>>> =
+        const { RefCell::new(Vec::new()) };
+    static VALUE_CELLS: RefCell<Vec<Weak<RefCell<Value>>>> =
+        const { RefCell::new(Vec::new()) };
     static BYOB_WARNING_EMITTED: RefCell<bool> = const { RefCell::new(false) };
     static COMPRESSION_BUFFERING_WARNING_EMITTED: RefCell<bool> = const { RefCell::new(false) };
+}
+
+fn realm_stream_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
+fn track_readable_state(state: &Rc<RefCell<ReadableState>>) {
+    READABLE_STATES.with(|states| states.borrow_mut().push(Rc::downgrade(state)));
+}
+
+fn track_writable_state(state: &Rc<RefCell<WritableState>>) {
+    WRITABLE_STATES.with(|states| states.borrow_mut().push(Rc::downgrade(state)));
+}
+
+fn track_tee_state(state: &Rc<RefCell<TeeState>>) {
+    TEE_STATES.with(|states| states.borrow_mut().push(Rc::downgrade(state)));
+}
+
+fn tracked_value_cell(value: Value) -> Rc<RefCell<Value>> {
+    let cell = Rc::new(RefCell::new(value));
+    VALUE_CELLS.with(|cells| cells.borrow_mut().push(Rc::downgrade(&cell)));
+    cell
 }
 
 fn read_result(value: Value, done: bool) -> Value {
@@ -97,7 +128,7 @@ fn disturb(state: &Rc<RefCell<ReadableState>>) {
 
 fn controller_value(state: &Rc<RefCell<ReadableState>>) -> Value {
     let state_for_enqueue = Rc::clone(state);
-    let enqueue = Value::function(move |_, args| {
+    let enqueue = realm_stream_function(move |_, args| {
         let chunk = args.first().cloned().unwrap_or(Value::Undefined);
         let pending = {
             let mut state = state_for_enqueue.borrow_mut();
@@ -117,7 +148,7 @@ fn controller_value(state: &Rc<RefCell<ReadableState>>) -> Value {
     });
 
     let state_for_close = Rc::clone(state);
-    let close = Value::function(move |_, _| {
+    let close = realm_stream_function(move |_, _| {
         let pending = {
             let mut state = state_for_close.borrow_mut();
             if state.closed || state.error.is_some() {
@@ -135,7 +166,7 @@ fn controller_value(state: &Rc<RefCell<ReadableState>>) -> Value {
     });
 
     let state_for_error = Rc::clone(state);
-    let error = Value::function(move |_, args| {
+    let error = realm_stream_function(move |_, args| {
         let reason = args.first().cloned().unwrap_or(Value::Undefined);
         let pending = {
             let mut state = state_for_error.borrow_mut();
@@ -159,7 +190,7 @@ fn controller_value(state: &Rc<RefCell<ReadableState>>) -> Value {
         ("error".into(), error),
         (
             "__w3cos_getter_desiredSize".into(),
-            Value::function(move |_, _| {
+            realm_stream_function(move |_, _| {
                 let state = state_for_size.borrow();
                 if state.error.is_some() {
                     Value::Null
@@ -185,7 +216,7 @@ fn controller_value(state: &Rc<RefCell<ReadableState>>) -> Value {
 
 fn reader_value(state: Rc<RefCell<ReadableState>>) -> Value {
     let state_for_read = Rc::clone(&state);
-    let read = Value::function(move |_, _| {
+    let read = realm_stream_function(move |_, _| {
         disturb(&state_for_read);
         let immediate = {
             let mut state = state_for_read.borrow_mut();
@@ -234,7 +265,7 @@ fn reader_value(state: Rc<RefCell<ReadableState>>) -> Value {
         }
 
         let state_for_executor = Rc::clone(&state_for_read);
-        w3cos_core::promise::new(vec![Value::function(move |_, args| {
+        w3cos_core::promise::new(vec![realm_stream_function(move |_, args| {
             state_for_executor
                 .borrow_mut()
                 .pending
@@ -247,14 +278,14 @@ fn reader_value(state: Rc<RefCell<ReadableState>>) -> Value {
     });
 
     let state_for_cancel = Rc::clone(&state);
-    let cancel = Value::function(move |_, args| {
+    let cancel = realm_stream_function(move |_, args| {
         cancel_stream(
             &state_for_cancel,
             args.first().cloned().unwrap_or(Value::Undefined),
         )
     });
     let state_for_release = Rc::clone(&state);
-    let release = Value::function(move |_, _| {
+    let release = realm_stream_function(move |_, _| {
         let mut state = state_for_release.borrow_mut();
         if !state.pending.is_empty() {
             type_error("Cannot release a reader with pending read requests");
@@ -319,20 +350,20 @@ fn readable_stream_async_iterator(
 ) -> Value {
     let reader = acquire_reader(state);
     let finished = Rc::new(Cell::new(false));
-    let iterator_slot = Rc::new(RefCell::new(Value::Undefined));
+    let iterator_slot = tracked_value_cell(Value::Undefined);
     let iterator = Value::object(HashMap::new());
 
     let reader_for_next = reader.clone();
     let finished_for_next = Rc::clone(&finished);
     iterator.set_property(
         "next",
-        Value::function(move |_, _| {
+        realm_stream_function(move |_, _| {
             if finished_for_next.get() {
                 return w3cos_core::promise::resolve(vec![read_result(Value::Undefined, true)]);
             }
             let reader = reader_for_next.clone();
             let finished = Rc::clone(&finished_for_next);
-            w3cos_core::promise::new(vec![Value::function(move |_, args| {
+            w3cos_core::promise::new(vec![realm_stream_function(move |_, args| {
                 let resolve = args.first().cloned().unwrap_or(Value::Undefined);
                 let reject = args.get(1).cloned().unwrap_or(Value::Undefined);
                 let reader_for_success = reader.clone();
@@ -342,7 +373,7 @@ fn readable_stream_async_iterator(
                 reader.call_method("read", vec![]).call_method(
                     "then",
                     vec![
-                        Value::function(move |_, args| {
+                        realm_stream_function(move |_, args| {
                             let result = args.first().cloned().unwrap_or(Value::Undefined);
                             if result.get_property("done").to_bool() {
                                 finished_for_success.set(true);
@@ -351,7 +382,7 @@ fn readable_stream_async_iterator(
                             resolve.call(Value::Undefined, vec![result]);
                             Value::Undefined
                         }),
-                        Value::function(move |_, args| {
+                        realm_stream_function(move |_, args| {
                             let reason = args.first().cloned().unwrap_or(Value::Undefined);
                             finished_for_failure.set(true);
                             reader_for_failure.call_method("releaseLock", vec![]);
@@ -369,7 +400,7 @@ fn readable_stream_async_iterator(
     let finished_for_return = Rc::clone(&finished);
     iterator.set_property(
         "return",
-        Value::function(move |_, args| {
+        realm_stream_function(move |_, args| {
             let result = read_result(Value::Undefined, true);
             if finished_for_return.replace(true) {
                 return w3cos_core::promise::resolve(vec![result]);
@@ -380,7 +411,7 @@ fn readable_stream_async_iterator(
                 return w3cos_core::promise::resolve(vec![result]);
             }
             let reader = reader_for_return.clone();
-            w3cos_core::promise::new(vec![Value::function(move |_, args| {
+            w3cos_core::promise::new(vec![realm_stream_function(move |_, args| {
                 let resolve = args.first().cloned().unwrap_or(Value::Undefined);
                 let reject = args.get(1).cloned().unwrap_or(Value::Undefined);
                 let reader_for_success = reader.clone();
@@ -391,12 +422,12 @@ fn readable_stream_async_iterator(
                     .call_method(
                         "then",
                         vec![
-                            Value::function(move |_, _| {
+                            realm_stream_function(move |_, _| {
                                 reader_for_success.call_method("releaseLock", vec![]);
                                 resolve.call(Value::Undefined, vec![result_for_success.clone()]);
                                 Value::Undefined
                             }),
-                            Value::function(move |_, args| {
+                            realm_stream_function(move |_, args| {
                                 reader_for_failure.call_method("releaseLock", vec![]);
                                 reject.call(
                                     Value::Undefined,
@@ -413,7 +444,7 @@ fn readable_stream_async_iterator(
     let iterator_slot_for_method = Rc::clone(&iterator_slot);
     iterator.set_property(
         "__w3cos_symbol_asyncIterator",
-        Value::function(move |_, _| iterator_slot_for_method.borrow().clone()),
+        realm_stream_function(move |_, _| iterator_slot_for_method.borrow().clone()),
     );
     *iterator_slot.borrow_mut() = iterator.clone();
     iterator
@@ -426,14 +457,14 @@ fn pipe_to(state: &Rc<RefCell<ReadableState>>, destination: Value, options: Valu
     let signal = options.get_property("signal");
     let reader = acquire_reader(state);
     let writer = destination.call_method("getWriter", vec![]);
-    w3cos_core::promise::new(vec![Value::function(move |_, args| {
+    w3cos_core::promise::new(vec![realm_stream_function(move |_, args| {
         let resolve = args.first().cloned().unwrap_or(Value::Undefined);
         let reject = args.get(1).cloned().unwrap_or(Value::Undefined);
         let settled = Rc::new(Cell::new(false));
         let settled_for_finish = Rc::clone(&settled);
         let reader_for_finish = reader.clone();
         let writer_for_finish = writer.clone();
-        let finish = Value::function(move |_, args| {
+        let finish = realm_stream_function(move |_, args| {
             if settled_for_finish.replace(true) {
                 return Value::Undefined;
             }
@@ -471,7 +502,7 @@ fn pipe_to(state: &Rc<RefCell<ReadableState>>, destination: Value, options: Valu
             let writer_for_abort = writer.clone();
             let finish_for_abort = finish.clone();
             let settled_for_abort = Rc::clone(&settled);
-            let abort = Value::function(move |_, _| {
+            let abort = realm_stream_function(move |_, _| {
                 if settled_for_abort.get() {
                     return Value::Undefined;
                 }
@@ -498,13 +529,13 @@ fn pipe_to(state: &Rc<RefCell<ReadableState>>, destination: Value, options: Valu
             }
         }
 
-        let pump = Rc::new(RefCell::new(Value::Undefined));
+        let pump = tracked_value_cell(Value::Undefined);
         let pump_for_body = Rc::clone(&pump);
         let reader_for_body = reader.clone();
         let writer_for_body = writer.clone();
         let finish_for_body = finish.clone();
         let settled_for_body = Rc::clone(&settled);
-        *pump.borrow_mut() = Value::function(move |_, _| {
+        *pump.borrow_mut() = realm_stream_function(move |_, _| {
             if settled_for_body.get() {
                 return Value::Undefined;
             }
@@ -519,7 +550,7 @@ fn pipe_to(state: &Rc<RefCell<ReadableState>>, destination: Value, options: Valu
             reader_for_body.call_method("read", vec![]).call_method(
                 "then",
                 vec![
-                    Value::function(move |_, args| {
+                    realm_stream_function(move |_, args| {
                         if settled_for_result.get() {
                             return Value::Undefined;
                         }
@@ -537,13 +568,13 @@ fn pipe_to(state: &Rc<RefCell<ReadableState>>, destination: Value, options: Valu
                                 writer_for_result.call_method("close", vec![]).call_method(
                                     "then",
                                     vec![
-                                        Value::function(move |_, _| {
+                                        realm_stream_function(move |_, _| {
                                             finish_for_close.call(
                                                 Value::Undefined,
                                                 vec![Value::Bool(true), Value::Undefined],
                                             )
                                         }),
-                                        Value::function(move |_, args| {
+                                        realm_stream_function(move |_, args| {
                                             let reason =
                                                 args.first().cloned().unwrap_or(Value::Undefined);
                                             if !prevent_cancel {
@@ -568,7 +599,7 @@ fn pipe_to(state: &Rc<RefCell<ReadableState>>, destination: Value, options: Valu
                                     "then",
                                     vec![
                                         next,
-                                        Value::function(move |_, args| {
+                                        realm_stream_function(move |_, args| {
                                             let reason =
                                                 args.first().cloned().unwrap_or(Value::Undefined);
                                             if !prevent_cancel {
@@ -585,7 +616,7 @@ fn pipe_to(state: &Rc<RefCell<ReadableState>>, destination: Value, options: Valu
                         }
                         Value::Undefined
                     }),
-                    Value::function(move |_, args| {
+                    realm_stream_function(move |_, args| {
                         if settled_for_read_error.get() {
                             return Value::Undefined;
                         }
@@ -613,7 +644,8 @@ fn tee(state: &Rc<RefCell<ReadableState>>) -> Value {
         cancel_waiters: Vec::new(),
         finished: false,
     }));
-    let reader_slot = Rc::new(RefCell::new(Value::Undefined));
+    track_tee_state(&coordination);
+    let reader_slot = tracked_value_cell(Value::Undefined);
     let mut branches = Vec::new();
     for index in 0..2 {
         let coordination_for_start = Rc::clone(&coordination);
@@ -622,7 +654,7 @@ fn tee(state: &Rc<RefCell<ReadableState>>) -> Value {
         let source = Value::object(HashMap::new());
         source.set_property(
             "start",
-            Value::function(move |_, args| {
+            realm_stream_function(move |_, args| {
                 coordination_for_start.borrow_mut().controllers[index] =
                     args.first().cloned().unwrap_or(Value::Undefined);
                 Value::Undefined
@@ -630,7 +662,7 @@ fn tee(state: &Rc<RefCell<ReadableState>>) -> Value {
         );
         source.set_property(
             "cancel",
-            Value::function(move |_, args| {
+            realm_stream_function(move |_, args| {
                 let reason = args.first().cloned().unwrap_or(Value::Undefined);
                 {
                     let mut coordination = coordination_for_cancel.borrow_mut();
@@ -639,7 +671,7 @@ fn tee(state: &Rc<RefCell<ReadableState>>) -> Value {
                 }
                 let coordination_for_executor = Rc::clone(&coordination_for_cancel);
                 let reader_for_executor = Rc::clone(&reader_for_cancel);
-                w3cos_core::promise::new(vec![Value::function(move |_, args| {
+                w3cos_core::promise::new(vec![realm_stream_function(move |_, args| {
                     let resolve = args.first().cloned().unwrap_or(Value::Undefined);
                     let reject = args.get(1).cloned().unwrap_or(Value::Undefined);
                     let reasons = {
@@ -669,7 +701,7 @@ fn tee(state: &Rc<RefCell<ReadableState>>) -> Value {
                             .call_method(
                                 "then",
                                 vec![
-                                    Value::function(move |_, _| {
+                                    realm_stream_function(move |_, _| {
                                         reader_for_success.call_method("releaseLock", vec![]);
                                         let waiters = std::mem::take(
                                             &mut coordination_for_success
@@ -683,7 +715,7 @@ fn tee(state: &Rc<RefCell<ReadableState>>) -> Value {
                                         }
                                         Value::Undefined
                                     }),
-                                    Value::function(move |_, args| {
+                                    realm_stream_function(move |_, args| {
                                         reader_for_error.call_method("releaseLock", vec![]);
                                         let reason =
                                             args.first().cloned().unwrap_or(Value::Undefined);
@@ -708,11 +740,11 @@ fn tee(state: &Rc<RefCell<ReadableState>>) -> Value {
     }
     let reader = acquire_reader(state);
     *reader_slot.borrow_mut() = reader.clone();
-    let pump = Rc::new(RefCell::new(Value::Undefined));
+    let pump = tracked_value_cell(Value::Undefined);
     let pump_for_body = Rc::clone(&pump);
     let coordination_for_body = Rc::clone(&coordination);
     let reader_for_body = reader.clone();
-    *pump.borrow_mut() = Value::function(move |_, _| {
+    *pump.borrow_mut() = realm_stream_function(move |_, _| {
         if coordination_for_body.borrow().finished {
             return Value::Undefined;
         }
@@ -724,7 +756,7 @@ fn tee(state: &Rc<RefCell<ReadableState>>) -> Value {
         reader_for_body.call_method("read", vec![]).call_method(
             "then",
             vec![
-                Value::function(move |_, args| {
+                realm_stream_function(move |_, args| {
                     if coordination_for_result.borrow().finished {
                         return Value::Undefined;
                     }
@@ -773,7 +805,7 @@ fn tee(state: &Rc<RefCell<ReadableState>>) -> Value {
                     }
                     Value::Undefined
                 }),
-                Value::function(move |_, args| {
+                realm_stream_function(move |_, args| {
                     let reason = args.first().cloned().unwrap_or(Value::Undefined);
                     let (controllers, waiters) = {
                         let mut coordination = coordination_for_error.borrow_mut();
@@ -821,18 +853,19 @@ fn stream_value(source: Value, on_disturb: Value) -> Value {
         on_disturb,
         disturbed: false,
     }));
+    track_readable_state(&state);
     let controller = controller_value(&state);
     state.borrow_mut().controller = controller.clone();
     let state_for_locked = Rc::clone(&state);
     let stream = Value::object(HashMap::from([(
         "__w3cos_getter_locked".into(),
-        Value::function(move |_, _| Value::Bool(state_for_locked.borrow().locked)),
+        realm_stream_function(move |_, _| Value::Bool(state_for_locked.borrow().locked)),
     )]));
 
     let state_for_reader = Rc::clone(&state);
     stream.set_property(
         "getReader",
-        Value::function(move |_, options| {
+        realm_stream_function(move |_, options| {
             if options
                 .first()
                 .is_some_and(|value| value.get_property("mode").to_js_string() == "byob")
@@ -875,7 +908,7 @@ fn stream_value(source: Value, on_disturb: Value) -> Value {
     let state_for_cancel = Rc::clone(&state);
     stream.set_property(
         "cancel",
-        Value::function(move |_, args| {
+        realm_stream_function(move |_, args| {
             if state_for_cancel.borrow().locked {
                 type_error("Cannot cancel a locked ReadableStream");
             }
@@ -888,7 +921,7 @@ fn stream_value(source: Value, on_disturb: Value) -> Value {
     let state_for_pipe = Rc::clone(&state);
     stream.set_property(
         "pipeTo",
-        Value::function(move |_, args| {
+        realm_stream_function(move |_, args| {
             pipe_to(
                 &state_for_pipe,
                 args.first().cloned().unwrap_or(Value::Undefined),
@@ -899,7 +932,7 @@ fn stream_value(source: Value, on_disturb: Value) -> Value {
     let state_for_pipe_through = Rc::clone(&state);
     stream.set_property(
         "pipeThrough",
-        Value::function(move |_, args| {
+        realm_stream_function(move |_, args| {
             let pair = args.first().cloned().unwrap_or(Value::Undefined);
             pipe_to(
                 &state_for_pipe_through,
@@ -910,11 +943,14 @@ fn stream_value(source: Value, on_disturb: Value) -> Value {
         }),
     );
     let state_for_tee = Rc::clone(&state);
-    stream.set_property("tee", Value::function(move |_, _| tee(&state_for_tee)));
+    stream.set_property(
+        "tee",
+        realm_stream_function(move |_, _| tee(&state_for_tee)),
+    );
     let state_for_values = Rc::clone(&state);
     stream.set_property(
         "values",
-        Value::function(move |_, args| {
+        realm_stream_function(move |_, args| {
             let prevent_cancel = args
                 .first()
                 .is_some_and(|options| options.get_property("preventCancel").to_bool());
@@ -924,7 +960,7 @@ fn stream_value(source: Value, on_disturb: Value) -> Value {
     let state_for_async_iterator = Rc::clone(&state);
     stream.set_property(
         "__w3cos_symbol_asyncIterator",
-        Value::function(move |_, _| {
+        realm_stream_function(move |_, _| {
             readable_stream_async_iterator(&state_for_async_iterator, false)
         }),
     );
@@ -945,7 +981,7 @@ pub fn readable_stream_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_stream_function(|_, args| {
             stream_value(
                 args.first()
                     .cloned()
@@ -956,7 +992,7 @@ pub fn readable_stream_class() -> Value {
         class.set_property("name", Value::string("ReadableStream"));
         class.set_property(
             "from",
-            Value::function(|_, args| {
+            realm_stream_function(|_, args| {
                 let values = args
                     .first()
                     .cloned()
@@ -967,7 +1003,7 @@ pub fn readable_stream_class() -> Value {
                 let values_for_start = values;
                 source.set_property(
                     "start",
-                    Value::function(move |_, args| {
+                    realm_stream_function(move |_, args| {
                         let controller = args.first().cloned().unwrap_or(Value::Undefined);
                         for value in &values_for_start {
                             controller.call_method("enqueue", vec![value.clone()]);
@@ -989,7 +1025,7 @@ pub fn readable_stream_class() -> Value {
             "tee",
             "values",
         ] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_stream_function(|_, _| Value::Undefined));
         }
         prototype.set_property("locked", Value::Undefined);
         class.set_property("prototype", prototype);
@@ -1003,7 +1039,7 @@ pub fn readable_stream_default_reader_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_stream_function(|_, args| {
             args.first()
                 .cloned()
                 .unwrap_or(Value::Undefined)
@@ -1013,7 +1049,7 @@ pub fn readable_stream_default_reader_class() -> Value {
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for method in ["cancel", "read", "releaseLock"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_stream_function(|_, _| Value::Undefined));
         }
         prototype.set_property("closed", Value::Undefined);
         class.set_property("prototype", prototype);
@@ -1027,14 +1063,14 @@ pub fn readable_stream_default_controller_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_stream_function(|_, _| {
             type_error("ReadableStreamDefaultController cannot be constructed directly")
         });
         class.set_property("name", Value::string("ReadableStreamDefaultController"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for method in ["close", "enqueue", "error"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_stream_function(|_, _| Value::Undefined));
         }
         prototype.set_property("desiredSize", Value::Undefined);
         class.set_property("prototype", prototype);
@@ -1048,7 +1084,7 @@ pub fn readable_stream_byob_reader_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_stream_function(|_, args| {
             let options = Value::object(HashMap::from([("mode".into(), Value::string("byob"))]));
             args.first()
                 .cloned()
@@ -1059,7 +1095,7 @@ pub fn readable_stream_byob_reader_class() -> Value {
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for method in ["cancel", "read", "releaseLock"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_stream_function(|_, _| Value::Undefined));
         }
         prototype.set_property("closed", Value::Undefined);
         class.set_property("prototype", prototype);
@@ -1073,7 +1109,7 @@ pub fn readable_stream_byob_request_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_stream_function(|_, _| {
             type_error("ReadableStreamBYOBRequest cannot be constructed directly")
         });
         class.set_property("name", Value::string("ReadableStreamBYOBRequest"));
@@ -1081,7 +1117,7 @@ pub fn readable_stream_byob_request_class() -> Value {
         prototype.set_property("constructor", class.clone());
         prototype.set_property("view", Value::Undefined);
         for method in ["respond", "respondWithNewView"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_stream_function(|_, _| Value::Undefined));
         }
         class.set_property("prototype", prototype);
         *slot.borrow_mut() = Some(class.clone());
@@ -1094,14 +1130,14 @@ pub fn readable_byte_stream_controller_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_stream_function(|_, _| {
             type_error("ReadableByteStreamController cannot be constructed directly")
         });
         class.set_property("name", Value::string("ReadableByteStreamController"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for method in ["close", "enqueue", "error"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_stream_function(|_, _| Value::Undefined));
         }
         for property in ["byobRequest", "desiredSize"] {
             prototype.set_property(property, Value::Undefined);
@@ -1117,7 +1153,7 @@ fn writable_controller_value(state: &Rc<RefCell<WritableState>>) -> Value {
     let controller = Value::object(HashMap::from([
         (
             "error".into(),
-            Value::function(move |_, args| {
+            realm_stream_function(move |_, args| {
                 let mut state = state_for_error.borrow_mut();
                 if state.error.is_none() && !state.closed {
                     state.error = Some(args.first().cloned().unwrap_or(Value::Undefined));
@@ -1217,7 +1253,7 @@ fn writer_value(state: Rc<RefCell<WritableState>>) -> Value {
     let writer = Value::object(HashMap::from([
         (
             "write".into(),
-            Value::function(move |_, args| {
+            realm_stream_function(move |_, args| {
                 write_chunk(
                     &state_for_write,
                     args.first().cloned().unwrap_or(Value::Undefined),
@@ -1226,11 +1262,11 @@ fn writer_value(state: Rc<RefCell<WritableState>>) -> Value {
         ),
         (
             "close".into(),
-            Value::function(move |_, _| close_writable(&state_for_close)),
+            realm_stream_function(move |_, _| close_writable(&state_for_close)),
         ),
         (
             "abort".into(),
-            Value::function(move |_, args| {
+            realm_stream_function(move |_, args| {
                 abort_writable(
                     &state_for_abort,
                     args.first().cloned().unwrap_or(Value::Undefined),
@@ -1239,14 +1275,14 @@ fn writer_value(state: Rc<RefCell<WritableState>>) -> Value {
         ),
         (
             "releaseLock".into(),
-            Value::function(move |_, _| {
+            realm_stream_function(move |_, _| {
                 state_for_release.borrow_mut().locked = false;
                 Value::Undefined
             }),
         ),
         (
             "__w3cos_getter_desiredSize".into(),
-            Value::function(move |_, _| {
+            realm_stream_function(move |_, _| {
                 if state_for_size.borrow().error.is_some() {
                     Value::Null
                 } else {
@@ -1274,17 +1310,18 @@ fn writable_value(sink: Value) -> Value {
         closed: false,
         error: None,
     }));
+    track_writable_state(&state);
     let controller = writable_controller_value(&state);
     state.borrow_mut().controller = controller.clone();
     let state_for_locked = Rc::clone(&state);
     let stream = Value::object(HashMap::from([(
         "__w3cos_getter_locked".into(),
-        Value::function(move |_, _| Value::Bool(state_for_locked.borrow().locked)),
+        realm_stream_function(move |_, _| Value::Bool(state_for_locked.borrow().locked)),
     )]));
     let state_for_writer = Rc::clone(&state);
     stream.set_property(
         "getWriter",
-        Value::function(move |_, _| {
+        realm_stream_function(move |_, _| {
             {
                 let mut state = state_for_writer.borrow_mut();
                 if state.locked {
@@ -1298,7 +1335,7 @@ fn writable_value(sink: Value) -> Value {
     let state_for_abort = Rc::clone(&state);
     stream.set_property(
         "abort",
-        Value::function(move |_, args| {
+        realm_stream_function(move |_, args| {
             if state_for_abort.borrow().locked {
                 type_error("Cannot abort a locked WritableStream");
             }
@@ -1311,7 +1348,7 @@ fn writable_value(sink: Value) -> Value {
     let state_for_close = Rc::clone(&state);
     stream.set_property(
         "close",
-        Value::function(move |_, _| {
+        realm_stream_function(move |_, _| {
             if state_for_close.borrow().locked {
                 type_error("Cannot close a locked WritableStream");
             }
@@ -1334,7 +1371,7 @@ pub fn writable_stream_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_stream_function(|_, args| {
             writable_value(
                 args.first()
                     .cloned()
@@ -1345,7 +1382,7 @@ pub fn writable_stream_class() -> Value {
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for method in ["abort", "close", "getWriter"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_stream_function(|_, _| Value::Undefined));
         }
         prototype.set_property("locked", Value::Undefined);
         class.set_property("prototype", prototype);
@@ -1359,7 +1396,7 @@ pub fn writable_stream_default_writer_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_stream_function(|_, args| {
             args.first()
                 .cloned()
                 .unwrap_or(Value::Undefined)
@@ -1369,7 +1406,7 @@ pub fn writable_stream_default_writer_class() -> Value {
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for method in ["abort", "close", "releaseLock", "write"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_stream_function(|_, _| Value::Undefined));
         }
         for property in ["closed", "desiredSize", "ready"] {
             prototype.set_property(property, Value::Undefined);
@@ -1385,13 +1422,13 @@ pub fn writable_stream_default_controller_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_stream_function(|_, _| {
             type_error("WritableStreamDefaultController cannot be constructed directly")
         });
         class.set_property("name", Value::string("WritableStreamDefaultController"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
-        prototype.set_property("error", Value::function(|_, _| Value::Undefined));
+        prototype.set_property("error", realm_stream_function(|_, _| Value::Undefined));
         prototype.set_property("signal", Value::Undefined);
         class.set_property("prototype", prototype);
         *slot.borrow_mut() = Some(class.clone());
@@ -1404,14 +1441,14 @@ pub fn transform_stream_default_controller_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_stream_function(|_, _| {
             type_error("TransformStreamDefaultController cannot be constructed directly")
         });
         class.set_property("name", Value::string("TransformStreamDefaultController"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for method in ["enqueue", "error", "terminate"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_stream_function(|_, _| Value::Undefined));
         }
         prototype.set_property("desiredSize", Value::Undefined);
         class.set_property("prototype", prototype);
@@ -1425,16 +1462,16 @@ pub fn transform_stream_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_stream_function(|_, args| {
             let transformer = args
                 .first()
                 .cloned()
                 .unwrap_or_else(|| Value::object(HashMap::new()));
-            let readable_controller = Rc::new(RefCell::new(Value::Undefined));
+            let readable_controller = tracked_value_cell(Value::Undefined);
             let controller_for_start = Rc::clone(&readable_controller);
             let readable_source = Value::object(HashMap::from([(
                 "start".into(),
-                Value::function(move |_, args| {
+                realm_stream_function(move |_, args| {
                     *controller_for_start.borrow_mut() =
                         args.first().cloned().unwrap_or(Value::Undefined);
                     Value::Undefined
@@ -1446,7 +1483,7 @@ pub fn transform_stream_class() -> Value {
             let transform_controller = Value::object(HashMap::new());
             transform_controller.set_property(
                 "enqueue",
-                Value::function(move |_, args| {
+                realm_stream_function(move |_, args| {
                     controller_target.borrow().call_method(
                         "enqueue",
                         vec![args.first().cloned().unwrap_or(Value::Undefined)],
@@ -1456,7 +1493,7 @@ pub fn transform_stream_class() -> Value {
             let controller_target = Rc::clone(&readable_controller);
             transform_controller.set_property(
                 "error",
-                Value::function(move |_, args| {
+                realm_stream_function(move |_, args| {
                     controller_target.borrow().call_method(
                         "error",
                         vec![args.first().cloned().unwrap_or(Value::Undefined)],
@@ -1466,7 +1503,7 @@ pub fn transform_stream_class() -> Value {
             let controller_target = Rc::clone(&readable_controller);
             transform_controller.set_property(
                 "terminate",
-                Value::function(move |_, _| {
+                realm_stream_function(move |_, _| {
                     controller_target.borrow().call_method("close", vec![])
                 }),
             );
@@ -1480,7 +1517,7 @@ pub fn transform_stream_class() -> Value {
             let sink = Value::object(HashMap::new());
             sink.set_property(
                 "write",
-                Value::function(move |_, args| {
+                realm_stream_function(move |_, args| {
                     let chunk = args.first().cloned().unwrap_or(Value::Undefined);
                     let transform = transformer_for_write.get_property("transform");
                     if transform.is_function() {
@@ -1497,7 +1534,7 @@ pub fn transform_stream_class() -> Value {
             let controller_for_close = transform_controller;
             sink.set_property(
                 "close",
-                Value::function(move |_, _| {
+                realm_stream_function(move |_, _| {
                     let flush = transformer_for_close.get_property("flush");
                     if flush.is_function() {
                         flush.call(
@@ -1545,7 +1582,7 @@ fn queuing_strategy_class(byte_length: bool) -> Value {
         } else {
             "CountQueuingStrategy"
         };
-        let class = Value::function(move |_, args| {
+        let class = realm_stream_function(move |_, args| {
             let init = args.first().cloned().unwrap_or(Value::Undefined);
             let high_water_mark = init.get_property("highWaterMark").to_number();
             if !high_water_mark.is_finite() || high_water_mark < 0.0 {
@@ -1557,7 +1594,7 @@ fn queuing_strategy_class(byte_length: bool) -> Value {
             )]));
             strategy.set_property(
                 "size",
-                Value::function(move |_, args| {
+                realm_stream_function(move |_, args| {
                     if byte_length {
                         Value::Number(
                             args.first()
@@ -1581,7 +1618,7 @@ fn queuing_strategy_class(byte_length: bool) -> Value {
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         prototype.set_property("highWaterMark", Value::Undefined);
-        prototype.set_property("size", Value::function(|_, _| Value::Undefined));
+        prototype.set_property("size", realm_stream_function(|_, _| Value::Undefined));
         class.set_property("prototype", prototype);
         *slot.borrow_mut() = Some(class.clone());
         class
@@ -1601,12 +1638,12 @@ pub fn text_encoder_stream_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_stream_function(|_, _| {
             let encoder =
                 w3cos_core::class::construct(&crate::text_encoding::text_encoder_class(), vec![]);
             let transformer = Value::object(HashMap::from([(
                 "transform".into(),
-                Value::function(move |_, args| {
+                realm_stream_function(move |_, args| {
                     let encoded = encoder.call_method(
                         "encode",
                         vec![Value::string(
@@ -1648,7 +1685,7 @@ pub fn text_decoder_stream_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let class = realm_stream_function(|_, args| {
             let label = args.first().cloned().unwrap_or(Value::Undefined);
             let label = if label.is_undefined() {
                 Value::string("utf-8")
@@ -1669,7 +1706,7 @@ pub fn text_decoder_stream_class() -> Value {
             let transformer = Value::object(HashMap::from([
                 (
                     "transform".into(),
-                    Value::function(move |_, args| {
+                    realm_stream_function(move |_, args| {
                         let chunk = args.first().cloned().unwrap_or(Value::Undefined);
                         let Some(bytes) = w3cos_core::binary::bytes_of(&chunk) else {
                             args.get(1)
@@ -1695,7 +1732,7 @@ pub fn text_decoder_stream_class() -> Value {
                 ),
                 (
                     "flush".into(),
-                    Value::function(move |_, args| {
+                    realm_stream_function(move |_, args| {
                         let bytes = std::mem::take(&mut *buffered.borrow_mut());
                         let chunk = w3cos_core::binary::typed_array_value(
                             bytes
@@ -1800,7 +1837,7 @@ fn compression_stream_class_inner(decompress: bool) -> Value {
         } else {
             "CompressionStream"
         };
-        let class = Value::function(move |_, args| {
+        let class = realm_stream_function(move |_, args| {
             let format = args
                 .first()
                 .cloned()
@@ -1827,7 +1864,7 @@ fn compression_stream_class_inner(decompress: bool) -> Value {
             let transformer = Value::object(HashMap::from([
                 (
                     "transform".into(),
-                    Value::function(move |_, args| {
+                    realm_stream_function(move |_, args| {
                         let chunk = args.first().cloned().unwrap_or(Value::Undefined);
                         let Some(bytes) = w3cos_core::binary::bytes_of(&chunk) else {
                             args.get(1)
@@ -1853,7 +1890,7 @@ fn compression_stream_class_inner(decompress: bool) -> Value {
                 ),
                 (
                     "flush".into(),
-                    Value::function(move |_, args| {
+                    realm_stream_function(move |_, args| {
                         let bytes = std::mem::take(&mut *buffered.borrow_mut());
                         let controller = args.first().cloned().unwrap_or(Value::Undefined);
                         match codec_bytes(&format_for_flush, &bytes, decompress) {
@@ -1921,7 +1958,7 @@ pub fn from_bytes(bytes: Vec<u8>, on_disturb: Value) -> Value {
     let source = Value::object(HashMap::new());
     source.set_property(
         "start",
-        Value::function(move |_, args| {
+        realm_stream_function(move |_, args| {
             let controller = args.first().cloned().unwrap_or(Value::Undefined);
             if chunk.get_property("length").to_number() > 0.0 {
                 controller.call_method("enqueue", vec![chunk.clone()]);
@@ -1933,10 +1970,234 @@ pub fn from_bytes(bytes: Vec<u8>, on_disturb: Value) -> Value {
     stream_value(source, on_disturb)
 }
 
+pub fn reset_realm() {
+    VALUE_CELLS.with(|cells| {
+        for cell in cells.borrow_mut().drain(..) {
+            if let Some(cell) = cell.upgrade() {
+                *cell.borrow_mut() = Value::Undefined;
+            }
+        }
+    });
+    TEE_STATES.with(|states| {
+        for state in states.borrow_mut().drain(..) {
+            if let Some(state) = state.upgrade() {
+                let mut state = state.borrow_mut();
+                state.controllers.clear();
+                state.reasons.clear();
+                state.cancel_waiters.clear();
+                state.canceled = [true, true];
+                state.finished = true;
+            }
+        }
+    });
+    READABLE_STATES.with(|states| {
+        for state in states.borrow_mut().drain(..) {
+            if let Some(state) = state.upgrade() {
+                let mut state = state.borrow_mut();
+                state.queue.clear();
+                state.pending.clear();
+                state.closed = true;
+                state.error = None;
+                state.locked = false;
+                state.source = Value::Undefined;
+                state.controller = Value::Undefined;
+                state.on_disturb = Value::Undefined;
+                state.disturbed = true;
+            }
+        }
+    });
+    WRITABLE_STATES.with(|states| {
+        for state in states.borrow_mut().drain(..) {
+            if let Some(state) = state.upgrade() {
+                let mut state = state.borrow_mut();
+                state.sink = Value::Undefined;
+                state.controller = Value::Undefined;
+                state.locked = false;
+                state.closed = true;
+                state.error = None;
+            }
+        }
+    });
+    for slot in [
+        &READABLE_STREAM_CLASS,
+        &DEFAULT_READER_CLASS,
+        &DEFAULT_CONTROLLER_CLASS,
+        &BYOB_READER_CLASS,
+        &BYOB_REQUEST_CLASS,
+        &BYTE_CONTROLLER_CLASS,
+        &WRITABLE_STREAM_CLASS,
+        &DEFAULT_WRITER_CLASS,
+        &WRITABLE_CONTROLLER_CLASS,
+        &TRANSFORM_STREAM_CLASS,
+        &TRANSFORM_CONTROLLER_CLASS,
+        &COUNT_QUEUING_STRATEGY_CLASS,
+        &BYTE_LENGTH_QUEUING_STRATEGY_CLASS,
+        &TEXT_ENCODER_STREAM_CLASS,
+        &TEXT_DECODER_STREAM_CLASS,
+        &COMPRESSION_STREAM_CLASS,
+        &DECOMPRESSION_STREAM_CLASS,
+    ] {
+        slot.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn stream_classes_states_and_async_pumps_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_classes = vec![
+            readable_stream_class(),
+            readable_stream_default_reader_class(),
+            readable_stream_default_controller_class(),
+            readable_stream_byob_reader_class(),
+            readable_stream_byob_request_class(),
+            readable_byte_stream_controller_class(),
+            writable_stream_class(),
+            writable_stream_default_writer_class(),
+            writable_stream_default_controller_class(),
+            transform_stream_class(),
+            transform_stream_default_controller_class(),
+            count_queuing_strategy_class(),
+            byte_length_queuing_strategy_class(),
+            text_encoder_stream_class(),
+            text_decoder_stream_class(),
+            compression_stream_class(),
+            decompression_stream_class(),
+        ];
+
+        let source_controller = Rc::new(RefCell::new(Value::Undefined));
+        let source_controller_for_start = Rc::clone(&source_controller);
+        let source_marker = Rc::new(());
+        let source_marker_weak = Rc::downgrade(&source_marker);
+        let source = Value::object(HashMap::new());
+        source.set_property(
+            "start",
+            Value::function(move |_, args| {
+                let _ = &source_marker;
+                *source_controller_for_start.borrow_mut() =
+                    args.first().cloned().unwrap_or(Value::Undefined);
+                Value::Undefined
+            }),
+        );
+        let old_readable =
+            w3cos_core::class::construct(&readable_stream_class(), vec![source.clone()]);
+        let old_reader = old_readable.call_method("getReader", vec![]);
+        let pending_read = old_reader.call_method("read", vec![]);
+        assert!(pending_read.is_object());
+        let readable_state =
+            READABLE_STATES.with(|states| states.borrow().last().cloned().unwrap());
+        assert_eq!(readable_state.upgrade().unwrap().borrow().pending.len(), 1);
+        drop(source);
+
+        let sink_marker = Rc::new(());
+        let sink_marker_weak = Rc::downgrade(&sink_marker);
+        let sink = Value::object(HashMap::new());
+        sink.set_property(
+            "write",
+            Value::function(move |_, _| {
+                let _ = &sink_marker;
+                Value::Undefined
+            }),
+        );
+        let old_writable =
+            w3cos_core::class::construct(&writable_stream_class(), vec![sink.clone()]);
+        let old_writer = old_writable.call_method("getWriter", vec![]);
+        let writable_state =
+            WRITABLE_STATES.with(|states| states.borrow().last().cloned().unwrap());
+        drop(sink);
+
+        let tee_source = Value::object(HashMap::new());
+        let tee_stream = w3cos_core::class::construct(&readable_stream_class(), vec![tee_source]);
+        let branches = tee_stream.call_method("tee", vec![]);
+        assert_eq!(branches.get_property("length").to_number(), 2.0);
+        let tee_state = TEE_STATES.with(|states| states.borrow().last().cloned().unwrap());
+        let pump_cell = VALUE_CELLS.with(|cells| cells.borrow().last().cloned().unwrap());
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let new_classes = vec![
+            readable_stream_class(),
+            readable_stream_default_reader_class(),
+            readable_stream_default_controller_class(),
+            readable_stream_byob_reader_class(),
+            readable_stream_byob_request_class(),
+            readable_byte_stream_controller_class(),
+            writable_stream_class(),
+            writable_stream_default_writer_class(),
+            writable_stream_default_controller_class(),
+            transform_stream_class(),
+            transform_stream_default_controller_class(),
+            count_queuing_strategy_class(),
+            byte_length_queuing_strategy_class(),
+            text_encoder_stream_class(),
+            text_decoder_stream_class(),
+            compression_stream_class(),
+            decompression_stream_class(),
+        ];
+        assert!(
+            old_classes
+                .iter()
+                .zip(&new_classes)
+                .all(|(old, new)| !old.strict_eq(new))
+        );
+        assert!(
+            old_classes
+                .first()
+                .unwrap()
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(old_reader.call_method("read", vec![]).is_undefined());
+        assert!(
+            old_writer
+                .call_method("write", vec![Value::Number(1.0)])
+                .is_undefined()
+        );
+        assert!(
+            source_controller
+                .borrow()
+                .call_method("enqueue", vec![Value::Number(1.0)])
+                .is_undefined()
+        );
+
+        let readable_state = readable_state.upgrade().unwrap();
+        let readable_state = readable_state.borrow();
+        assert!(readable_state.closed);
+        assert!(readable_state.pending.is_empty());
+        assert!(readable_state.queue.is_empty());
+        assert!(readable_state.source.is_undefined());
+        assert!(readable_state.controller.is_undefined());
+        drop(readable_state);
+        let writable_state = writable_state.upgrade().unwrap();
+        let writable_state = writable_state.borrow();
+        assert!(writable_state.closed);
+        assert!(writable_state.sink.is_undefined());
+        assert!(writable_state.controller.is_undefined());
+        drop(writable_state);
+        if let Some(tee_state) = tee_state.upgrade() {
+            let tee_state = tee_state.borrow();
+            assert!(tee_state.finished);
+            assert!(tee_state.controllers.is_empty());
+            assert!(tee_state.cancel_waiters.is_empty());
+        }
+        if let Some(pump_cell) = pump_cell.upgrade() {
+            assert!(pump_cell.borrow().is_undefined());
+        }
+        assert!(source_marker_weak.upgrade().is_none());
+        assert!(sink_marker_weak.upgrade().is_none());
+
+        assert!(w3cos_core::class::construct(&readable_stream_class(), vec![]).is_object());
+        reset_realm();
+    }
 
     #[test]
     fn readable_stream_enqueues_reads_closes_locks_and_disturbs() {

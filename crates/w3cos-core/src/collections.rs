@@ -16,17 +16,18 @@
 //! `builtins::Map` stringified keys, collapsing every function onto one
 //! entry and corrupting the service graph.
 //!
-//! The backing store is a `Vec` scanned linearly so **insertion order** is
-//! preserved for `forEach` / `entries` / `keys` / `values` and for
-//! `for … of` / spread ([`Value::iter`] delegates to [`iter_collection`]).
+//! The backing store is a tombstone-preserving `Vec` scanned linearly so
+//! **insertion order** is preserved. `forEach` and collection iterators are
+//! live: they skip deleted slots, visit later additions, and revisit a value
+//! deleted and reinserted after the cursor. AOT [`Value::iter`] and dynamic
+//! W3IR iterator objects both consume the same [`crate::value::ValueIterator`]
+//! over this insertion sequence.
 //!
 //! v1 limitations:
 //! - `entries()` / `keys()` / `values()` return plain **arrays**, not
 //!   iterator objects — `next()`-style iterator protocol is not supported.
 //!   `for … of` and spread still work because they lower to `Value::iter`.
 //! - The id registry never reclaims ids of dropped instances.
-//! - `forEach` iterates a snapshot: entries added during the callback are
-//!   not visited (deletions/mutations still land in the store).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -39,10 +40,23 @@ const MAP_STATE_KEY: &str = "__w3cos_map_id";
 /// Hidden own property holding a Set instance's registry id.
 const SET_STATE_KEY: &str = "__w3cos_set_id";
 
-/// Map backing store: insertion-ordered key/value entries.
-type MapEntries = Vec<(Value, Value)>;
-/// Set backing store: insertion-ordered values.
-type SetValues = Vec<Value>;
+#[derive(Clone)]
+struct MapEntry {
+    key: Value,
+    value: Value,
+    active: bool,
+}
+
+#[derive(Clone)]
+struct SetEntry {
+    value: Value,
+    active: bool,
+}
+
+/// Map/Set stores retain tombstones so live iterators keep a stable cursor
+/// across deletion, clear, and delete-then-reinsert operations.
+type MapEntries = Vec<MapEntry>;
+type SetValues = Vec<SetEntry>;
 
 thread_local! {
     /// Map registries keyed by the id stored under [`MAP_STATE_KEY`].
@@ -101,14 +115,14 @@ fn set_state_of(value: &Value) -> Option<Rc<RefCell<SetValues>>> {
 fn find_index(entries: &MapEntries, key: &Value) -> Option<usize> {
     entries
         .iter()
-        .position(|(stored, _)| stored.same_value_zero(key))
+        .position(|entry| entry.active && entry.key.same_value_zero(key))
 }
 
 /// Index of `item` in a Set store, by SameValueZero.
 fn set_index(values: &SetValues, item: &Value) -> Option<usize> {
     values
         .iter()
-        .position(|stored| stored.same_value_zero(item))
+        .position(|entry| entry.active && entry.value.same_value_zero(item))
 }
 
 // ── Map ──────────────────────────────────────────────────────────────────
@@ -118,8 +132,12 @@ fn set_index(values: &SetValues, item: &Value) -> Option<usize> {
 fn map_set(entries: &Rc<RefCell<MapEntries>>, key: Value, value: Value) {
     let mut entries = entries.borrow_mut();
     match find_index(&entries, &key) {
-        Some(index) => entries[index].1 = value,
-        None => entries.push((key, value)),
+        Some(index) => entries[index].value = value,
+        None => entries.push(MapEntry {
+            key,
+            value,
+            active: true,
+        }),
     }
 }
 
@@ -144,13 +162,23 @@ fn map_instance(args: &[Value], proto: &Value) -> Value {
 /// tolerated as empty (JS would throw a TypeError; the runtime stays total).
 fn seed_map(entries: &Rc<RefCell<MapEntries>>, seed: &Value) {
     if let Some(other) = map_state_of(seed) {
-        let copied: MapEntries = other.borrow().clone();
+        let copied = other
+            .borrow()
+            .iter()
+            .filter(|entry| entry.active)
+            .cloned()
+            .collect::<MapEntries>();
         entries.borrow_mut().extend(copied);
         return;
     }
     for pair in seed.iter() {
+        if !pair.is_array() {
+            // Keep the runtime's total behavior for malformed entries. A
+            // string is iterable too, but its yielded characters are not
+            // valid Map entry objects.
+            continue;
+        }
         let mut items = pair.iter();
-        // Pairs that are not arrays are skipped rather than throwing.
         let Some(key) = items.next() else { continue };
         let value = items.next().unwrap_or(Value::Undefined);
         map_set(entries, key, value);
@@ -164,7 +192,7 @@ fn map_proto_get(this: Value, args: Vec<Value>) -> Value {
     let key = args.first().cloned().unwrap_or(Value::Undefined);
     let entries = entries.borrow();
     find_index(&entries, &key)
-        .map(|index| entries[index].1.clone())
+        .map(|index| entries[index].value.clone())
         .unwrap_or(Value::Undefined)
 }
 
@@ -194,7 +222,7 @@ fn map_proto_delete(this: Value, args: Vec<Value>) -> Value {
     let mut entries = entries.borrow_mut();
     match find_index(&entries, &key) {
         Some(index) => {
-            entries.remove(index);
+            entries[index].active = false;
             Value::Bool(true)
         }
         None => Value::Bool(false),
@@ -203,7 +231,9 @@ fn map_proto_delete(this: Value, args: Vec<Value>) -> Value {
 
 fn map_proto_clear(this: Value, _args: Vec<Value>) -> Value {
     if let Some(entries) = map_state_of(&this) {
-        entries.borrow_mut().clear();
+        for entry in entries.borrow_mut().iter_mut() {
+            entry.active = false;
+        }
     }
     Value::Undefined
 }
@@ -213,10 +243,19 @@ fn map_proto_for_each(this: Value, args: Vec<Value>) -> Value {
         return Value::Undefined;
     };
     let callback = args.first().cloned().unwrap_or(Value::Undefined);
-    // Snapshot (bound first so the borrow ends here): a callback mutating
-    // the map must not trip the RefCell borrow.
-    let snapshot: MapEntries = entries.borrow().clone();
-    for (key, value) in snapshot {
+    let mut index = 0;
+    loop {
+        let next = {
+            let entries = entries.borrow();
+            while index < entries.len() && !entries[index].active {
+                index += 1;
+            }
+            entries.get(index).map(|entry| {
+                index += 1;
+                (entry.key.clone(), entry.value.clone())
+            })
+        };
+        let Some((key, value)) = next else { break };
         callback.call(Value::Undefined, vec![value, key, this.clone()]);
     }
     Value::Undefined
@@ -230,7 +269,8 @@ fn map_proto_entries(this: Value, _args: Vec<Value>) -> Value {
         entries
             .borrow()
             .iter()
-            .map(|(key, value)| Value::array(vec![key.clone(), value.clone()]))
+            .filter(|entry| entry.active)
+            .map(|entry| Value::array(vec![entry.key.clone(), entry.value.clone()]))
             .collect(),
     )
 }
@@ -243,7 +283,8 @@ fn map_proto_keys(this: Value, _args: Vec<Value>) -> Value {
         entries
             .borrow()
             .iter()
-            .map(|(key, _)| key.clone())
+            .filter(|entry| entry.active)
+            .map(|entry| entry.key.clone())
             .collect(),
     )
 }
@@ -256,14 +297,17 @@ fn map_proto_values(this: Value, _args: Vec<Value>) -> Value {
         entries
             .borrow()
             .iter()
-            .map(|(_, value)| value.clone())
+            .filter(|entry| entry.active)
+            .map(|entry| entry.value.clone())
             .collect(),
     )
 }
 
 fn map_proto_size(this: Value, _args: Vec<Value>) -> Value {
     map_state_of(&this)
-        .map(|entries| Value::Number(entries.borrow().len() as f64))
+        .map(|entries| {
+            Value::Number(entries.borrow().iter().filter(|entry| entry.active).count() as f64)
+        })
         .unwrap_or(Value::Undefined)
 }
 
@@ -273,7 +317,10 @@ fn map_proto_size(this: Value, _args: Vec<Value>) -> Value {
 fn set_add(values: &Rc<RefCell<SetValues>>, item: Value) {
     let mut values = values.borrow_mut();
     if set_index(&values, &item).is_none() {
-        values.push(item);
+        values.push(SetEntry {
+            value: item,
+            active: true,
+        });
     }
 }
 
@@ -291,7 +338,12 @@ fn set_instance(args: &[Value], proto: &Value) -> Value {
         Some(seed) => {
             if let Some(other) = set_state_of(seed) {
                 // `new Set(other)` copies the other set's values.
-                let copied: SetValues = other.borrow().clone();
+                let copied = other
+                    .borrow()
+                    .iter()
+                    .filter(|entry| entry.active)
+                    .cloned()
+                    .collect::<SetValues>();
                 values.borrow_mut().extend(copied);
             } else {
                 for item in seed.iter() {
@@ -327,7 +379,7 @@ fn set_proto_delete(this: Value, args: Vec<Value>) -> Value {
     let mut values = values.borrow_mut();
     match set_index(&values, &item) {
         Some(index) => {
-            values.remove(index);
+            values[index].active = false;
             Value::Bool(true)
         }
         None => Value::Bool(false),
@@ -336,7 +388,9 @@ fn set_proto_delete(this: Value, args: Vec<Value>) -> Value {
 
 fn set_proto_clear(this: Value, _args: Vec<Value>) -> Value {
     if let Some(values) = set_state_of(&this) {
-        values.borrow_mut().clear();
+        for entry in values.borrow_mut().iter_mut() {
+            entry.active = false;
+        }
     }
     Value::Undefined
 }
@@ -346,10 +400,19 @@ fn set_proto_for_each(this: Value, args: Vec<Value>) -> Value {
         return Value::Undefined;
     };
     let callback = args.first().cloned().unwrap_or(Value::Undefined);
-    // Snapshot (bound first so the borrow ends here): a callback mutating
-    // the set must not trip the RefCell borrow.
-    let snapshot: SetValues = values.borrow().clone();
-    for value in snapshot {
+    let mut index = 0;
+    loop {
+        let next = {
+            let values = values.borrow();
+            while index < values.len() && !values[index].active {
+                index += 1;
+            }
+            values.get(index).map(|entry| {
+                index += 1;
+                entry.value.clone()
+            })
+        };
+        let Some(value) = next else { break };
         callback.call(Value::Undefined, vec![value.clone(), value, this.clone()]);
     }
     Value::Undefined
@@ -359,7 +422,14 @@ fn set_proto_values(this: Value, _args: Vec<Value>) -> Value {
     let Some(values) = set_state_of(&this) else {
         return Value::array(Vec::new());
     };
-    Value::array(values.borrow().clone())
+    Value::array(
+        values
+            .borrow()
+            .iter()
+            .filter(|entry| entry.active)
+            .map(|entry| entry.value.clone())
+            .collect(),
+    )
 }
 
 fn set_proto_entries(this: Value, _args: Vec<Value>) -> Value {
@@ -370,14 +440,17 @@ fn set_proto_entries(this: Value, _args: Vec<Value>) -> Value {
         values
             .borrow()
             .iter()
-            .map(|value| Value::array(vec![value.clone(), value.clone()]))
+            .filter(|entry| entry.active)
+            .map(|entry| Value::array(vec![entry.value.clone(), entry.value.clone()]))
             .collect(),
     )
 }
 
 fn set_proto_size(this: Value, _args: Vec<Value>) -> Value {
     set_state_of(&this)
-        .map(|values| Value::Number(values.borrow().len() as f64))
+        .map(|values| {
+            Value::Number(values.borrow().iter().filter(|entry| entry.active).count() as f64)
+        })
         .unwrap_or(Value::Undefined)
 }
 
@@ -486,24 +559,92 @@ pub fn is_typed_array(value: &Value) -> bool {
     crate::binary::is_typed_array(value)
 }
 
-/// Entries yielded by `for … of` / spread over one of our collection
-/// instances ([`Value::iter`] delegates here): [key, value] pair arrays for
-/// Maps, bare values for Sets, both in insertion order. `None` for any
-/// other value.
-pub(crate) fn iter_collection(value: &Value) -> Option<Vec<Value>> {
+fn next_map_entry(entries: &Rc<RefCell<MapEntries>>, index: &Cell<usize>) -> Option<Value> {
+    let entries = entries.borrow();
+    let mut cursor = index.get();
+    while cursor < entries.len() && !entries[cursor].active {
+        cursor += 1;
+    }
+    let entry = entries.get(cursor)?;
+    index.set(cursor + 1);
+    Some(Value::array(vec![entry.key.clone(), entry.value.clone()]))
+}
+
+fn next_set_value(values: &Rc<RefCell<SetValues>>, index: &Cell<usize>) -> Option<Value> {
+    let values = values.borrow();
+    let mut cursor = index.get();
+    while cursor < values.len() && !values[cursor].active {
+        cursor += 1;
+    }
+    let entry = values.get(cursor)?;
+    index.set(cursor + 1);
+    Some(entry.value.clone())
+}
+
+/// Live iterator used by AOT and wrapped by the dynamic W3IR iterator protocol
+/// over the same backing state.
+pub(crate) fn iter_collection(value: &Value) -> Option<Box<dyn Iterator<Item = Value>>> {
     if let Some(entries) = map_state_of(value) {
-        return Some(
-            entries
-                .borrow()
-                .iter()
-                .map(|(key, value)| Value::array(vec![key.clone(), value.clone()]))
-                .collect(),
-        );
+        return Some(Box::new(LiveMapIterator {
+            entries,
+            index: Cell::new(0),
+        }));
     }
     if let Some(values) = set_state_of(value) {
-        return Some(values.borrow().clone());
+        return Some(Box::new(LiveSetIterator {
+            values,
+            index: Cell::new(0),
+        }));
     }
     None
+}
+
+struct LiveMapIterator {
+    entries: Rc<RefCell<MapEntries>>,
+    index: Cell<usize>,
+}
+
+impl Iterator for LiveMapIterator {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        next_map_entry(&self.entries, &self.index)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self
+            .entries
+            .borrow()
+            .iter()
+            .skip(self.index.get())
+            .filter(|entry| entry.active)
+            .count();
+        (remaining, Some(remaining))
+    }
+}
+
+struct LiveSetIterator {
+    values: Rc<RefCell<SetValues>>,
+    index: Cell<usize>,
+}
+
+impl Iterator for LiveSetIterator {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        next_set_value(&self.values, &self.index)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self
+            .values
+            .borrow()
+            .iter()
+            .skip(self.index.get())
+            .filter(|entry| entry.active)
+            .count();
+        (remaining, Some(remaining))
+    }
 }
 
 pub enum CollectionSnapshot {
@@ -513,9 +654,25 @@ pub enum CollectionSnapshot {
 
 pub fn collection_snapshot(value: &Value) -> Option<CollectionSnapshot> {
     if let Some(entries) = map_state_of(value) {
-        return Some(CollectionSnapshot::Map(entries.borrow().clone()));
+        return Some(CollectionSnapshot::Map(
+            entries
+                .borrow()
+                .iter()
+                .filter(|entry| entry.active)
+                .map(|entry| (entry.key.clone(), entry.value.clone()))
+                .collect(),
+        ));
     }
-    set_state_of(value).map(|values| CollectionSnapshot::Set(values.borrow().clone()))
+    set_state_of(value).map(|values| {
+        CollectionSnapshot::Set(
+            values
+                .borrow()
+                .iter()
+                .filter(|entry| entry.active)
+                .map(|entry| entry.value.clone())
+                .collect(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -790,8 +947,48 @@ mod tests {
     }
 
     #[test]
+    fn map_iterator_and_for_each_observe_live_insertion_sequence() {
+        let map = new_map(vec![Value::array(vec![
+            pair(Value::string("a"), Value::Number(1.0)),
+            pair(Value::string("b"), Value::Number(2.0)),
+        ])]);
+        let mut iterator = map.iter();
+        assert_eq!(iterator.next().unwrap().to_js_string(), "a,1");
+        map.call_method("delete", vec![Value::string("b")]);
+        map.call_method("set", vec![Value::string("c"), Value::Number(3.0)]);
+        map.call_method("delete", vec![Value::string("a")]);
+        map.call_method("set", vec![Value::string("a"), Value::Number(4.0)]);
+        assert_eq!(iterator.next().unwrap().to_js_string(), "c,3");
+        assert_eq!(iterator.next().unwrap().to_js_string(), "a,4");
+        assert!(iterator.next().is_none());
+
+        let live = new_map(vec![Value::array(vec![pair(
+            Value::string("first"),
+            Value::Number(1.0),
+        )])]);
+        let visited = Rc::new(RefCell::new(Vec::new()));
+        let callback_target = live.clone();
+        let callback_visited = Rc::clone(&visited);
+        live.call_method(
+            "forEach",
+            vec![Value::function(move |_, args| {
+                callback_visited.borrow_mut().push(args[1].to_js_string());
+                if args[1].to_js_string() == "first" {
+                    callback_target
+                        .call_method("set", vec![Value::string("later"), Value::Number(2.0)]);
+                }
+                Value::Undefined
+            })],
+        );
+        assert_eq!(
+            visited.borrow().as_slice(),
+            &["first".to_string(), "later".to_string()]
+        );
+    }
+
+    #[test]
     fn map_for_each_tolerates_mutation_from_callback() {
-        // Deleting inside forEach must not trip the RefCell (snapshot iter).
+        // Deleting inside forEach must not trip the RefCell live iterator.
         let map = new_map(vec![Value::array(vec![
             pair(Value::string("a"), Value::Number(1.0)),
             pair(Value::string("b"), Value::Number(2.0)),
@@ -914,6 +1111,23 @@ mod tests {
         // for … of yields the values.
         let iterated: Vec<String> = set.iter().map(|v| v.to_js_string()).collect();
         assert_eq!(iterated, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn set_aot_iterator_observes_live_insertion_sequence() {
+        let set = new_set(vec![Value::array(vec![
+            Value::Number(1.0),
+            Value::Number(2.0),
+        ])]);
+        let mut iterator = set.iter();
+        assert_eq!(iterator.next(), Some(Value::Number(1.0)));
+        set.call_method("delete", vec![Value::Number(2.0)]);
+        set.call_method("add", vec![Value::Number(3.0)]);
+        set.call_method("delete", vec![Value::Number(1.0)]);
+        set.call_method("add", vec![Value::Number(1.0)]);
+        assert_eq!(iterator.next(), Some(Value::Number(3.0)));
+        assert_eq!(iterator.next(), Some(Value::Number(1.0)));
+        assert_eq!(iterator.next(), None);
     }
 
     #[test]

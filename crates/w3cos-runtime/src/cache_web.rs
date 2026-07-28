@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 #[derive(Default)]
@@ -69,6 +70,7 @@ fn request_value(url: &str) -> Value {
 }
 
 fn cache_value(entries: Rc<RefCell<Vec<(String, Value)>>>) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let entries_for_match = Rc::clone(&entries);
     let entries_for_match_all = Rc::clone(&entries);
     let entries_for_put = Rc::clone(&entries);
@@ -79,7 +81,7 @@ fn cache_value(entries: Rc<RefCell<Vec<(String, Value)>>>) -> Value {
     let cache = Value::object(HashMap::from([
         (
             "match".into(),
-            Value::function(move |_, args| {
+            realm_function(generation, move |_, args| {
                 let request = args.first().cloned().unwrap_or(Value::Undefined);
                 let options = args.get(1).cloned().unwrap_or(Value::Undefined);
                 let response = entries_for_match
@@ -94,7 +96,7 @@ fn cache_value(entries: Rc<RefCell<Vec<(String, Value)>>>) -> Value {
         ),
         (
             "matchAll".into(),
-            Value::function(move |_, args| {
+            realm_function(generation, move |_, args| {
                 let request = args.first().cloned();
                 let options = args.get(1).cloned().unwrap_or(Value::Undefined);
                 let responses = entries_for_match_all
@@ -112,7 +114,7 @@ fn cache_value(entries: Rc<RefCell<Vec<(String, Value)>>>) -> Value {
         ),
         (
             "put".into(),
-            Value::function(move |_, args| {
+            realm_function(generation, move |_, args| {
                 let request = args.first().cloned().unwrap_or(Value::Undefined);
                 let response = args.get(1).cloned().unwrap_or(Value::Undefined);
                 if request_method(&request) != "GET" {
@@ -146,7 +148,7 @@ fn cache_value(entries: Rc<RefCell<Vec<(String, Value)>>>) -> Value {
         ),
         (
             "add".into(),
-            Value::function(move |_, args| {
+            realm_function(generation, move |_, args| {
                 let request = args.first().cloned().unwrap_or(Value::Undefined);
                 let response = crate::fetch::fetch_value(vec![request.clone()]);
                 let url = request_url(&request);
@@ -158,7 +160,7 @@ fn cache_value(entries: Rc<RefCell<Vec<(String, Value)>>>) -> Value {
         ),
         (
             "addAll".into(),
-            Value::function(move |_, args| {
+            realm_function(generation, move |_, args| {
                 let requests = args.first().cloned().unwrap_or_default();
                 let fetched = requests
                     .iter()
@@ -177,7 +179,7 @@ fn cache_value(entries: Rc<RefCell<Vec<(String, Value)>>>) -> Value {
         ),
         (
             "delete".into(),
-            Value::function(move |_, args| {
+            realm_function(generation, move |_, args| {
                 let request = args.first().cloned().unwrap_or(Value::Undefined);
                 let options = args.get(1).cloned().unwrap_or(Value::Undefined);
                 let mut entries = entries_for_delete.borrow_mut();
@@ -188,7 +190,7 @@ fn cache_value(entries: Rc<RefCell<Vec<(String, Value)>>>) -> Value {
         ),
         (
             "keys".into(),
-            Value::function(move |_, args| {
+            realm_function(generation, move |_, args| {
                 let request = args.first().cloned();
                 let options = args.get(1).cloned().unwrap_or(Value::Undefined);
                 let requests = entries_for_keys
@@ -214,7 +216,10 @@ pub fn cache_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| cache_value(Rc::new(RefCell::new(Vec::new()))));
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
+            cache_value(Rc::new(RefCell::new(Vec::new())))
+        });
         class.set_property("name", Value::string("Cache"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -234,7 +239,8 @@ pub fn cache_storage_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| cache_storage_value());
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| cache_storage_value());
         class.set_property("name", Value::string("CacheStorage"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -260,10 +266,11 @@ pub fn cache_storage_value() -> Value {
                 );
             }
         });
+        let generation = crate::jsdom::realm_generation();
         let storage = Value::object(HashMap::from([
             (
                 "open".into(),
-                Value::function(|_, args| {
+                realm_function(generation, |_, args| {
                     let name = args
                         .first()
                         .cloned()
@@ -285,7 +292,7 @@ pub fn cache_storage_value() -> Value {
             ),
             (
                 "has".into(),
-                Value::function(|_, args| {
+                realm_function(generation, |_, args| {
                     let name = args
                         .first()
                         .cloned()
@@ -298,7 +305,7 @@ pub fn cache_storage_value() -> Value {
             ),
             (
                 "delete".into(),
-                Value::function(|_, args| {
+                realm_function(generation, |_, args| {
                     let name = args
                         .first()
                         .cloned()
@@ -314,7 +321,7 @@ pub fn cache_storage_value() -> Value {
             ),
             (
                 "keys".into(),
-                Value::function(|_, _| {
+                realm_function(generation, |_, _| {
                     let names = STORAGE.with(|storage| {
                         storage
                             .borrow()
@@ -328,7 +335,7 @@ pub fn cache_storage_value() -> Value {
             ),
             (
                 "match".into(),
-                Value::function(|_, args| {
+                realm_function(generation, |_, args| {
                     let request = args.first().cloned().unwrap_or(Value::Undefined);
                     let options = args.get(1).cloned().unwrap_or(Value::Undefined);
                     let cache_name = options.get_property("cacheName");
@@ -364,6 +371,16 @@ pub fn cache_storage_value() -> Value {
 
 pub fn reset() {
     STORAGE.with(|storage| *storage.borrow_mut() = CacheStorageState::default());
+    CACHE_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    CACHE_STORAGE_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    CACHE_STORAGE_VALUE.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    CACHE_WARNING_EMITTED.with(|warned| *warned.borrow_mut() = false);
 }
 
 #[cfg(test)]
@@ -420,5 +437,67 @@ mod tests {
                 .borrow()
                 .to_bool()
         );
+    }
+
+    #[test]
+    fn cache_storage_and_cache_methods_are_realm_owned() {
+        reset();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_storage = cache_storage_value();
+        let old_storage_class = cache_storage_class();
+        let old_cache_class = cache_class();
+        old_storage_class
+            .get_property("prototype")
+            .set_property("realmMarker", Value::Bool(true));
+        let old_cache = settled(old_storage.call_method("open", vec![Value::string("old-assets")]))
+            .borrow()
+            .clone();
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let new_storage = cache_storage_value();
+        let new_storage_class = cache_storage_class();
+        let new_cache_class = cache_class();
+        assert!(!old_storage.strict_eq(&new_storage));
+        assert!(!old_storage_class.strict_eq(&new_storage_class));
+        assert!(!old_cache_class.strict_eq(&new_cache_class));
+        assert!(
+            !new_storage_class
+                .get_property("prototype")
+                .get_property("realmMarker")
+                .to_bool()
+        );
+
+        assert!(matches!(
+            old_storage.call_method("open", vec![Value::string("stale-assets")]),
+            Value::Undefined
+        ));
+        assert!(matches!(
+            old_cache.call_method("keys", vec![]),
+            Value::Undefined
+        ));
+        assert!(matches!(
+            old_storage_class.call(Value::Undefined, vec![]),
+            Value::Undefined
+        ));
+        assert!(matches!(
+            old_cache_class.call(Value::Undefined, vec![]),
+            Value::Undefined
+        ));
+
+        let stale_exists =
+            settled(new_storage.call_method("has", vec![Value::string("stale-assets")]));
+        assert!(!stale_exists.borrow().to_bool());
+        let fresh_cache =
+            settled(new_storage.call_method("open", vec![Value::string("fresh-assets")]))
+                .borrow()
+                .clone();
+        assert!(w3cos_core::class::instance_of(
+            &fresh_cache,
+            &new_cache_class
+        ));
     }
 }

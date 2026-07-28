@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -28,6 +29,9 @@ impl Drop for TransientActivationGuard {
 pub(crate) fn reset() {
     ACTIVE_DEPTH.with(|depth| depth.set(0));
     HAS_BEEN_ACTIVE.with(|active| active.set(false));
+    USER_ACTIVATION_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 fn is_active() -> bool {
@@ -43,7 +47,8 @@ pub fn user_activation_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(Value::object(HashMap::from([
                 ("name".into(), Value::string("TypeError")),
                 (
@@ -64,14 +69,15 @@ pub fn user_activation_class() -> Value {
 }
 
 pub fn user_activation_value() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let activation = Value::object(HashMap::from([
         (
             "__w3cos_getter_isActive".into(),
-            Value::function(|_, _| Value::Bool(is_active())),
+            realm_function(generation, |_, _| Value::Bool(is_active())),
         ),
         (
             "__w3cos_getter_hasBeenActive".into(),
-            Value::function(|_, _| Value::Bool(has_been_active())),
+            realm_function(generation, |_, _| Value::Bool(has_been_active())),
         ),
     ]));
     w3cos_core::class::set_prototype_of(
@@ -88,6 +94,8 @@ mod tests {
     #[test]
     fn transient_and_sticky_activation_lifecycle() {
         reset();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let activation = user_activation_value();
         assert!(w3cos_core::class::instance_of(
             &activation,
@@ -108,5 +116,35 @@ mod tests {
 
         reset();
         assert!(!activation.get_property("hasBeenActive").to_bool());
+    }
+
+    #[test]
+    fn activation_getters_and_class_are_realm_owned() {
+        reset();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_activation = user_activation_value();
+        let old_class = user_activation_class();
+        old_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_activation = user_activation_value();
+        let new_class = user_activation_class();
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(
+            new_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+        let guard = begin_transient_activation();
+        assert!(old_activation.get_property("isActive").is_undefined());
+        assert!(new_activation.get_property("isActive").to_bool());
+        drop(guard);
+        reset();
     }
 }

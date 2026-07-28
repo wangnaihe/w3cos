@@ -10,13 +10,27 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 #[cfg(feature = "gpu")]
 use vello::wgpu;
 
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     static GPU_VALUE: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn realm_gpu_function(callback: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), callback)
+}
+
+fn register_gpu_value(value: &Value) {
+    register_weak_realm_object(&VALUES, value);
 }
 
 #[cfg(feature = "gpu")]
@@ -91,15 +105,19 @@ fn empty_set_like(name: &'static str) -> Value {
     let value = Value::object(HashMap::new());
     value.set_property(
         "__w3cos_getter_size",
-        Value::function(|_, _| Value::Number(0.0)),
+        realm_gpu_function(|_, _| Value::Number(0.0)),
     );
-    value.set_property("has", Value::function(|_, _| Value::Bool(false)));
-    value.set_property("forEach", Value::function(|_, _| Value::Undefined));
+    value.set_property("has", realm_gpu_function(|_, _| Value::Bool(false)));
+    value.set_property("forEach", realm_gpu_function(|_, _| Value::Undefined));
     for operation in ["entries", "keys", "values"] {
-        value.set_property(operation, Value::function(|_, _| Value::array(Vec::new())));
+        value.set_property(
+            operation,
+            realm_gpu_function(|_, _| Value::array(Vec::new())),
+        );
     }
     value.set_property("__w3cos_symbol_iterator", value.get_property("values"));
     set_prototype(&value, name);
+    register_gpu_value(&value);
     value
 }
 
@@ -146,6 +164,7 @@ fn limits_value() -> Value {
         value.set_property(name, Value::Number(number));
     }
     set_prototype(&value, "GPUSupportedLimits");
+    register_gpu_value(&value);
     value
 }
 
@@ -167,6 +186,7 @@ fn adapter_info_value(info: &wgpu::AdapterInfo) -> Value {
         ("isFallbackAdapter".into(), Value::Bool(false)),
     ]));
     set_prototype(&value, "GPUAdapterInfo");
+    register_gpu_value(&value);
     value
 }
 
@@ -200,7 +220,7 @@ fn buffer_value(state: BufferState, label: String) -> Value {
     let state_for_range = state.clone();
     value.set_property(
         "getMappedRange",
-        Value::function(move |_, _| {
+        realm_gpu_function(move |_, _| {
             if state_for_range.destroyed.get() || !state_for_range.mapped_at_creation.get() {
                 throw("InvalidStateError", "GPUBuffer is not mapped");
             }
@@ -216,7 +236,7 @@ fn buffer_value(state: BufferState, label: String) -> Value {
     let state_for_unmap = state.clone();
     value.set_property(
         "unmap",
-        Value::function(move |_, _| {
+        realm_gpu_function(move |_, _| {
             if state_for_unmap.mapped_at_creation.replace(false) {
                 if let Some(mapped) = state_for_unmap.mapped.borrow_mut().take()
                     && let Some(bytes) = w3cos_core::binary::bytes_of(&mapped)
@@ -234,7 +254,7 @@ fn buffer_value(state: BufferState, label: String) -> Value {
     let state_for_destroy = state.clone();
     value.set_property(
         "destroy",
-        Value::function(move |_, _| {
+        realm_gpu_function(move |_, _| {
             if !state_for_destroy.destroyed.replace(true) {
                 state_for_destroy.buffer.destroy();
             }
@@ -243,7 +263,7 @@ fn buffer_value(state: BufferState, label: String) -> Value {
     );
     value.set_property(
         "mapAsync",
-        Value::function(|_, _| {
+        realm_gpu_function(|_, _| {
             warn_once();
             w3cos_core::promise::reject(vec![error(
                 "NotSupportedError",
@@ -253,7 +273,7 @@ fn buffer_value(state: BufferState, label: String) -> Value {
     );
     value.set_property("__w3cos_getter_mapState", {
         let state = state.clone();
-        Value::function(move |_, _| {
+        realm_gpu_function(move |_, _| {
             Value::string(if state.mapped_at_creation.get() {
                 "mapped"
             } else {
@@ -262,6 +282,7 @@ fn buffer_value(state: BufferState, label: String) -> Value {
         })
     });
     set_prototype(&value, "GPUBuffer");
+    register_gpu_value(&value);
     value
 }
 
@@ -302,7 +323,7 @@ fn queue_value(state: Rc<DeviceState>) -> Value {
     let state_for_write = state.clone();
     value.set_property(
         "writeBuffer",
-        Value::function(move |_, args| {
+        realm_gpu_function(move |_, args| {
             let destination = arg(&args, 0);
             let Some(buffer) = buffer_state(&destination) else {
                 throw(
@@ -326,7 +347,7 @@ fn queue_value(state: Rc<DeviceState>) -> Value {
     let state_for_submit = state.clone();
     value.set_property(
         "submit",
-        Value::function(move |_, args| {
+        realm_gpu_function(move |_, args| {
             let mut command_buffers = Vec::new();
             for item in arg(&args, 0).iter() {
                 let id = item.get_property("__w3cos_command_buffer_id").to_number() as usize;
@@ -344,15 +365,16 @@ fn queue_value(state: Rc<DeviceState>) -> Value {
     );
     value.set_property(
         "onSubmittedWorkDone",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
+        realm_gpu_function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
     );
     for operation in ["copyExternalImageToTexture", "writeTexture"] {
         value.set_property(
             operation,
-            Value::function(move |_, _| unavailable(&format!("GPUQueue.{operation}"))),
+            realm_gpu_function(move |_, _| unavailable(&format!("GPUQueue.{operation}"))),
         );
     }
     set_prototype(&value, "GPUQueue");
+    register_gpu_value(&value);
     value
 }
 
@@ -381,7 +403,7 @@ fn command_encoder_value(state: Rc<DeviceState>, descriptor: Value) -> Value {
     let encoder_for_copy = encoder.clone();
     value.set_property(
         "copyBufferToBuffer",
-        Value::function(move |_, args| {
+        realm_gpu_function(move |_, args| {
             let Some(source) = buffer_state(&arg(&args, 0)) else {
                 throw("TypeError", "copyBufferToBuffer source must be a GPUBuffer");
             };
@@ -411,7 +433,7 @@ fn command_encoder_value(state: Rc<DeviceState>, descriptor: Value) -> Value {
     let encoder_for_clear = encoder.clone();
     value.set_property(
         "clearBuffer",
-        Value::function(move |_, args| {
+        realm_gpu_function(move |_, args| {
             let Some(buffer) = buffer_state(&arg(&args, 0)) else {
                 throw("TypeError", "clearBuffer target must be a GPUBuffer");
             };
@@ -432,7 +454,7 @@ fn command_encoder_value(state: Rc<DeviceState>, descriptor: Value) -> Value {
     let encoder_for_finish = encoder;
     value.set_property(
         "finish",
-        Value::function(move |_, args| {
+        realm_gpu_function(move |_, args| {
             let mut encoder = encoder_for_finish.borrow_mut();
             let Some(encoder) = encoder.take() else {
                 throw("InvalidStateError", "GPUCommandEncoder is already finished");
@@ -454,6 +476,7 @@ fn command_encoder_value(state: Rc<DeviceState>, descriptor: Value) -> Value {
                 ("__w3cos_command_buffer_id".into(), Value::Number(id as f64)),
             ]));
             set_prototype(&result, "GPUCommandBuffer");
+            register_gpu_value(&result);
             result
         }),
     );
@@ -471,11 +494,14 @@ fn command_encoder_value(state: Rc<DeviceState>, descriptor: Value) -> Value {
         if value.get_property(operation).is_undefined() {
             value.set_property(
                 operation,
-                Value::function(move |_, _| unavailable(&format!("GPUCommandEncoder.{operation}"))),
+                realm_gpu_function(move |_, _| {
+                    unavailable(&format!("GPUCommandEncoder.{operation}"))
+                }),
             );
         }
     }
     set_prototype(&value, "GPUCommandEncoder");
+    register_gpu_value(&value);
     value
 }
 
@@ -497,24 +523,26 @@ fn shader_module_value(state: Rc<DeviceState>, descriptor: Value) -> Value {
     let value = Value::object(HashMap::from([("label".into(), Value::string(&label))]));
     value.set_property(
         "__w3cos_keepalive",
-        Value::function(move |_, _| {
+        realm_gpu_function(move |_, _| {
             let _ = &module;
             Value::Undefined
         }),
     );
     value.set_property(
         "getCompilationInfo",
-        Value::function(|_, _| {
+        realm_gpu_function(|_, _| {
             warn_once();
             let info = Value::object(HashMap::from([(
                 "messages".into(),
                 Value::array(Vec::new()),
             )]));
             set_prototype(&info, "GPUCompilationInfo");
+            register_gpu_value(&info);
             w3cos_core::promise::resolve(vec![info])
         }),
     );
     set_prototype(&value, "GPUShaderModule");
+    register_gpu_value(&value);
     value
 }
 
@@ -543,41 +571,44 @@ fn device_value(adapter: Rc<wgpu::Adapter>) -> Value {
         ("queue".into(), queue_value(state.clone())),
         (
             "lost".into(),
-            w3cos_core::promise::new(vec![Value::function(|_, _| Value::Undefined)]),
+            w3cos_core::promise::new(vec![realm_gpu_function(|_, _| Value::Undefined)]),
         ),
         ("onuncapturederror".into(), Value::Null),
     ]));
     let state_for_buffer = state.clone();
     value.set_property(
         "createBuffer",
-        Value::function(move |_, args| create_buffer(state_for_buffer.clone(), arg(&args, 0))),
+        realm_gpu_function(move |_, args| create_buffer(state_for_buffer.clone(), arg(&args, 0))),
     );
     let state_for_encoder = state.clone();
     value.set_property(
         "createCommandEncoder",
-        Value::function(move |_, args| {
+        realm_gpu_function(move |_, args| {
             command_encoder_value(state_for_encoder.clone(), arg(&args, 0))
         }),
     );
     let state_for_shader = state.clone();
     value.set_property(
         "createShaderModule",
-        Value::function(move |_, args| {
+        realm_gpu_function(move |_, args| {
             shader_module_value(state_for_shader.clone(), arg(&args, 0))
         }),
     );
     let state_for_destroy = state.clone();
     value.set_property(
         "destroy",
-        Value::function(move |_, _| {
+        realm_gpu_function(move |_, _| {
             state_for_destroy.device.destroy();
             Value::Undefined
         }),
     );
-    value.set_property("pushErrorScope", Value::function(|_, _| Value::Undefined));
+    value.set_property(
+        "pushErrorScope",
+        realm_gpu_function(|_, _| Value::Undefined),
+    );
     value.set_property(
         "popErrorScope",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::Null])),
+        realm_gpu_function(|_, _| w3cos_core::promise::resolve(vec![Value::Null])),
     );
     for operation in [
         "createBindGroup",
@@ -593,13 +624,13 @@ fn device_value(adapter: Rc<wgpu::Adapter>) -> Value {
     ] {
         value.set_property(
             operation,
-            Value::function(move |_, _| unavailable(&format!("GPUDevice.{operation}"))),
+            realm_gpu_function(move |_, _| unavailable(&format!("GPUDevice.{operation}"))),
         );
     }
     for operation in ["createComputePipelineAsync", "createRenderPipelineAsync"] {
         value.set_property(
             operation,
-            Value::function(move |_, _| {
+            realm_gpu_function(move |_, _| {
                 warn_once();
                 w3cos_core::promise::reject(vec![error(
                     "NotSupportedError",
@@ -610,6 +641,7 @@ fn device_value(adapter: Rc<wgpu::Adapter>) -> Value {
     }
     crate::web_events::event_target_class().call(value.clone(), vec![]);
     set_prototype(&value, "GPUDevice");
+    register_gpu_value(&value);
     value
 }
 
@@ -624,7 +656,7 @@ fn adapter_value(adapter: wgpu::Adapter) -> Value {
     ]));
     value.set_property("requestDevice", {
         let adapter = adapter.clone();
-        Value::function(move |_, _| {
+        realm_gpu_function(move |_, _| {
             let device = device_value(adapter.clone());
             if device.is_null() {
                 warn_once();
@@ -638,6 +670,7 @@ fn adapter_value(adapter: wgpu::Adapter) -> Value {
         })
     });
     set_prototype(&value, "GPUAdapter");
+    register_gpu_value(&value);
     value
 }
 
@@ -673,11 +706,11 @@ pub fn gpu_value() -> Value {
         let value = Value::object(HashMap::from([
             (
                 "requestAdapter".into(),
-                Value::function(|_, _| request_adapter()),
+                realm_gpu_function(|_, _| request_adapter()),
             ),
             (
                 "getPreferredCanvasFormat".into(),
-                Value::function(|_, _| Value::string("bgra8unorm")),
+                realm_gpu_function(|_, _| Value::string("bgra8unorm")),
             ),
             (
                 "wgslLanguageFeatures".into(),
@@ -685,6 +718,7 @@ pub fn gpu_value() -> Value {
             ),
         ]));
         set_prototype(&value, "GPU");
+        register_gpu_value(&value);
         *slot.borrow_mut() = Some(value.clone());
         value
     })
@@ -909,7 +943,7 @@ fn constructible_error_class(name: &'static str) -> bool {
 
 fn build_class(name: &'static str) -> Value {
     let constructor = if constructible_error_class(name) {
-        Value::function(move |_, args| {
+        realm_gpu_function(move |_, args| {
             let message = arg(&args, 0).to_js_string();
             let value = w3cos_core::error_instance("Error", vec![Value::string(&message)]);
             value.set_property("message", Value::string(&message));
@@ -920,10 +954,11 @@ fn build_class(name: &'static str) -> Value {
                 );
             }
             set_prototype(&value, name);
+            register_gpu_value(&value);
             value
         })
     } else {
-        Value::function(move |_, _| throw("TypeError", &format!("Illegal constructor: {name}")))
+        realm_gpu_function(move |_, _| throw("TypeError", &format!("Illegal constructor: {name}")))
     };
     constructor.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::from([("constructor".into(), constructor.clone())]));
@@ -1051,15 +1086,51 @@ pub const CONSTANTS: &[&str] = &[
 ];
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
-    GPU_VALUE.with(|slot| *slot.borrow_mut() = None);
-    WARNING_EMITTED.with(|warned| warned.set(false));
+    GPU_VALUE.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    VALUES.with(|values| {
+        for value in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for interface in INTERFACES {
+                for member in members(interface) {
+                    value.set_property(member, Value::Undefined);
+                }
+            }
+            for internal in [
+                "__w3cos_getter_mapState",
+                "__w3cos_getter_size",
+                "__w3cos_keepalive",
+                "__w3cos_symbol_iterator",
+            ] {
+                value.set_property(internal, Value::Undefined);
+            }
+        }
+    });
     #[cfg(feature = "gpu")]
     {
-        BUFFERS.with(|values| values.borrow_mut().clear());
+        BUFFERS.with(|values| {
+            for buffer in values.borrow_mut().drain(..) {
+                buffer.mapped.borrow_mut().take();
+                if buffer.mapped_at_creation.replace(false) {
+                    buffer.buffer.unmap();
+                }
+                if !buffer.destroyed.replace(true) {
+                    buffer.buffer.destroy();
+                }
+            }
+        });
         COMMAND_ENCODERS.with(|values| values.borrow_mut().clear());
         COMMAND_BUFFERS.with(|values| values.borrow_mut().clear());
     }
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        disconnect_realm_class(class);
+    }
+    WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
 #[cfg(test)]
@@ -1100,8 +1171,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gpu_root_values_methods_and_classes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_gpu_class = class_for("GPU");
+        let old_error_class = class_for("GPUValidationError");
+        let gpu = gpu_value();
+        let features = gpu.get_property("wgslLanguageFeatures");
+        let error = w3cos_core::class::construct(
+            &old_error_class,
+            vec![Value::string("validation failed")],
+        );
+        let gpu_weak = crate::jsdom::weak_realm_object(&gpu);
+        let features_weak = crate::jsdom::weak_realm_object(&features);
+        drop(features);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_gpu_class.get_property("prototype").is_undefined());
+        assert!(old_error_class.get_property("prototype").is_undefined());
+        assert!(!old_gpu_class.strict_eq(&class_for("GPU")));
+        assert!(gpu.get_property("requestAdapter").is_undefined());
+        assert!(gpu.get_property("wgslLanguageFeatures").is_undefined());
+        assert!(error.get_property("message").is_undefined());
+        assert!(features_weak.upgrade().is_none());
+
+        drop(gpu);
+        drop(error);
+        assert!(gpu_weak.upgrade().is_none());
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "native wgpu teardown can outlive Rust TLS on macOS test processes"]
     fn native_adapter_creates_device_and_mapped_buffer_when_available() {
         reset();
         let adapter_slot = Rc::new(RefCell::new(Value::Undefined));

@@ -44,6 +44,16 @@ impl NodeType {
     }
 }
 
+/// Namespace identity retained for an attribute whose qualified name alone is
+/// insufficient for the DOM namespace APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeNamespace {
+    pub qualified_name: Atom,
+    pub namespace: Option<Atom>,
+    pub prefix: Option<Atom>,
+    pub local_name: Atom,
+}
+
 /// Internal node storage for the DOM tree.
 ///
 /// Uses Left-Child Right-Sibling (LCRS) tree structure (like Chrome/Blink):
@@ -67,6 +77,7 @@ pub struct DomNode {
     pub prev_sibling: Option<NodeId>,
     // Attributes: key is Atom (interned), value is String
     pub attributes: Vec<(Atom, String)>,
+    pub attribute_namespaces: Vec<AttributeNamespace>,
     pub class_list: Vec<Atom>,
 }
 
@@ -83,6 +94,7 @@ impl DomNode {
             next_sibling: None,
             prev_sibling: None,
             attributes: Vec::new(),
+            attribute_namespaces: Vec::new(),
             class_list: Vec::new(),
         }
     }
@@ -99,6 +111,7 @@ impl DomNode {
             next_sibling: None,
             prev_sibling: None,
             attributes: Vec::new(),
+            attribute_namespaces: Vec::new(),
             class_list: Vec::new(),
         }
     }
@@ -115,6 +128,7 @@ impl DomNode {
             next_sibling: None,
             prev_sibling: None,
             attributes: Vec::new(),
+            attribute_namespaces: Vec::new(),
             class_list: Vec::new(),
         }
     }
@@ -131,6 +145,7 @@ impl DomNode {
             next_sibling: None,
             prev_sibling: None,
             attributes: Vec::new(),
+            attribute_namespaces: Vec::new(),
             class_list: Vec::new(),
         }
     }
@@ -147,6 +162,7 @@ impl DomNode {
             next_sibling: None,
             prev_sibling: None,
             attributes: Vec::new(),
+            attribute_namespaces: Vec::new(),
             class_list: Vec::new(),
         }
     }
@@ -167,6 +183,7 @@ impl DomNode {
             next_sibling: None,
             prev_sibling: None,
             attributes: Vec::new(),
+            attribute_namespaces: Vec::new(),
             class_list: Vec::new(),
         }
     }
@@ -183,6 +200,7 @@ impl DomNode {
             next_sibling: None,
             prev_sibling: None,
             attributes: Vec::new(),
+            attribute_namespaces: Vec::new(),
             class_list: Vec::new(),
         }
     }
@@ -229,6 +247,8 @@ impl DomNode {
     /// Set `contenteditable` attribute.
     pub fn set_content_editable(&mut self, value: &str) {
         let ce = Atom::intern("contenteditable");
+        self.attribute_namespaces
+            .retain(|attribute| attribute.qualified_name != ce);
         for (k, v) in self.attributes.iter_mut() {
             if *k == ce {
                 *v = value.to_string();
@@ -250,6 +270,8 @@ impl DomNode {
     /// Set an attribute value by name.
     pub fn set_attribute(&mut self, name: &str, value: &str) {
         let key = Atom::intern(name);
+        self.attribute_namespaces
+            .retain(|attribute| attribute.qualified_name != key);
         for (k, v) in self.attributes.iter_mut() {
             if *k == key {
                 *v = value.to_string();
@@ -259,11 +281,127 @@ impl DomNode {
         self.attributes.push((key, value.to_string()));
     }
 
+    /// Set an attribute while retaining the namespace identity required by
+    /// `getAttributeNS`, `Attr.namespaceURI`, and foreign-content parsing.
+    pub fn set_attribute_ns(
+        &mut self,
+        namespace: Option<&str>,
+        qualified_name: &str,
+        prefix: Option<&str>,
+        local_name: &str,
+        value: &str,
+    ) {
+        let new_qualified_name = Atom::intern(qualified_name);
+        let namespace_atom = namespace.map(Atom::intern);
+        let local_name_atom = Atom::intern(local_name);
+        let existing_qualified_name = self
+            .attribute_namespaces
+            .iter()
+            .find(|attribute| {
+                attribute.namespace == namespace_atom && attribute.local_name == local_name_atom
+            })
+            .map(|attribute| attribute.qualified_name)
+            .or_else(|| {
+                self.attributes
+                    .iter()
+                    .find(|(name, _)| *name == new_qualified_name)
+                    .map(|(name, _)| *name)
+            });
+        if let Some(existing_qualified_name) = existing_qualified_name
+            && let Some((name, current_value)) = self
+                .attributes
+                .iter_mut()
+                .find(|(name, _)| *name == existing_qualified_name)
+        {
+            *name = new_qualified_name;
+            *current_value = value.to_string();
+        } else {
+            self.attributes
+                .push((new_qualified_name, value.to_string()));
+        }
+        if let Some(existing_qualified_name) = existing_qualified_name {
+            self.attribute_namespaces.retain(|attribute| {
+                attribute.qualified_name != existing_qualified_name
+                    && attribute.qualified_name != new_qualified_name
+            });
+        }
+        self.set_attribute_namespace_metadata(new_qualified_name, namespace, prefix, local_name);
+    }
+
+    fn set_attribute_namespace_metadata(
+        &mut self,
+        qualified_name: Atom,
+        namespace: Option<&str>,
+        prefix: Option<&str>,
+        local_name: &str,
+    ) {
+        self.attribute_namespaces
+            .retain(|attribute| attribute.qualified_name != qualified_name);
+        self.attribute_namespaces.push(AttributeNamespace {
+            qualified_name,
+            namespace: namespace.map(Atom::intern),
+            prefix: prefix.map(Atom::intern),
+            local_name: Atom::intern(local_name),
+        });
+    }
+
+    /// Get an attribute by namespace URI and local name.
+    pub fn get_attribute_ns(&self, namespace: Option<&str>, local_name: &str) -> Option<&str> {
+        let namespace = namespace.map(Atom::intern);
+        let local_name = Atom::intern(local_name);
+        if let Some(metadata) = self.attribute_namespaces.iter().find(|attribute| {
+            attribute.namespace == namespace && attribute.local_name == local_name
+        }) {
+            return self
+                .attributes
+                .iter()
+                .find(|(name, _)| *name == metadata.qualified_name)
+                .map(|(_, value)| value.as_str());
+        }
+        if namespace.is_none() {
+            return self.get_attribute(&local_name.as_str());
+        }
+        None
+    }
+
+    pub fn attribute_namespace(&self, qualified_name: &str) -> Option<&AttributeNamespace> {
+        let qualified_name = Atom::intern(qualified_name);
+        self.attribute_namespaces
+            .iter()
+            .find(|attribute| attribute.qualified_name == qualified_name)
+    }
+
     /// Remove an attribute by name. Returns true if it existed.
     pub fn remove_attribute(&mut self, name: &str) -> bool {
         let key = Atom::intern(name);
         let before = self.attributes.len();
         self.attributes.retain(|(k, _)| *k != key);
+        self.attribute_namespaces
+            .retain(|attribute| attribute.qualified_name != key);
         self.attributes.len() < before
+    }
+
+    /// Remove an attribute by namespace URI and local name.
+    pub fn remove_attribute_ns(&mut self, namespace: Option<&str>, local_name: &str) -> bool {
+        let namespace = namespace.map(Atom::intern);
+        let local_name = Atom::intern(local_name);
+        let qualified_name = self
+            .attribute_namespaces
+            .iter()
+            .find(|attribute| {
+                attribute.namespace == namespace && attribute.local_name == local_name
+            })
+            .map(|attribute| attribute.qualified_name);
+        if let Some(qualified_name) = qualified_name {
+            let before = self.attributes.len();
+            self.attributes.retain(|(name, _)| *name != qualified_name);
+            self.attribute_namespaces
+                .retain(|attribute| attribute.qualified_name != qualified_name);
+            return self.attributes.len() < before;
+        }
+        if namespace.is_none() {
+            return self.remove_attribute(&local_name.as_str());
+        }
+        false
     }
 }

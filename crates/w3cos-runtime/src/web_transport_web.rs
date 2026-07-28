@@ -10,9 +10,19 @@ use std::collections::HashMap;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn realm_transport_function(callback: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), callback)
 }
 
 fn error(name: &str, message: &str) -> Value {
@@ -86,6 +96,7 @@ fn bidirectional_stream() -> Value {
         ("writable".into(), writable()),
     ]));
     set_prototype(&value, "WebTransportBidirectionalStream");
+    register_weak_realm_object(&VALUES, &value);
     value
 }
 
@@ -100,6 +111,7 @@ fn datagram_stream() -> Value {
         ("outgoingHighWaterMark".into(), Value::Number(1.0)),
     ]));
     set_prototype(&value, "WebTransportDatagramDuplexStream");
+    register_weak_realm_object(&VALUES, &value);
     value
 }
 
@@ -110,8 +122,9 @@ fn web_socket_stream(args: Vec<Value>) -> Value {
         ("opened".into(), unavailable("WebSocketStream.opened")),
         ("closed".into(), unavailable("WebSocketStream.closed")),
     ]));
-    value.set_property("close", Value::function(|_, _| Value::Undefined));
+    value.set_property("close", realm_transport_function(|_, _| Value::Undefined));
     set_prototype(&value, "WebSocketStream");
+    register_weak_realm_object(&VALUES, &value);
     value
 }
 
@@ -125,16 +138,17 @@ fn web_transport(args: Vec<Value>) -> Value {
         ("closed".into(), unavailable("WebTransport.closed")),
         ("protocol".into(), Value::string("")),
     ]));
-    value.set_property("close", Value::function(|_, _| Value::Undefined));
+    value.set_property("close", realm_transport_function(|_, _| Value::Undefined));
     value.set_property(
         "createBidirectionalStream",
-        Value::function(|_, _| unavailable("WebTransport.createBidirectionalStream")),
+        realm_transport_function(|_, _| unavailable("WebTransport.createBidirectionalStream")),
     );
     value.set_property(
         "createUnidirectionalStream",
-        Value::function(|_, _| unavailable("WebTransport.createUnidirectionalStream")),
+        realm_transport_function(|_, _| unavailable("WebTransport.createUnidirectionalStream")),
     );
     set_prototype(&value, "WebTransport");
+    register_weak_realm_object(&VALUES, &value);
     value
 }
 
@@ -164,15 +178,18 @@ fn web_transport_error(args: Vec<Value>) -> Value {
         },
     );
     set_prototype(&value, "WebTransportError");
+    register_weak_realm_object(&VALUES, &value);
     value
 }
 
 fn build_class(name: &'static str) -> Value {
     let constructor = match name {
-        "WebSocketStream" => Value::function(|_, args| web_socket_stream(args)),
-        "WebTransport" => Value::function(|_, args| web_transport(args)),
-        "WebTransportError" => Value::function(|_, args| web_transport_error(args)),
-        _ => Value::function(move |_, _| throw_type(&format!("Illegal constructor: {name}"))),
+        "WebSocketStream" => realm_transport_function(|_, args| web_socket_stream(args)),
+        "WebTransport" => realm_transport_function(|_, args| web_transport(args)),
+        "WebTransportError" => realm_transport_function(|_, args| web_transport_error(args)),
+        _ => realm_transport_function(move |_, _| {
+            throw_type(&format!("Illegal constructor: {name}"))
+        }),
     };
     constructor.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::from([("constructor".into(), constructor.clone())]));
@@ -235,7 +252,36 @@ pub const INTERFACES: &[&str] = &[
 ];
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
+    VALUES.with(|values| {
+        for value in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for reference in [
+                "readable",
+                "writable",
+                "opened",
+                "closed",
+                "incomingUnidirectionalStreams",
+                "incomingBidirectionalStreams",
+                "datagrams",
+                "ready",
+                "close",
+                "createBidirectionalStream",
+                "createUnidirectionalStream",
+                "protocol",
+                "source",
+                "streamErrorCode",
+            ] {
+                value.set_property(reference, Value::Undefined);
+            }
+        }
+    });
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        disconnect_realm_class(class);
+    }
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -289,5 +335,40 @@ mod tests {
         );
         assert_eq!(value.get_property("source").to_js_string(), "session");
         assert_eq!(value.get_property("streamErrorCode").to_number(), 7.0);
+    }
+
+    #[test]
+    fn transports_stream_references_methods_and_classes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_transport_class = class_for("WebTransport");
+        let old_datagram_class = class_for("WebTransportDatagramDuplexStream");
+        let transport = w3cos_core::class::construct(
+            &old_transport_class,
+            vec![Value::string("https://example.test/transport")],
+        );
+        let datagrams = transport.get_property("datagrams");
+        let readable = datagrams.get_property("readable");
+        let datagrams_weak = crate::jsdom::weak_realm_object(&datagrams);
+        let readable_weak = crate::jsdom::weak_realm_object(&readable);
+        drop(datagrams);
+        drop(readable);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_transport_class.get_property("prototype").is_undefined());
+        assert!(old_datagram_class.get_property("prototype").is_undefined());
+        assert!(!old_transport_class.strict_eq(&class_for("WebTransport")));
+        assert!(transport.get_property("datagrams").is_undefined());
+        assert!(transport.get_property("ready").is_undefined());
+        assert!(
+            transport
+                .call_method("createBidirectionalStream", vec![])
+                .is_undefined()
+        );
+        assert!(datagrams_weak.upgrade().is_none());
+        assert!(readable_weak.upgrade().is_none());
     }
 }

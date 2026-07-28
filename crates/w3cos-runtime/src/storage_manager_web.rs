@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -32,14 +33,15 @@ pub fn storage_manager_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(error("TypeError", "Illegal constructor: StorageManager"))
         });
         class.set_property("name", Value::string("StorageManager"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for method in ["estimate", "getDirectory", "persist", "persisted"] {
-            prototype.set_property(method, Value::function(|_, _| Value::Undefined));
+            prototype.set_property(method, realm_function(generation, |_, _| Value::Undefined));
         }
         class.set_property("prototype", prototype);
         *slot.borrow_mut() = Some(class.clone());
@@ -48,6 +50,7 @@ pub fn storage_manager_class() -> Value {
 }
 
 pub fn storage_manager_value() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let manager = Value::object(HashMap::new());
     w3cos_core::class::set_prototype_of(
         &manager,
@@ -55,7 +58,7 @@ pub fn storage_manager_value() -> Value {
     );
     manager.set_property(
         "estimate",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             warn_storage_adapter();
             w3cos_core::promise::resolve(vec![Value::object(HashMap::from([
                 ("usage".into(), Value::Number(0.0)),
@@ -66,26 +69,35 @@ pub fn storage_manager_value() -> Value {
     );
     manager.set_property(
         "persisted",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             warn_storage_adapter();
             w3cos_core::promise::resolve(vec![Value::Bool(false)])
         }),
     );
     manager.set_property(
         "persist",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             warn_storage_adapter();
             w3cos_core::promise::resolve(vec![Value::Bool(false)])
         }),
     );
     manager.set_property(
         "getDirectory",
-        Value::function(|_, _| match crate::file_system_web::opfs_root_value() {
-            Ok(root) => w3cos_core::promise::resolve(vec![root]),
-            Err(error) => w3cos_core::promise::reject(vec![error]),
-        }),
+        realm_function(
+            generation,
+            |_, _| match crate::file_system_web::opfs_root_value() {
+                Ok(root) => w3cos_core::promise::resolve(vec![root]),
+                Err(error) => w3cos_core::promise::reject(vec![error]),
+            },
+        ),
     );
     manager
+}
+
+pub fn reset_realm() {
+    STORAGE_MANAGER_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 #[cfg(test)]
@@ -96,6 +108,9 @@ mod tests {
 
     #[test]
     fn estimates_and_persistence_use_explicit_compatibility_results() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let manager = storage_manager_value();
         assert!(w3cos_core::class::instance_of(
             &manager,
@@ -125,5 +140,36 @@ mod tests {
         }
         w3cos_core::promise::drain_microtasks();
         assert_eq!(&*values.borrow(), &["0", "false", "false", "w3cos-opfs"]);
+        reset_realm();
+    }
+
+    #[test]
+    fn manager_entry_points_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_manager = storage_manager_value();
+        let old_class = storage_manager_class();
+        old_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_manager = storage_manager_value();
+        let new_class = storage_manager_class();
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(
+            new_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        for method in ["estimate", "persisted", "persist", "getDirectory"] {
+            assert!(old_manager.call_method(method, vec![]).is_undefined());
+        }
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(new_manager.call_method("estimate", vec![]).is_object());
+        reset_realm();
     }
 }

@@ -24,6 +24,7 @@ const TEXT_MEASURE_CACHE_CAPACITY: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TextMeasureKey {
     width: u32,
+    font: u64,
     font_size: u32,
     line_height: u32,
     padding_top: u32,
@@ -117,18 +118,24 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
     match kind {
         ComponentKind::Text { content } => text_intrinsic_size(content, style),
         ComponentKind::Button { label } => button_intrinsic_size(label, style),
-        ComponentKind::Image { .. } => {
-            let w = if matches!(style.width, WDim::Auto) {
-                200.0
-            } else {
-                dim_to_px(style.width).unwrap_or(200.0)
-            };
-            let h = if matches!(style.height, WDim::Auto) {
-                200.0
-            } else {
-                dim_to_px(style.height).unwrap_or(200.0)
-            };
-            (w, h)
+        ComponentKind::Image { src } => {
+            let (natural_width, natural_height) = crate::image_loader::dimensions(src)
+                .map(|(width, height)| (width as f32, height as f32))
+                .unwrap_or((200.0, 200.0));
+            let width = dim_to_px(style.width);
+            let height = dim_to_px(style.height);
+            match (width, height) {
+                (Some(width), Some(height)) => (width, height),
+                (Some(width), None) if natural_width > 0.0 => {
+                    (width, natural_height * width / natural_width)
+                }
+                (None, Some(height)) if natural_height > 0.0 => {
+                    (natural_width * height / natural_height, height)
+                }
+                (Some(width), None) => (width, natural_height),
+                (None, Some(height)) => (natural_width, height),
+                (None, None) => (natural_width, natural_height),
+            }
         }
         ComponentKind::TextInput { .. } => {
             // Match the browser UA baseline for an `<input size="20">`
@@ -150,8 +157,15 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
     }
 }
 
-fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
-    let key = text_measure_key(DEFAULT_TEXT_WRAP_WIDTH, style);
+pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
+    let registry = crate::font_face::FontRegistry::global();
+    let font_runs = registry.resolve_style_runs(style, content);
+    let has_registered_runs = font_runs.iter().any(|run| run.font.is_some());
+    let key = text_measure_key(
+        DEFAULT_TEXT_WRAP_WIDTH,
+        style,
+        registry.cascade_cache_key(style, content),
+    );
     if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
         cache
             .borrow()
@@ -163,7 +177,9 @@ fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, 
         return measured;
     }
 
-    let measured = if matches!(style.display, WDisplay::InlineBlock) {
+    let measured = if has_registered_runs {
+        cascade_text_intrinsic_size(content, style, DEFAULT_TEXT_WRAP_WIDTH)
+    } else if matches!(style.display, WDisplay::InlineBlock) {
         #[cfg(feature = "skia")]
         {
             crate::render_skia::measure_skia_text_intrinsic_size(content, style)
@@ -196,6 +212,91 @@ fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, 
         cache.entries += 1;
     });
     measured
+}
+
+fn cascade_char_advance(character: char, style: &w3cos_std::style::Style) -> f32 {
+    crate::font_face::FontRegistry::global()
+        .resolve_style_for_character(style, character)
+        .and_then(|font| font.parsed())
+        .map_or_else(
+            || text_layout::char_advance(character, style.font_size, layout_font()),
+            |font| text_layout::char_advance(character, style.font_size, font.as_ref()),
+        )
+}
+
+fn cascade_measure_width(text: &str, style: &w3cos_std::style::Style) -> f32 {
+    text.chars()
+        .map(|character| cascade_char_advance(character, style))
+        .sum()
+}
+
+fn cascade_line_height(text: &str, style: &w3cos_std::style::Style) -> f32 {
+    let registry = crate::font_face::FontRegistry::global();
+    registry
+        .resolve_style_runs(style, text)
+        .into_iter()
+        .map(|run| {
+            let font = run
+                .font
+                .as_ref()
+                .and_then(crate::font_face::LoadedFont::parsed);
+            match font.as_deref() {
+                Some(font) => text_layout::single_line_content_height(
+                    &text[run.byte_range],
+                    style.font_size,
+                    style.line_height,
+                    font,
+                ),
+                None => text_layout::single_line_content_height(
+                    &text[run.byte_range],
+                    style.font_size,
+                    style.line_height,
+                    layout_font(),
+                ),
+            }
+        })
+        .fold(style.font_size * style.line_height, f32::max)
+}
+
+fn cascade_text_intrinsic_size(
+    content: &str,
+    style: &w3cos_std::style::Style,
+    wrap_width: f32,
+) -> (f32, f32) {
+    let padding = style.padding_lengths();
+    if matches!(
+        style.white_space,
+        w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre
+    ) {
+        let mut width = cascade_measure_width(content, style) + padding.left + padding.right;
+        if let w3cos_std::style::Dimension::Px(min_width) = style.min_width {
+            width = width.max(min_width);
+        }
+        return (
+            width,
+            cascade_line_height(content, style) + padding.top + padding.bottom,
+        );
+    }
+    let inner_width = (wrap_width - padding.left - padding.right).max(1.0);
+    let lines = text_layout::wrap_text_with_char_width(
+        content,
+        inner_width,
+        style.white_space,
+        |character| cascade_char_advance(character, style),
+    );
+    let width = lines
+        .iter()
+        .map(|line| cascade_measure_width(line, style))
+        .fold(0.0_f32, f32::max);
+    let height = if lines.len() == 1 {
+        cascade_line_height(&lines[0], style)
+    } else {
+        lines.len() as f32 * style.font_size * style.line_height
+    };
+    (
+        width + padding.left + padding.right,
+        height + padding.top + padding.bottom,
+    )
 }
 
 fn text_intrinsic_size_in_parent(
@@ -241,7 +342,9 @@ fn is_cjk(ch: char) -> bool {
 }
 
 fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::style::Style) -> f32 {
-    let key = text_measure_key(width, style);
+    let registry = crate::font_face::FontRegistry::global();
+    let font_runs = registry.resolve_style_runs(style, content);
+    let key = text_measure_key(width, style, registry.cascade_cache_key(style, content));
     if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
         cache
             .borrow()
@@ -253,7 +356,11 @@ fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::style::Styl
         return measured;
     }
 
-    let measured = text_layout::wrapped_block_height_font(content, width, style, layout_font());
+    let measured = if font_runs.iter().any(|run| run.font.is_some()) {
+        cascade_text_intrinsic_size(content, style, width).1
+    } else {
+        text_layout::wrapped_block_height_font(content, width, style, layout_font())
+    };
     TEXT_MEASURE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         cache.make_room();
@@ -267,10 +374,11 @@ fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::style::Styl
     measured
 }
 
-fn text_measure_key(width: f32, style: &w3cos_std::style::Style) -> TextMeasureKey {
+fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> TextMeasureKey {
     let padding = style.padding_lengths();
     TextMeasureKey {
         width: width.to_bits(),
+        font,
         font_size: style.font_size.to_bits(),
         line_height: style.line_height.to_bits(),
         padding_top: padding.top.to_bits(),
@@ -1485,6 +1593,8 @@ fn to_taffy_overflow(o: WOverflow) -> taffy::Overflow {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
     use w3cos_std::color::Color;
     use w3cos_std::component::Component;
@@ -1500,6 +1610,7 @@ mod tests {
         Style {
             display: WDisp::Flex,
             flex_direction: WDir::Column,
+            box_sizing: WBoxSizing::BorderBox,
             gap: 10.0,
             padding: w3cos_std::style::Edges::all(16.0),
             width: WDim::Px(400.0),
@@ -1960,12 +2071,50 @@ mod tests {
     }
 
     #[test]
+    fn decoded_image_intrinsics_drive_auto_size_and_preserve_aspect_ratio() {
+        let source = "browser-layout-intrinsic.png";
+        let image = image::RgbaImage::from_pixel(4, 2, image::Rgba([1, 2, 3, 255]));
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+
+        let kind = ComponentKind::Image {
+            src: source.to_string(),
+        };
+        assert_eq!(leaf_intrinsic_size(&kind, &Style::default()), (4.0, 2.0));
+        assert_eq!(
+            leaf_intrinsic_size(
+                &kind,
+                &Style {
+                    width: WDim::Px(40.0),
+                    ..Style::default()
+                },
+            ),
+            (40.0, 20.0)
+        );
+        assert_eq!(
+            leaf_intrinsic_size(
+                &kind,
+                &Style {
+                    height: WDim::Px(10.0),
+                    ..Style::default()
+                },
+            ),
+            (20.0, 10.0)
+        );
+        crate::image_loader::invalidate(source);
+    }
+
+    #[test]
     fn column_stretch_fills_viewport_width() {
         let l = compute(
             &Component::column(
                 Style {
                     display: WDisp::Flex,
                     flex_direction: WDir::Column,
+                    box_sizing: WBoxSizing::BorderBox,
                     padding: w3cos_std::style::Edges::all(20.0),
                     width: WDim::Percent(100.0),
                     ..Style::default()
@@ -2211,6 +2360,7 @@ mod tests {
                 Style {
                     display: WDisp::Flex,
                     flex_direction: WDir::Column,
+                    box_sizing: WBoxSizing::BorderBox,
                     padding: w3cos_std::style::Edges::all(16.0),
                     width: WDim::Px(370.0),
                     ..Style::default()
@@ -2628,6 +2778,99 @@ mod tests {
         let _ = wrapped_text_height("上海 → 杭州运输节点已更新", 280.0, &style);
         let entries = TEXT_MEASURE_CACHE.with(|cache| cache.borrow().entries);
         assert_eq!(entries, 3, "assigned width is part of the cache key");
+    }
+
+    #[test]
+    fn registered_css_font_drives_layout_metrics_and_cache_identity() {
+        const OWNER: u64 = 0x4c41_594f_5554;
+        const FAMILY: &str = "W3COS Narrow Layout Test";
+        fn table_offset(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
+            let table_count = u16::from_be_bytes(bytes.get(4..6)?.try_into().ok()?) as usize;
+            (0..table_count).find_map(|index| {
+                let entry = 12 + index * 16;
+                (bytes.get(entry..entry + 4)? == tag).then(|| {
+                    u32::from_be_bytes(bytes[entry + 8..entry + 12].try_into().unwrap()) as usize
+                })
+            })
+        }
+
+        let mut narrow_bytes = include_bytes!("../assets/Inter-Regular.ttf").to_vec();
+        let hhea = table_offset(&narrow_bytes, b"hhea").expect("hhea table");
+        let hmtx = table_offset(&narrow_bytes, b"hmtx").expect("hmtx table");
+        let metrics = u16::from_be_bytes(
+            narrow_bytes[hhea + 34..hhea + 36]
+                .try_into()
+                .expect("numberOfHMetrics"),
+        ) as usize;
+        for index in 0..metrics {
+            let offset = hmtx + index * 4;
+            let advance = u16::from_be_bytes(
+                narrow_bytes[offset..offset + 2]
+                    .try_into()
+                    .expect("advance width"),
+            );
+            narrow_bytes[offset..offset + 2].copy_from_slice(&(advance / 2).max(1).to_be_bytes());
+        }
+
+        let style = Style {
+            font_size: 20.0,
+            white_space: WWhiteSpace::NoWrap,
+            ..Style::default()
+        };
+        let fallback = text_intrinsic_size("WWWWWWWW", &style).0;
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                crate::font_face::FontFace {
+                    family: FAMILY.to_string(),
+                    src: crate::font_face::FontSource::Bytes(narrow_bytes),
+                    unicode_range: Some("U+0057".to_string()),
+                    ..crate::font_face::FontFace::default()
+                },
+            )
+            .expect("register narrow test font");
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                crate::font_face::FontFace {
+                    family: FAMILY.to_string(),
+                    src: crate::font_face::FontSource::Bytes(
+                        include_bytes!("../assets/Inter-Regular.ttf").to_vec(),
+                    ),
+                    unicode_range: Some("U+0030-0039".to_string()),
+                    ..crate::font_face::FontFace::default()
+                },
+            )
+            .expect("register digit subset test font");
+        let custom_style = Style {
+            font_family: Some(format!("Missing Font, \"{FAMILY}\"")),
+            ..style.clone()
+        };
+        let custom = text_intrinsic_size("WWWWWWWW", &custom_style).0;
+        assert!(
+            custom < fallback * 0.75,
+            "registered family must change measured width ({custom} vs {fallback})"
+        );
+        let narrow_w = text_intrinsic_size("W", &custom_style).0;
+        let regular_digit = text_intrinsic_size("3", &custom_style).0;
+        let mixed = text_intrinsic_size("W3W", &custom_style).0;
+        assert!(
+            (mixed - (narrow_w * 2.0 + regular_digit)).abs() < 0.01,
+            "mixed subset runs must use each face's own metrics"
+        );
+        assert!(
+            crate::font_face::FontRegistry::global()
+                .resolve_style_for_character(&custom_style, 'A')
+                .is_none(),
+            "characters outside every unicode-range must continue through fallback"
+        );
+
+        crate::font_face::FontRegistry::global().clear_owner(OWNER);
+        let restored = text_intrinsic_size("WWWWWWWW", &custom_style).0;
+        assert!(
+            (restored - fallback).abs() < 0.01,
+            "font removal must not reuse stale custom metrics"
+        );
     }
 
     #[test]

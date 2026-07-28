@@ -331,6 +331,20 @@ pub fn get_screen_details() -> Value {
     w3cos_core::promise::resolve(vec![screen_details_value()])
 }
 
+/// Release Realm-owned screen wrappers and listeners while retaining the
+/// platform orientation snapshot used to initialize the next Realm.
+pub fn reset_realm() {
+    DETAILS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    SCREEN.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    ORIENTATION.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,9 +2,19 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use w3cos_core::Value;
+
+use crate::jsdom::{
+    WeakRealmObject, realm_function, register_weak_realm_object, reset_realm_class,
+    upgrade_realm_object, weak_realm_object,
+};
+
+struct SourceBufferRegistration {
+    object: WeakRealmObject,
+    bytes: Weak<RefCell<Vec<u8>>>,
+}
 
 thread_local! {
     static MEDIA_SOURCE_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -12,6 +22,13 @@ thread_local! {
     static SOURCE_BUFFER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static SOURCE_BUFFER_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+    static MEDIA_SOURCES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static SOURCE_BUFFERS: RefCell<Vec<SourceBufferRegistration>> = const { RefCell::new(Vec::new()) };
+    static SOURCE_BUFFER_LISTS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+}
+
+fn realm_media_source_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
 }
 
 fn warning() {
@@ -46,7 +63,7 @@ pub fn source_buffer_list_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| illegal("SourceBufferList"));
+        let class = realm_media_source_function(|_, _| illegal("SourceBufferList"));
         class.set_property("name", Value::string("SourceBufferList"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -72,6 +89,7 @@ fn source_buffer_list_value() -> Value {
         &list,
         &source_buffer_list_class().get_property("prototype"),
     );
+    register_weak_realm_object(&SOURCE_BUFFER_LISTS, &list);
     list
 }
 
@@ -109,7 +127,7 @@ pub fn source_buffer_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| illegal("SourceBuffer"));
+        let class = realm_media_source_function(|_, _| illegal("SourceBuffer"));
         class.set_property("name", Value::string("SourceBuffer"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -165,7 +183,7 @@ fn source_buffer_value(mime_type: &str) -> Value {
     let append_bytes = Rc::clone(&bytes);
     buffer.set_property(
         "appendBuffer",
-        Value::function(move |_, args| {
+        realm_media_source_function(move |_, args| {
             append_target.set_property("updating", Value::Bool(true));
             dispatch(&append_target, "updatestart");
             let value = args.first().cloned().unwrap_or(Value::Undefined);
@@ -188,7 +206,7 @@ fn source_buffer_value(mime_type: &str) -> Value {
     let remove_target = buffer.clone();
     buffer.set_property(
         "remove",
-        Value::function(move |_, _| {
+        realm_media_source_function(move |_, _| {
             remove_target.set_property("updating", Value::Bool(true));
             dispatch(&remove_target, "updatestart");
             warning();
@@ -201,7 +219,7 @@ fn source_buffer_value(mime_type: &str) -> Value {
     let abort_target = buffer.clone();
     buffer.set_property(
         "abort",
-        Value::function(move |_, _| {
+        realm_media_source_function(move |_, _| {
             abort_target.set_property("updating", Value::Bool(false));
             dispatch(&abort_target, "abort");
             dispatch(&abort_target, "updateend");
@@ -211,7 +229,7 @@ fn source_buffer_value(mime_type: &str) -> Value {
     let change_target = buffer.clone();
     buffer.set_property(
         "changeType",
-        Value::function(move |_, args| {
+        realm_media_source_function(move |_, args| {
             let mime = args.first().map(Value::to_js_string).unwrap_or_default();
             if mime.is_empty() {
                 w3cos_core::throw_value(w3cos_core::error_instance(
@@ -225,6 +243,14 @@ fn source_buffer_value(mime_type: &str) -> Value {
         }),
     );
     w3cos_core::class::set_prototype_of(&buffer, &source_buffer_class().get_property("prototype"));
+    SOURCE_BUFFERS.with(|buffers| {
+        let mut buffers = buffers.borrow_mut();
+        buffers.retain(|buffer| buffer.object.strong_count() != 0);
+        buffers.push(SourceBufferRegistration {
+            object: weak_realm_object(&buffer),
+            bytes: Rc::downgrade(&bytes),
+        });
+    });
     buffer
 }
 
@@ -233,7 +259,7 @@ pub fn media_source_handle_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| illegal("MediaSourceHandle"));
+        let class = realm_media_source_function(|_, _| illegal("MediaSourceHandle"));
         class.set_property("name", Value::string("MediaSourceHandle"));
         class.set_property(
             "prototype",
@@ -249,7 +275,7 @@ pub fn media_source_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, _| {
+        let class = realm_media_source_function(|this, _| {
             crate::web_events::event_target_class().call(this.clone(), Vec::new());
             let source_buffers = source_buffer_list_value();
             let active_buffers = source_buffer_list_value();
@@ -267,7 +293,7 @@ pub fn media_source_class() -> Value {
             let add_source = this.clone();
             this.set_property(
                 "addSourceBuffer",
-                Value::function(move |_, args| {
+                realm_media_source_function(move |_, args| {
                     let mime = args.first().map(Value::to_js_string).unwrap_or_default();
                     if mime.is_empty() {
                         w3cos_core::throw_value(w3cos_core::error_instance(
@@ -292,7 +318,7 @@ pub fn media_source_class() -> Value {
             let remove_source = this.clone();
             this.set_property(
                 "removeSourceBuffer",
-                Value::function(move |_, args| {
+                realm_media_source_function(move |_, args| {
                     let buffer = args.first().cloned().unwrap_or(Value::Undefined);
                     list_remove(&remove_source.get_property("sourceBuffers"), &buffer);
                     list_remove(&remove_source.get_property("activeSourceBuffers"), &buffer);
@@ -302,7 +328,7 @@ pub fn media_source_class() -> Value {
             let end_source = this.clone();
             this.set_property(
                 "endOfStream",
-                Value::function(move |_, _| {
+                realm_media_source_function(move |_, _| {
                     end_source.set_property("readyState", Value::string("ended"));
                     dispatch(&end_source, "sourceended");
                     Value::Undefined
@@ -311,19 +337,20 @@ pub fn media_source_class() -> Value {
             for method in ["setLiveSeekableRange", "clearLiveSeekableRange"] {
                 this.set_property(
                     method,
-                    Value::function(|_, _| {
+                    realm_media_source_function(|_, _| {
                         warning();
                         Value::Undefined
                     }),
                 );
             }
+            register_weak_realm_object(&MEDIA_SOURCES, &this);
             Value::Undefined
         });
         class.set_property("name", Value::string("MediaSource"));
         class.set_property("canConstructInDedicatedWorker", Value::Bool(false));
         class.set_property(
             "isTypeSupported",
-            Value::function(|_, args| {
+            realm_media_source_function(|_, args| {
                 let mime = args.first().map(Value::to_js_string).unwrap_or_default();
                 if !mime.is_empty() {
                     warning();
@@ -360,6 +387,69 @@ pub fn media_source_class() -> Value {
 }
 
 pub fn reset() {
+    SOURCE_BUFFERS.with(|buffers| {
+        for registration in buffers.borrow_mut().drain(..) {
+            if let Some(bytes) = registration.bytes.upgrade() {
+                bytes.borrow_mut().clear();
+            }
+            let Some(buffer) = upgrade_realm_object(&registration.object) else {
+                continue;
+            };
+            buffer.set_property("updating", Value::Bool(false));
+            for callback in [
+                "onabort",
+                "onerror",
+                "onupdate",
+                "onupdateend",
+                "onupdatestart",
+            ] {
+                buffer.set_property(callback, Value::Null);
+            }
+            for method in ["abort", "appendBuffer", "changeType", "remove"] {
+                buffer.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    SOURCE_BUFFER_LISTS.with(|lists| {
+        for list in lists
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|list| upgrade_realm_object(&list))
+        {
+            let length = list.get_property("length").to_u32();
+            for index in 0..length {
+                list.set_property(&index.to_string(), Value::Undefined);
+            }
+            list.set_property("length", Value::Number(0.0));
+            list.set_property("onaddsourcebuffer", Value::Null);
+            list.set_property("onremovesourcebuffer", Value::Null);
+        }
+    });
+    MEDIA_SOURCES.with(|sources| {
+        for source in sources
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|source| upgrade_realm_object(&source))
+        {
+            source.set_property("readyState", Value::string("closed"));
+            for callback in ["onsourceclose", "onsourceended", "onsourceopen"] {
+                source.set_property(callback, Value::Null);
+            }
+            for method in [
+                "addSourceBuffer",
+                "clearLiveSeekableRange",
+                "endOfStream",
+                "removeSourceBuffer",
+                "setLiveSeekableRange",
+            ] {
+                source.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    reset_realm_class(&MEDIA_SOURCE_CLASS);
+    reset_realm_class(&MEDIA_SOURCE_HANDLE_CLASS);
+    reset_realm_class(&SOURCE_BUFFER_CLASS);
+    reset_realm_class(&SOURCE_BUFFER_LIST_CLASS);
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -382,5 +472,94 @@ mod tests {
         assert!(!buffer.get_property("updating").to_bool());
         source.call_method("endOfStream", Vec::new());
         assert_eq!(source.get_property("readyState").to_js_string(), "ended");
+    }
+
+    #[test]
+    fn sources_buffers_lists_callbacks_and_bytes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_source_class = media_source_class();
+        let old_buffer_class = source_buffer_class();
+        let source = w3cos_core::class::construct(&old_source_class, Vec::new());
+        let buffer = source.call_method("addSourceBuffer", vec![Value::string("video/webm")]);
+        let list = source.get_property("sourceBuffers");
+        buffer.call_method(
+            "appendBuffer",
+            vec![w3cos_core::binary::typed_array_value(vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+            ])],
+        );
+        let (buffer_object, bytes) = SOURCE_BUFFERS.with(|buffers| {
+            let buffers = buffers.borrow();
+            let registration = buffers.last().unwrap();
+            (registration.object.clone(), registration.bytes.clone())
+        });
+        assert_eq!(bytes.upgrade().unwrap().borrow().len(), 2);
+
+        let source_marker = Rc::new(());
+        let source_marker_weak = Rc::downgrade(&source_marker);
+        source.set_property(
+            "onsourceopen",
+            Value::function(move |_, _| {
+                let _ = &source_marker;
+                Value::Undefined
+            }),
+        );
+        let buffer_marker = Rc::new(());
+        let buffer_marker_weak = Rc::downgrade(&buffer_marker);
+        buffer.set_property(
+            "onupdate",
+            Value::function(move |_, _| {
+                let _ = &buffer_marker;
+                Value::Undefined
+            }),
+        );
+        let list_marker = Rc::new(());
+        let list_marker_weak = Rc::downgrade(&list_marker);
+        list.set_property(
+            "onremovesourcebuffer",
+            Value::function(move |_, _| {
+                let _ = &list_marker;
+                Value::Undefined
+            }),
+        );
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_source_class.strict_eq(&media_source_class()));
+        assert!(!old_buffer_class.strict_eq(&source_buffer_class()));
+        assert!(
+            old_source_class
+                .call(Value::Undefined, Vec::new())
+                .is_undefined()
+        );
+        assert_eq!(source.get_property("readyState").to_js_string(), "closed");
+        assert!(
+            source
+                .call_method("addSourceBuffer", vec![Value::string("video/webm")])
+                .is_undefined()
+        );
+        assert!(source.get_property("onsourceopen").is_null());
+        assert!(buffer.call_method("abort", Vec::new()).is_undefined());
+        assert!(buffer.get_property("onupdate").is_null());
+        assert_eq!(list.get_property("length").to_number(), 0.0);
+        assert!(list.get_property("onremovesourcebuffer").is_null());
+        assert!(
+            bytes
+                .upgrade()
+                .is_none_or(|bytes| bytes.borrow().is_empty())
+        );
+        assert!(source_marker_weak.upgrade().is_none());
+        assert!(buffer_marker_weak.upgrade().is_none());
+        assert!(list_marker_weak.upgrade().is_none());
+
+        drop(source);
+        drop(buffer);
+        drop(list);
+        assert!(buffer_object.upgrade().is_none());
+        assert!(bytes.upgrade().is_none());
     }
 }

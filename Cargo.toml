@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "tools/size-audit",
+    "tools/size-probes",
+    "crates/w3cos-ir",
+    "crates/w3cos-vm",
     "crates/w3cos-core",
     "crates/w3cos-runtime",
     "crates/w3cos-compiler",
@@ -23,6 +27,8 @@ license = "Apache-2.0"
 repository = "https://github.com/wangnaihe/w3cos"
 
 [workspace.dependencies]
+w3cos-ir = { path = "crates/w3cos-ir" }
+w3cos-vm = { path = "crates/w3cos-vm" }
 w3cos-core = { path = "crates/w3cos-core" }
 w3cos-runtime = { path = "crates/w3cos-runtime", default-features = false }
 w3cos-compiler = { path = "crates/w3cos-compiler" }
@@ -35,6 +41,7 @@ w3cos-mobile = { path = "crates/w3cos-mobile" }
 png = "0.17"
 image = "0.25"
 flate2 = "1.1"
+wuff = "0.2.8"
 
 # Layout: Taffy 0.9 — Flexbox + Grid + Block + position
 taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout", "content_size"] }
@@ -77,6 +84,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 quick-xml = "0.39"
 clap = { version = "4", features = ["derive"] }
+object = { version = "0.37", default-features = false, features = ["read", "std"] }
+url = "2"
+psl = "2"
 
 # Keep local debug builds useful without retaining full variable-level debug
 # information in every dependency artifact. Automated gates additionally
@@ -88,3 +98,15 @@ split-debuginfo = "packed"
 [profile.test]
 debug = 1
 split-debuginfo = "packed"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.release-size]
+inherits = "release"
+opt-level = "z"
+lto = "fat"

@@ -13,8 +13,15 @@
 //!   not cascade-correct, documented). Unresolvable `var()` is kept literal.
 //! - `calc()` is evaluated only when the whole value is a px-only expression;
 //!   anything else (%, rem, var(), `*`/`) is kept literal.
-//! - `@media` / `@supports` / `@layer` blocks are INCLUDED unconditionally
-//!   (no media evaluation); `@keyframes` / `@font-face` are skipped.
+//! - `@media` conditions are retained on each flattened rule for Browser
+//!   viewport evaluation. Build-time AOT registration still includes those
+//!   rules unconditionally until native viewport-conditioned registration is
+//!   introduced. `@supports` / `@layer` blocks are included, while
+//!   `@keyframes` are skipped.
+//! - Leading `@import` URLs and media conditions are exposed as ordered
+//!   dependency metadata; fetching remains owned by the Browser loader.
+//! - `@font-face` families, ordered `local()`/`url()` sources, formats and
+//!   descriptors are exposed as metadata for the same Browser loader.
 //! - Every problem degrades to a warning string; nothing here fails a build.
 
 use std::collections::{HashMap, HashSet};
@@ -30,6 +37,37 @@ pub struct CollectedRule {
     pub selector: String,
     /// Raw declarations in source order (custom properties excluded).
     pub declarations: Vec<(String, String)>,
+    /// Combined enclosing `@media` condition, if any.
+    pub media: Option<String>,
+}
+
+/// One leading CSS `@import` dependency discovered by the shared tolerant
+/// parser. URL resolution and fetching remain the caller's responsibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StylesheetImport {
+    pub href: String,
+    pub media: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StylesheetFontSource {
+    Url {
+        href: String,
+        format: Option<String>,
+    },
+    Local(String),
+}
+
+/// One `@font-face` declaration parsed from authored CSS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StylesheetFontFace {
+    pub family: String,
+    pub sources: Vec<StylesheetFontSource>,
+    pub weight: Option<String>,
+    pub style: Option<String>,
+    pub display: Option<String>,
+    pub unicode_range: Option<String>,
+    pub media: Option<String>,
 }
 
 /// Result of collecting CSS imports from a module graph.
@@ -39,6 +77,10 @@ pub struct CollectedStylesheet {
     pub files: usize,
     /// Flat rules in (file, source) order — the cascade's registration order.
     pub rules: Vec<CollectedRule>,
+    /// Leading `@import` dependencies in authored order.
+    pub imports: Vec<StylesheetImport>,
+    /// Parsed `@font-face` declarations in authored order.
+    pub font_faces: Vec<StylesheetFontFace>,
     /// Human-readable warnings (bad css, skipped preprocessors, unresolved
     /// vars). Surfaced as `//! WARNING css ...` diagnostics in the bundle.
     pub warnings: Vec<String>,
@@ -109,28 +151,73 @@ pub fn collect_esm_css(graph: &ModuleGraph, resolver: &EsmResolver) -> Collected
             };
             out.files += 1;
             let display = resolved.path.display().to_string();
-            let file_rules = parse_css_raw(&source, &display, &mut out.warnings);
-            for rule in file_rules {
-                // Custom properties are collected from :root / * rules only and
-                // used for compile-time var() substitution — they are not
-                // emitted as style declarations themselves.
-                let trimmed = rule.selectors.trim();
-                if trimmed == ":root" || trimmed == "*" || trimmed == "html" {
-                    for (prop, value) in &rule.declarations {
-                        if prop.starts_with("--") {
-                            custom_props.insert(prop.clone(), value.clone());
-                        }
-                    }
-                }
-                raw_rules.push(rule);
-            }
+            let file_rules = parse_css_raw(
+                &source,
+                &display,
+                &mut out.warnings,
+                &mut out.imports,
+                &mut out.font_faces,
+            );
+            ingest_raw_rules(file_rules, &mut raw_rules, &mut custom_props);
         }
     }
 
+    finish_raw_rules(&raw_rules, &custom_props, &mut out);
+    out
+}
+
+/// Parse one authored stylesheet through the same tolerant parser and
+/// normalization path used by build-time ESM CSS imports. Dynamic Browser
+/// targets consume this API from the capability-scoped loader, so Browser and
+/// native AOT do not grow separate CSS parsers.
+pub fn parse_css_source(source: &str, source_url: &str) -> CollectedStylesheet {
+    let mut out = CollectedStylesheet {
+        files: 1,
+        ..CollectedStylesheet::default()
+    };
+    let mut raw_rules = Vec::new();
+    let mut custom_props = HashMap::new();
+    let parsed = parse_css_raw(
+        source,
+        source_url,
+        &mut out.warnings,
+        &mut out.imports,
+        &mut out.font_faces,
+    );
+    ingest_raw_rules(parsed, &mut raw_rules, &mut custom_props);
+    finish_raw_rules(&raw_rules, &custom_props, &mut out);
+    out
+}
+
+fn ingest_raw_rules(
+    rules: Vec<RawRule>,
+    raw_rules: &mut Vec<RawRule>,
+    custom_props: &mut HashMap<String, String>,
+) {
+    for rule in rules {
+        // Custom properties are collected from :root / * rules only and used
+        // for var() substitution. They are not emitted as declarations.
+        let trimmed = rule.selectors.trim();
+        if trimmed == ":root" || trimmed == "*" || trimmed == "html" {
+            for (prop, value) in &rule.declarations {
+                if prop.starts_with("--") {
+                    custom_props.insert(prop.clone(), value.clone());
+                }
+            }
+        }
+        raw_rules.push(rule);
+    }
+}
+
+fn finish_raw_rules(
+    raw_rules: &[RawRule],
+    custom_props: &HashMap<String, String>,
+    out: &mut CollectedStylesheet,
+) {
     // Flatten: split comma groups, drop custom properties, resolve var()/calc().
     let mut unresolved_vars: Vec<String> = Vec::new();
     let mut literal_calcs: Vec<String> = Vec::new();
-    for rule in &raw_rules {
+    for rule in raw_rules {
         let declarations: Vec<(String, String)> = rule
             .declarations
             .iter()
@@ -152,6 +239,7 @@ pub fn collect_esm_css(graph: &ModuleGraph, resolver: &EsmResolver) -> Collected
             out.rules.push(CollectedRule {
                 selector,
                 declarations: declarations.clone(),
+                media: rule.media.clone(),
             });
         }
     }
@@ -168,8 +256,6 @@ pub fn collect_esm_css(graph: &ModuleGraph, resolver: &EsmResolver) -> Collected
     for value in literal_calcs.iter().take(20) {
         out.warn(format!("css: non-px calc() kept literal: {value}"));
     }
-
-    out
 }
 
 /// A raw parsed rule: unsplit selector group + unprocessed declarations.
@@ -177,11 +263,18 @@ pub fn collect_esm_css(graph: &ModuleGraph, resolver: &EsmResolver) -> Collected
 struct RawRule {
     selectors: String,
     declarations: Vec<(String, String)>,
+    media: Option<String>,
 }
 
 /// Tolerant raw CSS rule extraction. Never fails: malformed input produces
 /// warnings and best-effort rules.
-fn parse_css_raw(source: &str, path: &str, warnings: &mut Vec<String>) -> Vec<RawRule> {
+fn parse_css_raw(
+    source: &str,
+    path: &str,
+    warnings: &mut Vec<String>,
+    imports: &mut Vec<StylesheetImport>,
+    font_faces: &mut Vec<StylesheetFontFace>,
+) -> Vec<RawRule> {
     let source = strip_block_comments(source);
     let open = source.matches('{').count();
     let close = source.matches('}').count();
@@ -194,7 +287,9 @@ fn parse_css_raw(source: &str, path: &str, warnings: &mut Vec<String>) -> Vec<Ra
         );
     }
     let mut rules = Vec::new();
-    parse_block_into(&source, path, warnings, &mut rules);
+    parse_block_into(
+        &source, path, warnings, &mut rules, imports, font_faces, None, true,
+    );
     if rules.is_empty() && source.trim().len() > 16 {
         push_warning(
             warnings,
@@ -216,9 +311,14 @@ fn parse_block_into(
     path: &str,
     warnings: &mut Vec<String>,
     rules: &mut Vec<RawRule>,
+    imports: &mut Vec<StylesheetImport>,
+    font_faces: &mut Vec<StylesheetFontFace>,
+    media: Option<&str>,
+    top_level: bool,
 ) {
     let bytes = source.as_bytes();
     let mut pos = 0;
+    let mut imports_allowed = top_level;
 
     while pos < bytes.len() {
         while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
@@ -229,7 +329,19 @@ fn parse_block_into(
         }
 
         if bytes[pos] == b'@' {
-            pos = parse_at_rule(&source, pos, path, warnings, rules);
+            let (next, keeps_imports_open) = parse_at_rule(
+                &source,
+                pos,
+                path,
+                warnings,
+                rules,
+                imports,
+                font_faces,
+                media,
+                imports_allowed,
+            );
+            pos = next;
+            imports_allowed &= keeps_imports_open;
             continue;
         }
 
@@ -263,10 +375,12 @@ fn parse_block_into(
             );
         }
         if !selector_str.is_empty() {
+            imports_allowed = false;
             let declarations = parse_declarations_raw(block_str);
             rules.push(RawRule {
                 selectors: selector_str.to_string(),
                 declarations,
+                media: media.map(ToString::to_string),
             });
         }
         if !terminated {
@@ -281,7 +395,11 @@ fn parse_at_rule(
     path: &str,
     warnings: &mut Vec<String>,
     rules: &mut Vec<RawRule>,
-) -> usize {
+    imports: &mut Vec<StylesheetImport>,
+    font_faces: &mut Vec<StylesheetFontFace>,
+    media: Option<&str>,
+    imports_allowed: bool,
+) -> (usize, bool) {
     let bytes = source.as_bytes();
     let mut pos = start + 1;
 
@@ -297,11 +415,25 @@ fn parse_at_rule(
         scan += 1;
     }
     if scan >= bytes.len() {
-        return scan;
+        return (scan, false);
     }
+    let prelude = source[pos..scan].trim().to_string();
 
     if bytes[scan] == b';' {
-        return scan + 1; // @import, @charset, @layer a, b; — nothing inside
+        if keyword.eq_ignore_ascii_case("import") && imports_allowed {
+            if let Some(import) = parse_import_prelude(&prelude) {
+                imports.push(import);
+            } else {
+                push_warning(
+                    warnings,
+                    format!("css {path}: malformed @import skipped: {prelude}"),
+                );
+            }
+        }
+        return (
+            scan + 1,
+            keyword.eq_ignore_ascii_case("import") || keyword.eq_ignore_ascii_case("charset"),
+        );
     }
 
     // At-rule with a block.
@@ -309,14 +441,145 @@ fn parse_at_rule(
     let (block_str, advance, _terminated) = extract_brace_content(&source[pos..]);
     pos += advance;
     match keyword {
-        // Conditional/grouping blocks: include their rules unconditionally.
-        "media" | "supports" | "layer" => {
-            parse_block_into(block_str, path, warnings, rules);
+        "media" => {
+            let combined = media
+                .map(|parent| format!("({parent}) and ({prelude})"))
+                .unwrap_or(prelude);
+            parse_block_into(
+                block_str,
+                path,
+                warnings,
+                rules,
+                imports,
+                font_faces,
+                Some(&combined),
+                false,
+            );
         }
-        // keyframes / font-face: no style rules for the registry.
+        // Other grouping blocks retain any enclosing media condition.
+        "supports" | "layer" => {
+            parse_block_into(
+                block_str, path, warnings, rules, imports, font_faces, media, false,
+            );
+        }
+        "font-face" => {
+            if let Some(face) = parse_font_face_block(block_str, media) {
+                font_faces.push(face);
+            } else {
+                push_warning(
+                    warnings,
+                    format!("css {path}: @font-face missing family or usable src"),
+                );
+            }
+        }
+        // keyframes: no style rules for the registry.
         _ => {}
     }
-    pos
+    (pos, false)
+}
+
+fn parse_import_prelude(prelude: &str) -> Option<StylesheetImport> {
+    let prelude = prelude.trim();
+    let (href, rest) = if let Some(quoted) = prelude.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        (quoted[..end].to_string(), &quoted[end + 1..])
+    } else if let Some(quoted) = prelude.strip_prefix('\'') {
+        let end = quoted.find('\'')?;
+        (quoted[..end].to_string(), &quoted[end + 1..])
+    } else {
+        let after_url = prelude
+            .get(..4)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("url("))
+            .map(|_| &prelude[4..])?;
+        let end = after_url.find(')')?;
+        let href = after_url[..end]
+            .trim()
+            .trim_matches(|character| character == '"' || character == '\'')
+            .to_string();
+        (href, &after_url[end + 1..])
+    };
+    if href.is_empty() {
+        return None;
+    }
+    let media = rest.trim();
+    Some(StylesheetImport {
+        href,
+        media: (!media.is_empty()).then(|| media.to_string()),
+    })
+}
+
+fn parse_font_face_block(block: &str, media: Option<&str>) -> Option<StylesheetFontFace> {
+    let declarations = parse_declarations_raw(block);
+    let value = |name: &str| {
+        declarations
+            .iter()
+            .find(|(property, _)| property.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    let family = value("font-family")?
+        .trim()
+        .trim_matches(|character| character == '"' || character == '\'')
+        .to_string();
+    if family.is_empty() {
+        return None;
+    }
+    let sources = split_top_level(value("src")?, b',')
+        .into_iter()
+        .filter_map(|candidate| {
+            let candidate = candidate.trim();
+            if let Some((name, _)) = parse_css_function(candidate, "local") {
+                return Some(StylesheetFontSource::Local(name));
+            }
+            let (href, rest) = parse_css_function(candidate, "url")?;
+            if href.is_empty() {
+                return None;
+            }
+            let format = parse_css_function(rest.trim(), "format").map(|(format, _)| format);
+            Some(StylesheetFontSource::Url { href, format })
+        })
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return None;
+    }
+    Some(StylesheetFontFace {
+        family,
+        sources,
+        weight: value("font-weight").map(ToString::to_string),
+        style: value("font-style").map(ToString::to_string),
+        display: value("font-display").map(ToString::to_string),
+        unicode_range: value("unicode-range").map(ToString::to_string),
+        media: media.map(ToString::to_string),
+    })
+}
+
+fn parse_css_function<'a>(source: &'a str, name: &str) -> Option<(String, &'a str)> {
+    let source = source.trim_start();
+    let open = source.find('(')?;
+    if !source[..open].trim().eq_ignore_ascii_case(name) {
+        return None;
+    }
+    let mut quote = None;
+    let mut depth = 0_i32;
+    for (offset, character) in source[open..].char_indices() {
+        match character {
+            '"' | '\'' if quote == Some(character) => quote = None,
+            '"' | '\'' if quote.is_none() => quote = Some(character),
+            '(' if quote.is_none() => depth += 1,
+            ')' if quote.is_none() => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = open + offset;
+                    let value = source[open + 1..end]
+                        .trim()
+                        .trim_matches(|character| character == '"' || character == '\'')
+                        .to_string();
+                    return Some((value, &source[end + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Extract content between a `{` (already consumed) and its matching `}`.
@@ -591,6 +854,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_source_uses_the_same_css_normalization_pipeline() {
+        let sheet = parse_css_source(
+            ":root { --accent: #123456; }\n\
+             .panel, .card { color: var(--accent); width: calc(4px + 6px); }",
+            "https://example.test/app.css",
+        );
+        assert_eq!(sheet.files, 1);
+        assert!(sheet.warnings.is_empty(), "warnings: {:?}", sheet.warnings);
+        assert_eq!(
+            sheet
+                .rules
+                .iter()
+                .map(|rule| rule.selector.as_str())
+                .collect::<Vec<_>>(),
+            [".panel", ".card"]
+        );
+        for rule in &sheet.rules {
+            assert_eq!(
+                rule.declarations,
+                [
+                    ("color".to_string(), "#123456".to_string()),
+                    ("width".to_string(), "10px".to_string())
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn collects_css_from_two_module_graph() {
         let root = write_fixture(
             "two_module",
@@ -730,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn comma_groups_split_and_media_included() {
+    fn comma_groups_split_and_media_condition_is_retained() {
         let root = write_fixture(
             "comma",
             &[
@@ -750,7 +1041,108 @@ mod tests {
             vec![".a", ".b", ".c"],
             "comma group splits, @media included, @keyframes skipped: {selectors:?}"
         );
+        assert_eq!(
+            sheet
+                .rules
+                .iter()
+                .find(|rule| rule.selector == ".c")
+                .and_then(|rule| rule.media.as_deref()),
+            Some("(max-width: 600px)")
+        );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn nested_media_conditions_are_combined_on_flattened_rules() {
+        let sheet = parse_css_source(
+            "@media screen and (min-width: 400px) {\
+                @supports (display: grid) { .grid { display: grid; } }\
+                @media (max-width: 900px) { .compact { gap: 4px; } }\
+            }",
+            "nested.css",
+        );
+        assert_eq!(
+            sheet
+                .rules
+                .iter()
+                .find(|rule| rule.selector == ".grid")
+                .and_then(|rule| rule.media.as_deref()),
+            Some("screen and (min-width: 400px)")
+        );
+        assert_eq!(
+            sheet
+                .rules
+                .iter()
+                .find(|rule| rule.selector == ".compact")
+                .and_then(|rule| rule.media.as_deref()),
+            Some("(screen and (min-width: 400px)) and ((max-width: 900px))")
+        );
+    }
+
+    #[test]
+    fn leading_imports_preserve_authored_order_urls_and_media() {
+        let sheet = parse_css_source(
+            "@charset \"utf-8\";\
+             @import \"reset.css\";\
+             @import url('./theme.css') screen and (min-width: 600px);\
+             .root { color: black; }\
+             @import \"too-late.css\";",
+            "imports.css",
+        );
+        assert_eq!(
+            sheet.imports,
+            vec![
+                StylesheetImport {
+                    href: "reset.css".to_string(),
+                    media: None,
+                },
+                StylesheetImport {
+                    href: "./theme.css".to_string(),
+                    media: Some("screen and (min-width: 600px)".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn font_faces_preserve_order_sources_descriptors_and_media() {
+        let sheet = parse_css_source(
+            "@font-face {\
+               font-family: 'Map Sans';\
+               src: local('Map Sans'), url('../fonts/map.woff2') format('woff2');\
+               font-weight: 400;\
+               font-style: italic;\
+               font-display: swap;\
+               unicode-range: U+0000-00FF;\
+             }\
+             @media screen and (min-width: 800px) {\
+               @font-face { font-family: Wide; src: url(wide.ttf) format(truetype); }\
+             }",
+            "fonts.css",
+        );
+        assert_eq!(sheet.font_faces.len(), 2);
+        assert_eq!(sheet.font_faces[0].family, "Map Sans");
+        assert_eq!(
+            sheet.font_faces[0].sources,
+            vec![
+                StylesheetFontSource::Local("Map Sans".to_string()),
+                StylesheetFontSource::Url {
+                    href: "../fonts/map.woff2".to_string(),
+                    format: Some("woff2".to_string()),
+                },
+            ]
+        );
+        assert_eq!(sheet.font_faces[0].weight.as_deref(), Some("400"));
+        assert_eq!(sheet.font_faces[0].style.as_deref(), Some("italic"));
+        assert_eq!(sheet.font_faces[0].display.as_deref(), Some("swap"));
+        assert_eq!(
+            sheet.font_faces[0].unicode_range.as_deref(),
+            Some("U+0000-00FF")
+        );
+        assert_eq!(
+            sheet.font_faces[1].media.as_deref(),
+            Some("screen and (min-width: 800px)")
+        );
     }
 
     #[test]

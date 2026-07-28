@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 struct EditState {
@@ -38,7 +39,8 @@ pub fn text_format_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |this, args| {
             let init = args.first().cloned().unwrap_or(Value::Undefined);
             this.set_property("rangeStart", init.get_property("rangeStart"));
             this.set_property("rangeEnd", init.get_property("rangeEnd"));
@@ -79,6 +81,7 @@ fn utf16_replace(text: &str, start: u32, end: u32, replacement: &str) -> String 
 }
 
 fn edit_context_value(init: Value) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let text = {
         let value = init.get_property("text");
         if value.is_undefined() {
@@ -130,7 +133,7 @@ fn edit_context_value(init: Value) -> Value {
         let getter_state = Rc::clone(&state);
         context.set_property(
             &format!("__w3cos_getter_{member}"),
-            Value::function(move |_, _| {
+            realm_function(generation, move |_, _| {
                 let state = getter_state.borrow();
                 match getter {
                     0 => Value::string(&state.text),
@@ -145,7 +148,7 @@ fn edit_context_value(init: Value) -> Value {
     let selection_state = Rc::clone(&state);
     context.set_property(
         "updateSelection",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let start = args.first().cloned().unwrap_or_default().to_u32();
             let end = args.get(1).cloned().unwrap_or_default().to_u32();
             let length = selection_state.borrow().text.encode_utf16().count() as u32;
@@ -162,7 +165,7 @@ fn edit_context_value(init: Value) -> Value {
     let text_context = context.clone();
     context.set_property(
         "updateText",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let start = args.first().cloned().unwrap_or_default().to_u32();
             let end = args.get(1).cloned().unwrap_or_default().to_u32();
             let replacement = args.get(2).cloned().unwrap_or_default().to_js_string();
@@ -199,7 +202,7 @@ fn edit_context_value(init: Value) -> Value {
     let bounds_state = Rc::clone(&state);
     context.set_property(
         "updateCharacterBounds",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let range_start = args.first().cloned().unwrap_or_default().to_u32();
             let bounds = args.get(1).cloned().unwrap_or(Value::Undefined);
             if !bounds.is_array() {
@@ -225,7 +228,7 @@ fn edit_context_value(init: Value) -> Value {
     for method in ["updateControlBounds", "updateSelectionBounds"] {
         context.set_property(
             method,
-            Value::function(move |this, args| {
+            realm_function(generation, move |this, args| {
                 let rect = args.first().cloned().unwrap_or(Value::Undefined);
                 this.set_property(
                     &format!("__w3cos_{method}"),
@@ -249,7 +252,8 @@ pub fn edit_context_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, args| {
             edit_context_value(args.first().cloned().unwrap_or(Value::Undefined))
         });
         class.set_property("name", Value::string("EditContext"));
@@ -285,6 +289,15 @@ pub fn edit_context_class() -> Value {
     })
 }
 
+pub fn reset_realm() {
+    EDIT_CONTEXT_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    TEXT_FORMAT_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
 pub fn attach_element(context: &Value, element: Value) {
     if !w3cos_core::class::instance_of(context, &edit_context_class()) {
         type_error("HTMLElement.editContext must be an EditContext or null");
@@ -315,6 +328,9 @@ mod tests {
 
     #[test]
     fn edit_context_updates_utf16_text_selection_bounds_and_events() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
         let context = w3cos_core::class::construct(
             &edit_context_class(),
             vec![Value::object(HashMap::from([
@@ -367,5 +383,61 @@ mod tests {
                 .to_number(),
             4.0
         );
+        reset_realm();
+    }
+
+    #[test]
+    fn text_model_entry_points_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_class = edit_context_class();
+        let old_format_class = text_format_class();
+        let context = w3cos_core::class::construct(
+            &old_class,
+            vec![Value::object(HashMap::from([(
+                "text".into(),
+                Value::string("old"),
+            )]))],
+        );
+        old_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_class = edit_context_class();
+        let new_format_class = text_format_class();
+        assert!(!old_class.strict_eq(&new_class));
+        assert!(!old_format_class.strict_eq(&new_format_class));
+        assert!(
+            new_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(
+            old_format_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(context.get_property("text").is_undefined());
+        for method in [
+            "updateSelection",
+            "updateText",
+            "updateCharacterBounds",
+            "updateControlBounds",
+            "updateSelectionBounds",
+        ] {
+            assert!(context.call_method(method, vec![]).is_undefined());
+        }
+        assert_eq!(
+            w3cos_core::class::construct(&new_class, vec![])
+                .get_property("text")
+                .to_js_string(),
+            ""
+        );
+        reset_realm();
     }
 }

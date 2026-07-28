@@ -7,9 +7,31 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static VALUES: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+const CLASS_NAMES: &[&str] = &[
+    "FileSystemHandle",
+    "FileSystemFileHandle",
+    "FileSystemDirectoryHandle",
+    "FileSystemObserver",
+    "FileSystemWritableFileStream",
+];
+
+fn realm_file_system_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
+}
+
+fn register_file_system_value(value: &Value) {
+    register_weak_realm_object(&VALUES, value);
 }
 
 fn warning() {
@@ -40,14 +62,36 @@ fn illegal(name: &'static str) -> Value {
 
 fn build_class(name: &'static str) -> Value {
     let class = if name == "FileSystemObserver" {
-        Value::function(|_, args| observer_value(args.first().cloned().unwrap_or(Value::Undefined)))
+        realm_file_system_function(|_, args| {
+            observer_value(args.first().cloned().unwrap_or(Value::Undefined))
+        })
     } else {
-        Value::function(move |_, _| illegal(name))
+        realm_file_system_function(move |_, _| illegal(name))
     };
     class.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", class.clone());
-    let members: &[&str] = match name {
+    for member in class_members(name) {
+        prototype.set_property(member, Value::Undefined);
+    }
+    let parent = match name {
+        "FileSystemFileHandle" | "FileSystemDirectoryHandle" => {
+            Some(class_for("FileSystemHandle").get_property("prototype"))
+        }
+        "FileSystemWritableFileStream" => {
+            Some(crate::streams_web::writable_stream_class().get_property("prototype"))
+        }
+        _ => None,
+    };
+    if let Some(parent) = parent {
+        w3cos_core::class::set_prototype_of(&prototype, &parent);
+    }
+    class.set_property("prototype", prototype);
+    class
+}
+
+fn class_members(name: &str) -> &'static [&'static str] {
+    match name {
         "FileSystemHandle" => &[
             "isSameEntry",
             "kind",
@@ -69,24 +113,7 @@ fn build_class(name: &'static str) -> Value {
         "FileSystemObserver" => &["disconnect", "observe"],
         "FileSystemWritableFileStream" => &["mode", "seek", "truncate", "write"],
         _ => &[],
-    };
-    for member in members {
-        prototype.set_property(member, Value::Undefined);
     }
-    let parent = match name {
-        "FileSystemFileHandle" | "FileSystemDirectoryHandle" => {
-            Some(class_for("FileSystemHandle").get_property("prototype"))
-        }
-        "FileSystemWritableFileStream" => {
-            Some(crate::streams_web::writable_stream_class().get_property("prototype"))
-        }
-        _ => None,
-    };
-    if let Some(parent) = parent {
-        w3cos_core::class::set_prototype_of(&prototype, &parent);
-    }
-    class.set_property("prototype", prototype);
-    class
 }
 
 pub fn class_for(name: &'static str) -> Value {
@@ -131,14 +158,14 @@ fn base_handle(path: &Path, kind: &str) -> Value {
         ),
         (
             "queryPermission".into(),
-            Value::function(|_, _| {
+            realm_file_system_function(|_, _| {
                 warning();
                 w3cos_core::promise::resolve(vec![Value::string("granted")])
             }),
         ),
         (
             "requestPermission".into(),
-            Value::function(|_, _| {
+            realm_file_system_function(|_, _| {
                 warning();
                 w3cos_core::promise::resolve(vec![Value::string("granted")])
             }),
@@ -147,7 +174,7 @@ fn base_handle(path: &Path, kind: &str) -> Value {
     let own_path = path.to_path_buf();
     value.set_property(
         "isSameEntry",
-        Value::function(move |_, args| {
+        realm_file_system_function(move |_, args| {
             let same = args
                 .first()
                 .and_then(value_path)
@@ -158,7 +185,7 @@ fn base_handle(path: &Path, kind: &str) -> Value {
     let remove_path = path.to_path_buf();
     value.set_property(
         "remove",
-        Value::function(move |_, options| {
+        realm_file_system_function(move |_, options| {
             let recursive = options
                 .first()
                 .is_some_and(|value| value.get_property("recursive").to_bool());
@@ -177,6 +204,7 @@ fn base_handle(path: &Path, kind: &str) -> Value {
             }
         }),
     );
+    register_file_system_value(&value);
     value
 }
 
@@ -191,7 +219,7 @@ fn file_value(path: PathBuf) -> Value {
     let get_path = path.clone();
     value.set_property(
         "getFile",
-        Value::function(move |_, _| match std::fs::read(&get_path) {
+        realm_file_system_function(move |_, _| match std::fs::read(&get_path) {
             Ok(bytes) => {
                 let data = w3cos_core::binary::typed_array_value(
                     bytes
@@ -219,7 +247,7 @@ fn file_value(path: PathBuf) -> Value {
     let writable_path = path.clone();
     value.set_property(
         "createWritable",
-        Value::function(move |_, options| {
+        realm_file_system_function(move |_, options| {
             let keep = options
                 .first()
                 .is_some_and(|options| options.get_property("keepExistingData").to_bool());
@@ -229,7 +257,7 @@ fn file_value(path: PathBuf) -> Value {
     let move_path = path.clone();
     value.set_property(
         "move",
-        Value::function(move |_, args| {
+        realm_file_system_function(move |_, args| {
             let Some(name) = args.last().map(Value::to_js_string) else {
                 return rejected("TypeError", "A destination name is required");
             };
@@ -264,7 +292,7 @@ fn writable_value(path: PathBuf, keep_existing: bool) -> Value {
     let write_path = path.clone();
     value.set_property(
         "write",
-        Value::function(move |_, args| {
+        realm_file_system_function(move |_, args| {
             let input = args.first().cloned().unwrap_or(Value::Undefined);
             let kind = input.get_property("type").to_js_string();
             if kind == "seek" {
@@ -305,7 +333,7 @@ fn writable_value(path: PathBuf, keep_existing: bool) -> Value {
         let path = path.clone();
         value.set_property(
             method,
-            Value::function(move |_, args| {
+            realm_file_system_function(move |_, args| {
                 let amount = args.first().map(Value::to_u32).unwrap_or_default() as usize;
                 if truncate {
                     bytes.borrow_mut().resize(amount, 0);
@@ -321,12 +349,13 @@ fn writable_value(path: PathBuf, keep_existing: bool) -> Value {
     }
     value.set_property(
         "close",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
+        realm_file_system_function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
     );
     w3cos_core::class::set_prototype_of(
         &value,
         &class_for("FileSystemWritableFileStream").get_property("prototype"),
     );
+    register_file_system_value(&value);
     value
 }
 
@@ -338,7 +367,7 @@ fn async_iterator(values: Vec<Value>) -> Value {
     let next_index = Rc::clone(&index);
     iterator.set_property(
         "next",
-        Value::function(move |_, _| {
+        realm_file_system_function(move |_, _| {
             let index = next_index.get();
             next_index.set(index + 1);
             w3cos_core::promise::resolve(vec![Value::object(HashMap::from([
@@ -353,8 +382,9 @@ fn async_iterator(values: Vec<Value>) -> Value {
     let iterator_self = iterator.clone();
     iterator.set_property(
         "__w3cos_symbol_asyncIterator",
-        Value::function(move |_, _| iterator_self.clone()),
+        realm_file_system_function(move |_, _| iterator_self.clone()),
     );
+    register_file_system_value(&iterator);
     iterator
 }
 
@@ -387,7 +417,7 @@ fn directory_value(path: PathBuf) -> Value {
         let parent = path.clone();
         value.set_property(
             method,
-            Value::function(move |_, args| {
+            realm_file_system_function(move |_, args| {
                 let name = args.first().map(Value::to_js_string).unwrap_or_default();
                 if !valid_child_name(&name) {
                     return rejected("TypeMismatchError", "Invalid child name");
@@ -429,13 +459,13 @@ fn directory_value(path: PathBuf) -> Value {
         let directory = path.clone();
         value.set_property(
             method,
-            Value::function(move |_, _| directory_entries(&directory, mode)),
+            realm_file_system_function(move |_, _| directory_entries(&directory, mode)),
         );
     }
     let remove_parent = path.clone();
     value.set_property(
         "removeEntry",
-        Value::function(move |_, args| {
+        realm_file_system_function(move |_, args| {
             let name = args.first().map(Value::to_js_string).unwrap_or_default();
             if !valid_child_name(&name) {
                 return rejected("TypeMismatchError", "Invalid child name");
@@ -462,7 +492,7 @@ fn directory_value(path: PathBuf) -> Value {
     let resolve_parent = path.clone();
     value.set_property(
         "resolve",
-        Value::function(move |_, args| {
+        realm_file_system_function(move |_, args| {
             let result = args
                 .first()
                 .and_then(value_path)
@@ -501,16 +531,20 @@ fn observer_value(callback: Value) -> Value {
     let observer = Value::object(HashMap::new());
     observer.set_property(
         "observe",
-        Value::function(move |_, _| {
+        realm_file_system_function(move |_, _| {
             warning();
             w3cos_core::promise::resolve(vec![Value::Undefined])
         }),
     );
-    observer.set_property("disconnect", Value::function(|_, _| Value::Undefined));
+    observer.set_property(
+        "disconnect",
+        realm_file_system_function(|_, _| Value::Undefined),
+    );
     w3cos_core::class::set_prototype_of(
         &observer,
         &class_for("FileSystemObserver").get_property("prototype"),
     );
+    register_file_system_value(&observer);
     observer
 }
 
@@ -523,7 +557,31 @@ pub fn opfs_root_value() -> Result<Value, Value> {
 }
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
+    VALUES.with(|values| {
+        for value in values
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|value| upgrade_realm_object(&value))
+        {
+            for name in CLASS_NAMES {
+                for member in class_members(name) {
+                    value.set_property(member, Value::Undefined);
+                }
+            }
+            for reference in [
+                "__w3cos_path",
+                "__w3cos_symbol_asyncIterator",
+                "close",
+                "next",
+            ] {
+                value.set_property(reference, Value::Undefined);
+            }
+        }
+    });
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        disconnect_realm_class(class);
+    }
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -570,5 +628,42 @@ mod tests {
             std::fs::read_to_string(opfs_root_path().join("behavior-test.txt")).unwrap(),
             "hello"
         );
+    }
+
+    #[test]
+    fn handles_streams_iterators_and_classes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_directory_class = class_for("FileSystemDirectoryHandle");
+        let old_stream_class = class_for("FileSystemWritableFileStream");
+        let root = opfs_root_value().unwrap();
+        let path = opfs_root_path().join("realm-owned-test.txt");
+        let file = file_value(path.clone());
+        let writable = writable_value(path, false);
+        let iterator = async_iterator(vec![file.clone()]);
+        let file_weak = crate::jsdom::weak_realm_object(&file);
+        let iterator_weak = crate::jsdom::weak_realm_object(&iterator);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_directory_class.get_property("prototype").is_undefined());
+        assert!(old_stream_class.get_property("prototype").is_undefined());
+        assert!(!old_directory_class.strict_eq(&class_for("FileSystemDirectoryHandle")));
+        assert!(root.get_property("getFileHandle").is_undefined());
+        assert!(root.get_property("__w3cos_path").is_undefined());
+        assert!(file.get_property("getFile").is_undefined());
+        assert!(file.get_property("move").is_undefined());
+        assert!(writable.get_property("write").is_undefined());
+        assert!(writable.get_property("close").is_undefined());
+        assert!(iterator.get_property("next").is_undefined());
+
+        drop(root);
+        drop(file);
+        drop(writable);
+        drop(iterator);
+        assert!(file_weak.upgrade().is_none());
+        assert!(iterator_weak.upgrade().is_none());
     }
 }

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -15,6 +16,11 @@ thread_local! {
     static TOUCH_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static TOUCH_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static INPUT_DEVICE_CAPABILITIES_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static EVENT_TARGET_INSTANCES: RefCell<Vec<EventTargetBinding>> = const { RefCell::new(Vec::new()) };
+}
+
+fn realm_event_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), f)
 }
 
 pub const EVENT_SUBCLASS_NAMES: &[&str] = &[
@@ -98,7 +104,7 @@ pub fn touch_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let class = realm_event_function(|this, args| {
             let init = arg(&args, 0);
             install_fields(
                 &this,
@@ -150,7 +156,7 @@ pub fn touch_list_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let class = realm_event_function(|_, _| {
             w3cos_core::throw_value(Value::object(HashMap::from([
                 ("name".into(), Value::string("TypeError")),
                 (
@@ -181,7 +187,7 @@ pub fn touch_list_value(input: Value) -> Value {
     }
     properties.insert(
         "item".into(),
-        Value::function(move |_, args| {
+        realm_event_function(move |_, args| {
             let index = args.first().cloned().unwrap_or_default().to_u32() as usize;
             items.get(index).cloned().unwrap_or(Value::Null)
         }),
@@ -197,6 +203,11 @@ struct Listener {
     callback: Value,
     capture: bool,
     once: bool,
+}
+
+struct EventTargetBinding {
+    value: Value,
+    listeners: Rc<RefCell<Vec<Listener>>>,
 }
 
 fn arg(args: &[Value], index: usize) -> Value {
@@ -270,7 +281,7 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
 
     this.set_property(
         "preventDefault",
-        Value::function(|this, _| {
+        realm_event_function(|this, _| {
             if this.get_property("cancelable").to_bool() {
                 this.set_property("__pd", Value::Bool(true));
                 this.set_property("returnValue", Value::Bool(false));
@@ -280,14 +291,14 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
     );
     this.set_property(
         "stopPropagation",
-        Value::function(|this, _| {
+        realm_event_function(|this, _| {
             this.set_property("__sp", Value::Bool(true));
             Value::Undefined
         }),
     );
     this.set_property(
         "stopImmediatePropagation",
-        Value::function(|this, _| {
+        realm_event_function(|this, _| {
             this.set_property("__sp", Value::Bool(true));
             this.set_property("__sip", Value::Bool(true));
             Value::Undefined
@@ -295,7 +306,7 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
     );
     this.set_property(
         "composedPath",
-        Value::function(|this, _| {
+        realm_event_function(|this, _| {
             let path = this.get_property("__w3cos_path");
             if !path.is_undefined() {
                 return path;
@@ -310,7 +321,7 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
     );
     this.set_property(
         "initEvent",
-        Value::function(|this, args| {
+        realm_event_function(|this, args| {
             this.set_property("type", Value::string(&arg(&args, 0).to_js_string()));
             this.set_property("bubbles", Value::Bool(arg(&args, 1).to_bool()));
             this.set_property("cancelable", Value::Bool(arg(&args, 2).to_bool()));
@@ -323,15 +334,15 @@ fn install_event(this: &Value, args: &[Value], custom: bool) {
     );
     this.set_property(
         "__w3cos_getter_defaultPrevented",
-        Value::function(|this, _| this.get_property("__pd")),
+        realm_event_function(|this, _| this.get_property("__pd")),
     );
     this.set_property(
         "__w3cos_getter_cancelBubble",
-        Value::function(|this, _| this.get_property("__sp")),
+        realm_event_function(|this, _| this.get_property("__sp")),
     );
     this.set_property(
         "__w3cos_setter_cancelBubble",
-        Value::function(|this, args| {
+        realm_event_function(|this, args| {
             if arg(&args, 0).to_bool() {
                 this.set_property("__sp", Value::Bool(true));
             }
@@ -381,7 +392,7 @@ pub fn input_device_capabilities_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, args| {
+        let class = realm_event_function(|this, args| {
             let init = arg(&args, 0);
             this.set_property(
                 "firesTouchEvents",
@@ -418,7 +429,7 @@ fn install_modifier_fields(this: &Value, init: &Value) {
     );
     this.set_property(
         "getModifierState",
-        Value::function(|this, args| {
+        realm_event_function(|this, args| {
             let property = match arg(&args, 0).to_js_string().as_str() {
                 "Alt" => "altKey",
                 "Control" => "ctrlKey",
@@ -555,7 +566,7 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
                 ],
             );
             for method in ["getCoalescedEvents", "getPredictedEvents"] {
-                this.set_property(method, Value::function(|_, _| Value::array(vec![])));
+                this.set_property(method, realm_event_function(|_, _| Value::array(vec![])));
             }
         }
         EventSubclass::Wheel => {
@@ -599,7 +610,7 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
             );
             this.set_property(
                 "getTargetRanges",
-                Value::function(|_, _| Value::array(vec![])),
+                realm_event_function(|_, _| Value::array(vec![])),
             );
         }
         EventSubclass::Composition => {
@@ -607,7 +618,7 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
             install_fields(this, &init, &[("data", Value::string(""))]);
             this.set_property(
                 "initCompositionEvent",
-                Value::function(|_, _| Value::Undefined),
+                realm_event_function(|_, _| Value::Undefined),
             );
         }
         EventSubclass::Clipboard => {
@@ -788,7 +799,7 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
             );
             this.set_property(
                 "initStorageEvent",
-                Value::function(|this, args| {
+                realm_event_function(|this, args| {
                     this.call_method("initEvent", args.iter().take(3).cloned().collect());
                     for (index, name) in ["key", "oldValue", "newValue", "url", "storageArea"]
                         .iter()
@@ -1097,7 +1108,7 @@ fn install_prototype_members(prototype: &Value, methods: &[&str], properties: &[
         );
         prototype.set_property(
             method,
-            Value::function(move |_, _| {
+            realm_event_function(move |_, _| {
                 if returns_array {
                     Value::array(vec![])
                 } else {
@@ -1116,7 +1127,7 @@ fn build_event_subclasses() -> HashMap<String, Value> {
     for name in EVENT_SUBCLASS_NAMES {
         let kind = subclass_kind(name);
         let event_name = *name;
-        let constructor = Value::function(move |this, args| {
+        let constructor = realm_event_function(move |this, args| {
             install_subclass(&this, &args, kind);
             let init = arg(&args, 1);
             for member in generic_event_members(event_name).split_whitespace() {
@@ -1183,12 +1194,12 @@ pub fn event_subclass_class(name: &str) -> Value {
 }
 
 fn make_event_constructor(custom: bool) -> Value {
-    let constructor = Value::function(move |this, args| {
+    let constructor = realm_event_function(move |this, args| {
         install_event(&this, &args, custom);
         if custom {
             this.set_property(
                 "initCustomEvent",
-                Value::function(|this, args| {
+                realm_event_function(|this, args| {
                     this.call_method("initEvent", args.iter().take(3).cloned().collect());
                     this.set_property("detail", arg(&args, 3));
                     Value::Undefined
@@ -1282,13 +1293,13 @@ pub fn event_target_class() -> Value {
 }
 
 fn make_event_target_class() -> Value {
-    let constructor = Value::function(|this, _| {
+    let constructor = realm_event_function(|this, _| {
         let listeners: Rc<RefCell<Vec<Listener>>> = Rc::new(RefCell::new(Vec::new()));
 
         let state = listeners.clone();
         this.set_property(
             "addEventListener",
-            Value::function(move |_, args| {
+            realm_event_function(move |_, args| {
                 let type_name = arg(&args, 0).to_js_string();
                 let callback = arg(&args, 1);
                 let options = arg(&args, 2);
@@ -1316,7 +1327,7 @@ fn make_event_target_class() -> Value {
         let state = listeners.clone();
         this.set_property(
             "removeEventListener",
-            Value::function(move |_, args| {
+            realm_event_function(move |_, args| {
                 let type_name = arg(&args, 0).to_js_string();
                 let callback = arg(&args, 1);
                 let capture = bool_option(&arg(&args, 2), "capture");
@@ -1329,10 +1340,10 @@ fn make_event_target_class() -> Value {
             }),
         );
 
-        let state = listeners;
+        let state = listeners.clone();
         this.set_property(
             "dispatchEvent",
-            Value::function(move |this, args| {
+            realm_event_function(move |this, args| {
                 let event = arg(&args, 0);
                 let type_name = event.get_property("type").to_js_string();
                 if type_name.is_empty() || type_name == "undefined" {
@@ -1376,36 +1387,44 @@ fn make_event_target_class() -> Value {
         );
         this.set_property(
             "when",
-            Value::function(|this, args| {
+            realm_event_function(|this, args| {
                 let type_name = arg(&args, 0).to_js_string();
                 let options = arg(&args, 1);
-                crate::observable_web::observable_from_producer(Value::function(move |_, args| {
-                    let subscriber = arg(&args, 0);
-                    let subscriber_for_event = subscriber.clone();
-                    let listener = Value::function(move |_, args| {
-                        subscriber_for_event.call_method("next", vec![arg(&args, 0)]);
-                        Value::Undefined
-                    });
-                    this.call_method(
-                        "addEventListener",
-                        vec![Value::string(&type_name), listener.clone(), options.clone()],
-                    );
-                    let target = this.clone();
-                    let teardown_type = type_name.clone();
-                    subscriber.call_method(
-                        "addTeardown",
-                        vec![Value::function(move |_, _| {
-                            target.call_method(
-                                "removeEventListener",
-                                vec![Value::string(&teardown_type), listener.clone()],
-                            );
+                crate::observable_web::observable_from_producer(realm_event_function(
+                    move |_, args| {
+                        let subscriber = arg(&args, 0);
+                        let subscriber_for_event = subscriber.clone();
+                        let listener = realm_event_function(move |_, args| {
+                            subscriber_for_event.call_method("next", vec![arg(&args, 0)]);
                             Value::Undefined
-                        })],
-                    );
-                    Value::Undefined
-                }))
+                        });
+                        this.call_method(
+                            "addEventListener",
+                            vec![Value::string(&type_name), listener.clone(), options.clone()],
+                        );
+                        let target = this.clone();
+                        let teardown_type = type_name.clone();
+                        subscriber.call_method(
+                            "addTeardown",
+                            vec![realm_event_function(move |_, _| {
+                                target.call_method(
+                                    "removeEventListener",
+                                    vec![Value::string(&teardown_type), listener.clone()],
+                                );
+                                Value::Undefined
+                            })],
+                        );
+                        Value::Undefined
+                    },
+                ))
             }),
         );
+        EVENT_TARGET_INSTANCES.with(|instances| {
+            instances.borrow_mut().push(EventTargetBinding {
+                value: this,
+                listeners,
+            });
+        });
         Value::Undefined
     });
     constructor.set_property("name", Value::string("EventTarget"));
@@ -1423,6 +1442,50 @@ fn make_event_target_class() -> Value {
     );
     constructor.set_property("prototype", prototype);
     constructor
+}
+
+pub(crate) fn reset_realm() {
+    let bindings =
+        EVENT_TARGET_INSTANCES.with(|instances| std::mem::take(&mut *instances.borrow_mut()));
+    for binding in bindings {
+        binding.listeners.borrow_mut().clear();
+        let properties = match &binding.value {
+            Value::Object(object) => object.borrow().keys(),
+            Value::Function(function) => function.keys(),
+            _ => Vec::new(),
+        };
+        for property in properties {
+            if property.starts_with("on")
+                && listener_is_callable(&binding.value.get_property(&property))
+            {
+                binding.value.set_property(&property, Value::Null);
+            }
+        }
+        for method in [
+            "addEventListener",
+            "removeEventListener",
+            "dispatchEvent",
+            "when",
+        ] {
+            binding.value.set_property(method, Value::Undefined);
+        }
+    }
+
+    EVENT_SUBCLASSES.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    for slot in [
+        &EVENT_CLASS,
+        &CUSTOM_EVENT_CLASS,
+        &EVENT_TARGET_CLASS,
+        &TOUCH_CLASS,
+        &TOUCH_LIST_CLASS,
+        &INPUT_DEVICE_CAPABILITIES_CLASS,
+    ] {
+        slot.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1729,5 +1792,80 @@ mod tests {
                 .get_property("pointerMovementScrolls")
                 .to_bool()
         );
+    }
+
+    #[test]
+    fn event_classes_targets_and_callbacks_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_event_class = event_class();
+        let old_custom_event_class = custom_event_class();
+        let old_target_class = event_target_class();
+        let old_keyboard_class = event_subclass_class("KeyboardEvent");
+        let old_touch_class = touch_class();
+        let old_touch_list_class = touch_list_class();
+        let old_capabilities_class = input_device_capabilities_class();
+
+        let target = w3cos_core::class::construct(&old_target_class, vec![]);
+        let listener_marker = Rc::new(());
+        let listener_marker_weak = Rc::downgrade(&listener_marker);
+        target.call_method(
+            "addEventListener",
+            vec![
+                Value::string("tick"),
+                Value::function(move |_, _| {
+                    let _ = &listener_marker;
+                    Value::Undefined
+                }),
+            ],
+        );
+        let handler_marker = Rc::new(());
+        let handler_marker_weak = Rc::downgrade(&handler_marker);
+        target.set_property(
+            "ontick",
+            Value::function(move |_, _| {
+                let _ = &handler_marker;
+                Value::Undefined
+            }),
+        );
+        let event = w3cos_core::class::construct(&old_event_class, vec![Value::string("tick")]);
+        assert!(
+            target
+                .call_method("dispatchEvent", vec![event.clone()])
+                .to_bool()
+        );
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(!old_event_class.strict_eq(&event_class()));
+        assert!(!old_custom_event_class.strict_eq(&custom_event_class()));
+        assert!(!old_target_class.strict_eq(&event_target_class()));
+        assert!(!old_keyboard_class.strict_eq(&event_subclass_class("KeyboardEvent")));
+        assert!(!old_touch_class.strict_eq(&touch_class()));
+        assert!(!old_touch_list_class.strict_eq(&touch_list_class()));
+        assert!(!old_capabilities_class.strict_eq(&input_device_capabilities_class()));
+        assert!(
+            old_target_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        for method in [
+            "addEventListener",
+            "removeEventListener",
+            "dispatchEvent",
+            "when",
+        ] {
+            assert!(target.call_method(method, vec![]).is_undefined());
+        }
+        assert!(target.get_property("ontick").is_null());
+        assert!(event.call_method("preventDefault", vec![]).is_undefined());
+        assert!(listener_marker_weak.upgrade().is_none());
+        assert!(handler_marker_weak.upgrade().is_none());
+
+        let fresh = w3cos_core::class::construct(&event_target_class(), vec![]);
+        assert!(fresh.get_property("dispatchEvent").is_function());
+        reset_realm();
     }
 }

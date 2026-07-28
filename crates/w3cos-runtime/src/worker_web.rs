@@ -6,6 +6,7 @@ use std::rc::{Rc, Weak};
 
 use w3cos_core::Value;
 
+use crate::jsdom::realm_function;
 use crate::worker::{Worker, WorkerEvent, WorkerOptions};
 
 #[derive(Clone)]
@@ -30,6 +31,7 @@ thread_local! {
     static MESSAGE_CHANNEL_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static BROADCAST_CHANNEL_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static BROADCAST_CHANNELS: RefCell<Vec<BroadcastEntry>> = const { RefCell::new(Vec::new()) };
+    static MESSAGE_PORTS: RefCell<Vec<Weak<RefCell<PortState>>>> = const { RefCell::new(Vec::new()) };
     static NEXT_BROADCAST_CHANNEL_ID: Cell<u64> = const { Cell::new(1) };
     static WORKER_PORT_TRANSFER_WARNED: Cell<bool> = const { Cell::new(false) };
 }
@@ -114,7 +116,8 @@ pub fn worker_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, args| {
             let url = args.first().cloned().unwrap_or_default().to_js_string();
             let options = args.get(1).cloned().unwrap_or_default();
             let name = options.get_property("name").to_js_string();
@@ -141,7 +144,7 @@ pub fn worker_class() -> Value {
             let native_for_post = Rc::clone(&native);
             value.set_property(
                 "postMessage",
-                Value::function(move |_, args| {
+                realm_function(generation, move |_, args| {
                     if let Some(worker) = native_for_post.borrow().as_ref() {
                         let data = args.first().cloned().unwrap_or_default();
                         let transfer = args.get(1).cloned().unwrap_or(Value::Undefined);
@@ -173,7 +176,7 @@ pub fn worker_class() -> Value {
             let native_for_terminate = Rc::clone(&native);
             value.set_property(
                 "terminate",
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     if let Some(worker) = native_for_terminate.borrow_mut().take() {
                         worker.terminate();
                     }
@@ -240,6 +243,7 @@ pub fn poll_js_events() -> usize {
 }
 
 fn port_value_for_state(state: Rc<RefCell<PortState>>) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::from([("onmessageerror".to_string(), Value::Null)]));
     crate::web_events::event_target_class().call(value.clone(), vec![]);
     let active = Rc::new(Cell::new(true));
@@ -247,7 +251,7 @@ fn port_value_for_state(state: Rc<RefCell<PortState>>) -> Value {
     let active_for_getter = Rc::clone(&active);
     value.set_property(
         "__w3cos_getter_onmessage",
-        Value::function(move |_, _| {
+        realm_function(generation, move |_, _| {
             if active_for_getter.get() {
                 state_for_getter.borrow().handler.clone()
             } else {
@@ -259,7 +263,7 @@ fn port_value_for_state(state: Rc<RefCell<PortState>>) -> Value {
     let active_for_setter = Rc::clone(&active);
     value.set_property(
         "__w3cos_setter_onmessage",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             if !active_for_setter.get() {
                 return Value::Undefined;
             }
@@ -272,7 +276,7 @@ fn port_value_for_state(state: Rc<RefCell<PortState>>) -> Value {
     let active_for_start = Rc::clone(&active);
     value.set_property(
         "start",
-        Value::function(move |_, _| {
+        realm_function(generation, move |_, _| {
             if active_for_start.get() {
                 start_port(&state_for_start);
             }
@@ -283,7 +287,7 @@ fn port_value_for_state(state: Rc<RefCell<PortState>>) -> Value {
     let active_for_close = Rc::clone(&active);
     value.set_property(
         "close",
-        Value::function(move |this, _| {
+        realm_function(generation, move |this, _| {
             if !active_for_close.get() {
                 return Value::Undefined;
             }
@@ -298,7 +302,7 @@ fn port_value_for_state(state: Rc<RefCell<PortState>>) -> Value {
     let active_for_post = Rc::clone(&active);
     value.set_property(
         "postMessage",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             if !active_for_post.get() {
                 return Value::Undefined;
             }
@@ -319,7 +323,7 @@ fn port_value_for_state(state: Rc<RefCell<PortState>>) -> Value {
     let state_for_prepare = Rc::clone(&state);
     let active_for_prepare = Rc::clone(&active);
     let pending_for_prepare = Rc::clone(&pending_transfer);
-    let prepare = Value::function(move |_, _| {
+    let prepare = realm_function(generation, move |_, _| {
         if !active_for_prepare.get() || state_for_prepare.borrow().closed {
             w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
                 "MessagePort is already detached or closed.",
@@ -336,7 +340,7 @@ fn port_value_for_state(state: Rc<RefCell<PortState>>) -> Value {
     let state_for_finalize = Rc::clone(&state);
     let active_for_finalize = Rc::clone(&active);
     let pending_for_finalize = Rc::clone(&pending_transfer);
-    let finalize = Value::function(move |this, _| {
+    let finalize = realm_function(generation, move |this, _| {
         let Some(transferred) = pending_for_finalize.borrow_mut().take() else {
             return Value::Undefined;
         };
@@ -364,6 +368,7 @@ fn message_port_value() -> (Value, Rc<RefCell<PortState>>) {
     }));
     let value = port_value_for_state(Rc::clone(&state));
     state.borrow_mut().value = value.clone();
+    MESSAGE_PORTS.with(|ports| ports.borrow_mut().push(Rc::downgrade(&state)));
     (value, state)
 }
 
@@ -372,7 +377,8 @@ pub fn message_port_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| message_port_value().0);
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| message_port_value().0);
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         for member in [
@@ -410,7 +416,8 @@ pub fn message_channel_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| channel_value());
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| channel_value());
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
         prototype.set_property("port1", Value::Undefined);
@@ -426,7 +433,8 @@ pub fn broadcast_channel_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, args| {
             let name = args
                 .first()
                 .cloned()
@@ -449,7 +457,7 @@ pub fn broadcast_channel_class() -> Value {
             let closed_for_post = Rc::clone(&closed);
             value.set_property(
                 "postMessage",
-                Value::function(move |_, args| {
+                realm_function(generation, move |_, args| {
                     if closed_for_post.get() {
                         w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
                             "BroadcastChannel is closed.",
@@ -470,15 +478,18 @@ pub fn broadcast_channel_class() -> Value {
                     });
                     for recipient in recipients {
                         let delivery = w3cos_core::web::structured_clone(vec![snapshot.clone()]);
-                        crate::jsdom::queue_microtask_value(Value::function(move |_, _| {
-                            if !recipient.closed.get() {
-                                recipient.value.call_method(
-                                    "dispatchEvent",
-                                    vec![event_with_data("message", delivery.clone())],
-                                );
-                            }
-                            Value::Undefined
-                        }));
+                        crate::jsdom::queue_microtask_value(realm_function(
+                            generation,
+                            move |_, _| {
+                                if !recipient.closed.get() {
+                                    recipient.value.call_method(
+                                        "dispatchEvent",
+                                        vec![event_with_data("message", delivery.clone())],
+                                    );
+                                }
+                                Value::Undefined
+                            },
+                        ));
                     }
                     Value::Undefined
                 }),
@@ -487,7 +498,7 @@ pub fn broadcast_channel_class() -> Value {
             let closed_for_close = Rc::clone(&closed);
             value.set_property(
                 "close",
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     closed_for_close.set(true);
                     BROADCAST_CHANNELS.with(|channels| {
                         channels.borrow_mut().retain(|entry| entry.id != id);
@@ -536,14 +547,15 @@ pub fn shared_worker_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, _| {
             let channel = channel_value();
             let public_port = channel.get_property("port1");
             let worker_port = channel.get_property("port2");
             let echo_port = worker_port.clone();
             worker_port.set_property(
                 "onmessage",
-                Value::function(move |_, args| {
+                realm_function(generation, move |_, args| {
                     let event = args.first().cloned().unwrap_or_default();
                     echo_port.call_method("postMessage", vec![event.get_property("data")]);
                     Value::Undefined
@@ -564,6 +576,82 @@ pub fn shared_worker_class() -> Value {
         *slot.borrow_mut() = Some(class.clone());
         class
     })
+}
+
+fn clear_event_target(value: &Value) {
+    for member in [
+        "addEventListener",
+        "removeEventListener",
+        "dispatchEvent",
+        "onmessage",
+        "onmessageerror",
+        "onerror",
+    ] {
+        value.set_property(member, Value::Undefined);
+    }
+}
+
+pub fn reset_realm() {
+    WORKERS.with(|workers| {
+        for worker in workers.borrow_mut().drain(..) {
+            if let Some(native) = worker.native.borrow_mut().take() {
+                native.terminate();
+            }
+            clear_event_target(&worker.value);
+            for member in ["postMessage", "terminate"] {
+                worker.value.set_property(member, Value::Undefined);
+            }
+        }
+    });
+    BROADCAST_CHANNELS.with(|channels| {
+        for channel in channels.borrow_mut().drain(..) {
+            channel.closed.set(true);
+            clear_event_target(&channel.value);
+            for member in ["postMessage", "close"] {
+                channel.value.set_property(member, Value::Undefined);
+            }
+        }
+    });
+    MESSAGE_PORTS.with(|ports| {
+        for state in ports
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|state| state.upgrade())
+        {
+            let value = {
+                let mut state = state.borrow_mut();
+                state.handler = Value::Undefined;
+                state.queued.clear();
+                state.started = false;
+                state.closed = true;
+                state.peer = None;
+                state.value.clone()
+            };
+            w3cos_core::web::unregister_host_transferable(&value);
+            clear_event_target(&value);
+            for member in [
+                "__w3cos_getter_onmessage",
+                "__w3cos_setter_onmessage",
+                "postMessage",
+                "start",
+                "close",
+            ] {
+                value.set_property(member, Value::Undefined);
+            }
+        }
+    });
+    for slot in [
+        &WORKER_CLASS,
+        &SHARED_WORKER_CLASS,
+        &MESSAGE_PORT_CLASS,
+        &MESSAGE_CHANNEL_CLASS,
+        &BROADCAST_CHANNEL_CLASS,
+    ] {
+        slot.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+    NEXT_BROADCAST_CHANNEL_ID.with(|next| next.set(1));
 }
 
 #[cfg(test)]
@@ -1006,5 +1094,65 @@ mod tests {
             "unsupported cross-thread port transfer must not detach the source"
         );
         worker.call_method("terminate", vec![]);
+    }
+
+    #[test]
+    fn workers_ports_and_broadcast_deliveries_are_realm_owned() {
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_worker_class = worker_class();
+        let old_shared_worker_class = shared_worker_class();
+        let old_port_class = message_port_class();
+        let old_channel_class = message_channel_class();
+        let old_broadcast_class = broadcast_channel_class();
+        let worker =
+            w3cos_core::class::construct(&old_worker_class, vec![Value::string("echo.js")]);
+        let channel = w3cos_core::class::construct(&old_channel_class, vec![]);
+        let port1 = channel.get_property("port1");
+        let port2 = channel.get_property("port2");
+        let sender =
+            w3cos_core::class::construct(&old_broadcast_class, vec![Value::string("old-page")]);
+        let receiver =
+            w3cos_core::class::construct(&old_broadcast_class, vec![Value::string("old-page")]);
+        let deliveries = Rc::new(Cell::new(0_u32));
+        let deliveries_for_receiver = Rc::clone(&deliveries);
+        receiver.set_property(
+            "onmessage",
+            Value::function(move |_, _| {
+                deliveries_for_receiver.set(deliveries_for_receiver.get() + 1);
+                Value::Undefined
+            }),
+        );
+        sender.call_method("postMessage", vec![Value::string("queued")]);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        assert_eq!(crate::jsdom::drain_microtasks(), 0);
+        assert_eq!(poll_js_events(), 0);
+        assert_eq!(deliveries.get(), 0);
+        assert!(!old_worker_class.strict_eq(&worker_class()));
+        assert!(!old_shared_worker_class.strict_eq(&shared_worker_class()));
+        assert!(!old_port_class.strict_eq(&message_port_class()));
+        assert!(!old_channel_class.strict_eq(&message_channel_class()));
+        assert!(!old_broadcast_class.strict_eq(&broadcast_channel_class()));
+        assert!(
+            old_worker_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(worker.call_method("postMessage", vec![]).is_undefined());
+        assert!(port1.call_method("postMessage", vec![]).is_undefined());
+        assert!(port2.call_method("start", vec![]).is_undefined());
+        assert!(sender.call_method("postMessage", vec![]).is_undefined());
+        assert!(receiver.call_method("close", vec![]).is_undefined());
+        let current_channel = w3cos_core::class::construct(&message_channel_class(), vec![]);
+        assert!(
+            current_channel
+                .get_property("port1")
+                .get_property("postMessage")
+                .is_function()
+        );
+        reset_realm();
     }
 }

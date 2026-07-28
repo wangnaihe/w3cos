@@ -287,9 +287,9 @@ impl ParsedModuleGraph {
     /// star exports).
     pub fn all_exports(&self, module_path: &Path, resolver: &EsmResolver) -> Vec<ResolvedSymbol> {
         let mut names: Vec<String> = Vec::new();
-        let mut queue: Vec<PathBuf> = vec![module_path.to_path_buf()];
+        let mut queue: Vec<(PathBuf, bool)> = vec![(module_path.to_path_buf(), true)];
         let mut seen_modules: HashSet<PathBuf> = HashSet::new();
-        while let Some(path) = queue.pop() {
+        while let Some((path, include_default)) = queue.pop() {
             if !seen_modules.insert(path.clone()) {
                 continue;
             }
@@ -301,19 +301,25 @@ impl ParsedModuleGraph {
                     if let Some(source) = &export.source {
                         let from_dir = path.parent().unwrap_or_else(|| Path::new("."));
                         if let Ok(resolved) = resolver.resolve(source, from_dir) {
-                            queue.push(resolved.path);
+                            queue.push((resolved.path, false));
                         }
                     }
-                } else if !names.contains(&export.exported) {
+                } else if (include_default || export.exported != "default")
+                    && !names.contains(&export.exported)
+                {
                     names.push(export.exported.clone());
                 }
             }
         }
         let mut symbols = Vec::new();
         for name in names {
-            if let SymbolResolution::Resolved(sym) =
+            if let SymbolResolution::Resolved(mut sym) =
                 self.resolve_export_from(module_path, &name, resolver, &mut HashSet::new())
             {
+                // Resolution identifies the defining cell, while the
+                // namespace must retain the name exposed by this module
+                // (`export { value as alias } from ...`).
+                sym.exported_name = name;
                 symbols.push(sym);
             }
         }
@@ -369,6 +375,13 @@ pub struct NamespaceImport {
     pub exports: Vec<ResolvedSymbol>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeImport {
+    pub local: String,
+    pub imported: String,
+    pub specifier: String,
+}
+
 /// A module after flattening: dependency order + per-module namespace.
 #[derive(Debug, Clone)]
 pub struct BundledModule {
@@ -387,6 +400,13 @@ pub struct BundledModule {
     /// `import * as ns` bindings: the local name evaluates to a lazily built
     /// namespace object exposing the target module's exports.
     pub namespace_imports: Vec<NamespaceImport>,
+    /// Imports supplied at runtime through the Core module registry.
+    pub runtime_imports: Vec<RuntimeImport>,
+    /// Runtime-only side-effect and binding dependencies in source order.
+    pub runtime_dependencies: Vec<String>,
+    /// Public ESM surface of this module after resolving named and star
+    /// re-exports to their defining live bindings.
+    pub shared_exports: Vec<ResolvedSymbol>,
 }
 
 impl BundledModule {
@@ -451,6 +471,16 @@ impl EsmBundle {
                     local_to_bundled.push((name.clone(), bundled_name));
                 }
             }
+            let runtime_dependencies = parsed
+                .find_module(path)
+                .map(|info| {
+                    info.dependency_sources
+                        .iter()
+                        .filter(|source| resolver.is_runtime_module(source))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
 
             bundle.modules.push(BundledModule {
                 path: path.clone(),
@@ -460,6 +490,9 @@ impl EsmBundle {
                 host_imports: Vec::new(),
                 literal_imports: Vec::new(),
                 namespace_imports: Vec::new(),
+                runtime_imports: Vec::new(),
+                runtime_dependencies,
+                shared_exports: parsed.all_exports(path, resolver),
             });
         }
 
@@ -481,6 +514,16 @@ impl EsmBundle {
             };
 
             for import in &info.imports {
+                if resolver.is_runtime_module(&import.source) {
+                    bundle.modules[module_index]
+                        .runtime_imports
+                        .push(RuntimeImport {
+                            local: import.local.clone(),
+                            imported: import.imported.clone(),
+                            specifier: import.source.clone(),
+                        });
+                    continue;
+                }
                 if Path::new(&import.source)
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -624,7 +667,7 @@ fn visit_module(
             }
         }
         for source in sources {
-            if is_asset_import(&source) {
+            if is_asset_import(&source) || resolver.is_runtime_module(&source) {
                 continue;
             }
             if let Ok(resolved) = resolver.resolve(&source, from_dir) {
@@ -650,6 +693,7 @@ struct PackageJson {
 #[derive(Debug, Clone)]
 pub struct EsmResolver {
     project_root: PathBuf,
+    runtime_modules: HashSet<String>,
     /// Memoizes `resolve(specifier, from_dir)` — Monaco-scale graphs re-resolve
     /// the same specifier thousands of times through re-export chains, and each
     /// uncached call costs filesystem syscalls.
@@ -660,8 +704,18 @@ impl EsmResolver {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
             project_root: project_root.into(),
+            runtime_modules: HashSet::new(),
             resolve_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub fn with_runtime_modules(mut self, specifiers: impl IntoIterator<Item = String>) -> Self {
+        self.runtime_modules.extend(specifiers);
+        self
+    }
+
+    pub fn is_runtime_module(&self, specifier: &str) -> bool {
+        self.runtime_modules.contains(specifier)
     }
 
     pub fn resolve_entry(&self, entry: &Path) -> Result<ResolvedModule> {
@@ -757,7 +811,10 @@ impl EsmResolver {
 
         for import in imports {
             // CSS and other non-code assets are part of the asset pipeline, not this JS graph.
-            if is_asset_import(&import) || is_host_module(&import) {
+            if is_asset_import(&import)
+                || is_host_module(&import)
+                || self.is_runtime_module(&import)
+            {
                 continue;
             }
             let resolved = self.resolve(&import, from_dir)?;
@@ -1073,7 +1130,7 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
         ..Default::default()
     };
 
-    for item in &module.body {
+    for (item_index, item) in module.body.iter().enumerate() {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
                 let source = atom_to_string(&import.src.value);
@@ -1116,7 +1173,7 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
             }
             ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(named)) => {
                 let source = named.src.as_ref().map(|src| atom_to_string(&src.value));
-                for spec in &named.specifiers {
+                for (specifier_index, spec) in named.specifiers.iter().enumerate() {
                     match spec {
                         ExportSpecifier::Named(named_spec) => {
                             let local = module_export_name(&named_spec.orig);
@@ -1139,6 +1196,25 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
                             });
                         }
                         ExportSpecifier::Namespace(ns) => {
+                            if let Some(source) = &source {
+                                let local =
+                                    synthetic_namespace_export_name(item_index, specifier_index);
+                                if !info.dependency_sources.contains(source) {
+                                    info.dependency_sources.push(source.clone());
+                                }
+                                info.top_level_variables.push(local.clone());
+                                info.imports.push(ImportBinding {
+                                    imported: "*".to_string(),
+                                    local: local.clone(),
+                                    source: source.clone(),
+                                });
+                                info.exports.push(ExportBinding {
+                                    exported: module_export_name(&ns.name),
+                                    local: Some(local),
+                                    source: None,
+                                });
+                                continue;
+                            }
                             info.exports.push(ExportBinding {
                                 exported: module_export_name(&ns.name),
                                 local: None,
@@ -1160,29 +1236,28 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
             ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(default_decl)) => {
                 match &default_decl.decl {
                     DefaultDecl::Class(class) => {
-                        if let Some(ident) = &class.ident {
-                            info.top_level_classes.push(ident.sym.to_string());
-                            info.exports.push(ExportBinding {
-                                exported: "default".to_string(),
-                                local: Some(ident.sym.to_string()),
-                                source: None,
-                            });
-                        } else {
-                            info.exports.push(ExportBinding {
-                                exported: "default".to_string(),
-                                local: None,
-                                source: None,
-                            });
-                        }
-                    }
-                    DefaultDecl::Fn(function) => {
-                        let local = function.ident.as_ref().map(|ident| ident.sym.to_string());
-                        if let Some(name) = &local {
-                            info.top_level_functions.push(name.clone());
-                        }
+                        let local = class
+                            .ident
+                            .as_ref()
+                            .map(|ident| ident.sym.to_string())
+                            .unwrap_or_else(|| synthetic_default_export_name(item_index));
+                        info.top_level_classes.push(local.clone());
                         info.exports.push(ExportBinding {
                             exported: "default".to_string(),
-                            local,
+                            local: Some(local),
+                            source: None,
+                        });
+                    }
+                    DefaultDecl::Fn(function) => {
+                        let local = function
+                            .ident
+                            .as_ref()
+                            .map(|ident| ident.sym.to_string())
+                            .unwrap_or_else(|| synthetic_default_export_name(item_index));
+                        info.top_level_functions.push(local.clone());
+                        info.exports.push(ExportBinding {
+                            exported: "default".to_string(),
+                            local: Some(local),
                             source: None,
                         });
                     }
@@ -1195,17 +1270,14 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
                     }
                 }
             }
-            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(default_expr)) => {
-                // `export default <expr>;` — anonymous default export. When the
-                // expression is a plain identifier we can point at the local
-                // binding; otherwise codegen treats it as an anonymous value.
-                let local = match &*default_expr.expr {
-                    Expr::Ident(ident) => Some(ident.sym.to_string()),
-                    _ => None,
-                };
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(_)) => {
+                // Default expressions are snapshot bindings, including the
+                // identifier form (`export default local`).
+                let local = synthetic_default_export_name(item_index);
+                info.top_level_variables.push(local.clone());
                 info.exports.push(ExportBinding {
                     exported: "default".to_string(),
-                    local,
+                    local: Some(local),
                     source: None,
                 });
             }
@@ -1217,9 +1289,17 @@ fn collect_module_info(path: &Path, module: &Module) -> ParsedModuleInfo {
     info
 }
 
+pub(crate) fn synthetic_default_export_name(item_index: usize) -> String {
+    format!("__w3cos_default_export_{item_index}")
+}
+
+pub(crate) fn synthetic_namespace_export_name(item_index: usize, specifier_index: usize) -> String {
+    format!("__w3cos_namespace_export_{item_index}_{specifier_index}")
+}
+
 fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
     match decl {
-        Decl::Class(class) => {
+        Decl::Class(class) if !class.declare => {
             let name = class.ident.sym.to_string();
             info.top_level_classes.push(name.clone());
             info.exports.push(ExportBinding {
@@ -1228,7 +1308,7 @@ fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
                 source: None,
             });
         }
-        Decl::Fn(function) => {
+        Decl::Fn(function) if !function.declare => {
             let name = function.ident.sym.to_string();
             info.top_level_functions.push(name.clone());
             info.exports.push(ExportBinding {
@@ -1237,7 +1317,7 @@ fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
                 source: None,
             });
         }
-        Decl::Var(var) => {
+        Decl::Var(var) if !var.declare => {
             for decl in &var.decls {
                 // Handles plain `const x = ...` AND destructured exports like
                 // `export const { getWindowId, ... } = (function(){...})()`
@@ -1284,11 +1364,13 @@ fn collect_pat_names(pat: &Pat, names: &mut Vec<String>) {
 
 fn collect_top_level_decl(decl: &Decl, info: &mut ParsedModuleInfo) {
     match decl {
-        Decl::Class(class) => info.top_level_classes.push(class.ident.sym.to_string()),
-        Decl::Fn(function) => info
+        Decl::Class(class) if !class.declare => {
+            info.top_level_classes.push(class.ident.sym.to_string())
+        }
+        Decl::Fn(function) if !function.declare => info
             .top_level_functions
             .push(function.ident.sym.to_string()),
-        Decl::Var(var) => {
+        Decl::Var(var) if !var.declare => {
             for declaration in &var.decls {
                 collect_pat_names(&declaration.name, &mut info.top_level_variables);
             }
@@ -1317,6 +1399,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn typescript_ambient_declarations_do_not_create_runtime_symbols() {
+        let root = fixture_root("w3cos_esm_resolver_ambient_erasure");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.ts");
+        std::fs::write(
+            &entry,
+            r#"declare function ambientFunction(value: number): number;
+declare class AmbientClass { value: number }
+declare const ambientValue: number;
+export function main() { return 42; }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert_eq!(bundle.symbol_count(), 1);
+        assert_eq!(bundle.symbols[0].original_name, "main");
+        assert_eq!(bundle.symbols[0].kind, SymbolKind::Function);
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1544,7 +1650,12 @@ export function main() { return invoke("example", "ping"); }"#,
         )
         .unwrap();
         std::fs::write(root.join("src/barrel.js"), r#"export * from "./impl.js";"#).unwrap();
-        std::fs::write(root.join("src/impl.js"), r#"export function foo() {}"#).unwrap();
+        std::fs::write(
+            root.join("src/impl.js"),
+            r#"export function foo() {}
+export default function hiddenDefault() {}"#,
+        )
+        .unwrap();
 
         let resolver = EsmResolver::new(&root);
         let parsed = resolver
@@ -1566,6 +1677,12 @@ export function main() { return invoke("example", "ping"); }"#,
             exports
                 .iter()
                 .any(|s| s.exported_name == "foo" && s.defining_module == impl_path)
+        );
+        assert!(
+            exports
+                .iter()
+                .all(|symbol| symbol.exported_name != "default"),
+            "export * must not forward the dependency's default export"
         );
 
         std::fs::remove_dir_all(root).ok();
@@ -2085,6 +2202,45 @@ export * from "./extra.js";"#,
             "namespace import must not land in unresolved: {:?}",
             bundle.unresolved
         );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn manifest_runtime_modules_stay_out_of_static_graph_and_become_live_imports() {
+        let root = fixture_root("w3cos_esm_runtime_module");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.ts");
+        let specifier = "https://cdn.example.test/maps/plugin.js";
+        std::fs::write(
+            &entry,
+            format!(
+                r#"import {{ value, bump }} from "{specifier}";
+import * as plugin from "{specifier}";
+export function main() {{ bump(); return value + plugin.value; }}"#
+            ),
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root).with_runtime_modules([specifier.to_string()]);
+        let graph = resolver.build_graph_from_entry(&entry).unwrap();
+        assert_eq!(graph.nodes.len(), 1, "runtime module must not be fetched");
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let app = bundle
+            .modules
+            .iter()
+            .find(|module| module.path == entry)
+            .unwrap();
+        assert_eq!(app.runtime_dependencies, [specifier]);
+        assert_eq!(app.runtime_imports.len(), 3);
+        assert!(app.runtime_imports.iter().any(|import| {
+            import.local == "value" && import.imported == "value" && import.specifier == specifier
+        }));
+        assert!(app.runtime_imports.iter().any(|import| {
+            import.local == "plugin" && import.imported == "*" && import.specifier == specifier
+        }));
 
         std::fs::remove_dir_all(root).ok();
     }

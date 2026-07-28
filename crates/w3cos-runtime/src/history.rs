@@ -167,7 +167,7 @@ pub fn back() -> bool {
     navigated
 }
 
-pub fn forward() {
+pub fn forward() -> bool {
     let (navigated, state_val) = STORE.with(|s| {
         let mut store = s.borrow_mut();
         let nav = store.history.forward();
@@ -180,6 +180,7 @@ pub fn forward() {
         mark_dirty();
         fire_popstate(state_val);
     }
+    navigated
 }
 
 pub fn go(delta: i32) {
@@ -274,6 +275,10 @@ fn fire_popstate(state: Option<String>) {
 /// Whether the current session-history entry has a predecessor.
 pub fn can_go_back() -> bool {
     STORE.with(|s| s.borrow().history.can_go_back())
+}
+
+pub fn can_go_forward() -> bool {
+    STORE.with(|s| s.borrow().history.can_go_forward())
 }
 
 fn fire_hashchange(old_url: String, new_url: String) {

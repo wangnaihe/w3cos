@@ -10,9 +10,20 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, disconnect_realm_class, realm_function, register_weak_realm_object,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static CONTEXTS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
+    static OBJECTS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn realm_webgl_function(callback: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), callback)
 }
 
 const WEBGL1_METHODS: &str = "
@@ -205,6 +216,7 @@ fn object_value(name: &'static str) -> Value {
         Value::Bool(false),
     )]));
     w3cos_core::class::set_prototype_of(&value, &class_for(name).get_property("prototype"));
+    register_weak_realm_object(&OBJECTS, &value);
     value
 }
 
@@ -213,7 +225,7 @@ fn set_prototype(value: &Value, name: &'static str) {
 }
 
 fn build_class(name: &'static str) -> Value {
-    let constructor = Value::function(move |_, _| illegal(name));
+    let constructor = realm_webgl_function(move |_, _| illegal(name));
     constructor.set_property("name", Value::string(name));
     let prototype = Value::object(HashMap::from([("constructor".into(), constructor.clone())]));
     if matches!(name, "WebGLRenderingContext" | "WebGL2RenderingContext") {
@@ -290,12 +302,12 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     let width_canvas = canvas.clone();
     value.set_property(
         "__w3cos_getter_drawingBufferWidth",
-        Value::function(move |_, _| width_canvas.get_property("width")),
+        realm_webgl_function(move |_, _| width_canvas.get_property("width")),
     );
     let height_canvas = canvas;
     value.set_property(
         "__w3cos_getter_drawingBufferHeight",
-        Value::function(move |_, _| height_canvas.get_property("height")),
+        realm_webgl_function(move |_, _| height_canvas.get_property("height")),
     );
     for (method, class_name) in [
         ("createBuffer", "WebGLBuffer"),
@@ -313,7 +325,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     ] {
         value.set_property(
             method,
-            Value::function(move |_, _| object_value(class_name)),
+            realm_webgl_function(move |_, _| object_value(class_name)),
         );
     }
     for (method, class_name) in [
@@ -331,7 +343,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     ] {
         value.set_property(
             method,
-            Value::function(move |_, args| {
+            realm_webgl_function(move |_, args| {
                 let item = args.first().cloned().unwrap_or(Value::Undefined);
                 Value::Bool(
                     w3cos_core::class::instance_of(&item, &class_for(class_name))
@@ -355,7 +367,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     ] {
         value.set_property(
             method,
-            Value::function(|_, args| {
+            realm_webgl_function(|_, args| {
                 if let Some(item) = args.first() {
                     item.set_property("__w3cos_deleted", Value::Bool(true));
                 }
@@ -366,7 +378,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     let state_for_clear = state.clone();
     value.set_property(
         "clearColor",
-        Value::function(move |_, args| {
+        realm_webgl_function(move |_, args| {
             state_for_clear.borrow_mut().insert(
                 "clearColor".into(),
                 Value::array(
@@ -381,7 +393,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     let state_for_viewport = state.clone();
     value.set_property(
         "viewport",
-        Value::function(move |_, args| {
+        realm_webgl_function(move |_, args| {
             state_for_viewport.borrow_mut().insert(
                 "viewport".into(),
                 Value::array(
@@ -396,7 +408,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     let state_for_parameter = state.clone();
     value.set_property(
         "getParameter",
-        Value::function(
+        realm_webgl_function(
             move |_, args| match args.first().map(Value::to_u32).unwrap_or(0) {
                 3106 => state_for_parameter.borrow()["clearColor"].clone(),
                 2978 => state_for_parameter.borrow()["viewport"].clone(),
@@ -412,17 +424,20 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
             },
         ),
     );
-    value.set_property("getError", Value::function(|_, _| Value::Number(0.0)));
-    value.set_property("isContextLost", Value::function(|_, _| Value::Bool(false)));
-    value.set_property("isEnabled", Value::function(|_, _| Value::Bool(false)));
+    value.set_property("getError", realm_webgl_function(|_, _| Value::Number(0.0)));
+    value.set_property(
+        "isContextLost",
+        realm_webgl_function(|_, _| Value::Bool(false)),
+    );
+    value.set_property("isEnabled", realm_webgl_function(|_, _| Value::Bool(false)));
     value.set_property(
         "getSupportedExtensions",
-        Value::function(|_, _| Value::array(Vec::new())),
+        realm_webgl_function(|_, _| Value::array(Vec::new())),
     );
-    value.set_property("getExtension", Value::function(|_, _| Value::Null));
+    value.set_property("getExtension", realm_webgl_function(|_, _| Value::Null));
     value.set_property(
         "getContextAttributes",
-        Value::function(|_, _| {
+        realm_webgl_function(|_, _| {
             Value::object(HashMap::from([
                 ("alpha".into(), Value::Bool(true)),
                 ("antialias".into(), Value::Bool(false)),
@@ -435,23 +450,23 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     );
     value.set_property(
         "checkFramebufferStatus",
-        Value::function(|_, _| Value::Number(36053.0)),
+        realm_webgl_function(|_, _| Value::Number(36053.0)),
     );
     value.set_property(
         "getAttribLocation",
-        Value::function(|_, _| Value::Number(0.0)),
+        realm_webgl_function(|_, _| Value::Number(0.0)),
     );
     value.set_property(
         "getProgramInfoLog",
-        Value::function(|_, _| Value::string("")),
+        realm_webgl_function(|_, _| Value::string("")),
     );
     value.set_property(
         "getShaderInfoLog",
-        Value::function(|_, _| Value::string("")),
+        realm_webgl_function(|_, _| Value::string("")),
     );
     value.set_property(
         "getShaderPrecisionFormat",
-        Value::function(|_, _| {
+        realm_webgl_function(|_, _| {
             let result = Value::object(HashMap::from([
                 ("rangeMin".into(), Value::Number(127.0)),
                 ("rangeMax".into(), Value::Number(127.0)),
@@ -461,12 +476,13 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
                 &result,
                 &class_for("WebGLShaderPrecisionFormat").get_property("prototype"),
             );
+            register_weak_realm_object(&OBJECTS, &result);
             result
         }),
     );
     value.set_property(
         "shaderSource",
-        Value::function(|_, args| {
+        realm_webgl_function(|_, args| {
             if let Some(shader) = args.first() {
                 shader.set_property(
                     "__w3cos_source",
@@ -478,7 +494,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     );
     value.set_property(
         "getShaderSource",
-        Value::function(|_, args| {
+        realm_webgl_function(|_, args| {
             args.first()
                 .map(|shader| shader.get_property("__w3cos_source"))
                 .unwrap_or(Value::Null)
@@ -486,15 +502,15 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     );
     value.set_property(
         "getShaderParameter",
-        Value::function(|_, _| Value::Bool(true)),
+        realm_webgl_function(|_, _| Value::Bool(true)),
     );
     value.set_property(
         "getProgramParameter",
-        Value::function(|_, _| Value::Bool(true)),
+        realm_webgl_function(|_, _| Value::Bool(true)),
     );
     value.set_property(
         "makeXRCompatible",
-        Value::function(|_, _| {
+        realm_webgl_function(|_, _| {
             warn_once();
             w3cos_core::promise::resolve(vec![Value::Undefined])
         }),
@@ -508,7 +524,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
         if value.get_property(method).is_undefined() {
             value.set_property(
                 method,
-                Value::function(move |_, _| {
+                realm_webgl_function(move |_, _| {
                     if matches!(
                         method,
                         "drawArrays"
@@ -539,6 +555,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
             "WebGLRenderingContext"
         },
     );
+    register_weak_realm_object(&CONTEXTS, &value);
     value
 }
 
@@ -563,7 +580,37 @@ pub const INTERFACES: &[&str] = &[
 ];
 
 pub fn reset() {
-    CLASSES.with(|classes| classes.borrow_mut().clear());
+    CONTEXTS.with(|contexts| {
+        for context in contexts
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|context| upgrade_realm_object(&context))
+        {
+            context.set_property("canvas", Value::Undefined);
+            context.set_property("__w3cos_getter_drawingBufferHeight", Value::Undefined);
+            context.set_property("__w3cos_getter_drawingBufferWidth", Value::Undefined);
+            for method in WEBGL1_METHODS
+                .split_whitespace()
+                .chain(WEBGL2_METHODS.split_whitespace())
+            {
+                context.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    OBJECTS.with(|objects| {
+        for object in objects
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|object| upgrade_realm_object(&object))
+        {
+            object.set_property("__w3cos_deleted", Value::Bool(true));
+            object.set_property("__w3cos_source", Value::Undefined);
+        }
+    });
+    let classes = CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()));
+    for class in classes.into_values() {
+        disconnect_realm_class(class);
+    }
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -617,5 +664,47 @@ mod tests {
         assert_eq!(gl.get_property("ARRAY_BUFFER").to_number(), 34962.0);
         assert_eq!(gl.get_property("TEXTURE31").to_number(), 34015.0);
         assert!(gl.call_method("createVertexArray", vec![]).is_object());
+    }
+
+    #[test]
+    fn contexts_resources_canvas_references_and_classes_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_context_class = class_for("WebGLRenderingContext");
+        let old_shader_class = class_for("WebGLShader");
+        let canvas = Value::object(HashMap::from([
+            ("width".into(), Value::Number(320.0)),
+            ("height".into(), Value::Number(200.0)),
+        ]));
+        let canvas_weak = crate::jsdom::weak_realm_object(&canvas);
+        let gl = context_value(canvas.clone(), false);
+        drop(canvas);
+        let shader = gl.call_method("createShader", vec![Value::Number(35633.0)]);
+        gl.call_method(
+            "shaderSource",
+            vec![shader.clone(), Value::string("void main(){}")],
+        );
+        let gl_weak = crate::jsdom::weak_realm_object(&gl);
+        let shader_weak = crate::jsdom::weak_realm_object(&shader);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_context_class.get_property("prototype").is_undefined());
+        assert!(old_shader_class.get_property("prototype").is_undefined());
+        assert!(!old_context_class.strict_eq(&class_for("WebGLRenderingContext")));
+        assert!(gl.get_property("canvas").is_undefined());
+        assert!(gl.get_property("drawingBufferWidth").is_undefined());
+        assert!(gl.call_method("createBuffer", Vec::new()).is_undefined());
+        assert!(gl.call_method("getError", Vec::new()).is_undefined());
+        assert!(shader.get_property("__w3cos_deleted").to_bool());
+        assert!(shader.get_property("__w3cos_source").is_undefined());
+        assert!(canvas_weak.upgrade().is_none());
+
+        drop(gl);
+        drop(shader);
+        assert!(gl_weak.upgrade().is_none());
+        assert!(shader_weak.upgrade().is_none());
     }
 }

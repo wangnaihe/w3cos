@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_skia::{
     Color as SkColor, FillRule, Mask, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
@@ -59,6 +60,7 @@ impl ClipMaskCache {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GlyphKey {
     ch: char,
+    font: u64,
     font_size: u32,
 }
 
@@ -74,8 +76,11 @@ struct GlyphRasterCache {
 
 impl GlyphRasterCache {
     fn get_or_rasterize(&mut self, font: &fontdue::Font, ch: char, font_size: f32) -> &CachedGlyph {
+        let mut font_hasher = DefaultHasher::new();
+        font.hash(&mut font_hasher);
         let key = GlyphKey {
             ch,
+            font: font_hasher.finish(),
             font_size: font_size.to_bits(),
         };
         if self.glyphs.len() >= 2048 && !self.glyphs.contains_key(&key) {
@@ -702,7 +707,6 @@ fn render_node(
     if style.opacity <= 0.0 {
         return;
     }
-
     // Apply transform offset
     let tx = style.transform.translate_x;
     let ty = style.transform.translate_y;
@@ -763,6 +767,44 @@ fn render_node(
 
     if bg.a > 0 {
         draw_rect(pixmap, rect, bg, style.border_radius, clip_mask);
+    }
+    for layer in crate::background_image::background_paint_layers(style, rect)
+        .into_iter()
+        .rev()
+    {
+        match layer {
+            crate::background_image::BackgroundPaintLayer::Raster(layer) => {
+                if let Some(decoded) = crate::image_loader::get_or_load(&layer.source) {
+                    for tile in layer.tiles {
+                        draw_image_pixels(
+                            pixmap,
+                            tile,
+                            decoded.width,
+                            decoded.height,
+                            &decoded.data,
+                            opacity,
+                            clip_mask,
+                            Some(layer.clip),
+                            layer.blend_mode,
+                        );
+                    }
+                }
+            }
+            crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
+                for tile in layer.geometry.tiles {
+                    draw_gradient_pixels(
+                        pixmap,
+                        tile,
+                        &layer.kind,
+                        &layer.stops,
+                        opacity,
+                        clip_mask,
+                        layer.geometry.clip,
+                        layer.blend_mode,
+                    );
+                }
+            }
+        }
     }
 
     let has_edge_border = style.border_top_width.is_some()
@@ -853,6 +895,8 @@ fn render_node(
                     &decoded.data,
                     opacity,
                     clip_mask,
+                    None,
+                    crate::background_image::BackgroundBlendMode::Normal,
                 );
             } else {
                 let placeholder_bg = if bg.a == 0 {
@@ -883,6 +927,7 @@ fn render_node(
                     style.font_size,
                     text_color,
                     font,
+                    style,
                     clip_mask,
                 );
             }
@@ -906,13 +951,13 @@ fn render_node(
             };
             let content = text_content_box(rect, style);
             let text_x = content.x;
-            let text_y = text_layout::y_for_draw_text_line_centered(
+            let ink = crate::font_face::FontRegistry::global().measure_style_ink_bounds(
+                style,
                 display_text,
                 style.font_size,
                 font,
-                content.y,
-                content.height,
             );
+            let text_y = content.y + (content.height - ink.height) * 0.5 - ink.top;
             let tc = text_color_override.unwrap_or(text_color);
             draw_text_line(
                 pixmap,
@@ -922,6 +967,7 @@ fn render_node(
                 style.font_size,
                 tc,
                 font,
+                style,
                 clip_mask,
             );
             if is_focused {
@@ -932,6 +978,7 @@ fn render_node(
                     style.font_size,
                     text_color,
                     font,
+                    style,
                     clip_mask,
                 );
             }
@@ -965,6 +1012,8 @@ fn render_node(
                     raster.data.as_slice(),
                     opacity,
                     clip_mask,
+                    None,
+                    crate::background_image::BackgroundBlendMode::Normal,
                 );
             }
         }
@@ -1252,13 +1301,15 @@ fn draw_text_ink_in_box(
     font_size: f32,
     color: Color,
     font: &fontdue::Font,
+    style: &Style,
     align: TextAlign,
     clip_mask: Option<&Mask>,
 ) {
-    let ink = text_layout::measure_text_ink_bounds(text, font_size, font, 0.0, 0.0);
+    let ink = crate::font_face::FontRegistry::global()
+        .measure_style_ink_bounds(style, text, font_size, font);
     if ink.width <= 0.0 && ink.height <= 0.0 {
         draw_text_line(
-            pixmap, box_rect.x, box_rect.y, text, font_size, color, font, clip_mask,
+            pixmap, box_rect.x, box_rect.y, text, font_size, color, font, style, clip_mask,
         );
         return;
     }
@@ -1269,7 +1320,7 @@ fn draw_text_ink_in_box(
         TextAlign::Left | TextAlign::Justify => box_rect.x - ink.left,
     };
     let y = box_rect.y + (box_rect.height - ink.height) * 0.5 - ink.top;
-    draw_text_line(pixmap, x, y, text, font_size, color, font, clip_mask);
+    draw_text_line(pixmap, x, y, text, font_size, color, font, style, clip_mask);
 }
 
 fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
@@ -1299,12 +1350,15 @@ fn draw_text_in_rect(
 ) {
     let content = text_paint_box(rect, style);
     let line_h = style.font_size * style.line_height;
-    let layout = text_layout::retained_text_paint_layout(
+    let registry = crate::font_face::FontRegistry::global();
+    let layout = text_layout::retained_text_paint_layout_with(
         text,
         content.width,
         style.font_size,
-        font,
         style.white_space,
+        registry.cascade_cache_key(style, text) ^ 0x4350_5554_4558_5401,
+        |character| registry.style_char_advance(style, character, style.font_size, font),
+        |line| registry.measure_style_ink_bounds(style, line, style.font_size, font),
     );
     let lines = &layout.lines;
 
@@ -1317,6 +1371,7 @@ fn draw_text_in_rect(
             style.font_size,
             color,
             font,
+            style,
             align,
             clip_mask,
         );
@@ -1335,7 +1390,17 @@ fn draw_text_in_rect(
             TextAlign::Left | TextAlign::Justify => content.x - ink.left,
         };
         let y = block_top + i as f32 * line_h;
-        draw_text_line(pixmap, x, y, line, style.font_size, color, font, clip_mask);
+        draw_text_line(
+            pixmap,
+            x,
+            y,
+            line,
+            style.font_size,
+            color,
+            font,
+            style,
+            clip_mask,
+        );
     }
 }
 
@@ -1355,6 +1420,7 @@ fn draw_text_centered_in_rect(
         style.font_size,
         color,
         font,
+        style,
         TextAlign::Center,
         clip_mask,
     );
@@ -1369,6 +1435,7 @@ fn draw_text_line(
     font_size: f32,
     color: Color,
     font: &fontdue::Font,
+    style: &Style,
     clip_mask: Option<&Mask>,
 ) {
     let mut cursor_x = x;
@@ -1392,7 +1459,11 @@ fn draw_text_line(
     GLYPH_RASTER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         for ch in text.chars() {
-            let glyph = cache.get_or_rasterize(font, ch, font_size);
+            let registered = crate::font_face::FontRegistry::global()
+                .resolve_style_for_character(style, ch)
+                .and_then(|font| font.parsed());
+            let glyph_font = registered.as_deref().unwrap_or(font);
+            let glyph = cache.get_or_rasterize(glyph_font, ch, font_size);
             let metrics = &glyph.metrics;
             let advance = if metrics.advance_width > 0.0 {
                 metrics.advance_width
@@ -1465,6 +1536,7 @@ fn draw_blinking_cursor(
     font_size: f32,
     color: Color,
     font: &fontdue::Font,
+    style: &Style,
     clip_mask: Option<&Mask>,
 ) {
     let ms = SystemTime::now()
@@ -1477,15 +1549,10 @@ fn draw_blinking_cursor(
     let mut cursor_x = content.x;
     let cursor_y = content.y + (content.height - font_size) / 2.0 + font_size;
 
-    GLYPH_RASTER_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        for ch in text.chars() {
-            cursor_x += cache
-                .get_or_rasterize(font, ch, font_size)
-                .metrics
-                .advance_width;
-        }
-    });
+    let registry = crate::font_face::FontRegistry::global();
+    for character in text.chars() {
+        cursor_x += registry.style_char_advance(style, character, font_size, font);
+    }
     let px_w = pixmap.width() as i32;
     let px_h = pixmap.height() as i32;
     let in_clip = |px: i32, py: i32| -> bool {
@@ -1532,6 +1599,8 @@ fn draw_image_pixels(
     rgba: &[u8],
     opacity: f32,
     clip_mask: Option<&Mask>,
+    background_clip: Option<crate::background_image::BackgroundClip>,
+    blend_mode: crate::background_image::BackgroundBlendMode,
 ) {
     let dest_w = rect.width.ceil() as u32;
     let dest_h = rect.height.ceil() as u32;
@@ -1547,6 +1616,11 @@ fn draw_image_pixels(
             let px = rect.x as i32 + dx as i32;
             let py = rect.y as i32 + dy as i32;
             if px < 0 || py < 0 || px >= px_w || py >= px_h {
+                continue;
+            }
+            if background_clip.is_some_and(|clip| {
+                !point_in_background_clip(px as f32 + 0.5, py as f32 + 0.5, clip)
+            }) {
                 continue;
             }
             if let Some(mask) = clip_mask {
@@ -1574,9 +1648,132 @@ fn draw_image_pixels(
 
             let dst_idx = (py * px_w + px) as usize;
             let dst = pixels[dst_idx];
-            pixels[dst_idx] = blend_pixel(dst, r, g, b, a);
+            pixels[dst_idx] = blend_background_pixel(dst, r, g, b, a, blend_mode);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_gradient_pixels(
+    pixmap: &mut Pixmap,
+    rect: LayoutRect,
+    kind: &crate::background_image::GradientKind,
+    stops: &[crate::background_image::GradientStop],
+    opacity: f32,
+    clip_mask: Option<&Mask>,
+    background_clip: crate::background_image::BackgroundClip,
+    blend_mode: crate::background_image::BackgroundBlendMode,
+) {
+    let start_x = rect.x.floor() as i32;
+    let start_y = rect.y.floor() as i32;
+    let end_x = (rect.x + rect.width).ceil() as i32;
+    let end_y = (rect.y + rect.height).ceil() as i32;
+    let px_w = pixmap.width() as i32;
+    let px_h = pixmap.height() as i32;
+    let linear = match kind {
+        crate::background_image::GradientKind::Linear { angle_degrees } => Some(
+            crate::background_image::linear_gradient_points(rect, *angle_degrees),
+        ),
+        _ => None,
+    };
+    let radial = match kind {
+        crate::background_image::GradientKind::Radial {
+            center_x,
+            center_y,
+            shape,
+        } => Some(crate::background_image::radial_gradient_axes(
+            rect, *center_x, *center_y, *shape,
+        )),
+        _ => None,
+    };
+    let pixels = pixmap.pixels_mut();
+    for py in start_y.max(0)..end_y.min(px_h) {
+        for px in start_x.max(0)..end_x.min(px_w) {
+            let x = px as f32 + 0.5;
+            let y = py as f32 + 0.5;
+            if !point_in_background_clip(x, y, background_clip) {
+                continue;
+            }
+            if let Some(mask) = clip_mask {
+                let mask_idx = (py * mask.width() as i32 + px) as usize;
+                if mask.data().get(mask_idx).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+            }
+            let t = if let Some((start, end)) = linear {
+                let dx = end.0 - start.0;
+                let dy = end.1 - start.1;
+                ((x - start.0) * dx + (y - start.1) * dy) / (dx * dx + dy * dy).max(1.0)
+            } else if let Some((center, (radius_x, radius_y))) = radial {
+                (((x - center.0) / radius_x).powi(2) + ((y - center.1) / radius_y).powi(2)).sqrt()
+            } else {
+                continue;
+            }
+            .clamp(0.0, 1.0);
+            let color = interpolate_gradient_color(stops, t);
+            let alpha = (color.a as f32 * opacity.clamp(0.0, 1.0)).round() as u8;
+            let index = (py * px_w + px) as usize;
+            pixels[index] =
+                blend_background_pixel(pixels[index], color.r, color.g, color.b, alpha, blend_mode);
+        }
+    }
+}
+
+fn interpolate_gradient_color(
+    stops: &[crate::background_image::GradientStop],
+    position: f32,
+) -> Color {
+    let upper = stops
+        .iter()
+        .position(|stop| stop.position >= position)
+        .unwrap_or(stops.len() - 1);
+    if upper == 0 {
+        return stops[0].color;
+    }
+    let lower = upper - 1;
+    let span = (stops[upper].position - stops[lower].position).max(f32::EPSILON);
+    let t = ((position - stops[lower].position) / span).clamp(0.0, 1.0);
+    let lerp = |from: u8, to: u8| {
+        (from as f32 + (to as f32 - from as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::rgba(
+        lerp(stops[lower].color.r, stops[upper].color.r),
+        lerp(stops[lower].color.g, stops[upper].color.g),
+        lerp(stops[lower].color.b, stops[upper].color.b),
+        lerp(stops[lower].color.a, stops[upper].color.a),
+    )
+}
+
+fn point_in_background_clip(x: f32, y: f32, clip: crate::background_image::BackgroundClip) -> bool {
+    let rect = clip.rect;
+    if x < rect.x || y < rect.y || x >= rect.x + rect.width || y >= rect.y + rect.height {
+        return false;
+    }
+    let radius = clip
+        .radius
+        .min(rect.width * 0.5)
+        .min(rect.height * 0.5)
+        .max(0.0);
+    if radius == 0.0 {
+        return true;
+    }
+    let center_x = if x < rect.x + radius {
+        rect.x + radius
+    } else if x > rect.x + rect.width - radius {
+        rect.x + rect.width - radius
+    } else {
+        x
+    };
+    let center_y = if y < rect.y + radius {
+        rect.y + radius
+    } else if y > rect.y + rect.height - radius {
+        rect.y + rect.height - radius
+    } else {
+        y
+    };
+    (x - center_x).powi(2) + (y - center_y).powi(2) <= radius.powi(2)
 }
 
 fn blend_pixel(
@@ -1599,6 +1796,75 @@ fn blend_pixel(
     let out_b = (sb as u16 * sa16 / 255 + db * inv / 255).min(255) as u8;
 
     tiny_skia::PremultipliedColorU8::from_rgba(out_r, out_g, out_b, out_a).unwrap()
+}
+
+fn blend_background_pixel(
+    dst: tiny_skia::PremultipliedColorU8,
+    sr: u8,
+    sg: u8,
+    sb: u8,
+    sa: u8,
+    mode: crate::background_image::BackgroundBlendMode,
+) -> tiny_skia::PremultipliedColorU8 {
+    use crate::background_image::BackgroundBlendMode as Mode;
+    if mode == Mode::Normal || dst.alpha() == 0 {
+        return blend_pixel(dst, sr, sg, sb, sa);
+    }
+    let da = f32::from(dst.alpha()) / 255.0;
+    let backdrop =
+        |channel: u8| (f32::from(channel) / 255.0 / da.max(f32::EPSILON)).clamp(0.0, 1.0);
+    let blend = |source: u8, destination: u8| {
+        let source = f32::from(source) / 255.0;
+        let destination = backdrop(destination);
+        let value = match mode {
+            Mode::Normal => source,
+            Mode::Multiply => source * destination,
+            Mode::Screen => source + destination - source * destination,
+            Mode::Overlay => {
+                if destination <= 0.5 {
+                    2.0 * source * destination
+                } else {
+                    1.0 - 2.0 * (1.0 - source) * (1.0 - destination)
+                }
+            }
+            Mode::Darken => source.min(destination),
+            Mode::Lighten => source.max(destination),
+            Mode::ColorDodge => {
+                if source >= 1.0 {
+                    1.0
+                } else {
+                    (destination / (1.0 - source)).min(1.0)
+                }
+            }
+            Mode::ColorBurn => {
+                if source <= 0.0 {
+                    0.0
+                } else {
+                    1.0 - ((1.0 - destination) / source).min(1.0)
+                }
+            }
+            Mode::HardLight => {
+                if source <= 0.5 {
+                    2.0 * source * destination
+                } else {
+                    1.0 - 2.0 * (1.0 - source) * (1.0 - destination)
+                }
+            }
+            Mode::SoftLight => {
+                (1.0 - 2.0 * source) * destination * destination + 2.0 * source * destination
+            }
+            Mode::Difference => (destination - source).abs(),
+            Mode::Exclusion => source + destination - 2.0 * source * destination,
+        };
+        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    blend_pixel(
+        dst,
+        blend(sr, dst.red()),
+        blend(sg, dst.green()),
+        blend(sb, dst.blue()),
+        sa,
+    )
 }
 
 fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
@@ -1681,6 +1947,11 @@ mod font_cjk_tests {
         let data = include_bytes!("../assets/CJK-Subset.ttf");
         let font =
             fontdue::Font::from_bytes(data as &[u8], fontdue::FontSettings::default()).unwrap();
+        let latin = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
         let mut cache = GlyphRasterCache::default();
 
         assert!(!cache.get_or_rasterize(&font, '话', 16.0).bitmap.is_empty());
@@ -1689,6 +1960,100 @@ mod font_cjk_tests {
 
         assert!(!cache.get_or_rasterize(&font, '话', 18.0).bitmap.is_empty());
         assert_eq!(cache.glyphs.len(), 2);
+
+        cache.get_or_rasterize(&font, 'A', 16.0);
+        cache.get_or_rasterize(&latin, 'A', 16.0);
+        assert_eq!(
+            cache.glyphs.len(),
+            4,
+            "the same character and size in two fonts needs two glyph entries"
+        );
+    }
+
+    #[test]
+    fn cpu_text_raster_uses_unicode_range_font_runs() {
+        const OWNER: u64 = 0x4350_5553_5542_5345;
+        const FAMILY: &str = "W3COS CPU Subset Test";
+
+        fn scaled_inter(divisor: u16) -> Vec<u8> {
+            fn table_offset(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
+                let count = u16::from_be_bytes(bytes.get(4..6)?.try_into().ok()?) as usize;
+                (0..count).find_map(|index| {
+                    let entry = 12 + index * 16;
+                    (bytes.get(entry..entry + 4)? == tag).then(|| {
+                        u32::from_be_bytes(
+                            bytes[entry + 8..entry + 12]
+                                .try_into()
+                                .expect("table offset"),
+                        ) as usize
+                    })
+                })
+            }
+
+            let mut bytes = include_bytes!("../assets/Inter-Regular.ttf").to_vec();
+            let hhea = table_offset(&bytes, b"hhea").expect("hhea table");
+            let hmtx = table_offset(&bytes, b"hmtx").expect("hmtx table");
+            let count =
+                u16::from_be_bytes(bytes[hhea + 34..hhea + 36].try_into().unwrap()) as usize;
+            for index in 0..count {
+                let offset = hmtx + index * 4;
+                let advance = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap());
+                bytes[offset..offset + 2]
+                    .copy_from_slice(&(advance / divisor).max(1).to_be_bytes());
+            }
+            bytes
+        }
+
+        for (range, divisor) in [("U+0057", 4), ("U+0030-0039", 2)] {
+            crate::font_face::FontRegistry::global()
+                .register_for_owner(
+                    OWNER,
+                    crate::font_face::FontFace {
+                        family: FAMILY.to_string(),
+                        src: crate::font_face::FontSource::Bytes(scaled_inter(divisor)),
+                        unicode_range: Some(range.to_string()),
+                        ..crate::font_face::FontFace::default()
+                    },
+                )
+                .expect("register CPU subset");
+        }
+        let style = Style {
+            font_family: Some(FAMILY.to_string()),
+            ..Style::default()
+        };
+        let fallback = fontdue::Font::from_bytes(
+            include_bytes!("../assets/CJK-Subset.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        let mut pixmap = Pixmap::new(160, 40).unwrap();
+        clear_glyph_cache();
+        draw_text_line(
+            &mut pixmap,
+            0.0,
+            0.0,
+            "W3W",
+            20.0,
+            Color::rgb(0, 0, 0),
+            &fallback,
+            &style,
+            None,
+        );
+        GLYPH_RASTER_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.glyphs.len(), 2);
+            assert_eq!(
+                cache
+                    .glyphs
+                    .keys()
+                    .map(|key| key.font)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                2,
+                "W and digit subsets must rasterize with their own font instances"
+            );
+        });
+        crate::font_face::FontRegistry::global().clear_owner(OWNER);
     }
 
     #[test]
@@ -1809,5 +2174,48 @@ mod font_cjk_tests {
 
         style.background = Color::rgb(255, 255, 255);
         assert!(scroll_raster_copy_safe(&style));
+    }
+
+    #[test]
+    fn cpu_gradient_sampling_and_rounded_clip_use_shared_description() {
+        let stops = [
+            crate::background_image::GradientStop {
+                color: Color::rgb(255, 0, 0),
+                position: 0.0,
+            },
+            crate::background_image::GradientStop {
+                color: Color::rgb(0, 0, 255),
+                position: 1.0,
+            },
+        ];
+        let mut pixmap = Pixmap::new(10, 10).unwrap();
+        draw_gradient_pixels(
+            &mut pixmap,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            &crate::background_image::GradientKind::Linear {
+                angle_degrees: 90.0,
+            },
+            &stops,
+            1.0,
+            None,
+            crate::background_image::BackgroundClip {
+                rect: LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+                radius: 4.0,
+            },
+            crate::background_image::BackgroundBlendMode::Normal,
+        );
+        assert_eq!(pixmap.pixel(0, 0).unwrap().alpha(), 0);
+        assert!(pixmap.pixel(2, 5).unwrap().red() > pixmap.pixel(2, 5).unwrap().blue());
+        assert!(pixmap.pixel(8, 5).unwrap().blue() > pixmap.pixel(8, 5).unwrap().red());
     }
 }

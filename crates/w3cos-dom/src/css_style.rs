@@ -169,13 +169,41 @@ impl CSSStyleDeclaration {
                 self.inner.overflow_anchor = !value.trim().eq_ignore_ascii_case("none")
             }
 
-            "background" | "background-color" | "backgroundColor" => {
+            "background-color" | "backgroundColor" => {
                 if let Some(color) = Color::from_css(value) {
                     self.inner.background = color;
+                }
+            }
+            "background-image" | "backgroundImage" => {
+                if value.trim().eq_ignore_ascii_case("none") {
                     self.inner.background_image = None;
-                } else if value.contains("gradient(") {
+                } else if value.contains("gradient(") || value.contains("url(") {
                     self.inner.background_image = Some(value.trim().to_string());
                 }
+            }
+            "background-size" | "backgroundSize" => {
+                self.inner.background_size = css_background_value(value, "auto")
+            }
+            "background-position" | "backgroundPosition" => {
+                self.inner.background_position = css_background_value(value, "0% 0%")
+            }
+            "background-repeat" | "backgroundRepeat" => {
+                self.inner.background_repeat = css_background_value(value, "repeat")
+            }
+            "background-origin" | "backgroundOrigin" => {
+                self.inner.background_origin = css_background_value(value, "padding-box")
+            }
+            "background-clip" | "backgroundClip" => {
+                self.inner.background_clip = css_background_value(value, "border-box")
+            }
+            "background-attachment" | "backgroundAttachment" => {
+                self.inner.background_attachment = css_background_value(value, "scroll")
+            }
+            "background-blend-mode" | "backgroundBlendMode" => {
+                self.inner.background_blend_mode = css_background_value(value, "normal")
+            }
+            "background" => {
+                apply_background_shorthand(&mut self.inner, value);
             }
             "color" => {
                 if let Some(color) = Color::from_css(value) {
@@ -371,6 +399,46 @@ impl CSSStyleDeclaration {
                 "#{:02x}{:02x}{:02x}",
                 self.inner.color.r, self.inner.color.g, self.inner.color.b
             ),
+            "background-image" | "backgroundImage" => self
+                .inner
+                .background_image
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+            "background-size" | "backgroundSize" => self
+                .inner
+                .background_size
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()),
+            "background-position" | "backgroundPosition" => self
+                .inner
+                .background_position
+                .clone()
+                .unwrap_or_else(|| "0% 0%".to_string()),
+            "background-repeat" | "backgroundRepeat" => self
+                .inner
+                .background_repeat
+                .clone()
+                .unwrap_or_else(|| "repeat".to_string()),
+            "background-origin" | "backgroundOrigin" => self
+                .inner
+                .background_origin
+                .clone()
+                .unwrap_or_else(|| "padding-box".to_string()),
+            "background-clip" | "backgroundClip" => self
+                .inner
+                .background_clip
+                .clone()
+                .unwrap_or_else(|| "border-box".to_string()),
+            "background-attachment" | "backgroundAttachment" => self
+                .inner
+                .background_attachment
+                .clone()
+                .unwrap_or_else(|| "scroll".to_string()),
+            "background-blend-mode" | "backgroundBlendMode" => self
+                .inner
+                .background_blend_mode
+                .clone()
+                .unwrap_or_else(|| "normal".to_string()),
             "opacity" => format!("{}", self.inner.opacity),
             "width" => dimension_to_css(&self.inner.width),
             "height" => dimension_to_css(&self.inner.height),
@@ -412,6 +480,29 @@ impl CSSStyleDeclaration {
     pub fn to_style(&self) -> Style {
         self.inner.clone()
     }
+}
+
+fn css_background_value(value: &str, initial: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case(initial) {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn apply_background_shorthand(style: &mut Style, value: &str) {
+    let parsed = w3cos_std::background::parse_shorthand(value);
+    style.background = parsed.color.unwrap_or(Color::TRANSPARENT);
+    style.background_image = Some(parsed.images.join(", "));
+    style.background_size = css_background_value(&parsed.sizes.join(", "), "auto");
+    style.background_position = css_background_value(&parsed.positions.join(", "), "0% 0%");
+    style.background_repeat = css_background_value(&parsed.repeats.join(", "), "repeat");
+    style.background_origin = css_background_value(&parsed.origins.join(", "), "padding-box");
+    style.background_clip = css_background_value(&parsed.clips.join(", "), "border-box");
+    style.background_attachment = css_background_value(&parsed.attachments.join(", "), "scroll");
+    // `background` resets every longhand, including the separately parsed blend mode.
+    style.background_blend_mode = None;
 }
 
 fn parse_edge_spacing(value: &str, edge: SafeAreaEdge, css_edge: &str) -> Option<Spacing> {
@@ -1107,11 +1198,72 @@ mod tests {
     }
 
     #[test]
+    fn background_image_preserves_url_layers_and_none_clears_them() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property(
+            "background-image",
+            "linear-gradient(red, blue), url('images/card.png')",
+        );
+        assert_eq!(
+            declaration.get_property("background-image"),
+            "linear-gradient(red, blue), url('images/card.png')"
+        );
+        declaration.set_property("backgroundImage", "none");
+        assert_eq!(declaration.get_property("background-image"), "none");
+    }
+
+    #[test]
+    fn background_shorthand_expands_raster_placement_fields() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property(
+            "background",
+            "#123456 url('map/tile.png') center / cover no-repeat content-box padding-box",
+        );
+        assert_eq!(
+            declaration.inner.background_image.as_deref(),
+            Some("url('map/tile.png')")
+        );
+        assert_eq!(declaration.inner.background_size.as_deref(), Some("cover"));
+        assert_eq!(
+            declaration.inner.background_position.as_deref(),
+            Some("center")
+        );
+        assert_eq!(
+            declaration.inner.background_repeat.as_deref(),
+            Some("no-repeat")
+        );
+        assert_eq!(
+            declaration.inner.background_origin.as_deref(),
+            Some("content-box")
+        );
+        assert_eq!(
+            declaration.inner.background_clip.as_deref(),
+            Some("padding-box")
+        );
+        assert_eq!(declaration.inner.background, Color::from_hex("#123456"));
+    }
+
+    #[test]
     fn background_retains_gradient_layers() {
         let value = "radial-gradient(circle at 85% 8%, rgba(22, 119, 255, 0.18), transparent 34%), linear-gradient(160deg, #f7faff 0%, #eef3fb 100%)";
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("background", value);
         assert_eq!(declaration.inner.background_image.as_deref(), Some(value));
+    }
+
+    #[test]
+    fn background_attachment_and_blend_longhands_round_trip() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("background", "url(a.png) fixed, url(b.png) local");
+        declaration.set_property("backgroundBlendMode", "multiply, screen");
+        assert_eq!(
+            declaration.get_property("background-attachment"),
+            "fixed, local"
+        );
+        assert_eq!(
+            declaration.get_property("background-blend-mode"),
+            "multiply, screen"
+        );
     }
 
     #[test]

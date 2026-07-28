@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 #[derive(Clone, Default)]
@@ -71,7 +72,8 @@ pub fn storage_bucket_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(error("TypeError", "Illegal constructor: StorageBucket"))
         });
         class.set_property("name", Value::string("StorageBucket"));
@@ -97,6 +99,7 @@ pub fn storage_bucket_class() -> Value {
 }
 
 fn bucket_value(name: String) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::from([
         ("name".into(), Value::string(&name)),
         ("indexedDB".into(), crate::indexed_db_web::factory_value()),
@@ -105,7 +108,7 @@ fn bucket_value(name: String) -> Value {
     let name_for_expires = name.clone();
     value.set_property(
         "__w3cos_getter_expires",
-        Value::function(move |_, _| {
+        realm_function(generation, move |_, _| {
             BUCKETS.with(|buckets| {
                 buckets
                     .borrow()
@@ -118,18 +121,20 @@ fn bucket_value(name: String) -> Value {
     );
     value.set_property(
         "persisted",
-        Value::function(|_, _| w3cos_core::promise::resolve(vec![Value::Bool(false)])),
+        realm_function(generation, |_, _| {
+            w3cos_core::promise::resolve(vec![Value::Bool(false)])
+        }),
     );
     value.set_property(
         "persist",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             warn_process_local();
             w3cos_core::promise::resolve(vec![Value::Bool(false)])
         }),
     );
     value.set_property(
         "estimate",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             w3cos_core::promise::resolve(vec![Value::object(HashMap::from([
                 ("usage".into(), Value::Number(0.0)),
                 ("quota".into(), Value::Number(0.0)),
@@ -139,7 +144,7 @@ fn bucket_value(name: String) -> Value {
     let name_for_set = name;
     value.set_property(
         "setExpires",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let expires = args
                 .first()
                 .cloned()
@@ -161,7 +166,7 @@ fn bucket_value(name: String) -> Value {
     );
     value.set_property(
         "getDirectory",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             w3cos_core::promise::reject(vec![error(
                 "NotSupportedError",
                 "Bucket-scoped OPFS requires a platform storage adapter",
@@ -192,7 +197,8 @@ pub fn storage_bucket_manager_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| {
             w3cos_core::throw_value(error(
                 "TypeError",
                 "Illegal constructor: StorageBucketManager",
@@ -208,10 +214,11 @@ pub fn storage_bucket_manager_class() -> Value {
 }
 
 pub fn storage_bucket_manager_value() -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::new());
     value.set_property(
         "open",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             let name = match validate_name(args.first().cloned().unwrap_or(Value::Undefined)) {
                 Ok(name) => name,
                 Err(reason) => return w3cos_core::promise::reject(vec![reason]),
@@ -244,7 +251,7 @@ pub fn storage_bucket_manager_value() -> Value {
     );
     value.set_property(
         "keys",
-        Value::function(|_, _| {
+        realm_function(generation, |_, _| {
             let names = BUCKETS.with(|buckets| {
                 buckets
                     .borrow()
@@ -257,7 +264,7 @@ pub fn storage_bucket_manager_value() -> Value {
     );
     value.set_property(
         "delete",
-        Value::function(|_, args| {
+        realm_function(generation, |_, args| {
             let name = match validate_name(args.first().cloned().unwrap_or(Value::Undefined)) {
                 Ok(name) => name,
                 Err(reason) => return w3cos_core::promise::reject(vec![reason]),
@@ -278,6 +285,15 @@ pub fn storage_bucket_manager_value() -> Value {
         &["open", "keys", "delete"],
     );
     value
+}
+
+pub fn reset_realm() {
+    MANAGER_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    BUCKET_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 #[cfg(test)]
@@ -358,5 +374,70 @@ mod tests {
             );
         crate::jsdom::drain_microtasks();
         assert_eq!(&*name.borrow(), "TypeError");
+    }
+
+    #[test]
+    fn metadata_persists_but_js_entry_points_are_realm_owned() {
+        BUCKETS.with(|buckets| buckets.borrow_mut().clear());
+        reset_realm();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_manager = storage_bucket_manager_value();
+        let old_manager_class = storage_bucket_manager_class();
+        let old_bucket_class = storage_bucket_class();
+        old_bucket_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+        let old_bucket = bucket_value("persistent-data".into());
+        BUCKETS.with(|buckets| {
+            buckets
+                .borrow_mut()
+                .insert("persistent-data".into(), BucketState::default());
+        });
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let new_manager = storage_bucket_manager_value();
+        let new_manager_class = storage_bucket_manager_class();
+        let new_bucket_class = storage_bucket_class();
+        assert!(!old_manager_class.strict_eq(&new_manager_class));
+        assert!(!old_bucket_class.strict_eq(&new_bucket_class));
+        assert!(
+            new_bucket_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+        assert!(old_manager.call_method("keys", vec![]).is_undefined());
+        assert!(
+            old_manager
+                .call_method("delete", vec![Value::string("persistent-data")])
+                .is_undefined()
+        );
+        assert!(
+            old_bucket
+                .call_method("setExpires", vec![Value::Number(42.0)])
+                .is_undefined()
+        );
+        assert!(old_bucket.get_property("expires").is_undefined());
+        assert!(
+            old_bucket_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+
+        let names = Rc::new(RefCell::new(String::new()));
+        let names_for_then = Rc::clone(&names);
+        new_manager.call_method("keys", vec![]).call_method(
+            "then",
+            vec![Value::function(move |_, args| {
+                *names_for_then.borrow_mut() = args[0].to_js_string();
+                Value::Undefined
+            })],
+        );
+        crate::jsdom::drain_microtasks();
+        assert_eq!(&*names.borrow(), "persistent-data");
+        BUCKETS.with(|buckets| buckets.borrow_mut().clear());
+        reset_realm();
     }
 }

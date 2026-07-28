@@ -17,7 +17,52 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo fmt --all -- --check
+      - name: Check workspace
+        run: cargo check --workspace
+      - name: Strict lint unified runtime additions
+        run: cargo clippy -p w3cos-ir -p w3cos-vm -p w3cos-size-audit -p w3cos-size-probes --features w3cos-size-probes/browser --all-targets --no-deps -- -D warnings -A clippy::cargo_common_metadata
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test workspace libraries and tools
+        run: cargo test --workspace --exclude w3cos-compiler --exclude w3cos-runtime
+      - name: Test required compiler suites
+        run: cargo test -p w3cos-compiler --lib --tests
+      - name: Test required runtime suites
+        run: cargo test -p w3cos-runtime --lib --tests
+      - name: Test optional dynamic JavaScript path
+        run: cargo test -p w3cos-runtime --no-default-features --features dynamic-js dynamic_script::tests --lib
+      - name: Test map-style dynamic SDK loading
+        run: cargo test -p w3cos-runtime --no-default-features --features dynamic-js --test map_sdk_compat
+      - name: Verify ordinary AOT dependency boundary
+        run: scripts/check-aot-dependency-boundary.sh
+      - name: Verify dynamic JavaScript execution boundary
+        run: scripts/check-dynamic-js-boundary.sh
+      - name: Test size audit policy
+        run: cargo test -p w3cos-size-audit
+      - name: Build stripped AOT and dynamic-browser linkage probes
+        run: |
+          cargo build -p w3cos-size-audit --profile release-size
+          cargo build -p w3cos-size-probes --bin w3cos-aot-size-probe --profile release-size
+          cargo build -p w3cos-size-probes --features browser --bin w3cos-browser-size-probe --profile release-size
+          test "$(target/release-size/w3cos-aot-size-probe)" = "ordinary-aot"
+          test "$(target/release-size/w3cos-browser-size-probe)" = "dynamic-w3vm"
+      - name: Enforce linkage-probe size budgets
+        run: |
+          target/release-size/w3cos-size-audit \
+            --profile aot \
+            --component executable=target/release-size/w3cos-aot-size-probe \
+            --output target/size-audit-aot.json
+          aot_bytes="$(stat -c%s target/release-size/w3cos-aot-size-probe)"
+          target/release-size/w3cos-size-audit \
+            --profile browser \
+            --component executable=target/release-size/w3cos-browser-size-probe \
+            --baseline-bytes "$aot_bytes" \
+            --max-regression-percent 50 \
+            --output target/size-audit-browser.json
+      - name: Upload linkage-probe size reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: size-audit-linkage-probes
+          path: |
+            target/size-audit-aot.json
+            target/size-audit-browser.json

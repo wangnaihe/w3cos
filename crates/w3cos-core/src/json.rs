@@ -60,9 +60,14 @@ fn walk_reviver(reviver: &Value, key: &str, value: Value) -> Value {
                     .borrow()
                     .get(index)
                     .cloned()
+                    .map(crate::value::array_slot_value)
                     .unwrap_or(Value::Undefined);
                 let revived = walk_reviver(reviver, &index.to_string(), child);
-                items.borrow_mut()[index] = revived;
+                items.borrow_mut()[index] = if revived.is_undefined() {
+                    crate::value::array_hole()
+                } else {
+                    revived
+                };
             }
             value
         }
@@ -159,8 +164,12 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
             let inner = push_indent(context);
             let mut parts = Vec::new();
             for (index, item) in items.borrow().iter().enumerate() {
-                let text = serialize(context, &index.to_string(), item)
-                    .unwrap_or_else(|| "null".to_string());
+                let text = if crate::value::is_array_hole(item) {
+                    "null".to_string()
+                } else {
+                    serialize(context, &index.to_string(), item)
+                        .unwrap_or_else(|| "null".to_string())
+                };
                 parts.push(text);
             }
             let outer = pop_indent(context, &inner);

@@ -1405,10 +1405,17 @@ fn clone_value(value: &Value, clones: &mut HashMap<usize, Value>) -> Value {
 
     match value {
         Value::Array(items) => {
-            let cloned = Value::array(Vec::new());
-            clones.insert(pointer, cloned.clone());
             let children = items.borrow().clone();
+            let cloned = Value::array(
+                (0..children.len())
+                    .map(|_| crate::value::array_hole())
+                    .collect(),
+            );
+            clones.insert(pointer, cloned.clone());
             for (index, item) in children.iter().enumerate() {
+                if crate::value::is_array_hole(item) {
+                    continue;
+                }
                 cloned.set_property(&index.to_string(), clone_value(item, clones));
             }
             cloned

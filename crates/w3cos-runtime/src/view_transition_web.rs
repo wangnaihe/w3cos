@@ -412,6 +412,17 @@ pub fn install_document(document: &Value) {
     );
 }
 
+/// Drop any transition object owned by the document being discarded.
+///
+/// The shared Promise generation is advanced before this hook runs, so
+/// abandoned transition continuations cannot settle callbacks in the new
+/// Realm.
+pub fn reset_realm() {
+    ACTIVE.with(|active| {
+        active.borrow_mut().take();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;

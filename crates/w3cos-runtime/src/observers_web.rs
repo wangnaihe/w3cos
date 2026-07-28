@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Once;
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 thread_local! {
@@ -59,7 +60,8 @@ pub fn navigation_diagnostic_class(name: &str) -> Value {
         else {
             return Value::Undefined;
         };
-        let class = Value::function(move |_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string(&format!("{name} is not constructible"))],
@@ -80,6 +82,7 @@ pub fn navigation_diagnostic_class(name: &str) -> Value {
 
 /// Create a host-supplied BFCache restoration diagnostic with browser identity.
 pub fn navigation_diagnostic_value(name: &str, values: Value) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let diagnostic = Value::object(HashMap::new());
     for member in navigation_diagnostic_members(name) {
         let supplied = values.get_property(member);
@@ -96,7 +99,7 @@ pub fn navigation_diagnostic_value(name: &str, values: Value) -> Value {
     let class_name = name.to_string();
     diagnostic.set_property(
         "toJSON",
-        Value::function(move |_, _| {
+        realm_function(generation, move |_, _| {
             let mut snapshot = HashMap::new();
             for member in navigation_diagnostic_members(&class_name) {
                 snapshot.insert(
@@ -400,7 +403,8 @@ fn illegal_observer_record_class(
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(move |_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, move |_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string(&format!("Illegal constructor: {name}"))],
@@ -480,8 +484,9 @@ pub fn resize_observer_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
+        let generation = crate::jsdom::realm_generation();
         let class = finish_class_with_members(
-            Value::function(|_, args| {
+            realm_function(generation, move |_, args| {
                 let callback = args.first().cloned().unwrap_or_default();
                 if !callback.is_function() {
                     w3cos_core::throw_value(w3cos_core::error_instance(
@@ -501,7 +506,7 @@ pub fn resize_observer_class() -> Value {
                 let observe_state = Rc::clone(&state);
                 observer.set_property(
                     "observe",
-                    Value::function(move |this, args| {
+                    realm_function(generation, move |this, args| {
                         let target_value = args.first().cloned().unwrap_or_default();
                         let options = args.get(1).cloned().unwrap_or_default();
                         let box_kind = if options.get_property("box").is_undefined() {
@@ -562,7 +567,7 @@ pub fn resize_observer_class() -> Value {
                 let unobserve_state = Rc::clone(&state);
                 observer.set_property(
                     "unobserve",
-                    Value::function(move |this, args| {
+                    realm_function(generation, move |this, args| {
                         original_unobserve.call(this, args.clone());
                         if let Some(target) = args.first().and_then(crate::jsdom::node_id_of) {
                             unobserve_state.borrow_mut().targets.remove(&target);
@@ -574,7 +579,7 @@ pub fn resize_observer_class() -> Value {
                 let disconnect_state = state;
                 observer.set_property(
                     "disconnect",
-                    Value::function(move |this, args| {
+                    realm_function(generation, move |this, args| {
                         original_disconnect.call(this, args);
                         disconnect_state.borrow_mut().targets.clear();
                         Value::Undefined
@@ -711,7 +716,8 @@ pub fn mutation_observer_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = finish_class_with_members(Value::function(|_, args| {
+        let generation = crate::jsdom::realm_generation();
+        let class = finish_class_with_members(realm_function(generation, move |_, args| {
             let callback = args.first().cloned().unwrap_or_default();
             if !callback.is_function() {
                 w3cos_core::throw_value(w3cos_core::error_instance(
@@ -735,7 +741,7 @@ pub fn mutation_observer_class() -> Value {
             let observe_state = Rc::clone(&state);
             value.set_property(
                 "observe",
-                Value::function(move |_, args| {
+                realm_function(generation, move |_, args| {
                     let target_value = args.first().cloned().unwrap_or_default();
                     let Some(target) = crate::jsdom::node_id_of(&target_value).or_else(|| {
                         (target_value == crate::jsdom::document_value()).then_some(0)
@@ -801,7 +807,7 @@ pub fn mutation_observer_class() -> Value {
             let disconnect_state = Rc::clone(&state);
             value.set_property(
                 "disconnect",
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     let mut state = disconnect_state.borrow_mut();
                     state.observations.clear();
                     state.pending.clear();
@@ -811,14 +817,14 @@ pub fn mutation_observer_class() -> Value {
             let take_state = Rc::clone(&state);
             value.set_property(
                 "takeRecords",
-                Value::function(move |_, _| {
+                realm_function(generation, move |_, _| {
                     Value::array(std::mem::take(&mut take_state.borrow_mut().pending))
                 }),
             );
             let enqueue_state = state;
             value.set_property(
                 "__w3cosEnqueue",
-                Value::function(move |_, args| {
+                realm_function(generation, move |_, args| {
                     let record = args.first().cloned().unwrap_or_default();
                     enqueue_state.borrow_mut().pending.push(record);
                     schedule_mutation_delivery(&enqueue_state);
@@ -859,7 +865,8 @@ fn schedule_mutation_delivery(state: &Rc<RefCell<MutationObserverState>>) {
     }
     state.borrow_mut().scheduled = true;
     let delivery = Rc::clone(state);
-    crate::jsdom::queue_microtask_value(Value::function(move |_, _| {
+    let generation = crate::jsdom::realm_generation();
+    crate::jsdom::queue_microtask_value(realm_function(generation, move |_, _| {
         let (callback, observer, records) = {
             let mut state = delivery.borrow_mut();
             state.scheduled = false;
@@ -1169,7 +1176,8 @@ fn schedule_intersection_delivery(state: &Rc<RefCell<IntersectionObserverState>>
     }
     state.borrow_mut().scheduled = true;
     let delivery = Rc::clone(state);
-    crate::jsdom::queue_microtask_value(Value::function(move |_, _| {
+    let generation = crate::jsdom::realm_generation();
+    crate::jsdom::queue_microtask_value(realm_function(generation, move |_, _| {
         let (callback, observer, records) = {
             let mut state = delivery.borrow_mut();
             state.scheduled = false;
@@ -1254,8 +1262,9 @@ pub fn intersection_observer_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
+        let generation = crate::jsdom::realm_generation();
         let class = finish_class_with_members(
-            Value::function(|_, args| {
+            realm_function(generation, move |_, args| {
                 let callback = args.first().cloned().unwrap_or_default();
                 if !callback.is_function() {
                     w3cos_core::throw_value(w3cos_core::error_instance(
@@ -1364,7 +1373,7 @@ pub fn intersection_observer_class() -> Value {
                 let observe_state = Rc::clone(&state);
                 value.set_property(
                     "observe",
-                    Value::function(move |_, args| {
+                    realm_function(generation, move |_, args| {
                         let Some(target) = args.first().and_then(crate::jsdom::node_id_of) else {
                             w3cos_core::throw_value(w3cos_core::error_instance(
                                 "TypeError",
@@ -1384,7 +1393,7 @@ pub fn intersection_observer_class() -> Value {
                 let unobserve_state = Rc::clone(&state);
                 value.set_property(
                     "unobserve",
-                    Value::function(move |_, args| {
+                    realm_function(generation, move |_, args| {
                         if let Some(target) = args.first().and_then(crate::jsdom::node_id_of) {
                             unobserve_state.borrow_mut().targets.remove(&target);
                         }
@@ -1394,7 +1403,7 @@ pub fn intersection_observer_class() -> Value {
                 let disconnect_state = Rc::clone(&state);
                 value.set_property(
                     "disconnect",
-                    Value::function(move |_, _| {
+                    realm_function(generation, move |_, _| {
                         let mut state = disconnect_state.borrow_mut();
                         state.targets.clear();
                         state.pending.clear();
@@ -1404,7 +1413,7 @@ pub fn intersection_observer_class() -> Value {
                 let records_state = state;
                 value.set_property(
                     "takeRecords",
-                    Value::function(move |_, _| {
+                    realm_function(generation, move |_, _| {
                         Value::array(std::mem::take(&mut records_state.borrow_mut().pending))
                     }),
                 );
@@ -1435,8 +1444,9 @@ pub fn performance_observer_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
+        let generation = crate::jsdom::realm_generation();
         let class = finish_class_with_members(
-            Value::function(|_, args| {
+            realm_function(generation, move |_, args| {
                 let callback = args.first().cloned().unwrap_or_default();
                 let value = Value::object(HashMap::new());
                 let state = Rc::new(RefCell::new(PerformanceObserverState {
@@ -1453,7 +1463,7 @@ pub fn performance_observer_class() -> Value {
                 let observe_state = Rc::clone(&state);
                 value.set_property(
                     "observe",
-                    Value::function(move |_, args| {
+                    realm_function(generation, move |_, args| {
                         let options = args.first().cloned().unwrap_or_default();
                         let entry_types = options.get_property("entryTypes");
                         let single_type = options.get_property("type");
@@ -1509,7 +1519,7 @@ pub fn performance_observer_class() -> Value {
                 let disconnect_state = Rc::clone(&state);
                 value.set_property(
                     "disconnect",
-                    Value::function(move |_, _| {
+                    realm_function(generation, move |_, _| {
                         let mut state = disconnect_state.borrow_mut();
                         state.active = false;
                         state.entry_types.clear();
@@ -1520,7 +1530,7 @@ pub fn performance_observer_class() -> Value {
                 let take_state = state;
                 value.set_property(
                     "takeRecords",
-                    Value::function(move |_, _| {
+                    realm_function(generation, move |_, _| {
                         Value::array(std::mem::take(&mut take_state.borrow_mut().pending))
                     }),
                 );
@@ -1572,8 +1582,9 @@ pub fn performance_entry_class(name: &'static str) -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
+        let generation = crate::jsdom::realm_generation();
         let class = if name == "PerformanceMark" {
-            finish_class(Value::function(|_, args| {
+            finish_class(realm_function(generation, move |_, args| {
                 if args.is_empty() {
                     w3cos_core::throw_value(w3cos_core::error_instance(
                         "TypeError",
@@ -1611,7 +1622,7 @@ pub fn performance_entry_class(name: &'static str) -> Value {
                 })
             }))
         } else {
-            finish_class(Value::function(move |_, _| {
+            finish_class(realm_function(generation, move |_, _| {
                 w3cos_core::throw_value(w3cos_core::error_instance(
                     "TypeError",
                     vec![Value::string(&format!("{name} is not constructible"))],
@@ -1648,8 +1659,9 @@ pub fn performance_timeline_class(name: &'static str) -> Value {
         let Some((parent, members)) = performance_timeline_spec(name) else {
             return Value::Undefined;
         };
+        let generation = crate::jsdom::realm_generation();
         let class = finish_class_with_members(
-            Value::function(move |_, _| {
+            realm_function(generation, move |_, _| {
                 w3cos_core::throw_value(w3cos_core::error_instance(
                     "TypeError",
                     vec![Value::string(&format!("{name} is not constructible"))],
@@ -1671,7 +1683,9 @@ pub fn performance_timeline_class(name: &'static str) -> Value {
         if members.contains(&"toJSON") {
             prototype.set_property(
                 "toJSON",
-                Value::function(move |this, _| performance_snapshot_json(&this, name)),
+                realm_function(generation, move |this, _| {
+                    performance_snapshot_json(&this, name)
+                }),
             );
         }
         classes.borrow_mut().insert(name.to_string(), class.clone());
@@ -1800,7 +1814,8 @@ pub fn performance_long_task_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = finish_class(Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = finish_class(realm_function(generation, |_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string(
@@ -1816,7 +1831,7 @@ pub fn performance_long_task_class() -> Value {
         prototype.set_property("attribution", Value::Undefined);
         prototype.set_property(
             "toJSON",
-            Value::function(|this, _| {
+            realm_function(generation, |this, _| {
                 Value::object(HashMap::from([
                     ("name".into(), this.get_property("name")),
                     ("entryType".into(), this.get_property("entryType")),
@@ -1836,7 +1851,8 @@ pub fn task_attribution_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = finish_class(Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = finish_class(realm_function(generation, |_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string("TaskAttributionTiming is not constructible")],
@@ -1857,7 +1873,7 @@ pub fn task_attribution_class() -> Value {
         }
         prototype.set_property(
             "toJSON",
-            Value::function(|this, _| {
+            realm_function(generation, |this, _| {
                 Value::object(HashMap::from([
                     ("name".into(), this.get_property("name")),
                     ("entryType".into(), this.get_property("entryType")),
@@ -1880,7 +1896,8 @@ pub fn visibility_state_entry_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = finish_class(Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = finish_class(realm_function(generation, |_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string("VisibilityStateEntry is not constructible")],
@@ -1901,6 +1918,7 @@ pub fn visibility_state_entry_class() -> Value {
 }
 
 fn task_attribution_value(attribution: &TaskAttribution) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::from([
         ("name".into(), Value::string(&attribution.name)),
         ("entryType".into(), Value::string("taskattribution")),
@@ -1925,7 +1943,7 @@ fn task_attribution_value(attribution: &TaskAttribution) -> Value {
     ]));
     value.set_property(
         "toJSON",
-        Value::function(|this, _| {
+        realm_function(generation, |this, _| {
             Value::object(HashMap::from([
                 ("name".into(), this.get_property("name")),
                 ("entryType".into(), this.get_property("entryType")),
@@ -1949,7 +1967,8 @@ pub fn performance_entry_list_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = finish_class(Value::function(|_, _| {
+        let generation = crate::jsdom::realm_generation();
+        let class = finish_class(realm_function(generation, |_, _| {
             w3cos_core::throw_value(w3cos_core::error_instance(
                 "TypeError",
                 vec![Value::string(
@@ -1958,9 +1977,10 @@ pub fn performance_entry_list_class() -> Value {
             ))
         }));
         for method in ["getEntries", "getEntriesByName", "getEntriesByType"] {
-            class
-                .get_property("prototype")
-                .set_property(method, Value::function(|_, _| Value::array(vec![])));
+            class.get_property("prototype").set_property(
+                method,
+                realm_function(generation, |_, _| Value::array(vec![])),
+            );
         }
         *slot.borrow_mut() = Some(class.clone());
         class
@@ -1968,6 +1988,7 @@ pub fn performance_entry_list_class() -> Value {
 }
 
 fn performance_entry_value(entry: &PerformanceEntry) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::from([
         ("name".to_string(), Value::string(&entry.name)),
         ("entryType".to_string(), Value::string(&entry.entry_type)),
@@ -1988,7 +2009,7 @@ fn performance_entry_value(entry: &PerformanceEntry) -> Value {
     }
     value.set_property(
         "toJSON",
-        Value::function(|this, _| {
+        realm_function(generation, |this, _| {
             let result = Value::object(HashMap::from([
                 ("name".to_string(), this.get_property("name")),
                 ("entryType".to_string(), this.get_property("entryType")),
@@ -2021,17 +2042,20 @@ fn performance_entry_value(entry: &PerformanceEntry) -> Value {
 }
 
 fn performance_entry_list(entries: Vec<Value>) -> Value {
+    let generation = crate::jsdom::realm_generation();
     let all = Rc::new(entries);
     let value = Value::object(HashMap::new());
     let all_entries = Rc::clone(&all);
     value.set_property(
         "getEntries",
-        Value::function(move |_, _| Value::array(all_entries.as_ref().clone())),
+        realm_function(generation, move |_, _| {
+            Value::array(all_entries.as_ref().clone())
+        }),
     );
     let named_entries = Rc::clone(&all);
     value.set_property(
         "getEntriesByName",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let name = args.first().map(Value::to_js_string).unwrap_or_default();
             let kind = args.get(1).map(Value::to_js_string);
             Value::array(
@@ -2051,7 +2075,7 @@ fn performance_entry_list(entries: Vec<Value>) -> Value {
     let typed_entries = all;
     value.set_property(
         "getEntriesByType",
-        Value::function(move |_, args| {
+        realm_function(generation, move |_, args| {
             let kind = args.first().map(Value::to_js_string).unwrap_or_default();
             Value::array(
                 typed_entries
@@ -2078,7 +2102,8 @@ fn schedule_performance_delivery(state: &Rc<RefCell<PerformanceObserverState>>) 
         state.scheduled = true;
     }
     let delivery_state = Rc::clone(state);
-    crate::jsdom::queue_microtask_value(Value::function(move |_, _| {
+    let generation = crate::jsdom::realm_generation();
+    crate::jsdom::queue_microtask_value(realm_function(generation, move |_, _| {
         let (callback, observer, entries) = {
             let mut state = delivery_state.borrow_mut();
             state.scheduled = false;
@@ -2312,19 +2337,99 @@ pub fn performance_clear(entry_type: &str, name: Option<&str>) {
 
 pub fn reset_performance_timeline() {
     PERFORMANCE_ENTRIES.with(|entries| entries.borrow_mut().clear());
-    PERFORMANCE_OBSERVERS.with(|observers| observers.borrow_mut().clear());
+    PERFORMANCE_OBSERVERS.with(|observers| {
+        for state in observers.borrow_mut().drain(..) {
+            let mut state = state.borrow_mut();
+            state.callback = Value::Undefined;
+            state.entry_types.clear();
+            state.pending.clear();
+            state.active = false;
+            state.scheduled = false;
+            for method in ["observe", "disconnect", "takeRecords"] {
+                state.observer.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    for slot in [
+        &PERFORMANCE_CLASS,
+        &PERFORMANCE_ENTRY_CLASS,
+        &PERFORMANCE_MARK_CLASS,
+        &PERFORMANCE_MEASURE_CLASS,
+        &PERFORMANCE_LONG_TASK_CLASS,
+        &TASK_ATTRIBUTION_CLASS,
+        &VISIBILITY_STATE_CLASS,
+        &PERFORMANCE_ENTRY_LIST_CLASS,
+    ] {
+        slot.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+    PERFORMANCE_TIMELINE_CLASSES.with(|classes| classes.borrow_mut().clear());
+    NAVIGATION_DIAGNOSTIC_CLASSES.with(|classes| classes.borrow_mut().clear());
 }
 
 pub fn reset_mutation_observers() {
-    MUTATION_OBSERVERS.with(|observers| observers.borrow_mut().clear());
+    MUTATION_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    MUTATION_RECORD_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    MUTATION_OBSERVERS.with(|observers| {
+        for state in observers.borrow_mut().drain(..) {
+            let mut state = state.borrow_mut();
+            state.callback = Value::Undefined;
+            state.observations.clear();
+            state.pending.clear();
+            state.scheduled = false;
+            for method in ["observe", "disconnect", "takeRecords", "__w3cosEnqueue"] {
+                state.observer.set_property(method, Value::Undefined);
+            }
+        }
+    });
 }
 
 pub fn reset_intersection_observers() {
-    INTERSECTION_OBSERVERS.with(|observers| observers.borrow_mut().clear());
+    INTERSECTION_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    INTERSECTION_ENTRY_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    INTERSECTION_OBSERVERS.with(|observers| {
+        for state in observers.borrow_mut().drain(..) {
+            let mut state = state.borrow_mut();
+            state.callback = Value::Undefined;
+            state.targets.clear();
+            state.pending.clear();
+            state.scheduled = false;
+            for method in ["observe", "unobserve", "disconnect", "takeRecords"] {
+                state.observer.set_property(method, Value::Undefined);
+            }
+        }
+    });
 }
 
 pub fn reset_resize_observers() {
-    DOM_RESIZE_OBSERVERS.with(|observers| observers.borrow_mut().clear());
+    RESIZE_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    RESIZE_ENTRY_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    RESIZE_SIZE_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    DOM_RESIZE_OBSERVERS.with(|observers| {
+        for state in observers.borrow_mut().drain(..) {
+            let mut state = state.borrow_mut();
+            state.callback = Value::Undefined;
+            state.targets.clear();
+            for method in ["observe", "unobserve", "disconnect"] {
+                state.observer.set_property(method, Value::Undefined);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2943,6 +3048,118 @@ mod tests {
                 .get_property("length")
                 .to_u32(),
             0
+        );
+    }
+
+    #[test]
+    fn page_observers_and_pending_deliveries_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_resize_class = resize_observer_class();
+        let old_resize_entry_class = resize_observer_entry_class();
+        let old_mutation_class = mutation_observer_class();
+        let old_intersection_class = intersection_observer_class();
+        let callback_count = Rc::new(RefCell::new(0_u32));
+        let callback_count_for_observer = Rc::clone(&callback_count);
+        let mutation = w3cos_core::class::construct(
+            &old_mutation_class,
+            vec![Value::function(move |_, _| {
+                *callback_count_for_observer.borrow_mut() += 1;
+                Value::Undefined
+            })],
+        );
+        mutation.call_method("__w3cosEnqueue", vec![Value::object(HashMap::new())]);
+        let resize = w3cos_core::class::construct(
+            &old_resize_class,
+            vec![Value::function(|_, _| Value::Undefined)],
+        );
+        let intersection = w3cos_core::class::construct(
+            &old_intersection_class,
+            vec![Value::function(|_, _| Value::Undefined)],
+        );
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        assert_eq!(crate::jsdom::drain_microtasks(), 0);
+        assert_eq!(*callback_count.borrow(), 0);
+        assert!(!old_resize_class.strict_eq(&resize_observer_class()));
+        assert!(!old_resize_entry_class.strict_eq(&resize_observer_entry_class()));
+        assert!(!old_mutation_class.strict_eq(&mutation_observer_class()));
+        assert!(!old_intersection_class.strict_eq(&intersection_observer_class()));
+        assert!(
+            old_resize_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(
+            old_mutation_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(
+            old_intersection_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(resize.call_method("observe", vec![]).is_undefined());
+        assert!(mutation.call_method("takeRecords", vec![]).is_undefined());
+        assert!(intersection.call_method("observe", vec![]).is_undefined());
+    }
+
+    #[test]
+    fn performance_timeline_and_pending_delivery_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let old_observer_class = performance_observer_class();
+        let old_mark_class = performance_entry_class("PerformanceMark");
+        let old_timeline_class = performance_timeline_class("PerformanceResourceTiming");
+        let old_diagnostic_class = navigation_diagnostic_class("NotRestoredReasons");
+        let callback_count = Rc::new(RefCell::new(0_u32));
+        let callback_count_for_observer = Rc::clone(&callback_count);
+        let observer = w3cos_core::class::construct(
+            &old_observer_class,
+            vec![Value::function(move |_, _| {
+                *callback_count_for_observer.borrow_mut() += 1;
+                Value::Undefined
+            })],
+        );
+        observer.call_method(
+            "observe",
+            vec![Value::object(HashMap::from([(
+                "type".into(),
+                Value::string("mark"),
+            )]))],
+        );
+        let old_entry = performance_mark(&[Value::string("old-page")], 1.0);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        assert_eq!(crate::jsdom::drain_microtasks(), 0);
+        assert_eq!(*callback_count.borrow(), 0);
+        assert!(!old_observer_class.strict_eq(&performance_observer_class()));
+        assert!(!old_mark_class.strict_eq(&performance_entry_class("PerformanceMark")));
+        assert!(
+            !old_timeline_class.strict_eq(&performance_timeline_class("PerformanceResourceTiming"))
+        );
+        assert!(
+            !old_diagnostic_class.strict_eq(&navigation_diagnostic_class("NotRestoredReasons"))
+        );
+        assert!(
+            old_observer_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+        assert!(
+            old_mark_class
+                .call(Value::Undefined, vec![Value::string("stale")])
+                .is_undefined()
+        );
+        assert!(observer.call_method("takeRecords", vec![]).is_undefined());
+        assert!(old_entry.call_method("toJSON", vec![]).is_undefined());
+        assert!(
+            performance_entry_class("PerformanceMark")
+                .call(Value::Undefined, vec![Value::string("current")])
+                .is_object()
         );
     }
 }

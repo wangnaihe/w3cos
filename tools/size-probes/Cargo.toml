@@ -1,0 +1,22 @@
+[package]
+name = "w3cos-size-probes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Linkage probes for reproducible W3COS AOT and dynamic-browser size reports"
+
+[features]
+browser = ["w3cos-runtime/dynamic-js"]
+
+[dependencies]
+w3cos-core = { workspace = true }
+w3cos-runtime = { workspace = true, default-features = false }
+
+[[bin]]
+name = "w3cos-aot-size-probe"
+path = "src/aot.rs"
+
+[[bin]]
+name = "w3cos-browser-size-probe"
+path = "src/browser.rs"
+required-features = ["browser"]

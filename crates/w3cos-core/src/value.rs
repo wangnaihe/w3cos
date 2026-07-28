@@ -3,7 +3,11 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::ops::{Deref, Index, IndexMut};
 use std::rc::{Rc, Weak};
+use std::slice::SliceIndex;
+
+use crate::heap::{HeapAllocation, HeapKind};
 
 /// JavaScript-compatible dynamic value type.
 ///
@@ -17,9 +21,240 @@ pub enum Value {
     Bool(bool),
     Number(f64),
     String(String),
-    Array(Rc<RefCell<Vec<Value>>>),
+    Array(Rc<RefCell<ArrayStorage>>),
     Object(Rc<RefCell<crate::JsObject>>),
     Function(JsFunction),
+}
+
+/// Shared backing storage for [`Value::Array`].
+///
+/// Construction remains centralized through [`Value::array`] so heap
+/// accounting cannot be bypassed.
+pub struct ArrayStorage {
+    values: Vec<Value>,
+    allocation: HeapAllocation,
+}
+
+impl ArrayStorage {
+    fn new(values: Vec<Value>) -> Self {
+        let allocation = HeapAllocation::new(
+            HeapKind::Array,
+            std::mem::size_of::<Self>().saturating_add(
+                values
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            ),
+        );
+        Self { values, allocation }
+    }
+
+    pub(crate) fn refresh_heap_accounting(&self) {
+        self.allocation.set_bytes(
+            std::mem::size_of::<Self>().saturating_add(
+                self.values
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            ),
+        );
+    }
+
+    pub fn replace_values(&mut self, values: Vec<Value>) {
+        self.values = values;
+        self.refresh_heap_accounting();
+    }
+
+    pub(crate) fn push(&mut self, value: Value) {
+        self.values.push(value);
+        self.refresh_heap_accounting();
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<Value> {
+        self.values.pop()
+    }
+
+    pub(crate) fn remove(&mut self, index: usize) -> Value {
+        self.values.remove(index)
+    }
+
+    pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
+        self.values.split_off(at)
+    }
+
+    pub(crate) fn resize_with(&mut self, new_len: usize, f: impl FnMut() -> Value) {
+        self.values.resize_with(new_len, f);
+        self.refresh_heap_accounting();
+    }
+
+    pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
+        self.values.get_mut(index)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.values.clear();
+    }
+
+    pub(crate) fn reverse(&mut self) {
+        self.values.reverse();
+    }
+}
+
+impl Deref for ArrayStorage {
+    type Target = Vec<Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl Extend<Value> for ArrayStorage {
+    fn extend<T: IntoIterator<Item = Value>>(&mut self, iter: T) {
+        self.values.extend(iter);
+        self.refresh_heap_accounting();
+    }
+}
+
+impl<I> Index<I> for ArrayStorage
+where
+    I: SliceIndex<[Value]>,
+{
+    type Output = I::Output;
+
+    fn index(&self, index: I) -> &Self::Output {
+        &self.values[index]
+    }
+}
+
+impl<I> IndexMut<I> for ArrayStorage
+where
+    I: SliceIndex<[Value]>,
+{
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        &mut self.values[index]
+    }
+}
+
+impl fmt::Debug for ArrayStorage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.values.fmt(formatter)
+    }
+}
+
+thread_local! {
+    /// Internal ECMAScript empty-slot marker. It is identity-based and never
+    /// exposed through property reads or iteration.
+    static ARRAY_HOLE: Value =
+        Value::Object(Rc::new(RefCell::new(crate::JsObject::new())));
+}
+
+pub(crate) fn array_hole() -> Value {
+    ARRAY_HOLE.with(Clone::clone)
+}
+
+pub(crate) fn is_array_hole(value: &Value) -> bool {
+    ARRAY_HOLE.with(|hole| match (value, hole) {
+        (Value::Object(value), Value::Object(hole)) => Rc::ptr_eq(value, hole),
+        _ => false,
+    })
+}
+
+pub(crate) fn array_slot_value(value: Value) -> Value {
+    if is_array_hole(&value) {
+        Value::Undefined
+    } else {
+        value
+    }
+}
+
+fn function_heap_bytes(props: &HashMap<String, Value>) -> usize {
+    std::mem::size_of::<JsFunction>()
+        .saturating_add(
+            props
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Value)>()),
+        )
+        .saturating_add(
+            props
+                .keys()
+                .map(String::capacity)
+                .fold(0usize, usize::saturating_add),
+        )
+}
+
+pub struct ValueIterator {
+    inner: Box<dyn Iterator<Item = Value>>,
+}
+
+struct LiveArrayIterator {
+    values: Rc<RefCell<ArrayStorage>>,
+    index: usize,
+}
+
+struct ProtocolValueIterator {
+    iterator: Value,
+    done: bool,
+}
+
+impl Iterator for ProtocolValueIterator {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let result = self.iterator.call_method("__w3cos_iterator_next", vec![]);
+        if result.get_property("done").to_bool() {
+            self.done = true;
+            None
+        } else {
+            Some(result.get_property("value"))
+        }
+    }
+}
+
+impl Iterator for LiveArrayIterator {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = self.values.borrow().get(self.index).cloned()?;
+        self.index += 1;
+        Some(array_slot_value(value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.values.borrow().len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ValueIterator {
+    pub(crate) fn new(iterator: impl Iterator<Item = Value> + 'static) -> Self {
+        Self {
+            inner: Box::new(iterator),
+        }
+    }
+
+    fn boxed(iterator: Box<dyn Iterator<Item = Value>>) -> Self {
+        Self { inner: iterator }
+    }
+
+    /// Number of currently remaining values. Live collection iterators may
+    /// grow after this observation when their backing Array/Map/Set is mutated.
+    pub fn len(&self) -> usize {
+        let (lower, upper) = self.inner.size_hint();
+        upper.filter(|upper| *upper == lower).unwrap_or(lower)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Iterator for ValueIterator {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
 }
 
 impl PartialEq for Value {
@@ -45,11 +280,13 @@ pub struct JsFunction {
     /// `id.toString = () => name` (monaco's service decorators), static
     /// methods installed on constructor functions, etc.
     props: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+    allocation: Rc<HeapAllocation>,
 }
 
 pub(crate) struct WeakJsFunction {
     inner: Weak<dyn Fn(Value, Vec<Value>) -> Value>,
     props: Weak<RefCell<std::collections::HashMap<String, Value>>>,
+    allocation: Weak<HeapAllocation>,
 }
 
 impl JsFunction {
@@ -60,9 +297,14 @@ impl JsFunction {
         // Libraries install methods on constructor prototypes before
         // constructing instances.
         props.insert("prototype".to_string(), Value::object(HashMap::new()));
+        let allocation = Rc::new(HeapAllocation::new(
+            HeapKind::Function,
+            function_heap_bytes(&props),
+        ));
         Self {
             inner: Rc::new(f),
             props: Rc::new(RefCell::new(props)),
+            allocation,
         }
     }
 
@@ -90,7 +332,9 @@ impl JsFunction {
 
     /// Assign a property on the function object.
     pub fn set_property(&self, key: &str, value: Value) {
-        self.props.borrow_mut().insert(key.to_string(), value);
+        let mut props = self.props.borrow_mut();
+        props.insert(key.to_string(), value);
+        self.allocation.set_bytes(function_heap_bytes(&props));
     }
 
     /// A stable identity address for this function value (clones of the same
@@ -109,6 +353,7 @@ impl JsFunction {
         WeakJsFunction {
             inner: Rc::downgrade(&self.inner),
             props: Rc::downgrade(&self.props),
+            allocation: Rc::downgrade(&self.allocation),
         }
     }
 }
@@ -118,6 +363,7 @@ impl WeakJsFunction {
         Some(JsFunction {
             inner: self.inner.upgrade()?,
             props: self.props.upgrade()?,
+            allocation: self.allocation.upgrade()?,
         })
     }
 }
@@ -263,7 +509,17 @@ impl Value {
             }
             Value::String(s) => s.clone(),
             Value::Array(arr) => {
-                let elems: Vec<String> = arr.borrow().iter().map(|v| v.to_js_string()).collect();
+                let elems: Vec<String> = arr
+                    .borrow()
+                    .iter()
+                    .map(|value| {
+                        if is_array_hole(value) || value.is_nullish() {
+                            String::new()
+                        } else {
+                            value.to_js_string()
+                        }
+                    })
+                    .collect();
                 elems.join(",")
             }
             Value::Object(_) => {
@@ -315,6 +571,13 @@ impl Value {
     pub fn is_function(&self) -> bool {
         matches!(self, Value::Function(_))
     }
+    pub fn is_callable(&self) -> bool {
+        match self {
+            Value::Function(_) => true,
+            Value::Object(object) => object.borrow().call_slot().is_some(),
+            _ => false,
+        }
+    }
 
     /// ECMAScript `ToInt32`.
     pub fn to_i32(&self) -> i32 {
@@ -338,7 +601,11 @@ impl Value {
             Value::Object(o) => Value::Bool(o.borrow().has(&key)),
             Value::Array(arr) => {
                 if let Ok(idx) = key.parse::<usize>() {
-                    Value::Bool(idx < arr.borrow().len())
+                    Value::Bool(
+                        arr.borrow()
+                            .get(idx)
+                            .is_some_and(|value| !is_array_hole(value)),
+                    )
                 } else {
                     Value::Bool(false)
                 }
@@ -367,7 +634,11 @@ impl Value {
                     return value;
                 }
                 if let Ok(idx) = key.parse::<usize>() {
-                    arr.borrow().get(idx).cloned().unwrap_or(Value::Undefined)
+                    arr.borrow()
+                        .get(idx)
+                        .cloned()
+                        .map(array_slot_value)
+                        .unwrap_or(Value::Undefined)
                 } else if key == "length" {
                     Value::Number(arr.borrow().len() as f64)
                 } else {
@@ -460,7 +731,7 @@ impl Value {
                     }
                     let mut a = arr.borrow_mut();
                     if idx >= a.len() {
-                        a.resize(idx + 1, Value::Undefined);
+                        a.resize_with(idx + 1, array_hole);
                     }
                     a[idx] = value;
                 }
@@ -479,12 +750,17 @@ impl Value {
             Value::Array(array) => {
                 if let Ok(index) = key.parse::<usize>() {
                     if let Some(slot) = array.borrow_mut().get_mut(index) {
-                        *slot = Value::Undefined;
+                        *slot = array_hole();
                     }
                 }
                 true
             }
-            Value::Function(function) => function.props.borrow_mut().remove(key).is_some(),
+            Value::Function(function) => {
+                let mut props = function.props.borrow_mut();
+                props.remove(key);
+                function.allocation.set_bytes(function_heap_bytes(&props));
+                true
+            }
             _ => true,
         };
         Value::Bool(deleted)
@@ -505,7 +781,7 @@ impl Value {
     }
 
     pub fn array(items: Vec<Value>) -> Self {
-        Value::Array(Rc::new(RefCell::new(items)))
+        Value::Array(Rc::new(RefCell::new(ArrayStorage::new(items))))
     }
 
     pub fn object(props: HashMap<String, Value>) -> Self {
@@ -558,7 +834,112 @@ impl Value {
     /// Invoke a property as a method while preserving the JavaScript receiver.
     pub fn call_method(&self, key: &str, args: Vec<Value>) -> Value {
         if key == "__w3cos_symbol_iterator" {
-            return iterator_object(self.iter().collect());
+            if let Some(iterator) = acquire_custom_iterator(self, "__w3cos_symbol_iterator", args) {
+                return iterator;
+            }
+            return iterator_object(self.iter());
+        }
+        if key == "__w3cos_symbol_async_iterator" {
+            if let Some(iterator) =
+                acquire_custom_iterator(self, "__w3cos_symbol_async_iterator", args.clone())
+            {
+                return iterator;
+            }
+            return self.call_method("__w3cos_symbol_iterator", args);
+        }
+        if key == "__w3cos_iterator_next" {
+            let next = self.get_property("next");
+            if !next.is_callable() {
+                throw_value(type_error("iterator next method is not callable"));
+            }
+            let result = next.call(self.clone(), args);
+            if !is_iterator_object(&result) {
+                throw_value(type_error("iterator next method must return an object"));
+            }
+            return result;
+        }
+        if key == "__w3cos_async_iterator_next" {
+            let next = self.get_property("next");
+            if !next.is_callable() {
+                throw_value(type_error("iterator next method is not callable"));
+            }
+            let result = next.call(self.clone(), args);
+            return crate::promise::resolve(vec![result]).call_method(
+                "then",
+                vec![Value::function(|_, args| {
+                    let result = args.first().cloned().unwrap_or(Value::Undefined);
+                    if !is_iterator_object(&result) {
+                        throw_value(type_error("iterator next method must return an object"));
+                    }
+                    result
+                })],
+            );
+        }
+        if key == "__w3cos_iterator_close_return" {
+            if let Some(exception) = close_iterator_chain(self, None) {
+                throw_value(exception);
+            }
+            return Value::Undefined;
+        }
+        if key == "__w3cos_iterator_close_throw" {
+            let pending = args.first().cloned().unwrap_or(Value::Undefined);
+            return close_iterator_chain(self, Some(pending.clone())).unwrap_or(pending);
+        }
+        if key == "__w3cos_async_iterator_close_return" {
+            return close_async_iterator_chain(self, None, false);
+        }
+        if key == "__w3cos_async_iterator_close_throw" {
+            let pending = args.first().cloned().unwrap_or(Value::Undefined);
+            return close_async_iterator_chain(self, Some(pending), true);
+        }
+        if key == "__w3cos_for_in_keys" {
+            return crate::intrinsics::for_in_keys(self);
+        }
+        if key == "__w3cos_super_ctor" {
+            let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+            return crate::class::super_ctor(&receiver, self, args.into_iter().skip(1).collect());
+        }
+        if key == "__w3cos_super_method" {
+            let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+            let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
+            return crate::class::super_method(
+                &receiver,
+                self,
+                &name,
+                args.into_iter().skip(2).collect(),
+            );
+        }
+        if key == "__w3cos_super_get" {
+            let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+            let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
+            return crate::class::super_get(&receiver, self, &name);
+        }
+        if key == "__w3cos_super_set" {
+            let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+            let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
+            let value = args.get(2).cloned().unwrap_or(Value::Undefined);
+            return crate::class::super_set(&receiver, self, &name, value);
+        }
+        if key == "__w3cos_static_super_method" {
+            let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+            let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
+            return crate::class::static_super_method(
+                &receiver,
+                self,
+                &name,
+                args.into_iter().skip(2).collect(),
+            );
+        }
+        if key == "__w3cos_static_super_get" {
+            let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+            let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
+            return crate::class::static_super_get(&receiver, self, &name);
+        }
+        if key == "__w3cos_static_super_set" {
+            let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+            let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
+            let value = args.get(2).cloned().unwrap_or(Value::Undefined);
+            return crate::class::static_super_set(&receiver, self, &name, value);
         }
         if key == "hasOwnProperty" {
             let property = args
@@ -570,9 +951,12 @@ impl Value {
                 Value::Object(object) => object.borrow().properties.contains_key(&property),
                 Value::Array(values) => {
                     property == "length"
-                        || property
-                            .parse::<usize>()
-                            .is_ok_and(|index| index < values.borrow().len())
+                        || property.parse::<usize>().is_ok_and(|index| {
+                            values
+                                .borrow()
+                                .get(index)
+                                .is_some_and(|value| !is_array_hole(value))
+                        })
                 }
                 Value::Function(function) => function.has_own_property(&property),
                 _ => false,
@@ -596,7 +980,12 @@ impl Value {
             (Value::Function(_), "apply") => {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 let applied_args = match args.get(1) {
-                    Some(Value::Array(values)) => values.borrow().clone(),
+                    Some(Value::Array(values)) => values
+                        .borrow()
+                        .iter()
+                        .cloned()
+                        .map(array_slot_value)
+                        .collect(),
                     _ => Vec::new(),
                 };
                 return self.call(this_arg, applied_args);
@@ -829,6 +1218,9 @@ impl Value {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, value)| {
+                        if is_array_hole(value) {
+                            return None;
+                        }
                         predicate
                             .call(
                                 Value::Undefined,
@@ -870,6 +1262,9 @@ impl Value {
             (Value::Array(values), "forEach") => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 for (index, value) in values.borrow().iter().cloned().enumerate() {
+                    if is_array_hole(&value) {
+                        continue;
+                    }
                     callback.call(
                         Value::Undefined,
                         vec![value, Value::Number(index as f64), self.clone()],
@@ -882,23 +1277,68 @@ impl Value {
         self.get_property(key).call(self.clone(), args)
     }
 
-    pub fn iter(&self) -> std::vec::IntoIter<Value> {
+    pub fn is_iterable(&self) -> bool {
+        if !self.get_property("__w3cos_symbol_iterator").is_undefined() {
+            return true;
+        }
+        if crate::binary::typed_array_value_iterator(self).is_some() {
+            return true;
+        }
         match self {
-            Value::Array(values) => values.borrow().clone().into_iter(),
+            Value::Array(_) | Value::String(_) => true,
+            Value::Object(object) => {
+                crate::collections::iter_collection(self).is_some()
+                    || object
+                        .borrow()
+                        .get_direct("__w3cosIterableSnapshot")
+                        .is_function()
+                    || self.get_property("_first").is_object()
+                    || object
+                        .borrow()
+                        .get_direct("__w3cosMapValuesSnapshot")
+                        .is_function()
+                    || matches!(
+                        object.borrow().get_direct("__w3cosMapValues"),
+                        Value::Array(_)
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    pub fn iter(&self) -> ValueIterator {
+        if let Some(iterator) = acquire_custom_iterator(self, "__w3cos_symbol_iterator", vec![]) {
+            return ValueIterator::new(ProtocolValueIterator {
+                iterator,
+                done: false,
+            });
+        }
+        if let Some(iterator) = crate::binary::typed_array_value_iterator(self) {
+            return iterator;
+        }
+        match self {
+            Value::Array(values) => ValueIterator::new(LiveArrayIterator {
+                values: Rc::clone(values),
+                index: 0,
+            }),
+            Value::String(value) => ValueIterator::new(
+                value
+                    .chars()
+                    .map(|character| Value::String(character.to_string()))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            ),
             // First use the standards-oriented Map/Set registry. Retain the
             // host runtime's snapshot hook as a fallback for its lightweight
             // built-in Map used by compiled application paths.
             Value::Object(object) => {
-                if let Some(values) = crate::binary::iter_typed_array(self) {
-                    return values.into_iter();
-                }
-                if let Some(values) = crate::collections::iter_collection(self) {
-                    return values.into_iter();
+                if let Some(iterator) = crate::collections::iter_collection(self) {
+                    return ValueIterator::boxed(iterator);
                 }
                 let iterable_snapshot = object.borrow().get_direct("__w3cosIterableSnapshot");
                 if iterable_snapshot.is_function() {
                     if let Value::Array(values) = iterable_snapshot.call(self.clone(), vec![]) {
-                        return values.borrow().clone().into_iter();
+                        return ValueIterator::new(values.borrow().clone().into_iter());
                     }
                 }
                 // Monaco's command registry stores commands in its own
@@ -921,7 +1361,7 @@ impl Value {
                         }
                         node = next;
                     }
-                    return values.into_iter();
+                    return ValueIterator::new(values.into_iter());
                 }
                 // The AOT lowering turns common `Map#forEach(value => ...)`
                 // loops into this iterator path. Map exposes a live values
@@ -933,24 +1373,20 @@ impl Value {
                     object.borrow().get_direct("__w3cosMapValues")
                 };
                 match values {
-                    Value::Array(values) => values.borrow().clone().into_iter(),
-                    _ => Vec::new().into_iter(),
+                    Value::Array(values) => ValueIterator::new(values.borrow().clone().into_iter()),
+                    _ => ValueIterator::new(Vec::new().into_iter()),
                 }
             }
-            _ => Vec::new().into_iter(),
+            _ => ValueIterator::new(Vec::new().into_iter()),
         }
     }
 }
 
-fn iterator_object(values: Vec<Value>) -> Value {
-    let values = Rc::new(values);
-    let index = Rc::new(RefCell::new(0usize));
-    let next_values = values.clone();
-    let next_index = index.clone();
+pub(crate) fn iterator_object(iterator: ValueIterator) -> Value {
+    let iterator = Rc::new(RefCell::new(iterator));
+    let next_iterator = Rc::clone(&iterator);
     let next = Value::function(move |_, _| {
-        let mut index = next_index.borrow_mut();
-        if let Some(value) = next_values.get(*index).cloned() {
-            *index += 1;
+        if let Some(value) = next_iterator.borrow_mut().next() {
             crate::js_object! {
                 "value" => value,
                 "done" => Value::Bool(false),
@@ -962,7 +1398,146 @@ fn iterator_object(values: Vec<Value>) -> Value {
             }
         }
     });
-    crate::js_object! { "next" => next }
+    let object = crate::js_object! { "next" => next };
+    let iterator = object.clone();
+    object.set_property(
+        "__w3cos_symbol_iterator",
+        Value::function(move |_, _| iterator.clone()),
+    );
+    object
+}
+
+fn acquire_custom_iterator(value: &Value, key: &str, args: Vec<Value>) -> Option<Value> {
+    let method = value.get_property(key);
+    if method.is_undefined() {
+        return None;
+    }
+    if !method.is_callable() {
+        throw_value(type_error("value's iterator method is not callable"));
+    }
+    let iterator = method.call(value.clone(), args);
+    if !is_iterator_object(&iterator) {
+        throw_value(type_error("iterator method must return an object"));
+    }
+    Some(iterator)
+}
+
+fn close_async_iterator_chain(
+    iterators: &Value,
+    pending_throw: Option<Value>,
+    return_pending: bool,
+) -> Value {
+    let completion = Rc::new(RefCell::new(pending_throw));
+    let mut chain = crate::promise::resolve(vec![Value::Undefined]);
+    for iterator in iterators.iter() {
+        let completion = Rc::clone(&completion);
+        chain = chain.call_method(
+            "then",
+            vec![Value::function(move |_, _| {
+                let return_method = iterator.get_property("return");
+                if return_method.is_undefined() {
+                    return Value::Undefined;
+                }
+                if !return_method.is_callable() {
+                    *completion.borrow_mut() =
+                        Some(type_error("iterator return method is not callable"));
+                    return Value::Undefined;
+                }
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    return_method.call(iterator.clone(), Vec::new())
+                }));
+                let result = match outcome {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        if completion.borrow().is_none() {
+                            *completion.borrow_mut() =
+                                Some(crate::promise::payload_to_value(payload));
+                        }
+                        return Value::Undefined;
+                    }
+                };
+                let fulfilled_completion = Rc::clone(&completion);
+                let on_fulfilled = Value::function(move |_, args| {
+                    let result = args.first().cloned().unwrap_or(Value::Undefined);
+                    if fulfilled_completion.borrow().is_none() && !is_iterator_object(&result) {
+                        *fulfilled_completion.borrow_mut() =
+                            Some(type_error("iterator return method must return an object"));
+                    }
+                    Value::Undefined
+                });
+                let rejected_completion = Rc::clone(&completion);
+                let on_rejected = Value::function(move |_, args| {
+                    if rejected_completion.borrow().is_none() {
+                        *rejected_completion.borrow_mut() =
+                            Some(args.first().cloned().unwrap_or(Value::Undefined));
+                    }
+                    Value::Undefined
+                });
+                crate::promise::resolve(vec![result])
+                    .call_method("then", vec![on_fulfilled, on_rejected])
+            })],
+        );
+    }
+    let completion = Rc::clone(&completion);
+    chain.call_method(
+        "then",
+        vec![Value::function(move |_, _| {
+            match completion.borrow().clone() {
+                Some(value) if return_pending => value,
+                Some(value) => throw_value(value),
+                None => Value::Undefined,
+            }
+        })],
+    )
+}
+
+fn is_iterator_object(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Object(_) | Value::Array(_) | Value::Function(_)
+    ) && crate::bigint::get(value).is_none()
+}
+
+pub(crate) fn type_error(message: &str) -> Value {
+    Value::object(HashMap::from([
+        ("name".into(), Value::string("TypeError")),
+        ("message".into(), Value::string(message)),
+    ]))
+}
+
+fn close_iterator_chain(iterators: &Value, mut throw_completion: Option<Value>) -> Option<Value> {
+    for iterator in iterators.iter() {
+        let return_method = iterator.get_property("return");
+        if return_method.is_undefined() {
+            continue;
+        }
+        if !return_method.is_callable() {
+            // GetMethod failures precede the completion-priority check in
+            // IteratorClose, so they replace even an existing throw.
+            throw_completion = Some(type_error("iterator return method is not callable"));
+            continue;
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            return_method.call(iterator.clone(), Vec::new())
+        }));
+        match outcome {
+            Ok(result) => {
+                if throw_completion.is_none() && !is_iterator_object(&result) {
+                    throw_completion =
+                        Some(type_error("iterator return method must return an object"));
+                }
+            }
+            Err(payload) => match payload.downcast::<PanicValue>() {
+                Ok(exception) => {
+                    if throw_completion.is_none() {
+                        throw_completion = Some(exception.0);
+                    }
+                }
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+        }
+    }
+    throw_completion
 }
 
 /// Normalize a JS array index argument (`undefined` → `default`; negatives
@@ -996,7 +1571,7 @@ fn string_index_to_byte(value: &str, index: usize) -> usize {
 /// for names the dedicated match arms in [`Value::call_method`] implement
 /// (`filter`/`push`/`forEach`) or don't cover at all.
 fn array_call_method(
-    values: &Rc<RefCell<Vec<Value>>>,
+    values: &Rc<RefCell<ArrayStorage>>,
     key: &str,
     args: Vec<Value>,
     this: &Value,
@@ -1007,19 +1582,22 @@ fn array_call_method(
     };
     Some(match key {
         "filter" | "push" | "forEach" | "set" => return None, // handled by dedicated arms
-        "pop" => values.borrow_mut().pop().unwrap_or(Value::Undefined),
+        "pop" => values
+            .borrow_mut()
+            .pop()
+            .map(array_slot_value)
+            .unwrap_or(Value::Undefined),
         "shift" => {
             if values.borrow().is_empty() {
                 Value::Undefined
             } else {
-                values.borrow_mut().remove(0)
+                array_slot_value(values.borrow_mut().remove(0))
             }
         }
         "unshift" => {
             let mut values = values.borrow_mut();
-            for (offset, item) in args.iter().enumerate() {
-                values.insert(offset, item.clone());
-            }
+            values.values.splice(0..0, args.iter().cloned());
+            values.refresh_heap_accounting();
             Value::Number(values.len() as f64)
         }
         "slice" => {
@@ -1050,7 +1628,13 @@ fn array_call_method(
                 .borrow()
                 .iter()
                 .enumerate()
-                .map(|(index, value)| f.call(Value::Undefined, callback_args(value, index)))
+                .map(|(index, value)| {
+                    if is_array_hole(value) {
+                        array_hole()
+                    } else {
+                        f.call(Value::Undefined, callback_args(value, index))
+                    }
+                })
                 .collect();
             Value::array(mapped)
         }
@@ -1061,10 +1645,11 @@ fn array_call_method(
                 .iter()
                 .enumerate()
                 .find(|(index, value)| {
-                    f.call(Value::Undefined, callback_args(value, *index))
+                    let value = array_slot_value((*value).clone());
+                    f.call(Value::Undefined, callback_args(&value, *index))
                         .to_bool()
                 })
-                .map(|(_, value)| value.clone())
+                .map(|(_, value)| array_slot_value(value.clone()))
                 .unwrap_or(Value::Undefined)
         }
         "findIndex" => {
@@ -1074,7 +1659,8 @@ fn array_call_method(
                 .iter()
                 .enumerate()
                 .find(|(index, value)| {
-                    f.call(Value::Undefined, callback_args(value, *index))
+                    let value = array_slot_value((*value).clone());
+                    f.call(Value::Undefined, callback_args(&value, *index))
                         .to_bool()
                 })
                 .map(|(index, _)| index as f64)
@@ -1083,23 +1669,38 @@ fn array_call_method(
         }
         "some" => {
             let f = arg(0);
-            let hit = values.borrow().iter().enumerate().any(|(index, value)| {
-                f.call(Value::Undefined, callback_args(value, index))
-                    .to_bool()
-            });
+            let hit = values
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| !is_array_hole(value))
+                .any(|(index, value)| {
+                    f.call(Value::Undefined, callback_args(value, index))
+                        .to_bool()
+                });
             Value::Bool(hit)
         }
         "every" => {
             let f = arg(0);
-            let all = values.borrow().iter().enumerate().all(|(index, value)| {
-                f.call(Value::Undefined, callback_args(value, index))
-                    .to_bool()
-            });
+            let all = values
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| !is_array_hole(value))
+                .all(|(index, value)| {
+                    f.call(Value::Undefined, callback_args(value, index))
+                        .to_bool()
+                });
             Value::Bool(all)
         }
         "includes" => {
             let needle = arg(0);
-            let hit = values.borrow().iter().any(|value| value.strict_eq(&needle));
+            let hit = values
+                .borrow()
+                .iter()
+                .cloned()
+                .map(array_slot_value)
+                .any(|value| value.strict_eq(&needle));
             Value::Bool(hit)
         }
         "indexOf" => {
@@ -1107,7 +1708,7 @@ fn array_call_method(
             let index = values
                 .borrow()
                 .iter()
-                .position(|value| value.strict_eq(&needle))
+                .position(|value| !is_array_hole(value) && value.strict_eq(&needle))
                 .map(|index| index as f64)
                 .unwrap_or(-1.0);
             Value::Number(index)
@@ -1117,7 +1718,7 @@ fn array_call_method(
             let index = values
                 .borrow()
                 .iter()
-                .rposition(|value| value.strict_eq(&needle))
+                .rposition(|value| !is_array_hole(value) && value.strict_eq(&needle))
                 .map(|index| index as f64)
                 .unwrap_or(-1.0);
             Value::Number(index)
@@ -1133,7 +1734,7 @@ fn array_call_method(
                     .borrow()
                     .iter()
                     .map(|value| {
-                        if value.is_nullish() {
+                        if is_array_hole(value) || value.is_nullish() {
                             String::new()
                         } else {
                             value.to_js_string()
@@ -1158,12 +1759,19 @@ fn array_call_method(
             let values = values.borrow();
             let (mut acc, start) = match args.get(1) {
                 Some(init) => (init.clone(), 0),
-                None => match values.first() {
-                    Some(first) => (first.clone(), 1),
+                None => match values
+                    .iter()
+                    .enumerate()
+                    .find(|(_, value)| !is_array_hole(value))
+                {
+                    Some((index, first)) => (first.clone(), index + 1),
                     None => return Some(Value::Undefined),
                 },
             };
             for (index, value) in values.iter().enumerate().skip(start) {
+                if is_array_hole(value) {
+                    continue;
+                }
                 acc = f.call(
                     Value::Undefined,
                     vec![
@@ -1181,12 +1789,20 @@ fn array_call_method(
             let values = values.borrow();
             let (mut acc, start) = match args.get(1) {
                 Some(init) => (init.clone(), values.len()),
-                None => match values.last() {
-                    Some(last) => (last.clone(), values.len().saturating_sub(1)),
+                None => match values
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, value)| !is_array_hole(value))
+                {
+                    Some((index, last)) => (last.clone(), index),
                     None => return Some(Value::Undefined),
                 },
             };
             for index in (0..start).rev() {
+                if is_array_hole(&values[index]) {
+                    continue;
+                }
                 acc = f.call(
                     Value::Undefined,
                     vec![
@@ -1203,6 +1819,9 @@ fn array_call_method(
             let comparator = args.first().cloned();
             let mut sorted = values.borrow().clone();
             sorted.sort_by(|left, right| match &comparator {
+                _ if is_array_hole(left) && is_array_hole(right) => std::cmp::Ordering::Equal,
+                _ if is_array_hole(left) => std::cmp::Ordering::Greater,
+                _ if is_array_hole(right) => std::cmp::Ordering::Less,
                 Some(f) if !f.is_undefined() => {
                     let order = f
                         .call(Value::Undefined, vec![left.clone(), right.clone()])
@@ -1211,7 +1830,9 @@ fn array_call_method(
                 }
                 _ => left.to_js_string().cmp(&right.to_js_string()),
             });
-            *values.borrow_mut() = sorted;
+            let mut values = values.borrow_mut();
+            values.values = sorted;
+            values.refresh_heap_accounting();
             this.clone()
         }
         "reverse" => {
@@ -1225,6 +1846,9 @@ fn array_call_method(
                 .unwrap_or(1);
             fn flatten(into: &mut Vec<Value>, items: &[Value], depth: usize) {
                 for item in items {
+                    if is_array_hole(item) {
+                        continue;
+                    }
                     match item {
                         Value::Array(inner) if depth > 0 => {
                             flatten(into, &inner.borrow(), depth - 1)
@@ -1241,6 +1865,9 @@ fn array_call_method(
             let f = arg(0);
             let mut out = Vec::new();
             for (index, value) in values.borrow().iter().enumerate() {
+                if is_array_hole(value) {
+                    continue;
+                }
                 match f.call(Value::Undefined, callback_args(value, index)) {
                     Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
                     other => out.push(other),
@@ -1251,7 +1878,11 @@ fn array_call_method(
         "at" => {
             let values = values.borrow();
             let index = array_index(args.first(), values.len(), values.len());
-            values.get(index).cloned().unwrap_or(Value::Undefined)
+            values
+                .get(index)
+                .cloned()
+                .map(array_slot_value)
+                .unwrap_or(Value::Undefined)
         }
         _ => return None,
     })
@@ -1642,6 +2273,65 @@ mod tests {
     }
 
     #[test]
+    fn sparse_array_slots_are_absent_but_iterate_as_undefined() {
+        let array = Value::array(vec![
+            Value::Number(1.0),
+            Value::Undefined,
+            Value::Number(3.0),
+        ]);
+        assert_eq!(array.delete_property("1"), Value::Bool(true));
+
+        assert_eq!(array.get_property("length"), Value::Number(3.0));
+        assert!(array.get_property("1").is_undefined());
+        assert_eq!(Value::string("1").js_in(&array), Value::Bool(false));
+        assert_eq!(
+            array.call_method("hasOwnProperty", vec![Value::string("1")]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            array.iter().collect::<Vec<_>>(),
+            vec![Value::Number(1.0), Value::Undefined, Value::Number(3.0)]
+        );
+        assert_eq!(array.to_js_string(), "1,,3");
+        assert_eq!(
+            crate::json::stringify(vec![array.clone()]),
+            Value::string("[1,null,3]")
+        );
+        assert_eq!(crate::builtins::object_keys(&array).to_js_string(), "0,2");
+        assert_eq!(crate::intrinsics::for_in_keys(&array).to_js_string(), "0,2");
+        let copied = Value::object(HashMap::new());
+        crate::intrinsics::copy_data_properties(&copied, &array);
+        assert_eq!(
+            copied.call_method("hasOwnProperty", vec![Value::string("1")]),
+            Value::Bool(false)
+        );
+        assert_eq!(copied.get_property("2"), Value::Number(3.0));
+
+        let visited = Rc::new(RefCell::new(Vec::new()));
+        let callback_visited = Rc::clone(&visited);
+        array.call_method(
+            "forEach",
+            vec![Value::function(move |_, arguments| {
+                callback_visited
+                    .borrow_mut()
+                    .push(arguments[1].to_number() as usize);
+                Value::Undefined
+            })],
+        );
+        assert_eq!(visited.borrow().as_slice(), &[0, 2]);
+
+        let mapped = array.call_method(
+            "map",
+            vec![Value::function(|_, arguments| arguments[0].clone())],
+        );
+        assert_eq!(Value::string("1").js_in(&mapped), Value::Bool(false));
+
+        array.set_property("5", Value::Number(6.0));
+        assert_eq!(array.get_property("length"), Value::Number(6.0));
+        assert_eq!(Value::string("4").js_in(&array), Value::Bool(false));
+    }
+
+    #[test]
     fn plain_objects_expose_has_own_property() {
         let object = crate::js_object! {
             "present" => Value::Undefined,
@@ -1945,6 +2635,291 @@ mod tests {
     }
 
     #[test]
+    fn aot_iter_uses_the_same_custom_iterator_protocol_as_dynamic_calls() {
+        let index = Rc::new(RefCell::new(0usize));
+        let next_index = Rc::clone(&index);
+        let iterator = crate::js_object! {
+            "next" => Value::function(move |_, _| {
+                let mut index = next_index.borrow_mut();
+                if *index < 2 {
+                    *index += 1;
+                    crate::js_object! {
+                        "value" => Value::Number(*index as f64),
+                        "done" => Value::Bool(false),
+                    }
+                } else {
+                    crate::js_object! {
+                        "value" => Value::Undefined,
+                        "done" => Value::Bool(true),
+                    }
+                }
+            }),
+        };
+        let custom_iterator = iterator.clone();
+        let iterable = crate::js_object! {
+            "__w3cos_symbol_iterator" => Value::function(move |_, _| {
+                custom_iterator.clone()
+            }),
+        };
+        assert_eq!(
+            iterable.iter().collect::<Vec<_>>(),
+            vec![Value::Number(1.0), Value::Number(2.0)]
+        );
+
+        let builtin_iterator = Value::array(vec![Value::string("a"), Value::string("b")])
+            .call_method("__w3cos_symbol_iterator", vec![]);
+        assert_eq!(
+            builtin_iterator.iter().collect::<Vec<_>>(),
+            vec![Value::string("a"), Value::string("b")]
+        );
+    }
+
+    #[test]
+    fn string_iterator_yields_unicode_code_points() {
+        let iterator = Value::string("A😀").call_method("__w3cos_symbol_iterator", vec![]);
+        assert_eq!(
+            iterator.call_method("next", vec![]).get_property("value"),
+            Value::string("A")
+        );
+        assert_eq!(
+            iterator.call_method("next", vec![]).get_property("value"),
+            Value::string("😀")
+        );
+        assert!(
+            iterator
+                .call_method("next", vec![])
+                .get_property("done")
+                .to_bool()
+        );
+    }
+
+    #[test]
+    fn array_aot_and_protocol_iterators_observe_live_length_changes() {
+        let array = Value::array(vec![Value::Number(1.0), Value::Number(2.0)]);
+        let mut aot = array.iter();
+        assert_eq!(aot.next(), Some(Value::Number(1.0)));
+        array.call_method("pop", vec![]);
+        array.call_method("push", vec![Value::Number(3.0), Value::Number(4.0)]);
+        assert_eq!(aot.len(), 2);
+        assert_eq!(aot.next(), Some(Value::Number(3.0)));
+        assert_eq!(aot.next(), Some(Value::Number(4.0)));
+        assert_eq!(aot.next(), None);
+
+        let protocol_array = Value::array(vec![Value::Number(10.0), Value::Number(20.0)]);
+        let iterator = protocol_array.call_method("__w3cos_symbol_iterator", vec![]);
+        assert_eq!(
+            iterator.call_method("next", vec![]).get_property("value"),
+            Value::Number(10.0)
+        );
+        protocol_array.call_method("pop", vec![]);
+        protocol_array.call_method("push", vec![Value::Number(30.0)]);
+        assert_eq!(
+            iterator.call_method("next", vec![]).get_property("value"),
+            Value::Number(30.0)
+        );
+        assert!(
+            iterator
+                .call_method("next", vec![])
+                .get_property("done")
+                .to_bool()
+        );
+    }
+
+    #[test]
+    fn typed_array_iterators_read_unvisited_values_from_shared_backing() {
+        let typed = crate::binary::typed_array_value(vec![Value::Number(1.0), Value::Number(2.0)]);
+        let mut aot = typed.iter();
+        assert_eq!(aot.next(), Some(Value::Number(1.0)));
+        typed.set_property("1", Value::Number(9.0));
+        assert_eq!(aot.next(), Some(Value::Number(9.0)));
+
+        let protocol_typed =
+            crate::binary::typed_array_value(vec![Value::Number(10.0), Value::Number(20.0)]);
+        let iterator = protocol_typed.call_method("__w3cos_symbol_iterator", vec![]);
+        assert_eq!(
+            iterator.call_method("next", vec![]).get_property("value"),
+            Value::Number(10.0)
+        );
+        protocol_typed.set_property("1", Value::Number(30.0));
+        assert_eq!(
+            iterator.call_method("next", vec![]).get_property("value"),
+            Value::Number(30.0)
+        );
+    }
+
+    #[test]
+    fn iterator_close_chain_closes_outer_iterators_and_preserves_throw_completion() {
+        let closed = Rc::new(RefCell::new(Vec::new()));
+        let make_iterator = |name: &'static str, throws: bool| {
+            let iterator = Value::object(HashMap::new());
+            let observed = Rc::clone(&closed);
+            iterator.set_property(
+                "return",
+                Value::function(move |_, _| {
+                    observed.borrow_mut().push(name);
+                    if throws {
+                        throw_value(Value::string(&format!("{name} close")));
+                    }
+                    Value::Undefined
+                }),
+            );
+            iterator
+        };
+        let inner = make_iterator("inner", true);
+        let outer = make_iterator("outer", false);
+        let chain = Value::array(vec![inner, outer]);
+
+        let return_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            chain.call_method("__w3cos_iterator_close_return", vec![])
+        }));
+        let return_exception = return_outcome
+            .unwrap_err()
+            .downcast::<PanicValue>()
+            .unwrap()
+            .0;
+        assert_eq!(return_exception, Value::string("inner close"));
+        assert_eq!(closed.borrow().as_slice(), &["inner", "outer"]);
+
+        closed.borrow_mut().clear();
+        let pending = Value::string("original throw");
+        assert_eq!(
+            chain.call_method("__w3cos_iterator_close_throw", vec![pending.clone()]),
+            pending
+        );
+        assert_eq!(closed.borrow().as_slice(), &["inner", "outer"]);
+    }
+
+    #[test]
+    fn iterator_protocol_rejects_non_callable_methods_and_primitive_results() {
+        let caught = |operation: &dyn Fn() -> Value| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+                .unwrap_err()
+                .downcast::<PanicValue>()
+                .unwrap()
+                .0
+        };
+
+        let non_callable = Value::object(HashMap::new());
+        non_callable.set_property("__w3cos_symbol_iterator", Value::Number(1.0));
+        assert_eq!(
+            caught(&|| non_callable.call_method("__w3cos_symbol_iterator", vec![]))
+                .get_property("name"),
+            Value::string("TypeError")
+        );
+        assert_eq!(
+            caught(&|| non_callable.iter().next().unwrap_or(Value::Undefined)).get_property("name"),
+            Value::string("TypeError")
+        );
+
+        let primitive_iterator = Value::object(HashMap::new());
+        primitive_iterator.set_property(
+            "__w3cos_symbol_iterator",
+            Value::function(|_, _| Value::Number(1.0)),
+        );
+        assert_eq!(
+            caught(&|| primitive_iterator.call_method("__w3cos_symbol_iterator", vec![]))
+                .get_property("name"),
+            Value::string("TypeError")
+        );
+        assert_eq!(
+            caught(&|| primitive_iterator.iter().next().unwrap_or(Value::Undefined))
+                .get_property("name"),
+            Value::string("TypeError")
+        );
+
+        let iterator = Value::object(HashMap::new());
+        iterator.set_property(
+            "next",
+            Value::function(|_, _| Value::string("not an object")),
+        );
+        assert_eq!(
+            caught(&|| iterator.call_method("__w3cos_iterator_next", vec![])).get_property("name"),
+            Value::string("TypeError")
+        );
+
+        let invalid_return = Value::object(HashMap::new());
+        invalid_return.set_property("return", Value::Number(1.0));
+        let completion = Value::array(vec![invalid_return]).call_method(
+            "__w3cos_iterator_close_throw",
+            vec![Value::string("original")],
+        );
+        assert_eq!(completion.get_property("name"), Value::string("TypeError"));
+
+        let primitive_return = Value::object(HashMap::new());
+        primitive_return.set_property("return", Value::function(|_, _| Value::Number(1.0)));
+        let return_chain = Value::array(vec![primitive_return]);
+        assert_eq!(
+            caught(&|| return_chain.call_method("__w3cos_iterator_close_return", vec![]))
+                .get_property("name"),
+            Value::string("TypeError")
+        );
+        assert_eq!(
+            return_chain.call_method(
+                "__w3cos_iterator_close_throw",
+                vec![Value::string("original")]
+            ),
+            Value::string("original")
+        );
+    }
+
+    #[test]
+    fn async_iterator_protocol_validates_acquisition_steps_and_close_priority() {
+        let caught = |operation: &dyn Fn() -> Value| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+                .unwrap_err()
+                .downcast::<PanicValue>()
+                .unwrap()
+                .0
+        };
+        let non_callable = Value::object(HashMap::new());
+        non_callable.set_property("__w3cos_symbol_async_iterator", Value::Number(1.0));
+        assert_eq!(
+            caught(&|| non_callable.call_method("__w3cos_symbol_async_iterator", vec![]))
+                .get_property("name"),
+            Value::string("TypeError")
+        );
+
+        let invalid_next = crate::js_object! {
+            "next" => Value::function(|_, _| {
+                crate::promise::resolve(vec![Value::Number(1.0)])
+            }),
+        };
+        let next = invalid_next.call_method("__w3cos_async_iterator_next", vec![]);
+        crate::promise::drain_microtasks();
+        assert!(matches!(
+            crate::promise::status(&next),
+            Some(crate::promise::PromiseStatus::Rejected(reason))
+                if reason.get_property("name") == Value::string("TypeError")
+        ));
+
+        let invalid_return = crate::js_object! { "return" => Value::Number(1.0) };
+        let close = Value::array(vec![invalid_return]).call_method(
+            "__w3cos_async_iterator_close_throw",
+            vec![Value::string("body")],
+        );
+        crate::promise::drain_microtasks();
+        assert!(matches!(
+            crate::promise::status(&close),
+            Some(crate::promise::PromiseStatus::Fulfilled(reason))
+                if reason.get_property("name") == Value::string("TypeError")
+        ));
+
+        let rejecting_return = crate::js_object! {
+            "return" => Value::function(|_, _| {
+                crate::promise::reject(vec![Value::string("close")])
+            }),
+        };
+        let close = Value::array(vec![rejecting_return])
+            .call_method("__w3cos_async_iterator_close_return", vec![]);
+        crate::promise::drain_microtasks();
+        assert!(matches!(
+            crate::promise::status(&close),
+            Some(crate::promise::PromiseStatus::Rejected(reason))
+                if reason == Value::string("close")
+        ));
+    }
+
+    #[test]
     fn property_access() {
         let mut props = HashMap::new();
         props.insert("x".to_string(), Value::Number(42.0));
@@ -2039,5 +3014,6 @@ mod tests {
         let value = Value::object(HashMap::from([("model".into(), Value::Number(1.0))]));
         assert!(value.delete_property("model").to_bool());
         assert!(value.get_property("model").is_undefined());
+        assert!(value.delete_property("model").to_bool());
     }
 }

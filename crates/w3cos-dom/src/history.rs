@@ -99,6 +99,10 @@ impl History {
     pub fn can_go_back(&self) -> bool {
         self.index > 0
     }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.index + 1 < self.entries.len()
+    }
 }
 
 impl Default for History {

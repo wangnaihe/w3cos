@@ -351,6 +351,65 @@ mod tests {
     }
 
     #[test]
+    fn test_element_namespaced_attributes_retain_identity_and_clone() {
+        let mut doc = Document::new();
+        let el = doc.create_element("use");
+        el.set_attribute_ns(
+            &mut doc,
+            Some("http://www.w3.org/1999/xlink"),
+            "xlink:href",
+            Some("xlink"),
+            "href",
+            "#shape",
+        );
+        assert_eq!(el.get_attribute(&doc, "xlink:href"), Some("#shape"));
+        assert_eq!(
+            el.get_attribute_ns(&doc, Some("http://www.w3.org/1999/xlink"), "href"),
+            Some("#shape")
+        );
+        assert_eq!(el.get_attribute_ns(&doc, None, "href"), None);
+        el.set_attribute(&mut doc, "xlink:href", "#ordinary");
+        assert_eq!(
+            el.get_attribute_ns(&doc, Some("http://www.w3.org/1999/xlink"), "href"),
+            None
+        );
+        el.set_attribute_ns(
+            &mut doc,
+            Some("http://www.w3.org/1999/xlink"),
+            "xlink:href",
+            Some("xlink"),
+            "href",
+            "#shape",
+        );
+        el.set_attribute_ns(
+            &mut doc,
+            Some("http://www.w3.org/1999/xlink"),
+            "legacy:href",
+            Some("legacy"),
+            "href",
+            "#renamed",
+        );
+        assert_eq!(el.get_attribute(&doc, "xlink:href"), None);
+        assert_eq!(el.get_attribute(&doc, "legacy:href"), Some("#renamed"));
+        assert_eq!(
+            el.get_attribute_ns(&doc, Some("http://www.w3.org/1999/xlink"), "href"),
+            Some("#renamed")
+        );
+
+        let cloned = doc.clone_node(el.id, false);
+        let cloned = crate::Element::new(cloned);
+        assert_eq!(
+            cloned.get_attribute_ns(&doc, Some("http://www.w3.org/1999/xlink"), "href"),
+            Some("#renamed")
+        );
+        assert!(cloned.remove_attribute_ns(&mut doc, Some("http://www.w3.org/1999/xlink"), "href"));
+        assert_eq!(
+            cloned.get_attribute_ns(&doc, Some("http://www.w3.org/1999/xlink"), "href"),
+            None
+        );
+    }
+
+    #[test]
     fn test_class_attribute_updates_selector_state() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(".title", &[("font-size", "24px")]);
@@ -917,7 +976,7 @@ mod tests {
                 keyboard_inset: false,
             }
         ));
-        assert!(matches!(style.inner.overflow, Overflow::Auto));
+        assert!(matches!(style.inner.resolved_overflow_y(), Overflow::Auto));
         assert_eq!(style.inner.background, Color::rgba(10, 20, 30, 128));
     }
 

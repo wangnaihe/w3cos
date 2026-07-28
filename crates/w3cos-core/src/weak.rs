@@ -8,13 +8,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
-use crate::value::WeakJsFunction;
+use crate::value::{ArrayStorage, WeakJsFunction};
 use crate::{JsObject, Value};
 
 const STATE_KEY: &str = "__w3cos_weak_id";
 
 enum WeakValue {
-    Array(Weak<RefCell<Vec<Value>>>),
+    Array(Weak<RefCell<ArrayStorage>>),
     Object(Weak<RefCell<JsObject>>),
     Function(WeakJsFunction),
 }

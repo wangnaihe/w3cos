@@ -15,9 +15,10 @@ use swc_ecma_ast::*;
 /// `#name` references lower correctly.
 #[derive(Clone, Debug, Default)]
 pub struct ClassScope {
-    /// Sanitized class name used to mangle private members:
-    /// `__w3cos_priv_{class_name}_{name}`.
+    /// Sanitized class name used only for generated Rust symbol names.
     pub class_name: String,
+    /// Rust expression evaluating to this class's Core brand object.
+    pub brand: String,
     /// Rust expression evaluating to the parent class `Value` (for `extends`).
     pub parent: Option<String>,
     /// Whether the current member is static (`super` then reads the parent
@@ -315,20 +316,26 @@ impl LowerCtx {
     /// Lower a bare identifier reference (used by codegen for alias targets
     /// that are not module-local bindings, e.g. globals).
     pub fn lower_ident(&self, name: &str) -> String {
+        if self.dynamic_values
+            && !self.is_name_shadowed(name)
+            && let Some(global) = global_value_expr(name)
+        {
+            return global;
+        }
         self.resolve_value(&sanitize_ident(name))
     }
 
-    /// Mangle a private `#name` into its property key for a class.
-    pub(crate) fn mangle_private(class_name: &str, name: &PrivateName) -> String {
-        format!("__w3cos_priv_{class_name}_{}", atom_str(&name.name))
+    /// Produce a stable suffix for generated Rust functions that implement a
+    /// private member. This is never exposed as a JavaScript property key.
+    pub(crate) fn private_symbol_suffix(class_name: &str, name: &PrivateName) -> String {
+        format!("{class_name}_{}", atom_str(&name.name))
     }
 
-    /// The property key for a private `#name` in the current class scope.
-    fn private_key(&self, name: &PrivateName) -> String {
-        match &self.class_scope {
-            Some(scope) => Self::mangle_private(&scope.class_name, name),
-            None => atom_str(&name.name),
-        }
+    fn private_brand(&self) -> String {
+        self.class_scope
+            .as_ref()
+            .map(|scope| scope.brand.clone())
+            .unwrap_or_else(|| "w3cos_core::Value::Undefined".to_string())
     }
 
     /// The literal form of a property key, when statically known.
@@ -782,7 +789,7 @@ impl LowerCtx {
                     format!("'{label}: ")
                 };
                 format!(
-                    "{}{prefix}for {left} in Object.call_method(\"keys\", vec![{right}]).iter() {{\n{}\n{}}}",
+                    "{}{prefix}for {left} in w3cos_core::intrinsics::for_in_keys(&{right}).iter() {{\n{}\n{}}}",
                     self.pad(),
                     body,
                     self.pad()
@@ -1641,7 +1648,9 @@ impl LowerCtx {
                         if !self.is_name_shadowed(name) {
                             match name.as_str() {
                                 "Promise" => {
-                                    return format!("w3cos_core::promise::new(vec![{args}])");
+                                    return format!(
+                                        "w3cos_core::intrinsics::promise_new(vec![{args}])"
+                                    );
                                 }
                                 // `new Array(n)` (length) vs `new Array(a,b)`
                                 // (elements) per JS semantics.
@@ -1666,7 +1675,7 @@ impl LowerCtx {
                                 "Error" | "EvalError" | "RangeError" | "ReferenceError"
                                 | "SyntaxError" | "TypeError" | "URIError" | "AggregateError" => {
                                     return format!(
-                                        "w3cos_core::class::construct(&w3cos_core::error_class({name:?}), vec![{args}])"
+                                        "w3cos_core::intrinsics::construct(&w3cos_core::error_class({name:?}), vec![{args}])"
                                     );
                                 }
                                 _ => {}
@@ -1680,7 +1689,7 @@ impl LowerCtx {
                         Some(name) => self.resolve_value(name),
                         None => self.lower_expr(&new_expr.callee),
                     };
-                    format!("w3cos_core::class::construct(&{callee_value}, vec![{args}])")
+                    format!("w3cos_core::intrinsics::construct(&{callee_value}, vec![{args}])")
                 } else {
                     let callee = match new_expr.callee.as_ref() {
                         Expr::Ident(identifier) => self.resolve_name(&atom_str(&identifier.sym)),
@@ -1696,23 +1705,34 @@ impl LowerCtx {
                     && let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left
                 {
                     let object = self.lower_expr(&member.obj);
+                    if let MemberProp::PrivateName(name) = &member.prop {
+                        let brand = self.private_brand();
+                        let name = atom_str(&name.name);
+                        let right = self.lower_expr(&assign.right);
+                        if let Some(intrinsic) = compound_assign_intrinsic(assign.op) {
+                            return format!(
+                                "{{ let __obj = {object}; let __brand = {brand}; let __w3cos_old = w3cos_core::intrinsics::get_private(&__obj, &__brand, &w3cos_core::Value::string({name:?})); let __w3cos_av = w3cos_core::intrinsics::{intrinsic}(&__w3cos_old, &{right}); w3cos_core::intrinsics::set_private(&__obj, &__brand, &w3cos_core::Value::string({name:?}), __w3cos_av.clone()); __w3cos_av }}"
+                            );
+                        }
+                        return format!(
+                            "{{ let __obj = {object}; let __brand = {brand}; let __w3cos_av = {right}; w3cos_core::intrinsics::set_private(&__obj, &__brand, &w3cos_core::Value::string({name:?}), __w3cos_av.clone()); __w3cos_av }}"
+                        );
+                    }
                     let key = match &member.prop {
-                        MemberProp::Ident(ident) => format!("{:?}", ident.sym.to_string()),
-                        MemberProp::Computed(computed) => {
-                            format!("{}.to_js_string()", self.lower_expr(&computed.expr))
+                        MemberProp::Ident(ident) => {
+                            format!("w3cos_core::Value::string({:?})", ident.sym.to_string())
                         }
-                        MemberProp::PrivateName(name) => {
-                            format!("{:?}", self.private_key(name))
-                        }
+                        MemberProp::Computed(computed) => self.lower_expr(&computed.expr),
+                        MemberProp::PrivateName(_) => unreachable!(),
                     };
                     let right = self.lower_expr(&assign.right);
-                    if let Some(method) = compound_assign_op(assign.op) {
+                    if let Some(intrinsic) = compound_assign_intrinsic(assign.op) {
                         return format!(
-                            "{{ let __obj = {object}; let __w3cos_av = __obj.get_property(&{key}).{method}(&{right}); __obj.set_property(&{key}, __w3cos_av.clone()); __w3cos_av }}"
+                            "{{ let __obj = {object}; let __key = {key}; let __old = w3cos_core::intrinsics::get_property(&__obj, &__key); let __w3cos_av = w3cos_core::intrinsics::{intrinsic}(&__old, &{right}); w3cos_core::intrinsics::set_property(&__obj, &__key, __w3cos_av.clone()); __w3cos_av }}"
                         );
                     }
                     return format!(
-                        "{{ let __w3cos_av = {right}; {object}.set_property(&{key}, __w3cos_av.clone()); __w3cos_av }}"
+                        "{{ let __obj = {object}; let __key = {key}; let __w3cos_av = {right}; w3cos_core::intrinsics::set_property(&__obj, &__key, __w3cos_av.clone()); __w3cos_av }}"
                     );
                 }
                 if self.dynamic_values
@@ -1728,8 +1748,10 @@ impl LowerCtx {
                             .map(|(_, bundled)| bundled.as_str())
                             .unwrap_or(&local);
                         let right = self.lower_expr(&assign.right);
-                        if let Some(method) = compound_assign_op(assign.op) {
-                            return format!("{bundled}_set({bundled}_get().{method}(&{right}))");
+                        if let Some(intrinsic) = compound_assign_intrinsic(assign.op) {
+                            return format!(
+                                "{bundled}_set(w3cos_core::intrinsics::{intrinsic}(&{bundled}_get(), &{right}))"
+                            );
                         }
                         return format!("{bundled}_set({right})");
                     }
@@ -1737,9 +1759,9 @@ impl LowerCtx {
                         // Rc<RefCell> local: write through the shared cell.
                         let target = self.resolve_name(&local);
                         let right = self.lower_expr(&assign.right);
-                        if let Some(method) = compound_assign_op(assign.op) {
+                        if let Some(intrinsic) = compound_assign_intrinsic(assign.op) {
                             return format!(
-                                "{{ let __w3cos_av = (*{target}.borrow()).{method}(&{right}); *{target}.borrow_mut() = __w3cos_av.clone(); __w3cos_av }}"
+                                "{{ let __w3cos_av = w3cos_core::intrinsics::{intrinsic}(&*{target}.borrow(), &{right}); *{target}.borrow_mut() = __w3cos_av.clone(); __w3cos_av }}"
                             );
                         }
                         return format!(
@@ -1755,21 +1777,21 @@ impl LowerCtx {
                         // and drop the write — documented degradation that
                         // keeps emission total.
                         let right = self.lower_expr(&assign.right);
-                        if let Some(method) = compound_assign_op(assign.op) {
+                        if let Some(intrinsic) = compound_assign_intrinsic(assign.op) {
                             let target = self.resolve_value(&local);
                             return format!(
-                                "{{ let __w3cos_av = {target}.{method}(&{right}); __w3cos_av }} /* write dropped: non-assignable binding */"
+                                "{{ let __w3cos_av = w3cos_core::intrinsics::{intrinsic}(&{target}, &{right}); __w3cos_av }} /* write dropped: non-assignable binding */"
                             );
                         }
                         return format!(
                             "{{ let __w3cos_av = {right}; __w3cos_av }} /* write dropped: non-assignable binding */"
                         );
                     }
-                    if let Some(method) = compound_assign_op(assign.op) {
+                    if let Some(intrinsic) = compound_assign_intrinsic(assign.op) {
                         let target = self.resolve_name(&local);
                         let right = self.lower_expr(&assign.right);
                         return format!(
-                            "{{ let __w3cos_av = {target}.{method}(&{right}); {target} = __w3cos_av.clone(); __w3cos_av }}"
+                            "{{ let __w3cos_av = w3cos_core::intrinsics::{intrinsic}(&{target}, &{right}); {target} = __w3cos_av.clone(); __w3cos_av }}"
                         );
                     }
                 }
@@ -1825,6 +1847,14 @@ impl LowerCtx {
                 }
             }
             Expr::Bin(bin) => {
+                if self.dynamic_values
+                    && bin.op == BinaryOp::In
+                    && matches!(bin.left.as_ref(), Expr::PrivateName(_))
+                {
+                    let right = self.lower_expr(&bin.right);
+                    let brand = self.private_brand();
+                    return format!("w3cos_core::intrinsics::has_private(&{right}, &{brand})");
+                }
                 let left = self.lower_expr(&bin.left);
                 let right = self.lower_expr(&bin.right);
                 if self.dynamic_values {
@@ -1856,26 +1886,30 @@ impl LowerCtx {
                         if let Expr::Member(member) = unary.arg.as_ref() {
                             let object = self.lower_expr(&member.obj);
                             let key = match &member.prop {
-                                MemberProp::Ident(ident) => {
-                                    format!("{:?}", ident.sym.to_string())
-                                }
-                                MemberProp::Computed(computed) => {
-                                    format!("{}.to_js_string()", self.lower_expr(&computed.expr))
-                                }
+                                MemberProp::Ident(ident) => format!(
+                                    "w3cos_core::Value::string({:?})",
+                                    ident.sym.to_string()
+                                ),
+                                MemberProp::Computed(computed) => self.lower_expr(&computed.expr),
                                 MemberProp::PrivateName(name) => {
-                                    format!("{:?}", self.private_key(name))
+                                    let _ = name;
+                                    return "w3cos_core::Value::Bool(false)".to_string();
                                 }
                             };
-                            return format!("{object}.delete_property(&{key})");
+                            return format!(
+                                "w3cos_core::intrinsics::delete_property(&{object}, &{key})"
+                            );
                         }
                         return "w3cos_core::Value::Bool(true)".to_string();
                     }
                     let arg = self.lower_expr(&unary.arg);
                     match unary.op {
-                        UnaryOp::Bang => format!("{arg}.js_not()"),
-                        UnaryOp::Minus => format!("{arg}.js_neg()"),
-                        UnaryOp::Tilde => format!("{arg}.js_bitnot()"),
-                        UnaryOp::TypeOf => format!("w3cos_core::type_of(&{arg})"),
+                        UnaryOp::Bang => {
+                            format!("w3cos_core::intrinsics::logical_not(&{arg})")
+                        }
+                        UnaryOp::Minus => format!("w3cos_core::intrinsics::negate(&{arg})"),
+                        UnaryOp::Tilde => format!("w3cos_core::intrinsics::bitwise_not(&{arg})"),
+                        UnaryOp::TypeOf => format!("w3cos_core::intrinsics::type_of(&{arg})"),
                         UnaryOp::Void => {
                             format!("{{ let _ = {arg}; w3cos_core::Value::Undefined }}")
                         }
@@ -1890,28 +1924,39 @@ impl LowerCtx {
             Expr::Update(update) => {
                 if self.dynamic_values {
                     let delta = if update.op == UpdateOp::PlusPlus {
-                        "js_add"
+                        "add"
                     } else {
-                        "js_sub"
+                        "subtract"
                     };
                     if let Expr::Member(member) = update.arg.as_ref() {
                         let object = self.lower_expr(&member.obj);
+                        if let MemberProp::PrivateName(name) = &member.prop {
+                            let brand = self.private_brand();
+                            let name = atom_str(&name.name);
+                            return if update.prefix {
+                                format!(
+                                    "{{ let __obj = {object}; let __brand = {brand}; let __name = w3cos_core::Value::string({name:?}); let __old = w3cos_core::intrinsics::get_private(&__obj, &__brand, &__name); let __w3cos_next = w3cos_core::intrinsics::{delta}(&__old, &w3cos_core::Value::Number(1.0)); w3cos_core::intrinsics::set_private(&__obj, &__brand, &__name, __w3cos_next.clone()); __w3cos_next }}"
+                                )
+                            } else {
+                                format!(
+                                    "{{ let __obj = {object}; let __brand = {brand}; let __name = w3cos_core::Value::string({name:?}); let __w3cos_prev = w3cos_core::intrinsics::get_private(&__obj, &__brand, &__name); let __next = w3cos_core::intrinsics::{delta}(&__w3cos_prev, &w3cos_core::Value::Number(1.0)); w3cos_core::intrinsics::set_private(&__obj, &__brand, &__name, __next); __w3cos_prev }}"
+                                )
+                            };
+                        }
                         let key = match &member.prop {
-                            MemberProp::Ident(ident) => format!("{:?}", ident.sym.to_string()),
-                            MemberProp::Computed(computed) => {
-                                format!("{}.to_js_string()", self.lower_expr(&computed.expr))
+                            MemberProp::Ident(ident) => {
+                                format!("w3cos_core::Value::string({:?})", ident.sym.to_string())
                             }
-                            MemberProp::PrivateName(name) => {
-                                format!("{:?}", self.private_key(name))
-                            }
+                            MemberProp::Computed(computed) => self.lower_expr(&computed.expr),
+                            MemberProp::PrivateName(_) => unreachable!(),
                         };
                         return if update.prefix {
                             format!(
-                                "{{ let __obj = {object}; let __w3cos_next = __obj.get_property(&{key}).{delta}(&w3cos_core::Value::Number(1.0)); __obj.set_property(&{key}, __w3cos_next.clone()); __w3cos_next }}"
+                                "{{ let __obj = {object}; let __key = {key}; let __old = w3cos_core::intrinsics::get_property(&__obj, &__key); let __w3cos_next = w3cos_core::intrinsics::{delta}(&__old, &w3cos_core::Value::Number(1.0)); w3cos_core::intrinsics::set_property(&__obj, &__key, __w3cos_next.clone()); __w3cos_next }}"
                             )
                         } else {
                             format!(
-                                "{{ let __obj = {object}; let __w3cos_prev = __obj.get_property(&{key}); __obj.set_property(&{key}, __w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0))); __w3cos_prev }}"
+                                "{{ let __obj = {object}; let __key = {key}; let __w3cos_prev = w3cos_core::intrinsics::get_property(&__obj, &__key); let __next = w3cos_core::intrinsics::{delta}(&__w3cos_prev, &w3cos_core::Value::Number(1.0)); w3cos_core::intrinsics::set_property(&__obj, &__key, __next); __w3cos_prev }}"
                             )
                         };
                     }
@@ -1932,11 +1977,11 @@ impl LowerCtx {
                                     .unwrap_or(&local);
                                 return if update.prefix {
                                     format!(
-                                        "{{ let __w3cos_next = {bundled}_get().{delta}(&w3cos_core::Value::Number(1.0)); {bundled}_set(__w3cos_next.clone()); __w3cos_next }}"
+                                        "{{ let __w3cos_next = w3cos_core::intrinsics::{delta}(&{bundled}_get(), &w3cos_core::Value::Number(1.0)); {bundled}_set(__w3cos_next.clone()); __w3cos_next }}"
                                     )
                                 } else {
                                     format!(
-                                        "{{ let __w3cos_prev = {bundled}_get(); {bundled}_set(__w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0))); __w3cos_prev }}"
+                                        "{{ let __w3cos_prev = {bundled}_get(); {bundled}_set(w3cos_core::intrinsics::{delta}(&__w3cos_prev, &w3cos_core::Value::Number(1.0))); __w3cos_prev }}"
                                     )
                                 };
                             }
@@ -1945,11 +1990,11 @@ impl LowerCtx {
                                 let target = self.resolve_name(&local);
                                 return if update.prefix {
                                     format!(
-                                        "{{ let __w3cos_next = (*{target}.borrow()).clone().{delta}(&w3cos_core::Value::Number(1.0)); *{target}.borrow_mut() = __w3cos_next.clone(); __w3cos_next }}"
+                                        "{{ let __w3cos_next = w3cos_core::intrinsics::{delta}(&(*{target}.borrow()).clone(), &w3cos_core::Value::Number(1.0)); *{target}.borrow_mut() = __w3cos_next.clone(); __w3cos_next }}"
                                     )
                                 } else {
                                     format!(
-                                        "{{ let __w3cos_prev = (*{target}.borrow()).clone(); *{target}.borrow_mut() = __w3cos_prev.{delta}(&w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
+                                        "{{ let __w3cos_prev = (*{target}.borrow()).clone(); *{target}.borrow_mut() = w3cos_core::intrinsics::{delta}(&__w3cos_prev, &w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
                                     )
                                 };
                             }
@@ -1959,11 +2004,11 @@ impl LowerCtx {
                     };
                     return if update.prefix {
                         format!(
-                            "{{ let __w3cos_next = {arg}.{delta}(&w3cos_core::Value::Number(1.0)); {arg} = __w3cos_next.clone(); __w3cos_next }}"
+                            "{{ let __w3cos_next = w3cos_core::intrinsics::{delta}(&{arg}, &w3cos_core::Value::Number(1.0)); {arg} = __w3cos_next.clone(); __w3cos_next }}"
                         )
                     } else {
                         format!(
-                            "{{ let __w3cos_prev = {arg}.clone(); {arg} = {arg}.{delta}(&w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
+                            "{{ let __w3cos_prev = {arg}.clone(); {arg} = w3cos_core::intrinsics::{delta}(&{arg}, &w3cos_core::Value::Number(1.0)); __w3cos_prev }}"
                         )
                     };
                 }
@@ -2218,10 +2263,15 @@ impl LowerCtx {
                 for (i, quasi) in tpl.quasis.iter().enumerate() {
                     let raw = quasi.raw.to_string();
                     if !raw.is_empty() {
-                        value = format!("{value}.js_add(&w3cos_core::Value::from({raw:?}))");
+                        value = format!(
+                            "w3cos_core::intrinsics::add(&{value}, &w3cos_core::Value::from({raw:?}))"
+                        );
                     }
                     if i < tpl.exprs.len() {
-                        value = format!("{value}.js_add(&{})", self.lower_expr(&tpl.exprs[i]));
+                        value = format!(
+                            "w3cos_core::intrinsics::add(&{value}, &{})",
+                            self.lower_expr(&tpl.exprs[i])
+                        );
                     }
                 }
                 if self.dynamic_values {
@@ -2258,19 +2308,24 @@ impl LowerCtx {
                             let key = atom_str(&ident.sym);
                             if scope.is_static {
                                 // `super.x` in a static member: parent class object.
-                                format!("{parent}.get_property({key:?})")
+                                format!(
+                                    "w3cos_core::intrinsics::get_property(&{parent}, &w3cos_core::Value::string({key:?}))"
+                                )
                             } else {
-                                format!("w3cos_core::class::super_get(&{this}, &{parent}, {key:?})")
+                                format!(
+                                    "w3cos_core::intrinsics::super_get(&{this}, &{parent}, &w3cos_core::Value::string({key:?}))"
+                                )
                             }
                         }
                         (Some(scope), SuperProp::Computed(computed)) => {
                             let parent = scope.parent.clone().unwrap_or_default();
-                            let key =
-                                format!("&{}.to_js_string()", self.lower_expr(&computed.expr));
+                            let key = self.lower_expr(&computed.expr);
                             if scope.is_static {
-                                format!("{parent}.get_property({key})")
+                                format!("w3cos_core::intrinsics::get_property(&{parent}, &{key})")
                             } else {
-                                format!("w3cos_core::class::super_get(&{this}, &{parent}, {key})")
+                                format!(
+                                    "w3cos_core::intrinsics::super_get(&{this}, &{parent}, &{key})"
+                                )
                             }
                         }
                         (None, _) => {
@@ -2281,11 +2336,13 @@ impl LowerCtx {
                 "/* super.prop */".to_string()
             }
             Expr::PrivateName(name) => {
-                // `#x in obj` — the private brand as a (mangled) string key.
+                // A bare private name is invalid JavaScript. Valid `#x in obj`
+                // expressions are handled by binary-expression lowering.
+                let _ = name;
                 if self.dynamic_values {
-                    format!("w3cos_core::Value::from({:?})", self.private_key(name))
+                    "w3cos_core::Value::Undefined".to_string()
                 } else {
-                    format!("{:?}", self.private_key(name))
+                    "\"/* invalid private name */\"".to_string()
                 }
             }
             Expr::Cond(cond) => {
@@ -2347,24 +2404,23 @@ impl LowerCtx {
                 OptChainBase::Member(member) => {
                     let obj = self.lower_expr(&member.obj);
                     if self.dynamic_values {
+                        if let MemberProp::PrivateName(name) = &member.prop {
+                            let brand = self.private_brand();
+                            let name = atom_str(&name.name);
+                            return format!(
+                                "if {obj}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ w3cos_core::intrinsics::get_private(&{obj}, &{brand}, &w3cos_core::Value::string({name:?})) }}"
+                            );
+                        }
                         let property = match &member.prop {
-                            MemberProp::Ident(id) => format!("{:?}", id.sym.to_string()),
-                            MemberProp::Computed(computed) => {
-                                format!("&{}.to_js_string()", self.lower_expr(&computed.expr))
+                            MemberProp::Ident(id) => {
+                                format!("w3cos_core::Value::string({:?})", id.sym.to_string())
                             }
-                            MemberProp::PrivateName(name) => {
-                                format!("{:?}", self.private_key(name))
-                            }
+                            MemberProp::Computed(computed) => self.lower_expr(&computed.expr),
+                            MemberProp::PrivateName(_) => unreachable!(),
                         };
-                        return if property.starts_with('&') {
-                            format!(
-                                "if {obj}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ {obj}.get_property({property}) }}"
-                            )
-                        } else {
-                            format!(
-                                "if {obj}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ {obj}.get_property({property}) }}"
-                            )
-                        };
+                        return format!(
+                            "if {obj}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ w3cos_core::intrinsics::get_property(&{obj}, &{property}) }}"
+                        );
                     }
                     let prop = match &member.prop {
                         MemberProp::Ident(id) => format!(".{}", atom_str(&id.sym)),
@@ -2390,25 +2446,26 @@ impl LowerCtx {
                             let receiver = self.lower_expr(&member.obj);
                             let method = match &member.prop {
                                 MemberProp::Ident(id) => format!(
-                                    "__w3cos_receiver.get_property({:?})",
+                                    "w3cos_core::intrinsics::get_property(&__w3cos_receiver, &w3cos_core::Value::string({:?}))",
                                     id.sym.to_string()
                                 ),
                                 MemberProp::Computed(computed) => format!(
-                                    "{{ let __w3cos_key = {}.to_js_string(); __w3cos_receiver.get_property(&__w3cos_key) }}",
+                                    "{{ let __w3cos_key = {}; w3cos_core::intrinsics::get_property(&__w3cos_receiver, &__w3cos_key) }}",
                                     self.lower_expr(&computed.expr)
                                 ),
                                 MemberProp::PrivateName(name) => format!(
-                                    "__w3cos_receiver.get_property({:?})",
-                                    self.private_key(name)
+                                    "w3cos_core::intrinsics::get_private(&__w3cos_receiver, &{}, &w3cos_core::Value::string({:?}))",
+                                    self.private_brand(),
+                                    atom_str(&name.name)
                                 ),
                             };
                             return format!(
-                                "{{ let __w3cos_receiver = {receiver}; if __w3cos_receiver.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ let __w3cos_method = {method}; if __w3cos_method.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ __w3cos_method.call(__w3cos_receiver.clone(), vec![{args}]) }} }} }}"
+                                "{{ let __w3cos_receiver = {receiver}; if __w3cos_receiver.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ let __w3cos_method = {method}; if __w3cos_method.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ w3cos_core::intrinsics::call(&__w3cos_method, __w3cos_receiver.clone(), vec![{args}]) }} }} }}"
                             );
                         }
                         let callee = self.lower_expr(&call.callee);
                         format!(
-                            "if {callee}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ {callee}.call(w3cos_core::Value::Undefined, vec![{args}]) }}"
+                            "if {callee}.is_nullish() {{ w3cos_core::Value::Undefined }} else {{ w3cos_core::intrinsics::call(&{callee}, w3cos_core::Value::Undefined, vec![{args}]) }}"
                         )
                     } else {
                         let callee = self.lower_expr(&call.callee);
@@ -2562,7 +2619,10 @@ impl LowerCtx {
             JSXObject::Ident(identifier) => self.resolve_value(&atom_str(&identifier.sym)),
             JSXObject::JSXMemberExpr(member) => self.lower_jsx_member_name(member),
         };
-        format!("{object}.get_property({:?})", atom_str(&member.prop.sym))
+        format!(
+            "w3cos_core::intrinsics::get_property(&{object}, &w3cos_core::Value::string({:?}))",
+            atom_str(&member.prop.sym)
+        )
     }
 
     fn lower_jsx_props(&self, attributes: &[JSXAttrOrSpread]) -> String {
@@ -2641,7 +2701,9 @@ impl LowerCtx {
             let this = self.this_expr();
             return match self.class_scope.as_ref().and_then(|s| s.parent.clone()) {
                 Some(parent) => {
-                    format!("w3cos_core::class::super_ctor(&{this}, &{parent}, vec![{args}])")
+                    format!(
+                        "w3cos_core::intrinsics::super_construct(&{this}, &{parent}, vec![{args}])"
+                    )
                 }
                 None => {
                     "w3cos_core::Value::Undefined /* super() outside derived ctor */".to_string()
@@ -2714,15 +2776,23 @@ impl LowerCtx {
             && let Expr::Member(member) = callee.as_ref()
         {
             let object = self.lower_expr(&member.obj);
+            if let MemberProp::PrivateName(name) = &member.prop {
+                let brand = self.private_brand();
+                let name = atom_str(&name.name);
+                let args = self.lower_dynamic_argument_vec(&call.args);
+                return format!(
+                    "{{ let __obj = {object}; let __private = w3cos_core::intrinsics::get_private(&__obj, &{brand}, &w3cos_core::Value::string({name:?})); w3cos_core::intrinsics::call(&__private, __obj, {args}) }}"
+                );
+            }
             let key = match &member.prop {
-                MemberProp::Ident(id) => format!("{:?}", id.sym.to_string()),
-                MemberProp::Computed(computed) => {
-                    format!("&{}.to_js_string()", self.lower_expr(&computed.expr))
+                MemberProp::Ident(id) => {
+                    format!("w3cos_core::Value::string({:?})", id.sym.to_string())
                 }
-                MemberProp::PrivateName(name) => format!("{:?}", self.private_key(name)),
+                MemberProp::Computed(computed) => self.lower_expr(&computed.expr),
+                MemberProp::PrivateName(_) => unreachable!(),
             };
             let args = self.lower_dynamic_argument_vec(&call.args);
-            return format!("{object}.call_method({key}, {args})");
+            return format!("w3cos_core::intrinsics::call_method(&{object}, &{key}, {args})");
         }
         let callee = match &call.callee {
             Callee::Expr(e) => self.lower_expr(e),
@@ -2736,7 +2806,7 @@ impl LowerCtx {
                     .map(|a| self.lower_expr(&a.expr))
                     .unwrap_or_else(|| "w3cos_core::Value::Undefined".to_string());
                 return format!(
-                    "{{ let _ = {spec}; w3cos_core::promise::resolve(vec![w3cos_core::Value::Undefined]) }} /* dynamic import */"
+                    "{{ let _ = {spec}; w3cos_core::intrinsics::promise_resolve(vec![w3cos_core::Value::Undefined]) }} /* dynamic import */"
                 );
             }
             _ => "/* super/import call */".to_string(),
@@ -2759,7 +2829,7 @@ impl LowerCtx {
                 // Calling a class without `new` (a TypeError in JS) —
                 // approximate via construct() to stay total.
                 return format!(
-                    "w3cos_core::class::construct(&{}, {})",
+                    "w3cos_core::intrinsics::construct(&{}, {})",
                     self.resolve_value(&name),
                     dynamic_args.as_ref().expect("dynamic argument vector")
                 );
@@ -2768,7 +2838,7 @@ impl LowerCtx {
                 // Function-valued variable: call the Value, not a Rust fn.
                 let callee = self.resolve_value(&name);
                 return format!(
-                    "{callee}.call(w3cos_core::Value::Undefined, {})",
+                    "w3cos_core::intrinsics::call(&{callee}, w3cos_core::Value::Undefined, {})",
                     dynamic_args.as_ref().expect("dynamic argument vector")
                 );
             }
@@ -2784,7 +2854,7 @@ impl LowerCtx {
                     || matches!(name.as_str(), "parseInt" | "parseFloat"));
             if !is_static {
                 return format!(
-                    "{callee}.call(w3cos_core::Value::Undefined, {})",
+                    "w3cos_core::intrinsics::call(&{callee}, w3cos_core::Value::Undefined, {})",
                     dynamic_args.as_ref().expect("dynamic argument vector")
                 );
             }
@@ -2804,7 +2874,7 @@ impl LowerCtx {
                     // Value expressions: invoke through Value::call.
                     _ => {
                         return format!(
-                            "{callee}.call(w3cos_core::Value::Undefined, {})",
+                            "w3cos_core::intrinsics::call(&{callee}, w3cos_core::Value::Undefined, {})",
                             dynamic_args.as_ref().expect("dynamic argument vector")
                         );
                     }
@@ -2824,15 +2894,20 @@ impl LowerCtx {
         let obj = self.lower_expr(&member.obj);
         if self.dynamic_values {
             return match &member.prop {
-                MemberProp::Ident(id) => {
-                    format!("{obj}.get_property_checked({:?})", id.sym.to_string())
-                }
+                MemberProp::Ident(id) => format!(
+                    "w3cos_core::intrinsics::get_property(&{obj}, &w3cos_core::Value::string({:?}))",
+                    id.sym.to_string()
+                ),
                 MemberProp::Computed(computed) => format!(
-                    "{obj}.get_property_checked(&{}.to_js_string())",
+                    "w3cos_core::intrinsics::get_property(&{obj}, &{})",
                     self.lower_expr(&computed.expr)
                 ),
                 MemberProp::PrivateName(name) => {
-                    format!("{obj}.get_property_checked({:?})", self.private_key(name))
+                    let brand = self.private_brand();
+                    let name = atom_str(&name.name);
+                    format!(
+                        "w3cos_core::intrinsics::get_private(&{obj}, &{brand}, &w3cos_core::Value::string({name:?}))"
+                    )
                 }
             };
         }
@@ -3004,7 +3079,7 @@ impl LowerCtx {
             Pat::Array(array) => {
                 for (index, element) in array.elems.iter().enumerate() {
                     if let Some(element) = element {
-                        let nested = format!("{source}.get_property({:?})", index.to_string());
+                        let nested = shared_property_get(source, &index.to_string());
                         self.lower_closure_pattern(element, &nested, output, fixups);
                     }
                 }
@@ -3014,8 +3089,7 @@ impl LowerCtx {
                     match property {
                         ObjectPatProp::Assign(assign) => {
                             let name = sanitize_ident(&assign.key.sym.to_string());
-                            let value =
-                                format!("{source}.get_property({:?})", assign.key.sym.to_string());
+                            let value = shared_property_get(source, &assign.key.sym.to_string());
                             output.push_str(&self.bind_local(&name, &value));
                             output.push(' ');
                             if let Some(default) = &assign.value {
@@ -3034,7 +3108,7 @@ impl LowerCtx {
                                 PropName::Num(value) => value.value.to_string(),
                                 _ => continue,
                             };
-                            let nested = format!("{source}.get_property({key:?})");
+                            let nested = shared_property_get(source, &key);
                             self.lower_closure_pattern(&key_value.value, &nested, output, fixups);
                         }
                         ObjectPatProp::Rest(rest) => {
@@ -3132,24 +3206,24 @@ impl LowerCtx {
                 let key = atom_str(&ident.sym);
                 if scope.is_static {
                     format!(
-                        "{{ let __super_fn = {parent}.get_property({key:?}); __super_fn.call({this}.clone(), vec![{args}]) }}"
+                        "{{ let __super_fn = w3cos_core::intrinsics::get_property(&{parent}, &w3cos_core::Value::string({key:?})); w3cos_core::intrinsics::call(&__super_fn, {this}.clone(), vec![{args}]) }}"
                     )
                 } else {
                     format!(
-                        "w3cos_core::class::super_method(&{this}, &{parent}, {key:?}, vec![{args}])"
+                        "w3cos_core::intrinsics::super_call(&{this}, &{parent}, &w3cos_core::Value::string({key:?}), vec![{args}])"
                     )
                 }
             }
             (Some(scope), SuperProp::Computed(computed)) => {
                 let parent = scope.parent.clone().unwrap_or_default();
-                let key = format!("&{}.to_js_string()", self.lower_expr(&computed.expr));
+                let key = self.lower_expr(&computed.expr);
                 if scope.is_static {
                     format!(
-                        "{{ let __super_fn = {parent}.get_property({key}); __super_fn.call({this}.clone(), vec![{args}]) }}"
+                        "{{ let __key = {key}; let __super_fn = w3cos_core::intrinsics::get_property(&{parent}, &__key); w3cos_core::intrinsics::call(&__super_fn, {this}.clone(), vec![{args}]) }}"
                     )
                 } else {
                     format!(
-                        "w3cos_core::class::super_method(&{this}, &{parent}, {key}, vec![{args}])"
+                        "w3cos_core::intrinsics::super_call(&{this}, &{parent}, &{key}, vec![{args}])"
                     )
                 }
             }
@@ -3174,11 +3248,13 @@ impl LowerCtx {
         let parent_ref = parent.as_ref().map(|_| "__parent".to_string());
         let instance_scope = ClassScope {
             class_name: class_name.clone(),
+            brand: "__brand.borrow().clone()".to_string(),
             parent: parent_ref.clone(),
             is_static: false,
         };
         let static_scope = ClassScope {
             class_name: class_name.clone(),
+            brand: "__brand.borrow().clone()".to_string(),
             parent: parent_ref,
             is_static: true,
         };
@@ -3188,6 +3264,9 @@ impl LowerCtx {
         let mut static_installs: Vec<String> = Vec::new();
         let mut static_inits: Vec<String> = Vec::new();
         let mut field_inits: Vec<String> = Vec::new();
+        let mut field_key_defs: Vec<(String, String)> = Vec::new();
+        let mut instance_field_key_bindings: Vec<String> = Vec::new();
+        let mut field_key_index = 0usize;
         // Names referenced by instance-field initializers (they inline into
         // the ctor closure, which must capture them).
         let mut field_refs: HashSet<String> = HashSet::new();
@@ -3240,7 +3319,9 @@ impl LowerCtx {
                         MethodKind::Setter => "__w3cos_setter_",
                     };
                     let key = self.key_arg(prefix, &method.key);
-                    installs.push(format!("{target}.set_property({key}, {closure});"));
+                    installs.push(format!(
+                        "w3cos_core::intrinsics::set_property(&{target}, &w3cos_core::Value::string({key}), {closure});"
+                    ));
                 }
                 ClassMember::PrivateMethod(method) => {
                     let params = method
@@ -3261,18 +3342,19 @@ impl LowerCtx {
                         &instance_scope
                     };
                     let closure = self.lower_method_closure(&params, &body, scope);
-                    let (target, installs) = if method.is_static {
-                        ("__class", &mut static_installs)
-                    } else {
-                        ("__proto", &mut proto_installs)
+                    let key = atom_str(&method.key.name);
+                    let install = match method.kind {
+                        MethodKind::Method => format!(
+                            "w3cos_core::intrinsics::define_private_method(&__class, &w3cos_core::Value::string({key:?}), {closure});"
+                        ),
+                        MethodKind::Getter => format!(
+                            "w3cos_core::intrinsics::define_private_accessor(&__class, &w3cos_core::Value::string({key:?}), Some({closure}), None);"
+                        ),
+                        MethodKind::Setter => format!(
+                            "w3cos_core::intrinsics::define_private_accessor(&__class, &w3cos_core::Value::string({key:?}), None, Some({closure}));"
+                        ),
                     };
-                    let mangled = Self::mangle_private(&class_name, &method.key);
-                    let key = match method.kind {
-                        MethodKind::Method => mangled,
-                        MethodKind::Getter => format!("__w3cos_getter_{mangled}"),
-                        MethodKind::Setter => format!("__w3cos_setter_{mangled}"),
-                    };
-                    installs.push(format!("{target}.set_property({key:?}, {closure});"));
+                    static_installs.push(install);
                 }
                 ClassMember::ClassProp(prop) => {
                     let scope = if prop.is_static {
@@ -3284,14 +3366,24 @@ impl LowerCtx {
                         field_refs.extend(expr_referenced_names(value));
                     }
                     let init = self.lower_field_value(prop.value.as_deref(), scope);
-                    let key = self.key_arg("", &prop.key);
+                    let key = if let PropName::Computed(computed) = &prop.key {
+                        let binding = format!("__field_key_{field_key_index}");
+                        field_key_index += 1;
+                        field_key_defs.push((binding.clone(), self.lower_expr(&computed.expr)));
+                        if !prop.is_static {
+                            instance_field_key_bindings.push(binding.clone());
+                        }
+                        format!("&{binding}.to_js_string()")
+                    } else {
+                        self.key_arg("", &prop.key)
+                    };
                     if prop.is_static {
                         static_inits.push(format!(
-                            "w3cos_core::class::define_field(&__this, {key}, {init});"
+                            "w3cos_core::intrinsics::define_field(&__this, &w3cos_core::Value::string({key}), {init});"
                         ));
                     } else {
                         field_inits.push(format!(
-                            "w3cos_core::class::define_field(&__this, {key}, {init});"
+                            "w3cos_core::intrinsics::define_field(&__this, &w3cos_core::Value::string({key}), {init});"
                         ));
                     }
                 }
@@ -3305,14 +3397,14 @@ impl LowerCtx {
                         field_refs.extend(expr_referenced_names(value));
                     }
                     let init = self.lower_field_value(prop.value.as_deref(), scope);
-                    let key = format!("{:?}", Self::mangle_private(&class_name, &prop.key));
+                    let key = atom_str(&prop.key.name);
                     if prop.is_static {
                         static_inits.push(format!(
-                            "w3cos_core::class::define_field(&__this, {key}, {init});"
+                            "w3cos_core::intrinsics::define_private(&__this, &__this, &w3cos_core::Value::string({key:?}), {init});"
                         ));
                     } else {
                         field_inits.push(format!(
-                            "w3cos_core::class::define_field(&__this, {key}, {init});"
+                            "w3cos_core::intrinsics::define_private(&__this, &__args[0], &w3cos_core::Value::string({key:?}), {init});"
                         ));
                     }
                 }
@@ -3333,18 +3425,37 @@ impl LowerCtx {
         }
 
         let derived = parent.is_some();
+        let field_initializer = if field_inits.is_empty() {
+            "w3cos_core::Value::Undefined".to_string()
+        } else {
+            let mut captures = capture_names(&self.known_values, &HashSet::new(), &field_refs);
+            if parent.is_some() && !captures.iter().any(|name| name == "__parent") {
+                captures.push("__parent".to_string());
+            }
+            captures.sort();
+            let capture_bindings = captures
+                .iter()
+                .map(|name| format!("let mut {name} = {name}.clone(); "))
+                .chain(
+                    instance_field_key_bindings
+                        .iter()
+                        .map(|name| format!("let {name} = {name}.clone(); ")),
+                )
+                .chain(std::iter::once(
+                    "let __brand = __brand.clone(); ".to_string(),
+                ))
+                .collect::<String>();
+            let fields = field_inits.join(" ");
+            format!(
+                "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ let _ = &__args; {fields} w3cos_core::Value::Undefined }}) }}"
+            )
+        };
         let ctor_closure = match &ctor {
-            Some((params, body)) => self.lower_ctor_closure(
-                params,
-                body,
-                &field_inits,
-                &instance_scope,
-                derived,
-                &field_refs,
-            ),
+            Some((params, body)) => self.lower_ctor_closure(params, body, &instance_scope),
             None if derived => {
                 // Derived class without a ctor: forward all args to super.
-                let mut captures = capture_names(&self.known_values, &HashSet::new(), &field_refs);
+                let mut captures =
+                    capture_names(&self.known_values, &HashSet::new(), &HashSet::new());
                 if !captures.iter().any(|name| name == "__parent") {
                     captures.push("__parent".to_string());
                 }
@@ -3353,53 +3464,50 @@ impl LowerCtx {
                     .iter()
                     .map(|name| format!("let mut {name} = {name}.clone(); "))
                     .collect::<String>();
-                let fields = field_inits.join(" ");
                 format!(
-                    "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ w3cos_core::class::super_ctor(&__this, &__parent, __args); {fields} __this }}) }}"
+                    "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ w3cos_core::intrinsics::super_construct(&__this, &__parent, __args); __this }}) }}"
                 )
             }
             None => {
-                let captures = capture_names(&self.known_values, &HashSet::new(), &field_refs);
+                let captures = capture_names(&self.known_values, &HashSet::new(), &HashSet::new());
                 let capture_bindings = captures
                     .iter()
                     .map(|name| format!("let mut {name} = {name}.clone(); "))
                     .collect::<String>();
-                let fields = field_inits.join(" ");
                 format!(
-                    "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ let _ = &__args; {fields} __this }}) }}"
+                    "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ let _ = &__args; __this }}) }}"
                 )
             }
         };
 
         let mut out = String::from("{ ");
+        out.push_str(
+            "let __brand = std::rc::Rc::new(std::cell::RefCell::new(w3cos_core::Value::Undefined)); ",
+        );
         if let Some(parent_expr) = &parent {
             out.push_str(&format!("let __parent = {parent_expr}; "));
         }
-        out.push_str("let __proto = w3cos_core::Value::object(std::collections::HashMap::new()); ");
+        for (binding, expression) in &field_key_defs {
+            out.push_str(&format!("let {binding} = {expression}; "));
+        }
+        out.push_str(&format!("let __ctor = {ctor_closure}; "));
+        out.push_str(&format!("let __initializer = {field_initializer}; "));
+        if derived {
+            out.push_str(
+                "let __class = w3cos_core::intrinsics::create_class_with_initializer(&__ctor, Some(&__parent), &__initializer); ",
+            );
+        } else {
+            out.push_str("let __class = w3cos_core::intrinsics::create_class_with_initializer(&__ctor, None, &__initializer); ");
+        }
+        out.push_str("*__brand.borrow_mut() = __class.clone(); ");
+        out.push_str("let __proto = w3cos_core::intrinsics::get_property(&__class, &w3cos_core::Value::string(\"prototype\")); ");
         for install in &proto_installs {
             out.push_str(install);
             out.push(' ');
         }
-        if derived {
-            out.push_str(
-                "w3cos_core::class::set_prototype_of(&__proto, &__parent.get_property(\"prototype\")); ",
-            );
-        }
-        out.push_str(&format!("let __ctor = {ctor_closure}; "));
-        out.push_str("let __ctor_c = __ctor.clone(); ");
-        out.push_str("let __proto_c = __proto.clone(); ");
-        out.push_str(
-            "let __class = w3cos_core::Value::callable(std::collections::HashMap::new(), move |_this, __args| { let __instance = w3cos_core::Value::object(std::collections::HashMap::new()); w3cos_core::class::set_prototype_of(&__instance, &__proto_c); let __ret = __ctor_c.call(__instance.clone(), __args); if __ret.is_object() { __ret } else { __instance } }); ",
-        );
-        out.push_str("__proto.set_property(\"constructor\", __class.clone()); ");
-        out.push_str("__class.set_property(\"prototype\", __proto); ");
-        out.push_str("__class.set_property(\"__w3cos_ctor\", __ctor); ");
         for install in &static_installs {
             out.push_str(install);
             out.push(' ');
-        }
-        if derived {
-            out.push_str("w3cos_core::class::set_prototype_of(&__class, &__parent); ");
         }
         if !static_inits.is_empty() {
             out.push_str("{ let __this = __class.clone(); ");
@@ -3442,6 +3550,9 @@ impl LowerCtx {
         let capture_bindings = captures
             .iter()
             .map(|name| format!("let mut {name} = {name}.clone(); "))
+            .chain(std::iter::once(
+                "let __brand = __brand.clone(); ".to_string(),
+            ))
             .collect::<String>();
         let mut ctx = self.child_dynamic_ctx();
         ctx.class_scope = Some(scope.clone());
@@ -3457,23 +3568,11 @@ impl LowerCtx {
         )
     }
 
-    /// Lower a class-expression constructor. Field initializers run at the
-    /// top for base classes and immediately after the top-level `super(...)`
-    /// call for derived classes (at the end when no such call exists).
-    /// `field_refs` carries the names field initializers reference (they
-    /// inline into the ctor closure and must be captured).
-    fn lower_ctor_closure(
-        &self,
-        params: &[Pat],
-        body: &[Stmt],
-        field_inits: &[String],
-        scope: &ClassScope,
-        derived: bool,
-        field_refs: &HashSet<String>,
-    ) -> String {
+    /// Lower a class-expression constructor. Instance-field scheduling is
+    /// handled by the shared Core class builder.
+    fn lower_ctor_closure(&self, params: &[Pat], body: &[Stmt], scope: &ClassScope) -> String {
         let parameter_names = pattern_names(params);
-        let mut referenced = stmts_referenced_names(body);
-        referenced.extend(field_refs.iter().cloned());
+        let referenced = stmts_referenced_names(body);
         let mut captures = capture_names(&self.known_values, &parameter_names, &referenced);
         if scope.parent.is_some() && !captures.iter().any(|name| name == "__parent") {
             captures.push("__parent".to_string());
@@ -3482,6 +3581,9 @@ impl LowerCtx {
         let capture_bindings = captures
             .iter()
             .map(|name| format!("let mut {name} = {name}.clone(); "))
+            .chain(std::iter::once(
+                "let __brand = __brand.clone(); ".to_string(),
+            ))
             .collect::<String>();
         let mut ctx = self.child_dynamic_ctx();
         ctx.class_scope = Some(scope.clone());
@@ -3491,26 +3593,7 @@ impl LowerCtx {
         ctx.enter_fn_scope(params, body);
         let bindings = ctx.lower_closure_params(params);
         let prologue = ctx.hoist_fn_body_vars(body);
-        let fields = field_inits.join(" ");
-        let body_code = if derived {
-            let mut code = String::new();
-            let mut injected = false;
-            for stmt in body {
-                code.push_str(&ctx.lower_stmt(stmt));
-                code.push(' ');
-                if !injected && is_super_call_stmt(stmt) {
-                    code.push_str(&fields);
-                    code.push(' ');
-                    injected = true;
-                }
-            }
-            if !injected {
-                code.push_str(&fields);
-            }
-            code
-        } else {
-            format!("{fields} {}", ctx.lower_stmts(body))
-        };
+        let body_code = ctx.lower_stmts(body);
         format!(
             "{{ {capture_bindings} w3cos_core::Value::function(move |__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>| -> w3cos_core::Value {{ {bindings}{prologue}{body_code} __this }}) }}"
         )
@@ -3532,7 +3615,7 @@ impl LowerCtx {
             Pat::Array(array) => {
                 for (index, element) in array.elems.iter().enumerate() {
                     if let Some(element) = element {
-                        let nested = format!("{source}.get_property({:?})", index.to_string());
+                        let nested = shared_property_get(source, &index.to_string());
                         self.lower_dynamic_local_pattern(element, &nested, lines, indent);
                     }
                 }
@@ -3543,8 +3626,7 @@ impl LowerCtx {
                     match property {
                         ObjectPatProp::Assign(assign) => {
                             let name = sanitize_ident(&assign.key.sym.to_string());
-                            let value =
-                                format!("{source}.get_property({:?})", assign.key.sym.to_string());
+                            let value = shared_property_get(source, &assign.key.sym.to_string());
                             let bound = if let Some(default) = &assign.value {
                                 let fallback = self.lower_expr(default);
                                 format!(
@@ -3562,7 +3644,7 @@ impl LowerCtx {
                                 PropName::Num(value) => value.value.to_string(),
                                 _ => continue,
                             };
-                            let nested = format!("{source}.get_property({key:?})");
+                            let nested = shared_property_get(source, &key);
                             self.lower_dynamic_local_pattern(
                                 &key_value.value,
                                 &nested,
@@ -3571,7 +3653,9 @@ impl LowerCtx {
                             );
                         }
                         ObjectPatProp::Rest(rest) => {
-                            let rest_source = format!("{source}.object_rest(&[{excluded}])");
+                            let rest_source = format!(
+                                "w3cos_core::intrinsics::object_rest(&{source}, &[{excluded}])"
+                            );
                             self.lower_dynamic_local_pattern(&rest.arg, &rest_source, lines, indent)
                         }
                     }
@@ -3605,16 +3689,24 @@ impl LowerCtx {
                 }
                 SimpleAssignTarget::Member(member) => {
                     let object = self.lower_expr(&member.obj);
+                    if let MemberProp::PrivateName(name) = &member.prop {
+                        let brand = self.private_brand();
+                        let name = atom_str(&name.name);
+                        lines.push(format!(
+                            "w3cos_core::intrinsics::set_private(&{object}, &{brand}, &w3cos_core::Value::string({name:?}), {source});"
+                        ));
+                        return;
+                    }
                     let key = match &member.prop {
                         MemberProp::Ident(ident) => format!("{:?}", ident.sym.to_string()),
                         MemberProp::Computed(computed) => {
                             format!("{}.to_js_string()", self.lower_expr(&computed.expr))
                         }
-                        MemberProp::PrivateName(name) => {
-                            format!("{:?}", self.private_key(name))
-                        }
+                        MemberProp::PrivateName(_) => unreachable!(),
                     };
-                    lines.push(format!("{object}.set_property(&{key}, {source});"));
+                    lines.push(format!(
+                        "w3cos_core::intrinsics::set_property(&{object}, &w3cos_core::Value::string({key}), {source});"
+                    ));
                 }
                 _ => {}
             },
@@ -3622,7 +3714,7 @@ impl LowerCtx {
                 AssignTargetPat::Array(array) => {
                     for (index, element) in array.elems.iter().enumerate() {
                         if let Some(element) = element {
-                            let nested = format!("{source}.get_property({:?})", index.to_string());
+                            let nested = shared_property_get(source, &index.to_string());
                             self.lower_dynamic_assign_pattern(element, &nested, lines);
                         }
                     }
@@ -3632,10 +3724,8 @@ impl LowerCtx {
                         match property {
                             ObjectPatProp::Assign(assign) => {
                                 let name = sanitize_ident(&assign.key.sym.to_string());
-                                let value = format!(
-                                    "{source}.get_property({:?})",
-                                    assign.key.sym.to_string()
-                                );
+                                let value =
+                                    shared_property_get(source, &assign.key.sym.to_string());
                                 let assigned = if let Some(default) = &assign.value {
                                     let fallback = self.lower_expr(default);
                                     format!(
@@ -3653,7 +3743,7 @@ impl LowerCtx {
                                     PropName::Num(value) => value.value.to_string(),
                                     _ => continue,
                                 };
-                                let nested = format!("{source}.get_property({key:?})");
+                                let nested = shared_property_get(source, &key);
                                 self.lower_dynamic_assign_pattern(&key_value.value, &nested, lines);
                             }
                             ObjectPatProp::Rest(rest) => {
@@ -3677,7 +3767,7 @@ impl LowerCtx {
             Pat::Array(array) => {
                 for (index, element) in array.elems.iter().enumerate() {
                     if let Some(element) = element {
-                        let nested = format!("{source}.get_property({:?})", index.to_string());
+                        let nested = shared_property_get(source, &index.to_string());
                         self.lower_dynamic_assign_pattern(element, &nested, lines);
                     }
                 }
@@ -3687,8 +3777,7 @@ impl LowerCtx {
                     match property {
                         ObjectPatProp::Assign(assign) => {
                             let name = sanitize_ident(&assign.key.sym.to_string());
-                            let value =
-                                format!("{source}.get_property({:?})", assign.key.sym.to_string());
+                            let value = shared_property_get(source, &assign.key.sym.to_string());
                             let assigned = if let Some(default) = &assign.value {
                                 let fallback = self.lower_expr(default);
                                 format!(
@@ -3706,7 +3795,7 @@ impl LowerCtx {
                                 PropName::Num(value) => value.value.to_string(),
                                 _ => continue,
                             };
-                            let nested = format!("{source}.get_property({key:?})");
+                            let nested = shared_property_get(source, &key);
                             self.lower_dynamic_assign_pattern(&key_value.value, &nested, lines);
                         }
                         ObjectPatProp::Rest(rest) => {
@@ -3939,7 +4028,7 @@ fn lower_closure_pattern(
         Pat::Array(array) => {
             for (index, element) in array.elems.iter().enumerate() {
                 if let Some(element) = element {
-                    let nested = format!("{source}.get_property({:?})", index.to_string());
+                    let nested = shared_property_get(source, &index.to_string());
                     lower_closure_pattern(element, &nested, output, renames, value_bindings);
                 }
             }
@@ -3950,8 +4039,7 @@ fn lower_closure_pattern(
                 match property {
                     ObjectPatProp::Assign(assign) => {
                         let name = sanitize_ident(&assign.key.sym.to_string());
-                        let value =
-                            format!("{source}.get_property({:?})", assign.key.sym.to_string());
+                        let value = shared_property_get(source, &assign.key.sym.to_string());
                         if let Some(default) = &assign.value {
                             let ctx = LowerCtx::new_dynamic_with_bindings(
                                 renames.to_vec(),
@@ -3972,7 +4060,7 @@ fn lower_closure_pattern(
                             PropName::Num(value) => value.value.to_string(),
                             _ => continue,
                         };
-                        let nested = format!("{source}.get_property({key:?})");
+                        let nested = shared_property_get(source, &key);
                         lower_closure_pattern(
                             &key_value.value,
                             &nested,
@@ -3982,7 +4070,9 @@ fn lower_closure_pattern(
                         );
                     }
                     ObjectPatProp::Rest(rest) => {
-                        let rest_source = format!("{source}.object_rest(&[{excluded}])");
+                        let rest_source = format!(
+                            "w3cos_core::intrinsics::object_rest(&{source}, &[{excluded}])"
+                        );
                         lower_closure_pattern(
                             &rest.arg,
                             &rest_source,
@@ -4031,34 +4121,26 @@ fn atom_str(atom: &impl ToString) -> String {
     sanitize_ident(&atom.to_string())
 }
 
-/// Is this statement a top-level `super(...)` call (derived-ctor marker)?
-pub(crate) fn is_super_call_stmt(stmt: &Stmt) -> bool {
-    matches!(
-        stmt,
-        Stmt::Expr(expr_stmt)
-            if matches!(
-                expr_stmt.expr.as_ref(),
-                Expr::Call(call) if matches!(call.callee, Callee::Super(_))
-            )
-    )
+fn shared_property_get(source: &str, key: &str) -> String {
+    format!("w3cos_core::intrinsics::get_property(&{source}, &w3cos_core::Value::string({key:?}))")
 }
 
-/// Map a compound assignment operator (`+=`, `-=`, ...) to the `Value`
-/// method implementing it. Plain `=` and logical-assign ops return `None`.
-fn compound_assign_op(op: AssignOp) -> Option<&'static str> {
+/// Map a compound assignment operator (`+=`, `-=`, ...) to the shared Core
+/// intrinsic implementing it. Plain `=` and logical-assign ops return `None`.
+fn compound_assign_intrinsic(op: AssignOp) -> Option<&'static str> {
     match op {
-        AssignOp::AddAssign => Some("js_add"),
-        AssignOp::SubAssign => Some("js_sub"),
-        AssignOp::MulAssign => Some("js_mul"),
-        AssignOp::DivAssign => Some("js_div"),
-        AssignOp::ModAssign => Some("js_rem"),
-        AssignOp::ExpAssign => Some("js_pow"),
-        AssignOp::BitAndAssign => Some("js_bitand"),
-        AssignOp::BitOrAssign => Some("js_bitor"),
-        AssignOp::BitXorAssign => Some("js_bitxor"),
-        AssignOp::LShiftAssign => Some("js_shl"),
-        AssignOp::RShiftAssign => Some("js_shr"),
-        AssignOp::ZeroFillRShiftAssign => Some("js_ushr"),
+        AssignOp::AddAssign => Some("add"),
+        AssignOp::SubAssign => Some("subtract"),
+        AssignOp::MulAssign => Some("multiply"),
+        AssignOp::DivAssign => Some("divide"),
+        AssignOp::ModAssign => Some("remainder"),
+        AssignOp::ExpAssign => Some("exponentiate"),
+        AssignOp::BitAndAssign => Some("bitwise_and"),
+        AssignOp::BitOrAssign => Some("bitwise_or"),
+        AssignOp::BitXorAssign => Some("bitwise_xor"),
+        AssignOp::LShiftAssign => Some("left_shift"),
+        AssignOp::RShiftAssign => Some("signed_right_shift"),
+        AssignOp::ZeroFillRShiftAssign => Some("unsigned_right_shift"),
         _ => None,
     }
 }
@@ -4302,22 +4384,10 @@ fn global_value_expr(name: &str) -> Option<String> {
         "Map" => "w3cos_core::collections::map_class()".to_string(),
         "RegExp" => "w3cos_core::regexp::regexp_class()".to_string(),
         "BigInt" => "w3cos_core::bigint::bigint_class()".to_string(),
-        // `Array` as a value: callable facade — calling it mirrors the
-        // `new Array` semantics (single numeric arg = length); the statics
-        // implemented by the core builtin (currently `from`) are installed as
-        // properties so `Array.from(x)` keeps working.
-        "Array" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"from\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Array.call_method(\"from\", __args))), (\"isArray\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(matches!(__args.first(), Some(w3cos_core::Value::Array(_))))))]), |_this, __args| { if __args.len() == 1 && __args[0].is_number() { let n = __args[0].to_number() as usize; w3cos_core::Value::array(vec![w3cos_core::Value::Undefined; n]) } else { w3cos_core::Value::array(__args) } })"
-            .to_string(),
-        // `Object` as a value (`x.constructor === Object`, `Object(x)`):
-        // callable facade with the core builtin's statics as properties, so
-        // `Object.keys(x)` / `Object.values(x)` / `Object.is(a, b)` keep
-        // working through plain member calls. `create` ignores the prototype
-        // argument (fresh empty object); `assign` merges own enumerable
-        // properties; `entries`/`getOwnPropertyNames` mirror `keys`;
-        // `freeze` is a pass-through. The standard prototype method remains
-        // extractable through `Object.prototype.hasOwnProperty.call(...)`.
-        "Object" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"prototype\".to_string(), w3cos_core::Value::object(::std::collections::HashMap::from([(\"hasOwnProperty\".to_string(), w3cos_core::Value::function(|__this, __args| __this.call_method(\"hasOwnProperty\", __args)))]))), (\"keys\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"keys\", __args))), (\"values\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"values\", __args))), (\"is\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"is\", __args))), (\"create\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::object(::std::collections::HashMap::new()))), (\"getPrototypeOf\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::class::get_prototype_of(&__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))), (\"getOwnPropertyDescriptor\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let key = __args.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); w3cos_core::class::get_own_property_descriptor(&obj, &key) })), (\"defineProperty\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let key = __args.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let descriptor = __args.get(2).cloned().unwrap_or(w3cos_core::Value::Undefined); w3cos_core::class::define_property(&obj, &key, &descriptor) })), (\"freeze\".to_string(), w3cos_core::Value::function(|_this, __args| __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined))), (\"getOwnPropertyNames\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Object.call_method(\"keys\", __args))), (\"assign\".to_string(), w3cos_core::Value::function(|_this, __args| { let target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); for source in __args.iter().skip(1) { for key in w3cos_core::Object.call_method(\"keys\", vec![source.clone()]).iter() { let k = key.to_js_string(); let v = source.get_property(&k); target.set_property(&k, v); } } target })), (\"entries\".to_string(), w3cos_core::Value::function(|_this, __args| { let obj = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let mut out = Vec::new(); for key in w3cos_core::Object.call_method(\"keys\", vec![obj.clone()]).iter() { let k = key.to_js_string(); out.push(w3cos_core::Value::array(vec![w3cos_core::Value::from(k.clone()), obj.get_property(&k)])); } w3cos_core::Value::array(out) }))]), |_this, __args| __args.first().cloned().unwrap_or_else(|| w3cos_core::Value::object(::std::collections::HashMap::new())))"
-            .to_string(),
+        // These callable standard globals are created in Core so ordinary
+        // AOT and dynamic W3VM Realms cannot drift into separate facades.
+        "Array" => "w3cos_core::array_value()".to_string(),
+        "Object" => "w3cos_core::object_value()".to_string(),
         "document" => "w3cos_runtime::jsdom::document_value()".to_string(),
         "window" | "self" | "globalThis" => {
             "w3cos_runtime::jsdom::window_value()".to_string()
@@ -4327,8 +4397,10 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "visualViewport" | "customElements" | "caches" | "scheduler" | "cookieStore"
         | "trustedTypes"
         | "screen" | "crypto" | "navigation" | "launchQueue" | "reportError" | "setImmediate"
-        | "MessageChannel" => {
-            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+        | "MessageChannel" | "__REACT_DEVTOOLS_GLOBAL_HOOK__" => {
+            format!(
+                "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value(), &w3cos_core::Value::string({name:?}))"
+            )
         }
         // Scheduling/utility globals: the jsdom window holds them as function
         // values, so a bare reference is just the property read (calling it
@@ -4338,7 +4410,9 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "requestIdleCallback" | "cancelIdleCallback"
         | "matchMedia" | "getComputedStyle" | "getSelection" | "scrollTo"
         | "scrollBy" | "scroll" | "getScreenDetails" => {
-            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+            format!(
+                "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value(), &w3cos_core::Value::string({name:?}))"
+            )
         }
         "atob" => {
             "w3cos_core::Value::function(|_this, __args| w3cos_core::web::atob(__args))"
@@ -4355,8 +4429,8 @@ fn global_value_expr(name: &str) -> Option<String> {
         // Facade objects exposing the builtin entry points as properties, so
         // `Promise.resolve(x)` / `JSON.parse(s)` work through plain member
         // calls (and the facades can be passed around as values).
-        "Promise" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"resolve\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::resolve(__args))), (\"reject\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::reject(__args))), (\"all\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::all(__args))), (\"race\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::promise::race(__args)))]))".to_string(),
-        "JSON" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"parse\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::json::parse(__args))), (\"stringify\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::json::stringify(__args)))]))".to_string(),
+        "Promise" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"resolve\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_resolve(__args))), (\"reject\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_reject(__args))), (\"all\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_all(__args))), (\"race\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_race(__args)))]), |_this, __args| w3cos_core::intrinsics::promise_new(__args))".to_string(),
+        "JSON" => "w3cos_core::json_value()".to_string(),
         "Intl" => "w3cos_core::web::intl_value()".to_string(),
         "URL" => "w3cos_core::web::url_class()".to_string(),
         "URLSearchParams" => "w3cos_core::web::url_search_params_class()".to_string(),
@@ -4399,7 +4473,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         "Date" => "w3cos_core::web::date_class()".to_string(),
         "fetch" => "w3cos_core::Value::function(|_this, __args| w3cos_runtime::fetch::fetch_value(__args))".to_string(),
         "WebSocket" => {
-            "w3cos_runtime::jsdom::window_value().get_property(\"WebSocket\")".to_string()
+            "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value(), &w3cos_core::Value::string(\"WebSocket\"))".to_string()
         }
         "Request" | "Response" | "Headers" | "AbortController" | "AbortSignal"
         | "TextEncoder" | "TextDecoder" | "Event" | "CustomEvent" | "EventTarget"
@@ -4501,7 +4575,9 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "IDBCursorWithValue" | "IDBVersionChangeEvent"
         | "SpeechRecognition" | "webkitSpeechRecognition" | "MediaStream"
         | "MediaStreamTrack" | "MediaDeviceInfo" => {
-            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+            format!(
+                "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value(), &w3cos_core::Value::string({name:?}))"
+            )
         }
         "DOMException"
         | "DOMRect" | "DOMRectReadOnly" | "DOMRectList" | "DOMPoint" | "DOMPointReadOnly"
@@ -4511,16 +4587,20 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "CSSStyleDeclaration" | "DOMParser"
         | "XMLSerializer" | "CSSStyleSheet" | "eval"
         | "escape" | "unescape" | "CSS" => {
-            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+            format!(
+                "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value(), &w3cos_core::Value::string({name:?}))"
+            )
         }
         "encodeURI" | "encodeURIComponent" | "decodeURI" | "decodeURIComponent" => {
-            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+            format!(
+                "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value(), &w3cos_core::Value::string({name:?}))"
+            )
         }
         // `Reflect` facade: `Reflect.construct(target, args)` routes through
         // the class runtime (Monaco's InstantiationService._createInstance
         // builds every service through it). The optional newTarget argument
         // is ignored; all other Reflect members degrade to Undefined.
-        "Reflect" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"construct\".to_string(), w3cos_core::Value::function(|_this, __args| { let __target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let __ctor_args: Vec<w3cos_core::Value> = __args.get(1).map(|__a| __a.iter().collect()).unwrap_or_default(); w3cos_core::class::construct(&__target, __ctor_args) }))]))".to_string(),
+        "Reflect" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"construct\".to_string(), w3cos_core::Value::function(|_this, __args| { let __target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let __ctor_args: Vec<w3cos_core::Value> = __args.get(1).map(|__a| __a.iter().collect()).unwrap_or_default(); w3cos_core::intrinsics::construct(&__target, __ctor_args) }))]))".to_string(),
         // Symbols use collision-resistant string sentinels in the compact
         // runtime. `Symbol.for(key)` must be stable because libraries use the
         // global registry for cross-module identity.
@@ -4864,20 +4944,32 @@ fn lower_bin_op(op: BinaryOp) -> &'static str {
 
 fn lower_dynamic_bin_op(op: BinaryOp, left: &str, right: &str) -> String {
     match op {
-        BinaryOp::Add => format!("{left}.js_add(&{right})"),
-        BinaryOp::Sub => format!("{left}.js_sub(&{right})"),
-        BinaryOp::Mul => format!("{left}.js_mul(&{right})"),
-        BinaryOp::Div => format!("{left}.js_div(&{right})"),
-        BinaryOp::Mod => format!("{left}.js_rem(&{right})"),
-        BinaryOp::Exp => format!("{left}.js_pow(&{right})"),
-        BinaryOp::EqEqEq => format!("w3cos_core::Value::Bool({left}.strict_eq(&{right}))"),
-        BinaryOp::NotEqEq => format!("w3cos_core::Value::Bool(!{left}.strict_eq(&{right}))"),
-        BinaryOp::EqEq => format!("w3cos_core::Value::Bool({left}.abstract_eq(&{right}))"),
-        BinaryOp::NotEq => format!("w3cos_core::Value::Bool(!{left}.abstract_eq(&{right}))"),
-        BinaryOp::Lt => format!("w3cos_core::Value::Bool({left}.js_lt(&{right}))"),
-        BinaryOp::LtEq => format!("w3cos_core::Value::Bool({left}.js_le(&{right}))"),
-        BinaryOp::Gt => format!("w3cos_core::Value::Bool({left}.js_gt(&{right}))"),
-        BinaryOp::GtEq => format!("w3cos_core::Value::Bool({left}.js_ge(&{right}))"),
+        BinaryOp::Add => format!("w3cos_core::intrinsics::add(&{left}, &{right})"),
+        BinaryOp::Sub => format!("w3cos_core::intrinsics::subtract(&{left}, &{right})"),
+        BinaryOp::Mul => format!("w3cos_core::intrinsics::multiply(&{left}, &{right})"),
+        BinaryOp::Div => format!("w3cos_core::intrinsics::divide(&{left}, &{right})"),
+        BinaryOp::Mod => format!("w3cos_core::intrinsics::remainder(&{left}, &{right})"),
+        BinaryOp::Exp => format!("w3cos_core::intrinsics::exponentiate(&{left}, &{right})"),
+        BinaryOp::EqEqEq => {
+            format!("w3cos_core::intrinsics::strict_equal(&{left}, &{right})")
+        }
+        BinaryOp::NotEqEq => format!(
+            "w3cos_core::intrinsics::logical_not(&w3cos_core::intrinsics::strict_equal(&{left}, &{right}))"
+        ),
+        BinaryOp::EqEq => {
+            format!("w3cos_core::intrinsics::abstract_equal(&{left}, &{right})")
+        }
+        BinaryOp::NotEq => format!(
+            "w3cos_core::intrinsics::logical_not(&w3cos_core::intrinsics::abstract_equal(&{left}, &{right}))"
+        ),
+        BinaryOp::Lt => format!("w3cos_core::intrinsics::less_than(&{left}, &{right})"),
+        BinaryOp::LtEq => {
+            format!("w3cos_core::intrinsics::less_than_or_equal(&{left}, &{right})")
+        }
+        BinaryOp::Gt => format!("w3cos_core::intrinsics::greater_than(&{left}, &{right})"),
+        BinaryOp::GtEq => {
+            format!("w3cos_core::intrinsics::greater_than_or_equal(&{left}, &{right})")
+        }
         BinaryOp::LogicalAnd => {
             // Bind the left operand once: emitting its text twice (as a naive
             // `if l { r } else { l }` does) doubles per `&&` in a chain and
@@ -4890,15 +4982,19 @@ fn lower_dynamic_bin_op(op: BinaryOp, left: &str, right: &str) -> String {
         BinaryOp::NullishCoalescing => {
             format!("{{ let __l = {left}; if __l.is_nullish() {{ {right} }} else {{ __l }} }}")
         }
-        BinaryOp::BitAnd => format!("{left}.js_bitand(&{right})"),
-        BinaryOp::BitOr => format!("{left}.js_bitor(&{right})"),
-        BinaryOp::BitXor => format!("{left}.js_bitxor(&{right})"),
-        BinaryOp::LShift => format!("{left}.js_shl(&{right})"),
-        BinaryOp::RShift => format!("{left}.js_shr(&{right})"),
-        BinaryOp::ZeroFillRShift => format!("{left}.js_ushr(&{right})"),
-        BinaryOp::In => format!("{left}.js_in(&{right})"),
+        BinaryOp::BitAnd => format!("w3cos_core::intrinsics::bitwise_and(&{left}, &{right})"),
+        BinaryOp::BitOr => format!("w3cos_core::intrinsics::bitwise_or(&{left}, &{right})"),
+        BinaryOp::BitXor => format!("w3cos_core::intrinsics::bitwise_xor(&{left}, &{right})"),
+        BinaryOp::LShift => format!("w3cos_core::intrinsics::left_shift(&{left}, &{right})"),
+        BinaryOp::RShift => {
+            format!("w3cos_core::intrinsics::signed_right_shift(&{left}, &{right})")
+        }
+        BinaryOp::ZeroFillRShift => {
+            format!("w3cos_core::intrinsics::unsigned_right_shift(&{left}, &{right})")
+        }
+        BinaryOp::In => format!("w3cos_core::intrinsics::in_operator(&{left}, &{right})"),
         BinaryOp::InstanceOf => {
-            format!("w3cos_core::Value::Bool(w3cos_core::class::instance_of(&{left}, &{right}))")
+            format!("w3cos_core::intrinsics::instance_of(&{left}, &{right})")
         }
     }
 }
@@ -5069,7 +5165,7 @@ mod tests {
             "spread arguments: {code}"
         );
         assert!(
-            code.contains("fn_.clone().call(w3cos_core::Value::Undefined"),
+            code.contains("w3cos_core::intrinsics::call(&fn_.clone()"),
             "dynamic function call: {code}"
         );
     }
@@ -5133,18 +5229,21 @@ mod tests {
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("let mut value = __binding0.get_property(\"0\")")
-                && code.contains("let mut setValue = __binding0.get_property(\"1\")"),
+            code.contains("let mut value = w3cos_core::intrinsics::get_property(&__binding0")
+                && code.contains("Value::string(\"0\")")
+                && code.contains("Value::string(\"1\")"),
             "array destructuring: {code}"
         );
         assert!(
-            code.contains("let mut h = __binding1.get_property(\"height\")")
-                && code
-                    .contains("let mut width = { let value = __binding1.get_property(\"width\")"),
+            code.contains("let mut h = w3cos_core::intrinsics::get_property(&__binding1")
+                && code.contains("Value::string(\"height\")")
+                && code.contains("Value::string(\"width\")"),
             "object destructuring: {code}"
         );
         assert!(
-            code.contains("let mut rest = __binding1.object_rest(&[\"height\", \"width\"]);"),
+            code.contains(
+                "let mut rest = w3cos_core::intrinsics::object_rest(&__binding1, &[\"height\", \"width\"]);"
+            ),
             "object rest must exclude prior bindings: {code}"
         );
     }
@@ -5158,8 +5257,11 @@ mod tests {
         let code = ctx.lower_stmts(&stmts);
         assert!(
             code.contains("Value::function(move |_this, __args|")
-                && code.contains("let mut current = __args.get(0)")
-                && code.contains("set_property(&\"value\"")
+                && code.contains(
+                    "let mut current = w3cos_core::intrinsics::get_property(&__args.get(0)"
+                )
+                && code.contains("w3cos_core::intrinsics::set_property(")
+                && code.contains("Value::string(\"value\")")
                 && code.contains("is_nullish()"),
             "dynamic closure lowering: {code}"
         );
@@ -5240,7 +5342,7 @@ mod tests {
         );
         assert!(
             code.contains("let mut ctx = ctx.clone();")
-                && code.contains("ctx.clone().get_property"),
+                && code.contains("w3cos_core::intrinsics::get_property(&ctx.clone()"),
             "nested JSX callback must clone ctx before use: {code}"
         );
     }
@@ -5292,7 +5394,7 @@ mod tests {
             "optionalPackageHook",
         ] {
             assert!(
-                code.contains(&format!("window_value().get_property({name:?})")),
+                code.contains(&format!("Value::string({name:?})")),
                 "optional global {name}: {code}"
             );
         }
@@ -5333,7 +5435,7 @@ mod tests {
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("suspended.js_bitnot()"),
+            code.contains("w3cos_core::intrinsics::bitwise_not(&suspended)"),
             "bitwise not must not degrade to the operand: {code}"
         );
     }
@@ -5582,49 +5684,45 @@ const scr = screen.width;"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_runtime::jsdom::document_value().call_method(\"getElementById\""),
+            code.contains(
+                "w3cos_core::intrinsics::call_method(&w3cos_runtime::jsdom::document_value()"
+            ) && code.contains("Value::string(\"getElementById\")"),
             "document.* → jsdom document: {code}"
         );
         assert!(
-            code.contains("w3cos_runtime::jsdom::window_value().get_property(\"innerWidth\")"),
+            code.contains("Value::string(\"innerWidth\")"),
             "window.innerWidth: {code}"
         );
         assert!(
-            code.contains("w3cos_runtime::jsdom::window_value().get_property(\"location\")"),
+            code.contains("Value::string(\"location\")"),
             "globalThis.location: {code}"
         );
         assert!(
-            code.contains("w3cos_runtime::jsdom::window_value().get_property(\"closed\")"),
+            code.contains("Value::string(\"closed\")"),
             "self.closed: {code}"
         );
         assert!(
-            code.contains(
-                "w3cos_runtime::jsdom::window_value().get_property(\"navigator\").get_property(\"userAgent\")"
-            ),
+            code.contains("Value::string(\"navigator\")")
+                && code.contains("Value::string(\"userAgent\")"),
             "navigator.userAgent: {code}"
         );
         assert!(
-            code.contains(
-                "w3cos_runtime::jsdom::window_value().get_property(\"localStorage\").call_method(\"getItem\""
-            ),
+            code.contains("Value::string(\"localStorage\")")
+                && code.contains("Value::string(\"getItem\")"),
             "localStorage.getItem: {code}"
         );
         assert!(
-            code.contains(
-                "w3cos_runtime::jsdom::window_value().get_property(\"indexedDB\").call_method(\"open\""
-            ),
+            code.contains("Value::string(\"indexedDB\")")
+                && code.contains("Value::string(\"open\")"),
             "indexedDB.open: {code}"
         );
         assert!(
-            code.contains(
-                "w3cos_runtime::jsdom::window_value().get_property(\"performance\").call_method(\"now\""
-            ),
+            code.contains("Value::string(\"performance\")")
+                && code.contains("Value::string(\"now\")"),
             "performance.now: {code}"
         );
         assert!(
-            code.contains(
-                "w3cos_runtime::jsdom::window_value().get_property(\"screen\").get_property(\"width\")"
-            ),
+            code.contains("Value::string(\"screen\")") && code.contains("Value::string(\"width\")"),
             "screen.width: {code}"
         );
     }
@@ -5654,9 +5752,7 @@ const sel = getSelection();"#,
             "getSelection",
         ] {
             assert!(
-                code.contains(&format!(
-                    "w3cos_runtime::jsdom::window_value().get_property(\"{name}\")"
-                )),
+                code.contains(&format!("Value::string(\"{name}\")")),
                 "{name} → window function value: {code}"
             );
         }
@@ -5668,7 +5764,7 @@ const sel = getSelection();"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("let _ = reload.call("),
+            code.contains("let _ = w3cos_core::intrinsics::call(&reload"),
             "void operand must still be evaluated: {code}"
         );
         assert!(
@@ -5701,24 +5797,20 @@ const params = new URLSearchParams("a=1");"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::promise::new(vec!["),
+            code.contains("w3cos_core::intrinsics::promise_new(vec!["),
             "new Promise: {code}"
         );
         assert!(
-            code.contains("w3cos_core::promise::resolve(__args)"),
+            code.contains("w3cos_core::intrinsics::promise_resolve(__args)"),
             "Promise.resolve facade: {code}"
         );
         assert!(
-            code.contains("w3cos_core::promise::all(__args)"),
+            code.contains("w3cos_core::intrinsics::promise_all(__args)"),
             "Promise.all facade: {code}"
         );
         assert!(
-            code.contains("w3cos_core::json::parse(__args)"),
-            "JSON.parse facade: {code}"
-        );
-        assert!(
-            code.contains("w3cos_core::json::stringify(__args)"),
-            "JSON.stringify facade: {code}"
+            code.matches("w3cos_core::json_value()").count() >= 2,
+            "JSON parse/stringify must use the shared Core facade: {code}"
         );
         assert!(
             code.contains("w3cos_core::web::atob(__args)"),
@@ -5737,7 +5829,7 @@ const params = new URLSearchParams("a=1");"#,
             "fetch facade: {code}"
         );
         assert!(
-            code.contains("window_value().get_property(\"WebSocket\")"),
+            code.contains("Value::string(\"WebSocket\")"),
             "WebSocket facade: {code}"
         );
         for constructor in [
@@ -5748,7 +5840,7 @@ const params = new URLSearchParams("a=1");"#,
             "AbortSignal",
         ] {
             assert!(
-                code.contains(&format!("window_value().get_property(\"{constructor}\")")),
+                code.contains(&format!("Value::string(\"{constructor}\")")),
                 "{constructor} facade: {code}"
             );
         }
@@ -5780,13 +5872,15 @@ const params = new URLSearchParams("a=1");"#,
         let code = ctx.lower_stmts(&stmts);
         assert!(
             code.contains("let __assign_value = arr")
-                && code.contains("a = __assign_value.get_property(\"0\");")
-                && code.contains("b = __assign_value.get_property(\"1\");"),
+                && code.contains("a = w3cos_core::intrinsics::get_property(&__assign_value")
+                && code.contains("b = w3cos_core::intrinsics::get_property(&__assign_value"),
             "array destructuring assignment: {code}"
         );
         assert!(
-            code.contains("x = __assign_value.get_property(\"x\");")
-                && code.contains("z = __assign_value.get_property(\"y\").get_property(\"z\");"),
+            code.contains("x = w3cos_core::intrinsics::get_property(&__assign_value")
+                && code.contains("z = w3cos_core::intrinsics::get_property(")
+                && code.contains("Value::string(\"y\")")
+                && code.contains("Value::string(\"z\")"),
             "object destructuring assignment: {code}"
         );
         assert!(
@@ -5892,14 +5986,131 @@ const params = new URLSearchParams("a=1");"#,
             "self-recursive nested fn keeps fn item: {code}"
         );
         assert!(
-            code.contains("fib(vec![n.clone().js_sub(&w3cos_core::Value::Number(1.0)).clone()])")
-                || code.contains("fib(vec![n.js_sub(&w3cos_core::Value::Number(1.0))"),
+            code.contains(
+                "fib(vec![w3cos_core::intrinsics::subtract(&n.clone(), &w3cos_core::Value::Number(1.0)).clone()])"
+            ) || code.contains(
+                "fib(vec![w3cos_core::intrinsics::subtract(&n, &w3cos_core::Value::Number(1.0))"
+            ),
             "recursive call uses the direct fn-item form: {code}"
         );
         assert!(
             !code.contains("let mut fib = w3cos_core::Value::Undefined;"),
             "fn-item names are not hoisted (would shadow the item): {code}"
         );
+    }
+
+    #[test]
+    fn dynamic_module_expressions_use_the_shared_binary_intrinsics() {
+        let stmts = parse_stmts(
+            r#"
+const arithmetic = a - b * c / d % e ** f;
+const equality = a == b || a != b || a === b || a !== b;
+const ordering = a < b || a <= b || a > b || a >= b;
+const bits = (a & b) | (a ^ b) | (a << b) | (a >> b) | (a >>> b);
+const membership = key in object;
+const inheritance = object instanceof Constructor;
+"#,
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+
+        for intrinsic in [
+            "subtract",
+            "multiply",
+            "divide",
+            "remainder",
+            "exponentiate",
+            "abstract_equal",
+            "strict_equal",
+            "logical_not",
+            "less_than",
+            "less_than_or_equal",
+            "greater_than",
+            "greater_than_or_equal",
+            "bitwise_and",
+            "bitwise_or",
+            "bitwise_xor",
+            "left_shift",
+            "signed_right_shift",
+            "unsigned_right_shift",
+            "in_operator",
+            "instance_of",
+        ] {
+            assert!(
+                code.contains(&format!("w3cos_core::intrinsics::{intrinsic}(")),
+                "missing shared {intrinsic} intrinsic: {code}"
+            );
+        }
+        assert!(
+            !code.contains(".js_sub(")
+                && !code.contains(".js_mul(")
+                && !code.contains(".js_div(")
+                && !code.contains(".js_rem(")
+                && !code.contains(".js_pow(")
+                && !code.contains("class::instance_of("),
+            "module initialization must not bypass the shared binary ABI: {code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_module_operations_cannot_bypass_the_shared_semantic_abi() {
+        let stmts = parse_stmts(
+            r#"
+const read = object[key];
+object[key] = read;
+object.count += 2;
+object.count++;
+object.method(read);
+callable(read);
+const made = new Constructor(read);
+delete object[key];
+const optional = object?.method?.(read);
+const pending = new Promise((resolve) => resolve(read));
+const ready = Promise.resolve(read);
+const Derived = class extends Base {
+  constructor(value) { super(value); }
+  method() { return super.read() + super.value; }
+};
+"#,
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Base"]));
+        let code = ctx.lower_stmts(&stmts);
+
+        for intrinsic in [
+            "get_property",
+            "set_property",
+            "delete_property",
+            "call_method",
+            "call",
+            "construct",
+            "add",
+            "promise_new",
+            "promise_resolve",
+            "super_construct",
+            "super_call",
+            "super_get",
+        ] {
+            assert!(
+                code.contains(&format!("w3cos_core::intrinsics::{intrinsic}(")),
+                "missing shared {intrinsic} intrinsic: {code}"
+            );
+        }
+        for bypass in [
+            ".get_property(",
+            ".set_property(",
+            ".delete_property(",
+            ".call_method(",
+            ".js_add(",
+            "w3cos_core::class::construct(",
+            "w3cos_core::class::super_",
+            "w3cos_core::promise::new(",
+            "w3cos_core::promise::resolve(",
+        ] {
+            assert!(
+                !code.contains(bypass),
+                "direct semantic bypass {bypass} reintroduced: {code}"
+            );
+        }
     }
 
     #[test]
@@ -5925,12 +6136,13 @@ function f(window) { return window.x; }"#,
             "local `document` shadows the global: {code}"
         );
         assert!(
-            code.contains("document.clone().get_property(\"title\")"),
+            code.contains("w3cos_core::intrinsics::get_property(&document.clone()")
+                && code.contains("Value::string(\"title\")"),
             "shadowed member read: {code}"
         );
         assert!(
-            code.contains("return window.get_property(\"x\");")
-                || code.contains("return window.clone().get_property(\"x\");"),
+            code.contains("return w3cos_core::intrinsics::get_property(&window")
+                && code.contains("Value::string(\"x\")"),
             "fn param `window` shadows the global: {code}"
         );
     }
@@ -5994,7 +6206,7 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["EditorView"]));
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::class::construct(&EditorView(), vec!["),
+            code.contains("w3cos_core::intrinsics::construct(&EditorView(), vec!["),
             "new on a class → construct(&EditorView(), ...): {code}"
         );
     }
@@ -6008,23 +6220,25 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(renames);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::class::construct(&makeWidget_value()"),
+            code.contains("w3cos_core::intrinsics::construct(&makeWidget_value()"),
             "new on a function value → construct: {code}"
         );
-        // The Error special-case stays intact; Map is no longer special-cased
-        // (it routes through construct on the collections class value).
+        // Error and Map both route through construct on their runtime class
+        // values, preserving constructor semantics without codegen-only paths.
         let stmts = parse_stmts("const m = new Map([\"a\", 1]); const e = new Error(\"x\");");
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
             code.contains(
-                "w3cos_core::class::construct(&w3cos_core::collections::map_class(), vec!["
+                "w3cos_core::intrinsics::construct(&w3cos_core::collections::map_class(), vec!["
             ),
             "new Map → construct on the collections class: {code}"
         );
         assert!(
-            code.contains("Error::new(vec!["),
-            "Error special-case: {code}"
+            code.contains(
+                "w3cos_core::intrinsics::construct(&w3cos_core::error_class(\"Error\"), vec!["
+            ),
+            "new Error → construct on the runtime error class: {code}"
         );
     }
 
@@ -6043,16 +6257,16 @@ function f(window) { return window.x; }"#,
         ] {
             assert!(
                 code.contains(&format!(
-                    "w3cos_core::class::construct(&w3cos_core::collections::{class_fn}(), vec!["
+                    "w3cos_core::intrinsics::construct(&w3cos_core::collections::{class_fn}(), vec!["
                 )),
                 "{ctor} → construct on the collections class: {code}"
             );
         }
         assert!(
             code.contains(
-                "w3cos_core::class::instance_of(&m.clone(), &w3cos_core::collections::map_class())"
+                "w3cos_core::intrinsics::instance_of(&m.clone(), &w3cos_core::collections::map_class())"
             ),
-            "instanceof Map → instance_of on the collections class: {code}"
+            "instanceof Map → shared instance_of intrinsic: {code}"
         );
         // Bare `Map`/`Set` references resolve to the class singletons.
         assert!(
@@ -6072,7 +6286,7 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::class::construct(&w3cos_core::proxy_class(), vec!["),
+            code.contains("w3cos_core::intrinsics::construct(&w3cos_core::proxy_class(), vec!["),
             "new Proxy → dynamic proxy runtime: {code}"
         );
     }
@@ -6083,9 +6297,8 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("\"isArray\".to_string()")
-                && code.contains("Some(w3cos_core::Value::Array(_))"),
-            "Array.isArray must inspect the runtime Value variant: {code}"
+            code.contains("w3cos_core::array_value()"),
+            "Array.isArray must use the shared Core facade: {code}"
         );
     }
 
@@ -6101,7 +6314,8 @@ function f(window) { return window.x; }"#,
             "regexp literal → runtime value: {code}"
         );
         assert!(
-            code.contains("call_method(\"match\""),
+            code.contains("w3cos_core::intrinsics::call_method(&value")
+                && code.contains("Value::string(\"match\")"),
             "reserved Rust words must remain unchanged as JS property keys: {code}"
         );
     }
@@ -6112,8 +6326,9 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("options.delete_property(&\"model\")")
-                && code.contains("options.delete_property(&key.to_js_string())"),
+            code.contains("w3cos_core::intrinsics::delete_property(&options")
+                && code.contains("Value::string(\"model\")")
+                && code.contains("&key)"),
             "delete must perform a runtime property mutation: {code}"
         );
     }
@@ -6125,7 +6340,8 @@ function f(window) { return window.x; }"#,
         let code = ctx.lower_stmts(&stmts);
         assert!(
             code.contains("w3cos_core::binary::typed_array_class(\"Uint16Array\")")
-                && code.contains("call_method(\"set\""),
+                && code.contains("w3cos_core::intrinsics::call_method(&lines.clone()")
+                && code.contains("Value::string(\"set\")"),
             "typed arrays need indexed runtime storage: {code}"
         );
     }
@@ -6136,8 +6352,9 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&statements);
         assert!(
-            code.contains("__proto.set_property(\"match\"")
-                && !code.contains("__proto.set_property(\"match_\""),
+            code.contains("w3cos_core::intrinsics::set_property(&__proto")
+                && code.contains("Value::string(\"match\")")
+                && !code.contains("Value::string(\"match_\")"),
             "Rust identifier sanitization must not alter JS property keys: {code}"
         );
     }
@@ -6150,8 +6367,8 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::class::construct(&__target, __ctor_args)"),
-            "Reflect.construct → class::construct facade: {code}"
+            code.contains("w3cos_core::intrinsics::construct(&__target, __ctor_args)"),
+            "Reflect.construct → shared construct facade: {code}"
         );
     }
 
@@ -6174,7 +6391,9 @@ function f(window) { return window.x; }"#,
         let code = context.lower_stmts(&statements);
 
         assert!(
-            code.contains("__w3cos_symbol_for:{}") && code.contains("call_method(\"for\""),
+            code.contains("__w3cos_symbol_for:{}")
+                && code.contains("w3cos_core::intrinsics::call_method(")
+                && code.contains("Value::string(\"for\")"),
             "Symbol.for registry facade: {code}"
         );
     }
@@ -6193,11 +6412,11 @@ function f(window) { return window.x; }"#,
             "logical-and preserves the selected operand: {code}"
         );
         assert!(
-            code.contains("w3cos_core::class::construct(&__target, __ctor_args) }))]))"),
+            code.contains("w3cos_core::intrinsics::construct(&__target, __ctor_args) }))]))"),
             "Reflect facade closes function, tuple, array, HashMap, and object: {code}"
         );
         assert!(
-            !code.contains("w3cos_core::class::construct(&__target, __ctor_args) })))]))"),
+            !code.contains("w3cos_core::intrinsics::construct(&__target, __ctor_args) })))]))"),
             "Reflect facade must not contain the old extra tuple delimiter: {code}"
         );
     }
@@ -6208,8 +6427,8 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Animal"]));
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::class::instance_of(&dog, &Animal())"),
-            "instanceof → class::instance_of: {code}"
+            code.contains("w3cos_core::intrinsics::instance_of(&dog, &Animal())"),
+            "instanceof → shared instance_of intrinsic: {code}"
         );
     }
 
@@ -6219,7 +6438,7 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Widget"]));
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::class::construct(&Widget(), vec!["),
+            code.contains("w3cos_core::intrinsics::construct(&Widget(), vec!["),
             "class call without new → construct: {code}"
         );
     }
@@ -6229,6 +6448,7 @@ function f(window) { return window.x; }"#,
         let stmts = parse_stmts(
             r#"const Dog = class Dog extends Animal {
   #tag = "dog";
+  ["ready"] = true;
   constructor(name, bark) { super(name); this.bark = bark; }
   get label() { return this.name; }
   set label(v) { this.name = v; }
@@ -6240,69 +6460,81 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Animal"]));
         let code = ctx.lower_stmts(&stmts);
 
-        // Eagerly built class value with call slot.
-        assert!(
-            code.contains("w3cos_core::Value::callable(std::collections::HashMap::new()"),
-            "class object with call slot: {code}"
-        );
-        // Parent evaluated once, prototype chain wired.
-        assert!(code.contains("let __parent = Animal();"), "parent: {code}");
+        // Eagerly built class value through the shared Core class builder.
         assert!(
             code.contains(
-                "w3cos_core::class::set_prototype_of(&__proto, &__parent.get_property(\"prototype\"));"
+                "w3cos_core::intrinsics::create_class_with_initializer(&__ctor, Some(&__parent), &__initializer)"
             ),
-            "proto chain: {code}"
+            "shared class object builder: {code}"
         );
+        // Parent is evaluated once; Core wires prototype and static inheritance.
+        assert!(code.contains("let __parent = Animal();"), "parent: {code}");
+        // super(...) in ctor → shared super intrinsic; field init afterwards.
         assert!(
-            code.contains("w3cos_core::class::set_prototype_of(&__class, &__parent);"),
-            "static inheritance: {code}"
-        );
-        // super(...) in ctor → super_ctor; field init `this.bark` afterwards.
-        assert!(
-            code.contains("w3cos_core::class::super_ctor(&__this, &__parent, vec![name.clone()"),
+            code.contains(
+                "w3cos_core::intrinsics::super_construct(&__this, &__parent, vec![name.clone()"
+            ),
             "super ctor: {code}"
         );
         assert!(
-            code.contains("__this.clone().set_property(&\"bark\", __w3cos_av.clone())"),
+            code.contains("w3cos_core::intrinsics::set_property(&__obj, &__key")
+                && code.contains("Value::string(\"bark\")"),
             "this.bark assignment: {code}"
         );
         // Getter/setter conventions on the prototype.
         assert!(
-            code.contains("__proto.set_property(\"__w3cos_getter_label\""),
+            code.contains("Value::string(\"__w3cos_getter_label\")"),
             "getter install: {code}"
         );
         assert!(
-            code.contains("__proto.set_property(\"__w3cos_setter_label\""),
+            code.contains("Value::string(\"__w3cos_setter_label\")"),
             "setter install: {code}"
         );
         // super.method() / super.prop
         assert!(
-            code.contains("w3cos_core::class::super_method(&__this, &__parent, \"kind\", vec![])"),
+            code.contains(
+                "w3cos_core::intrinsics::super_call(&__this, &__parent, &w3cos_core::Value::string(\"kind\"), vec![])"
+            ),
             "super method: {code}"
         );
         assert!(
-            code.contains("w3cos_core::class::super_get(&__this, &__parent, \"sound\")"),
+            code.contains(
+                "w3cos_core::intrinsics::super_get(&__this, &__parent, &w3cos_core::Value::string(\"sound\"))"
+            ),
             "super get: {code}"
         );
-        // Private field mangled with the class name.
+        // Private field uses the shared hidden Core slot, not a string key.
         assert!(
-            code.contains("__w3cos_priv_Dog_tag"),
-            "private mangle: {code}"
+            code.contains("w3cos_core::intrinsics::define_private(&__this, &__args[0]")
+                && code.contains("w3cos_core::intrinsics::get_private(&__this.clone()")
+                && code.contains("Value::string(\"tag\")"),
+            "shared private slot: {code}"
+        );
+        assert!(
+            code.contains("let __field_key_0 = w3cos_core::Value::from(\"ready\")")
+                && code.contains("let __field_key_0 = __field_key_0.clone();")
+                && code.contains(
+                    "w3cos_core::intrinsics::define_field(&__this, &w3cos_core::Value::string(&__field_key_0.to_js_string())"
+                ),
+            "computed field key is captured once: {code}"
         );
         // Static method installed on the class object; static block runs in place.
         assert!(
-            code.contains("__class.set_property(\"make\""),
+            code.contains("w3cos_core::intrinsics::set_property(&__class")
+                && code.contains("Value::string(\"make\")"),
             "static method: {code}"
         );
         assert!(
-            code.contains("__this.clone().set_property(&\"count\""),
+            code.contains("Value::string(\"count\")")
+                && code.contains("w3cos_core::intrinsics::set_property(&__obj"),
             "static block assignment via this = class object: {code}"
         );
-        // constructor / prototype / raw-ctor wiring.
+        // Shared Core owns constructor / prototype / raw-ctor wiring.
         assert!(
-            code.contains("__class.set_property(\"prototype\", __proto);")
-                && code.contains("__class.set_property(\"__w3cos_ctor\", __ctor);")
-                && code.contains("__proto.set_property(\"constructor\", __class.clone());"),
+            code.contains(
+                "w3cos_core::intrinsics::create_class_with_initializer(&__ctor, Some(&__parent), &__initializer)"
+            )
+                && code.contains("let __proto = w3cos_core::intrinsics::get_property(&__class"),
             "wiring: {code}"
         );
     }
@@ -6315,24 +6547,29 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Base"]));
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("__parent.get_property(\"run\").call(__this.clone(), vec![])")
-                || code.contains("{ let __super_fn = __parent.get_property(\"run\");"),
+            code.contains(
+                "let __super_fn = w3cos_core::intrinsics::get_property(&__parent, &w3cos_core::Value::string(\"run\"))"
+            ) && code.contains("w3cos_core::intrinsics::call(&__super_fn"),
             "static super call → parent class object: {code}"
         );
         assert!(
-            code.contains("__parent.get_property(\"speed\")"),
+            code.contains(
+                "w3cos_core::intrinsics::get_property(&__parent, &w3cos_core::Value::string(\"speed\"))"
+            ),
             "static super read → parent class object: {code}"
         );
     }
 
     #[test]
-    fn lowers_private_brand_check_via_js_in() {
+    fn lowers_private_brand_check_via_shared_core_brand() {
         let stmts = parse_stmts("const P = class P { #x = 1; has(o) { return #x in o; } };");
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::Value::from(\"__w3cos_priv_P_x\").js_in(&o.clone())"),
-            "#x in o → mangled js_in: {code}"
+            code.contains(
+                "w3cos_core::intrinsics::has_private(&o.clone(), &__brand.borrow().clone())"
+            ),
+            "#x in o → shared private brand: {code}"
         );
     }
 
@@ -6345,11 +6582,15 @@ function f(window) { return window.x; }"#,
         let code = ctx.lower_stmts(&stmts);
         assert!(
             code.contains("let mut Local = w3cos_core::Value::Undefined;")
-                && code.contains("Local = { let __proto = "),
+                && code.contains("Local = { let __brand = ")
+                && code.contains("let __ctor = ")
+                && code.contains(
+                    "w3cos_core::intrinsics::create_class_with_initializer(&__ctor, None, &__initializer)"
+                ),
             "nested class → hoisted local class value: {code}"
         );
         assert!(
-            code.contains("w3cos_core::class::construct(&Local.clone(), vec![])"),
+            code.contains("w3cos_core::intrinsics::construct(&Local.clone(), vec![])"),
             "new on the local class: {code}"
         );
     }
@@ -6360,7 +6601,7 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["A"]));
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::class::super_ctor(&__this, &__parent, __args)"),
+            code.contains("w3cos_core::intrinsics::super_construct(&__this, &__parent, __args)"),
             "synthesized forwarding ctor: {code}"
         );
     }
@@ -6372,15 +6613,19 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("__obj.get_property(&\"x\").js_add(&w3cos_core::Value::Number(2.0))"),
+            code.contains("let __old = w3cos_core::intrinsics::get_property(&__obj, &__key)")
+                && code.contains("w3cos_core::intrinsics::add(&__old")
+                && code.contains("Value::string(\"x\")"),
             "compound member assign: {code}"
         );
         assert!(
-            code.contains("let __w3cos_prev = __obj.get_property(&\"y\");"),
+            code.contains(
+                "let __w3cos_prev = w3cos_core::intrinsics::get_property(&__obj, &__key)"
+            ) && code.contains("Value::string(\"y\")"),
             "member update: {code}"
         );
         assert!(
-            code.contains("return __this.clone().get_property(\"x\");"),
+            code.contains("return w3cos_core::intrinsics::get_property(&__this.clone()"),
             "this read: {code}"
         );
     }
@@ -6394,14 +6639,15 @@ function f(window) { return window.x; }"#,
         let code = ctx.lower_stmts(&stmts);
         assert!(
             code.contains(
-                "let __w3cos_next = local.js_add(&w3cos_core::Value::Number(1.0)); local = __w3cos_next.clone(); __w3cos_next"
+                "let __w3cos_next = w3cos_core::intrinsics::add(&local, &w3cos_core::Value::Number(1.0)); local = __w3cos_next.clone(); __w3cos_next"
             ),
             "prefix local update must evaluate to the incremented value: {code}"
         );
         assert!(
-            code.contains(
-                "let __w3cos_next = __obj.get_property(&\"current\").js_add(&w3cos_core::Value::Number(1.0)); __obj.set_property(&\"current\", __w3cos_next.clone()); __w3cos_next"
-            ),
+            code.contains("Value::string(\"current\")")
+                && code
+                    .contains("let __old = w3cos_core::intrinsics::get_property(&__obj, &__key)")
+                && code.contains("w3cos_core::intrinsics::add(&__old"),
             "prefix member update must evaluate to the incremented value: {code}"
         );
     }
@@ -6415,14 +6661,16 @@ function f(window) { return window.x; }"#,
         let code = ctx.lower_stmts(&stmts);
         assert!(
             code.contains(
-                "let __w3cos_prev = local.clone(); local = local.js_add(&w3cos_core::Value::Number(1.0)); __w3cos_prev"
+                "let __w3cos_prev = local.clone(); local = w3cos_core::intrinsics::add(&local, &w3cos_core::Value::Number(1.0)); __w3cos_prev"
             ),
             "postfix local update must evaluate to the previous value: {code}"
         );
         assert!(
-            code.contains(
-                "let __w3cos_prev = __obj.get_property(&\"current\"); __obj.set_property(&\"current\", __w3cos_prev.js_add(&w3cos_core::Value::Number(1.0))); __w3cos_prev"
-            ),
+            code.contains("Value::string(\"current\")")
+                && code.contains(
+                    "let __w3cos_prev = w3cos_core::intrinsics::get_property(&__obj, &__key)"
+                )
+                && code.contains("w3cos_core::intrinsics::add(&__w3cos_prev"),
             "postfix member update must evaluate to the previous value: {code}"
         );
     }

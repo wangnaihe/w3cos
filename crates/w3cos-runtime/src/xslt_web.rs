@@ -6,9 +6,19 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 
+use crate::jsdom::{
+    WeakRealmObject, realm_function, register_weak_realm_object, reset_realm_class,
+    upgrade_realm_object,
+};
+
 thread_local! {
     static XSLT_PROCESSOR_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static XSLT_PROCESSORS: RefCell<Vec<WeakRealmObject>> = const { RefCell::new(Vec::new()) };
     static WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn realm_xslt_function(callback: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
+    realm_function(crate::jsdom::realm_generation(), callback)
 }
 
 fn warning() {
@@ -35,13 +45,13 @@ pub fn xslt_processor_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|this, _| {
+        let class = realm_xslt_function(|this, _| {
             let parameters = Rc::new(RefCell::new(HashMap::<String, Value>::new()));
             this.set_property("__w3cos_stylesheet", Value::Null);
             let import_target = this.clone();
             this.set_property(
                 "importStylesheet",
-                Value::function(move |_, args| {
+                realm_xslt_function(move |_, args| {
                     import_target.set_property(
                         "__w3cos_stylesheet",
                         args.first().cloned().unwrap_or(Value::Null),
@@ -52,7 +62,7 @@ pub fn xslt_processor_class() -> Value {
             let set_parameters = Rc::clone(&parameters);
             this.set_property(
                 "setParameter",
-                Value::function(move |_, args| {
+                realm_xslt_function(move |_, args| {
                     let namespace = args.first().map(Value::to_js_string).unwrap_or_default();
                     let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
                     set_parameters.borrow_mut().insert(
@@ -65,7 +75,7 @@ pub fn xslt_processor_class() -> Value {
             let get_parameters = Rc::clone(&parameters);
             this.set_property(
                 "getParameter",
-                Value::function(move |_, args| {
+                realm_xslt_function(move |_, args| {
                     let namespace = args.first().map(Value::to_js_string).unwrap_or_default();
                     let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
                     get_parameters
@@ -78,7 +88,7 @@ pub fn xslt_processor_class() -> Value {
             let remove_parameters = Rc::clone(&parameters);
             this.set_property(
                 "removeParameter",
-                Value::function(move |_, args| {
+                realm_xslt_function(move |_, args| {
                     let namespace = args.first().map(Value::to_js_string).unwrap_or_default();
                     let name = args.get(1).map(Value::to_js_string).unwrap_or_default();
                     remove_parameters
@@ -90,7 +100,7 @@ pub fn xslt_processor_class() -> Value {
             let clear_parameters = Rc::clone(&parameters);
             this.set_property(
                 "clearParameters",
-                Value::function(move |_, _| {
+                realm_xslt_function(move |_, _| {
                     clear_parameters.borrow_mut().clear();
                     Value::Undefined
                 }),
@@ -99,7 +109,7 @@ pub fn xslt_processor_class() -> Value {
             let reset_target = this.clone();
             this.set_property(
                 "reset",
-                Value::function(move |_, _| {
+                realm_xslt_function(move |_, _| {
                     reset_parameters.borrow_mut().clear();
                     reset_target.set_property("__w3cos_stylesheet", Value::Null);
                     Value::Undefined
@@ -107,7 +117,7 @@ pub fn xslt_processor_class() -> Value {
             );
             this.set_property(
                 "transformToFragment",
-                Value::function(|_, args| {
+                realm_xslt_function(|_, args| {
                     warning();
                     let source = source_node(args.first().cloned().unwrap_or(Value::Undefined));
                     let document = args
@@ -125,7 +135,7 @@ pub fn xslt_processor_class() -> Value {
             );
             this.set_property(
                 "transformToDocument",
-                Value::function(|_, args| {
+                realm_xslt_function(|_, args| {
                     warning();
                     let source = source_node(args.first().cloned().unwrap_or(Value::Undefined));
                     let name = source.get_property("localName").to_js_string();
@@ -144,6 +154,7 @@ pub fn xslt_processor_class() -> Value {
                     result
                 }),
             );
+            register_weak_realm_object(&XSLT_PROCESSORS, &this);
             Value::Undefined
         });
         class.set_property("name", Value::string("XSLTProcessor"));
@@ -168,6 +179,28 @@ pub fn xslt_processor_class() -> Value {
 }
 
 pub fn reset() {
+    XSLT_PROCESSORS.with(|processors| {
+        for processor in processors
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|processor| upgrade_realm_object(&processor))
+        {
+            processor.set_property("__w3cos_stylesheet", Value::Undefined);
+            for method in [
+                "clearParameters",
+                "getParameter",
+                "importStylesheet",
+                "removeParameter",
+                "reset",
+                "setParameter",
+                "transformToDocument",
+                "transformToFragment",
+            ] {
+                processor.set_property(method, Value::Undefined);
+            }
+        }
+    });
+    reset_realm_class(&XSLT_PROCESSOR_CLASS);
     WARNING_EMITTED.with(|warned| warned.set(false));
 }
 
@@ -195,5 +228,50 @@ mod tests {
         source.set_property("textContent", Value::string("value"));
         let fragment = processor.call_method("transformToFragment", vec![source, document]);
         assert_eq!(fragment.get_property("textContent").to_js_string(), "value");
+    }
+
+    #[test]
+    fn processors_parameters_stylesheets_and_methods_are_realm_owned() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_class = xslt_processor_class();
+        let processor = w3cos_core::class::construct(&old_class, Vec::new());
+        let processor_weak = crate::jsdom::weak_realm_object(&processor);
+        let stylesheet = Value::object(HashMap::new());
+        let stylesheet_weak = crate::jsdom::weak_realm_object(&stylesheet);
+        processor.call_method("importStylesheet", vec![stylesheet.clone()]);
+        drop(stylesheet);
+        let marker = Rc::new(());
+        let marker_weak = Rc::downgrade(&marker);
+        let parameter_marker = Rc::clone(&marker);
+        processor.call_method(
+            "setParameter",
+            vec![
+                Value::Null,
+                Value::string("callback"),
+                Value::function(move |_, _| {
+                    let _ = &parameter_marker;
+                    Value::Undefined
+                }),
+            ],
+        );
+        drop(marker);
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        assert!(old_class.get_property("prototype").is_undefined());
+        assert!(processor.get_property("__w3cos_stylesheet").is_undefined());
+        assert!(
+            processor
+                .call_method("getParameter", vec![Value::Null, Value::string("callback")],)
+                .is_undefined()
+        );
+        assert!(stylesheet_weak.upgrade().is_none());
+        assert!(marker_weak.upgrade().is_none());
+
+        drop(processor);
+        assert!(processor_weak.upgrade().is_none());
     }
 }

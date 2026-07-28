@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 
+use crate::jsdom::realm_function;
 use w3cos_core::Value;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,7 @@ struct HeldLock {
 
 struct PendingLock {
     id: u64,
+    generation: u32,
     name: String,
     mode: LockMode,
     callback: Value,
@@ -99,11 +101,11 @@ fn available(state: &LockState, name: &str, mode: LockMode) -> bool {
     }
 }
 
-fn schedule_process() {
+fn schedule_process(generation: u32) {
     w3cos_core::promise::resolve(vec![Value::Undefined]).call_method(
         "then",
-        vec![Value::function(|_, _| {
-            process_queue();
+        vec![realm_function(generation, move |_, _| {
+            process_queue(generation);
             Value::Undefined
         })],
     );
@@ -120,12 +122,13 @@ fn settle_callback(pending: PendingLock, lock: Value, releases_lock: bool) {
     );
     let resolve = pending.resolve.clone();
     let id = pending.id;
+    let generation = pending.generation;
     result.call_method(
         "then",
         vec![
             Value::function(move |_, args| {
                 if releases_lock {
-                    release(id);
+                    release(id, generation);
                 }
                 resolve.call(
                     Value::Undefined,
@@ -137,7 +140,7 @@ fn settle_callback(pending: PendingLock, lock: Value, releases_lock: bool) {
                 let reject = pending.reject;
                 Value::function(move |_, args| {
                     if releases_lock {
-                        release(id);
+                        release(id, generation);
                     }
                     reject.call(
                         Value::Undefined,
@@ -150,7 +153,10 @@ fn settle_callback(pending: PendingLock, lock: Value, releases_lock: bool) {
     );
 }
 
-fn release(id: u64) {
+fn release(id: u64, generation: u32) {
+    if crate::jsdom::realm_generation() != generation {
+        return;
+    }
     let removed = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let before = state.held.len();
@@ -158,11 +164,14 @@ fn release(id: u64) {
         state.held.len() != before
     });
     if removed {
-        schedule_process();
+        schedule_process(generation);
     }
 }
 
-fn process_queue() {
+fn process_queue(generation: u32) {
+    if crate::jsdom::realm_generation() != generation {
+        return;
+    }
     loop {
         enum Action {
             Grant(PendingLock),
@@ -205,7 +214,8 @@ pub fn lock_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| Value::Undefined);
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| Value::Undefined);
         class.set_property("name", Value::string("Lock"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -222,7 +232,8 @@ pub fn lock_manager_class() -> Value {
         if let Some(class) = slot.borrow().clone() {
             return class;
         }
-        let class = Value::function(|_, _| lock_manager_value());
+        let generation = crate::jsdom::realm_generation();
+        let class = realm_function(generation, |_, _| lock_manager_value());
         class.set_property("name", Value::string("LockManager"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
@@ -248,10 +259,11 @@ pub fn lock_manager_value() -> Value {
                 );
             }
         });
+        let generation = crate::jsdom::realm_generation();
         let manager = Value::object(HashMap::from([
             (
                 "request".into(),
-                Value::function(|_, args| {
+                realm_function(generation, move |_, args| {
                     let name = args
                         .first()
                         .cloned()
@@ -326,6 +338,7 @@ pub fn lock_manager_value() -> Value {
                             }
                             let pending = PendingLock {
                                 id,
+                                generation,
                                 name: name.clone(),
                                 mode,
                                 callback: callback.clone(),
@@ -346,7 +359,7 @@ pub fn lock_manager_value() -> Value {
                                 "addEventListener",
                                 vec![
                                     Value::string("abort"),
-                                    Value::function(move |_, _| {
+                                    realm_function(generation, move |_, _| {
                                         let removed = STATE.with(|state| {
                                             let mut state = state.borrow_mut();
                                             let before = state.pending.len();
@@ -364,14 +377,14 @@ pub fn lock_manager_value() -> Value {
                                 ],
                             );
                         }
-                        schedule_process();
+                        schedule_process(generation);
                         Value::Undefined
                     })])
                 }),
             ),
             (
                 "query".into(),
-                Value::function(|_, _| {
+                realm_function(generation, |_, _| {
                     let snapshot = STATE.with(|state| {
                         let state = state.borrow();
                         Value::object(HashMap::from([
@@ -418,6 +431,16 @@ pub fn reset() {
             pending: VecDeque::new(),
         }
     });
+    LOCK_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    LOCK_MANAGER_CLASS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    LOCK_MANAGER_VALUE.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    LOCK_WARNING_EMITTED.with(|warned| *warned.borrow_mut() = false);
 }
 
 #[cfg(test)]
@@ -626,5 +649,133 @@ mod tests {
         w3cos_core::promise::drain_microtasks();
         assert!(stolen.get());
         assert!(replacement_ran.get());
+    }
+
+    #[test]
+    fn manager_requests_and_abort_listeners_are_realm_owned() {
+        reset();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let old_manager = lock_manager_value();
+        let old_manager_class = lock_manager_class();
+        let old_lock_class = lock_class();
+        old_manager_class
+            .get_property("prototype")
+            .set_property("oldRealmMarker", Value::Bool(true));
+
+        let old_release = Rc::new(RefCell::new(Value::Undefined));
+        old_manager.call_method(
+            "request",
+            vec![
+                Value::string("realm-lock"),
+                Value::function({
+                    let old_release = Rc::clone(&old_release);
+                    move |_, _| {
+                        w3cos_core::promise::new(vec![Value::function({
+                            let old_release = Rc::clone(&old_release);
+                            move |_, args| {
+                                *old_release.borrow_mut() =
+                                    args.first().cloned().unwrap_or(Value::Undefined);
+                                Value::Undefined
+                            }
+                        })])
+                    }
+                }),
+            ],
+        );
+        let old_controller =
+            w3cos_core::class::construct(&crate::fetch::abort_controller_class(), vec![]);
+        old_manager.call_method(
+            "request",
+            vec![
+                Value::string("realm-lock"),
+                Value::object(HashMap::from([(
+                    "signal".into(),
+                    old_controller.get_property("signal"),
+                )])),
+                Value::function(|_, _| Value::Undefined),
+            ],
+        );
+        w3cos_core::promise::drain_microtasks();
+        STATE.with(|state| {
+            assert_eq!(state.borrow().held.len(), 1);
+            assert_eq!(state.borrow().pending.len(), 1);
+        });
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let new_manager = lock_manager_value();
+        let new_manager_class = lock_manager_class();
+        let new_lock_class = lock_class();
+        assert!(old_manager != new_manager);
+        assert!(old_manager_class != new_manager_class);
+        assert!(old_lock_class != new_lock_class);
+        assert!(
+            new_manager_class
+                .get_property("prototype")
+                .get_property("oldRealmMarker")
+                .is_undefined()
+        );
+
+        let new_release = Rc::new(RefCell::new(Value::Undefined));
+        new_manager.call_method(
+            "request",
+            vec![
+                Value::string("realm-lock"),
+                Value::function({
+                    let new_release = Rc::clone(&new_release);
+                    move |_, _| {
+                        w3cos_core::promise::new(vec![Value::function({
+                            let new_release = Rc::clone(&new_release);
+                            move |_, args| {
+                                *new_release.borrow_mut() =
+                                    args.first().cloned().unwrap_or(Value::Undefined);
+                                Value::Undefined
+                            }
+                        })])
+                    }
+                }),
+            ],
+        );
+        new_manager.call_method(
+            "request",
+            vec![
+                Value::string("realm-lock"),
+                Value::function(|_, _| Value::Undefined),
+            ],
+        );
+        w3cos_core::promise::drain_microtasks();
+        STATE.with(|state| {
+            assert_eq!(state.borrow().held.len(), 1);
+            assert_eq!(state.borrow().pending.len(), 1);
+        });
+
+        old_controller.call_method("abort", vec![]);
+        old_release
+            .borrow()
+            .call(Value::Undefined, vec![Value::Undefined]);
+        w3cos_core::promise::drain_microtasks();
+        STATE.with(|state| {
+            assert_eq!(state.borrow().held.len(), 1);
+            assert_eq!(state.borrow().pending.len(), 1);
+        });
+        assert!(old_manager.call_method("request", vec![]).is_undefined());
+        assert!(
+            old_manager_class
+                .call(Value::Undefined, vec![])
+                .is_undefined()
+        );
+
+        new_release
+            .borrow()
+            .call(Value::Undefined, vec![Value::Undefined]);
+        w3cos_core::promise::drain_microtasks();
+        STATE.with(|state| {
+            assert!(state.borrow().held.is_empty());
+            assert!(state.borrow().pending.is_empty());
+        });
+        reset();
     }
 }
