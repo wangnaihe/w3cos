@@ -2244,6 +2244,13 @@ fn initialize_environment(
             .ok_or(VmError::MissingBinding(*binding))?
             .initialize(value);
     }
+    if let Some(binding) = function.arguments_binding {
+        let value = w3cos_core::intrinsics::create_array(arguments.clone());
+        environment
+            .get(&binding)
+            .ok_or(VmError::MissingBinding(binding))?
+            .initialize(value);
+    }
     if let Some(binding) = function.rest_parameter {
         let value = w3cos_core::intrinsics::create_array(
             arguments
@@ -2325,6 +2332,7 @@ mod tests {
             name: None,
             parameters: Vec::new(),
             rest_parameter: None,
+            arguments_binding: None,
             bindings,
             captures,
             this_binding: None,
@@ -2763,6 +2771,7 @@ mod tests {
                 name: Some("asyncEntry".into()),
                 parameters: Vec::new(),
                 rest_parameter: None,
+                arguments_binding: None,
                 bindings: vec![awaited.clone()],
                 captures: Vec::new(),
                 this_binding: None,
@@ -3178,6 +3187,7 @@ mod tests {
             name: Some("generatorEntry".into()),
             parameters: Vec::new(),
             rest_parameter: None,
+            arguments_binding: None,
             bindings: Vec::new(),
             captures: Vec::new(),
             this_binding: None,
@@ -3258,6 +3268,7 @@ mod tests {
             name: Some("asyncGeneratorEntry".into()),
             parameters: Vec::new(),
             rest_parameter: None,
+            arguments_binding: None,
             bindings: Vec::new(),
             captures: Vec::new(),
             this_binding: None,

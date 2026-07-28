@@ -242,6 +242,12 @@ fn generate_sync_function_with_factories(
             binding.0
         ));
     }
+    if let Some(binding) = function.arguments_binding {
+        parameter_initializers.push_str(&format!(
+            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true))));\n",
+            binding.0
+        ));
+    }
     if let Some(binding) = function.rest_parameter {
         parameter_initializers.push_str(&format!(
             "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.iter().skip({}).cloned().collect()), true))));\n",
@@ -382,6 +388,12 @@ fn generate_async_function_with_factories(
     for (index, binding) in function.parameters.iter().enumerate() {
         parameter_initializers.push_str(&format!(
             "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true))));\n",
+            binding.0
+        ));
+    }
+    if let Some(binding) = function.arguments_binding {
+        parameter_initializers.push_str(&format!(
+            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true))));\n",
             binding.0
         ));
     }
@@ -697,6 +709,12 @@ fn generate_generator_with_factories(
     for (index, binding) in function.parameters.iter().enumerate() {
         parameter_initializers.push_str(&format!(
             "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true))));\n",
+            binding.0
+        ));
+    }
+    if let Some(binding) = function.arguments_binding {
+        parameter_initializers.push_str(&format!(
+            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true))));\n",
             binding.0
         ));
     }
@@ -1017,6 +1035,12 @@ fn generate_async_generator_with_factories(
     for (index, binding) in function.parameters.iter().enumerate() {
         parameter_initializers.push_str(&format!(
             "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true))));\n",
+            binding.0
+        ));
+    }
+    if let Some(binding) = function.arguments_binding {
+        parameter_initializers.push_str(&format!(
+            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true))));\n",
             binding.0
         ));
     }

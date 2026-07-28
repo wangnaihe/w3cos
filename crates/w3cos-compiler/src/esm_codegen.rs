@@ -602,7 +602,7 @@ fn generate_module_with_bodies(
         },
         Err(error) => (None, Some(error.to_string())),
     };
-    if let Some(error) = w3ir_error {
+    if let Some(error) = &w3ir_error {
         out.push_str(&format!(
             "    // W3IR lowering unavailable: {}\n",
             error.replace(['\r', '\n'], " ")
@@ -673,7 +673,15 @@ fn generate_module_with_bodies(
                         &class_names,
                         &namespace_names,
                     )
-                    .map_err(|detail| EsmCodegenError::class(module, sym, detail))?,
+                    .map_err(|detail| {
+                        let detail = match &w3ir_error {
+                            Some(error) => {
+                                format!("{detail}; module W3IR lowering failed: {error}")
+                            }
+                            None => detail,
+                        };
+                        EsmCodegenError::class(module, sym, detail)
+                    })?,
                 );
                 let alias = sanitize_ident(&sym.original_name);
                 if alias != sym.bundled_name {
@@ -1343,7 +1351,11 @@ fn module_init_capture_map(
                     import.imported
                 ));
             }
-            let getter = context.lower_ident(&import.imported);
+            let getter = if import.imported == "arguments" {
+                "w3cos_core::Value::Undefined".to_string()
+            } else {
+                context.lower_ident(&import.imported)
+            };
             let setter = value_bindings
                 .contains(&sanitize_ident(&import.imported))
                 .then(|| module.lookup(&import.imported))
@@ -2085,20 +2097,15 @@ fn emit_w3ir_generator_symbol(
     class_names: &HashSet<String>,
     namespace_names: &HashSet<String>,
 ) -> Option<Result<String, String>> {
-    if !function_flags(items, &symbol.original_name).is_some_and(|(_, is_generator)| is_generator) {
+    let Some((is_async, true)) = function_flags(items, &symbol.original_name) else {
         return None;
-    }
+    };
 
     let factory = format!("{}__w3ir_factory", symbol.bundled_name);
     let emitted = (|| {
         let w3ir_module =
             w3ir_module.ok_or_else(|| "module lowering did not produce W3IR".to_string())?;
-        let function = w3ir_module
-            .functions
-            .iter()
-            .find(|function| {
-                function.name.as_deref() == Some(&symbol.original_name) && function.is_generator
-            })
+        let function = select_w3ir_function(w3ir_module, &symbol.original_name, is_async, true)
             .ok_or_else(|| "function is missing from the lowered W3IR module".to_string())?;
         let state_machine =
             crate::w3ir_aot::generate_generator_from_module(w3ir_module, function, &factory)
@@ -2131,6 +2138,13 @@ fn emit_w3ir_generator_symbol(
         format!("{}:value", symbol.bundled_name),
         symbol.bundled_name,
     ));
+    if symbol.kind == SymbolKind::Variable {
+        output.push_str(&format!(
+            "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+            symbol.bundled_name,
+            format!("{}:value", symbol.bundled_name),
+        ));
+    }
     let alias = sanitize_ident(&symbol.original_name);
     if alias != symbol.bundled_name {
         output.push_str(&format!(
@@ -2164,14 +2178,7 @@ fn emit_w3ir_async_symbol(
     let emitted = (|| {
         let w3ir_module =
             w3ir_module.ok_or_else(|| "module lowering did not produce W3IR".to_string())?;
-        let function = w3ir_module
-            .functions
-            .iter()
-            .find(|function| {
-                function.name.as_deref() == Some(&symbol.original_name)
-                    && function.is_async
-                    && !function.is_generator
-            })
+        let function = select_w3ir_function(w3ir_module, &symbol.original_name, true, false)
             .ok_or_else(|| "function is missing from the lowered W3IR module".to_string())?;
         let state_machine =
             crate::w3ir_aot::generate_async_function_from_module(w3ir_module, function, &factory)
@@ -2204,6 +2211,13 @@ fn emit_w3ir_async_symbol(
         format!("{}:value", symbol.bundled_name),
         symbol.bundled_name,
     ));
+    if symbol.kind == SymbolKind::Variable {
+        output.push_str(&format!(
+            "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+            symbol.bundled_name,
+            format!("{}:value", symbol.bundled_name),
+        ));
+    }
     let alias = sanitize_ident(&symbol.original_name);
     if alias != symbol.bundled_name {
         output.push_str(&format!(
@@ -2237,14 +2251,7 @@ fn emit_w3ir_sync_symbol(
     let emitted = (|| {
         let w3ir_module =
             w3ir_module.ok_or_else(|| "module lowering did not produce W3IR".to_string())?;
-        let function = w3ir_module
-            .functions
-            .iter()
-            .find(|function| {
-                function.name.as_deref() == Some(&symbol.original_name)
-                    && !function.is_async
-                    && !function.is_generator
-            })
+        let function = select_w3ir_function(w3ir_module, &symbol.original_name, false, false)
             .ok_or_else(|| "function is missing from the lowered W3IR module".to_string())?;
         let state_machine =
             crate::w3ir_aot::generate_sync_function_from_module(w3ir_module, function, &factory)
@@ -2277,6 +2284,13 @@ fn emit_w3ir_sync_symbol(
         format!("{}:value", symbol.bundled_name),
         symbol.bundled_name,
     ));
+    if symbol.kind == SymbolKind::Variable {
+        output.push_str(&format!(
+            "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+            symbol.bundled_name,
+            format!("{}:value", symbol.bundled_name),
+        ));
+    }
     let alias = sanitize_ident(&symbol.original_name);
     if alias != symbol.bundled_name {
         output.push_str(&format!(
@@ -2306,6 +2320,65 @@ fn generator_capture_map(
         namespace_names,
         &HashMap::new(),
     )
+}
+
+fn select_w3ir_function<'a>(
+    module: &'a w3cos_ir::Module,
+    name: &str,
+    is_async: bool,
+    is_generator: bool,
+) -> Option<&'a w3cos_ir::Function> {
+    entry_bound_w3ir_function(module, name)
+        .filter(|function| function.is_async == is_async && function.is_generator == is_generator)
+        .or_else(|| {
+            module.functions.iter().find(|function| {
+                function.name.as_deref() == Some(name)
+                    && function.is_async == is_async
+                    && function.is_generator == is_generator
+            })
+        })
+}
+
+fn entry_bound_w3ir_function<'a>(
+    module: &'a w3cos_ir::Module,
+    name: &str,
+) -> Option<&'a w3cos_ir::Function> {
+    let entry = module
+        .functions
+        .iter()
+        .find(|candidate| candidate.id == module.entry)?;
+    let binding = entry
+        .bindings
+        .iter()
+        .find(|binding| binding.name == name)?
+        .id;
+    let mut closures = HashMap::new();
+    for block in &entry.blocks {
+        for instruction in &block.instructions {
+            match instruction {
+                w3cos_ir::Instruction::CreateClosure { dst, function, .. } => {
+                    closures.insert(*dst, *function);
+                }
+                w3cos_ir::Instruction::InitializeBinding {
+                    binding: target,
+                    value,
+                }
+                | w3cos_ir::Instruction::StoreBinding {
+                    binding: target,
+                    value,
+                } if *target == binding => {
+                    if let Some(function) = closures.get(value) {
+                        return module
+                            .functions
+                            .iter()
+                            .find(|candidate| candidate.id == *function);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 fn generator_capture_map_with_synthetic(
@@ -2347,7 +2420,17 @@ fn generator_capture_map_with_synthetic(
             if binding.name.starts_with('*') {
                 return None;
             }
-            let load = context.lower_ident(&binding.name);
+            let load = module
+                .host_imports
+                .iter()
+                .find(|(local, _)| local == &binding.name)
+                .map(|(local, _)| {
+                    format!(
+                        "w3cos_core::Value::function(move |_, __args| {}(__args))",
+                        sanitize_ident(local)
+                    )
+                })
+                .unwrap_or_else(|| context.lower_ident(&binding.name));
             let setter = binding
                 .mutable
                 .then(|| module.lookup(&binding.name))
@@ -3430,7 +3513,8 @@ export const readSize = ({height: h, width: w = 10}) => h + w;"#,
         );
         assert!(
             code.contains("synchronous function identity compiled from W3IR")
-                && code.contains("__args.get(0).cloned()"),
+                && code.contains("__args.get(0).cloned()")
+                && code.contains("identity_set(value: w3cos_core::Value)"),
             "top-level arrows should lower to callable W3IR functions: {code}"
         );
         assert!(
@@ -3456,6 +3540,65 @@ export const readSize = ({height: h, width: w = 10}) => h + w;"#,
         );
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn w3ir_capture_of_host_import_uses_a_callable_value() {
+        let root = fixture_root("w3cos_esm_codegen_host_import_capture");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"import { invoke } from "w3cos/native";
+export function boot() { return invoke("open-input", "prepare"); }"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+
+        assert!(
+            code.contains("w3cos_core::Value::function(move |_, __args| invoke(__args))"),
+            "host imports captured by W3IR functions must be represented as callable values: {code}"
+        );
+        assert!(
+            !code.contains("invoke_value()"),
+            "host import captures must not use an unavailable ESM symbol accessor: {code}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn top_level_function_selection_uses_the_entry_binding_when_names_collide() {
+        let source = r#"
+            function wrapper(local) {
+                return { clearToast() { return local; } };
+            }
+            let state = "ready";
+            function clearToast() {
+                state = "cleared";
+            }
+        "#;
+        let module =
+            crate::w3ir_lowering::lower_module(source, "app:///same-name-functions.js").unwrap();
+        let selected = select_w3ir_function(&module, "clearToast", false, false)
+            .expect("top-level clearToast");
+        let entry = module
+            .functions
+            .iter()
+            .find(|function| function.id == module.entry)
+            .unwrap();
+        let state = entry
+            .bindings
+            .iter()
+            .find(|binding| binding.name == "state")
+            .unwrap()
+            .id;
+        assert_eq!(selected.name.as_deref(), Some("clearToast"));
+        assert_eq!(selected.captures, vec![state]);
     }
 
     #[test]

@@ -385,6 +385,10 @@ pub struct Function {
     /// arguments after `parameters`.
     #[serde(default)]
     pub rest_parameter: Option<BindingId>,
+    /// Implicit non-arrow `arguments` binding initialized from the complete
+    /// call argument list. Arrow functions capture their enclosing binding.
+    #[serde(default)]
+    pub arguments_binding: Option<BindingId>,
     pub bindings: Vec<Binding>,
     /// Outer lexical cells captured by this function.
     pub captures: Vec<BindingId>,
@@ -545,6 +549,22 @@ impl Function {
                 return Err(ValidationError::DuplicateFunctionParameter(
                     self.id,
                     rest_parameter,
+                ));
+            }
+        }
+        if let Some(arguments_binding) = self.arguments_binding {
+            if local_binding_kinds.get(&arguments_binding) != Some(&BindingKind::Parameter) {
+                return Err(ValidationError::MissingFunctionBinding(
+                    self.id,
+                    arguments_binding,
+                ));
+            }
+            if parameter_bindings.contains(&arguments_binding)
+                || self.rest_parameter == Some(arguments_binding)
+            {
+                return Err(ValidationError::DuplicateFunctionParameter(
+                    self.id,
+                    arguments_binding,
                 ));
             }
         }
@@ -979,6 +999,7 @@ mod tests {
                 name: Some("main".into()),
                 parameters: Vec::new(),
                 rest_parameter: None,
+                arguments_binding: None,
                 bindings: Vec::new(),
                 captures: Vec::new(),
                 this_binding: None,
@@ -1134,6 +1155,7 @@ mod tests {
                     name: Some("main".into()),
                     parameters: Vec::new(),
                     rest_parameter: None,
+                    arguments_binding: None,
                     bindings: vec![outer.clone(), imported],
                     captures: Vec::new(),
                     this_binding: None,
@@ -1186,6 +1208,7 @@ mod tests {
                     name: Some("inner".into()),
                     parameters: Vec::new(),
                     rest_parameter: None,
+                    arguments_binding: None,
                     bindings: Vec::new(),
                     captures: vec![outer.id],
                     this_binding: None,
@@ -1284,6 +1307,7 @@ mod tests {
             name: Some("inner".into()),
             parameters: Vec::new(),
             rest_parameter: None,
+            arguments_binding: None,
             bindings: Vec::new(),
             captures: vec![binding.id],
             this_binding: None,

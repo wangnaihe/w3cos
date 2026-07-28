@@ -445,6 +445,7 @@ fn finish_module(mut builder: Builder, specifier: &str, name: &str) -> Result<Mo
         name: Some(name.into()),
         parameters: Vec::new(),
         rest_parameter: None,
+        arguments_binding: None,
         bindings: builder.bindings,
         captures: Vec::new(),
         this_binding: None,
@@ -709,6 +710,7 @@ struct Builder {
     bindings: Vec<Binding>,
     parameters: Vec<BindingId>,
     rest_parameter: Option<BindingId>,
+    arguments_binding: Option<BindingId>,
     requested_modules: Vec<String>,
     star_exports: Vec<String>,
     imports: Vec<Import>,
@@ -753,6 +755,7 @@ impl Builder {
             bindings: Vec::new(),
             parameters: Vec::new(),
             rest_parameter: None,
+            arguments_binding: None,
             requested_modules: Vec::new(),
             star_exports: Vec::new(),
             imports: Vec::new(),
@@ -803,6 +806,7 @@ impl Builder {
             bindings: Vec::new(),
             parameters: Vec::new(),
             rest_parameter: None,
+            arguments_binding: None,
             requested_modules: Vec::new(),
             star_exports: Vec::new(),
             imports: Vec::new(),
@@ -1234,6 +1238,7 @@ impl Builder {
                     }
                 }
             }
+            Stmt::Labeled(statement) => self.predeclare_var_bindings(&statement.body)?,
             _ => {}
         }
         Ok(())
@@ -1864,6 +1869,15 @@ impl Builder {
         self.declare_local_with_kind("*this*", BindingKind::Parameter, false)
     }
 
+    fn declare_arguments_binding(&mut self) -> Result<()> {
+        if self.scopes[0].contains_key("arguments") {
+            return Ok(());
+        }
+        let binding = self.declare_local_with_kind("arguments", BindingKind::Parameter, false)?;
+        self.arguments_binding = Some(binding);
+        Ok(())
+    }
+
     fn lower_statement(&mut self, statement: &Stmt) -> Result<()> {
         if self.terminated {
             return Ok(());
@@ -2253,18 +2267,20 @@ impl Builder {
             self.seal_current_block();
         }
 
-        self.exception_regions.push(ExceptionRegion {
-            protected_blocks: try_protection.blocks,
-            catch_block,
-            finally_block: if catch_block.is_none() {
-                Some(exceptional_finally_block.ok_or_else(|| {
-                    anyhow!("runtime W3IR try statement requires catch or finally")
-                })?)
-            } else {
-                None
-            },
-            exception,
-        });
+        if !try_protection.blocks.is_empty() {
+            self.exception_regions.push(ExceptionRegion {
+                protected_blocks: try_protection.blocks,
+                catch_block,
+                finally_block: if catch_block.is_none() {
+                    Some(exceptional_finally_block.ok_or_else(|| {
+                        anyhow!("runtime W3IR try statement requires catch or finally")
+                    })?)
+                } else {
+                    None
+                },
+                exception,
+            });
+        }
 
         if let Some(finalizer) = &statement.finalizer {
             let active = self
@@ -2273,7 +2289,9 @@ impl Builder {
                 .expect("try finalizer was pushed");
             debug_assert_eq!(active.body, *finalizer);
 
-            if let Some(protection) = catch_protection {
+            if let Some(protection) = catch_protection
+                && !protection.blocks.is_empty()
+            {
                 self.exception_regions.push(ExceptionRegion {
                     protected_blocks: protection.blocks,
                     catch_block: None,
@@ -2705,12 +2723,14 @@ impl Builder {
             }
             self.seal_current_block();
             let exception = self.register();
-            self.exception_regions.push(ExceptionRegion {
-                protected_blocks: iterator_context.protected_blocks,
-                catch_block: Some(exception_close_block),
-                finally_block: None,
-                exception,
-            });
+            if !iterator_context.protected_blocks.is_empty() {
+                self.exception_regions.push(ExceptionRegion {
+                    protected_blocks: iterator_context.protected_blocks,
+                    catch_block: Some(exception_close_block),
+                    finally_block: None,
+                    exception,
+                });
+            }
 
             self.start_block(close_block);
             let _ = self.emit_iterator_close_chain(&[iterator], None, is_async)?;
@@ -4649,6 +4669,7 @@ impl Builder {
             name: Some(format!("{name}.<definition_values>")),
             parameters: child.parameters,
             rest_parameter: child.rest_parameter,
+            arguments_binding: child.arguments_binding,
             bindings: child.bindings,
             captures: child.capture_order.clone(),
             this_binding: None,
@@ -4727,6 +4748,7 @@ impl Builder {
             name,
             parameters: child.parameters,
             rest_parameter: child.rest_parameter,
+            arguments_binding: child.arguments_binding,
             bindings: child.bindings,
             captures: captures.clone(),
             this_binding: Some(this_binding),
@@ -4790,6 +4812,9 @@ impl Builder {
             }
             parameter_sources.push(child.declare_parameter(parameter, index)?);
         }
+        if bind_this {
+            child.declare_arguments_binding()?;
+        }
         for statement in statements {
             child.predeclare_function_binding(statement)?;
         }
@@ -4828,6 +4853,7 @@ impl Builder {
             name,
             parameters: child.parameters,
             rest_parameter: child.rest_parameter,
+            arguments_binding: child.arguments_binding,
             bindings: child.bindings,
             captures: captures.clone(),
             this_binding,
@@ -6388,6 +6414,40 @@ mod tests {
                 vec![Value::string("ReferenceError")],
             ]
         );
+    }
+
+    #[test]
+    fn empty_try_body_does_not_emit_an_empty_exception_region() {
+        let module = lower_script(
+            r#"
+                try {
+                } catch (error) {
+                    callback(error);
+                } finally {
+                    callback("finally");
+                }
+            "#,
+            "https://example.test/empty-try.js",
+        )
+        .unwrap();
+        let callback_binding = module
+            .imports
+            .iter()
+            .find(|import| import.imported == "callback")
+            .expect("callback import")
+            .local;
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let callback_observed = Rc::clone(&observed);
+        let callback = Value::function(move |_, arguments| {
+            callback_observed.borrow_mut().push(arguments[0].clone());
+            Value::Undefined
+        });
+
+        Vm::new(module, Limits::default())
+            .unwrap()
+            .run_with_bindings(HashMap::from([(callback_binding, callback)]))
+            .unwrap();
+        assert_eq!(observed.borrow().as_slice(), &[Value::string("finally")]);
     }
 
     #[test]
@@ -9227,6 +9287,72 @@ mod tests {
             .unwrap();
         assert!(observed.borrow()[0].is_undefined());
         assert_eq!(observed.borrow()[1], Value::string("ready"));
+    }
+
+    #[test]
+    fn var_binding_inside_label_is_function_scoped() {
+        let module = lower_script(
+            r#"
+                outer: {
+                    var value = "ready";
+                    break outer;
+                }
+                callback(value);
+            "#,
+            "https://example.test/labeled-var-hoist.js",
+        )
+        .unwrap();
+        let callback_binding = module
+            .imports
+            .iter()
+            .find(|import| import.imported == "callback")
+            .unwrap()
+            .local;
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let callback_observed = Rc::clone(&observed);
+        let callback = Value::function(move |_, arguments| {
+            callback_observed.borrow_mut().push(arguments[0].clone());
+            Value::Undefined
+        });
+
+        Vm::new(module, Limits::default())
+            .unwrap()
+            .run_with_bindings(HashMap::from([(callback_binding, callback)]))
+            .unwrap();
+        assert_eq!(observed.borrow().as_slice(), &[Value::string("ready")]);
+    }
+
+    #[test]
+    fn ordinary_functions_bind_arguments_and_arrows_capture_it() {
+        let module = lower_script(
+            r#"
+                function read(value) {
+                    const inner = () => arguments[0];
+                    return inner();
+                }
+                callback(read("ready"));
+            "#,
+            "https://example.test/function-arguments.js",
+        )
+        .unwrap();
+        let callback_binding = module
+            .imports
+            .iter()
+            .find(|import| import.imported == "callback")
+            .unwrap()
+            .local;
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let callback_observed = Rc::clone(&observed);
+        let callback = Value::function(move |_, arguments| {
+            callback_observed.borrow_mut().push(arguments[0].clone());
+            Value::Undefined
+        });
+
+        Vm::new(module, Limits::default())
+            .unwrap()
+            .run_with_bindings(HashMap::from([(callback_binding, callback)]))
+            .unwrap();
+        assert_eq!(observed.borrow().as_slice(), &[Value::string("ready")]);
     }
 
     #[test]
