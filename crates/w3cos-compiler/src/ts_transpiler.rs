@@ -3327,10 +3327,12 @@ mod tests {
             needs_fetch: false,
             needs_history: false,
             needs_runtime: false,
+            needs_web_graphics_advanced: false,
+            needs_web_media_advanced: false,
             needs_dom: false,
             needs_std: false,
         };
-        let toml = crate::generate_standalone_cargo_toml(&flags);
+        let toml = crate::generate_standalone_cargo_toml(&flags, &crate::CompileOptions::default());
         assert!(
             toml.contains("w3cos-core"),
             "missing w3cos-core dep: {toml}"

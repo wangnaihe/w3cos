@@ -8309,7 +8309,6 @@ fn is_decodable_picture_type(content_type: &str) -> bool {
             | "image/bmp"
             | "image/x-icon"
             | "image/vnd.microsoft.icon"
-            | "image/tiff"
             | "image/avif"
     )
 }

@@ -3165,6 +3165,36 @@ mod tests {
         dir
     }
 
+    fn runtime_fixture_manifest(
+        package: &str,
+        edition: &str,
+        core_path: &std::path::Path,
+        runtime_path: &std::path::Path,
+        extra_dependencies: &str,
+    ) -> String {
+        format!(
+            "[package]\nname = {package:?}\nversion = \"0.1.0\"\nedition = {edition:?}\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?}, default-features = false, features = [\"web-graphics-advanced\", \"web-media-advanced\"] }}\n{extra_dependencies}\n[workspace]\n"
+        )
+    }
+
+    #[test]
+    fn generated_runtime_fixtures_never_enable_renderer_defaults() {
+        let manifest = runtime_fixture_manifest(
+            "fixture",
+            "2024",
+            std::path::Path::new("/w3cos-core"),
+            std::path::Path::new("/w3cos-runtime"),
+            "",
+        );
+
+        assert!(manifest.contains("default-features = false"));
+        assert!(manifest.contains("\"web-graphics-advanced\""));
+        assert!(manifest.contains("\"web-media-advanced\""));
+        assert!(!manifest.contains("\"skia\""));
+        assert!(!manifest.contains("\"gpu\""));
+        assert!(!manifest.contains("\"cpu-render\""));
+    }
+
     #[test]
     fn generates_rust_skeleton_for_codemirror_like_bundle() {
         let root = fixture_root("w3cos_esm_codegen_skeleton");
@@ -7341,8 +7371,12 @@ export function runXhr(url) {
         let std_path = manifest_dir.join("../../crates/w3cos-std");
         std::fs::write(
             crate_dir.join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"jsdom_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?}, default-features = false }}\nw3cos-std = {{ path = {std_path:?} }}\ntungstenite = \"0.24\"\n\n[workspace]\n"
+            runtime_fixture_manifest(
+                "jsdom_run",
+                "2021",
+                &core_path,
+                &runtime_path,
+                &format!("w3cos-std = {{ path = {std_path:?} }}\ntungstenite = \"0.24\"\n"),
             ),
         )
         .unwrap();
@@ -10255,8 +10289,12 @@ export function readResult() {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-runtime");
         std::fs::write(
             crate_dir.join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"host_semantic_differential_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?} }}\n\n[workspace]\n"
+            runtime_fixture_manifest(
+                "host_semantic_differential_bundle_run",
+                "2024",
+                &core_path,
+                &runtime_path,
+                "",
             ),
         )
         .unwrap();

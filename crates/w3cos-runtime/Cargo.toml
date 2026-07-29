@@ -6,10 +6,12 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe"]
+web-graphics-advanced = []
+web-media-advanced = []
 devtools = []
 ai-bridge = ["dep:w3cos-ai-bridge"]
 dynamic-js = [
@@ -38,6 +40,7 @@ w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
 parley = { workspace = true }
 fontdue = { workspace = true }
+fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 anyhow = { workspace = true }
 image = { workspace = true }
 flate2 = { workspace = true }
@@ -96,7 +99,7 @@ libsqlite3-sys = { version = "0.35", features = ["bundled"] }
 [target.'cfg(all(any(target_os = "macos", target_os = "linux", target_os = "windows"), not(target_env = "ohos")))'.dependencies]
 ureq = { workspace = true }
 notify-rust = "4"
-arboard = "3.6.1"
+arboard = { version = "3.6.1", default-features = false }
 notify = { workspace = true }
 sysinfo = { workspace = true }
 nix = { workspace = true }

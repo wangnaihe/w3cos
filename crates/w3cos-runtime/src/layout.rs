@@ -60,16 +60,7 @@ thread_local! {
 }
 
 pub(crate) fn layout_font() -> &'static fontdue::Font {
-    LAYOUT_FONT.get_or_init(|| {
-        // Chromium keeps one compact metrics face and lets the platform
-        // rasterizer own large fallback fonts. Fontdue eagerly expands every
-        // glyph outline, so parsing the CJK face here costs roughly 250 MiB
-        // per instance on Android. Inter supplies exact Latin metrics; missing
-        // CJK glyphs use the CSS-compatible 1em estimate in text_layout.
-        let data = include_bytes!("../assets/Inter-Regular.ttf");
-        fontdue::Font::from_bytes(data as &[u8], fontdue::FontSettings::default())
-            .expect("embedded layout font")
-    })
+    LAYOUT_FONT.get_or_init(|| crate::font_face::host_ui_font().font.clone())
 }
 
 #[derive(Debug, Clone, Copy)]

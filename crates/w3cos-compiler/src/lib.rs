@@ -63,6 +63,8 @@ pub struct CompileFlags {
     pub needs_fetch: bool,
     pub needs_history: bool,
     pub needs_runtime: bool,
+    pub needs_web_graphics_advanced: bool,
+    pub needs_web_media_advanced: bool,
     pub needs_dom: bool,
     pub needs_std: bool,
 }
@@ -197,13 +199,14 @@ fn compile_with_source_dir(
         std::fs::write(output_dir.join("src/main.rs"), rust_code)?;
     } else {
         let output = ts_transpiler::transpile_with_flags(ts_source)?;
-        let (esm_diagnostics, esm_bundle_code, _has_entry_main) =
+        let (esm_diagnostics, esm_bundle_code, _has_entry_main, has_dynamic_global_access) =
             if let Some(entry_path) = source_path {
                 match build_esm_artifacts(entry_path) {
                     Ok(artifacts) => (
                         artifacts.diagnostics,
                         artifacts.bundle_code,
                         artifacts.has_entry_main,
+                        artifacts.has_dynamic_global_access,
                     ),
                     Err(error)
                         if error
@@ -216,10 +219,11 @@ fn compile_with_source_dir(
                         format!("//! ESM graph: unresolved ({err})\n\n"),
                         None,
                         false,
+                        false,
                     ),
                 }
             } else {
-                (String::new(), None, false)
+                (String::new(), None, false, false)
             };
         let has_esm_bundle = esm_bundle_code.is_some();
         let esm_needs_core = esm_bundle_code
@@ -230,6 +234,14 @@ fn compile_with_source_dir(
         let esm_uses_jsdom = esm_bundle_code
             .as_ref()
             .is_some_and(|code| code.contains("w3cos_runtime::jsdom"));
+        let needs_web_graphics_advanced = esm_bundle_code
+            .as_deref()
+            .is_some_and(uses_advanced_web_graphics)
+            || has_dynamic_global_access;
+        let needs_web_media_advanced = esm_bundle_code
+            .as_deref()
+            .is_some_and(uses_advanced_web_media)
+            || has_dynamic_global_access;
         let flags = CompileFlags {
             needs_hashmap: output.needs_hashmap,
             // The legacy transpiler still scans the source before the ESM
@@ -244,10 +256,12 @@ fn compile_with_source_dir(
             needs_runtime: output.code.contains("use w3cos_runtime")
                 || has_esm_bundle
                 || esm_uses_jsdom,
+            needs_web_graphics_advanced,
+            needs_web_media_advanced,
             needs_dom: output.code.contains("use w3cos_dom"),
             needs_std: output.code.contains("use w3cos_std") || has_esm_bundle,
         };
-        let cargo_toml = generate_standalone_cargo_toml(&flags);
+        let cargo_toml = generate_standalone_cargo_toml(&flags, options);
         std::fs::write(output_dir.join("Cargo.toml"), cargo_toml)?;
 
         let mut main_rs = format!("{esm_diagnostics}");
@@ -286,6 +300,9 @@ struct EsmArtifacts {
     /// True when the bundle exports a `main` function from the entry module,
     /// i.e. the generated `esm_bundle.rs` runs real app code via `run_entry()`.
     has_entry_main: bool,
+    /// Unknown computed access on a Web global cannot be capability-pruned
+    /// without changing JavaScript semantics.
+    has_dynamic_global_access: bool,
 }
 
 fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
@@ -307,6 +324,10 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
     let resolver = esm_resolver::EsmResolver::new(project_root)
         .with_runtime_modules(runtime_modules.iter().cloned());
     let graph = resolver.build_graph_from_entry(entry_path)?;
+    let has_dynamic_global_access = graph.nodes.iter().any(|node| {
+        std::fs::read_to_string(&node.module.path)
+            .is_ok_and(|source| uses_computed_web_global_access(&source))
+    });
     let parsed = resolver.parse_graph_from_entry(entry_path)?;
     // The manifest may reference an entry through `../` segments. Use the
     // resolver's normalized identity for bundle ordering as well; otherwise
@@ -382,6 +403,7 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
         diagnostics,
         bundle_code,
         has_entry_main,
+        has_dynamic_global_access,
     })
 }
 
@@ -682,7 +704,7 @@ fn is_ui_dsl(source: &str) -> bool {
 }
 
 /// Generate a minimal Cargo.toml for standalone (non-UI) Rust programs.
-fn generate_standalone_cargo_toml(flags: &CompileFlags) -> String {
+fn generate_standalone_cargo_toml(flags: &CompileFlags, options: &CompileOptions) -> String {
     let mut toml = String::from(
         r#"[package]
 name = "w3cos-app"
@@ -705,6 +727,39 @@ edition = "2024"
             })
             .unwrap_or_else(|| format!("{name} = {{ path = \"../../crates/{name}\" }}\n"))
     };
+    let runtime_dependency = || {
+        let mut runtime_features = vec!["gpu"];
+        if flags.needs_web_graphics_advanced {
+            runtime_features.push("web-graphics-advanced");
+        }
+        if flags.needs_web_media_advanced {
+            runtime_features.push("web-media-advanced");
+        }
+        if options.devtools {
+            runtime_features.push("devtools");
+        }
+        let features = format!(
+            "[{}]",
+            runtime_features
+                .iter()
+                .map(|feature| format!("{feature:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        workspace_root
+            .as_ref()
+            .map(|root| {
+                format!(
+                    "w3cos-runtime = {{ path = {:?}, default-features = false, features = {features} }}\n",
+                    root.join("crates/w3cos-runtime")
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "w3cos-runtime = {{ path = \"../../crates/w3cos-runtime\", default-features = false, features = {features} }}\n"
+                )
+            })
+    };
 
     if flags.needs_core {
         toml.push_str(&dependency("w3cos-core"));
@@ -713,7 +768,7 @@ edition = "2024"
         toml.push_str("tokio = { version = \"1\", features = [\"full\"] }\n");
     }
     if flags.needs_fetch || flags.needs_history || flags.needs_runtime {
-        toml.push_str(&dependency("w3cos-runtime"));
+        toml.push_str(&runtime_dependency());
     }
     if flags.needs_dom {
         toml.push_str(&dependency("w3cos-dom"));
@@ -721,7 +776,88 @@ edition = "2024"
     if flags.needs_std {
         toml.push_str(&dependency("w3cos-std"));
     }
+    toml.push_str(codegen::GENERATED_RELEASE_PROFILE);
     toml
+}
+
+fn uses_advanced_web_graphics(generated_rust: &str) -> bool {
+    const EXACT_GLOBALS: &[&str] = &[
+        "AudioData",
+        "AudioDecoder",
+        "AudioEncoder",
+        "EncodedAudioChunk",
+        "EncodedVideoChunk",
+        "ImageDecoder",
+        "ImageTrack",
+        "ImageTrackList",
+        "MediaStreamTrackGenerator",
+        "MediaStreamTrackProcessor",
+        "VideoColorSpace",
+        "VideoDecoder",
+        "VideoEncoder",
+        "VideoFrame",
+        "experimental-webgl",
+        "gpu",
+        "webgl",
+        "webgl2",
+        "xr",
+    ];
+    EXACT_GLOBALS
+        .iter()
+        .any(|name| generated_rust.contains(&format!("\"{name}\"")))
+        // WebGPU, WebGL, and WebXR expose families of globals. Match their
+        // case-sensitive prefixes so new interfaces stay conservative
+        // without maintaining a second copy of the runtime interface lists.
+        || ["\"GPU", "\"WebGL", "\"XR"]
+            .iter()
+            .any(|prefix| generated_rust.contains(prefix))
+}
+
+fn uses_computed_web_global_access(source: &str) -> bool {
+    ["window", "globalThis", "self", "navigator"]
+        .iter()
+        .any(|global| {
+            source
+                .match_indices(global)
+                .any(|(index, _)| source[index + global.len()..].trim_start().starts_with('['))
+        })
+}
+
+fn uses_advanced_web_media(generated_rust: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "\"AudioContext",
+        "\"BaseAudioContext",
+        "\"OfflineAudioContext",
+        "\"RTCIce",
+        "\"RTCPeer",
+        "\"RTCRtp",
+        "\"RTCSession",
+    ];
+    const EXACT: &[&str] = &[
+        "CaptureController",
+        "ImageCapture",
+        "MediaCapabilities",
+        "MediaDeviceInfo",
+        "MediaDevices",
+        "MediaMetadata",
+        "MediaRecorder",
+        "MediaSession",
+        "MediaSource",
+        "MediaSourceHandle",
+        "MediaStream",
+        "MediaStreamTrack",
+        "SourceBuffer",
+        "SourceBufferList",
+        "mediaCapabilities",
+        "mediaDevices",
+        "mediaSession",
+    ];
+    PREFIXES
+        .iter()
+        .any(|prefix| generated_rust.contains(prefix))
+        || EXACT
+            .iter()
+            .any(|name| generated_rust.contains(&format!("\"{name}\"")))
 }
 
 #[cfg(test)]
@@ -895,10 +1031,12 @@ console.log("Done!");
             needs_fetch: false,
             needs_history: false,
             needs_runtime: false,
+            needs_web_graphics_advanced: false,
+            needs_web_media_advanced: false,
             needs_dom: false,
             needs_std: false,
         };
-        let toml = generate_standalone_cargo_toml(&flags);
+        let toml = generate_standalone_cargo_toml(&flags, &CompileOptions::default());
         assert!(!toml.contains("tokio"), "should not include tokio: {toml}");
     }
 
@@ -912,12 +1050,96 @@ console.log("Done!");
             needs_fetch: false,
             needs_history: false,
             needs_runtime: false,
+            needs_web_graphics_advanced: false,
+            needs_web_media_advanced: false,
             needs_dom: false,
             needs_std: false,
         };
-        let toml = generate_standalone_cargo_toml(&flags);
+        let toml = generate_standalone_cargo_toml(&flags, &CompileOptions::default());
         assert!(toml.contains("tokio"), "should include tokio: {toml}");
         assert!(toml.contains("features"), "should have features: {toml}");
+    }
+
+    #[test]
+    fn standalone_cargo_toml_uses_single_renderer_and_release_profile() {
+        let flags = CompileFlags {
+            needs_hashmap: false,
+            needs_async: false,
+            needs_rc: false,
+            needs_core: true,
+            needs_fetch: false,
+            needs_history: false,
+            needs_runtime: true,
+            needs_web_graphics_advanced: false,
+            needs_web_media_advanced: false,
+            needs_dom: false,
+            needs_std: true,
+        };
+        let toml = generate_standalone_cargo_toml(&flags, &CompileOptions { devtools: true });
+        assert!(
+            toml.contains(r#"default-features = false, features = ["gpu", "devtools"]"#),
+            "ESM applications must link one renderer: {toml}"
+        );
+        assert!(toml.contains("opt-level = \"z\""), "{toml}");
+        assert!(toml.contains("lto = \"fat\""), "{toml}");
+        assert!(toml.contains("panic = \"unwind\""), "{toml}");
+    }
+
+    #[test]
+    fn standalone_cargo_toml_enables_detected_advanced_web_graphics() {
+        let flags = CompileFlags {
+            needs_hashmap: false,
+            needs_async: false,
+            needs_rc: false,
+            needs_core: true,
+            needs_fetch: false,
+            needs_history: false,
+            needs_runtime: true,
+            needs_web_graphics_advanced: true,
+            needs_web_media_advanced: false,
+            needs_dom: false,
+            needs_std: true,
+        };
+        let toml = generate_standalone_cargo_toml(&flags, &CompileOptions::default());
+        assert!(
+            toml.contains(
+                r#"default-features = false, features = ["gpu", "web-graphics-advanced"]"#
+            ),
+            "advanced graphics must be restored when referenced: {toml}"
+        );
+    }
+
+    #[test]
+    fn advanced_web_graphics_detection_covers_interface_families() {
+        assert!(uses_advanced_web_graphics(r#"Value::string("GPUDevice")"#));
+        assert!(uses_advanced_web_graphics(r#"Value::string("XRSession")"#));
+        assert!(uses_advanced_web_graphics(
+            r#"Value::string("VideoDecoder")"#
+        ));
+        assert!(uses_advanced_web_graphics(r#"Value::string("webgl2")"#));
+        assert!(!uses_advanced_web_graphics(
+            r#"Value::string("MessageChannel")"#
+        ));
+    }
+
+    #[test]
+    fn computed_web_global_access_conservatively_keeps_capabilities() {
+        assert!(uses_computed_web_global_access("window [capability]"));
+        assert!(uses_computed_web_global_access("globalThis[name]"));
+        assert!(uses_computed_web_global_access("navigator [key]"));
+        assert!(!uses_computed_web_global_access("window.document"));
+    }
+
+    #[test]
+    fn advanced_web_media_detection_keeps_media_but_not_speech() {
+        assert!(uses_advanced_web_media(r#"Value::string("AudioContext")"#));
+        assert!(uses_advanced_web_media(
+            r#"Value::string("RTCPeerConnection")"#
+        ));
+        assert!(uses_advanced_web_media(r#"Value::string("mediaDevices")"#));
+        assert!(!uses_advanced_web_media(
+            r#"Value::string("SpeechRecognition")"#
+        ));
     }
 
     #[test]
@@ -946,7 +1168,6 @@ console.log("Done!");
             cargo_toml.contains("tokio"),
             "missing tokio dep: {cargo_toml}"
         );
-
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1245,10 +1466,10 @@ console.log("view", view);
         compile(ts, &dir).expect("source should transpile to a diagnostic Rust project");
         let cargo_toml_path = dir.join("Cargo.toml");
         let mut cargo_toml = std::fs::read_to_string(&cargo_toml_path).unwrap();
-        cargo_toml = cargo_toml.replacen(
-            "w3cos-runtime = { path = ",
-            "w3cos-runtime = { default-features = false, path = ",
-            1,
+        assert!(
+            cargo_toml.contains("w3cos-runtime = {")
+                && cargo_toml.contains("default-features = false"),
+            "generated diagnostic project must disable runtime defaults: {cargo_toml}"
         );
         cargo_toml.push_str("\n[workspace]\n");
         std::fs::write(&cargo_toml_path, cargo_toml).unwrap();

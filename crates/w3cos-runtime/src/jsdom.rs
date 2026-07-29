@@ -3186,6 +3186,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 arg(&args, 0).to_js_string(),
             )
         }),
+        #[cfg(feature = "web-media-advanced")]
         "audioPlaybackStats" if matches!(dom::tag_name(node).as_str(), "audio" | "video") => {
             if let Some(stats) = get_expando(node, "audioPlaybackStats") {
                 stats
@@ -4095,6 +4096,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                         context
                     }
                 }
+                #[cfg(feature = "web-graphics-advanced")]
                 "webgl" | "experimental-webgl" => {
                     if let Some(context) = get_expando(node, "__ctxwebgl") {
                         context
@@ -4104,6 +4106,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                         context
                     }
                 }
+                #[cfg(feature = "web-graphics-advanced")]
                 "webgl2" => {
                     if let Some(context) = get_expando(node, "__ctxwebgl2") {
                         context
@@ -4116,6 +4119,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 _ => Value::Null,
             }
         }),
+        #[cfg(feature = "web-media-advanced")]
         "captureStream" if dom::tag_name(node) == "canvas" => func(move |_, args| {
             let frame_rate = args.first().map(Value::to_number).unwrap_or(0.0);
             if frame_rate < 0.0 {
@@ -8818,14 +8822,17 @@ fn navigator_value() -> Value {
         "userActivation".to_string(),
         crate::user_activation_web::user_activation_value(),
     );
-    props.insert(
-        "mediaSession".to_string(),
-        crate::media_session_web::media_session_value(),
-    );
-    props.insert(
-        "mediaCapabilities".to_string(),
-        crate::media_capabilities_web::media_capabilities_value(),
-    );
+    #[cfg(feature = "web-media-advanced")]
+    {
+        props.insert(
+            "mediaSession".to_string(),
+            crate::media_session_web::media_session_value(),
+        );
+        props.insert(
+            "mediaCapabilities".to_string(),
+            crate::media_capabilities_web::media_capabilities_value(),
+        );
+    }
     props.insert(
         "credentials".to_string(),
         crate::credentials_web::credentials_container_value(),
@@ -8879,6 +8886,7 @@ fn navigator_value() -> Value {
         "geolocation".to_string(),
         crate::geolocation_web::geolocation_value(),
     );
+    #[cfg(feature = "web-media-advanced")]
     props.insert(
         "mediaDevices".to_string(),
         crate::media_devices_web::media_devices_value(),
@@ -8922,8 +8930,11 @@ fn navigator_value() -> Value {
         "protectedAudience".to_string(),
         crate::experimental_web::protected_audience_value(),
     );
-    props.insert("gpu".to_string(), crate::webgpu_web::gpu_value());
-    props.insert("xr".to_string(), crate::webxr_web::xr_system_value());
+    #[cfg(feature = "web-graphics-advanced")]
+    {
+        props.insert("gpu".to_string(), crate::webgpu_web::gpu_value());
+        props.insert("xr".to_string(), crate::webxr_web::xr_system_value());
+    }
 
     let navigator = Value::object(props);
     w3cos_core::class::set_prototype_of(
@@ -9837,72 +9848,81 @@ fn build_window_value() -> Value {
         "Notification".to_string(),
         crate::notification_web::notification_class(),
     );
-    props.insert(
-        "MediaStream".to_string(),
-        crate::media_devices_web::media_stream_class(),
-    );
-    props.insert(
-        "MediaStreamTrack".to_string(),
-        crate::media_devices_web::media_stream_track_class(),
-    );
-    props.insert(
-        "MediaStreamTrackGenerator".to_string(),
-        crate::media_devices_web::media_stream_track_generator_class(),
-    );
-    props.insert(
-        "MediaStreamTrackProcessor".to_string(),
-        crate::media_devices_web::media_stream_track_processor_class(),
-    );
-    for name in [
-        "AudioPlaybackStats",
-        "MediaStreamTrackAudioStats",
-        "MediaStreamTrackVideoStats",
-    ] {
+    #[cfg(feature = "web-media-advanced")]
+    {
         props.insert(
-            name.to_string(),
-            crate::media_devices_web::media_stats_class(name),
+            "MediaStream".to_string(),
+            crate::media_devices_web::media_stream_class(),
+        );
+        props.insert(
+            "MediaStreamTrack".to_string(),
+            crate::media_devices_web::media_stream_track_class(),
         );
     }
-    props.insert(
-        "MediaRecorder".to_string(),
-        crate::media_recording_web::media_recorder_class(),
-    );
-    props.insert(
-        "ImageCapture".to_string(),
-        crate::media_recording_web::image_capture_class(),
-    );
-    props.insert(
-        "CaptureController".to_string(),
-        crate::media_recording_web::capture_controller_class(),
-    );
-    props.insert(
-        "CropTarget".to_string(),
-        crate::media_recording_web::crop_target_class(),
-    );
-    props.insert(
-        "RestrictionTarget".to_string(),
-        crate::media_recording_web::restriction_target_class(),
-    );
-    props.insert(
-        "BrowserCaptureMediaStreamTrack".to_string(),
-        crate::media_recording_web::browser_capture_media_stream_track_class(),
-    );
-    props.insert(
-        "MediaSource".to_string(),
-        crate::media_source_web::media_source_class(),
-    );
-    props.insert(
-        "MediaSourceHandle".to_string(),
-        crate::media_source_web::media_source_handle_class(),
-    );
-    props.insert(
-        "SourceBuffer".to_string(),
-        crate::media_source_web::source_buffer_class(),
-    );
-    props.insert(
-        "SourceBufferList".to_string(),
-        crate::media_source_web::source_buffer_list_class(),
-    );
+    #[cfg(all(feature = "web-graphics-advanced", feature = "web-media-advanced"))]
+    {
+        props.insert(
+            "MediaStreamTrackGenerator".to_string(),
+            crate::media_devices_web::media_stream_track_generator_class(),
+        );
+        props.insert(
+            "MediaStreamTrackProcessor".to_string(),
+            crate::media_devices_web::media_stream_track_processor_class(),
+        );
+    }
+    #[cfg(feature = "web-media-advanced")]
+    {
+        for name in [
+            "AudioPlaybackStats",
+            "MediaStreamTrackAudioStats",
+            "MediaStreamTrackVideoStats",
+        ] {
+            props.insert(
+                name.to_string(),
+                crate::media_devices_web::media_stats_class(name),
+            );
+        }
+        props.insert(
+            "MediaRecorder".to_string(),
+            crate::media_recording_web::media_recorder_class(),
+        );
+        props.insert(
+            "ImageCapture".to_string(),
+            crate::media_recording_web::image_capture_class(),
+        );
+        props.insert(
+            "CaptureController".to_string(),
+            crate::media_recording_web::capture_controller_class(),
+        );
+        props.insert(
+            "CropTarget".to_string(),
+            crate::media_recording_web::crop_target_class(),
+        );
+        props.insert(
+            "RestrictionTarget".to_string(),
+            crate::media_recording_web::restriction_target_class(),
+        );
+        props.insert(
+            "BrowserCaptureMediaStreamTrack".to_string(),
+            crate::media_recording_web::browser_capture_media_stream_track_class(),
+        );
+        props.insert(
+            "MediaSource".to_string(),
+            crate::media_source_web::media_source_class(),
+        );
+        props.insert(
+            "MediaSourceHandle".to_string(),
+            crate::media_source_web::media_source_handle_class(),
+        );
+        props.insert(
+            "SourceBuffer".to_string(),
+            crate::media_source_web::source_buffer_class(),
+        );
+        props.insert(
+            "SourceBufferList".to_string(),
+            crate::media_source_web::source_buffer_list_class(),
+        );
+    }
     for name in [
         "PaymentAddress",
         "PaymentManager",
@@ -9911,22 +9931,26 @@ fn build_window_value() -> Value {
     ] {
         props.insert(name.to_string(), crate::payment_web::class_for(name));
     }
-    for name in [
-        "AudioData",
-        "AudioDecoder",
-        "AudioEncoder",
-        "EncodedAudioChunk",
-        "EncodedVideoChunk",
-        "VideoColorSpace",
-        "VideoDecoder",
-        "VideoEncoder",
-        "VideoFrame",
-    ] {
-        props.insert(name.to_string(), crate::webcodecs_web::class_for(name));
+    #[cfg(feature = "web-graphics-advanced")]
+    {
+        for name in [
+            "AudioData",
+            "AudioDecoder",
+            "AudioEncoder",
+            "EncodedAudioChunk",
+            "EncodedVideoChunk",
+            "VideoColorSpace",
+            "VideoDecoder",
+            "VideoEncoder",
+            "VideoFrame",
+        ] {
+            props.insert(name.to_string(), crate::webcodecs_web::class_for(name));
+        }
+        for name in ["ImageDecoder", "ImageTrack", "ImageTrackList"] {
+            props.insert(name.to_string(), crate::image_decoder_web::class_for(name));
+        }
     }
-    for name in ["ImageDecoder", "ImageTrack", "ImageTrackList"] {
-        props.insert(name.to_string(), crate::image_decoder_web::class_for(name));
-    }
+    #[cfg(feature = "web-media-advanced")]
     for (name, class) in crate::webrtc_web::classes() {
         props.insert(name.to_string(), class);
     }
@@ -9942,17 +9966,20 @@ fn build_window_value() -> Value {
             crate::web_transport_web::class_for(name),
         );
     }
-    for name in crate::webxr_web::INTERFACES {
-        props.insert(name.to_string(), crate::webxr_web::class_for(name));
-    }
-    for name in crate::webgpu_web::INTERFACES {
-        props.insert(name.to_string(), crate::webgpu_web::class_for(name));
-    }
-    for name in crate::webgl_web::INTERFACES {
-        props.insert(name.to_string(), crate::webgl_web::class_for(name));
-    }
-    for name in crate::webgpu_web::CONSTANTS {
-        props.insert(name.to_string(), crate::webgpu_web::constant_value(name));
+    #[cfg(feature = "web-graphics-advanced")]
+    {
+        for name in crate::webxr_web::INTERFACES {
+            props.insert(name.to_string(), crate::webxr_web::class_for(name));
+        }
+        for name in crate::webgpu_web::INTERFACES {
+            props.insert(name.to_string(), crate::webgpu_web::class_for(name));
+        }
+        for name in crate::webgl_web::INTERFACES {
+            props.insert(name.to_string(), crate::webgl_web::class_for(name));
+        }
+        for name in crate::webgpu_web::CONSTANTS {
+            props.insert(name.to_string(), crate::webgpu_web::constant_value(name));
+        }
     }
     props.insert(
         "sharedStorage".to_string(),
@@ -9970,6 +9997,7 @@ fn build_window_value() -> Value {
         "fetchLater".to_string(),
         crate::experimental_web::fetch_later_value(),
     );
+    #[cfg(feature = "web-media-advanced")]
     for name in [
         "AnalyserNode",
         "AudioBuffer",
@@ -10008,22 +10036,25 @@ fn build_window_value() -> Value {
     ] {
         props.insert(name.to_string(), crate::audio_web::class_for(name));
     }
-    props.insert(
-        "MediaDeviceInfo".to_string(),
-        crate::media_devices_web::media_device_info_class(),
-    );
-    props.insert(
-        "InputDeviceInfo".to_string(),
-        crate::media_devices_web::input_device_info_class(),
-    );
-    props.insert(
-        "MediaDevices".to_string(),
-        crate::media_devices_web::media_devices_class(),
-    );
-    props.insert(
-        "OverconstrainedError".to_string(),
-        crate::media_devices_web::overconstrained_error_class(),
-    );
+    #[cfg(feature = "web-media-advanced")]
+    {
+        props.insert(
+            "MediaDeviceInfo".to_string(),
+            crate::media_devices_web::media_device_info_class(),
+        );
+        props.insert(
+            "InputDeviceInfo".to_string(),
+            crate::media_devices_web::input_device_info_class(),
+        );
+        props.insert(
+            "MediaDevices".to_string(),
+            crate::media_devices_web::media_devices_class(),
+        );
+        props.insert(
+            "OverconstrainedError".to_string(),
+            crate::media_devices_web::overconstrained_error_class(),
+        );
+    }
     let speech_recognition = crate::speech_web::speech_recognition_class();
     props.insert("SpeechRecognition".to_string(), speech_recognition.clone());
     props.insert("webkitSpeechRecognition".to_string(), speech_recognition);
@@ -10226,22 +10257,26 @@ fn build_window_value() -> Value {
         "UserActivation".to_string(),
         crate::user_activation_web::user_activation_class(),
     );
-    props.insert(
-        "MediaMetadata".to_string(),
-        crate::media_session_web::media_metadata_class(),
-    );
-    props.insert(
-        "ChapterInformation".to_string(),
-        crate::media_session_web::chapter_information_class(),
-    );
-    props.insert(
-        "MediaSession".to_string(),
-        crate::media_session_web::media_session_class(),
-    );
+    #[cfg(feature = "web-media-advanced")]
+    {
+        props.insert(
+            "MediaMetadata".to_string(),
+            crate::media_session_web::media_metadata_class(),
+        );
+        props.insert(
+            "ChapterInformation".to_string(),
+            crate::media_session_web::chapter_information_class(),
+        );
+        props.insert(
+            "MediaSession".to_string(),
+            crate::media_session_web::media_session_class(),
+        );
+    }
     props.insert(
         "BatteryManager".to_string(),
         crate::battery_web::battery_manager_class(),
     );
+    #[cfg(feature = "web-media-advanced")]
     props.insert(
         "MediaCapabilities".to_string(),
         crate::media_capabilities_web::media_capabilities_class(),
@@ -11921,12 +11956,16 @@ pub fn reset_bridge() {
     crate::speech_web::reset();
     crate::speech_synthesis_web::reset();
     crate::geolocation_web::reset();
-    crate::media_devices_web::reset();
-    crate::media_session_web::reset();
-    crate::media_capabilities_web::reset();
-    crate::media_recording_web::reset();
-    crate::media_source_web::reset();
+    #[cfg(feature = "web-media-advanced")]
+    {
+        crate::media_devices_web::reset();
+        crate::media_session_web::reset();
+        crate::media_capabilities_web::reset();
+        crate::media_recording_web::reset();
+        crate::media_source_web::reset();
+    }
     crate::payment_web::reset();
+    #[cfg(feature = "web-graphics-advanced")]
     crate::webcodecs_web::reset();
     crate::navigator_web::reset();
     crate::midi_web::reset();
@@ -11948,14 +11987,20 @@ pub fn reset_bridge() {
     crate::text_tracks_web::reset();
     crate::file_system_web::reset();
     crate::animations_web::reset();
+    #[cfg(feature = "web-media-advanced")]
     crate::audio_web::reset();
+    #[cfg(feature = "web-graphics-advanced")]
     crate::image_decoder_web::reset();
+    #[cfg(feature = "web-media-advanced")]
     crate::webrtc_web::reset();
     crate::experimental_web::reset();
     crate::web_transport_web::reset();
-    crate::webxr_web::reset();
-    crate::webgpu_web::reset();
-    crate::webgl_web::reset();
+    #[cfg(feature = "web-graphics-advanced")]
+    {
+        crate::webxr_web::reset();
+        crate::webgpu_web::reset();
+        crate::webgl_web::reset();
+    }
     crate::cookie_store_web::reset_document_context();
     crate::trusted_types_web::reset();
     crate::user_activation_web::reset();
@@ -15538,6 +15583,56 @@ mod tests {
         let r0 = sel.call_method("getRangeAt", vec![Value::Number(0.0)]);
         assert_eq!(r0.get_property("startOffset").to_number(), 0.0);
         sel.call_method("removeAllRanges", vec![]);
+    }
+
+    #[cfg(not(feature = "web-graphics-advanced"))]
+    #[test]
+    fn advanced_web_graphics_globals_are_absent_when_pruned() {
+        setup();
+        let window = window_value();
+        for name in [
+            "GPUAdapter",
+            "WebGLRenderingContext",
+            "XRSession",
+            "VideoDecoder",
+            "ImageDecoder",
+            "MediaStreamTrackProcessor",
+        ] {
+            assert!(
+                window.get_property(name).is_undefined(),
+                "{name} must not be exposed without web-graphics-advanced"
+            );
+        }
+        let navigator = window.get_property("navigator");
+        assert!(navigator.get_property("gpu").is_undefined());
+        assert!(navigator.get_property("xr").is_undefined());
+
+        let canvas = document_value().call_method("createElement", vec![Value::string("canvas")]);
+        assert!(
+            canvas
+                .call_method("getContext", vec![Value::string("webgl")])
+                .is_null()
+        );
+    }
+
+    #[cfg(not(feature = "web-media-advanced"))]
+    #[test]
+    fn advanced_media_is_pruned_without_removing_speech_recognition() {
+        setup();
+        let window = window_value();
+        for name in [
+            "AudioContext",
+            "MediaRecorder",
+            "MediaSource",
+            "MediaStream",
+            "RTCPeerConnection",
+        ] {
+            assert!(window.get_property(name).is_undefined(), "{name}");
+        }
+        assert!(window.get_property("SpeechRecognition").is_function());
+        let navigator = window.get_property("navigator");
+        assert!(navigator.get_property("mediaDevices").is_undefined());
+        assert!(navigator.get_property("mediaSession").is_undefined());
     }
 
     #[test]

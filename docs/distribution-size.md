@@ -28,6 +28,50 @@ abort-on-panic, and symbol stripping. Feature removal remains the primary size
 tool: stripping cannot remove an enabled renderer, decoder, embedded font,
 compiler, or VM.
 
+Generated standalone desktop applications embed an equivalent size-oriented
+`release` profile and select only the GPU renderer by default. They deliberately
+retain `panic = "unwind"` because compiled JavaScript exceptions currently use
+Rust unwinding; switching those artifacts to `panic = "abort"` is invalid until
+the AOT path represents JavaScript completion records explicitly.
+
+### LogiDesk W3IR reference measurement
+
+The 2026-07-29 arm64 macOS audit reduced the stripped LogiDesk executable from
+133,197,312 to 46,075,840 bytes (65.41%). The retained changes are the generated
+size profile, single-renderer linkage, erased `JsFunction` closure construction,
+W3IR straight-line block coalescing/single-block dispatch removal, grouped
+exception capture, explicit raster-codec selection, and text-only clipboard
+linkage. Capability-level registration also removes unreferenced
+WebGPU/WebGL/WebXR/WebCodecs/ImageDecoder globals from generated applications;
+that step reduced the same locked artifact by 150,224 bytes. A separate advanced
+media group removes unreferenced Web Audio, media capture/source/session and
+WebRTC surfaces while retaining speech recognition; it saved another 265,888
+bytes. The compiler restores each complete capability group when an interface is referenced, and
+conservatively keeps it for computed access through `window`, `globalThis`,
+`self`, or `navigator`. The runtime crate's default feature set remains complete.
+
+The same locked build's link map attributed 10,028,840 bytes to the packaged CJK
+face and 736,764 bytes to Inter. Host production paths now select a system UI
+font once and preserve the face index for font collections; GPU, CPU/Skia, SVG,
+and Harmony rendering no longer package those faces. Fixed font files remain
+test-only for deterministic geometry, while application-provided `@font-face`
+data remains an application resource. This reduced the prior 56,858,032-byte
+artifact by 10,782,192 bytes (18.96%); `__TEXT,__const` alone fell by 10,764,288
+bytes.
+
+Several source-level reductions did not improve the linked artifact and are not
+part of the implementation: recursive native methods for acyclic CFGs saved
+130,480 bytes but increased stack risk; central capture-map helpers increased
+the executable by 99,024 bytes; and transitive font/Vello dependency pinning
+increased it by 82,464 bytes under the tested resolution. Revisit these only
+with a new linker or code-generation strategy and the same locked A/B build.
+Binding-load specialization reduced generated Rust by 14.25%, but failed the
+real DOM E2E because module initializers can override a local binding through a
+capture getter; it was fully reverted rather than weakening W3IR semantics.
+Size gates must retain the product's generated `Cargo.lock`; a fresh standalone
+resolution is a different dependency graph and is not a valid regression
+comparison.
+
 Audit a package using non-overlapping component inputs:
 
 ```sh

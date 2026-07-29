@@ -8,7 +8,8 @@
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use w3cos_ir::{
-    BinaryOperator, BindingKind, Constant, Function, FunctionId, Instruction, Module, UnaryOperator,
+    BinaryOperator, BindingKind, BlockId, Constant, Function, FunctionId, Instruction, Module,
+    Register, UnaryOperator,
 };
 
 #[derive(Clone, Copy)]
@@ -180,49 +181,112 @@ fn generate_sync_function_with_factories(
 ) -> Result<String> {
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
+    let sync_blocks = coalesce_sync_blocks(function);
     let mut blocks = String::new();
-    for block in &function.blocks {
-        let exception_target = function
-            .exception_regions
-            .iter()
-            .find(|region| region.protected_blocks.contains(&block.id))
-            .and_then(|region| {
-                region
-                    .catch_block
-                    .or(region.finally_block)
-                    .map(|target| (region.exception, target))
-            });
-        blocks.push_str(&format!("                {} => {{\n", block.id.0));
-        for instruction in &block.instructions {
-            blocks.push_str("                    ");
-            let emitted = emit_instruction(
-                instruction,
-                exception_target,
-                function,
-                factories,
-                EmissionMode::Sync,
-                module_specifier,
-            )?;
-            if let Some((exception, target)) = exception_target
-                && !matches!(
+    let mut direct_body = None;
+    for (block_id, instructions) in &sync_blocks {
+        let exception_target = exception_target_for_block(function, *block_id);
+        let emitted = emit_block_instructions(
+            instructions,
+            exception_target,
+            function,
+            factories,
+            EmissionMode::Sync,
+            module_specifier,
+            &type_name,
+            false,
+        )?;
+        if sync_blocks.len() == 1
+            && *block_id == function.entry
+            && exception_target.is_none()
+            && instructions.last().is_some_and(|instruction| {
+                matches!(
                     instruction,
-                    Instruction::Jump { .. }
-                        | Instruction::Branch { .. }
-                        | Instruction::Return { .. }
-                        | Instruction::Throw { .. }
+                    Instruction::Return { .. } | Instruction::Throw { .. }
                 )
-            {
-                blocks.push_str(&format!(
-                    "let __w3cos_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ {emitted} }})); if let Err(__w3cos_payload) = __w3cos_outcome {{ let __w3cos_exception = if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {{ value.0.clone() }} else {{ std::panic::resume_unwind(__w3cos_payload); }}; self.registers[{}] = __w3cos_exception; self.block = {}; continue 'drive; }}",
-                    exception.0, target.0,
-                ));
-            } else {
-                blocks.push_str(&emitted);
-            }
-            blocks.push('\n');
+            })
+        {
+            direct_body = Some(emitted.clone());
         }
+        blocks.push_str(&format!("                {} => {{\n", block_id.0));
+        blocks.push_str(&emitted);
         blocks.push_str("                }\n");
     }
+    let mut exception_handler_groups: Vec<(u32, u32, Vec<u32>)> = Vec::new();
+    for (block_id, _) in &sync_blocks {
+        let exception_target = exception_target_for_block(function, *block_id);
+        if let Some((exception, target)) = exception_target {
+            if let Some((_, _, blocks)) = exception_handler_groups
+                .iter_mut()
+                .find(|(register, handler, _)| *register == exception.0 && *handler == target.0)
+            {
+                blocks.push(block_id.0);
+            } else {
+                exception_handler_groups.push((exception.0, target.0, vec![block_id.0]));
+            }
+        }
+    }
+    let mut exception_handlers = String::new();
+    for (exception, target, mut protected_blocks) in exception_handler_groups {
+        protected_blocks.sort_unstable();
+        exception_handlers.push_str(&format!(
+            "                    {} => {{ self.registers[{}] = __w3cos_exception; self.block = {}; }}\n",
+            compact_block_patterns(&protected_blocks),
+            exception,
+            target,
+        ));
+    }
+    let is_direct = direct_body.is_some();
+    let run_body = if let Some(direct_body) = &direct_body {
+        direct_body.clone()
+    } else if exception_handlers.is_empty() {
+        format!(
+            r#"
+        'drive: loop {{
+            match self.block {{
+{blocks}                _ => return w3cos_core::throw_value(
+                    w3cos_core::Value::string("invalid synchronous W3IR block")
+                ),
+            }}
+        }}"#
+        )
+    } else {
+        format!(
+            r#"
+        loop {{
+            let __w3cos_outcome = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| {{
+                    'drive: loop {{
+                        match self.block {{
+{blocks}                            _ => return w3cos_core::throw_value(
+                                w3cos_core::Value::string("invalid synchronous W3IR block")
+                            ),
+                        }}
+                    }}
+                }}),
+            );
+            let __w3cos_payload = match __w3cos_outcome {{
+                Ok(__w3cos_value) => return __w3cos_value,
+                Err(__w3cos_payload) => __w3cos_payload,
+            }};
+            let __w3cos_exception =
+                if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {{
+                    value.0.clone()
+                }} else {{
+                    std::panic::resume_unwind(__w3cos_payload);
+                }};
+            match self.block {{
+{exception_handlers}                _ => std::panic::resume_unwind(__w3cos_payload),
+            }}
+        }}"#
+        )
+    };
+    let block_field = if is_direct { "" } else { "    block: u32,\n" };
+    let block_initializer = if is_direct {
+        String::new()
+    } else {
+        format!("        block: {},\n", function.entry.0)
+    };
 
     let mut binding_initializers = String::new();
     for binding in &function.bindings {
@@ -272,18 +336,12 @@ struct {type_name} {{
     >,
     capture_getters: std::collections::HashMap<u32, w3cos_core::Value>,
     capture_setters: std::collections::HashMap<u32, w3cos_core::Value>,
-    block: u32,
+{block_field}
 }}
 
 impl {type_name} {{
     fn run(&mut self) -> w3cos_core::Value {{
-        'drive: loop {{
-            match self.block {{
-{blocks}                _ => return w3cos_core::throw_value(
-                    w3cos_core::Value::string("invalid synchronous W3IR block")
-                ),
-            }}
-        }}
+{run_body}
     }}
 }}
 
@@ -307,12 +365,11 @@ pub fn {rust_name}(
         bindings,
         capture_getters,
         capture_setters,
-        block: {entry},
+{block_initializer}
     }}.run()
 }}
 "#,
         registers = function.registers,
-        entry = function.entry.0,
     ))
 }
 
@@ -340,36 +397,16 @@ fn generate_async_function_with_factories(
                     .map(|target| (region.exception, target))
             });
         blocks.push_str(&format!("                {} => {{\n", block.id.0));
-        for instruction in &block.instructions {
-            blocks.push_str("                    ");
-            let emitted = emit_instruction(
-                instruction,
-                exception_target,
-                function,
-                factories,
-                EmissionMode::Async,
-                module_specifier,
-            )?
-            .replace("__W3COS_ASYNC_FRAME__", &type_name);
-            if let Some((exception, target)) = exception_target
-                && !matches!(
-                    instruction,
-                    Instruction::Await { .. }
-                        | Instruction::Jump { .. }
-                        | Instruction::Branch { .. }
-                        | Instruction::Return { .. }
-                        | Instruction::Throw { .. }
-                )
-            {
-                blocks.push_str(&format!(
-                    "let __w3cos_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ {emitted} }})); if let Err(__w3cos_payload) = __w3cos_outcome {{ let __w3cos_exception = if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {{ value.0.clone() }} else {{ std::panic::resume_unwind(__w3cos_payload); }}; self.registers[{}] = __w3cos_exception; self.block = {}; continue 'drive; }}",
-                    exception.0, target.0,
-                ));
-            } else {
-                blocks.push_str(&emitted);
-            }
-            blocks.push('\n');
-        }
+        blocks.push_str(&emit_block_instructions(
+            &block.instructions,
+            exception_target,
+            function,
+            factories,
+            EmissionMode::Async,
+            module_specifier,
+            &type_name,
+            true,
+        )?);
         blocks.push_str("                }\n");
     }
 
@@ -612,38 +649,16 @@ fn generate_generator_with_factories(
                     .map(|target| (region.exception, target))
             });
         blocks.push_str(&format!("                {} => {{\n", block.id.0));
-        for instruction in &block.instructions {
-            blocks.push_str("                    ");
-            let emitted = emit_instruction(
-                instruction,
-                exception_target,
-                function,
-                factories,
-                EmissionMode::Generator,
-                module_specifier,
-            )?
-            .replace("__W3COS_STATE__", &format!("{type_name}State"));
-            if let Some((exception, target)) = exception_target
-                && !matches!(
-                    instruction,
-                    Instruction::Yield { .. }
-                        | Instruction::YieldDelegate { .. }
-                        | Instruction::Jump { .. }
-                        | Instruction::Branch { .. }
-                        | Instruction::Return { .. }
-                        | Instruction::Throw { .. }
-                )
-            {
-                blocks.push_str(&format!(
-                    "let __w3cos_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ {emitted} }})); if let Err(__w3cos_payload) = __w3cos_outcome {{ let __w3cos_exception = if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {{ value.0.clone() }} else {{ std::panic::resume_unwind(__w3cos_payload); }}; self.registers[{}] = __w3cos_exception; self.block = {}; continue 'drive; }}",
-                    exception.0,
-                    target.0,
-                ));
-            } else {
-                blocks.push_str(&emitted);
-            }
-            blocks.push('\n');
-        }
+        blocks.push_str(&emit_block_instructions(
+            &block.instructions,
+            exception_target,
+            function,
+            factories,
+            EmissionMode::Generator,
+            module_specifier,
+            &type_name,
+            true,
+        )?);
         blocks.push_str("                }\n");
     }
 
@@ -901,39 +916,16 @@ fn generate_async_generator_with_factories(
                     .map(|target| (region.exception, target))
             });
         blocks.push_str(&format!("                {} => {{\n", block.id.0));
-        for instruction in &block.instructions {
-            blocks.push_str("                    ");
-            let emitted = emit_instruction(
-                instruction,
-                exception_target,
-                function,
-                factories,
-                EmissionMode::AsyncGenerator,
-                module_specifier,
-            )?
-            .replace("__W3COS_STATE__", &format!("{type_name}State"));
-            if let Some((exception, target)) = exception_target
-                && !matches!(
-                    instruction,
-                    Instruction::Await { .. }
-                        | Instruction::Yield { .. }
-                        | Instruction::YieldDelegate { .. }
-                        | Instruction::Jump { .. }
-                        | Instruction::Branch { .. }
-                        | Instruction::Return { .. }
-                        | Instruction::Throw { .. }
-                )
-            {
-                blocks.push_str(&format!(
-                    "let __w3cos_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ {emitted} }})); if let Err(__w3cos_payload) = __w3cos_outcome {{ let __w3cos_exception = if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {{ value.0.clone() }} else {{ std::panic::resume_unwind(__w3cos_payload); }}; self.registers[{}] = __w3cos_exception; self.block = {}; continue 'drive; }}",
-                    exception.0,
-                    target.0,
-                ));
-            } else {
-                blocks.push_str(&emitted);
-            }
-            blocks.push('\n');
-        }
+        blocks.push_str(&emit_block_instructions(
+            &block.instructions,
+            exception_target,
+            function,
+            factories,
+            EmissionMode::AsyncGenerator,
+            module_specifier,
+            &type_name,
+            true,
+        )?);
         blocks.push_str("                }\n");
     }
 
@@ -1540,6 +1532,198 @@ pub fn {rust_name}(
     ))
 }
 
+fn exception_target_for_block(function: &Function, block: BlockId) -> Option<(Register, BlockId)> {
+    function
+        .exception_regions
+        .iter()
+        .find(|region| region.protected_blocks.contains(&block))
+        .and_then(|region| {
+            region
+                .catch_block
+                .or(region.finally_block)
+                .map(|target| (region.exception, target))
+        })
+}
+
+fn coalesce_sync_blocks(function: &Function) -> Vec<(BlockId, Vec<Instruction>)> {
+    let mut predecessors = HashMap::<BlockId, usize>::new();
+    for block in &function.blocks {
+        match block.instructions.last() {
+            Some(Instruction::Jump { target }) => {
+                *predecessors.entry(*target).or_default() += 1;
+            }
+            Some(Instruction::Branch {
+                then_block,
+                else_block,
+                ..
+            }) => {
+                *predecessors.entry(*then_block).or_default() += 1;
+                if then_block != else_block {
+                    *predecessors.entry(*else_block).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut roots = HashSet::from([function.entry]);
+    for region in &function.exception_regions {
+        roots.extend(region.catch_block);
+        roots.extend(region.finally_block);
+    }
+    let blocks_by_id = function
+        .blocks
+        .iter()
+        .map(|block| (block.id, block))
+        .collect::<HashMap<_, _>>();
+    let mut merged_targets = HashSet::new();
+    for block in &function.blocks {
+        let Some(Instruction::Jump { target }) = block.instructions.last() else {
+            continue;
+        };
+        if predecessors.get(target).copied() == Some(1)
+            && !roots.contains(target)
+            && exception_target_for_block(function, block.id)
+                == exception_target_for_block(function, *target)
+        {
+            merged_targets.insert(*target);
+        }
+    }
+
+    let mut output = Vec::new();
+    for block in &function.blocks {
+        if merged_targets.contains(&block.id) {
+            continue;
+        }
+        let mut instructions = block.instructions.clone();
+        let mut visited = HashSet::from([block.id]);
+        loop {
+            let Some(Instruction::Jump { target }) = instructions.last() else {
+                break;
+            };
+            if !merged_targets.contains(target) || !visited.insert(*target) {
+                break;
+            }
+            let Some(next) = blocks_by_id.get(target) else {
+                break;
+            };
+            instructions.pop();
+            instructions.extend(next.instructions.iter().cloned());
+        }
+        output.push((block.id, instructions));
+    }
+    output
+}
+
+fn emit_block_instructions(
+    instructions: &[Instruction],
+    exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
+    function: &Function,
+    factories: &HashMap<FunctionId, String>,
+    mode: EmissionMode,
+    module_specifier: Option<&str>,
+    type_name: &str,
+    wrap_exceptions: bool,
+) -> Result<String> {
+    let emitted = instructions
+        .iter()
+        .map(|instruction| {
+            emit_instruction(
+                instruction,
+                exception_target,
+                function,
+                factories,
+                mode,
+                module_specifier,
+            )
+            .map(|emitted| match mode {
+                EmissionMode::Async => emitted.replace("__W3COS_ASYNC_FRAME__", type_name),
+                EmissionMode::Generator | EmissionMode::AsyncGenerator => {
+                    emitted.replace("__W3COS_STATE__", &format!("{type_name}State"))
+                }
+                EmissionMode::Sync => emitted,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let protected_end = instructions
+        .iter()
+        .position(|instruction| is_direct_control_flow(instruction, mode))
+        .unwrap_or(instructions.len());
+    let mut output = String::new();
+    if wrap_exceptions
+        && let Some((exception, target)) = exception_target
+        && protected_end > 0
+    {
+        output.push_str(
+            "                    let __w3cos_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
+        );
+        for instruction in &emitted[..protected_end] {
+            output.push_str("                        ");
+            output.push_str(instruction);
+            output.push('\n');
+        }
+        output.push_str(
+            "                    }));\n                    if let Err(__w3cos_payload) = __w3cos_outcome {\n                        let __w3cos_exception = if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {\n                            value.0.clone()\n                        } else {\n                            std::panic::resume_unwind(__w3cos_payload);\n                        };\n",
+        );
+        output.push_str(&format!(
+            "                        self.registers[{}] = __w3cos_exception;\n                        self.block = {};\n                        continue 'drive;\n                    }}\n",
+            exception.0, target.0,
+        ));
+    } else {
+        for instruction in &emitted[..protected_end] {
+            output.push_str("                    ");
+            output.push_str(instruction);
+            output.push('\n');
+        }
+    }
+    for instruction in &emitted[protected_end..] {
+        output.push_str("                    ");
+        output.push_str(instruction);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn compact_block_patterns(blocks: &[u32]) -> String {
+    let mut patterns = Vec::new();
+    let mut index = 0;
+    while index < blocks.len() {
+        let start = blocks[index];
+        let mut end = start;
+        index += 1;
+        while index < blocks.len() && blocks[index] == end + 1 {
+            end = blocks[index];
+            index += 1;
+        }
+        if start == end {
+            patterns.push(start.to_string());
+        } else {
+            patterns.push(format!("{start}..={end}"));
+        }
+    }
+    patterns.join(" | ")
+}
+
+fn is_direct_control_flow(instruction: &Instruction, mode: EmissionMode) -> bool {
+    matches!(
+        instruction,
+        Instruction::Jump { .. }
+            | Instruction::Branch { .. }
+            | Instruction::Return { .. }
+            | Instruction::Throw { .. }
+    ) || matches!(
+        (mode, instruction),
+        (
+            EmissionMode::Async | EmissionMode::AsyncGenerator,
+            Instruction::Await { .. }
+        ) | (
+            EmissionMode::Generator | EmissionMode::AsyncGenerator,
+            Instruction::Yield { .. } | Instruction::YieldDelegate { .. }
+        )
+    )
+}
+
 fn emit_instruction(
     instruction: &Instruction,
     exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
@@ -1564,7 +1748,7 @@ fn emit_instruction(
             "self.registers[{}] = if let Some(getter) = self.capture_getters.get(&{}) {{ getter.call(w3cos_core::Value::Undefined, Vec::new()) }} else {{ match self.bindings.get(&{}) {{ Some(cell) => {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}, None => w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }};",
             register(*dst),
             binding.0,
-            binding.0
+            binding.0,
         ),
         Instruction::InitializeBinding { binding, value } => format!(
             "if let Some(binding) = self.bindings.get(&{}) {{ *binding.borrow_mut() = (self.registers[{}].clone(), true); }} else {{ self.bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((self.registers[{}].clone(), true)))); }}",
@@ -1578,7 +1762,7 @@ fn emit_instruction(
             binding.0,
             register(*value),
             binding.0,
-            register(*value)
+            register(*value),
         ),
         Instruction::RefreshBinding { binding } => format!(
             "if let Some(binding) = self.bindings.get(&{}) {{ let refreshed = binding.borrow().clone(); self.bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new(refreshed))); }}",
@@ -2710,6 +2894,226 @@ fn main() {{
         assert!(generated.contains("continue 'drive"));
         assert!(generated.contains("State::Suspended"));
         assert!(!generated.contains("w3cos_vm"));
+    }
+
+    #[test]
+    fn coalesces_sync_exception_capture_once_per_function() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function read(input) {
+                    try {
+                        const parsed = JSON.parse(input);
+                        const value = parsed.value;
+                        return value + 1;
+                    } catch (error) {
+                        return "invalid";
+                    }
+                }
+                read;
+            "#,
+            "app:///sync-aot-exception-region.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("read"))
+            .unwrap();
+        let protected_instructions = function
+            .exception_regions
+            .iter()
+            .flat_map(|region| region.protected_blocks.iter())
+            .filter_map(|id| function.blocks.iter().find(|block| block.id == *id))
+            .flat_map(|block| block.instructions.iter())
+            .filter(|instruction| !is_direct_control_flow(instruction, EmissionMode::Sync))
+            .count();
+        let generated = generate_sync_function_from_module(&module, function, "read_aot").unwrap();
+
+        assert!(protected_instructions > 1);
+        assert_eq!(
+            generated
+                .matches("let __w3cos_outcome = std::panic::catch_unwind")
+                .count(),
+            1,
+            "one exception boundary should cover all protected blocks in a sync function: {generated}"
+        );
+        assert!(generated.contains("match self.block"));
+    }
+
+    #[test]
+    fn coalesces_straight_line_sync_blocks_before_emission() {
+        let function = Function {
+            id: FunctionId(0),
+            name: Some("linear".into()),
+            parameters: Vec::new(),
+            rest_parameter: None,
+            arguments_binding: None,
+            bindings: Vec::new(),
+            captures: Vec::new(),
+            this_binding: None,
+            registers: 1,
+            entry: BlockId(0),
+            blocks: vec![
+                w3cos_ir::Block {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::LoadConstant {
+                            dst: Register(0),
+                            value: Constant::Number(1.0),
+                        },
+                        Instruction::Jump { target: BlockId(1) },
+                    ],
+                    source_span: None,
+                },
+                w3cos_ir::Block {
+                    id: BlockId(1),
+                    instructions: vec![Instruction::Return { value: Register(0) }],
+                    source_span: None,
+                },
+            ],
+            exception_regions: Vec::new(),
+            suspension_points: Vec::new(),
+            generator_suspension_points: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            source_span: None,
+        };
+
+        let blocks = coalesce_sync_blocks(&function);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, BlockId(0));
+        assert!(matches!(
+            blocks[0].1.as_slice(),
+            [Instruction::LoadConstant { .. }, Instruction::Return { .. }]
+        ));
+
+        let generated =
+            generate_sync_function_with_factories(&function, "linear", &HashMap::new(), None)
+                .unwrap();
+        assert!(
+            !generated.contains("match self.block"),
+            "a terminal single-block sync function should not retain a dispatcher: {generated}"
+        );
+        assert!(
+            !generated.contains("block: u32"),
+            "a terminal single-block sync function should not retain block state: {generated}"
+        );
+    }
+
+    #[test]
+    fn retains_dispatcher_for_cyclic_sync_cfg() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function count(value) {
+                    let total = 0;
+                    while (value > 0) {
+                        total += value;
+                        value -= 1;
+                    }
+                    return total;
+                }
+                count;
+            "#,
+            "app:///cyclic-sync.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("count"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "count_aot").unwrap();
+
+        assert!(generated.contains("match self.block"), "{generated}");
+        assert!(generated.contains("block: u32"), "{generated}");
+    }
+
+    #[test]
+    fn generated_sync_function_dispatches_runtime_exceptions_to_its_handler() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function read(input) {
+                    try {
+                        return input.missing.value;
+                    } catch (error) {
+                        return "invalid";
+                    }
+                }
+                read;
+            "#,
+            "app:///sync-aot-runtime-exception.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("read"))
+            .unwrap()
+            .clone();
+        let expected = Vm::new(module.clone(), Limits::default())
+            .unwrap()
+            .callable(function.id, HashMap::new())
+            .unwrap()
+            .call(Value::Undefined, vec![Value::Null])
+            .to_js_string();
+        let generated = generate_sync_function_from_module(&module, &function, "read_aot").unwrap();
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("src")).unwrap();
+        let core_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../w3cos-core")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_aot_sync_exception_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {:?} }}\n",
+                core_path
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("src/main.rs"),
+            format!(
+                r#"
+{generated}
+fn main() {{
+    println!(
+        "{{}}",
+        read_aot(
+            w3cos_core::Value::Undefined,
+            vec![w3cos_core::Value::Null],
+            std::collections::HashMap::new(),
+        )
+        .to_js_string(),
+    );
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--manifest-path",
+                fixture.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .env(
+                "CARGO_TARGET_DIR",
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/w3ir-aot-fixtures"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated sync exception fixture failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
     }
 
     #[test]

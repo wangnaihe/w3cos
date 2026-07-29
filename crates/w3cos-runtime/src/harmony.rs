@@ -137,10 +137,10 @@ impl HarmonyRuntime {
             .ok_or_else(|| "Skia could not create an OHOS GL interface".to_string())?;
         let direct_context = direct_contexts::make_gl(interface, None)
             .ok_or_else(|| "Skia could not create an OHOS Ganesh context".to_string())?;
-        let font = include_bytes!("../assets/CJK-Subset.ttf");
+        let font = crate::font_face::host_ui_font();
         let typeface = FontMgr::default()
-            .new_from_data(font.as_slice(), None)
-            .ok_or_else(|| "embedded W3COS font is invalid".to_string())?;
+            .new_from_data(font.data.as_slice(), Some(font.index as usize))
+            .ok_or_else(|| "Host system font is invalid".to_string())?;
 
         let mut runtime = Self {
             display,

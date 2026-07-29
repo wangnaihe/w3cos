@@ -39,7 +39,17 @@ w3cos-ai-bridge = { path = "crates/w3cos-ai-bridge" }
 w3cos-rn-compat = { path = "crates/w3cos-rn-compat" }
 w3cos-mobile = { path = "crates/w3cos-mobile" }
 png = "0.17"
-image = "0.25"
+# Chromium-facing raster formats. Avoid linking scientific/authoring codecs
+# (DDS/EXR/HDR/PNM/QOI/TGA/TIFF) into every standalone application.
+image = { version = "0.25", default-features = false, features = [
+    "avif",
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "webp",
+] }
 flate2 = "1.1"
 wuff = "0.2.8"
 

@@ -57,13 +57,22 @@ pub struct SkiaVulkanPresenter {
 
 impl SkiaVulkanPresenter {
     pub fn new(window: &winit::window::Window, font_bytes: &[u8]) -> Option<Self> {
-        unsafe { Self::try_new(window, font_bytes).ok() }
+        unsafe { Self::try_new(window, font_bytes, None).ok() }
     }
 
-    unsafe fn try_new(window: &winit::window::Window, font_bytes: &[u8]) -> Result<Self, String> {
+    pub fn new_host(window: &winit::window::Window) -> Option<Self> {
+        let host = crate::font_face::host_ui_font();
+        unsafe { Self::try_new(window, host.data.as_slice(), Some(host.index as usize)).ok() }
+    }
+
+    unsafe fn try_new(
+        window: &winit::window::Window,
+        font_bytes: &[u8],
+        font_index: Option<usize>,
+    ) -> Result<Self, String> {
         let typeface = FontMgr::default()
-            .new_from_data(font_bytes, None)
-            .ok_or_else(|| "embedded font is not a valid Skia typeface".to_string())?;
+            .new_from_data(font_bytes, font_index)
+            .ok_or_else(|| "host font is not a valid Skia typeface".to_string())?;
         let entry = ash::Entry::load().map_err(|error| format!("load Vulkan: {error}"))?;
         let window_handle = window
             .window_handle()

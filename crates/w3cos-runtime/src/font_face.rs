@@ -391,6 +391,56 @@ struct FontKey {
 
 static GLOBAL_REGISTRY: OnceLock<FontRegistry> = OnceLock::new();
 
+pub(crate) struct HostUiFont {
+    pub(crate) data: Arc<Vec<u8>>,
+    pub(crate) index: u32,
+    pub(crate) font: fontdue::Font,
+}
+
+static HOST_UI_FONT: OnceLock<HostUiFont> = OnceLock::new();
+
+pub(crate) fn host_ui_font() -> &'static HostUiFont {
+    HOST_UI_FONT.get_or_init(|| {
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
+        database.load_fonts_dir("/system/fonts");
+        #[cfg(target_os = "ios")]
+        {
+            database.load_fonts_dir("/System/Library/Fonts");
+            database.load_fonts_dir("/System/Library/Fonts/Core");
+            database.load_fonts_dir("/System/Library/Fonts/Cache");
+        }
+        let id = database
+            .query(&fontdb::Query {
+                families: &[
+                    fontdb::Family::Name("PingFang SC"),
+                    fontdb::Family::Name("Microsoft YaHei"),
+                    fontdb::Family::Name("Noto Sans CJK SC"),
+                    fontdb::Family::Name("Noto Sans SC"),
+                    fontdb::Family::Name("Noto Sans"),
+                    fontdb::Family::Name("Roboto"),
+                    fontdb::Family::SansSerif,
+                ],
+                ..fontdb::Query::default()
+            })
+            .or_else(|| database.faces().next().map(|face| face.id))
+            .expect("host must provide at least one system font");
+        let (data, index) = database
+            .with_face_data(id, |data, index| (Arc::new(data.to_vec()), index))
+            .expect("selected system font must remain readable");
+        let font = fontdue::Font::from_bytes(
+            data.as_slice(),
+            fontdue::FontSettings {
+                collection_index: index,
+                ..fontdue::FontSettings::default()
+            },
+        )
+        .expect("selected system font must be valid");
+        HostUiFont { data, index, font }
+    })
+}
+
 impl FontRegistry {
     fn new() -> Self {
         Self {
@@ -986,6 +1036,14 @@ mod tests {
         assert_eq!(FontWeight::from_str("700"), FontWeight::BOLD);
         assert_eq!(FontWeight::from_str("normal"), FontWeight::NORMAL);
         assert_eq!(FontWeight::from_str("400"), FontWeight::NORMAL);
+    }
+
+    #[test]
+    fn host_ui_font_is_available_without_packaged_font_bytes() {
+        let host = host_ui_font();
+        assert_ne!(host.font.lookup_glyph_index('A'), 0);
+        #[cfg(target_os = "macos")]
+        assert_ne!(host.font.lookup_glyph_index('输'), 0);
     }
 
     #[test]

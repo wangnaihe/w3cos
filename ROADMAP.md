@@ -2815,6 +2815,9 @@ W3COS.
 
 ## Phase 4.1 — Standard Native Shell
 
+Detailed template and host delivery plan:
+[`docs/SHELL_TEMPLATES.md`](docs/SHELL_TEMPLATES.md).
+
 ### Current-shell hardening
 - [ ] Replace the current single-signal, in-process app switcher with the real `AppRegistry`, `WindowManager`, compositor, and process/application lifecycle
 - [ ] Move Files, Terminal, Settings, Browser, Editor, and AI Agent out of static shell demo builders into registered system applications

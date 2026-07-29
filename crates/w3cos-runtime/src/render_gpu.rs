@@ -352,14 +352,13 @@ fn render_node_gpu_layer(
     }
 }
 
-pub fn make_font_data(font_bytes: &'static [u8]) -> FontData {
-    let blob = Blob::new(Arc::new(font_bytes.to_vec()));
-    FontData::new(blob, 0)
+pub(crate) fn make_owned_font_data(font_bytes: Arc<Vec<u8>>, index: u32) -> FontData {
+    let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> = font_bytes;
+    FontData::new(Blob::new(bytes), index)
 }
 
-fn make_owned_font_data(font_bytes: Arc<Vec<u8>>) -> FontData {
-    let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> = font_bytes;
-    FontData::new(Blob::new(bytes), 0)
+fn make_custom_font_data(font_bytes: Arc<Vec<u8>>) -> FontData {
+    make_owned_font_data(font_bytes, 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1057,7 +1056,7 @@ fn draw_text(
         let owned_data = parsed.as_ref().and_then(|_| {
             run.font
                 .as_ref()
-                .map(|font| make_owned_font_data(font.data.clone()))
+                .map(|font| make_custom_font_data(font.data.clone()))
         });
         cursor_x += draw_text_run(
             scene,

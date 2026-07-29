@@ -77,6 +77,20 @@ pub struct CompileOptions {
     pub devtools: bool,
 }
 
+pub(crate) const GENERATED_RELEASE_PROFILE: &str = r#"
+# Generated applications are standalone crates, so they do not inherit the
+# W3COS workspace release profile. Keep the production profile here: without
+# LTO the W3IR closure graph is monomorphized into tens of megabytes of
+# duplicate machine code. JS exceptions currently unwind through Rust, so
+# panic=abort is not semantically valid for application artifacts.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
+"#;
+
 /// Generate a Cargo.toml for the compiled application.
 pub fn generate_cargo_toml(
     _output_dir: &std::path::Path,
@@ -86,9 +100,9 @@ pub fn generate_cargo_toml(
     let runtime_path = workspace_root.join("crates/w3cos-runtime");
     let std_path = workspace_root.join("crates/w3cos-std");
     let runtime_features = if options.devtools {
-        r#", features = ["devtools"]"#
+        r#"["gpu", "devtools"]"#
     } else {
-        ""
+        r#"["gpu"]"#
     };
 
     Ok(format!(
@@ -98,11 +112,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-w3cos-runtime = {{ path = "{runtime}"{runtime_features} }}
+w3cos-runtime = {{ path = "{runtime}", default-features = false, features = {runtime_features} }}
 w3cos-std = {{ path = "{std_}" }}
+{release_profile}
 "#,
         runtime = runtime_path.display(),
         std_ = std_path.display(),
+        release_profile = GENERATED_RELEASE_PROFILE,
     ))
 }
 
@@ -1576,9 +1592,24 @@ mod tests {
         let opts = CompileOptions { devtools: true };
         let toml = generate_cargo_toml(std::path::Path::new("."), &opts).unwrap();
         assert!(
-            toml.contains(r#"features = ["devtools"]"#),
+            toml.contains(r#"default-features = false, features = ["gpu", "devtools"]"#),
             "devtools feature missing: {toml}"
         );
+    }
+
+    #[test]
+    fn codegen_cargo_toml_uses_single_renderer_and_size_release_profile() {
+        let toml =
+            generate_cargo_toml(std::path::Path::new("."), &CompileOptions::default()).unwrap();
+        assert!(
+            toml.contains(r#"default-features = false, features = ["gpu"]"#),
+            "desktop applications must link one renderer: {toml}"
+        );
+        assert!(toml.contains("opt-level = \"z\""), "{toml}");
+        assert!(toml.contains("lto = \"fat\""), "{toml}");
+        assert!(toml.contains("codegen-units = 1"), "{toml}");
+        assert!(toml.contains("panic = \"unwind\""), "{toml}");
+        assert!(toml.contains("strip = \"symbols\""), "{toml}");
     }
 
     #[test]

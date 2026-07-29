@@ -774,10 +774,22 @@ fn parse_quiet(source: &str) -> Option<resvg::usvg::Tree> {
 
 fn parse_impl(source: &str, warn: bool) -> Option<resvg::usvg::Tree> {
     let mut options = resvg::usvg::Options::default();
-    options.font_family = "Geneva".to_string();
+    #[cfg(not(test))]
+    {
+        options.font_family = "sans-serif".to_string();
+        options
+            .fontdb_mut()
+            .load_font_data(crate::font_face::host_ui_font().data.as_ref().clone());
+    }
+    #[cfg(test)]
+    {
+        options.font_family = "Geneva".to_string();
+    }
+    #[cfg(test)]
     options
         .fontdb_mut()
         .load_font_data(include_bytes!("../assets/Inter-Regular.ttf").to_vec());
+    #[cfg(test)]
     options
         .fontdb_mut()
         .load_font_data(include_bytes!("../assets/CJK-Subset.ttf").to_vec());

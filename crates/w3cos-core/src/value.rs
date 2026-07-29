@@ -290,7 +290,18 @@ pub(crate) struct WeakJsFunction {
 }
 
 impl JsFunction {
+    #[inline]
     pub fn new(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
+        let inner: Rc<dyn Fn(Value, Vec<Value>) -> Value> = Rc::new(f);
+        Self::from_erased(inner)
+    }
+
+    /// Construct the common JS function object after erasing the concrete
+    /// Rust closure type. AOT bundles create thousands of distinct closures;
+    /// keeping prototype/allocation setup in the generic constructor causes
+    /// that body to be monomorphized once per closure before LTO can merge it.
+    #[inline(never)]
+    fn from_erased(inner: Rc<dyn Fn(Value, Vec<Value>) -> Value>) -> Self {
         let mut props = std::collections::HashMap::new();
         // Ordinary JavaScript function objects own a prototype object. The
         // compiler uses these Values for function declarations/constructors;
@@ -302,7 +313,7 @@ impl JsFunction {
             function_heap_bytes(&props),
         ));
         Self {
-            inner: Rc::new(f),
+            inner,
             props: Rc::new(RefCell::new(props)),
             allocation,
         }

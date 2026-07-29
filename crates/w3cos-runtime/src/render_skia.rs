@@ -24,19 +24,23 @@ use crate::text_layout;
 
 const FONT_FALLBACK_CACHE_CAPACITY: usize = 2048;
 
-#[cfg(target_os = "android")]
-const INTRINSIC_FONT_BYTES: &[u8] = include_bytes!("../assets/CJK-Subset.ttf");
-#[cfg(not(target_os = "android"))]
-const INTRINSIC_FONT_BYTES: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
-
 thread_local! {
     /// System font matching is comparatively expensive on Apple platforms.
     /// Cache Skia typeface references for characters missing from the primary
     /// face; this does not copy the underlying system font into application memory.
     static FONT_FALLBACK_CACHE: RefCell<HashMap<(u32, char, u16), Option<Typeface>>> =
         RefCell::new(HashMap::new());
-    static INTRINSIC_PRIMARY_TYPEFACE: Typeface =
-        primary_typeface(INTRINSIC_FONT_BYTES).expect("Skia intrinsic font");
+    static INTRINSIC_PRIMARY_TYPEFACE: Typeface = {
+        #[cfg(test)]
+        {
+            primary_typeface(include_bytes!("../assets/Inter-Regular.ttf"))
+                .expect("Skia test font")
+        }
+        #[cfg(not(test))]
+        {
+            host_typeface().expect("host Skia font")
+        }
+    };
 }
 
 fn primary_typeface(font_bytes: &[u8]) -> Option<Typeface> {
@@ -52,6 +56,11 @@ fn primary_typeface(font_bytes: &[u8]) -> Option<Typeface> {
         }
     }
     FontMgr::default().new_from_data(font_bytes, None)
+}
+
+fn host_typeface() -> Option<Typeface> {
+    let host = crate::font_face::host_ui_font();
+    FontMgr::default().new_from_data(host.data.as_slice(), Some(host.index as usize))
 }
 
 fn registered_typeface(style: &Style) -> Option<(crate::font_face::LoadedFont, Typeface)> {
@@ -81,6 +90,16 @@ pub struct SkiaRasterizer {
 impl SkiaRasterizer {
     pub fn new(font_bytes: &[u8]) -> Option<Self> {
         let typeface = primary_typeface(font_bytes)?;
+        Some(Self {
+            surface: None,
+            size: (0, 0),
+            rgba: Vec::new(),
+            typeface,
+        })
+    }
+
+    pub fn new_host() -> Option<Self> {
+        let typeface = host_typeface()?;
         Some(Self {
             surface: None,
             size: (0, 0),
@@ -252,11 +271,18 @@ pub struct SkiaMetalPresenter {
 #[cfg(target_os = "ios")]
 impl SkiaMetalPresenter {
     pub fn new(window: &winit::window::Window, font_bytes: &[u8]) -> Option<Self> {
+        Self::new_with_typeface(window, primary_typeface(font_bytes)?)
+    }
+
+    pub fn new_host(window: &winit::window::Window) -> Option<Self> {
+        Self::new_with_typeface(window, host_typeface()?)
+    }
+
+    fn new_with_typeface(window: &winit::window::Window, typeface: Typeface) -> Option<Self> {
         use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
         use objc2_quartz_core::CALayer;
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-        let typeface = primary_typeface(font_bytes)?;
         let device = MTLCreateSystemDefaultDevice()?;
         let layer = objc2_quartz_core::CAMetalLayer::new();
         layer.setDevice(Some(&device));

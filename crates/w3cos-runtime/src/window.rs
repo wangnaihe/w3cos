@@ -282,11 +282,6 @@ use w3cos_std::style::{
 };
 use w3cos_std::{Component, ComponentKind, EventAction};
 
-#[cfg(any(target_os = "ios", target_os = "android"))]
-static EMBEDDED_FONT: &[u8] = include_bytes!("../assets/CJK-Subset.ttf");
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
-static EMBEDDED_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
-
 const ANIMATION_FRAME_INTERVAL_MS: u64 = 16;
 const TOUCH_SCROLL_SLOP: f32 = 8.0;
 const KINETIC_SCROLL_MIN_VELOCITY: f32 = 80.0;
@@ -1344,9 +1339,8 @@ impl App {
         dom_mode: bool,
         root: Component,
     ) -> Self {
-        // Share the compact metrics face with layout. Mobile Skia still owns
-        // EMBEDDED_FONT (the CJK render face), avoiding fontdue's eager
-        // expansion of the same 10 MiB CJK font once per subsystem.
+        // Layout and every rendering backend share the Host-selected system
+        // face; deterministic embedded faces are restricted to tests.
         let font = layout::layout_font();
 
         Self {
@@ -1449,7 +1443,10 @@ impl App {
             #[cfg(feature = "gpu")]
             scene: Scene::new(),
             #[cfg(feature = "gpu")]
-            font_data: render_gpu::make_font_data(EMBEDDED_FONT),
+            font_data: {
+                let host_font = crate::font_face::host_ui_font();
+                render_gpu::make_owned_font_data(host_font.data.clone(), host_font.index)
+            },
             #[cfg(feature = "gpu")]
             glyph_cache: render_gpu::GlyphCache::new(),
             #[cfg(feature = "gpu")]
@@ -1850,11 +1847,11 @@ impl App {
         self.scale_factor = window.scale_factor();
         #[cfg(all(feature = "skia", target_os = "ios"))]
         let skia_metal = skia_backend_requested()
-            .then(|| crate::render_skia::SkiaMetalPresenter::new(&window, EMBEDDED_FONT))
+            .then(|| crate::render_skia::SkiaMetalPresenter::new_host(&window))
             .flatten();
         #[cfg(all(feature = "skia", target_os = "android"))]
         let skia_vulkan = skia_backend_requested()
-            .then(|| crate::render_skia_vulkan::SkiaVulkanPresenter::new(&window, EMBEDDED_FONT))
+            .then(|| crate::render_skia_vulkan::SkiaVulkanPresenter::new_host(&window))
             .flatten();
         #[cfg(all(feature = "skia", target_os = "android"))]
         if skia_backend_requested() && skia_vulkan.is_none() {
@@ -1885,7 +1882,7 @@ impl App {
             framebuffer: None,
             #[cfg(feature = "skia")]
             skia: (!direct_skia)
-                .then(|| crate::render_skia::SkiaRasterizer::new(EMBEDDED_FONT))
+                .then(crate::render_skia::SkiaRasterizer::new_host)
                 .flatten(),
             #[cfg(all(feature = "skia", target_os = "ios"))]
             skia_metal,
