@@ -4264,6 +4264,20 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
                 dom::remove_attribute(node, attribute);
             }
         }
+        "disabled" => {
+            if value.to_bool() {
+                dom::set_attribute(node, "disabled", "");
+            } else {
+                dom::remove_attribute(node, "disabled");
+            }
+        }
+        "readOnly" => {
+            if value.to_bool() {
+                dom::set_attribute(node, "readonly", "");
+            } else {
+                dom::remove_attribute(node, "readonly");
+            }
+        }
         "id" => dom::set_attribute(node, "id", &value.to_js_string()),
         "className" => dom::set_class_name(node, &value.to_js_string()),
         "value" => dom::set_attribute(node, "value", &value.to_js_string()),
@@ -6019,11 +6033,20 @@ pub(crate) fn dispatch_native_click(target: u32) -> bool {
 /// Returns `None` when `target` is not a submit control or has no ancestor
 /// form. Otherwise returns whether the dispatched submit event was canceled.
 pub(crate) fn dispatch_native_submit_for_control(target: u32) -> Option<bool> {
-    let tag = dom::tag_name(target);
-    if !tag.eq_ignore_ascii_case("button") && !tag.eq_ignore_ascii_case("input") {
-        return None;
-    }
-    let control_type = dom::get_attribute(target, "type").unwrap_or_else(|| {
+    // A click can hit text/span content inside a button. HTML activation
+    // behavior belongs to the nearest ancestor submit control, not only the
+    // innermost event target.
+    let mut control = Some(target);
+    let control = loop {
+        let node = control?;
+        let tag = dom::tag_name(node);
+        if tag.eq_ignore_ascii_case("button") || tag.eq_ignore_ascii_case("input") {
+            break node;
+        }
+        control = dom::parent_node(node);
+    };
+    let tag = dom::tag_name(control);
+    let control_type = dom::get_attribute(control, "type").unwrap_or_else(|| {
         if tag.eq_ignore_ascii_case("button") {
             "submit".to_string()
         } else {
@@ -6034,7 +6057,7 @@ pub(crate) fn dispatch_native_submit_for_control(target: u32) -> Option<bool> {
         return None;
     }
 
-    let mut current = dom::parent_node(target);
+    let mut current = dom::parent_node(control);
     while let Some(node) = current {
         if dom::tag_name(node).eq_ignore_ascii_case("form") {
             return Some(!dispatch_sync(
@@ -9620,11 +9643,49 @@ fn crypto_value() -> Value {
 
 fn subtle_crypto_value() -> Value {
     let mut props = HashMap::new();
+    props.insert(
+        "digest".to_string(),
+        func(|_, args| {
+            let algorithm = arg(&args, 0);
+            let algorithm_name = if algorithm.is_object() {
+                algorithm.get_property("name").to_js_string()
+            } else {
+                algorithm.to_js_string()
+            };
+            let algorithm_name = algorithm_name.to_ascii_uppercase();
+            let algorithm = match algorithm_name.as_str() {
+                "SHA-1" => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+                "SHA-256" => &ring::digest::SHA256,
+                "SHA-384" => &ring::digest::SHA384,
+                "SHA-512" => &ring::digest::SHA512,
+                _ => {
+                    return w3cos_core::promise::reject(vec![
+                        w3cos_core::web::dom_exception_instance(
+                            &format!("Unrecognized digest algorithm: {algorithm_name}"),
+                            "NotSupportedError",
+                        ),
+                    ]);
+                }
+            };
+            let input = arg(&args, 1);
+            let Some(bytes) = w3cos_core::binary::bytes_of(&input) else {
+                return w3cos_core::promise::reject(vec![
+                    w3cos_core::web::dom_exception_instance(
+                        "crypto.subtle.digest() requires an ArrayBuffer or ArrayBufferView",
+                        "TypeError",
+                    ),
+                ]);
+            };
+            let digest = ring::digest::digest(algorithm, &bytes);
+            w3cos_core::promise::resolve(vec![w3cos_core::binary::array_buffer_value(
+                digest.as_ref().to_vec(),
+            )])
+        }),
+    );
     for method in [
         "decrypt",
         "deriveBits",
         "deriveKey",
-        "digest",
         "encrypt",
         "exportKey",
         "generateKey",
@@ -12054,6 +12115,37 @@ mod tests {
     }
 
     #[test]
+    fn subtle_crypto_digest_supports_sha256_array_buffer_views() {
+        setup();
+        let subtle = window_value()
+            .get_property("crypto")
+            .get_property("subtle");
+        let input = w3cos_core::binary::typed_array_value(
+            b"hello"
+                .iter()
+                .map(|byte| Value::Number(*byte as f64))
+                .collect(),
+        );
+        let digest = subtle.call_method(
+            "digest",
+            vec![Value::string("SHA-256"), input],
+        );
+        let Some(w3cos_core::promise::PromiseStatus::Fulfilled(buffer)) =
+            w3cos_core::promise::status(&digest)
+        else {
+            panic!("digest promise did not fulfill");
+        };
+        assert_eq!(
+            w3cos_core::binary::bytes_of(&buffer).unwrap(),
+            vec![
+                0x2c, 0xf2, 0x4d, 0xba, 0x5f, 0xb0, 0xa3, 0x0e, 0x26, 0xe8, 0x3b, 0x2a,
+                0xc5, 0xb9, 0xe2, 0x9e, 0x1b, 0x16, 0x1e, 0x5c, 0x1f, 0xa7, 0x42, 0x5e,
+                0x73, 0x04, 0x33, 0x62, 0x93, 0x8b, 0x98, 0x24,
+            ]
+        );
+    }
+
+    #[test]
     fn trusted_native_input_updates_user_activation_during_dispatch() {
         setup();
         let target = create_in_body("button");
@@ -13664,6 +13756,8 @@ mod tests {
         let doc = document_value();
         let form = create_in_body("form");
         let button = doc.call_method("createElement", vec![Value::string("button")]);
+        let caption = doc.call_method("createElement", vec![Value::string("span")]);
+        button.call_method("appendChild", vec![caption.clone()]);
         form.call_method("appendChild", vec![button.clone()]);
 
         let submissions = Rc::new(Cell::new(0));
@@ -13681,15 +13775,19 @@ mod tests {
         );
 
         let button_id = node_id_of(&button).unwrap();
+        let caption_id = node_id_of(&caption).unwrap();
         assert_eq!(dispatch_native_submit_for_control(button_id), Some(true));
         assert_eq!(submissions.get(), 1);
+        assert_eq!(dispatch_native_submit_for_control(caption_id), Some(true));
+        assert_eq!(submissions.get(), 2);
 
         button.call_method(
             "setAttribute",
             vec![Value::string("type"), Value::string("button")],
         );
         assert_eq!(dispatch_native_submit_for_control(button_id), None);
-        assert_eq!(submissions.get(), 1);
+        assert_eq!(dispatch_native_submit_for_control(caption_id), None);
+        assert_eq!(submissions.get(), 2);
     }
 
     #[test]
@@ -15773,6 +15871,32 @@ mod tests {
         assert!(input.get_property("checked").to_bool());
         input.set_property("checked", Value::Bool(false));
         assert!(!input.get_property("checked").to_bool());
+    }
+
+    #[test]
+    fn boolean_control_properties_remove_reflected_attributes_when_cleared() {
+        setup();
+        let button = create_in_body("button");
+        button.call_method(
+            "setAttribute",
+            vec![Value::string("disabled"), Value::string("")],
+        );
+        assert!(button.get_property("disabled").to_bool());
+
+        button.set_property("disabled", Value::Bool(false));
+
+        assert!(!button.get_property("disabled").to_bool());
+        assert!(
+            !button
+                .call_method("hasAttribute", vec![Value::string("disabled")])
+                .to_bool()
+        );
+
+        let input = create_in_body("input");
+        input.set_property("readOnly", Value::Bool(true));
+        assert!(input.get_property("readOnly").to_bool());
+        input.set_property("readOnly", Value::Bool(false));
+        assert!(!input.get_property("readOnly").to_bool());
     }
 
     #[test]

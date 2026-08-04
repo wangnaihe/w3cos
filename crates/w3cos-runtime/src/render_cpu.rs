@@ -1349,6 +1349,26 @@ fn draw_text_in_rect(
     clip_mask: Option<&Mask>,
 ) {
     let content = text_paint_box(rect, style);
+    let clips_own_overflow = matches!(
+        style.resolved_overflow_x(),
+        w3cos_std::style::Overflow::Hidden
+            | w3cos_std::style::Overflow::Scroll
+            | w3cos_std::style::Overflow::Auto
+    ) || matches!(
+        style.resolved_overflow_y(),
+        w3cos_std::style::Overflow::Hidden
+            | w3cos_std::style::Overflow::Scroll
+            | w3cos_std::style::Overflow::Auto
+    );
+    let mut own_clip_mask = clips_own_overflow
+        .then(|| make_clip_mask(pixmap, rect))
+        .flatten();
+    if let (Some(own), Some(ancestor)) = (own_clip_mask.as_mut(), clip_mask) {
+        for (own_alpha, ancestor_alpha) in own.data_mut().iter_mut().zip(ancestor.data()) {
+            *own_alpha = (*own_alpha).min(*ancestor_alpha);
+        }
+    }
+    let effective_clip = own_clip_mask.as_ref().or(clip_mask);
     let line_h = style.font_size * style.line_height;
     let registry = crate::font_face::FontRegistry::global();
     let layout = text_layout::retained_text_paint_layout_with(
@@ -1373,7 +1393,7 @@ fn draw_text_in_rect(
             font,
             style,
             align,
-            clip_mask,
+            effective_clip,
         );
         return;
     }
@@ -1399,7 +1419,7 @@ fn draw_text_in_rect(
             color,
             font,
             style,
-            clip_mask,
+            effective_clip,
         );
     }
 }

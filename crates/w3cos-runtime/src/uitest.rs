@@ -13,6 +13,7 @@ static SERVER_ONCE: Once = Once::new();
 static SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
 static HIT_TARGETS: Mutex<Vec<UiHitTarget>> = Mutex::new(Vec::new());
 static INPUT_TARGETS: Mutex<Vec<UiInputTarget>> = Mutex::new(Vec::new());
+static LAST_CLICK_TRACE: Mutex<Option<String>> = Mutex::new(None);
 static EVENT_LOOP_PROXY: Mutex<Option<EventLoopProxy<()>>> = Mutex::new(None);
 static PENDING_COMMANDS: Mutex<VecDeque<PendingCommand>> = Mutex::new(VecDeque::new());
 static NEEDS_REPAINT: AtomicBool = AtomicBool::new(false);
@@ -54,6 +55,10 @@ pub struct UiHitTarget {
     pub index: usize,
     pub label: String,
     pub action: String,
+    pub host_id: Option<u64>,
+    pub disabled: bool,
+    pub aria_disabled: Option<String>,
+    pub interaction_state: Option<String>,
     pub cx: f32,
     pub cy: f32,
 }
@@ -99,6 +104,7 @@ fn build_snapshot_json() -> String {
         "pathname": pathname,
         "targets": targets,
         "inputTargets": input_targets,
+        "lastClickTrace": LAST_CLICK_TRACE.lock().ok().and_then(|trace| trace.clone()),
         "focusedIndex": match FOCUSED_INDEX.load(Ordering::SeqCst) {
             -1 => serde_json::Value::Null,
             index => serde_json::json!(index),
@@ -185,6 +191,14 @@ pub fn set_pointer_hit(x: f32, y: f32, index: Option<usize>) {
             index.map(|value| value as i64).unwrap_or(-1),
             Ordering::SeqCst,
         );
+    }
+}
+
+pub fn set_click_trace(trace: String) {
+    if hook_enabled()
+        && let Ok(mut last) = LAST_CLICK_TRACE.lock()
+    {
+        *last = Some(trace);
     }
 }
 

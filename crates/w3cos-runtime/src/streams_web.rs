@@ -1970,6 +1970,99 @@ pub fn from_bytes(bytes: Vec<u8>, on_disturb: Value) -> Value {
     stream_value(source, on_disturb)
 }
 
+fn schedule_native_reader_poll(
+    reader: Rc<crate::streams::ReadableStreamDefaultReader>,
+    controller: Value,
+    polling: Rc<Cell<bool>>,
+    stopped: Rc<Cell<bool>>,
+    delay_ms: u64,
+) {
+    let callback = realm_stream_function(move |_, _| {
+        if stopped.get() {
+            polling.set(false);
+            return Value::Undefined;
+        }
+        match reader.try_read() {
+            Some(crate::streams::ReadResult::Chunk(bytes)) => {
+                polling.set(false);
+                let chunk = w3cos_core::binary::typed_array_value(
+                    bytes
+                        .into_iter()
+                        .map(|byte| Value::Number(byte as f64))
+                        .collect(),
+                );
+                controller.call_method("enqueue", vec![chunk]);
+            }
+            Some(crate::streams::ReadResult::Done) => {
+                polling.set(false);
+                stopped.set(true);
+                controller.call_method("close", vec![]);
+            }
+            Some(crate::streams::ReadResult::Error(message)) => {
+                polling.set(false);
+                stopped.set(true);
+                controller.call_method(
+                    "error",
+                    vec![Value::object(HashMap::from([
+                        ("name".into(), Value::string("NetworkError")),
+                        ("message".into(), Value::string(&message)),
+                    ]))],
+                );
+            }
+            None => schedule_native_reader_poll(
+                Rc::clone(&reader),
+                controller.clone(),
+                Rc::clone(&polling),
+                Rc::clone(&stopped),
+                16,
+            ),
+        }
+        Value::Undefined
+    });
+    crate::jsdom::schedule_timeout_value(callback, delay_ms);
+}
+
+/// Bridge a background native byte reader into a JavaScript `ReadableStream`.
+///
+/// Pulls are polled through the normal page task queue, so awaiting
+/// `reader.read()` yields the UI thread while preserving incremental chunks.
+pub fn from_native_stream(stream: crate::streams::ReadableStream, on_disturb: Value) -> Value {
+    let reader = Rc::new(stream.get_reader());
+    let polling = Rc::new(Cell::new(false));
+    let stopped = Rc::new(Cell::new(false));
+    let source = Value::object(HashMap::new());
+
+    let reader_for_pull = Rc::clone(&reader);
+    let polling_for_pull = Rc::clone(&polling);
+    let stopped_for_pull = Rc::clone(&stopped);
+    source.set_property(
+        "pull",
+        realm_stream_function(move |_, args| {
+            if stopped_for_pull.get() || polling_for_pull.replace(true) {
+                return Value::Undefined;
+            }
+            schedule_native_reader_poll(
+                Rc::clone(&reader_for_pull),
+                args.first().cloned().unwrap_or(Value::Undefined),
+                Rc::clone(&polling_for_pull),
+                Rc::clone(&stopped_for_pull),
+                0,
+            );
+            Value::Undefined
+        }),
+    );
+
+    let stopped_for_cancel = Rc::clone(&stopped);
+    source.set_property(
+        "cancel",
+        realm_stream_function(move |_, _| {
+            stopped_for_cancel.set(true);
+            Value::Undefined
+        }),
+    );
+    stream_value(source, on_disturb)
+}
+
 pub fn reset_realm() {
     VALUE_CELLS.with(|cells| {
         for cell in cells.borrow_mut().drain(..) {

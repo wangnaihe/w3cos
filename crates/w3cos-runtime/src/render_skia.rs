@@ -929,6 +929,27 @@ fn draw_text_in_rect(
     metrics_font: &fontdue::Font,
 ) {
     let content = text_paint_box(rect, style);
+    // An overflow clip belongs to the element itself as well as its
+    // descendants. The retained prepaint clip chain only carries ancestor
+    // clips, so a leaf text node must clip its own glyph paint explicitly.
+    // Without this, a correctly shrunken `white-space:nowrap` flex title still
+    // paints across adjacent controls.
+    let own_clip = matches!(
+        style.resolved_overflow_x(),
+        w3cos_std::style::Overflow::Hidden
+            | w3cos_std::style::Overflow::Scroll
+            | w3cos_std::style::Overflow::Auto
+    ) || matches!(
+        style.resolved_overflow_y(),
+        w3cos_std::style::Overflow::Hidden
+            | w3cos_std::style::Overflow::Scroll
+            | w3cos_std::style::Overflow::Auto
+    );
+    let clip_save = own_clip.then(|| {
+        let save = canvas.save();
+        canvas.clip_rect(to_rect(rect), None, Some(false));
+        save
+    });
     let registry = crate::font_face::FontRegistry::global();
     let layout = text_layout::retained_text_paint_layout_with(
         text,
@@ -956,6 +977,9 @@ fn draw_text_in_rect(
             Some(style),
         );
         draw_text_ink_in_box(canvas, content, &layout.lines[0], ink, style, typeface);
+        if let Some(save) = clip_save {
+            canvas.restore_to_count(save);
+        }
         return;
     }
     let line_height = style.font_size * style.line_height;
@@ -980,6 +1004,9 @@ fn draw_text_in_rect(
             typeface,
             style,
         );
+    }
+    if let Some(save) = clip_save {
+        canvas.restore_to_count(save);
     }
 }
 
@@ -1477,6 +1504,57 @@ mod tests {
         let mut style = Style::default();
         style.justify_content = JustifyContent::Center;
         assert_eq!(effective_text_align(&style), TextAlign::Center);
+    }
+
+    #[test]
+    fn text_leaf_clips_its_own_hidden_overflow() {
+        let mut surface = Surface::new_raster_n32_premul((96, 32)).unwrap();
+        surface.canvas().clear(Color::TRANSPARENT);
+        let typeface = FontMgr::default()
+            .new_from_data(TEST_FONT, None)
+            .expect("Skia test typeface");
+        let metrics_font = test_font();
+        let style = Style {
+            color: w3cos_std::color::Color::rgba(0, 0, 0, 255),
+            font_size: 20.0,
+            white_space: w3cos_std::style::WhiteSpace::NoWrap,
+            overflow_x: Some(w3cos_std::style::Overflow::Hidden),
+            overflow_y: Some(w3cos_std::style::Overflow::Hidden),
+            ..Style::default()
+        };
+        let rect = LayoutRect {
+            x: 2.0,
+            y: 2.0,
+            width: 24.0,
+            height: 26.0,
+        };
+
+        draw_text_in_rect(
+            surface.canvas(),
+            rect,
+            "MMMMMMMM",
+            &style,
+            &typeface,
+            &metrics_font,
+        );
+
+        let mut pixels = vec![0_u8; 96 * 32 * 4];
+        let info = ImageInfo::new((96, 32), ColorType::RGBA8888, AlphaType::Premul, None);
+        assert!(surface.read_pixels(&info, &mut pixels, 96 * 4, (0, 0)));
+        let has_ink_inside = pixels
+            .chunks_exact(4)
+            .enumerate()
+            .any(|(index, pixel)| index % 96 < 26 && pixel[3] != 0);
+        let has_ink_after_clip = pixels
+            .chunks_exact(4)
+            .enumerate()
+            .any(|(index, pixel)| index % 96 >= 26 && pixel[3] != 0);
+
+        assert!(has_ink_inside, "test text should paint inside its own box");
+        assert!(
+            !has_ink_after_clip,
+            "nowrap glyphs must not paint beyond the text leaf overflow clip"
+        );
     }
 
     #[test]

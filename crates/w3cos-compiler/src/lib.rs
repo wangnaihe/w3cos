@@ -387,9 +387,22 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
 
     // Only generate bundle code if there are symbols to compile.
     let bundle_code = if bundle.symbol_count() > 0 {
-        Some(esm_codegen::try_generate_with_bodies_and_css(
-            &bundle, &css.rules,
-        )?)
+        let generated = esm_codegen::try_generate_with_bodies_and_css(&bundle, &css.rules)?;
+        // Vite prebundles into a process-specific temporary directory. Those
+        // absolute paths are valid module identities, but retaining the random
+        // prefix makes byte-identical UI builds look changed to rustc and
+        // defeats incremental compilation. Use a stable virtual bundle root;
+        // imports and registrations are rewritten together.
+        let bundle_root = bundle
+            .entry
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_string_lossy();
+        if bundle_root.is_empty() || bundle_root == "/" {
+            Some(generated)
+        } else {
+            Some(generated.replace(bundle_root.as_ref(), "/__w3cos_bundle__"))
+        }
     } else {
         None
     };
@@ -1530,6 +1543,14 @@ console.log("view", view);
         let bundle_rs = std::fs::read_to_string(out.join("src/esm_bundle.rs"))
             .expect("esm_bundle.rs should be generated");
         assert!(
+            bundle_rs.contains("/__w3cos_bundle__/app.ts"),
+            "generated module identities should use a reproducible virtual root: {bundle_rs}"
+        );
+        assert!(
+            !bundle_rs.contains(&root.to_string_lossy().to_string()),
+            "generated source must not retain build-machine paths: {bundle_rs}"
+        );
+        assert!(
             bundle_rs.contains("w3cos_runtime::jsdom::document_value()"),
             "document should map to the jsdom bridge: {bundle_rs}"
         );
@@ -1825,6 +1846,37 @@ export function keymap() {}"#,
             "a failed W3IR lowering must not emit a partial or fallback bundle"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn esm_capture_codegen_is_reproducible() {
+        let root = std::env::temp_dir().join(format!(
+            "w3cos_esm_reproducible_captures_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let app = root.join("src/app.ts");
+        std::fs::write(
+            &app,
+            r#"const alpha = 1;
+const beta = 2;
+const gamma = 3;
+export function main() {
+  return () => alpha + beta + gamma;
+}"#,
+        )
+        .unwrap();
+
+        let first = root.join("first");
+        let second = root.join("second");
+        compile_from_file(&app, &first).unwrap();
+        compile_from_file(&app, &second).unwrap();
+        assert_eq!(
+            std::fs::read(first.join("src/esm_bundle.rs")).unwrap(),
+            std::fs::read(second.join("src/esm_bundle.rs")).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1477,7 +1477,61 @@ fn response_from_bytes(
     Value::object(props)
 }
 
+fn response_from_native_stream(
+    body: ReadableStream,
+    status: u16,
+    status_text: String,
+    headers: Value,
+    url: String,
+    response_type: String,
+) -> Value {
+    let body_used = Rc::new(Cell::new(false));
+    let body_used_for_stream = Rc::clone(&body_used);
+    let body_stream = crate::streams_web::from_native_stream(
+        body,
+        realm_fetch_function(move |_, _| {
+            body_used_for_stream.set(true);
+            Value::Undefined
+        }),
+    );
+    let mut props = HashMap::from([
+        ("status".into(), Value::Number(status as f64)),
+        ("ok".into(), Value::Bool((200..300).contains(&status))),
+        ("statusText".into(), Value::from(status_text)),
+        ("headers".into(), headers),
+        ("url".into(), Value::from(url)),
+        ("type".into(), Value::from(response_type)),
+        ("redirected".into(), Value::Bool(false)),
+        ("body".into(), body_stream),
+    ]);
+    let body_used_getter = Rc::clone(&body_used);
+    props.insert(
+        "__w3cos_getter_bodyUsed".into(),
+        realm_fetch_function(move |_, _| Value::Bool(body_used_getter.get())),
+    );
+    for method in ["text", "json", "arrayBuffer", "clone"] {
+        props.insert(
+            method.into(),
+            realm_fetch_function(move |_, _| {
+                w3cos_core::promise::reject(vec![Value::object(HashMap::from([
+                    ("name".into(), Value::string("TypeError")),
+                    (
+                        "message".into(),
+                        Value::from(format!(
+                            "Response.{method}() is unavailable after selecting the streaming body"
+                        )),
+                    ),
+                ]))])
+            }),
+        );
+    }
+    Value::object(props)
+}
+
 fn response_value(response: FetchResponse, _requested_url: String) -> Value {
+    let is_event_stream = response
+        .header("content-type")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
     let status = response.status;
     let status_text = response.status_text.clone();
     let url = response.url.clone();
@@ -1489,8 +1543,19 @@ fn response_value(response: FetchResponse, _requested_url: String) -> Value {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
     )));
-    let body = response.array_buffer().unwrap_or_default();
-    let value = response_from_bytes(body, status, status_text, headers, url, "basic".into());
+    let value = if is_event_stream {
+        response_from_native_stream(
+            response.body_stream,
+            status,
+            status_text,
+            headers,
+            url,
+            "basic".into(),
+        )
+    } else {
+        let body = response.array_buffer().unwrap_or_default();
+        response_from_bytes(body, status, status_text, headers, url, "basic".into())
+    };
     value.set_property("redirected", Value::Bool(redirected));
     value
 }
@@ -2152,22 +2217,14 @@ pub(crate) fn reset_realm() {
 }
 
 fn build_agent(options: &FetchOptions) -> ureq::Agent {
-    if let Some(ms) = options.timeout_ms {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_millis(ms)))
-            .save_redirect_history(true)
-            .http_status_as_error(false)
-            .build();
-        ureq::Agent::new_with_config(config)
-    } else {
-        ureq::Agent::new_with_config(
-            ureq::Agent::config_builder()
-                .timeout_global(Some(std::time::Duration::from_secs(30)))
-                .save_redirect_history(true)
-                .http_status_as_error(false)
-                .build(),
-        )
-    }
+    let config = ureq::Agent::config_builder()
+        // Browser fetch has no implicit deadline. Callers that need one use
+        // RequestInit.timeout or AbortSignal.timeout explicitly.
+        .timeout_global(options.timeout_ms.map(std::time::Duration::from_millis))
+        .save_redirect_history(true)
+        .http_status_as_error(false)
+        .build();
+    ureq::Agent::new_with_config(config)
 }
 
 fn fetch_inner(
@@ -2851,9 +2908,9 @@ fn fetch_browser_bytes_with_redirects(
     completion_order: &AtomicU64,
 ) -> Result<BrowserFetchResponse, Box<dyn std::error::Error>> {
     let config = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_millis(
-            options.timeout_ms.unwrap_or(30_000),
-        )))
+        // Match browser fetch: no default timeout. AbortSignal and an
+        // explicitly supplied RequestInit.timeout still cancel the request.
+        .timeout_global(options.timeout_ms.map(std::time::Duration::from_millis))
         .max_redirects(0)
         .max_redirects_will_error(false)
         .http_status_as_error(false)

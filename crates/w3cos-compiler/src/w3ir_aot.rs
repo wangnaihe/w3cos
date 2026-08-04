@@ -1967,7 +1967,9 @@ fn emit_instruction(
                 anyhow!("missing AOT factory for nested W3IR function {nested:?}")
             })?;
             let mut adapters = String::new();
-            for capture in captures {
+            let mut ordered_captures = captures.clone();
+            ordered_captures.sort_by_key(|capture| capture.0);
+            for capture in &ordered_captures {
                 let mutable = function
                     .bindings
                     .iter()

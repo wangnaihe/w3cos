@@ -782,22 +782,50 @@ impl SpatialGrid {
             return None;
         }
 
-        for &hit_idx in self.cells[cell_idx].iter().rev() {
-            let hit = &hit_nodes[hit_idx];
-            if x >= hit.rect.x
-                && x <= hit.rect.x + hit.rect.width
-                && y >= hit.rect.y
-                && y <= hit.rect.y + hit.rect.height
-            {
-                let mut cur = Some(hit.index);
-                while let Some(idx) = cur {
-                    if let Some(h) = hit_nodes.iter().find(|h| h.index == idx) {
-                        if h.is_host_target {
-                            return Some(idx);
+        // Match browser hit testing when a delegated host and a real control
+        // overlap. DOM/layout order alone is insufficient because framework
+        // wrappers can be emitted after their button child.
+        for priority in [3_u8, 2, 1, 0] {
+            let mut best = None;
+            for &hit_idx in self.cells[cell_idx].iter().rev() {
+                let hit = &hit_nodes[hit_idx];
+                if hit.is_host_target
+                    && match priority {
+                        3 => {
+                            hit.is_focusable
+                                && matches!(hit.on_click, EventAction::NativeHost { .. })
+                        }
+                        2 => hit.is_focusable,
+                        1 => hit.is_interactive,
+                        _ => true,
+                    }
+                    && x >= hit.rect.x
+                    && x <= hit.rect.x + hit.rect.width
+                    && y >= hit.rect.y
+                    && y <= hit.rect.y + hit.rect.height
+                {
+                    match best {
+                        None => best = Some(hit.index),
+                        Some(current) => {
+                            // A parent and its lowered child can have the same
+                            // focusable button rect after a React rebuild. The
+                            // browser targets the deepest element regardless of
+                            // layout-cache insertion order. Preserve reverse
+                            // paint order for unrelated overlapping siblings.
+                            let mut cursor = parents.get(hit.index).copied().flatten();
+                            while let Some(parent) = cursor {
+                                if parent == current {
+                                    best = Some(hit.index);
+                                    break;
+                                }
+                                cursor = parents.get(parent).copied().flatten();
+                            }
                         }
                     }
-                    cur = parents.get(idx).copied().flatten();
                 }
+            }
+            if best.is_some() {
+                return best;
             }
         }
         None
@@ -815,7 +843,8 @@ impl SpatialGrid {
         // applied a target can be visible while still living below that grid.
         // Scan only on that transformed-coordinate fallback instead of sizing
         // the grid to an arbitrarily long document.
-        for priority in [2_u8, 1, 0] {
+        for priority in [3_u8, 2, 1, 0] {
+            let mut best = None;
             for hit in hit_nodes.iter().rev() {
                 if hit.is_host_target
                     && required_scroll_ancestor.is_none_or(|(required, ancestors)| {
@@ -830,6 +859,10 @@ impl SpatialGrid {
                         false
                     })
                     && match priority {
+                        3 => {
+                            hit.is_focusable
+                                && matches!(hit.on_click, EventAction::NativeHost { .. })
+                        }
                         2 => hit.is_focusable,
                         1 => hit.is_interactive,
                         _ => true,
@@ -839,31 +872,49 @@ impl SpatialGrid {
                     && y >= hit.rect.y
                     && y <= hit.rect.y + hit.rect.height
                 {
-                    let mut current = Some(hit.index);
-                    while let Some(idx) = current {
-                        if hit_nodes
-                            .iter()
-                            .find(|candidate| candidate.index == idx)
-                            .is_some_and(|candidate| candidate.is_host_target)
-                        {
-                            return Some(idx);
+                    match best {
+                        None => best = Some(hit.index),
+                        Some(current) => {
+                            // Scrolled content uses document coordinates and
+                            // must make the same deepest-element choice as the
+                            // viewport grid. Dynamic framework rebuilds can
+                            // otherwise put an overlapping parent after its
+                            // labeled button child in the layout cache.
+                            let mut cursor = parents.get(hit.index).copied().flatten();
+                            while let Some(parent) = cursor {
+                                if parent == current {
+                                    best = Some(hit.index);
+                                    break;
+                                }
+                                cursor = parents.get(parent).copied().flatten();
+                            }
                         }
-                        current = parents.get(idx).copied().flatten();
                     }
                 }
+            }
+            if best.is_some() {
+                return best;
             }
         }
         None
     }
 }
 
-fn hit_test_order_key(hit: &HitNode, paint_z: &[i32]) -> (i32, bool, bool, usize) {
+fn hit_test_order_key(hit: &HitNode, paint_z: &[i32]) -> (bool, i32, bool, bool, usize) {
     (
+        matches!(hit.on_click, EventAction::NativeHost { .. }),
         paint_z.get(hit.index).copied().unwrap_or_default(),
         hit.is_focusable,
         hit.is_interactive,
         hit.index,
     )
+}
+
+fn dom_host_disabled(action: &EventAction) -> bool {
+    match action {
+        EventAction::NativeHost { id, .. } => crate::dom::has_attribute(*id as u32, "disabled"),
+        _ => false,
+    }
 }
 
 fn has_scroll_transform(
@@ -2582,13 +2633,16 @@ impl App {
                 if !layout::is_node_visible(&flat, idx) {
                     continue;
                 }
-                let is_interactive = matches!(node.kind, ComponentKind::Button { .. })
+                let disabled = dom_host_disabled(&node.on_click);
+                let is_interactive = (matches!(node.kind, ComponentKind::Button { .. })
                     || matches!(node.kind, ComponentKind::TextInput { .. })
-                    || node.on_click.has_pointer_interaction();
+                    || node.on_click.has_pointer_interaction())
+                    && !disabled;
                 let is_host_target =
                     is_interactive || matches!(node.on_click, EventAction::NativeHost { .. });
-                let is_focusable = matches!(node.kind, ComponentKind::Button { .. })
-                    || matches!(node.kind, ComponentKind::TextInput { .. });
+                let is_focusable = (matches!(node.kind, ComponentKind::Button { .. })
+                    || matches!(node.kind, ComponentKind::TextInput { .. }))
+                    && !disabled;
                 if is_focusable {
                     self.focusable_indices.push(idx);
                 }
@@ -2607,17 +2661,31 @@ impl App {
         crate::uitest::set_hit_targets(
             self.hit_nodes
                 .iter()
-                .filter(|hit| hit.is_interactive)
+                // Keep disabled DOM controls visible to UI diagnostics while
+                // excluding them from normal activation and focus semantics.
+                .filter(|hit| hit.is_interactive || dom_host_disabled(&hit.on_click))
                 .map(|hit| {
                     let label = match self.get_kind_at(hit.index) {
                         Some(ComponentKind::Button { label }) => label.clone(),
                         Some(ComponentKind::TextInput { placeholder, .. }) => placeholder.clone(),
                         _ => String::new(),
                     };
+                    let host_id = match hit.on_click {
+                        EventAction::NativeHost { id, .. } => Some(id),
+                        _ => None,
+                    };
                     crate::uitest::UiHitTarget {
                         index: hit.index,
                         label,
                         action: format!("{:?}", hit.on_click),
+                        host_id,
+                        disabled: host_id
+                            .is_some_and(|id| crate::dom::has_attribute(id as u32, "disabled")),
+                        aria_disabled: host_id
+                            .and_then(|id| crate::dom::get_attribute(id as u32, "aria-disabled")),
+                        interaction_state: host_id.and_then(|id| {
+                            crate::dom::get_attribute(id as u32, "data-interaction-state")
+                        }),
                         cx: hit.rect.x + hit.rect.width / 2.0 + input_window_offset.0,
                         cy: hit.rect.y + hit.rect.height / 2.0 + input_window_offset.1,
                     }
@@ -3910,14 +3978,20 @@ impl App {
         }
         crate::uitest::set_pointer_hit(self.mouse_x, self.mouse_y, hit);
         if let Some(idx) = hit {
+            let stable_host_id = self.native_host_chain(idx).first().copied();
             let prevented =
                 self.dispatch_native_pointer(idx, "down", pointer_id, pointer_type, 0, 1, 0.5);
             if !self.adopt_dom_active_text_input() {
                 self.focus_dom_text_input_within_hit(idx);
             }
             self.rebuild_if_dirty();
+            self.ensure_layout();
             self.pointer_down_default_prevented = prevented;
-            self.pressed_index = Some(idx);
+            self.pressed_index = Some(
+                stable_host_id
+                    .and_then(|id| self.native_host_index(id))
+                    .unwrap_or(idx),
+            );
             #[cfg(target_os = "ios")]
             if !prevented && matches!(self.get_kind_at(idx), Some(ComponentKind::TextInput { .. }))
             {
@@ -3944,21 +4018,32 @@ impl App {
             );
         }
         if let Some(pressed_idx) = self.pressed_index.take() {
+            let stable_host_id = self.native_host_chain(pressed_idx).first().copied();
             self.dispatch_native_pointer(pressed_idx, "up", pointer_id, pointer_type, 0, 0, 0.0);
+            // Browser-generated click runs after pointerup/touchend listeners
+            // and their discrete-event microtasks have reached a checkpoint.
+            // React can otherwise still be inside the previous event batch,
+            // leaving the old lowered button mounted just long enough for the
+            // following click to target a stale implementation node.
+            self.microtask_checkpoint();
             self.rebuild_if_dirty();
+            self.ensure_layout();
+            let released_idx = stable_host_id
+                .and_then(|id| self.native_host_index(id))
+                .unwrap_or(pressed_idx);
             #[cfg(any(target_os = "ios", target_os = "android"))]
             {
                 // Mobile touch end coordinates can be rounded or shifted by the
                 // platform compositor. A gesture that was not promoted to scroll
                 // should activate the target captured on touch start.
-                self.handle_click(pressed_idx);
+                self.handle_click(released_idx);
                 return;
             }
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             {
                 let current_hover = self.hit_test(self.mouse_x, self.mouse_y);
-                if current_hover == Some(pressed_idx) {
-                    self.handle_click(pressed_idx);
+                if current_hover == Some(released_idx) {
+                    self.handle_click(released_idx);
                 } else {
                     self.pointer_down_default_prevented = false;
                     self.repaint_after_interaction();
@@ -4096,7 +4181,7 @@ impl App {
                                 .iter()
                                 .find(|candidate| candidate.index == idx);
                             if target.is_some_and(|candidate| candidate.is_focusable) {
-                                return Some(idx);
+                                return Some(self.normalize_dom_hit_target(idx));
                             }
                             visual_host_fallback.get_or_insert(idx);
                             break;
@@ -4118,7 +4203,7 @@ impl App {
                 &self.overscroll_states,
             )
         }) {
-            return direct;
+            return direct.map(|idx| self.normalize_dom_hit_target(idx));
         }
 
         #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -4133,7 +4218,7 @@ impl App {
                     && y >= hit.rect.y - TEXT_INPUT_HIT_SLOP
                     && y <= hit.rect.y + hit.rect.height + TEXT_INPUT_HIT_SLOP
             }) {
-                return Some(hit.index);
+                return Some(self.normalize_dom_hit_target(hit.index));
             }
         }
 
@@ -4154,6 +4239,30 @@ impl App {
             })
             .or(visual_host_fallback)
             .or(direct)
+            .map(|idx| self.normalize_dom_hit_target(idx))
+    }
+
+    /// Lowered DOM controls can contain an implementation-only focusable
+    /// component whose rectangle is the one painted and hit-tested. Browser
+    /// events must still target the corresponding DOM host, never that
+    /// internal component index.
+    fn normalize_dom_hit_target(&self, idx: usize) -> usize {
+        if !self.dom_mode {
+            return idx;
+        }
+        let Some(hit) = self.hit_nodes.iter().find(|hit| hit.index == idx) else {
+            return idx;
+        };
+        if let EventAction::NativeHost { id, .. } = hit.on_click {
+            return self.native_host_index(id).unwrap_or(idx);
+        }
+        if !hit.is_focusable {
+            return idx;
+        }
+        self.native_host_chain(idx)
+            .first()
+            .and_then(|host_id| self.native_host_index(*host_id))
+            .unwrap_or(idx)
     }
 
     fn viewport_to_layout(&self, x: f32, y: f32) -> (f32, f32) {
@@ -5070,6 +5179,18 @@ impl App {
         let allow_default_focus = !self.pointer_down_default_prevented;
         self.pointer_down_default_prevented = false;
         if let Some(hit) = self.hit_nodes.iter().find(|h| h.index == idx) {
+            // HTML disabled form controls do not receive browser-generated
+            // click activation or focus. Keep their host box in hit testing so
+            // ancestors do not accidentally activate, but stop here before
+            // dispatching the DOM click chain.
+            if dom_host_disabled(&hit.on_click) {
+                crate::uitest::set_click_trace(format!(
+                    "disabled control index={idx} chain={:?}",
+                    self.native_host_chain(idx)
+                ));
+                self.repaint_after_interaction();
+                return;
+            }
             let kind_is_text_input =
                 matches!(self.get_kind_at(idx), Some(ComponentKind::TextInput { .. }));
             let kind_is_button =
@@ -5086,17 +5207,38 @@ impl App {
             }
             if kind_is_button {
                 let action = hit.on_click.clone();
+                // Focus dispatch can synchronously run React handlers and
+                // rebuild the lowered component tree. Preserve the DOM host
+                // chain captured by pointer-down so the subsequent click is
+                // never retargeted through a now-stale flat-tree index.
+                let click_chain = self.native_host_chain(idx);
+                // Mobile Safari does not focus a button merely because it was
+                // tapped. More importantly, dispatching a synthetic focus here
+                // can synchronously remount a React control between touchend
+                // and click, leaving the browser-generated click on a detached
+                // host. Text controls still take focus in their own branch.
+                #[cfg(not(any(target_os = "ios", target_os = "android")))]
                 if allow_default_focus {
                     self.set_focused_index(Some(idx));
                 }
-                let click_prevented = self.dispatch_native_click_bubble(idx);
+                let click_prevented = self.dispatch_native_click_chain(&click_chain);
                 let submitted = if self.dom_mode && !click_prevented {
-                    self.native_host_chain(idx).first().and_then(|target| {
+                    click_chain.iter().find_map(|target| {
                         crate::jsdom::dispatch_native_submit_for_control(*target as u32)
                     })
                 } else {
                     None
                 };
+                if std::env::var_os("W3COS_INPUT_TRACE").is_some() {
+                    eprintln!(
+                        "[W3C OS][CLICK] button index={idx} prevented={click_prevented} submitted={submitted:?} chain={:?}",
+                        click_chain
+                    );
+                }
+                crate::uitest::set_click_trace(format!(
+                    "button index={idx} prevented={click_prevented} submitted={submitted:?} chain={:?}",
+                    click_chain
+                ));
                 if !action.is_none() && !matches!(action, EventAction::NativeHost { .. }) {
                     state::execute_action(&action);
                 } else if !click_prevented && submitted.is_none() {
@@ -5139,6 +5281,10 @@ impl App {
 
     fn dispatch_native_click_bubble(&self, idx: usize) -> bool {
         let chain = self.native_host_chain(idx);
+        self.dispatch_native_click_chain(&chain)
+    }
+
+    fn dispatch_native_click_chain(&self, chain: &[u64]) -> bool {
         if self.dom_mode {
             chain
                 .first()
@@ -5203,6 +5349,23 @@ impl App {
         host_ids
     }
 
+    fn native_host_index(&self, host_id: u64) -> Option<usize> {
+        self.hit_nodes
+            .iter()
+            .rev()
+            .find(|hit| {
+                matches!(hit.on_click, EventAction::NativeHost { id, .. } if id == host_id)
+            })
+            .map(|hit| hit.index)
+            .or_else(|| {
+                layout::pre_flatten(&self.root)
+                    .iter()
+                    .rposition(
+                        |node| matches!(node.on_click, EventAction::NativeHost { id, .. } if *id == host_id),
+                    )
+            })
+    }
+
     fn set_focused_index(&mut self, next: Option<usize>) {
         if self.focused_index == next {
             return;
@@ -5231,6 +5394,25 @@ impl App {
         }
         self.focused_index = next;
         crate::uitest::set_focused_index(next);
+        #[cfg(target_os = "ios")]
+        if let Some(current) = next {
+            let initial_value =
+                self.text_input_values.get(&current).cloned().or_else(|| {
+                    match self.get_kind_at(current) {
+                        Some(ComponentKind::TextInput { value, .. }) => Some(value.clone()),
+                        _ => None,
+                    }
+                });
+            if let Some(initial_value) = initial_value
+                && let Some(window) = self.get_window()
+            {
+                // UIKit intentionally reuses one hidden UITextField for all DOM
+                // controls. It can remain first responder while focus moves, so
+                // ensure_text_input_first_responder() will not replace its text.
+                // Seed the newly focused control before polling native edits.
+                crate::ios_input::set_text_input_value(window, &initial_value);
+            }
+        }
         self.sync_soft_keyboard();
         if let Some(current) = next {
             let chain = self.native_host_chain(current);
@@ -6438,16 +6620,20 @@ impl ApplicationHandler for App {
             for action in &timer_actions {
                 state::execute_action(action);
             }
-            // Drive ordinary timers here. rAF is deliberately reserved for
-            // the next rendering opportunity immediately before paint.
-            let js_ran = crate::jsdom::tick_timers() + crate::jsdom::drain_microtasks();
-            if !timer_actions.is_empty() || js_ran > 0 {
+            if !timer_actions.is_empty() {
                 self.rebuild_if_dirty();
-            }
-
-            if !self.animations.is_empty() || !timer_actions.is_empty() || js_ran > 0 {
                 self.request_repaint();
             }
+        }
+
+        // A due JS timer is eligible at every native task boundary. Limiting
+        // this to ResumeTimeReached starves setTimeout(0) while redraw, touch,
+        // or IME polling keeps the loop in Poll/WaitCancelled turns.
+        // rAF remains reserved for the rendering opportunity before paint.
+        let js_ran = crate::jsdom::tick_timers() + crate::jsdom::drain_microtasks();
+        if js_ran > 0 {
+            self.rebuild_if_dirty();
+            self.request_repaint();
         }
 
         #[cfg(feature = "devtools")]
@@ -7724,6 +7910,196 @@ mod scroll_physics_tests {
     }
 
     #[test]
+    fn hit_order_prefers_dom_host_over_higher_z_lowered_button_node() {
+        let rect = LayoutRect {
+            x: 20.0,
+            y: 20.0,
+            width: 120.0,
+            height: 44.0,
+        };
+        let dom_button = HitNode {
+            rect,
+            index: 3,
+            is_interactive: true,
+            is_host_target: true,
+            is_focusable: true,
+            on_click: EventAction::NativeHost {
+                id: 42,
+                click: false,
+                scroll: false,
+                input: false,
+                focus: false,
+                keyboard: false,
+                submit: false,
+                pointer: true,
+                wheel: false,
+            },
+        };
+        let lowered_button = HitNode {
+            rect,
+            index: 4,
+            is_interactive: true,
+            is_host_target: true,
+            is_focusable: true,
+            on_click: EventAction::None,
+        };
+        let paint_z = [0, 0, 0, 0, 10];
+
+        assert!(
+            hit_test_order_key(&dom_button, &paint_z)
+                > hit_test_order_key(&lowered_button, &paint_z)
+        );
+    }
+
+    #[test]
+    fn viewport_grid_prefers_control_over_later_delegated_host() {
+        let rect = LayoutRect {
+            x: 20.0,
+            y: 20.0,
+            width: 120.0,
+            height: 44.0,
+        };
+        let targets = vec![
+            HitNode {
+                rect,
+                index: 3,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: true,
+                on_click: EventAction::None,
+            },
+            HitNode {
+                rect,
+                index: 8,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: false,
+                on_click: EventAction::None,
+            },
+        ];
+        let grid = SpatialGrid::build(&targets, 375.0, 812.0);
+        let parents = [None; 9];
+
+        assert_eq!(grid.query(40.0, 40.0, &targets, &parents), Some(3));
+    }
+
+    #[test]
+    fn viewport_grid_prefers_focusable_dom_host_over_lowered_button_node() {
+        let rect = LayoutRect {
+            x: 20.0,
+            y: 20.0,
+            width: 120.0,
+            height: 44.0,
+        };
+        let targets = vec![
+            HitNode {
+                rect,
+                index: 3,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: true,
+                on_click: EventAction::NativeHost {
+                    id: 42,
+                    click: false,
+                    scroll: false,
+                    input: false,
+                    focus: false,
+                    keyboard: false,
+                    submit: false,
+                    pointer: true,
+                    wheel: false,
+                },
+            },
+            HitNode {
+                rect,
+                index: 4,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: true,
+                on_click: EventAction::None,
+            },
+        ];
+        let grid = SpatialGrid::build(&targets, 375.0, 812.0);
+        let parents = [None; 5];
+
+        assert_eq!(grid.query(40.0, 40.0, &targets, &parents), Some(3));
+    }
+
+    #[test]
+    fn viewport_grid_prefers_deepest_overlapping_button_after_rebuild() {
+        let rect = LayoutRect {
+            x: 20.0,
+            y: 20.0,
+            width: 120.0,
+            height: 44.0,
+        };
+        // Layout-cache iteration can put the child before its parent, making
+        // reverse insertion order alone select the parent.
+        let targets = vec![
+            HitNode {
+                rect,
+                index: 4,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: true,
+                on_click: EventAction::None,
+            },
+            HitNode {
+                rect,
+                index: 3,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: true,
+                on_click: EventAction::None,
+            },
+        ];
+        let grid = SpatialGrid::build(&targets, 375.0, 812.0);
+        let parents = [None, None, None, None, Some(3)];
+
+        assert_eq!(grid.query(40.0, 40.0, &targets, &parents), Some(4));
+    }
+
+    #[test]
+    fn document_query_prefers_deepest_overlapping_button_after_scroll() {
+        let rect = LayoutRect {
+            x: 20.0,
+            y: 920.0,
+            width: 120.0,
+            height: 44.0,
+        };
+        let targets = vec![
+            HitNode {
+                rect,
+                index: 4,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: true,
+                on_click: EventAction::None,
+            },
+            HitNode {
+                rect,
+                index: 3,
+                is_interactive: true,
+                is_host_target: true,
+                is_focusable: true,
+                on_click: EventAction::None,
+            },
+        ];
+        let parents = [None, None, None, Some(1), Some(3)];
+
+        assert_eq!(
+            SpatialGrid::query_document(
+                40.0,
+                940.0,
+                &targets,
+                &parents,
+                Some((1, &parents)),
+            ),
+            Some(4)
+        );
+    }
+
+    #[test]
     fn nested_clip_owner_inherits_outer_scroll_transform() {
         let scroll_ancestors = [None, None, Some(1), Some(2)];
         let offsets = HashMap::from([(1, (0.0, 300.0)), (2, (0.0, 0.0))]);
@@ -7768,6 +8144,28 @@ mod scroll_physics_tests {
         crate::dom::set_attribute(input, "id", "email-input");
         crate::dom::append_child(label, input);
         crate::dom::append_child(crate::dom::body_id(), label);
+    }
+
+    #[test]
+    fn disabled_dom_host_is_not_interactive_or_focusable() {
+        crate::jsdom::reset_bridge();
+        let button = crate::dom::create_element("button");
+        crate::dom::set_attribute(button, "disabled", "");
+        let action = EventAction::NativeHost {
+            id: u64::from(button),
+            click: true,
+            scroll: false,
+            input: false,
+            focus: true,
+            keyboard: false,
+            submit: false,
+            pointer: true,
+            wheel: false,
+        };
+
+        assert!(dom_host_disabled(&action));
+        crate::dom::remove_attribute(button, "disabled");
+        assert!(!dom_host_disabled(&action));
     }
 
     fn flat_index_for_dom_id(app: &App, dom_id: u32) -> usize {

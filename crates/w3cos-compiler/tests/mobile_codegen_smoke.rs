@@ -48,6 +48,9 @@ fn mobile_ios_writes_main_rs() {
     assert!(app_ui.contains("button_with_click"));
     let cargo = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
     assert!(cargo.contains("w3cos-mobile"));
+    assert!(cargo.contains("[profile.dev.package.w3cos-mobile-app]"));
+    assert!(cargo.contains("opt-level = 1"));
+    assert!(cargo.contains("lto = \"off\""));
 }
 
 #[test]

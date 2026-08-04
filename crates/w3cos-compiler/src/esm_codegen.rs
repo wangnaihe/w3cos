@@ -2402,8 +2402,9 @@ fn generator_capture_map_with_synthetic(
     let context = LowerCtx::new_dynamic_with_bindings(renames, value_bindings.clone())
         .with_classes(class_names.clone())
         .with_namespaces(namespace_names.clone());
-    let entries = function
-        .captures
+    let mut ordered_captures = function.captures.clone();
+    ordered_captures.sort_by_key(|capture| capture.0);
+    let entries = ordered_captures
         .iter()
         .map(|capture| {
             // A module-level ESM cell/import/global can be adapted to a live

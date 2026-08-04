@@ -45,6 +45,11 @@ fn configure_ios_data_directory() {
         .join("w3cos");
     w3cos_runtime::storage::set_base_dir(data_dir.join("storage"));
     w3cos_runtime::indexed_db::set_base_dir(data_dir.join("indexeddb"));
+    if std::env::var("W3COS_UITEST").ok().as_deref() == Some("1")
+        && std::env::var("W3COS_CLEAR_STORAGE").ok().as_deref() == Some("1")
+    {
+        w3cos_runtime::storage::clear();
+    }
 }
 
 /// Run a mobile application. Uses the reactive component builder (same as desktop).

@@ -25,6 +25,11 @@ pub const document: BuiltinObject = BuiltinObject(BuiltinKind::Document);
 
 pub fn object_value() -> Value {
     let mut properties = HashMap::new();
+    let prototype = Value::object(HashMap::from([(
+        "hasOwnProperty".to_string(),
+        Value::function(|this, arguments| this.call_method("hasOwnProperty", arguments)),
+    )]));
+    properties.insert("prototype".to_string(), prototype);
     for name in ["keys", "values", "is"] {
         let method = name.to_string();
         properties.insert(
@@ -1188,6 +1193,32 @@ mod tests {
                 .call_method("stringify", vec![sparse])
                 .to_js_string(),
             "[null,\"middle\",null]"
+        );
+    }
+
+    #[test]
+    fn object_prototype_has_own_property_is_callable_with_an_explicit_receiver() {
+        let object = object_value();
+        let has_own_property = object
+            .get_property("prototype")
+            .get_property("hasOwnProperty");
+        let target = Value::object(HashMap::from([(
+            "present".to_string(),
+            Value::Bool(true),
+        )]));
+
+        assert!(
+            has_own_property
+                .call_method(
+                    "call",
+                    vec![target.clone(), Value::string("present")],
+                )
+                .to_bool()
+        );
+        assert!(
+            !has_own_property
+                .call_method("call", vec![target, Value::string("missing")])
+                .to_bool()
         );
     }
 

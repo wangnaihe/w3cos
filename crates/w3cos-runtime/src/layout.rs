@@ -170,7 +170,7 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
 
     let measured = if has_registered_runs {
         cascade_text_intrinsic_size(content, style, DEFAULT_TEXT_WRAP_WIDTH)
-    } else if matches!(style.display, WDisplay::InlineBlock) {
+    } else if matches!(style.display, WDisplay::InlineBlock | WDisplay::InlineFlex) {
         #[cfg(feature = "skia")]
         {
             crate::render_skia::measure_skia_text_intrinsic_size(content, style)
@@ -307,8 +307,11 @@ fn browser_normal_cjk_height(
     style: &w3cos_std::style::Style,
     parent_display: Option<WDisplay>,
 ) -> Option<f32> {
-    if (matches!(style.display, WDisplay::InlineBlock)
-        || matches!(parent_display, Some(WDisplay::InlineBlock)))
+    if (matches!(style.display, WDisplay::InlineBlock | WDisplay::InlineFlex)
+        || matches!(
+            parent_display,
+            Some(WDisplay::InlineBlock | WDisplay::InlineFlex)
+        ))
         && content.chars().any(is_cjk)
         && (style.line_height - w3cos_std::style::Style::default().line_height).abs() < f32::EPSILON
     {
@@ -811,7 +814,10 @@ fn build_taffy_tree(
 
     if comp.children.is_empty() {
         let size = leaf_taffy_size(&comp.kind, &comp.style, &style, parent_display);
-        let inline_control_in_block = matches!(comp.style.display, WDisplay::InlineBlock)
+        let inline_control_in_block = matches!(
+            comp.style.display,
+            WDisplay::InlineBlock | WDisplay::InlineFlex
+        )
             && !matches!(parent_display, Some(WDisplay::Flex | WDisplay::Grid));
         let (min_w, size_w) = if matches!(comp.style.width, WDim::Auto) {
             match &comp.kind {
@@ -820,9 +826,27 @@ fn build_taffy_tree(
                         comp.style.white_space,
                         WWhiteSpace::NoWrap | WWhiteSpace::Pre
                     );
-                    let shrink_to_fit =
-                        matches!(comp.style.display, WDisplay::Inline | WDisplay::InlineBlock);
-                    if nowrap || shrink_to_fit {
+                    // A lowered DOM text node commonly carries `display:inline`
+                    // from its `<span>` host. Browser inline text still wraps to
+                    // the containing block; treating it like inline-block locks
+                    // the leaf to its intrinsic width and lets CJK text escape
+                    // message bubbles. Only an actual inline-block shrink-fits.
+                    //
+                    // Likewise, `overflow:hidden` removes the automatic
+                    // min-content size of a flex item in browsers, allowing a
+                    // nowrap title to contract and be clipped by its own box.
+                    let shrink_to_fit = matches!(
+                        comp.style.display,
+                        WDisplay::InlineBlock | WDisplay::InlineFlex
+                    );
+                    let clips_overflow = matches!(
+                        comp.style.resolved_overflow_x(),
+                        WOverflow::Hidden | WOverflow::Scroll | WOverflow::Auto
+                    ) || matches!(
+                        comp.style.resolved_overflow_y(),
+                        WOverflow::Hidden | WOverflow::Scroll | WOverflow::Auto
+                    );
+                    if shrink_to_fit || (nowrap && !clips_overflow) {
                         let mut w = text_intrinsic_size(content, &comp.style).0;
                         if let WDim::Px(mw) = comp.style.min_width {
                             w = w.max(mw);
@@ -1015,7 +1039,9 @@ fn update_text_leaf_heights(
 
 fn to_taffy_display(d: WDisplay) -> taffy::Display {
     match d {
-        WDisplay::Flex | WDisplay::Inline | WDisplay::InlineBlock => taffy::Display::Flex,
+        WDisplay::Flex | WDisplay::Inline | WDisplay::InlineBlock | WDisplay::InlineFlex => {
+            taffy::Display::Flex
+        }
         WDisplay::Grid => taffy::Display::Grid,
         WDisplay::Block => taffy::Display::Block,
         WDisplay::None => taffy::Display::None,
@@ -1219,6 +1245,15 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             },
         ),
         WDisplay::InlineBlock => (
+            taffy::Display::Flex,
+            s.flex_grow,
+            s.flex_shrink,
+            Size {
+                width: to_taffy_dim(s.width, s.font_size, viewport_w, viewport_h),
+                height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
+            },
+        ),
+        WDisplay::InlineFlex => (
             taffy::Display::Flex,
             s.flex_grow,
             s.flex_shrink,
@@ -2308,6 +2343,44 @@ mod tests {
     }
 
     #[test]
+    fn inline_flex_badge_shrink_wraps_like_browser_css() {
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(300.0),
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    "首次入驻",
+                    Style {
+                        display: WDisp::InlineFlex,
+                        box_sizing: WBoxSizing::BorderBox,
+                        font_size: 12.0,
+                        line_height: 1.4,
+                        padding: w3cos_std::style::Edges::xy(8.0, 2.0),
+                        ..Style::default()
+                    },
+                )],
+            ),
+            300.0,
+            200.0,
+        )
+        .unwrap();
+        let badge = layout[1].0;
+        assert!(
+            (badge.width - 64.0).abs() < 1.0,
+            "inline-flex badge width should equal four CJK ems plus padding, got {}",
+            badge.width
+        );
+        assert!(
+            (badge.height - 20.8).abs() < 1.0,
+            "inline-flex badge height should equal line box plus padding, got {}",
+            badge.height
+        );
+    }
+
+    #[test]
     fn inline_block_container_uses_browser_cjk_normal_line_box() {
         let layout = compute(
             &Component::boxed(
@@ -2378,6 +2451,75 @@ mod tests {
         assert!(
             text_rect.height > 21.0,
             "text should wrap to multiple lines"
+        );
+    }
+
+    #[test]
+    fn lowered_inline_text_wraps_to_column_content_width() {
+        let text = "AI 正在理解你的业务，识别角色、资料和流程，并进行结构校验。";
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Flex,
+                    flex_direction: WDir::Column,
+                    width: WDim::Px(300.0),
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    text,
+                    Style {
+                        display: WDisp::Inline,
+                        font_size: 14.0,
+                        line_height: 1.55,
+                        ..Style::default()
+                    },
+                )],
+            ),
+            402.0,
+            874.0,
+        )
+        .unwrap();
+        let text_rect = layout.iter().find(|(_, idx)| *idx == 1).unwrap().0;
+        assert!(
+            (text_rect.width - 300.0).abs() < 1.0,
+            "inline text should use its containing block width, got {}",
+            text_rect.width
+        );
+        assert!(
+            text_rect.height > 22.0,
+            "inline CJK text should wrap inside the containing block"
+        );
+    }
+
+    #[test]
+    fn clipped_nowrap_text_can_shrink_in_column() {
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Flex,
+                    flex_direction: WDir::Column,
+                    width: WDim::Px(96.0),
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    "LogiDesk 对话标题",
+                    Style {
+                        overflow_x: Some(WOverflow::Hidden),
+                        overflow_y: Some(WOverflow::Hidden),
+                        white_space: WWhiteSpace::NoWrap,
+                        ..Style::default()
+                    },
+                )],
+            ),
+            402.0,
+            874.0,
+        )
+        .unwrap();
+        let text_rect = layout.iter().find(|(_, idx)| *idx == 1).unwrap().0;
+        assert!(
+            (text_rect.width - 96.0).abs() < 1.0,
+            "clipped nowrap text should shrink to its flex column, got {}",
+            text_rect.width
         );
     }
 

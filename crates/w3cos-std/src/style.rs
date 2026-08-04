@@ -272,6 +272,7 @@ pub enum Display {
     Grid,
     Inline,
     InlineBlock,
+    InlineFlex,
     None,
 }
 

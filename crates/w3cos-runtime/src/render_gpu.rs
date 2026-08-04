@@ -1180,6 +1180,26 @@ fn draw_text_in_rect(
     dpi: Affine,
 ) {
     let content = text_paint_box(rect, style);
+    let clips_own_overflow = matches!(
+        style.resolved_overflow_x(),
+        w3cos_std::style::Overflow::Hidden
+            | w3cos_std::style::Overflow::Scroll
+            | w3cos_std::style::Overflow::Auto
+    ) || matches!(
+        style.resolved_overflow_y(),
+        w3cos_std::style::Overflow::Hidden
+            | w3cos_std::style::Overflow::Scroll
+            | w3cos_std::style::Overflow::Auto
+    );
+    if clips_own_overflow {
+        let clip = Rect::new(
+            rect.x as f64,
+            rect.y as f64,
+            (rect.x + rect.width) as f64,
+            (rect.y + rect.height) as f64,
+        );
+        scene.push_clip_layer(Fill::NonZero, dpi, &clip);
+    }
     let line_h = style.font_size * style.line_height;
     let registry = crate::font_face::FontRegistry::global();
     let layout = crate::text_layout::retained_text_paint_layout_with(
@@ -1225,6 +1245,9 @@ fn draw_text_in_rect(
             glyph_cache,
             dpi,
         );
+    }
+    if clips_own_overflow {
+        scene.pop_layer();
     }
 }
 

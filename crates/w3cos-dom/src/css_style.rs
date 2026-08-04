@@ -75,22 +75,22 @@ impl CSSStyleDeclaration {
                 }
             }
             "padding-top" | "paddingTop" => {
-                if let Some(v) = parse_edge_spacing(value, SafeAreaEdge::Top, "top") {
+                if let Some(v) = parse_edge_spacing(value) {
                     self.inner.padding.top = v
                 }
             }
             "padding-right" | "paddingRight" => {
-                if let Some(v) = parse_edge_spacing(value, SafeAreaEdge::Right, "right") {
+                if let Some(v) = parse_edge_spacing(value) {
                     self.inner.padding.right = v
                 }
             }
             "padding-bottom" | "paddingBottom" => {
-                if let Some(v) = parse_edge_spacing(value, SafeAreaEdge::Bottom, "bottom") {
+                if let Some(v) = parse_edge_spacing(value) {
                     self.inner.padding.bottom = v
                 }
             }
             "padding-left" | "paddingLeft" => {
-                if let Some(v) = parse_edge_spacing(value, SafeAreaEdge::Left, "left") {
+                if let Some(v) = parse_edge_spacing(value) {
                     self.inner.padding.left = v
                 }
             }
@@ -392,7 +392,15 @@ impl CSSStyleDeclaration {
 
     pub fn get_property(&self, name: &str) -> String {
         match name {
-            "display" => format!("{:?}", self.inner.display).to_lowercase(),
+            "display" => match self.inner.display {
+                Display::Block => "block".to_string(),
+                Display::Flex => "flex".to_string(),
+                Display::Grid => "grid".to_string(),
+                Display::Inline => "inline".to_string(),
+                Display::InlineBlock => "inline-block".to_string(),
+                Display::InlineFlex => "inline-flex".to_string(),
+                Display::None => "none".to_string(),
+            },
             "position" => format!("{:?}", self.inner.position).to_lowercase(),
             "font-size" | "fontSize" => format!("{}px", self.inner.font_size),
             "color" => format!(
@@ -505,27 +513,40 @@ fn apply_background_shorthand(style: &mut Style, value: &str) {
     style.background_blend_mode = None;
 }
 
-fn parse_edge_spacing(value: &str, edge: SafeAreaEdge, css_edge: &str) -> Option<Spacing> {
+fn parse_edge_spacing(value: &str) -> Option<Spacing> {
     let value = value.trim();
-    let environment = format!("env(safe-area-inset-{css_edge})");
-    if value == environment {
-        return Some(Spacing::SafeAreaInset(edge));
+    let environments = [
+        ("env(safe-area-inset-top)", SafeAreaEdge::Top),
+        ("env(safe-area-inset-right)", SafeAreaEdge::Right),
+        ("env(safe-area-inset-bottom)", SafeAreaEdge::Bottom),
+        ("env(safe-area-inset-left)", SafeAreaEdge::Left),
+    ];
+    if let Some((_, edge)) = environments
+        .iter()
+        .find(|(environment, _)| value == *environment)
+    {
+        return Some(Spacing::SafeAreaInset(*edge));
     }
     if let Some(inner) = value
         .strip_prefix("calc(")
         .and_then(|value| value.strip_suffix(')'))
-        && let Some(px) = inner
-            .replace(&environment, "")
-            .replace('+', "")
-            .trim()
-            .strip_suffix("px")
-            .and_then(|value| value.trim().parse().ok())
     {
-        return Some(Spacing::Composite {
-            px,
-            safe_area: Some(edge),
-            keyboard_inset: false,
-        });
+        for (environment, edge) in environments {
+            if inner.contains(environment)
+                && let Some(px) = inner
+                    .replace(environment, "")
+                    .replace('+', "")
+                    .trim()
+                    .strip_suffix("px")
+                    .and_then(|value| value.trim().parse().ok())
+            {
+                return Some(Spacing::Composite {
+                    px,
+                    safe_area: Some(edge),
+                    keyboard_inset: false,
+                });
+            }
+        }
     }
     parse_spacing(value)
 }
@@ -533,7 +554,7 @@ fn parse_edge_spacing(value: &str, edge: SafeAreaEdge, css_edge: &str) -> Option
 fn parse_edge_shorthand(value: &str) -> Option<Edges> {
     let parts: Vec<Spacing> = split_css_whitespace(value)
         .iter()
-        .map(|part| parse_spacing(part))
+        .map(|part| parse_edge_spacing(part))
         .collect::<Option<_>>()?;
     let (top, right, bottom, left) = match parts.as_slice() {
         [all] => (*all, *all, *all, *all),
@@ -690,6 +711,7 @@ fn parse_display(value: &str) -> Display {
         "block" => Display::Block,
         "inline" => Display::Inline,
         "inline-block" => Display::InlineBlock,
+        "inline-flex" => Display::InlineFlex,
         "none" => Display::None,
         _ => Display::Flex,
     }
@@ -1292,6 +1314,32 @@ mod tests {
     }
 
     #[test]
+    fn box_edge_shorthand_preserves_safe_area_environment_values() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property(
+            "padding",
+            "calc(36px + env(safe-area-inset-top)) 22px calc(28px + env(safe-area-inset-bottom))",
+        );
+        assert_eq!(
+            declaration.inner.padding,
+            Edges {
+                top: Spacing::Composite {
+                    px: 36.0,
+                    safe_area: Some(SafeAreaEdge::Top),
+                    keyboard_inset: false,
+                },
+                right: Spacing::Px(22.0),
+                bottom: Spacing::Composite {
+                    px: 28.0,
+                    safe_area: Some(SafeAreaEdge::Bottom),
+                    keyboard_inset: false,
+                },
+                left: Spacing::Px(22.0),
+            }
+        );
+    }
+
+    #[test]
     fn modern_box_model_values_match_css_semantics() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("box-sizing", "border-box");
@@ -1342,3 +1390,10 @@ mod tests {
         assert_eq!(declaration.inner.height, Dimension::Vh(100.0));
     }
 }
+    #[test]
+    fn inline_flex_round_trips_without_falling_back_to_block_flex() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("display", "inline-flex");
+        assert_eq!(declaration.inner.display, Display::InlineFlex);
+        assert_eq!(declaration.get_property("display"), "inline-flex");
+    }

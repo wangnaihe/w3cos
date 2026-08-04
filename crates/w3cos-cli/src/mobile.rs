@@ -33,6 +33,66 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_if_changed(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    let contents = contents.as_ref();
+    if fs::read(path).is_ok_and(|existing| existing == contents) {
+        return Ok(());
+    }
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn prepare_mobile_build_dir(build_dir: &Path, preserve_generated_sources: bool) -> Result<()> {
+    let source_dir = build_dir.join("src");
+    if source_dir.exists() && !preserve_generated_sources {
+        fs::remove_dir_all(&source_dir)?;
+    }
+    fs::create_dir_all(build_dir)?;
+    Ok(())
+}
+
+struct GeneratedFileSnapshot {
+    path: PathBuf,
+    contents: Vec<u8>,
+    modified: std::time::SystemTime,
+}
+
+fn snapshot_generated_files(build_dir: &Path) -> Result<Vec<GeneratedFileSnapshot>> {
+    let mut paths = vec![build_dir.join("Cargo.toml")];
+    let source_dir = build_dir.join("src");
+    if source_dir.is_dir() {
+        for entry in fs::read_dir(source_dir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+        .into_iter()
+        .filter(|path| path.is_file())
+        .map(|path| {
+            Ok(GeneratedFileSnapshot {
+                contents: fs::read(&path)?,
+                modified: fs::metadata(&path)?.modified()?,
+                path,
+            })
+        })
+        .collect()
+}
+
+fn restore_unchanged_generated_mtimes(snapshots: &[GeneratedFileSnapshot]) -> Result<()> {
+    for snapshot in snapshots {
+        if fs::read(&snapshot.path).is_ok_and(|current| current == snapshot.contents) {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&snapshot.path)?
+                .set_times(fs::FileTimes::new().set_modified(snapshot.modified))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn mobile_init(project_name: &PathBuf, platform: &str) -> Result<()> {
     if project_name.exists() {
         bail!("directory already exists: {}", project_name.display());
@@ -147,10 +207,13 @@ pub fn mobile_build(
     }
 
     let build_dir = project_dir.join(".w3cos/mobile-build");
-    if build_dir.join("src").exists() {
-        fs::remove_dir_all(build_dir.join("src"))?;
-    }
-    fs::create_dir_all(&build_dir)?;
+    let preserve_generated_sources = std::env::var_os("W3COS_PRESERVE_GENERATED_SOURCES").is_some();
+    let generated_snapshots = if preserve_generated_sources {
+        snapshot_generated_files(&build_dir)?
+    } else {
+        Vec::new()
+    };
+    prepare_mobile_build_dir(&build_dir, preserve_generated_sources)?;
 
     if devtools {
         println!("🔧 Mobile DevTools enabled (CDP port 9229 on device/simulator)");
@@ -166,6 +229,9 @@ pub fn mobile_build(
         &CompileOptions { devtools },
     )?;
     apply_native_extensions(project_dir, &build_dir, platform)?;
+    if preserve_generated_sources {
+        restore_unchanged_generated_mtimes(&generated_snapshots)?;
+    }
 
     match platform {
         "android" => build_android(project_dir, &build_dir, release)?,
@@ -852,7 +918,7 @@ fn apply_native_extensions(project_dir: &Path, build_dir: &Path, platform: &str)
     let mut cargo = fs::read_to_string(&cargo_path)?;
     cargo.push_str(&dependencies);
     cargo.push('\n');
-    fs::write(cargo_path, cargo)?;
+    write_if_changed(&cargo_path, cargo)?;
 
     let main_path = build_dir.join("src/main.rs");
     if main_path.exists() {
@@ -861,8 +927,8 @@ fn apply_native_extensions(project_dir: &Path, build_dir: &Path, platform: &str)
         if !main.contains(marker) {
             bail!("generated iOS main has no native extension registration point");
         }
-        fs::write(
-            main_path,
+        write_if_changed(
+            &main_path,
             main.replacen(marker, &format!("{marker}{registrations}"), 1),
         )?;
         return Ok(());
@@ -878,7 +944,7 @@ fn apply_native_extensions(project_dir: &Path, build_dir: &Path, platform: &str)
             .map(|offset| lib.find(harmony_marker).unwrap() + offset + 2)
             .context("generated HarmonyOS library has no surface-created body")?;
         lib.insert_str(body_marker, &registrations);
-        fs::write(lib_path, lib)?;
+        write_if_changed(&lib_path, lib)?;
         return Ok(());
     }
     let entry_markers = [
@@ -891,7 +957,7 @@ fn apply_native_extensions(project_dir: &Path, build_dir: &Path, platform: &str)
         }
         lib = lib.replacen(marker, &format!("{marker}{registrations}"), 1);
     }
-    fs::write(lib_path, lib)?;
+    write_if_changed(&lib_path, lib)?;
     Ok(())
 }
 
@@ -998,7 +1064,10 @@ fn write_ios_plist(
 
 #[cfg(test)]
 mod tests {
-    use super::manifest_entry_supports_platform;
+    use super::{
+        manifest_entry_supports_platform, prepare_mobile_build_dir,
+        restore_unchanged_generated_mtimes, snapshot_generated_files,
+    };
     use serde_json::json;
 
     #[test]
@@ -1022,6 +1091,42 @@ mod tests {
                 .contains("unsupported manifest entry platform")
         );
     }
+
+    #[test]
+    fn fast_mobile_build_preserves_generated_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "w3cos-mobile-preserve-sources-{}",
+            std::process::id()
+        ));
+        let source = root.join("src/esm_bundle.rs");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "cached").unwrap();
+
+        prepare_mobile_build_dir(&root, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "cached");
+
+        let cached_time = std::time::SystemTime::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(10_000))
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(cached_time))
+            .unwrap();
+        let snapshots = snapshot_generated_files(&root).unwrap();
+        std::fs::write(&source, "cached").unwrap();
+        restore_unchanged_generated_mtimes(&snapshots).unwrap();
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().modified().unwrap(),
+            cached_time
+        );
+
+        prepare_mobile_build_dir(&root, false).unwrap();
+        assert!(!source.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> {
@@ -1044,18 +1149,18 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
 
     let profile = if release { "release" } else { "debug" };
     println!("🔨 Building iOS simulator binary ({profile})...");
+    let inherited_rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    let rustflags = if inherited_rustflags.trim().is_empty() {
+        "-C link-arg=-ObjC".to_string()
+    } else {
+        format!("{} -C link-arg=-ObjC", inherited_rustflags.trim())
+    };
     let mut cmd = Command::new("cargo");
     cmd.current_dir(build_dir)
-        .args(["build", "--target", target])
+        .args(["build", "--target", target, "--bin", "W3cosApp"])
         // Objective-C categories in static iOS SDKs are otherwise discarded
         // when Cargo performs the final application link.
-        .env(
-            "RUSTFLAGS",
-            format!(
-                "{} -C link-arg=-ObjC",
-                std::env::var("RUSTFLAGS").unwrap_or_default()
-            ),
-        );
+        .env("RUSTFLAGS", rustflags);
     if release {
         cmd.arg("--release");
     }

@@ -91,6 +91,18 @@ panic = "unwind"
 strip = "symbols"
 "#;
 
+pub(crate) const GENERATED_DEV_PROFILE: &str = r#"
+# Large W3IR state-machine match arms retain enough temporary stack state at
+# opt-level=0 to overflow the iOS main thread. Keep the minimum safe optimisation.
+[profile.dev]
+lto = "off"
+
+[profile.dev.package.w3cos-mobile-app]
+opt-level = 1
+debug = 1
+incremental = true
+"#;
+
 /// Generate a Cargo.toml for the compiled application.
 pub fn generate_cargo_toml(
     _output_dir: &std::path::Path,
@@ -749,6 +761,7 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
             "grid" => "Display::Grid",
             "inline" => "Display::Inline",
             "inline-block" => "Display::InlineBlock",
+            "inline-flex" => "Display::InlineFlex",
             "none" => "Display::None",
             _ => "Display::Flex",
         };
