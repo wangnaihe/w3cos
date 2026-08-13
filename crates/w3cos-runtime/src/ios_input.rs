@@ -1,12 +1,157 @@
 //! Minimal UIKit diagnostics for the winit input client.
 
 use objc2::encode::{Encode, Encoding};
-use objc2::runtime::{AnyClass, AnyObject};
+use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
+use objc2::{msg_send, sel};
 use std::ffi::{CStr, CString};
 use std::sync::Once;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
+
+static DOCUMENT_PICKER_DELEGATE: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" fn document_picker_did_pick(
+    _this: &AnyObject,
+    _cmd: Sel,
+    _controller: &AnyObject,
+    urls: &AnyObject,
+) {
+    let count: usize = unsafe { msg_send![urls, count] };
+    let mut paths = Vec::with_capacity(count);
+    let mut accessed_urls = Vec::with_capacity(count);
+    for index in 0..count {
+        let url: *mut AnyObject = unsafe { msg_send![urls, objectAtIndex: index] };
+        if url.is_null() {
+            continue;
+        }
+        let accessed: bool = unsafe { msg_send![&*url, startAccessingSecurityScopedResource] };
+        if accessed {
+            accessed_urls.push(url);
+        }
+        let path: *mut AnyObject = unsafe { msg_send![&*url, path] };
+        if let Some(path) = rust_string(path) {
+            paths.push(path);
+        }
+    }
+    complete_document_picker(paths);
+    for url in accessed_urls {
+        let _: () = unsafe { msg_send![&*url, stopAccessingSecurityScopedResource] };
+    }
+}
+
+extern "C" fn document_picker_cancelled(_this: &AnyObject, _cmd: Sel, _controller: &AnyObject) {
+    complete_document_picker(Vec::new());
+}
+
+fn complete_document_picker(paths: Vec<String>) {
+    let Ok(json) = serde_json::to_string(&paths) else {
+        return;
+    };
+    let Ok(json) = CString::new(json) else {
+        return;
+    };
+    crate::jsdom::w3cos_complete_file_picker(json.as_ptr());
+}
+
+fn document_picker_delegate() -> Option<&'static AnyObject> {
+    let existing = DOCUMENT_PICKER_DELEGATE.load(Ordering::Acquire);
+    if !existing.is_null() {
+        return Some(unsafe { &*existing });
+    }
+    let superclass = AnyClass::get("NSObject")?;
+    let class = if let Some(class) = AnyClass::get("W3cosDocumentPickerDelegate") {
+        class
+    } else {
+        let mut builder = ClassBuilder::new("W3cosDocumentPickerDelegate", superclass)?;
+        unsafe {
+            builder.add_method(
+                sel!(documentPicker:didPickDocumentsAtURLs:),
+                document_picker_did_pick as extern "C" fn(_, _, _, _),
+            );
+            builder.add_method(
+                sel!(documentPickerWasCancelled:),
+                document_picker_cancelled as extern "C" fn(_, _, _),
+            );
+        }
+        builder.register()
+    };
+    let delegate: *mut AnyObject = unsafe { msg_send![class, new] };
+    if delegate.is_null() {
+        return None;
+    }
+    match DOCUMENT_PICKER_DELEGATE.compare_exchange(
+        std::ptr::null_mut(),
+        delegate,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Some(unsafe { &*delegate }),
+        Err(existing) => {
+            let _: () = unsafe { msg_send![&*delegate, release] };
+            Some(unsafe { &*existing })
+        }
+    }
+}
+
+/// Present UIKit's document picker from the winit-owned application window.
+///
+/// Cargo produces the iOS executable directly, so this bridge must live in
+/// the runtime instead of the optional Swift/Xcode template shell.
+pub fn present_document_picker(allows_multiple: bool) -> bool {
+    let Some(application_class) = AnyClass::get("UIApplication") else {
+        return false;
+    };
+    let application: *mut AnyObject =
+        unsafe { objc2::msg_send![application_class, sharedApplication] };
+    if application.is_null() {
+        return false;
+    }
+    let window: *mut AnyObject = unsafe { objc2::msg_send![&*application, keyWindow] };
+    if window.is_null() {
+        return false;
+    }
+    let root: *mut AnyObject = unsafe { objc2::msg_send![&*window, rootViewController] };
+    if root.is_null() {
+        return false;
+    }
+    let Some(document_picker_class) = AnyClass::get("UIDocumentPickerViewController") else {
+        return false;
+    };
+    let Some(array_class) = AnyClass::get("NSArray") else {
+        return false;
+    };
+    let Some(public_data) = ns_string("public.data") else {
+        return false;
+    };
+    let document_types: *mut AnyObject =
+        unsafe { objc2::msg_send![array_class, arrayWithObject: &*public_data] };
+    let picker: *mut AnyObject = unsafe { objc2::msg_send![document_picker_class, alloc] };
+    if picker.is_null() || document_types.is_null() {
+        return false;
+    }
+    let picker: *mut AnyObject = unsafe {
+        objc2::msg_send![&*picker, initWithDocumentTypes: &*document_types, inMode: 0usize]
+    };
+    if picker.is_null() {
+        return false;
+    }
+    let _: () = unsafe { objc2::msg_send![&*picker, setAllowsMultipleSelection: allows_multiple] };
+    let Some(delegate) = document_picker_delegate() else {
+        return false;
+    };
+    let _: () = unsafe { objc2::msg_send![&*picker, setDelegate: delegate] };
+    let _: () = unsafe {
+        objc2::msg_send![
+            &*root,
+            presentViewController: &*picker,
+            animated: true,
+            completion: std::ptr::null::<AnyObject>()
+        ]
+    };
+    true
+}
 
 fn view(window: &Window) -> Option<&AnyObject> {
     let handle = window.window_handle().ok()?;

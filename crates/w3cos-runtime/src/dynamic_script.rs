@@ -3573,6 +3573,31 @@ impl ScriptLoader {
             return;
         };
         crate::dom::set_image_render_source(node, Some(&selection.source));
+        if let Some((bytes, _media_type)) = w3cos_core::web::object_url_resource(&selection.source)
+        {
+            match crate::image_loader::decode_and_install(&selection.source, &bytes) {
+                Ok(decoded) => {
+                    let current_src = selection.source.clone();
+                    let width = decoded.intrinsic_width;
+                    let height = decoded.intrinsic_height;
+                    element.set_property("__w3cos_image_request_src", Value::string(&current_src));
+                    set_image_element_state(&element, true, &current_src, width, height);
+                    crate::dom::mark_dom_dirty();
+                    self.resolve_image_decode_waiters(node);
+                    crate::jsdom::dispatch_element_lifecycle_event(node, "load");
+                    let onload = element.get_property("onload");
+                    if !onload.is_null() && !onload.is_undefined() {
+                        onload.call(element, vec![]);
+                    }
+                }
+                Err(error) => {
+                    set_image_element_state(&element, true, &selection.source, 0, 0);
+                    self.reject_image_decode_waiters(node, &error);
+                    self.dispatch_image_error(&element, &error);
+                }
+            }
+            return;
+        }
         match base.join(&selection.source) {
             Ok(url) if matches!(url.scheme(), "http" | "https") => {
                 element.set_property("__w3cos_image_request_src", Value::string(url.as_str()));
@@ -11785,6 +11810,53 @@ mod tests {
             loader.script_loader.http_source_cache_stats().writes >= 1,
             "image response must enter the shared persistent HTTP cache"
         );
+    }
+
+    #[test]
+    fn blob_object_url_image_decodes_without_a_network_scheme() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::image_loader::clear_cache();
+
+        let pixels = image::RgbaImage::from_pixel(3, 2, image::Rgba([20, 80, 160, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode blob image");
+        let bytes = w3cos_core::binary::typed_array_value(
+            png.into_inner()
+                .into_iter()
+                .map(|byte| Value::Number(f64::from(byte)))
+                .collect(),
+        );
+        let blob = w3cos_core::class::construct(
+            &w3cos_core::web::blob_class(),
+            vec![
+                Value::array(vec![bytes]),
+                Value::object(HashMap::from([("type".into(), Value::from("image/png"))])),
+            ],
+        );
+        let source = w3cos_core::web::url_class()
+            .call_method("createObjectURL", vec![blob])
+            .to_js_string();
+        let image = crate::dom::with_document_mut(|document| {
+            let image = document.create_element("img");
+            image.set_attribute(document, "src", &source);
+            document.body().append_child(document, image);
+            image.id.as_u32()
+        });
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader.prepare_image_node(
+            image,
+            &Url::parse("http://127.0.0.1/document.html").unwrap(),
+        );
+
+        let element = crate::jsdom::element_value(image);
+        assert!(element.get_property("complete").to_bool());
+        assert_eq!(element.get_property("currentSrc").to_js_string(), source);
+        assert_eq!(element.get_property("naturalWidth").to_u32(), 3);
+        assert_eq!(element.get_property("naturalHeight").to_u32(), 2);
+        assert_eq!(crate::image_loader::dimensions(&source), Some((3, 2)));
     }
 
     #[test]

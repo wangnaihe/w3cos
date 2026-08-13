@@ -13,6 +13,8 @@ static SERVER_ONCE: Once = Once::new();
 static SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
 static HIT_TARGETS: Mutex<Vec<UiHitTarget>> = Mutex::new(Vec::new());
 static INPUT_TARGETS: Mutex<Vec<UiInputTarget>> = Mutex::new(Vec::new());
+static IMAGE_TARGETS: Mutex<Vec<UiImageTarget>> = Mutex::new(Vec::new());
+static TEXT_TARGETS: Mutex<Vec<UiTextTarget>> = Mutex::new(Vec::new());
 static LAST_CLICK_TRACE: Mutex<Option<String>> = Mutex::new(None);
 static EVENT_LOOP_PROXY: Mutex<Option<EventLoopProxy<()>>> = Mutex::new(None);
 static PENDING_COMMANDS: Mutex<VecDeque<PendingCommand>> = Mutex::new(VecDeque::new());
@@ -80,11 +82,40 @@ pub struct UiInputTarget {
     pub height: f32,
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct UiImageTarget {
+    pub src: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub object_url_bytes: Option<usize>,
+    pub decoded_width: Option<u32>,
+    pub decoded_height: Option<u32>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct UiTextTarget {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 fn hook_enabled() -> bool {
     std::env::var("W3COS_UITEST").ok().as_deref() == Some("1") || crate::perf::enabled()
 }
 
 fn build_snapshot_json() -> String {
+    let (
+        file_picker_callback_registered,
+        file_picker_pending,
+        file_picker_requests,
+        file_picker_paths,
+        file_picker_files,
+        file_picker_change_listeners,
+    ) = crate::jsdom::file_picker_diagnostics();
     let signals = crate::state::all_signal_values();
     let hist_len = crate::history::get_length();
     let pathname = crate::history::get_pathname();
@@ -98,13 +129,33 @@ fn build_snapshot_json() -> String {
         .ok()
         .map(|g| g.clone())
         .unwrap_or_default();
+    let image_targets = IMAGE_TARGETS
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let text_targets = TEXT_TARGETS
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     serde_json::json!({
         "signals": signals,
         "histLen": hist_len,
         "pathname": pathname,
         "targets": targets,
         "inputTargets": input_targets,
+        "imageTargets": image_targets,
+        "textTargets": text_targets,
         "lastClickTrace": LAST_CLICK_TRACE.lock().ok().and_then(|trace| trace.clone()),
+        "filePicker": {
+            "callbackRegistered": file_picker_callback_registered,
+            "pending": file_picker_pending,
+            "requests": file_picker_requests,
+            "paths": file_picker_paths,
+            "files": file_picker_files,
+            "changeListeners": file_picker_change_listeners,
+        },
         "focusedIndex": match FOCUSED_INDEX.load(Ordering::SeqCst) {
             -1 => serde_json::Value::Null,
             index => serde_json::json!(index),
@@ -291,6 +342,24 @@ pub fn set_input_targets(targets: Vec<UiInputTarget>) {
     }
 }
 
+pub fn set_image_targets(targets: Vec<UiImageTarget>) {
+    if !hook_enabled() {
+        return;
+    }
+    if let Ok(mut cache) = IMAGE_TARGETS.lock() {
+        *cache = targets;
+    }
+}
+
+pub fn set_text_targets(targets: Vec<UiTextTarget>) {
+    if !hook_enabled() {
+        return;
+    }
+    if let Ok(mut cache) = TEXT_TARGETS.lock() {
+        *cache = targets;
+    }
+}
+
 pub fn write_snapshot() {
     if !hook_enabled() {
         return;
@@ -331,6 +400,12 @@ fn wake_event_loop() {
     {
         let _ = proxy.send_event(());
     }
+}
+
+/// Wake the native loop after an external platform callback mutates JS/DOM.
+pub(crate) fn request_platform_repaint() {
+    NEEDS_REPAINT.store(true, Ordering::SeqCst);
+    wake_event_loop();
 }
 
 fn queue_command(command: PendingCommand) {

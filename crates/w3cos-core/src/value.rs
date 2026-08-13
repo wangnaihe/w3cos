@@ -1131,6 +1131,14 @@ impl Value {
             (Value::String(value), "toLowerCase") => {
                 return Value::String(value.to_lowercase());
             }
+            (Value::String(value), "localeCompare") => {
+                let other = args.first().cloned().unwrap_or_default().to_js_string();
+                return Value::Number(match value.as_str().cmp(other.as_str()) {
+                    std::cmp::Ordering::Less => -1.0,
+                    std::cmp::Ordering::Equal => 0.0,
+                    std::cmp::Ordering::Greater => 1.0,
+                });
+            }
             (Value::String(value), "trim") => {
                 return Value::String(value.trim().to_string());
             }
@@ -2245,7 +2253,10 @@ pub fn throw_value(value: Value) -> ! {
     // uncaught JS throw only shows Rust's opaque "Box<dyn Any>".
     if std::env::var_os("W3COS_JS_CONSOLE").is_some() {
         let message = value.get_property("message");
-        let detail = if message.is_undefined() {
+        let diagnostics = value.get_property("diagnostics");
+        let detail = if !diagnostics.is_undefined() {
+            crate::json::stringify(vec![diagnostics]).to_js_string()
+        } else if message.is_undefined() {
             value.to_js_string()
         } else {
             message.to_js_string()

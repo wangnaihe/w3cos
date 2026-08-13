@@ -487,6 +487,17 @@ fn file_list(entries: Rc<RefCell<Vec<Value>>>) -> Value {
     value
 }
 
+pub(crate) fn file_list_from_files(files: Vec<Value>) -> Value {
+    let entries = files
+        .into_iter()
+        .map(|file| {
+            let type_name = file.get_property("type").to_js_string();
+            data_transfer_item("file", &type_name, file)
+        })
+        .collect();
+    file_list(Rc::new(RefCell::new(entries)))
+}
+
 pub fn data_transfer_class() -> Value {
     DATA_TRANSFER_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {

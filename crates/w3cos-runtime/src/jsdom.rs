@@ -52,6 +52,11 @@ use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "ios")]
+use objc2::runtime::{AnyClass, AnyObject};
+#[cfg(target_os = "ios")]
+use std::ffi::CStr;
+
 use w3cos_core::{JsObject, ProxyBuilder, Value};
 use w3cos_dom::Element;
 use w3cos_dom::events::{Event, EventData, EventType};
@@ -250,6 +255,155 @@ thread_local! {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64() * 1000.0;
+}
+
+#[cfg(target_os = "ios")]
+thread_local! {
+    static PENDING_FILE_INPUT: RefCell<Option<u32>> = const { RefCell::new(None) };
+}
+
+#[cfg(target_os = "ios")]
+static IOS_FILE_PICKER_CALLBACK: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(target_os = "ios")]
+static IOS_FILE_PICKER_REQUESTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "ios")]
+static IOS_FILE_PICKER_PATHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "ios")]
+static IOS_FILE_PICKER_FILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "ios")]
+static IOS_FILE_PICKER_CHANGE_LISTENERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_set_file_picker_callback(callback: extern "C" fn(u8)) {
+    IOS_FILE_PICKER_CALLBACK.store(
+        callback as *const () as *mut (),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) fn file_picker_diagnostics() -> (bool, bool, u64, u64, u64, u64) {
+    let registered = !IOS_FILE_PICKER_CALLBACK
+        .load(std::sync::atomic::Ordering::Acquire)
+        .is_null();
+    let pending = PENDING_FILE_INPUT.with(|value| value.borrow().is_some());
+    let requests = IOS_FILE_PICKER_REQUESTS.load(std::sync::atomic::Ordering::Acquire);
+    let paths = IOS_FILE_PICKER_PATHS.load(std::sync::atomic::Ordering::Acquire);
+    let files = IOS_FILE_PICKER_FILES.load(std::sync::atomic::Ordering::Acquire);
+    let change_listeners =
+        IOS_FILE_PICKER_CHANGE_LISTENERS.load(std::sync::atomic::Ordering::Acquire);
+    (
+        registered,
+        pending,
+        requests,
+        paths,
+        files,
+        change_listeners,
+    )
+}
+
+#[cfg(not(target_os = "ios"))]
+pub(crate) fn file_picker_diagnostics() -> (bool, bool, u64, u64, u64, u64) {
+    (false, false, 0, 0, 0, 0)
+}
+
+#[cfg(target_os = "ios")]
+fn request_ios_file_picker(node: u32) {
+    IOS_FILE_PICKER_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    PENDING_FILE_INPUT.with(|pending| *pending.borrow_mut() = Some(node));
+    let allows_multiple = dom::has_attribute(node, "multiple");
+    let callback = IOS_FILE_PICKER_CALLBACK.load(std::sync::atomic::Ordering::Acquire);
+    if callback.is_null() {
+        if !crate::ios_input::present_document_picker(allows_multiple) {
+            PENDING_FILE_INPUT.with(|pending| pending.borrow_mut().take());
+        }
+        return;
+    }
+    let callback: extern "C" fn(u8) = unsafe { std::mem::transmute(callback) };
+    callback(u8::from(allows_multiple));
+}
+
+#[cfg(target_os = "ios")]
+fn mime_type_for_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn w3cos_complete_file_picker(paths_json: *const std::ffi::c_char) {
+    if paths_json.is_null() {
+        PENDING_FILE_INPUT.with(|pending| pending.borrow_mut().take());
+        return;
+    }
+    let json = unsafe { std::ffi::CStr::from_ptr(paths_json) }.to_string_lossy();
+    let paths: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+    IOS_FILE_PICKER_PATHS.store(paths.len() as u64, std::sync::atomic::Ordering::Release);
+    let Some(node) = PENDING_FILE_INPUT.with(|pending| pending.borrow_mut().take()) else {
+        return;
+    };
+    let files = paths
+        .into_iter()
+        .filter_map(|path| {
+            let path = std::path::PathBuf::from(path);
+            let bytes = std::fs::read(&path).ok()?;
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let options = Value::object(HashMap::from([(
+                "type".to_string(),
+                Value::string(mime_type_for_path(&path)),
+            )]));
+            Some(w3cos_core::class::construct(
+                &crate::files::file_class(),
+                vec![
+                    Value::array(vec![w3cos_core::binary::array_buffer_value(bytes)]),
+                    Value::string(&name),
+                    options,
+                ],
+            ))
+        })
+        .collect::<Vec<_>>();
+    IOS_FILE_PICKER_FILES.store(files.len() as u64, std::sync::atomic::Ordering::Release);
+    if files.is_empty() {
+        return;
+    }
+    set_expando(
+        node,
+        "files",
+        crate::clipboard_web::file_list_from_files(files),
+    );
+    let change = event_type_for("change");
+    let listener_count = LISTENERS.with(|listeners| {
+        let chain = shadow_event_chain(node, true);
+        listeners
+            .borrow()
+            .iter()
+            .filter(|listener| chain.contains(&listener.node) && listener.event_type == change)
+            .count()
+    });
+    IOS_FILE_PICKER_CHANGE_LISTENERS
+        .store(listener_count as u64, std::sync::atomic::Ordering::Release);
+    dispatch_sync(node, change, EventData::None);
+    crate::uitest::request_platform_repaint();
 }
 
 // ── Small helpers ──────────────────────────────────────────────────────────
@@ -3840,6 +3994,18 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             dispatch_sync(node, EventType::Blur, EventData::Focus);
             Value::Undefined
         }),
+        "click" => func(move |_, _| {
+            let _prevented = !dispatch_sync(node, EventType::Click, EventData::None);
+            #[cfg(target_os = "ios")]
+            if !_prevented
+                && dom::tag_name(node) == "input"
+                && dom::get_attribute(node, "type")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("file"))
+            {
+                request_ios_file_picker(node);
+            }
+            Value::Undefined
+        }),
 
         // ── Events ──
         "addEventListener" => func(move |_, args| {
@@ -3925,6 +4091,14 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             } else {
                 Value::Undefined
             }
+        }
+        "files"
+            if dom::tag_name(node) == "input"
+                && dom::get_attribute(node, "type")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("file")) =>
+        {
+            get_expando(node, "files")
+                .unwrap_or_else(|| crate::clipboard_web::file_list_from_files(Vec::new()))
         }
         "text" if dom::tag_name(node) == "option" => Value::string(&dom::inner_text(node)),
         "text" if dom::tag_name(node) == "script" => Value::string(&dom::inner_text(node)),
@@ -6025,7 +6199,16 @@ pub(crate) fn dispatch_native_pointer(
 }
 
 pub(crate) fn dispatch_native_click(target: u32) -> bool {
-    !dispatch_sync(target, EventType::Click, EventData::None)
+    let prevented = !dispatch_sync(target, EventType::Click, EventData::None);
+    #[cfg(target_os = "ios")]
+    if !prevented
+        && dom::tag_name(target) == "input"
+        && dom::get_attribute(target, "type")
+            .is_some_and(|value| value.eq_ignore_ascii_case("file"))
+    {
+        request_ios_file_picker(target);
+    }
+    prevented
 }
 
 /// Apply the HTML default action for an activated submit button.
@@ -8762,6 +8945,44 @@ pub(crate) fn clipboard_write_text(text: &str) {
     CLIPBOARD_FALLBACK.with(|c| *c.borrow_mut() = text.to_string());
 }
 
+#[cfg(target_os = "ios")]
+fn navigator_languages() -> Vec<String> {
+    let Some(locale_class) = AnyClass::get("NSLocale") else {
+        return vec!["en-US".into()];
+    };
+    let languages: *mut AnyObject = unsafe { objc2::msg_send![locale_class, preferredLanguages] };
+    if languages.is_null() {
+        return vec!["en-US".into()];
+    }
+    let count: usize = unsafe { objc2::msg_send![&*languages, count] };
+    let mut result = Vec::with_capacity(count);
+    for index in 0..count {
+        let language: *mut AnyObject =
+            unsafe { objc2::msg_send![&*languages, objectAtIndex: index] };
+        if language.is_null() {
+            continue;
+        }
+        let bytes: *const std::ffi::c_char = unsafe { objc2::msg_send![&*language, UTF8String] };
+        if !bytes.is_null() {
+            result.push(
+                unsafe { CStr::from_ptr(bytes) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    if result.is_empty() {
+        vec!["en-US".into()]
+    } else {
+        result
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn navigator_languages() -> Vec<String> {
+    vec!["en-US".into()]
+}
+
 fn navigator_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
     props.insert(
@@ -8782,10 +9003,12 @@ fn navigator_value() -> Value {
         crate::compat_web::navigator_ua_data_value(),
     );
     props.insert("doNotTrack".to_string(), Value::Null);
-    props.insert("language".to_string(), Value::string("en-US"));
+    let languages = navigator_languages();
+    let language = languages.first().map(String::as_str).unwrap_or("en-US");
+    props.insert("language".to_string(), Value::string(language));
     props.insert(
         "languages".to_string(),
-        js_array(vec![Value::string("en-US")]),
+        js_array(languages.iter().map(|value| Value::string(value)).collect()),
     );
     props.insert(
         "__w3cos_getter_maxTouchPoints".to_string(),
@@ -9669,12 +9892,10 @@ fn subtle_crypto_value() -> Value {
             };
             let input = arg(&args, 1);
             let Some(bytes) = w3cos_core::binary::bytes_of(&input) else {
-                return w3cos_core::promise::reject(vec![
-                    w3cos_core::web::dom_exception_instance(
-                        "crypto.subtle.digest() requires an ArrayBuffer or ArrayBufferView",
-                        "TypeError",
-                    ),
-                ]);
+                return w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
+                    "crypto.subtle.digest() requires an ArrayBuffer or ArrayBufferView",
+                    "TypeError",
+                )]);
             };
             let digest = ring::digest::digest(algorithm, &bytes);
             w3cos_core::promise::resolve(vec![w3cos_core::binary::array_buffer_value(
@@ -12117,19 +12338,14 @@ mod tests {
     #[test]
     fn subtle_crypto_digest_supports_sha256_array_buffer_views() {
         setup();
-        let subtle = window_value()
-            .get_property("crypto")
-            .get_property("subtle");
+        let subtle = window_value().get_property("crypto").get_property("subtle");
         let input = w3cos_core::binary::typed_array_value(
             b"hello"
                 .iter()
                 .map(|byte| Value::Number(*byte as f64))
                 .collect(),
         );
-        let digest = subtle.call_method(
-            "digest",
-            vec![Value::string("SHA-256"), input],
-        );
+        let digest = subtle.call_method("digest", vec![Value::string("SHA-256"), input]);
         let Some(w3cos_core::promise::PromiseStatus::Fulfilled(buffer)) =
             w3cos_core::promise::status(&digest)
         else {
@@ -12138,9 +12354,9 @@ mod tests {
         assert_eq!(
             w3cos_core::binary::bytes_of(&buffer).unwrap(),
             vec![
-                0x2c, 0xf2, 0x4d, 0xba, 0x5f, 0xb0, 0xa3, 0x0e, 0x26, 0xe8, 0x3b, 0x2a,
-                0xc5, 0xb9, 0xe2, 0x9e, 0x1b, 0x16, 0x1e, 0x5c, 0x1f, 0xa7, 0x42, 0x5e,
-                0x73, 0x04, 0x33, 0x62, 0x93, 0x8b, 0x98, 0x24,
+                0x2c, 0xf2, 0x4d, 0xba, 0x5f, 0xb0, 0xa3, 0x0e, 0x26, 0xe8, 0x3b, 0x2a, 0xc5, 0xb9,
+                0xe2, 0x9e, 0x1b, 0x16, 0x1e, 0x5c, 0x1f, 0xa7, 0x42, 0x5e, 0x73, 0x04, 0x33, 0x62,
+                0x93, 0x8b, 0x98, 0x24,
             ]
         );
     }

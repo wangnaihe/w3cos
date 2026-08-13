@@ -214,15 +214,19 @@ fn finish_raw_rules(
     custom_props: &HashMap<String, String>,
     out: &mut CollectedStylesheet,
 ) {
-    // Flatten: split comma groups, drop custom properties, resolve var()/calc().
+    // Flatten: split comma groups and resolve globally-known var()/calc().
+    // Scoped custom properties must remain in the emitted rule so the native
+    // DOM can apply normal cascade and inheritance semantics at runtime.
     let mut unresolved_vars: Vec<String> = Vec::new();
     let mut literal_calcs: Vec<String> = Vec::new();
     for rule in raw_rules {
         let declarations: Vec<(String, String)> = rule
             .declarations
             .iter()
-            .filter(|(prop, _)| !prop.starts_with("--"))
             .map(|(prop, value)| {
+                if prop.starts_with("--") {
+                    return (prop.clone(), value.clone());
+                }
                 let value = finalize_value(
                     value,
                     &custom_props,
@@ -868,9 +872,13 @@ mod tests {
                 .iter()
                 .map(|rule| rule.selector.as_str())
                 .collect::<Vec<_>>(),
-            [".panel", ".card"]
+            [":root", ".panel", ".card"]
         );
-        for rule in &sheet.rules {
+        assert_eq!(
+            sheet.rules[0].declarations,
+            [("--accent".to_string(), "#123456".to_string())]
+        );
+        for rule in &sheet.rules[1..] {
             assert_eq!(
                 rule.declarations,
                 [
@@ -1146,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_properties_not_emitted_as_declarations() {
+    fn scoped_custom_properties_are_emitted_for_runtime_cascade() {
         let root = write_fixture(
             "custom_props",
             &[
@@ -1158,14 +1166,26 @@ mod tests {
             ],
         );
         let sheet = collect(&root, "src/app.ts");
-        for rule in &sheet.rules {
-            assert!(
-                rule.declarations.iter().all(|(p, _)| !p.starts_with("--")),
-                "custom props must not be emitted: {rule:?}"
-            );
-        }
-        // :root rule has no real declarations left → dropped entirely.
-        assert!(!sheet.rules.iter().any(|r| r.selector == ":root"));
+        let themed = sheet
+            .rules
+            .iter()
+            .find(|rule| rule.selector == ".themed")
+            .unwrap();
+        assert!(
+            themed
+                .declarations
+                .contains(&("--y".to_string(), "2px".to_string()))
+        );
+        let root_rule = sheet
+            .rules
+            .iter()
+            .find(|rule| rule.selector == ":root")
+            .unwrap();
+        assert!(
+            root_rule
+                .declarations
+                .contains(&("--x".to_string(), "1px".to_string()))
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

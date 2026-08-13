@@ -1594,6 +1594,8 @@ impl App {
         }
 
         if crate::uitest::take_repaint_request() {
+            self.microtask_checkpoint();
+            self.rebuild_if_dirty();
             self.request_repaint();
         }
         self.schedule_next_bench_repaint();
@@ -2707,6 +2709,66 @@ impl App {
                     y: hit.rect.y + input_window_offset.1,
                     width: hit.rect.width,
                     height: hit.rect.height,
+                })
+                .collect(),
+        );
+        crate::uitest::set_image_targets(
+            flat.iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    let ComponentKind::Image { src } = node.kind else {
+                        return None;
+                    };
+                    let rect = self
+                        .layout_cache
+                        .iter()
+                        .find_map(|(rect, candidate)| (*candidate == index).then_some(*rect))
+                        .unwrap_or(LayoutRect {
+                            x: -1.0,
+                            y: -1.0,
+                            width: 0.0,
+                            height: 0.0,
+                        });
+                    let object_url_bytes = src
+                        .starts_with("blob:w3cos/")
+                        .then(|| {
+                            w3cos_core::web::object_url_resource(src).map(|(bytes, _)| bytes.len())
+                        })
+                        .flatten();
+                    let (decoded_width, decoded_height) = crate::image_loader::dimensions(src)
+                        .map(|(width, height)| (Some(width), Some(height)))
+                        .unwrap_or((None, None));
+                    Some(crate::uitest::UiImageTarget {
+                        src: src.clone(),
+                        x: rect.x + input_window_offset.0,
+                        y: rect.y + input_window_offset.1,
+                        width: rect.width,
+                        height: rect.height,
+                        object_url_bytes,
+                        decoded_width,
+                        decoded_height,
+                    })
+                })
+                .collect(),
+        );
+        crate::uitest::set_text_targets(
+            flat.iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    let ComponentKind::Text { content } = &node.kind else {
+                        return None;
+                    };
+                    let rect = self
+                        .layout_cache
+                        .iter()
+                        .find_map(|(rect, candidate)| (*candidate == index).then_some(*rect))?;
+                    Some(crate::uitest::UiTextTarget {
+                        text: content.clone(),
+                        x: rect.x + input_window_offset.0,
+                        y: rect.y + input_window_offset.1,
+                        width: rect.width,
+                        height: rect.height,
+                    })
                 })
                 .collect(),
         );
@@ -8088,13 +8150,7 @@ mod scroll_physics_tests {
         let parents = [None, None, None, Some(1), Some(3)];
 
         assert_eq!(
-            SpatialGrid::query_document(
-                40.0,
-                940.0,
-                &targets,
-                &parents,
-                Some((1, &parents)),
-            ),
+            SpatialGrid::query_document(40.0, 940.0, &targets, &parents, Some((1, &parents)),),
             Some(4)
         );
     }

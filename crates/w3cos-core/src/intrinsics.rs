@@ -177,6 +177,10 @@ pub fn define_private_accessor(
 
 pub fn create_object(properties: Vec<(Value, Value)>) -> Value {
     let object = Value::object(HashMap::new());
+    crate::class::set_prototype_of(
+        &object,
+        &crate::builtins::object_value().get_property("prototype"),
+    );
     for (key, value) in properties {
         set_property(&object, &key, value);
     }
@@ -544,6 +548,11 @@ mod tests {
         assert_eq!(
             object.get_property("items").get_property("1"),
             Value::string("b")
+        );
+        assert!(
+            crate::class::get_prototype_of(&object)
+                .strict_eq(&crate::builtins::object_value().get_property("prototype")),
+            "object literals must inherit from the shared Object.prototype",
         );
     }
 

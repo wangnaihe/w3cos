@@ -42,11 +42,18 @@ fn from_json(json: &serde_json::Value) -> Value {
         serde_json::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(f64::NAN)),
         serde_json::Value::String(s) => Value::String(s.clone()),
         serde_json::Value::Array(items) => Value::array(items.iter().map(from_json).collect()),
-        serde_json::Value::Object(map) => Value::object(
-            map.iter()
-                .map(|(key, value)| (key.clone(), from_json(value)))
-                .collect::<HashMap<_, _>>(),
-        ),
+        serde_json::Value::Object(map) => {
+            let value = Value::object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), from_json(value)))
+                    .collect::<HashMap<_, _>>(),
+            );
+            crate::class::set_prototype_of(
+                &value,
+                &crate::builtins::object_value().get_property("prototype"),
+            );
+            value
+        }
     }
 }
 
@@ -311,6 +318,18 @@ mod tests {
         let value = parse(vec![Value::string(r#"{"a":[{"b":3}]}"#)]);
         let item = value.get_property("a").get_property("0").get_property("b");
         assert_eq!(item.to_number(), 3.0);
+    }
+
+    #[test]
+    fn parse_builds_plain_objects_with_the_shared_object_prototype() {
+        let value = parse(vec![Value::string(r#"{"nested":{"ok":true}}"#)]);
+        let prototype = crate::class::get_prototype_of(&value);
+        let object_prototype = crate::builtins::object_value().get_property("prototype");
+        assert!(prototype.strict_eq(&object_prototype));
+        assert!(
+            crate::class::get_prototype_of(&value.get_property("nested"))
+                .strict_eq(&object_prototype)
+        );
     }
 
     #[test]

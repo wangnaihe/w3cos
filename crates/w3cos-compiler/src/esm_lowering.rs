@@ -4443,7 +4443,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         // path; static members (e.g. `String.fromCharCode`) degrade to
         // Undefined via property access on the function value.
         "String" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::from(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string()))".to_string(),
-        "Number" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Number(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number()))".to_string(),
+        "Number" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"isFinite\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(matches!(__args.first(), Some(w3cos_core::Value::Number(value)) if value.is_finite())))), (\"isInteger\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(matches!(__args.first(), Some(w3cos_core::Value::Number(value)) if value.is_finite() && value.fract() == 0.0)))), (\"isNaN\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(matches!(__args.first(), Some(w3cos_core::Value::Number(value)) if value.is_nan())))), (\"isSafeInteger\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(matches!(__args.first(), Some(w3cos_core::Value::Number(value)) if value.is_finite() && value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0))))]), |_this, __args| w3cos_core::Value::Number(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number()))".to_string(),
         "Boolean" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_bool()))".to_string(),
         "isNaN" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number().is_nan()))".to_string(),
         "isFinite" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number().is_finite()))".to_string(),
@@ -5863,6 +5863,24 @@ const params = new URLSearchParams("a=1");"#,
             code.contains("w3cos_core::web::intl_value()"),
             "Intl runtime object: {code}"
         );
+    }
+
+    #[test]
+    fn dynamic_lowering_number_preserves_standard_static_predicates() {
+        let stmts =
+            parse_stmts("const safe = Number.isSafeInteger(1); const finite = Number.isFinite(1);");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("isSafeInteger"),
+            "Number.isSafeInteger: {code}"
+        );
+        assert!(
+            code.contains("9_007_199_254_740_991.0"),
+            "safe integer bound: {code}"
+        );
+        assert!(code.contains("isFinite"), "Number.isFinite: {code}");
+        assert!(code.contains("Value::callable"), "Number facade: {code}");
     }
 
     #[test]

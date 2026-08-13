@@ -5,7 +5,7 @@
 //! elements directly to native components, but must not define private copies.
 
 use w3cos_std::color::Color;
-use w3cos_std::style::{Display, Edges, FlexDirection, FontStyle, Spacing, Style};
+use w3cos_std::style::{BoxSizing, Display, Edges, FlexDirection, FontStyle, Spacing, Style};
 
 /// Apply W3COS's default HTML presentation to an existing style.
 ///
@@ -29,6 +29,7 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
 
     match local_name {
         "button" => {
+            style.box_sizing = BoxSizing::BorderBox;
             style.background = Color::rgb(239, 239, 239);
             style.color = Color::BLACK;
             style.font_size = 13.333_333;
@@ -38,6 +39,7 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
             style.border_radius = 2.0;
         }
         "input" | "select" | "textarea" => {
+            style.box_sizing = BoxSizing::BorderBox;
             style.background = Color::WHITE;
             style.color = Color::BLACK;
             style.font_size = 13.333_333;
@@ -86,10 +88,12 @@ mod tests {
         let button = html_default_style("button");
 
         assert_eq!(input.background, Color::WHITE);
+        assert_eq!(input.box_sizing, BoxSizing::BorderBox);
         assert_eq!(input.display, Display::InlineBlock);
         assert_eq!(input.padding, Edges::xy(2.0, 1.0));
         assert_eq!(input.border_color, Color::rgb(118, 118, 118));
         assert_eq!(button.background, Color::rgb(239, 239, 239));
+        assert_eq!(button.box_sizing, BoxSizing::BorderBox);
         assert_eq!(button.padding, Edges::xy(6.0, 1.0));
 
         assert_eq!(html_default_style("div").display, Display::Block);

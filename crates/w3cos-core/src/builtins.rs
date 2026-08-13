@@ -5,6 +5,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
+thread_local! {
+    static OBJECT_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
 #[derive(Clone, Copy)]
 enum BuiltinKind {
     Math,
@@ -24,6 +28,17 @@ pub const console: BuiltinObject = BuiltinObject(BuiltinKind::Console);
 pub const document: BuiltinObject = BuiltinObject(BuiltinKind::Document);
 
 pub fn object_value() -> Value {
+    OBJECT_CONSTRUCTOR.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        let value = build_object_value();
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
+fn build_object_value() -> Value {
     let mut properties = HashMap::new();
     let prototype = Value::object(HashMap::from([(
         "hasOwnProperty".to_string(),
@@ -117,6 +132,19 @@ pub fn object_value() -> Value {
             Value::array(entries)
         }),
     );
+    properties.insert(
+        "fromEntries".into(),
+        Value::function(|_, arguments| {
+            let entries = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let object = Value::object(HashMap::new());
+            for entry in entries.iter() {
+                let key = entry.get_property("0").to_js_string();
+                let value = entry.get_property("1");
+                object.set_property(&key, value);
+            }
+            object
+        }),
+    );
     Value::callable(properties, |_, arguments| {
         arguments
             .first()
@@ -135,11 +163,7 @@ pub fn array_value() -> Value {
         "from".into(),
         Value::function(|_, arguments| {
             let source = arguments.first().cloned().unwrap_or(Value::Undefined);
-            if source.is_iterable() {
-                Value::array(source.iter().collect())
-            } else {
-                Value::array(Vec::new())
-            }
+            array_from(source)
         }),
     );
     properties.insert(
@@ -160,6 +184,41 @@ pub fn array_value() -> Value {
         }
         Value::array(arguments)
     })
+}
+
+fn array_from(source: Value) -> Value {
+    // `Array.from` must prefer a real iterator, but the lightweight runtime's
+    // generic object heuristic also classifies host array-like proxies as
+    // iterable. FileList is one of those: its indexed values are exposed by a
+    // Proxy and its own `length`, while `Value::iter()` has no matching
+    // iterator protocol and therefore yields an empty snapshot. Only enter
+    // the iterable branch when an actual iterator/snapshot hook exists;
+    // otherwise materialize the standard array-like shape below.
+    let has_explicit_iterator = !source
+        .get_property("__w3cos_symbol_iterator")
+        .is_undefined()
+        || source.is_array()
+        || source.is_string()
+        || !source
+            .get_property("__w3cosIterableSnapshot")
+            .is_undefined()
+        || !source.get_property("_first").is_undefined()
+        || !source
+            .get_property("__w3cosMapValuesSnapshot")
+            .is_undefined()
+        || !source.get_property("__w3cosMapValues").is_undefined();
+    if has_explicit_iterator && source.is_iterable() {
+        return Value::array(source.iter().collect());
+    }
+    let length = source.get_property("length").to_number();
+    if !length.is_finite() || length <= 0.0 {
+        return Value::array(Vec::new());
+    }
+    Value::array(
+        (0..length.floor() as usize)
+            .map(|index| source.get_property(&index.to_string()))
+            .collect(),
+    )
 }
 
 pub fn json_value() -> Value {
@@ -227,10 +286,9 @@ impl BuiltinObject {
                 .first()
                 .map(object_values)
                 .unwrap_or_else(|| Value::array(Vec::new())),
-            (BuiltinKind::Array, "from") => arguments
-                .first()
-                .cloned()
-                .unwrap_or_else(|| Value::array(Vec::new())),
+            (BuiltinKind::Array, "from") => {
+                array_from(arguments.first().cloned().unwrap_or(Value::Undefined))
+            }
             (BuiltinKind::Console, _) => {
                 // Debug channel for compiled apps: W3COS_JS_CONSOLE=1 makes
                 // console.* print to stderr (production default stays silent).
@@ -1197,28 +1255,115 @@ mod tests {
     }
 
     #[test]
+    fn array_from_materializes_array_like_objects() {
+        let file = Value::object(HashMap::from([(
+            "name".to_string(),
+            Value::string("photo.png"),
+        )]));
+        let file_list = Value::object(HashMap::from([
+            ("0".to_string(), file),
+            ("length".to_string(), Value::Number(1.0)),
+        ]));
+
+        let files = array_value().call_method("from", vec![file_list]);
+
+        assert!(files.is_array());
+        assert_eq!(files.get_property("length").to_number(), 1.0);
+        assert_eq!(
+            files.get_property("0").get_property("name").to_js_string(),
+            "photo.png"
+        );
+    }
+
+    #[test]
+    fn array_from_materializes_proxy_backed_array_like_objects() {
+        let file = Value::object(HashMap::from([
+            ("name".to_string(), Value::string("photo.png")),
+            ("type".to_string(), Value::string("image/png")),
+        ]));
+        let indexed_file = file.clone();
+        let handler = crate::ProxyBuilder::new()
+            .get(move |target, key, _receiver| {
+                if key == "0" {
+                    indexed_file.clone()
+                } else {
+                    target.get_property(key)
+                }
+            })
+            .build();
+        let file_list = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
+            crate::JsObject::with_proxy(
+                HashMap::from([("length".to_string(), Value::Number(1.0))]),
+                handler,
+            ),
+        )));
+
+        let files = array_value().call_method("from", vec![file_list]);
+
+        assert_eq!(files.get_property("length").to_number(), 1.0);
+        assert_eq!(
+            files.get_property("0").get_property("type").to_js_string(),
+            "image/png"
+        );
+    }
+
+    #[test]
     fn object_prototype_has_own_property_is_callable_with_an_explicit_receiver() {
         let object = object_value();
         let has_own_property = object
             .get_property("prototype")
             .get_property("hasOwnProperty");
-        let target = Value::object(HashMap::from([(
-            "present".to_string(),
-            Value::Bool(true),
-        )]));
+        let target = Value::object(HashMap::from([("present".to_string(), Value::Bool(true))]));
 
         assert!(
             has_own_property
-                .call_method(
-                    "call",
-                    vec![target.clone(), Value::string("present")],
-                )
+                .call_method("call", vec![target.clone(), Value::string("present")],)
                 .to_bool()
         );
         assert!(
             !has_own_property
                 .call_method("call", vec![target, Value::string("missing")])
                 .to_bool()
+        );
+    }
+
+    #[test]
+    fn object_entries_preserve_property_insertion_order() {
+        let object = Value::object(HashMap::new());
+        object.set_property("none", Value::Number(0.0));
+        object.set_property("xs", Value::Number(4.0));
+        object.set_property("sm", Value::Number(8.0));
+
+        let entries = object_value().call_method("entries", vec![object]);
+        assert_eq!(
+            entries.get_property("0").get_property("0"),
+            Value::string("none")
+        );
+        assert_eq!(
+            entries.get_property("1").get_property("0"),
+            Value::string("xs")
+        );
+        assert_eq!(
+            entries.get_property("2").get_property("0"),
+            Value::string("sm")
+        );
+    }
+
+    #[test]
+    fn object_from_entries_preserves_iterable_order() {
+        let entries = Value::array(vec![
+            Value::array(vec![Value::string("second"), Value::Number(2.0)]),
+            Value::array(vec![Value::string("first"), Value::Number(1.0)]),
+        ]);
+
+        let object = object_value().call_method("fromEntries", vec![entries]);
+        assert_eq!(object.get_property("second"), Value::Number(2.0));
+        assert_eq!(object.get_property("first"), Value::Number(1.0));
+        assert_eq!(
+            object_value()
+                .call_method("keys", vec![object])
+                .to_js_string(),
+            "second,first"
         );
     }
 

@@ -25,6 +25,7 @@ pub struct SelectorContext {
     pub tag: String,
     pub id: Option<String>,
     pub classes: Vec<String>,
+    pub attributes: Vec<(String, String)>,
 }
 
 impl SelectorContext {
@@ -33,8 +34,23 @@ impl SelectorContext {
             tag: tag.to_string(),
             id: id.map(|s| s.to_string()),
             classes: classes.iter().map(|s| s.to_string()).collect(),
+            attributes: Vec::new(),
         }
     }
+
+    pub fn with_attributes(mut self, attributes: &[(&str, &str)]) -> Self {
+        self.attributes = attributes
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+enum AttributeSelector {
+    Present(String),
+    Equals(String, String),
 }
 
 /// Combinator linking a compound selector to the compound on its left.
@@ -53,6 +69,7 @@ struct CompoundSelector {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    attributes: Vec<AttributeSelector>,
     /// Contains a pseudo-class/element, attribute selector, or anything else
     /// v1 cannot evaluate statically — the rule never matches.
     unsupported: bool,
@@ -76,6 +93,15 @@ impl CompoundSelector {
         self.classes
             .iter()
             .all(|c| ctx.classes.iter().any(|have| have == c))
+            && self.attributes.iter().all(|selector| match selector {
+                AttributeSelector::Present(name) => {
+                    ctx.attributes.iter().any(|(have, _)| have == name)
+                }
+                AttributeSelector::Equals(name, value) => ctx
+                    .attributes
+                    .iter()
+                    .any(|(have, actual)| have == name && actual == value),
+            })
     }
 
     fn specificity(&self) -> u32 {
@@ -183,6 +209,13 @@ pub fn matching_declarations(
     ancestors: &[SelectorContext],
 ) -> Vec<(String, String, u32)> {
     let ctx = SelectorContext::new(tag, id, classes);
+    matching_declarations_for_context(&ctx, ancestors)
+}
+
+pub fn matching_declarations_for_context(
+    ctx: &SelectorContext,
+    ancestors: &[SelectorContext],
+) -> Vec<(String, String, u32)> {
     RULES.with(|rules| {
         let rules = rules.borrow();
         let mut matched: Vec<&Rule> = rules
@@ -379,17 +412,33 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                 consumed_any = true;
             }
             '[' => {
-                // Attribute selector — parsed but never matches in v1.
-                compound.unsupported = true;
-                let mut depth = 1i32;
-                pos += 1;
-                while pos < chars.len() && depth > 0 {
-                    if chars[pos] == '[' {
-                        depth += 1;
-                    } else if chars[pos] == ']' {
-                        depth -= 1;
-                    }
+                let start = pos + 1;
+                pos = start;
+                while pos < chars.len() && chars[pos] != ']' {
                     pos += 1;
+                }
+                if pos >= chars.len() {
+                    return None;
+                }
+                let expression: String = chars[start..pos].iter().collect();
+                pos += 1;
+                let expression = expression.trim();
+                if let Some((name, value)) = expression.split_once('=') {
+                    let name = name.trim();
+                    let value = value.trim().trim_matches(['\'', '"']);
+                    if name.is_empty() {
+                        return None;
+                    }
+                    compound.attributes.push(AttributeSelector::Equals(
+                        name.to_string(),
+                        value.to_string(),
+                    ));
+                } else if !expression.is_empty() {
+                    compound
+                        .attributes
+                        .push(AttributeSelector::Present(expression.to_string()));
+                } else {
+                    return None;
                 }
                 consumed_any = true;
             }
@@ -537,19 +586,47 @@ mod tests {
     }
 
     #[test]
-    fn pseudo_class_and_attr_rules_never_match() {
+    fn unsupported_pseudo_class_rules_never_match() {
         setup();
         register_rule(".btn:hover", &[("color", "red")]);
-        register_rule("input[disabled]", &[("opacity", "0.5")]);
         register_rule("li:first-child", &[("color", "blue")]);
         register_rule("a::before", &[("color", "green")]);
 
         assert!(matching_declarations("button", None, &["btn"], &[]).is_empty());
-        assert!(matching_declarations("input", None, &[], &[]).is_empty());
         assert!(matching_declarations("li", None, &[], &[]).is_empty());
         assert!(matching_declarations("a", None, &[], &[]).is_empty());
         // Rules are still registered (counted) — they just never match.
-        assert_eq!(rule_count(), 4);
+        assert_eq!(rule_count(), 3);
+    }
+
+    #[test]
+    fn attribute_presence_and_equality_selectors_match_runtime_attributes() {
+        setup();
+        register_rule("button[disabled]", &[("opacity", "0.5")]);
+        register_rule("[data-role='user']", &[("color", "white")]);
+
+        let disabled =
+            SelectorContext::new("button", None, &[]).with_attributes(&[("disabled", "")]);
+        let user =
+            SelectorContext::new("article", None, &[]).with_attributes(&[("data-role", "user")]);
+        let assistant = SelectorContext::new("article", None, &[])
+            .with_attributes(&[("data-role", "assistant")]);
+
+        assert!(rule_matches(
+            &RULES.with(|rules| rules.borrow()[0].clone()),
+            &disabled,
+            &[]
+        ));
+        assert!(rule_matches(
+            &RULES.with(|rules| rules.borrow()[1].clone()),
+            &user,
+            &[]
+        ));
+        assert!(!rule_matches(
+            &RULES.with(|rules| rules.borrow()[1].clone()),
+            &assistant,
+            &[]
+        ));
     }
 
     #[test]

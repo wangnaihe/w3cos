@@ -410,7 +410,18 @@ fn leaf_taffy_size(
     base: &taffy::Style,
     parent_display: Option<WDisplay>,
 ) -> taffy::Size<Dimension> {
-    let width = if matches!(style.width, WDim::Auto) {
+    // `display:inline` normally forces both axes to auto in `to_taffy_style`,
+    // but replaced elements such as `<img>` still honor their CSS width and
+    // height. Use the semantic dimensions here before applying leaf sizing.
+    let replaced_width = matches!(kind, ComponentKind::Image { .. })
+        .then(|| dim_to_px(style.width).map(Dimension::length))
+        .flatten();
+    let replaced_height = matches!(kind, ComponentKind::Image { .. })
+        .then(|| dim_to_px(style.height).map(Dimension::length))
+        .flatten();
+    let width = if let Some(width) = replaced_width {
+        width
+    } else if matches!(style.width, WDim::Auto) {
         match kind {
             ComponentKind::TextInput { .. } => {
                 Dimension::length(leaf_intrinsic_size(kind, style).0)
@@ -420,7 +431,9 @@ fn leaf_taffy_size(
     } else {
         base.size.width
     };
-    let height = if matches!(style.height, WDim::Auto) {
+    let height = if let Some(height) = replaced_height {
+        height
+    } else if matches!(style.height, WDim::Auto) {
         let h = match kind {
             ComponentKind::Text { content } => {
                 text_intrinsic_size_in_parent(content, style, parent_display).1
@@ -814,11 +827,11 @@ fn build_taffy_tree(
 
     if comp.children.is_empty() {
         let size = leaf_taffy_size(&comp.kind, &comp.style, &style, parent_display);
-        let inline_control_in_block = matches!(
-            comp.style.display,
-            WDisplay::InlineBlock | WDisplay::InlineFlex
-        )
-            && !matches!(parent_display, Some(WDisplay::Flex | WDisplay::Grid));
+        let inline_control_in_block =
+            matches!(
+                comp.style.display,
+                WDisplay::InlineBlock | WDisplay::InlineFlex
+            ) && !matches!(parent_display, Some(WDisplay::Flex | WDisplay::Grid));
         let (min_w, size_w) = if matches!(comp.style.width, WDim::Auto) {
             match &comp.kind {
                 ComponentKind::Text { content } => {
@@ -864,7 +877,9 @@ fn build_taffy_tree(
                             w = w.max(mw);
                         }
                         (Dimension::length(w), Dimension::auto())
-                    } else if matches!(parent_direction, Some(WDir::Column | WDir::ColumnReverse)) {
+                    } else if matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid))
+                        || matches!(parent_direction, Some(WDir::Column | WDir::ColumnReverse))
+                    {
                         let min_width = match comp.style.min_width {
                             WDim::Px(mw) => Dimension::length(mw),
                             _ => Dimension::length(0.0),
@@ -896,7 +911,7 @@ fn build_taffy_tree(
         } else {
             (Dimension::auto(), size.width)
         };
-        let min_h = if matches!(comp.style.height, WDim::Auto) {
+        let intrinsic_min_h = if matches!(comp.style.height, WDim::Auto) {
             match &comp.kind {
                 ComponentKind::Text { content } => Dimension::length(
                     text_intrinsic_size_in_parent(content, &comp.style, parent_display).1,
@@ -904,10 +919,26 @@ fn build_taffy_tree(
                 ComponentKind::Button { label } => {
                     Dimension::length(button_intrinsic_size(label, &comp.style).1)
                 }
+                // Replaced elements keep their intrinsic cross-axis size when
+                // their CSS height is `auto`. Without this automatic minimum,
+                // a grid/flex parent can collapse an otherwise valid image to
+                // 0px before the paint pass ever gets a chance to decode it.
+                ComponentKind::Image { .. } => {
+                    Dimension::length(leaf_intrinsic_size(&comp.kind, &comp.style).1)
+                }
                 _ => Dimension::auto(),
             }
         } else {
             Dimension::auto()
+        };
+        let min_h = match comp.style.min_height {
+            WDim::Auto => intrinsic_min_h,
+            _ => to_taffy_dim(
+                comp.style.min_height,
+                comp.style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
         };
 
         let leaf_style = Style {
@@ -1367,6 +1398,20 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             .as_deref()
             .map(parse_grid_template_columns)
             .unwrap_or_default(),
+        // A one-column CSS grid with no explicit template stretches its
+        // implicit column across the available inline size. Taffy's default
+        // auto track remains max-content when our shared Style model maps the
+        // default `justify-content` to FlexStart, which collapses nested form
+        // rows to their smallest control. Model the browser's effective
+        // single implicit track directly; explicit templates retain their own
+        // track sizing below.
+        grid_auto_columns: if matches!(s.display, WDisplay::Grid)
+            && s.grid_template_columns.is_none()
+        {
+            vec![taffy::style_helpers::flex(1.0)]
+        } else {
+            Vec::new()
+        },
         grid_column: s
             .grid_column
             .as_deref()
@@ -1526,6 +1571,12 @@ fn split_css_top_level_once(value: &str, separator: char) -> Option<(&str, &str)
 
 fn parse_grid_column(value: &str) -> Line<GridPlacement<String>> {
     let value = value.trim();
+    if let Ok(start) = value.parse::<i16>() {
+        return Line {
+            start: taffy::style_helpers::line(start),
+            end: GridPlacement::Auto,
+        };
+    }
     if let Some(span) = value.strip_prefix("span ")
         && let Ok(span) = span.trim().parse::<u16>()
     {
@@ -1829,6 +1880,40 @@ mod tests {
     }
 
     #[test]
+    fn single_grid_line_places_item_in_requested_column() {
+        let grid = Component::column(
+            Style {
+                display: WDisp::Grid,
+                width: WDim::Px(210.0),
+                grid_template_columns: Some("34px minmax(0, 1fr)".to_string()),
+                column_gap: Some(10.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        grid_column: Some("2".to_string()),
+                        height: WDim::Px(20.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        grid_column: Some("1".to_string()),
+                        height: WDim::Px(20.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+        let layout = compute(&grid, 210.0, 100.0).unwrap();
+        assert_eq!(layout[1].0.x, 44.0);
+        assert_eq!(layout[2].0.x, 0.0);
+    }
+
+    #[test]
     fn grid_repeat_uses_custom_property_fallback_count() {
         let tracks =
             parse_grid_template_columns("repeat(var(--schema-grid-columns, 12), minmax(0, 1fr))");
@@ -1951,6 +2036,23 @@ mod tests {
         let l = compute(&Component::button("OK", s()), 800.0, 600.0).unwrap();
         assert!(l[0].0.width >= 32.0);
         assert!(l[0].0.height >= 16.0);
+    }
+
+    #[test]
+    fn button_css_min_height_is_not_overwritten_by_intrinsic_height() {
+        let layout = compute(
+            &Component::button(
+                "新对话",
+                Style {
+                    min_height: WDim::Px(44.0),
+                    ..Style::default()
+                },
+            ),
+            402.0,
+            874.0,
+        )
+        .unwrap();
+        assert_eq!(layout[0].0.height, 44.0);
     }
 
     #[test]
@@ -2134,6 +2236,35 @@ mod tests {
     }
 
     #[test]
+    fn image_with_fixed_width_and_auto_height_does_not_collapse_in_grid() {
+        let image = Component::image(
+            "blob:w3cos/pending-preview",
+            Style {
+                display: WDisp::Inline,
+                width: WDim::Px(40.0),
+                height: WDim::Auto,
+                ..Style::default()
+            },
+        );
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Grid,
+                    width: WDim::Px(260.0),
+                    ..Style::default()
+                },
+                vec![image],
+            ),
+            402.0,
+            874.0,
+        )
+        .unwrap();
+
+        assert_eq!(layout[1].0.width, 40.0);
+        assert!(layout[1].0.height > 0.0, "replaced image height collapsed");
+    }
+
+    #[test]
     fn column_stretch_fills_viewport_width() {
         let l = compute(
             &Component::column(
@@ -2180,6 +2311,96 @@ mod tests {
             (btn.width - 338.0).abs() < 4.0,
             "button should stretch to inner column width, got {}",
             btn.width
+        );
+    }
+
+    #[test]
+    fn grid_text_wraps_to_the_available_track_width() {
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Grid,
+                    width: WDim::Px(320.0),
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    "使用手机号验证身份，继续处理你的物流协作任务",
+                    Style::default(),
+                )],
+            ),
+            390.0,
+            844.0,
+        )
+        .unwrap();
+        let text = layout
+            .iter()
+            .find(|(_, index)| *index == 1)
+            .map(|(rect, _)| rect)
+            .expect("text layout");
+        assert!(
+            text.width <= 320.0,
+            "grid text escaped its track: {}",
+            text.width
+        );
+        assert!(text.height > Style::default().font_size);
+    }
+
+    #[test]
+    fn implicit_grid_column_stretches_nested_form_rows() {
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Grid,
+                    width: WDim::Px(304.0),
+                    ..Style::default()
+                },
+                vec![Component::column(
+                    Style {
+                        display: WDisp::Grid,
+                        ..Style::default()
+                    },
+                    vec![Component::row(
+                        Style {
+                            display: WDisp::Flex,
+                            gap: 8.0,
+                            ..Style::default()
+                        },
+                        vec![
+                            Component::button(
+                                "+86",
+                                Style {
+                                    width: WDim::Px(92.0),
+                                    flex_shrink: 0.0,
+                                    ..Style::default()
+                                },
+                            ),
+                            Component::text_input(
+                                "",
+                                "请输入手机号",
+                                Style {
+                                    width: WDim::Percent(100.0),
+                                    min_width: WDim::Px(0.0),
+                                    ..Style::default()
+                                },
+                            ),
+                        ],
+                    )],
+                )],
+            ),
+            390.0,
+            844.0,
+        )
+        .unwrap();
+        let row = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let input = layout.iter().find(|(_, index)| *index == 4).unwrap().0;
+        assert!(
+            (row.width - 304.0).abs() < 1.0,
+            "implicit grid row width={}",
+            row.width
+        );
+        assert!(
+            input.width > 190.0 && input.x + input.width <= 304.0,
+            "input={input:?}"
         );
     }
 

@@ -10,6 +10,43 @@ use crate::selection::{Range, Selection};
 use crate::stylesheet;
 use crate::user_agent;
 
+fn resolve_css_variables(value: &str, custom_properties: &HashMap<String, String>) -> String {
+    let mut current = value.to_string();
+    for _ in 0..10 {
+        let Some(start) = current.find("var(") else {
+            break;
+        };
+        let after = &current[start + 4..];
+        let mut depth = 1i32;
+        let mut end = None;
+        for (index, character) in after.char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let inner = after[..end].trim();
+        let (name, fallback) = inner
+            .split_once(',')
+            .map_or((inner, None), |(name, fallback)| {
+                (name.trim(), Some(fallback.trim()))
+            });
+        let Some(replacement) = custom_properties.get(name).map(String::as_str).or(fallback) else {
+            break;
+        };
+        current = format!("{}{}{}", &current[..start], replacement, &after[end + 1..]);
+    }
+    current
+}
+
 /// W3C Document — the root of the DOM tree.
 ///
 /// Performance characteristics (Chrome/Blink inspired):
@@ -633,7 +670,7 @@ impl Document {
         text
     }
 
-    /// Selector context for stylesheet matching: tag, `id` attribute, classes.
+    /// Selector context for stylesheet matching: tag, id, classes, attributes.
     fn selector_context(&self, id: NodeId) -> stylesheet::SelectorContext {
         let node = self.get_node(id);
         let id_attr = node
@@ -643,7 +680,17 @@ impl Document {
             .map(|(_, v)| v.as_str());
         let classes: Vec<String> = node.class_list.iter().map(|c| c.as_str()).collect();
         let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        let attributes: Vec<(String, String)> = node
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.as_str().to_string()))
+            .collect();
+        let attribute_refs: Vec<(&str, &str)> = attributes
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
         stylesheet::SelectorContext::new(&node.tag.as_str(), id_attr, &class_refs)
+            .with_attributes(&attribute_refs)
     }
 
     /// Computed style for a node: stylesheet-matched declarations first
@@ -658,31 +705,44 @@ impl Document {
         let inline = &self.styles[id.0 as usize];
         let node = self.get_node(id);
         let matched = if stylesheet::has_rules() && node.node_type == NodeType::Element {
-            let id_attr = node
-                .attributes
-                .iter()
-                .find(|(k, _)| k.as_str() == "id")
-                .map(|(_, v)| v.as_str());
-            let classes: Vec<String> = node.class_list.iter().map(|c| c.as_str()).collect();
-            let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
-            stylesheet::matching_declarations(&node.tag.as_str(), id_attr, &class_refs, ancestors)
+            let context = self.selector_context(id);
+            stylesheet::matching_declarations_for_context(&context, ancestors)
         } else {
             Vec::new()
         };
-        let mut style = if matched.is_empty() {
-            inline.to_style()
-        } else {
-            let mut merged =
-                CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
-            for (prop, value, _specificity) in &matched {
-                merged.set_property(prop, value);
+        let mut merged =
+            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
+        let mut custom_properties = inherited
+            .and_then(|style| style.custom_properties.clone())
+            .unwrap_or_default();
+
+        // Custom properties participate in the cascade independently of
+        // declaration order. Collect them first, then resolve ordinary
+        // declarations using the winning inherited/scoped/inline values.
+        for (prop, value, _specificity) in &matched {
+            if prop.starts_with("--") {
+                custom_properties.insert(prop.clone(), value.clone());
             }
-            // Inline wins: re-apply the node's own `set_property` history on top.
-            for (prop, value) in &inline.inline_declarations {
-                merged.set_property(prop, value);
+        }
+        for (prop, value) in &inline.inline_declarations {
+            if prop.starts_with("--") {
+                custom_properties.insert(prop.clone(), value.clone());
             }
-            merged.to_style()
-        };
+        }
+        for (prop, value, _specificity) in &matched {
+            if !prop.starts_with("--") {
+                merged.set_property(prop, &resolve_css_variables(value, &custom_properties));
+            }
+        }
+        // Inline wins: re-apply the node's own declarations on top.
+        for (prop, value) in &inline.inline_declarations {
+            if !prop.starts_with("--") {
+                merged.set_property(prop, &resolve_css_variables(value, &custom_properties));
+            }
+        }
+        merged.inner.custom_properties =
+            (!custom_properties.is_empty()).then_some(custom_properties);
+        let mut style = merged.to_style();
 
         if let Some(parent) = inherited {
             let declares = |property: &str| {
@@ -777,17 +837,31 @@ impl Document {
                     let (attribute_width, attribute_height) = self.svg_root_size(id);
                     let width = match style.width {
                         w3cos_std::style::Dimension::Px(width) => width,
+                        w3cos_std::style::Dimension::Em(width) => width * style.font_size,
+                        w3cos_std::style::Dimension::Rem(width) => width * 16.0,
                         _ => attribute_width,
                     }
                     .max(1.0)
                     .ceil() as u32;
                     let height = match style.height {
                         w3cos_std::style::Dimension::Px(height) => height,
+                        w3cos_std::style::Dimension::Em(height) => height * style.font_size,
+                        w3cos_std::style::Dimension::Rem(height) => height * 16.0,
                         _ => attribute_height,
                     }
                     .max(1.0)
                     .ceil() as u32;
                     let (source, event_targets) = self.svg_markup(id);
+                    let current_color = format!(
+                        "rgba({}, {}, {}, {})",
+                        style.color.r,
+                        style.color.g,
+                        style.color.b,
+                        f32::from(style.color.a) / 255.0,
+                    );
+                    let source = source
+                        .replace("currentColor", &current_color)
+                        .replace("currentcolor", &current_color);
                     let component = w3cos_std::Component::svg_document_with_targets(
                         source,
                         width,
@@ -970,8 +1044,49 @@ impl Document {
                     }
                     "button" => {
                         let label = self.descendant_text_content(id);
-                        let label = if label.is_empty() { "Button" } else { &label };
-                        w3cos_std::Component::button(label, style)
+                        let has_visual_children = !children.is_empty();
+                        let label = if label.is_empty() && !has_visual_children {
+                            "Button"
+                        } else {
+                            &label
+                        };
+                        let mut button = w3cos_std::Component::button(label, style);
+                        button.children = children;
+                        button
+                    }
+                    "select" => {
+                        // A collapsed HTML select paints only its current option.
+                        // Lowering every `<option>` as a normal child makes the
+                        // intrinsic width equal to the concatenated option list
+                        // and pushes the surrounding flex row beyond the viewport.
+                        let selected_value = node
+                            .attributes
+                            .iter()
+                            .find(|(key, _)| key.as_str() == "value")
+                            .map(|(_, value)| value.as_str());
+                        let option_ids = self.children_ids(id);
+                        let selected = option_ids
+                            .iter()
+                            .find(|&&option_id| {
+                                let option = self.get_node(option_id);
+                                let option_value = option
+                                    .attributes
+                                    .iter()
+                                    .find(|(key, _)| key.as_str() == "value")
+                                    .map(|(_, value)| value.as_str())
+                                    .unwrap_or_default();
+                                option
+                                    .attributes
+                                    .iter()
+                                    .any(|(key, _)| key.as_str() == "selected")
+                                    || selected_value.is_some_and(|value| value == option_value)
+                            })
+                            .copied()
+                            .or_else(|| option_ids.first().copied());
+                        let label = selected
+                            .map(|option_id| self.descendant_text_content(option_id))
+                            .unwrap_or_default();
+                        w3cos_std::Component::button(&label, style)
                     }
                     "img" => {
                         let src = self
@@ -1009,6 +1124,27 @@ impl Document {
                         w3cos_std::Component::image(src, image_style)
                     }
                     "input" | "textarea" => {
+                        let input_type = node
+                            .attributes
+                            .iter()
+                            .find(|(key, _)| key.as_str() == "type")
+                            .map(|(_, value)| value.as_str())
+                            .unwrap_or("text");
+                        if tag.as_str() == "input" && input_type.eq_ignore_ascii_case("file") {
+                            let mut component = w3cos_std::Component::boxed(style, children);
+                            component.on_click = w3cos_std::EventAction::NativeHost {
+                                id: id.as_u32() as u64,
+                                click: true,
+                                scroll: false,
+                                input: false,
+                                focus: false,
+                                keyboard: false,
+                                submit: false,
+                                pointer: true,
+                                wheel: false,
+                            };
+                            return component;
+                        }
                         let placeholder = node
                             .attributes
                             .iter()
@@ -1022,10 +1158,8 @@ impl Document {
                             .map(|(_, v)| v.as_str())
                             .or(node.text_content.as_deref())
                             .unwrap_or("");
-                        let secure = tag.as_str() == "input"
-                            && node.attributes.iter().any(|(key, value)| {
-                                key.as_str() == "type" && value.eq_ignore_ascii_case("password")
-                            });
+                        let secure =
+                            tag.as_str() == "input" && input_type.eq_ignore_ascii_case("password");
                         let mut component = if secure {
                             w3cos_std::Component::secure_text_input(value, placeholder, style)
                         } else {
@@ -1591,7 +1725,7 @@ impl Document {
             }
         }
         if let Some(stroke) = stroke
-            && !matches!(tag, "polyline" | "polygon" | "path")
+            && matches!(tag, "rect" | "circle" | "ellipse" | "line" | "text" | "use")
         {
             style.border_width = stroke_width;
             style.border_color = stroke;

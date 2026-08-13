@@ -28,6 +28,7 @@ pub(crate) enum PrivateElement {
 /// object): `Value::call` on an object with a call slot invokes it.
 pub struct JsObject {
     pub(crate) properties: HashMap<String, Value>,
+    property_order: Vec<String>,
     pub(crate) prototype: Option<Rc<RefCell<JsObject>>>,
     pub(crate) proxy_handler: Option<ProxyHandler>,
     has_getter_properties: bool,
@@ -49,6 +50,7 @@ impl JsObject {
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         Self {
             properties: HashMap::new(),
+            property_order: Vec::new(),
             prototype: None,
             proxy_handler: None,
             has_getter_properties: false,
@@ -62,10 +64,13 @@ impl JsObject {
     }
 
     pub fn from_map(map: HashMap<String, Value>) -> Self {
+        let mut property_order = map.keys().cloned().collect::<Vec<_>>();
+        property_order.sort();
         let has_getter_properties = map.keys().any(|key| key.starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties: map,
+            property_order,
             prototype: None,
             proxy_handler: None,
             has_getter_properties,
@@ -82,12 +87,15 @@ impl JsObject {
 
     /// Create a proxied object: `new Proxy(target_props, handler)`.
     pub fn with_proxy(properties: HashMap<String, Value>, handler: ProxyHandler) -> Self {
+        let mut property_order = properties.keys().cloned().collect::<Vec<_>>();
+        property_order.sort();
         let has_getter_properties = properties
             .keys()
             .any(|key| key.starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
+            property_order,
             prototype: None,
             proxy_handler: Some(handler),
             has_getter_properties,
@@ -105,12 +113,15 @@ impl JsObject {
     /// Create a callable object (a JS class / constructor): plain properties
     /// plus a call slot invoked by `Value::call` / `class::construct`.
     pub fn with_call_slot(properties: HashMap<String, Value>, call: JsFunction) -> Self {
+        let mut property_order = properties.keys().cloned().collect::<Vec<_>>();
+        property_order.sort();
         let has_getter_properties = properties
             .keys()
             .any(|key| key.starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
+            property_order,
             prototype: None,
             proxy_handler: None,
             has_getter_properties,
@@ -170,6 +181,9 @@ impl JsObject {
         if key.starts_with("__w3cos_getter_") {
             self.has_getter_properties = true;
         }
+        if !self.properties.contains_key(key) {
+            self.property_order.push(key.to_string());
+        }
         self.properties.insert(key.to_string(), value);
         self.refresh_heap_accounting();
     }
@@ -212,6 +226,9 @@ impl JsObject {
             }
         }
         let removed = self.properties.remove(key).is_some();
+        if removed {
+            self.property_order.retain(|candidate| candidate != key);
+        }
         if removed && key.starts_with("__w3cos_getter_") {
             self.has_getter_properties = self
                 .properties
@@ -233,8 +250,8 @@ impl JsObject {
             }
         }
         let keys: Vec<Value> = self
-            .properties
-            .keys()
+            .property_order
+            .iter()
             .map(|k| Value::String(k.clone()))
             .collect();
         Value::array(keys)
@@ -288,6 +305,9 @@ impl JsObject {
         if let Value::Object(desc) = descriptor {
             let desc = desc.borrow();
             if let Some(val) = desc.properties.get("value") {
+                if !self.properties.contains_key(key) {
+                    self.property_order.push(key.to_string());
+                }
                 self.properties.insert(key.to_string(), val.clone());
                 self.refresh_heap_accounting();
             }
@@ -355,7 +375,7 @@ impl JsObject {
     // ── Helpers ────────────────────────────────────────────────────────
 
     pub fn keys(&self) -> Vec<String> {
-        self.properties.keys().cloned().collect()
+        self.property_order.clone()
     }
 
     pub fn len(&self) -> usize {

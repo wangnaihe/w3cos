@@ -137,6 +137,111 @@ mod tests {
     }
 
     #[test]
+    fn svg_current_color_uses_the_host_computed_color() {
+        let mut doc = Document::new();
+        let host = doc.create_element("span");
+        host.style_mut(&mut doc).set_property("color", "#f8fafc");
+        let svg = doc.create_element("svg");
+        svg.set_attribute(&mut doc, "width", "24");
+        svg.set_attribute(&mut doc, "height", "24");
+        let path = doc.create_element("path");
+        path.set_attribute(&mut doc, "d", "M0 0h24v24z");
+        path.set_attribute(&mut doc, "fill", "currentColor");
+        path.set_attribute(&mut doc, "stroke", "currentColor");
+        svg.append_child(&mut doc, path);
+        host.append_child(&mut doc, svg);
+        doc.body().append_child(&mut doc, host);
+
+        let tree = doc.to_component_tree();
+        let svg = tree.children[0]
+            .children
+            .first()
+            .expect("inline host SVG child");
+        let w3cos_std::ComponentKind::SvgDocument { source, .. } = &svg.kind else {
+            panic!("inline host child should lower to an SVG document");
+        };
+        assert!(
+            source.contains("fill=\"rgba(248, 250, 252, 1)\""),
+            "{source}"
+        );
+        assert!(
+            source.contains("stroke=\"rgba(248, 250, 252, 1)\""),
+            "{source}"
+        );
+        assert!(!source.contains("currentColor"), "{source}");
+    }
+
+    #[test]
+    fn stroke_only_svg_inherits_color_and_explicit_size_through_button_host() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".tool",
+            &[("color", "#295da7"), ("width", "46px"), ("height", "46px")],
+        );
+        crate::stylesheet::register_rule(".tool .semantic-icon", &[("font-size", "21px")]);
+        crate::stylesheet::register_rule(
+            ".semantic-icon > svg",
+            &[("width", "1em"), ("height", "1em")],
+        );
+
+        let mut doc = Document::new();
+        let button = doc.create_element("button");
+        button.set_class_name(&mut doc, "tool");
+        let host = doc.create_element("span");
+        host.set_class_name(&mut doc, "semantic-icon");
+        let svg = doc.create_element("svg");
+        svg.set_attribute(&mut doc, "viewBox", "0 0 24 24");
+        svg.set_attribute(&mut doc, "fill", "none");
+        svg.set_attribute(&mut doc, "stroke", "currentColor");
+        svg.set_attribute(&mut doc, "stroke-width", "1.8");
+        let path = doc.create_element("path");
+        path.set_attribute(&mut doc, "d", "M5 12h14");
+        svg.append_child(&mut doc, path);
+        host.append_child(&mut doc, svg);
+        button.append_child(&mut doc, host);
+        doc.body().append_child(&mut doc, button);
+
+        let tree = doc.to_component_tree();
+        let button = &tree.children[0];
+        let host = &button.children[0];
+        let svg = &host.children[0];
+        let w3cos_std::ComponentKind::SvgDocument {
+            source,
+            width,
+            height,
+            ..
+        } = &svg.kind
+        else {
+            panic!("button icon should lower to an SVG document");
+        };
+        assert_eq!((*width, *height), (21, 21));
+        assert_eq!(host.style.font_size, 21.0);
+        assert_eq!(svg.style.border_width, 0.0);
+        assert!(
+            source.contains("stroke=\"rgba(41, 93, 167, 1)\""),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn button_preserves_image_children_for_attachment_previews() {
+        let mut doc = Document::new();
+        let button = doc.create_element("button");
+        let image = doc.create_element("img");
+        image.set_attribute(&mut doc, "src", "blob:w3cos/attachment-preview");
+        button.append_child(&mut doc, image);
+        doc.body().append_child(&mut doc, button);
+
+        let tree = doc.to_component_tree();
+        let button = &tree.children[0];
+        assert_eq!(button.children.len(), 1);
+        assert!(matches!(
+            &button.children[0].kind,
+            w3cos_std::ComponentKind::Image { src } if src == "blob:w3cos/attachment-preview"
+        ));
+    }
+
+    #[test]
     fn svg_defs_do_not_shift_anonymous_paint_ordinals() {
         let mut doc = Document::new();
         let svg = doc.create_element("svg");
@@ -560,6 +665,29 @@ mod tests {
     }
 
     #[test]
+    fn test_stylesheet_attribute_rule_applies_in_component_tree() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".message[data-role='user']",
+            &[("color", "#ffffff"), ("background", "#176bd1")],
+        );
+
+        let mut doc = Document::new();
+        let el = doc.create_element("article");
+        el.class_list_add(&mut doc, "message");
+        el.set_attribute(&mut doc, "data-role", "user");
+        doc.body().append_child(&mut doc, el);
+
+        let tree = doc.to_component_tree();
+        let style = &tree.children[0].style;
+        assert_eq!(style.color.r, 255);
+        assert_eq!(style.background.r, 23);
+        assert_eq!(style.background.g, 107);
+        assert_eq!(style.background.b, 209);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_stylesheet_inline_style_wins() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(".title", &[("color", "#ff0000"), ("width", "42px")]);
@@ -716,6 +844,53 @@ mod tests {
     }
 
     #[test]
+    fn test_file_input_is_clickable_without_text_keyboard_semantics() {
+        let mut doc = Document::new();
+        let input = doc.create_element("input");
+        input.set_attribute(&mut doc, "type", "file");
+        doc.body().append_child(&mut doc, input);
+
+        let tree = doc.to_component_tree();
+        assert!(!matches!(
+            tree.children[0].kind,
+            w3cos_std::ComponentKind::TextInput { .. }
+        ));
+        assert!(matches!(
+            tree.children[0].on_click,
+            w3cos_std::EventAction::NativeHost {
+                id,
+                click: true,
+                input: false,
+                focus: false,
+                keyboard: false,
+                ..
+            } if id == input.id.as_u32() as u64
+        ));
+    }
+
+    #[test]
+    fn test_select_renders_only_its_current_option() {
+        let mut doc = Document::new();
+        let select = doc.create_element("select");
+        select.set_attribute(&mut doc, "value", "+86");
+        for value in ["+86", "+852", "+853"] {
+            let option = doc.create_element("option");
+            option.set_attribute(&mut doc, "value", value);
+            let label = doc.create_text_node(value);
+            option.append_child(&mut doc, label);
+            select.append_child(&mut doc, option);
+        }
+        doc.body().append_child(&mut doc, select);
+
+        let tree = doc.to_component_tree();
+        assert!(matches!(
+            &tree.children[0].kind,
+            w3cos_std::ComponentKind::Button { label } if label == "+86"
+        ));
+        assert!(tree.children[0].children.is_empty());
+    }
+
+    #[test]
     fn test_dom_container_keeps_native_host_for_pointer_dispatch() {
         let mut doc = Document::new();
         let editor = doc.create_element("div");
@@ -814,6 +989,48 @@ mod tests {
         assert_eq!(inherited_style.line_height, 1.4);
         assert_eq!(inherited_style.color, w3cos_std::Color::from_hex("#123456"));
         assert_eq!(doc.computed_style_for(explicit.id).font_size, 11.0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_scoped_inline_custom_properties_resolve_in_descendant_rules() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".card",
+            &[
+                ("padding", "var(--card-padding)"),
+                (
+                    "border",
+                    "var(--card-border-width) solid var(--card-border-color)",
+                ),
+                ("background", "var(--card-background)"),
+            ],
+        );
+
+        let mut doc = Document::new();
+        let surface = doc.create_element("section");
+        surface
+            .style_mut(&mut doc)
+            .set_property("--card-padding", "16px");
+        surface
+            .style_mut(&mut doc)
+            .set_property("--card-border-width", "1px");
+        surface
+            .style_mut(&mut doc)
+            .set_property("--card-border-color", "#d7e0ee");
+        surface
+            .style_mut(&mut doc)
+            .set_property("--card-background", "#ffffff");
+        let card = doc.create_element("div");
+        card.set_class_name(&mut doc, "card");
+        surface.append_child(&mut doc, card);
+        doc.body().append_child(&mut doc, surface);
+
+        let style = doc.computed_style_for(card.id);
+        assert_eq!(style.padding.left, w3cos_std::style::Spacing::Px(16.0));
+        assert_eq!(style.border_width, 1.0);
+        assert_eq!(style.border_color, w3cos_std::Color::from_hex("#d7e0ee"));
+        assert_eq!(style.background, w3cos_std::Color::from_hex("#ffffff"));
         crate::stylesheet::clear_rules();
     }
 

@@ -34,6 +34,13 @@ impl CSSStyleDeclaration {
     pub fn set_property(&mut self, name: &str, value: &str) {
         self.inline_declarations
             .push((name.to_string(), value.to_string()));
+        if name.starts_with("--") {
+            self.inner
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(name.to_string(), value.to_string());
+            return;
+        }
         match name {
             "display" => self.inner.display = parse_display(value),
             "position" => self.inner.position = parse_position(value),
@@ -94,6 +101,38 @@ impl CSSStyleDeclaration {
                     self.inner.padding.left = v
                 }
             }
+            "padding-inline" | "paddingInline" => {
+                let values = split_css_whitespace(value);
+                if let Some(start) = values.first().and_then(|value| parse_edge_spacing(value)) {
+                    let end = values
+                        .get(1)
+                        .and_then(|value| parse_edge_spacing(value))
+                        .unwrap_or(start);
+                    self.inner.padding.left = start;
+                    self.inner.padding.right = end;
+                }
+            }
+            "padding-inline-start" | "paddingInlineStart" => {
+                if let Some(v) = parse_edge_spacing(value) {
+                    self.inner.padding.left = v
+                }
+            }
+            "padding-inline-end" | "paddingInlineEnd" => {
+                if let Some(v) = parse_edge_spacing(value) {
+                    self.inner.padding.right = v
+                }
+            }
+            "padding-block" | "paddingBlock" => {
+                let values = split_css_whitespace(value);
+                if let Some(start) = values.first().and_then(|value| parse_edge_spacing(value)) {
+                    let end = values
+                        .get(1)
+                        .and_then(|value| parse_edge_spacing(value))
+                        .unwrap_or(start);
+                    self.inner.padding.top = start;
+                    self.inner.padding.bottom = end;
+                }
+            }
             "margin" => {
                 if let Some(edges) = parse_edge_shorthand(value) {
                     self.inner.margin = edges
@@ -119,6 +158,38 @@ impl CSSStyleDeclaration {
                     self.inner.margin.left = v
                 }
             }
+            "margin-inline" | "marginInline" => {
+                let values = split_css_whitespace(value);
+                if let Some(start) = values.first().and_then(|value| parse_spacing(value)) {
+                    let end = values
+                        .get(1)
+                        .and_then(|value| parse_spacing(value))
+                        .unwrap_or(start);
+                    self.inner.margin.left = start;
+                    self.inner.margin.right = end;
+                }
+            }
+            "margin-inline-start" | "marginInlineStart" => {
+                if let Some(v) = parse_spacing(value) {
+                    self.inner.margin.left = v
+                }
+            }
+            "margin-inline-end" | "marginInlineEnd" => {
+                if let Some(v) = parse_spacing(value) {
+                    self.inner.margin.right = v
+                }
+            }
+            "margin-block" | "marginBlock" => {
+                let values = split_css_whitespace(value);
+                if let Some(start) = values.first().and_then(|value| parse_spacing(value)) {
+                    let end = values
+                        .get(1)
+                        .and_then(|value| parse_spacing(value))
+                        .unwrap_or(start);
+                    self.inner.margin.top = start;
+                    self.inner.margin.bottom = end;
+                }
+            }
 
             "box-sizing" | "boxSizing" => {
                 self.inner.box_sizing = if value.trim() == "border-box" {
@@ -127,8 +198,22 @@ impl CSSStyleDeclaration {
                     BoxSizing::ContentBox
                 }
             }
-            "width" => self.inner.width = parse_dimension(value),
-            "height" => self.inner.height = parse_dimension(value),
+            "width" => {
+                if let Some((width, max_width)) = parse_min_percent_and_fixed(value) {
+                    self.inner.width = width;
+                    self.inner.max_width = max_width;
+                } else {
+                    self.inner.width = parse_dimension(value);
+                }
+            }
+            "height" => {
+                if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
+                    self.inner.height = height;
+                    self.inner.max_height = max_height;
+                } else {
+                    self.inner.height = parse_dimension(value);
+                }
+            }
             "min-width" | "minWidth" => self.inner.min_width = parse_dimension(value),
             "min-height" | "minHeight" => self.inner.min_height = parse_dimension(value),
             "max-width" | "maxWidth" => self.inner.max_width = parse_dimension(value),
@@ -221,7 +306,16 @@ impl CSSStyleDeclaration {
                 }
             }
             "border-radius" | "borderRadius" => {
-                if let Some(v) = parse_px(value) {
+                // The shared Style currently stores a uniform radius. Preserve
+                // modern 2/3/4-value syntax by using the largest corner radius
+                // instead of dropping the complete declaration when more than
+                // one token is present. This keeps the rounded envelope even
+                // when per-corner asymmetry cannot yet be represented.
+                if let Some(v) = split_css_whitespace(value)
+                    .iter()
+                    .filter_map(|part| parse_px(part))
+                    .reduce(f32::max)
+                {
                     self.inner.border_radius = v
                 }
             }
@@ -239,6 +333,18 @@ impl CSSStyleDeclaration {
             }
             "border-left-width" | "borderLeftWidth" => {
                 self.inner.border_left_width = parse_px(value)
+            }
+            "border-inline-width" | "borderInlineWidth" => {
+                let values = split_css_whitespace(value);
+                if let Some(start) = values.first().and_then(|value| parse_px(value)) {
+                    self.inner.border_left_width = Some(start);
+                    self.inner.border_right_width = Some(
+                        values
+                            .get(1)
+                            .and_then(|value| parse_px(value))
+                            .unwrap_or(start),
+                    );
+                }
             }
             "border-color" | "borderColor" => {
                 if let Some(color) = Color::from_css(value) {
@@ -269,6 +375,18 @@ impl CSSStyleDeclaration {
             }
             "border-left" | "borderLeft" => {
                 apply_border_side_shorthand(&mut self.inner, value, BorderSide::Left)
+            }
+            "border-inline-start" | "borderInlineStart" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Left)
+            }
+            "border-inline-end" | "borderInlineEnd" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Right)
+            }
+            "border-block-start" | "borderBlockStart" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Top)
+            }
+            "border-block-end" | "borderBlockEnd" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Bottom)
             }
             "opacity" => {
                 if let Ok(v) = value.parse() {
@@ -820,6 +938,27 @@ fn parse_dimension(value: &str) -> Dimension {
     Dimension::Auto
 }
 
+/// Resolve the common responsive `min(100%, <fixed-length>)` shape into the
+/// equivalent layout constraints understood by Taffy: `size: 100%` plus a
+/// fixed maximum. CSS permits either argument order.
+fn parse_min_percent_and_fixed(value: &str) -> Option<(Dimension, Dimension)> {
+    let inner = value.trim().strip_prefix("min(")?.strip_suffix(')')?;
+    let mut parts = inner.split(',').map(str::trim);
+    let first = parse_dimension(parts.next()?);
+    let second = parse_dimension(parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    match (first, second) {
+        (Dimension::Percent(percent), fixed) | (fixed, Dimension::Percent(percent))
+            if !matches!(fixed, Dimension::Auto | Dimension::Percent(_)) =>
+        {
+            Some((Dimension::Percent(percent), fixed))
+        }
+        _ => None,
+    }
+}
+
 fn parse_box_shadow(value: &str) -> Option<w3cos_std::style::BoxShadow> {
     // CSS allows the spread radius to be omitted: `x y blur color`.
     let parts = split_css_whitespace(value);
@@ -1200,6 +1339,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn responsive_min_width_becomes_percent_size_with_fixed_cap() {
+        for value in ["min(420px, 100%)", "min(100%, 420px)"] {
+            let mut declaration = CSSStyleDeclaration::new();
+            declaration.set_property("width", value);
+            assert_eq!(declaration.inner.width, Dimension::Percent(100.0));
+            assert_eq!(declaration.inner.max_width, Dimension::Px(420.0));
+        }
+    }
+
+    #[test]
     fn border_shorthand_accepts_rgba_color() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("border", "1px solid rgba(215, 224, 238, 0.92)");
@@ -1208,6 +1357,13 @@ mod tests {
             declaration.inner.border_color,
             Color::rgba(215, 224, 238, 235)
         );
+    }
+
+    #[test]
+    fn multi_value_border_radius_preserves_rounded_envelope() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-radius", "4px 16px 16px");
+        assert_eq!(declaration.inner.border_radius, 16.0);
     }
 
     #[test]
@@ -1384,16 +1540,33 @@ mod tests {
     }
 
     #[test]
+    fn logical_box_properties_map_to_ltr_physical_edges() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("padding-inline", "10px 12px");
+        declaration.set_property("margin-block", "4px 6px");
+        declaration.set_property("border-inline-width", "0");
+        declaration.set_property("border-block-start", "1px solid #dbe4ef");
+
+        assert_eq!(declaration.inner.padding.left, Spacing::Px(10.0));
+        assert_eq!(declaration.inner.padding.right, Spacing::Px(12.0));
+        assert_eq!(declaration.inner.margin.top, Spacing::Px(4.0));
+        assert_eq!(declaration.inner.margin.bottom, Spacing::Px(6.0));
+        assert_eq!(declaration.inner.border_left_width, Some(0.0));
+        assert_eq!(declaration.inner.border_right_width, Some(0.0));
+        assert_eq!(declaration.inner.border_top_width, Some(1.0));
+    }
+
+    #[test]
     fn dynamic_viewport_height_uses_viewport_units() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("height", "100dvh");
         assert_eq!(declaration.inner.height, Dimension::Vh(100.0));
     }
 }
-    #[test]
-    fn inline_flex_round_trips_without_falling_back_to_block_flex() {
-        let mut declaration = CSSStyleDeclaration::new();
-        declaration.set_property("display", "inline-flex");
-        assert_eq!(declaration.inner.display, Display::InlineFlex);
-        assert_eq!(declaration.get_property("display"), "inline-flex");
-    }
+#[test]
+fn inline_flex_round_trips_without_falling_back_to_block_flex() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("display", "inline-flex");
+    assert_eq!(declaration.inner.display, Display::InlineFlex);
+    assert_eq!(declaration.get_property("display"), "inline-flex");
+}

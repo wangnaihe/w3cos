@@ -5152,12 +5152,8 @@ impl Builder {
             Lit::Regex(value) => {
                 let constructor = self.resolve_binding("RegExp");
                 let constructor = self.load_binding(constructor);
-                let source = self.constant(Constant::String(
-                    format!("{:?}", value.exp).trim_matches('"').to_string(),
-                ));
-                let flags = self.constant(Constant::String(
-                    format!("{:?}", value.flags).trim_matches('"').to_string(),
-                ));
+                let source = self.constant(Constant::String(atom_to_string(&value.exp)));
+                let flags = self.constant(Constant::String(atom_to_string(&value.flags)));
                 let dst = self.register();
                 self.emit(Instruction::Construct {
                     dst,
@@ -9990,6 +9986,28 @@ mod tests {
         assert_eq!(payload.get_property("count"), Value::Number(3.0));
         assert_eq!(payload.get_property("loose"), Value::Bool(true));
         assert_eq!(payload.get_property("strict"), Value::Bool(false));
+    }
+
+    #[test]
+    fn regexp_literals_preserve_escape_sequences_in_w3ir() {
+        let module = lower_script(
+            r#"callback(/^rgba\([0-9]+\)$/.test("rgba(7)"));"#,
+            "https://example.test/regexp-escape.js",
+        )
+        .unwrap();
+        assert!(
+            module
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction,
+                    Instruction::LoadConstant { value: Constant::String(source), .. }
+                        if source == r"^rgba\([0-9]+\)$"
+                )),
+            "regexp source must not receive a second escaping pass",
+        );
     }
 
     #[test]

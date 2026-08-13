@@ -1159,6 +1159,21 @@ fn rasterize(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Option<Decode
 mod tests {
     use super::*;
 
+    #[test]
+    fn rasterizes_current_color_replacement_on_stroke_only_icons() {
+        clear_cache();
+        let source = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="rgba(41, 93, 167, 1)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m9.5 12.5 5.7-5.7a3 3 0 0 1 4.2 4.2l-7.8 7.8a5 5 0 0 1-7.1-7.1l7.4-7.4"/>
+            <path d="m7.4 14.6 7.1-7.1"/>
+        </svg>"#;
+
+        let image = get_or_render(source, 21, 21).expect("stroke-only SVG should rasterize");
+        assert!(
+            image.data.chunks_exact(4).any(|pixel| pixel[3] != 0),
+            "stroke-only SVG should produce visible pixels"
+        );
+    }
+
     const COMPLEX_SVG: &str = r##"
         <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 32 32">
           <defs>

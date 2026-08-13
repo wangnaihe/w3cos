@@ -677,6 +677,17 @@ pub fn date_value(milliseconds: f64) -> Value {
             "valueOf".into(),
             Value::function(move |_, _| Value::Number(milliseconds)),
         ),
+        (
+            "toISOString".into(),
+            Value::function(move |_, _| {
+                let text = chrono::Utc
+                    .timestamp_millis_opt(milliseconds.floor() as i64)
+                    .single()
+                    .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                    .unwrap_or_else(|| "Invalid Date".to_string());
+                Value::String(text)
+            }),
+        ),
     ]))
 }
 
@@ -3920,6 +3931,10 @@ mod tests {
         assert_eq!(
             date.call_method("getTime", vec![]),
             Value::Number(1_784_795_415_000.0)
+        );
+        assert_eq!(
+            date.call_method("toISOString", vec![]),
+            Value::string("2026-07-23T08:30:15.000Z")
         );
 
         let options = Value::object(HashMap::from([

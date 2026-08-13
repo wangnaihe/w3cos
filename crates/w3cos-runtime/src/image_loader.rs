@@ -42,15 +42,14 @@ pub fn get_or_load(src: &str) -> Option<DecodedImage> {
     if let Some(frame) = current_animation_frame(src) {
         return Some(frame);
     }
+    if let Some(entry) = CACHE.with(|cache| cache.borrow().get(src).cloned()) {
+        return entry;
+    }
+    let result = load_from_source(src);
     CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(entry) = cache.get(src) {
-            return entry.clone();
-        }
-        let result = load_from_source(src);
-        cache.insert(src.to_string(), result.clone());
-        result
-    })
+        cache.borrow_mut().insert(src.to_string(), result.clone());
+    });
+    result
 }
 
 /// Decode bytes fetched by the Browser subresource loader and publish them to
@@ -377,6 +376,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+    use w3cos_core::Value;
 
     fn png_2x1() -> Vec<u8> {
         let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([12, 34, 56, 255]));
@@ -385,6 +385,26 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         bytes.into_inner()
+    }
+
+    #[test]
+    fn blob_object_url_images_load_without_dynamic_js() {
+        let bytes = w3cos_core::binary::typed_array_value(
+            png_2x1()
+                .into_iter()
+                .map(|byte| Value::Number(f64::from(byte)))
+                .collect(),
+        );
+        let blob = w3cos_core::class::construct(
+            &w3cos_core::web::blob_class(),
+            vec![Value::array(vec![bytes])],
+        );
+        let url = w3cos_core::web::url_class()
+            .call_method("createObjectURL", vec![blob])
+            .to_js_string();
+
+        let decoded = get_or_load(&url).expect("blob image should decode");
+        assert_eq!((decoded.width, decoded.height), (2, 1));
     }
 
     #[test]
@@ -438,7 +458,15 @@ mod tests {
 }
 
 fn load_from_source(src: &str) -> Option<DecodedImage> {
-    let bytes = if src.starts_with("http://") || src.starts_with("https://") {
+    let bytes = if src.starts_with("blob:w3cos/") {
+        match w3cos_core::web::object_url_resource(src) {
+            Some((bytes, _)) => bytes,
+            None => {
+                eprintln!("[W3C OS] Failed to resolve image object URL {src}");
+                return None;
+            }
+        }
+    } else if src.starts_with("http://") || src.starts_with("https://") {
         let resp = match ureq::get(src).call() {
             Ok(r) => r,
             Err(e) => {
@@ -462,18 +490,8 @@ fn load_from_source(src: &str) -> Option<DecodedImage> {
         }
     };
 
-    match image::load_from_memory(&bytes) {
-        Ok(img) => {
-            let rgba = img.to_rgba8();
-            let (w, h) = (rgba.width(), rgba.height());
-            Some(DecodedImage {
-                width: w,
-                height: h,
-                intrinsic_width: w,
-                intrinsic_height: h,
-                data: Arc::new(rgba.into_raw()),
-            })
-        }
+    match decode_and_install(src, &bytes) {
+        Ok(decoded) => Some(decoded),
         Err(e) => {
             eprintln!("[W3C OS] Failed to decode image {src}: {e}");
             None
