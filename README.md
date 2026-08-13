@@ -5,7 +5,7 @@
 [License](LICENSE)
 [Rust](https://www.rust-lang.org)
 
-**An AI-native operating system built on W3C standards. TypeScript + DOM compiled to native binaries. No browser. No V8.**
+**An AI-native operating system and application runtime built on W3C standards. TypeScript + DOM run as native code, without embedding Chromium or V8.**
 
 ![W3C OS Demo](docs/screenshot.png)
 
@@ -15,10 +15,12 @@ app.ts  →  w3cos build  →  native binary (2.4 MB)
 
 ## What is this?
 
-W3C OS is a Linux-based operating system where:
+W3C OS is a native Web application platform and Linux-based operating system where:
 
 - Applications use **standard W3C DOM + CSS** (the same APIs as the Web)
-- TypeScript is compiled to **native machine code** via Rust/LLVM (not interpreted)
+- TypeScript can be compiled **ahead of time to native machine code** via
+  Rust/LLVM, while dynamic browser-style documents use the shared W3IR/W3VM
+  semantic core
 - AI agents can **read and operate every UI element** directly through the DOM — no screenshot guessing
 - The system boots from a **minimal Linux kernel** directly into the W3C OS Shell
 
@@ -27,6 +29,20 @@ Write Web-standard code. Get native performance. Give AI full visibility.
 Implementation status is tracked per engine and target in the
 [Web API capability matrix](WEB_API_CAPABILITIES.md); planned work and exit
 gates live in the [roadmap](ROADMAP.md).
+
+## Current milestone
+
+The current `main` milestone is **native Web UI semantic parity**. The latest
+baseline expands the real DOM/CSSOM path, stylesheet matching, Flexbox/Grid
+layout, Fetch response streams, object-URL images, SVG rendering, native
+hit-testing and form-control behavior. Mobile generation now covers Android,
+iOS, and HarmonyOS, with incremental generated modules and an iOS native text
+and file-input bridge.
+
+This is active implementation, not a browser-conformance claim. Physical-device
+lifecycle, complete mobile gesture arbitration, host-backed device APIs, and
+the formal downstream application gates remain open. See the
+[capability matrix](WEB_API_CAPABILITIES.md) for exact per-target boundaries.
 
 ## Quick Start
 
@@ -44,16 +60,16 @@ cargo build --release
 ./showcase    # Opens a native window — no browser involved
 ```
 
-## Mobile (Android / iOS)
+## Mobile (Android / iOS / HarmonyOS)
 
-RN-like **shell + AOT app** — generic platform, no product-specific examples.
+Native **shell + AOT app** — generic platform, no product-specific examples.
 
 ```bash
 # Desktop dev (same TSX pipeline)
 w3cos build examples/mobile-demo/app.tsx -o mobile-demo --release
 
-# Scaffold Android shell project
-w3cos mobile init MyApp --platform android
+# Scaffold all platform shells
+w3cos mobile init MyApp --platform all
 ```
 
 See [docs/MOBILE.md](docs/MOBILE.md).
@@ -99,7 +115,7 @@ $ w3cos build app.tsx -o myapp --release
 | RAM Usage      | 200+ MB          | 100+ MB         | 80+ MB      | **~15 MB**           |
 | Startup        | 2-5 sec          | 1-3 sec         | 0.5-2 sec   | **< 100ms**          |
 | Language       | JS (V8 JIT)      | JS (Hermes)     | Dart (AOT)  | **TS (native AOT)**  |
-| Runtime        | Chromium         | Bridge + Native | Dart VM     | **None**             |
+| Runtime        | Chromium         | Bridge + Native | Dart VM     | **Native Rust (AOT/W3VM)** |
 | DOM API        | ✅ (browser only) | ❌               | ❌           | **✅ (system-wide)**  |
 | AI reads UI    | Screenshot       | Screenshot      | Screenshot  | **DOM tree (< 1ms)** |
 | Standard       | Proprietary      | Proprietary     | Proprietary | **W3C**              |
@@ -157,13 +173,13 @@ See [system/INSTALL.md](system/INSTALL.md) for the full installation guide.
 ## How It Works
 
 ```
-TypeScript (W3C DOM + CSS)            ← You write this
-        ↓  w3cos-compiler
-Rust source code (auto-generated)     ← AST transform
-        ↓  rustc + LLVM
-Native ELF/Mach-O binary              ← Machine code
-        ↓  Linux kernel
-Runs directly on hardware             ← No runtime
+TypeScript / JavaScript / TSX + DOM + CSS
+        ├─ AOT: SWC → generated Rust → rustc/LLVM → native binary
+        └─ Dynamic document: SWC → W3IR → W3VM
+                         ↓
+          Shared Value / Promise / DOM / Web API semantics
+                         ↓
+       Native layout, rendering, input, and platform hosts
 ```
 
 ### Generate Web API skeletons
@@ -205,12 +221,16 @@ mistake an omitted subsystem for conformance.
 | ------------ | ------------------------------------------------------------------------------------------------------------- | ------------------------------ |
 | CSS Layout   | [Taffy](https://github.com/DioxusLabs/taffy) 0.9                                                              | Flexbox, Grid, Block, position |
 | Text Layout  | [Parley](https://github.com/linebender/parley)                                                                | Line-breaking, shaping, bidi   |
-| 2D Rendering | [tiny-skia](https://github.com/nickel-org/tiny-skia) → [Vello](https://github.com/linebender/vello) (Phase 2) | Vector graphics                |
+| 2D Rendering | Skia (primary), Vello/tiny-skia compatibility backends                                                  | Raster and vector graphics     |
 | Windowing    | [winit](https://github.com/rust-windowing/winit)                                                              | Cross-platform native windows  |
 | OS Base      | Linux kernel (Debian Minimal / Buildroot)                                                                     | Drivers, processes, filesystem |
 
 
-## CSS Support
+## CSS support snapshot
+
+The table below is a high-level native rendering snapshot. It does not replace
+the per-surface and per-target qualifications in
+[WEB_API_CAPABILITIES.md](WEB_API_CAPABILITIES.md).
 
 
 | Feature                                 | Status |
@@ -243,6 +263,8 @@ mistake an omitted subsystem for conformance.
 w3cos/
 ├── crates/
 │   ├── w3cos-core/        # JS-compatible Value type, reactive system, Proxy
+│   ├── w3cos-ir/          # Versioned shared JavaScript IR
+│   ├── w3cos-vm/          # Dynamic W3IR execution backend
 │   ├── w3cos-std/         # Type definitions (Style, Component, Color)
 │   ├── w3cos-dom/         # W3C DOM API (Document, Element, Events)
 │   ├── w3cos-a11y/        # Accessibility tree (ARIA, for AI + screen readers)
@@ -250,12 +272,15 @@ w3cos/
 │   ├── w3cos-compiler/    # TS → Rust transpiler (SWC parser + CSS/SCSS)
 │   ├── w3cos-runtime/     # Layout + Rendering + Window + System APIs
 │   ├── w3cos-cli/         # CLI: w3cos build / run / dev / init / mobile
-│   ├── w3cos-mobile/    # Mobile platform (touch, safe area, Android JNI)
+│   ├── w3cos-mobile/      # Mobile host contracts and platform bridges
+│   ├── w3cos-ffi/         # Native library and C ABI bridge
 │   ├── w3cos-shell/       # System-level desktop shell binary
 │   ├── w3cos-demo/        # Showcase demo binary
 │   └── w3cos-rn-compat/   # React Native API compatibility layer
 ├── templates/
-│   ├── android/           # Gradle shell (RN-like)
+│   ├── android/           # Gradle + NativeActivity shell
+│   ├── ios/               # Xcode/UIKit shell
+│   ├── harmony/           # ArkUI/XComponent shell scaffold
 │   └── shared/            # app.tsx + w3cos.app.json starter
 ├── docs/MOBILE.md         # Mobile build guide
 ├── system/

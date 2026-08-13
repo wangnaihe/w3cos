@@ -1,7 +1,7 @@
 # W3C OS Roadmap
 
-Last replanned: **2026-07-25**
-Baseline: `main` @ `ae6e458`
+Last reconciled with implementation: **2026-08-13**
+Baseline: `main` @ `23808bc`
 
 ## North Star
 
@@ -45,6 +45,32 @@ Status:
 | **R3** | Mobile Production Runtime | Android/iOS touch, IME, viewport, lifecycle, and device validation pass |
 | **R4** | npm Compatibility | Package support is driven by repeatable compatibility gates |
 | **R5** | W3C OS Distribution | Shell, package lifecycle, permissions, updates, and system agent are production-ready |
+
+## Current implementation checkpoint
+
+The `23808bc` checkpoint advances native Web UI behavior without changing the
+release exit definitions below:
+
+- DOM-to-component lowering now preserves more browser control semantics,
+  stylesheet selector context, custom properties, replaced images, and SVG
+  children.
+- CSS/layout work covers additional declaration shorthands, `inline-flex`,
+  Grid placement/stretching, wrapped text constraints, and intrinsic image
+  sizing.
+- Fetch responses can expose native byte delivery through `ReadableStream`;
+  object URLs participate in Fetch and image decoding without enabling the
+  dynamic-JavaScript runtime.
+- Window interaction ordering now prefers the deepest live DOM control after
+  framework rebuilds, respects disabled/read-only states, and keeps native
+  focus, submit, text, composition, and viewport updates on the shared DOM
+  path.
+- Mobile code generation writes stable incremental module files for Android,
+  iOS, and HarmonyOS. The iOS host includes native text-input/keyboard handling
+  and a document-picker bridge for file inputs.
+
+These are source and focused-test milestones. They do not close the physical
+Android/iOS device, full gesture, lifecycle, signing, or downstream-product
+gates in R3.
 
 ---
 
@@ -247,7 +273,9 @@ suite is red.
   `engine`, `esm_surface`, `desktop`, `android`, `ios`, and `conformance`.
 - [ ] Remove DONE claims where only a Rust module exists.
 - [ ] Keep roadmap, README capability claims, and mobile documentation aligned
-  in the same change that lands an API.
+  in the same change that lands an API. The `23808bc` reconciliation updates
+  the current baseline; future capability changes still need this enforced as
+  a landing rule.
 
 **R0 exit:** required CI is green and every claimed Web API has an ESM-level
 test.
@@ -922,6 +950,8 @@ Rust-only modules are no longer advertised as browser APIs.
 - [x] `w3cos mobile dev` with debug DevTools plumbing.
 - [x] Safe-area inset storage and native setter.
 - [x] HarmonyOS ArkUI/XComponent shell scaffold with fail-closed build.
+- [x] Split generated ESM modules into stable per-module Rust sources and avoid
+  rewriting unchanged generated files, enabling incremental mobile rebuilds.
 
 ### R3.2 Touch and pointer input
 
@@ -945,18 +975,24 @@ Rust-only modules are no longer advertised as browser APIs.
 
 ### R3.3 IME and editable text
 
-- [ ] Connect native focus to `<input>`, `<textarea>`, and contenteditable.
+- [x] Connect the shared runtime focus path to native text controls on iOS,
+  including first-responder ownership and DOM value synchronization for
+  `<input>` and `<textarea>`.
+- [ ] Extend the native bridge to contenteditable on Android and iOS and prove
+  parity on physical devices.
 - [x] Implement text-control `select()`, `setSelectionRange()`, and
   `setRangeText()` with UTF-16 offsets, selection direction, replacement
   modes, and `IndexSizeError`.
-- [ ] Implement UTF-8 commit/delete, caret geometry, selection ranges, and
-  keyboard viewport resize.
-- [ ] Complete `beforeinput`, `input`, and `composition*` lifecycle with marked
-  text.
+- [x] Bridge iOS native text/marked-text state into DOM `beforeinput`, `input`,
+  and `composition*` events and synchronize keyboard viewport insets.
+- [ ] Complete exact caret geometry, selection-range round trips, Android IME,
+  and physical-device UTF-8 commit/delete validation.
 - [ ] Implement `inputmode`, `enterkeyhint`, secure input, and
   EditContext-compatible geometry.
 - [ ] Add CJK, emoji, RTL, paste, autocorrect, and hardware-keyboard device
   tests.
+- [x] Route iOS `<input type="file">` activation through a native document
+  picker and return selected files through the DOM `FileList` bridge.
 
 ### R3.4 Immersive viewport and shell
 

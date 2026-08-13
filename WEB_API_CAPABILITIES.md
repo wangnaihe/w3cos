@@ -11,7 +11,7 @@ test-suite compliance.
 | API family | Engine | ESM surface | Desktop | Android | iOS | Conformance |
 |---|---:|---:|---:|---:|---:|---:|
 | `Intl.NumberFormat`, `Intl.DateTimeFormat` | ⚠️ en-US/zh-CN/de-DE/fr-FR/ja-JP profiles + bundled IANA DST rules; broad CLDR pending | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Fetch, `Headers`, `Request`, `Response`, abort signals | ⚠️ pre-abort + native deadlines; concurrent in-flight abort pending async Promise execution | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Fetch, `Headers`, `Request`, `Response`, abort signals | ⚠️ pre-abort, redirects, binary/object-URL bodies and native response delivery through `ReadableStream`; browser-style requests have no implicit timeout, while concurrent in-flight abort remains pending exact async Promise execution | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Cache API (`caches`, `CacheStorage`, `Cache`) | ⚠️ Promise-based open/match/matchAll/put/add/addAll/delete/keys over process-local memory; persistence, quotas and cross-process coordination pending with warning | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Web Storage (`Storage`, `localStorage`, `sessionStorage`) | ✅ standard identity and synchronous key/value lifecycle | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Web Crypto (`Crypto`, `SubtleCrypto`) | ⚠️ secure random bytes/UUIDs; SubtleCrypto preserves Promise methods but rejects with warning until a native provider is configured | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ |
@@ -118,8 +118,9 @@ test-suite compliance.
 | Screen Orientation | ✅ | ✅ | ✅ | ⚠️ host facade | ⚠️ host facade | ✅ |
 | `VisualViewport` | ✅ standard illegal constructor identity, EventTarget inheritance, live geometry/scroll and handler surface | ✅ | ✅ | ✅ keyboard inset sync | ✅ keyboard inset sync | ✅ |
 | Touch capability reporting (`navigator.maxTouchPoints`) | ⚠️ live host value | ✅ | ✅ 0 | ⚠️ fallback 5 | ⚠️ fallback 5 | ✅ |
-| Pointer/touch input events | ⚠️ hit-tested paired Pointer/Touch lifecycle, standard Touch/TouchList identities and explicit capture; gesture arbitration pending | ✅ | ✅ runtime window path | ⚠️ direct adapter pending | ⚠️ direct adapter pending | ✅ |
-| Text-control selection/replacement APIs | ✅ UTF-16 selection + `setRangeText` modes | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Pointer/touch input events | ⚠️ hit-tested paired Pointer/Touch lifecycle, standard Touch/TouchList identities, explicit capture, deepest-live-control ordering and disabled-control filtering; direct mobile contact adapters and full gesture arbitration remain pending | ✅ | ✅ runtime window path | ⚠️ direct adapter pending | ⚠️ shared window path; exact UIKit contact adapter pending | ✅ |
+| Text-control selection/replacement and native editing | ⚠️ UTF-16 selection and `setRangeText` modes plus shared native focus/value/composition bridge; exact Android IME, contenteditable and physical-device selection geometry remain pending | ✅ | ✅ | ⚠️ adapter pending | ⚠️ native text/marked-text bridge | ✅ |
+| Native file-input picker | ⚠️ DOM file activation and `FileList` delivery; platform chooser/permission behavior is host-owned | ✅ | ⚠️ adapter pending | ⚠️ adapter pending | ✅ document picker bridge | ⚠️ focused host/runtime tests; physical device pending |
 | EditContext and TextFormat | ⚠️ UTF-16 text/selection replacement, TextUpdateEvent delivery, character/control/selection geometry, TextFormat identity and live HTMLElement attachment; native IME composition/format input requires a host adapter | ✅ | ✅ | ⚠️ | ⚠️ | ✅ |
 | Form constraint validation (`ValidityState`, controls/forms) | ⚠️ live required/type/range/step/length/custom-error checks, invalid events and form aggregation; HTML pattern parsing and native report UI warn as pending | ✅ | ✅ | ✅ | ✅ | ✅ |
 | computed style and stylesheet cascade | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
