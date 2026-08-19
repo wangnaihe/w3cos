@@ -7566,7 +7566,16 @@ fn main() {
                 "compiled for-await-of should consume a ReadableStream"
             );
         }
-        other => panic!("compiled for-await-of should fulfill: {other:?}"),
+        Some(w3cos_core::promise::PromiseStatus::Rejected(reason)) => {
+            panic!(
+                "compiled for-await-of should fulfill, rejected: {}",
+                reason.to_js_string()
+            )
+        }
+        Some(w3cos_core::promise::PromiseStatus::Pending) => {
+            panic!("compiled for-await-of should fulfill, still pending")
+        }
+        None => panic!("compiled for-await-of should fulfill, not a promise"),
     }
     let r = m0::m0_transformStreamShape(vec![]);
     assert!(
@@ -10124,7 +10133,11 @@ export async function main() {
             Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) => {
                 format!("fulfilled:{}", value.to_js_string())
             }
-            other => format!("unexpected:{other:?}"),
+            Some(w3cos_core::promise::PromiseStatus::Rejected(value)) => {
+                format!("rejected:{}", value.to_js_string())
+            }
+            Some(w3cos_core::promise::PromiseStatus::Pending) => "pending".into(),
+            None => "not-a-promise".into(),
         };
 
         let resolver = EsmResolver::new(&root);
@@ -10160,7 +10173,10 @@ fn main() {{
     match w3cos_core::promise::status(&promise) {{
         Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) =>
             println!("fulfilled:{{}}", value.to_js_string()),
-        other => println!("unexpected:{{other:?}}"),
+        Some(w3cos_core::promise::PromiseStatus::Rejected(value)) =>
+            println!("rejected:{{}}", value.to_js_string()),
+        Some(w3cos_core::promise::PromiseStatus::Pending) => println!("pending"),
+        None => println!("not-a-promise"),
     }}
 }}
 "#

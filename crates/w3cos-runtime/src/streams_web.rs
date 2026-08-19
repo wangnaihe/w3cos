@@ -428,8 +428,8 @@ fn reader_value(state: Rc<RefCell<ReadableState>>) -> Value {
             };
         }
 
-        if view.is_some() {
-            let view = view.clone();
+        if let Some(view) = view {
+            let pending_view = view.clone();
             let state_for_executor = Rc::clone(&state_for_read);
             let promise = w3cos_core::promise::new(vec![realm_stream_function(move |_, args| {
                 state_for_executor
@@ -438,14 +438,11 @@ fn reader_value(state: Rc<RefCell<ReadableState>>) -> Value {
                     .push_back(PendingRead {
                         resolve: args.first().cloned().unwrap_or(Value::Undefined),
                         reject: args.get(1).cloned().unwrap_or(Value::Undefined),
-                        view: view.clone(),
+                        view: Some(pending_view.clone()),
                     });
                 Value::Undefined
             })]);
-            if let Some(view) = view {
-                state_for_read.borrow_mut().byob_request =
-                    byob_request_value(&state_for_read, view);
-            }
+            state_for_read.borrow_mut().byob_request = byob_request_value(&state_for_read, view);
             let (source, controller) = {
                 let state = state_for_read.borrow();
                 (state.source.clone(), state.controller.clone())
