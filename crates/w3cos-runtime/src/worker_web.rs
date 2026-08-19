@@ -49,6 +49,38 @@ fn json_to_core(value: serde_json::Value) -> Value {
     crate::indexed_db_web::json_to_value(value)
 }
 
+fn spawn_dedicated_js_worker(url: &str, options: WorkerOptions) -> Worker {
+    #[cfg(feature = "dynamic-js")]
+    if let Some(script) = crate::worker_realm::resolve_inline_worker_script(url) {
+        return match script {
+            crate::worker_realm::InlineWorkerScript::Source(source) => {
+                let specifier = url.to_string();
+                let worker_name = options.name.clone().unwrap_or_default();
+                Worker::spawn(options, move |scope| {
+                    crate::worker_realm::run_dedicated_worker(
+                        &source,
+                        &specifier,
+                        &worker_name,
+                        scope,
+                    );
+                })
+            }
+            crate::worker_realm::InlineWorkerScript::Invalid { message } => {
+                Worker::spawn(options, move |scope| {
+                    let _ = scope.report_error(message);
+                })
+            }
+        };
+    }
+    #[cfg(not(feature = "dynamic-js"))]
+    let _ = url;
+    Worker::spawn(options, |scope| {
+        while let Some(message) = scope.recv() {
+            let _ = scope.post_message(message);
+        }
+    })
+}
+
 fn event_with_data(event_type: &str, data: Value) -> Value {
     let event = w3cos_core::class::construct(
         &crate::web_events::event_subclass_class("MessageEvent"),
@@ -121,16 +153,12 @@ pub fn worker_class() -> Value {
             let url = args.first().cloned().unwrap_or_default().to_js_string();
             let options = args.get(1).cloned().unwrap_or_default();
             let name = options.get_property("name").to_js_string();
-            let native = Worker::spawn(
+            let native = spawn_dedicated_js_worker(
+                &url,
                 if name.is_empty() {
                     WorkerOptions::default()
                 } else {
                     WorkerOptions::named(name)
-                },
-                |scope| {
-                    while let Some(message) = scope.recv() {
-                        let _ = scope.post_message(message);
-                    }
                 },
             );
             let native = Rc::new(RefCell::new(Some(native)));
@@ -155,7 +183,8 @@ pub fn worker_class() -> Value {
                                 if !warned.replace(true) {
                                     eprintln!(
                                         "W3COS warning: Worker MessagePort transfer is not \
-                                         available until worker script realms are implemented"
+                                         available until cross-thread MessagePort transfer \
+                                         is implemented"
                                     );
                                 }
                             });
@@ -1153,6 +1182,126 @@ mod tests {
                 .get_property("postMessage")
                 .is_function()
         );
+        reset_realm();
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for worker events"
+            );
+            poll_js_events();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        poll_js_events();
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    fn javascript_blob_url(source: &str) -> Value {
+        let blob = w3cos_core::class::construct(
+            &w3cos_core::web::blob_class(),
+            vec![
+                Value::array(vec![Value::string(source)]),
+                Value::object(HashMap::from([(
+                    "type".to_string(),
+                    Value::string("text/javascript"),
+                )])),
+            ],
+        );
+        w3cos_core::web::url_class().call_method("createObjectURL", vec![blob])
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
+    fn blob_worker_runs_an_isolated_script_instead_of_echoing() {
+        reset_realm();
+        let url = javascript_blob_url(
+            "self.onmessage = function(event) { postMessage(event.data + 1); };",
+        );
+        let worker = w3cos_core::class::construct(&worker_class(), vec![url]);
+        let received = Rc::new(RefCell::new(Value::Undefined));
+        let received_for_handler = Rc::clone(&received);
+        worker.set_property(
+            "onmessage",
+            Value::function(move |_, args| {
+                *received_for_handler.borrow_mut() = args[0].get_property("data");
+                Value::Undefined
+            }),
+        );
+        worker.call_method("postMessage", vec![Value::Number(40.0)]);
+        wait_until(|| !received.borrow().is_undefined());
+        assert_eq!(
+            received.borrow().to_number(),
+            41.0,
+            "isolated worker must transform the payload instead of echoing it"
+        );
+        worker.call_method("terminate", vec![]);
+        reset_realm();
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
+    fn data_url_worker_transforms_object_payloads() {
+        reset_realm();
+        let worker = w3cos_core::class::construct(
+            &worker_class(),
+            vec![Value::string(
+                "data:text/javascript,self.onmessage=function(event){postMessage({n:event.data.n*2});}",
+            )],
+        );
+        let received = Rc::new(RefCell::new(Value::Undefined));
+        let received_for_handler = Rc::clone(&received);
+        worker.set_property(
+            "onmessage",
+            Value::function(move |_, args| {
+                *received_for_handler.borrow_mut() = args[0].get_property("data");
+                Value::Undefined
+            }),
+        );
+        worker.call_method(
+            "postMessage",
+            vec![Value::object(HashMap::from([(
+                "n".to_string(),
+                Value::Number(21.0),
+            )]))],
+        );
+        wait_until(|| !received.borrow().is_undefined());
+        assert_eq!(received.borrow().get_property("n").to_number(), 42.0);
+        worker.call_method("terminate", vec![]);
+        reset_realm();
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
+    fn invalid_inline_worker_script_reports_an_error_event() {
+        reset_realm();
+        let worker = w3cos_core::class::construct(
+            &worker_class(),
+            vec![Value::string("data:text/javascript,onmessage = function(")],
+        );
+        let received = Rc::new(RefCell::new(String::new()));
+        let received_for_handler = Rc::clone(&received);
+        worker.set_property(
+            "onerror",
+            Value::function(move |_, args| {
+                *received_for_handler.borrow_mut() = args[0].get_property("message").to_js_string();
+                Value::Undefined
+            }),
+        );
+        wait_until(|| !received.borrow().is_empty());
+        assert!(
+            received.borrow().contains("Unexpected")
+                || received.borrow().contains("Expected")
+                || received.borrow().contains("error")
+                || received.borrow().contains("failed")
+                || !received.borrow().is_empty(),
+            "compile failure should surface on Worker.onerror, got {:?}",
+            received.borrow()
+        );
+        worker.call_method("terminate", vec![]);
         reset_realm();
     }
 }

@@ -59,7 +59,7 @@ test-suite compliance.
 | `BigInt` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` | ⚠️ explicit finalizer cleanup + warning | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ArrayBuffer`, `DataView`, typed arrays | ⚠️ shared views + same-type methods/change-by-copy + bounds errors + Float16Array/DataView/Math binary16 + resizable/growable buffers and transfer; automatic length-tracking views warn and retain their construction-time length | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `structuredClone` and message cloning | ⚠️ cycles + BigInt/Date/RegExp/collections/Error/DOMException/Blob/File/ImageData and exact ArrayBuffer/SharedArrayBuffer/TypedArray/DataView topology; ArrayBuffer/MessagePort same-thread transfer; Worker graph transport (Worker MessagePort transfer warns pending isolated realms) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `structuredClone` and message cloning | ⚠️ cycles + BigInt/Date/RegExp/collections/Error/DOMException/Blob/File/ImageData and exact ArrayBuffer/SharedArrayBuffer/TypedArray/DataView topology; ArrayBuffer/MessagePort same-thread transfer; Worker graph transport (Worker MessagePort transfer warns pending cross-thread transfer) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `SharedArrayBuffer`, `Atomics` | ⚠️ non-blocking wait fallback | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Blob`, `File`, `FileReader` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | File System Access / OPFS handles | ⚠️ standard handle/directory/file/writable-stream/observer identities, runtime-local OPFS root, Promise file reads/writes, seek/truncate, directory creation/traversal/removal/resolve and granted local permission results; native picker UI, origin quota policy and cross-process observation require host adapters and warn | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ |
@@ -107,7 +107,7 @@ test-suite compliance.
 | DOM collections (`NodeList`, `HTMLCollection`) | ✅ static selector snapshots + live tree/tag/class collections, iteration and named access | ✅ | ✅ | ✅ | ✅ | ✅ |
 | DOM traversal (`NodeFilter`, `TreeWalker`, `NodeIterator`) | ✅ masks, callable/object filters, directional/live traversal, Document roots and removal pointer repair | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Legacy globals and dynamic code (`escape`, `unescape`, `eval`, `Function`) | ⚠️ legacy encoding complete; string source compilation warns and returns undefined in AOT | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Worker`, `SharedWorker`, message ports/channels | ⚠️ echo Worker uses graph structured clone; MessagePort uses structured clone + ArrayBuffer/MessagePort transfer | ⚠️ Worker script execution/isolated realms and cross-thread MessagePort transfer pending with warning | ⚠️ | ⚠️ | ⚠️ | ✅ |
+| `Worker`, `SharedWorker`, message ports/channels | ⚠️ echo Worker uses graph structured clone; `dynamic-js` `blob:`/`data:` Workers run an isolated W3VM realm; MessagePort uses structured clone + ArrayBuffer/MessagePort transfer | ⚠️ HTTP/file/AOT Worker scripts, SharedWorker realms, and cross-thread MessagePort transfer pending with warning | ⚠️ | ⚠️ | ⚠️ | ✅ |
 | `BroadcastChannel` | ✅ same-name asynchronous fan-out + per-recipient structured clone + close/errors | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `EventSource` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `XMLHttpRequest` over Fetch | ✅ standard XMLHttpRequestEventTarget/Upload hierarchy and ProgressEvent delivery | ✅ | ✅ | ✅ | ✅ | ✅ |

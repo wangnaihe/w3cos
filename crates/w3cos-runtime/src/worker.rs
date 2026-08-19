@@ -308,6 +308,16 @@ impl WorkerScope {
     pub fn is_terminated(&self) -> bool {
         self.terminate.load(Ordering::SeqCst)
     }
+
+    #[cfg(feature = "dynamic-js")]
+    pub(crate) fn event_sender(&self) -> mpsc::Sender<WorkerEvent> {
+        self.outbox.clone()
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    pub(crate) fn terminate_flag(&self) -> Arc<AtomicBool> {
+        self.terminate.clone()
+    }
 }
 
 /// Errors mirroring the union of `DOMException` cases the worker APIs raise.
