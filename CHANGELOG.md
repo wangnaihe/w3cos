@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Linux `rfd` 0.15.4 `xdg-portal` builds enable the required `tokio` feature so `cargo check --workspace` compiles on current crates.io.
+- ReadableStream / FileSystem async iterators publish `__w3cos_symbol_async_iterator` so compiled `for await...of` matches the W3IR protocol (the camelCase alias remains).
+- Compiled jsdom SubtleCrypto smoke now exercises an unimplemented operation (`sign`); `digest` is implemented and no longer rejects.
 - AI PR Review workflow writes a single `test_count=` line when `grep -c` finds zero tests (avoids GitHub Actions `Invalid format '0'`).
 - `libc::mq_attr` initialization no longer names the removed `__pad` field (current `libc` / rustc 1.97).
 - README screenshot now renders as inline image instead of text link

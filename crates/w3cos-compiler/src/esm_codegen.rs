@@ -6710,7 +6710,9 @@ export function cryptoIdentityShape() {
   let subtleError = "";
   try { new Crypto(); } catch (error) { cryptoError = error.name; }
   try { new SubtleCrypto(); } catch (error) { subtleError = error.name; }
-  crypto.subtle.digest("SHA-256", new Uint8Array()).catch((error) => {
+  // SHA-256 digest is implemented via ring; an unimplemented SubtleCrypto
+  // method still rejects with NotSupportedError.
+  crypto.subtle.sign("HMAC", {}, new Uint8Array()).catch((error) => {
     subtleCryptoLog = error.name;
   });
   return typeof Crypto + ":" + typeof SubtleCrypto + ":" +

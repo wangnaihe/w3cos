@@ -660,10 +660,10 @@ fn readable_stream_async_iterator(
         }),
     );
     let iterator_slot_for_method = Rc::clone(&iterator_slot);
-    iterator.set_property(
-        "__w3cos_symbol_asyncIterator",
-        realm_stream_function(move |_, _| iterator_slot_for_method.borrow().clone()),
-    );
+    let async_iterator =
+        realm_stream_function(move |_, _| iterator_slot_for_method.borrow().clone());
+    iterator.set_property("__w3cos_symbol_async_iterator", async_iterator.clone());
+    iterator.set_property("__w3cos_symbol_asyncIterator", async_iterator);
     *iterator_slot.borrow_mut() = iterator.clone();
     iterator
 }
@@ -1169,12 +1169,11 @@ fn stream_value(source: Value, on_disturb: Value) -> Value {
         }),
     );
     let state_for_async_iterator = Rc::clone(&state);
-    stream.set_property(
-        "__w3cos_symbol_asyncIterator",
-        realm_stream_function(move |_, _| {
-            readable_stream_async_iterator(&state_for_async_iterator, false)
-        }),
-    );
+    let async_iterator = realm_stream_function(move |_, _| {
+        readable_stream_async_iterator(&state_for_async_iterator, false)
+    });
+    stream.set_property("__w3cos_symbol_async_iterator", async_iterator.clone());
+    stream.set_property("__w3cos_symbol_asyncIterator", async_iterator);
     w3cos_core::class::set_prototype_of(
         &stream,
         &readable_stream_class().get_property("prototype"),
@@ -2706,7 +2705,11 @@ mod tests {
     fn readable_stream_async_iterator_reads_returns_and_releases_locks() {
         let stream = readable_stream_class()
             .call_method("from", vec![Value::array(vec![Value::string("chunk")])]);
-        let iterator = stream.call_method("__w3cos_symbol_asyncIterator", vec![]);
+        let iterator = stream.call_method("__w3cos_symbol_async_iterator", vec![]);
+        assert_eq!(
+            iterator.call_method("__w3cos_symbol_async_iterator", vec![]),
+            iterator
+        );
         assert_eq!(
             iterator.call_method("__w3cos_symbol_asyncIterator", vec![]),
             iterator

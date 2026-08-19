@@ -856,6 +856,13 @@ impl Value {
             {
                 return iterator;
             }
+            // Host objects historically published the camelCase alias used by
+            // `Symbol.asyncIterator` in older ESM lowering.
+            if let Some(iterator) =
+                acquire_custom_iterator(self, "__w3cos_symbol_asyncIterator", args.clone())
+            {
+                return iterator;
+            }
             return self.call_method("__w3cos_symbol_iterator", args);
         }
         if key == "__w3cos_iterator_next" {
