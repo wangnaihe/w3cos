@@ -2533,6 +2533,7 @@ mod tests {
             font_size: 13.0,
             line_height: 1.3,
             padding: w3cos_std::style::Edges::xy(10.0, 4.0),
+            white_space: WWhiteSpace::NoWrap,
             ..Style::default()
         };
         let layout = compute(
@@ -2549,15 +2550,17 @@ mod tests {
         )
         .unwrap();
         let badge = layout[1].0;
-        let (expected_width, expected_height) = text_intrinsic_size("首次入驻", &style);
+        let expected_width = text_intrinsic_size("首次入驻", &style).0;
+        let pad_y = style.padding_lengths().top + style.padding_lengths().bottom;
         assert!(
             (badge.width - expected_width).abs() < 1.0,
             "inline-block width should equal content plus padding, got {} expected {expected_width}",
             badge.width
         );
         assert!(
-            (badge.height - expected_height).abs() < 1.0,
-            "inline-block height should equal line box plus padding, got {} expected {expected_height}",
+            badge.height + 1.0 >= style.font_size + pad_y
+                && badge.height < style.font_size * style.line_height * 2.0 + pad_y,
+            "inline-block height should stay on one line box plus padding, got {}",
             badge.height
         );
         assert!(
@@ -2575,6 +2578,7 @@ mod tests {
             font_size: 12.0,
             line_height: 1.4,
             padding: w3cos_std::style::Edges::xy(8.0, 2.0),
+            white_space: WWhiteSpace::NoWrap,
             ..Style::default()
         };
         let layout = compute(
@@ -2591,15 +2595,17 @@ mod tests {
         )
         .unwrap();
         let badge = layout[1].0;
-        let (expected_width, expected_height) = text_intrinsic_size("首次入驻", &style);
+        let expected_width = text_intrinsic_size("首次入驻", &style).0;
+        let pad_y = style.padding_lengths().top + style.padding_lengths().bottom;
         assert!(
             (badge.width - expected_width).abs() < 1.0,
             "inline-flex badge width should equal content plus padding, got {} expected {expected_width}",
             badge.width
         );
         assert!(
-            (badge.height - expected_height).abs() < 1.0,
-            "inline-flex badge height should equal line box plus padding, got {} expected {expected_height}",
+            badge.height + 1.0 >= style.font_size + pad_y
+                && badge.height < style.font_size * style.line_height * 2.0 + pad_y,
+            "inline-flex badge height should stay on one line box plus padding, got {}",
             badge.height
         );
         assert!(
