@@ -942,8 +942,13 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
     is retained only for geometry hit modes; painted instances continue to use
     the display tree. Nested clip-path children and clip-path-on-clip-path
     chains are intersected on isolated local-coordinate layers.
-  - [ ] Complete animation-aware subtree invalidation, tile-granular
-    rerasterization, and an optional direct GPU vector path.
+  - [x] Animation-aware subtree invalidation and 32px tile-granular
+    rerasterization when SVG topology and geometry stay the same. Paint-only
+    source mutations (typical of DOM `setAttribute` / presentation animation)
+    copy clean tiles and rerasterize only dirty bounding boxes. Topology or
+    geometry changes still take a full tiled raster. SMIL and Web Animations
+    still do not write computed values into this raster path.
+  - [ ] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
 - [x] Define cookie behavior: real per-origin session store instead of inert
   assignment.
 

@@ -3,9 +3,15 @@
 //! SVG content is normalized by usvg and rasterized by resvg. The cache key
 //! deliberately excludes CSS transform and opacity: those are compositor
 //! properties and must not force SVG parsing/rasterization on every frame.
+//!
+//! Paint-only mutations of an unchanged document topology (typical of SVG
+//! presentation animation) reuse 32px tiles whose dirty bounding boxes do
+//! not overlap. Topology or geometry changes still take a full tiled raster.
+//! Direct GPU vector tessellation is not implemented.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::image_loader::DecodedImage;
@@ -13,6 +19,9 @@ use w3cos_std::SvgEventTarget;
 
 const SVG_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const SVG_PARSE_CACHE_ENTRIES: usize = 128;
+const SVG_RASTER_TILE_SIZE: u32 = 32;
+const SVG_DIRTY_PAD_PX: f32 = 8.0;
+const SVG_SESSION_LIMIT: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct RasterKey {
@@ -72,11 +81,40 @@ struct HitMaskEntry {
     last_used: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SessionKey {
+    shape: u64,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone)]
+struct NodeRecord {
+    key: String,
+    paint: u64,
+    geometry: u64,
+    bounds: [f32; 4],
+}
+
+#[derive(Clone)]
+struct TilePixels {
+    width: u32,
+    height: u32,
+    data: Arc<[u8]>,
+}
+
+struct TiledSession {
+    records: Vec<NodeRecord>,
+    tiles: HashMap<(u32, u32), TilePixels>,
+    last_used: u64,
+}
+
 #[derive(Default)]
 struct SvgCache {
     parsed: HashMap<String, ParsedEntry>,
     rasters: HashMap<RasterKey, RasterEntry>,
     hit_masks: HashMap<HitMaskKey, HitMaskEntry>,
+    sessions: HashMap<SessionKey, TiledSession>,
     clock: u64,
     next_revision: u64,
     parse_hits: u64,
@@ -86,6 +124,8 @@ struct SvgCache {
     mask_hits: u64,
     mask_misses: u64,
     evictions: u64,
+    tile_hits: u64,
+    tile_misses: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,6 +141,8 @@ pub struct SvgCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    pub tile_hits: u64,
+    pub tile_misses: u64,
 }
 
 thread_local! {
@@ -128,7 +170,7 @@ pub fn get_or_render(source: &str, width: u32, height: u32) -> Option<DecodedIma
         }
 
         cache.misses = cache.misses.wrapping_add(1);
-        let image = rasterize(&tree, width, height);
+        let image = cache.rasterize_document(&tree, width, height, clock);
         let bytes = image
             .as_ref()
             .map(|image| image.data.len())
@@ -250,6 +292,8 @@ pub fn cache_stats() -> SvgCacheStats {
             hits: cache.hits,
             misses: cache.misses,
             evictions: cache.evictions,
+            tile_hits: cache.tile_hits,
+            tile_misses: cache.tile_misses,
         }
     })
 }
@@ -341,6 +385,73 @@ impl SvgCache {
         self.evict_parsed_entries();
         tree.zip(hit_tree)
             .map(|(tree, hit_tree)| (revision, tree, hit_tree, use_ids))
+    }
+
+    fn rasterize_document(
+        &mut self,
+        tree: &resvg::usvg::Tree,
+        width: u32,
+        height: u32,
+        clock: u64,
+    ) -> Option<DecodedImage> {
+        let records = collect_node_records(tree.root(), "root");
+        let shape = shape_identity(tree, &records);
+        let session_key = SessionKey {
+            shape,
+            width,
+            height,
+        };
+        let previous = self.sessions.remove(&session_key);
+        let dirty_tiles = previous
+            .as_ref()
+            .map(|session| dirty_tile_origins(&session.records, &records, width, height, tree))
+            .unwrap_or_else(|| all_tile_origins(width, height));
+        let mut tiles = previous.map(|session| session.tiles).unwrap_or_default();
+        let mut copied = 0_u64;
+        tiles.retain(|&origin, _| {
+            if dirty_tiles.contains(&origin) {
+                false
+            } else if origin.0 < width && origin.1 < height {
+                copied = copied.saturating_add(1);
+                true
+            } else {
+                false
+            }
+        });
+        let mut rerastered = 0_u64;
+        for origin in &dirty_tiles {
+            if let Some(tile) = rasterize_tile(tree, width, height, origin.0, origin.1) {
+                tiles.insert(*origin, tile);
+                rerastered = rerastered.saturating_add(1);
+            }
+        }
+        self.tile_hits = self.tile_hits.wrapping_add(copied);
+        self.tile_misses = self.tile_misses.wrapping_add(rerastered);
+        let image = compose_tiles(&tiles, width, height)?;
+        self.sessions.insert(
+            session_key,
+            TiledSession {
+                records,
+                tiles,
+                last_used: clock,
+            },
+        );
+        self.evict_sessions();
+        Some(image)
+    }
+
+    fn evict_sessions(&mut self) {
+        while self.sessions.len() > SVG_SESSION_LIMIT {
+            let Some(oldest) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.sessions.remove(&oldest);
+        }
     }
 
     fn evict_parsed_entries(&mut self) {
@@ -1125,18 +1236,42 @@ fn sanitize_svg_for_hit_testing(
     String::from_utf8(writer.into_inner()).ok()
 }
 
-fn rasterize(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Option<DecodedImage> {
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+fn rasterize_tile(
+    tree: &resvg::usvg::Tree,
+    width: u32,
+    height: u32,
+    tile_x: u32,
+    tile_y: u32,
+) -> Option<TilePixels> {
+    let tile_w = (tile_x + SVG_RASTER_TILE_SIZE)
+        .min(width)
+        .saturating_sub(tile_x);
+    let tile_h = (tile_y + SVG_RASTER_TILE_SIZE)
+        .min(height)
+        .saturating_sub(tile_y);
+    if tile_w == 0 || tile_h == 0 {
+        return None;
+    }
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(tile_w, tile_h)?;
     let size = tree.size();
-    let transform = resvg::tiny_skia::Transform::from_scale(
+    let transform = resvg::tiny_skia::Transform::from_row(
         width as f32 / size.width(),
+        0.0,
+        0.0,
         height as f32 / size.height(),
+        -(tile_x as f32),
+        -(tile_y as f32),
     );
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    resvg::render(tree, transform, &mut pixmap.as_mut());
+    Some(TilePixels {
+        width: tile_w,
+        height: tile_h,
+        data: Arc::from(unpremultiply_rgba(pixmap.data())),
+    })
+}
 
-    // tiny-skia stores premultiplied RGBA. The image paths shared by all W3COS
-    // backends consume straight-alpha RGBA, so normalize at the cache boundary.
-    let mut rgba = pixmap.data().to_vec();
+fn unpremultiply_rgba(data: &[u8]) -> Vec<u8> {
+    let mut rgba = data.to_vec();
     for pixel in rgba.chunks_exact_mut(4) {
         let alpha = pixel[3];
         if alpha == 0 || alpha == 255 {
@@ -1146,6 +1281,31 @@ fn rasterize(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Option<Decode
             *channel = ((*channel as u32 * 255 + alpha as u32 / 2) / alpha as u32).min(255) as u8;
         }
     }
+    rgba
+}
+
+fn compose_tiles(
+    tiles: &HashMap<(u32, u32), TilePixels>,
+    width: u32,
+    height: u32,
+) -> Option<DecodedImage> {
+    let mut rgba = vec![0_u8; width as usize * height as usize * 4];
+    for ((tile_x, tile_y), tile) in tiles {
+        for row in 0..tile.height {
+            let dest_y = *tile_y + row;
+            if dest_y >= height {
+                continue;
+            }
+            let dest_start = ((dest_y * width + *tile_x) * 4) as usize;
+            let src_start = (row * tile.width * 4) as usize;
+            let copy_w = ((*tile_x + tile.width).min(width) - *tile_x) as usize * 4;
+            let dest_end = dest_start + copy_w;
+            let src_end = src_start + copy_w;
+            if dest_end <= rgba.len() && src_end <= tile.data.len() {
+                rgba[dest_start..dest_end].copy_from_slice(&tile.data[src_start..src_end]);
+            }
+        }
+    }
     Some(DecodedImage {
         width,
         height,
@@ -1153,6 +1313,200 @@ fn rasterize(tree: &resvg::usvg::Tree, width: u32, height: u32) -> Option<Decode
         intrinsic_height: height,
         data: Arc::new(rgba),
     })
+}
+
+fn all_tile_origins(width: u32, height: u32) -> HashSet<(u32, u32)> {
+    let mut origins = HashSet::new();
+    let mut y = 0;
+    while y < height {
+        let mut x = 0;
+        while x < width {
+            origins.insert((x, y));
+            x = x.saturating_add(SVG_RASTER_TILE_SIZE);
+        }
+        y = y.saturating_add(SVG_RASTER_TILE_SIZE);
+    }
+    origins
+}
+
+fn dirty_tile_origins(
+    previous: &[NodeRecord],
+    next: &[NodeRecord],
+    width: u32,
+    height: u32,
+    tree: &resvg::usvg::Tree,
+) -> HashSet<(u32, u32)> {
+    let previous_map: HashMap<&str, &NodeRecord> = previous
+        .iter()
+        .map(|record| (record.key.as_str(), record))
+        .collect();
+    let next_map: HashMap<&str, &NodeRecord> = next
+        .iter()
+        .map(|record| (record.key.as_str(), record))
+        .collect();
+    let mut dirty = HashSet::new();
+    let scale_x = width as f32 / tree.size().width();
+    let scale_y = height as f32 / tree.size().height();
+    let mark = |dirty: &mut HashSet<(u32, u32)>, bounds: [f32; 4]| {
+        let left = ((bounds[0] * scale_x) - SVG_DIRTY_PAD_PX).floor().max(0.0) as u32;
+        let top = ((bounds[1] * scale_y) - SVG_DIRTY_PAD_PX).floor().max(0.0) as u32;
+        let right = ((bounds[0] + bounds[2]) * scale_x + SVG_DIRTY_PAD_PX)
+            .ceil()
+            .min(width as f32) as u32;
+        let bottom = ((bounds[1] + bounds[3]) * scale_y + SVG_DIRTY_PAD_PX)
+            .ceil()
+            .min(height as f32) as u32;
+        let mut y = top / SVG_RASTER_TILE_SIZE * SVG_RASTER_TILE_SIZE;
+        while y < bottom.max(top.saturating_add(1)) && y < height {
+            let mut x = left / SVG_RASTER_TILE_SIZE * SVG_RASTER_TILE_SIZE;
+            while x < right.max(left.saturating_add(1)) && x < width {
+                dirty.insert((x, y));
+                x = x.saturating_add(SVG_RASTER_TILE_SIZE);
+            }
+            y = y.saturating_add(SVG_RASTER_TILE_SIZE);
+        }
+    };
+    for record in next {
+        match previous_map.get(record.key.as_str()) {
+            Some(old) if old.paint == record.paint => {}
+            Some(old) => {
+                mark(&mut dirty, old.bounds);
+                mark(&mut dirty, record.bounds);
+            }
+            None => mark(&mut dirty, record.bounds),
+        }
+    }
+    for record in previous {
+        if !next_map.contains_key(record.key.as_str()) {
+            mark(&mut dirty, record.bounds);
+        }
+    }
+    if dirty.is_empty() {
+        return HashSet::new();
+    }
+    dirty
+}
+
+fn shape_identity(tree: &resvg::usvg::Tree, records: &[NodeRecord]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_debug(&mut hasher, &tree.size());
+    for record in records {
+        record.key.hash(&mut hasher);
+        record.geometry.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn hash_debug(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    value: &impl std::fmt::Debug,
+) {
+    format!("{value:?}").hash(hasher);
+}
+
+fn collect_node_records(group: &resvg::usvg::Group, prefix: &str) -> Vec<NodeRecord> {
+    let mut records = Vec::new();
+    collect_node_records_into(group, prefix, &mut records);
+    records
+}
+
+fn collect_node_records_into(
+    group: &resvg::usvg::Group,
+    prefix: &str,
+    records: &mut Vec<NodeRecord>,
+) {
+    records.push(node_record(
+        prefix,
+        "group",
+        &format!(
+            "{:?}:{:?}:{:?}:{}",
+            group.abs_transform(),
+            group.opacity(),
+            group.blend_mode(),
+            group.isolate()
+        ),
+        &format!(
+            "{:?}:{:?}:{}",
+            group.clip_path().is_some(),
+            group.mask().is_some(),
+            group.filters().len()
+        ),
+        group_bounds(group),
+    ));
+    for (index, node) in group.children().iter().enumerate() {
+        let key = if node.id().is_empty() {
+            format!("{prefix}/{index}")
+        } else {
+            node.id().to_string()
+        };
+        match node {
+            resvg::usvg::Node::Group(child) => {
+                collect_node_records_into(child, &key, records);
+            }
+            resvg::usvg::Node::Path(path) => records.push(node_record(
+                &key,
+                "path",
+                &format!(
+                    "{:?}:{:?}:{:?}:{}",
+                    path.fill(),
+                    path.stroke(),
+                    path.abs_transform(),
+                    path.is_visible()
+                ),
+                &format!("{:?}", path.data()),
+                path.abs_stroke_bounding_box(),
+            )),
+            resvg::usvg::Node::Image(image) => records.push(node_record(
+                &key,
+                "image",
+                &format!(
+                    "{:?}:{}:{:?}",
+                    image.abs_transform(),
+                    image.is_visible(),
+                    image.rendering_mode()
+                ),
+                &format!("{:?}", image.abs_bounding_box()),
+                image.abs_bounding_box(),
+            )),
+            resvg::usvg::Node::Text(text) => records.push(node_record(
+                &key,
+                "text",
+                &format!(
+                    "{:?}:{:?}:{:?}",
+                    text.abs_transform(),
+                    text.chunks(),
+                    text.flattened()
+                ),
+                &format!("{:?}", text.abs_bounding_box()),
+                text.abs_bounding_box(),
+            )),
+        }
+    }
+}
+
+fn group_bounds(group: &resvg::usvg::Group) -> resvg::usvg::Rect {
+    group.abs_layer_bounding_box().to_rect()
+}
+
+fn node_record(
+    key: &str,
+    kind: &str,
+    paint: &str,
+    geometry: &str,
+    bounds: resvg::usvg::Rect,
+) -> NodeRecord {
+    let mut paint_hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut paint_hasher);
+    paint.hash(&mut paint_hasher);
+    let mut geometry_hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut geometry_hasher);
+    geometry.hash(&mut geometry_hasher);
+    NodeRecord {
+        key: format!("{kind}:{key}"),
+        paint: paint_hasher.finish(),
+        geometry: geometry_hasher.finish(),
+        bounds: [bounds.x(), bounds.y(), bounds.width(), bounds.height()],
+    }
 }
 
 #[cfg(test)]
@@ -1222,6 +1576,95 @@ mod tests {
         assert_eq!(stats.parse_misses, 2);
         assert_eq!(stats.parse_hits, 1);
         assert_eq!(stats.misses, 3);
+    }
+
+    fn pixel_at(image: &DecodedImage, x: u32, y: u32) -> [u8; 4] {
+        let index = ((y * image.width + x) * 4) as usize;
+        image.data[index..index + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn paint_only_mutation_reuses_tiles_outside_the_dirty_bounds() {
+        clear_cache();
+        let red = r##"<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+            <rect id="stable" x="80" y="80" width="40" height="40" fill="#0000ff"/>
+            <rect id="anim" x="0" y="0" width="24" height="24" fill="#ff0000"/>
+        </svg>"##;
+        let green = red.replace("#ff0000", "#00ff00");
+        let first = get_or_render(red, 128, 128).unwrap();
+        let after_first = cache_stats();
+        let second = get_or_render(&green, 128, 128).unwrap();
+        let stats = cache_stats();
+        assert!(
+            stats.tile_hits > after_first.tile_hits,
+            "unchanged tiles should be copied, hits {} -> {}",
+            after_first.tile_hits,
+            stats.tile_hits
+        );
+        let new_tile_misses = stats.tile_misses - after_first.tile_misses;
+        let new_tile_hits = stats.tile_hits - after_first.tile_hits;
+        assert!(
+            new_tile_misses < new_tile_hits,
+            "dirty tiles ({new_tile_misses}) should be fewer than reused tiles ({new_tile_hits})"
+        );
+        assert_eq!(pixel_at(&first, 100, 100), pixel_at(&second, 100, 100));
+        assert_ne!(pixel_at(&first, 8, 8), pixel_at(&second, 8, 8));
+        assert!(pixel_at(&second, 8, 8)[1] > pixel_at(&second, 8, 8)[0]);
+    }
+
+    #[test]
+    fn topology_change_does_not_reuse_stale_tiles() {
+        clear_cache();
+        let base = r##"<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+            <rect id="stable" x="80" y="80" width="40" height="40" fill="#0000ff"/>
+        </svg>"##;
+        let extra = r##"<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+            <rect id="stable" x="80" y="80" width="40" height="40" fill="#0000ff"/>
+            <circle id="extra" cx="16" cy="16" r="12" fill="#ff0000"/>
+        </svg>"##;
+        let without = get_or_render(base, 128, 128).unwrap();
+        let after_first = cache_stats();
+        let with_circle = get_or_render(extra, 128, 128).unwrap();
+        let stats = cache_stats();
+        assert_eq!(
+            stats.tile_hits, after_first.tile_hits,
+            "a new node must not copy tiles from a different document topology"
+        );
+        assert_ne!(pixel_at(&without, 16, 16), pixel_at(&with_circle, 16, 16));
+        assert_eq!(
+            pixel_at(&without, 100, 100),
+            pixel_at(&with_circle, 100, 100)
+        );
+    }
+
+    #[test]
+    fn text_fill_mutation_reuses_tiles_outside_the_dirty_bounds() {
+        clear_cache();
+        let red = r##"<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+            <rect id="stable" x="80" y="80" width="40" height="40" fill="#0000ff"/>
+            <text id="anim" x="4" y="24" font-size="20" fill="#ff0000">Hi</text>
+        </svg>"##;
+        let green = red.replace("#ff0000", "#00ff00");
+        let first = get_or_render(red, 128, 128).unwrap();
+        let after_first = cache_stats();
+        let second = get_or_render(&green, 128, 128).unwrap();
+        let stats = cache_stats();
+        assert!(
+            stats.tile_hits > after_first.tile_hits,
+            "unchanged tiles should be copied after a text fill change"
+        );
+        assert!(
+            stats.tile_misses > after_first.tile_misses,
+            "text fill change should rerasterize the glyph tiles"
+        );
+        assert_eq!(pixel_at(&first, 100, 100), pixel_at(&second, 100, 100));
+        let changed = (0..48)
+            .flat_map(|y| (0..48).map(move |x| (x, y)))
+            .any(|(x, y)| pixel_at(&first, x, y) != pixel_at(&second, x, y));
+        assert!(
+            changed,
+            "text fill change should alter pixels in the glyph region"
+        );
     }
 
     #[test]
