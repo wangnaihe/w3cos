@@ -56,6 +56,6 @@ See [docs/MOBILE.md](../../docs/MOBILE.md) and [examples/mobile-demo](../../exam
 | `w3cos.app.json` manifest | ✅ parse |
 | Desktop dev fallback | ✅ |
 | Android JNI entry | 🚧 skeleton |
-| Touch → DOM | 🚧 stub |
+| Touch → DOM | ✅ shared jsdom hit-test; MotionEvent/UITouch adapters pending |
 | iOS host | ✅ winit/UIKit runtime |
 | iOS on-device `SpeechRecognition` | 🚧 zh-CN adapter implemented; device validation required |

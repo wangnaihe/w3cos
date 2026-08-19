@@ -977,10 +977,14 @@ Rust-only modules are no longer advertised as browser APIs.
   `PointerEvent` and `TouchEvent` lifecycles, including stable identifiers,
   active/target/changed `TouchList` snapshots, pressure, cancel, primary-touch
   selection, and `preventDefault()` feedback.
-- [ ] Replace the standalone `w3cos-mobile::touch::TouchEvent::dispatch()`
-  compatibility placeholder and wire Android MotionEvent / iOS UITouch direct
-  surface adapters; the placeholder now emits a one-time warning instead of
-  silently succeeding.
+- [x] Replace the standalone `w3cos-mobile::touch::TouchEvent::dispatch()`
+  compatibility placeholder with hit-tested dispatch into the shared jsdom
+  PointerEvent/TouchEvent path (CSSOM boxes, same geometry as
+  `document.elementFromPoint`). A miss on `Start` is ignored; active contacts
+  keep their target through later phases.
+- [ ] Wire Android MotionEvent / iOS UITouch direct surface adapters; the
+  shared DTO path does not replace those host contact adapters. Exact hardware
+  simultaneous-contact reporting and gesture arbitration remain pending.
 - [x] Implement explicit pointer capture by pointer id, event retargeting,
   `gotpointercapture` / `lostpointercapture`, implicit release, and
   `NotFoundError` for inactive pointers.
