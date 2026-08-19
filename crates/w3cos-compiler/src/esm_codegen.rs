@@ -7405,6 +7405,12 @@ export function runXhr(url) {
   return xhr.status + ":" + xhr.response.accepted + ":" +
     xhr.getResponseHeader("x-reply") + ":" + events + ":" +
     (xhr instanceof XMLHttpRequest) + ":" + (xhr instanceof EventTarget);
+}
+export function abortInFlightFetch(url) {
+  const controller = new AbortController();
+  Promise.resolve().then(() => controller.abort("from-promise"));
+  const response = fetch(url, { signal: controller.signal, cache: "no-store" });
+  return response.type + ":" + response.statusText + ":" + controller.signal.aborted;
 }"#,
         )
         .unwrap();
@@ -8524,6 +8530,32 @@ fn main() {
         "XMLHttpRequest Fetch compatibility round trip: {r:?}"
     );
     xhr_server.join().unwrap();
+    let abort_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let abort_port = abort_listener.local_addr().unwrap().port();
+    let abort_server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = abort_listener.accept().unwrap();
+        let mut request = [0_u8; 2048];
+        let _ = stream.read(&mut request);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlate",
+        );
+    });
+    let started = std::time::Instant::now();
+    let r = m0::m0_abortInFlightFetch(vec![w3cos_core::Value::from(format!(
+        "http://127.0.0.1:{abort_port}/slow"
+    ))]);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "compiled in-flight abort should not wait for native I/O: {elapsed:?}"
+    );
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "error:AbortError: from-promise:true"),
+        "compiled Promise abort should interrupt in-flight AOT fetch: {r:?}"
+    );
+    abort_server.join().unwrap();
     let r = m0::m0_socketShape(vec![]);
     assert!(
         matches!(&r, w3cos_core::Value::String(s) if s == "function:0:1:2:3"),

@@ -11,7 +11,7 @@ test-suite compliance.
 | API family | Engine | ESM surface | Desktop | Android | iOS | Conformance |
 |---|---:|---:|---:|---:|---:|---:|
 | `Intl.NumberFormat`, `Intl.DateTimeFormat` | ⚠️ en-US/zh-CN/de-DE/fr-FR/ja-JP profiles + bundled IANA DST rules; broad CLDR pending | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Fetch, `Headers`, `Request`, `Response`, abort signals | ⚠️ pre-abort, redirects, binary/object-URL bodies and native response delivery through `ReadableStream`; browser-style requests have no implicit timeout, while concurrent in-flight abort remains pending exact async Promise execution | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Fetch, `Headers`, `Request`, `Response`, abort signals | ⚠️ pre-abort, redirects, binary/object-URL bodies and native response delivery through `ReadableStream`; browser-style requests have no implicit timeout; in-flight AbortController abort from Promise/microtask/timer pumps interrupts native AOT Fetch without waiting for the transport deadline | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Cache API (`caches`, `CacheStorage`, `Cache`) | ⚠️ Promise-based open/match/matchAll/put/add/addAll/delete/keys over process-local memory; persistence, quotas and cross-process coordination pending with warning | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Web Storage (`Storage`, `localStorage`, `sessionStorage`) | ✅ standard identity and synchronous key/value lifecycle | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Web Crypto (`Crypto`, `SubtleCrypto`) | ⚠️ secure random bytes/UUIDs; SubtleCrypto preserves Promise methods but rejects with warning until a native provider is configured | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ |

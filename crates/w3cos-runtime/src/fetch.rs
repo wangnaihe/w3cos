@@ -526,7 +526,10 @@ fn fetch_page_response(
     signal: &Value,
 ) -> Result<(FetchResponse, &'static str), String> {
     let Some(document_url) = crate::cookie_store_web::active_document_url_if_set() else {
-        return Ok((fetch(url, options), "basic"));
+        if signal.is_undefined() {
+            return Ok((fetch(url, options), "basic"));
+        }
+        return fetch_native_interruptible(url, options, signal);
     };
     let document = url::Url::parse(&document_url)
         .map_err(|error| format!("the active document URL is invalid: {error}"))?;
@@ -739,6 +742,58 @@ fn page_http_cache_key(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Run native Fetch I/O on a worker while pumping timers and Promise
+/// microtasks so compiled AOT `await` / `then` can abort an in-flight request.
+fn fetch_native_interruptible(
+    url: &str,
+    options: FetchOptions,
+    signal: &Value,
+) -> Result<(FetchResponse, &'static str), String> {
+    let (sender, receiver) = mpsc::channel();
+    let worker_url = url.to_string();
+    thread::spawn(move || {
+        let result = fetch_inner(&worker_url, &options).map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+
+    loop {
+        if signal.get_property("aborted").to_bool() {
+            return Err("fetch was aborted".to_string());
+        }
+        match receiver.recv_timeout(std::time::Duration::from_millis(2)) {
+            Ok(result) => {
+                crate::jsdom::tick_timers();
+                crate::jsdom::drain_microtasks();
+                if signal.get_property("aborted").to_bool() {
+                    return Err("fetch was aborted".to_string());
+                }
+                return match result {
+                    Ok(response) => Ok((response, "basic")),
+                    Err(error) => Ok((
+                        FetchResponse {
+                            status: 0,
+                            ok: false,
+                            status_text: error,
+                            headers: HashMap::new(),
+                            url: url.to_string(),
+                            redirected: false,
+                            body_stream: ReadableStream::from_bytes(Vec::new()),
+                        },
+                        "basic",
+                    )),
+                };
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                crate::jsdom::tick_timers();
+                crate::jsdom::drain_microtasks();
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("fetch worker disconnected".to_string());
+            }
+        }
+    }
+}
+
 fn fetch_page_bytes_interruptible(
     url: &str,
     options: FetchOptions,
@@ -4614,6 +4669,105 @@ mod tests {
             "TimeoutError: TimeoutError"
         );
         server.join().expect("timeout-abort fixture completed");
+    }
+
+    #[test]
+    fn aot_fetch_abort_from_promise_interrupts_in_flight_native_request() {
+        crate::cookie_store_web::reset_document_context();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind aot-abort fixture");
+        let address = listener.local_addr().expect("aot-abort fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept aot-abort request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).expect("read aot-abort request");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlate",
+            );
+        });
+
+        let controller = w3cos_core::class::construct(&abort_controller_class(), vec![]);
+        let signal = controller.get_property("signal");
+        let controller_for_promise = controller.clone();
+        w3cos_core::promise::resolve(vec![Value::Undefined]).call_method(
+            "then",
+            vec![Value::function(move |_, _| {
+                controller_for_promise.call_method("abort", vec![Value::from("from-promise")]);
+                Value::Undefined
+            })],
+        );
+        let started = std::time::Instant::now();
+        let response = fetch_value(vec![
+            Value::from(format!("http://{address}/aot-slow")),
+            Value::object(HashMap::from([
+                ("signal".into(), signal.clone()),
+                ("cache".into(), Value::from("no-store")),
+            ])),
+        ]);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert!(signal.get_property("aborted").to_bool());
+        assert_eq!(response.get_property("type").to_js_string(), "error");
+        assert_eq!(
+            response.get_property("statusText").to_js_string(),
+            "AbortError: from-promise"
+        );
+        server.join().expect("aot-abort fixture completed");
+    }
+
+    #[test]
+    fn aot_fetch_abort_from_timeout_interrupts_in_flight_native_request() {
+        crate::cookie_store_web::reset_document_context();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind aot-timer-abort fixture");
+        let address = listener
+            .local_addr()
+            .expect("aot-timer-abort fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept aot-timer-abort request");
+            let mut request = [0_u8; 2048];
+            let _ = stream
+                .read(&mut request)
+                .expect("read aot-timer-abort request");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlate",
+            );
+        });
+
+        let controller = w3cos_core::class::construct(&abort_controller_class(), vec![]);
+        let signal = controller.get_property("signal");
+        let controller_for_timer = controller.clone();
+        crate::jsdom::schedule_timeout_value(
+            Value::function(move |_, _| {
+                controller_for_timer.call_method("abort", vec![Value::from("from-timer")]);
+                Value::Undefined
+            }),
+            10,
+        );
+        let started = std::time::Instant::now();
+        let response = fetch_value(vec![
+            Value::from(format!("http://{address}/aot-timer")),
+            Value::object(HashMap::from([
+                ("signal".into(), signal.clone()),
+                ("cache".into(), Value::from("no-store")),
+            ])),
+        ]);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert!(signal.get_property("aborted").to_bool());
+        assert_eq!(
+            response.get_property("statusText").to_js_string(),
+            "AbortError: from-timer"
+        );
+        server.join().expect("aot-timer-abort fixture completed");
     }
 
     #[test]
