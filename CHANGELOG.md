@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **SVG paint-only tile invalidation** — retained SVG rasters reuse 32px tiles when document topology and geometry stay the same and only paint (fill/stroke/opacity/visibility/text chunks) changes. Dirty bounding boxes are rerasterized with an 8px pad; topology or geometry changes still take a full tiled raster. SMIL/Web Animations still do not write computed values into this path, and there is no GPU vector tessellation.
 - **Isolated dedicated Worker realms (dynamic-js)** — `new Worker(blob:)` / `new Worker(data:)` capture script bytes on the parent thread and execute them on the worker OS thread with a fresh W3VM (`self`, `postMessage`, `self.onmessage`). W3IR still rejects top-level undeclared `onmessage = …`. HTTP/file/dummy URLs still echo structured-clone messages. SharedWorker, AOT-compiled worker scripts, and MessagePort transfer into a worker are still unimplemented.
 - **AOT Fetch in-flight abort** — without a page document URL, `fetch` with an AbortSignal runs native I/O on a worker and pumps timers/microtasks, so `Promise.then` / timer abort returns AbortError without waiting for the transport deadline. Background ureq I/O may still finish.
 
