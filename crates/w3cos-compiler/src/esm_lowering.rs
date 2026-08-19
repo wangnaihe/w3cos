@@ -301,7 +301,9 @@ impl LowerCtx {
             // Resolve every otherwise-unbound name through the Window
             // environment record instead of maintaining package-specific
             // allowlists in the compiler.
-            format!("w3cos_runtime::jsdom::window_value().get_property({name:?})")
+            format!(
+                "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value(), &w3cos_core::Value::string({name:?}))"
+            )
         } else {
             resolved
         }
@@ -2895,11 +2897,11 @@ impl LowerCtx {
         if self.dynamic_values {
             return match &member.prop {
                 MemberProp::Ident(id) => format!(
-                    "w3cos_core::intrinsics::get_property(&{obj}, &w3cos_core::Value::string({:?}))",
+                    "w3cos_core::intrinsics::get_property_checked(&{obj}, &w3cos_core::Value::string({:?}))",
                     id.sym.to_string()
                 ),
                 MemberProp::Computed(computed) => format!(
-                    "w3cos_core::intrinsics::get_property(&{obj}, &{})",
+                    "w3cos_core::intrinsics::get_property_checked(&{obj}, &{})",
                     self.lower_expr(&computed.expr)
                 ),
                 MemberProp::PrivateName(name) => {
@@ -5132,16 +5134,12 @@ mod tests {
         let code = context.lower_stmts(&statements);
 
         assert!(
-            code.contains("__w3cos_array_items.push(first)"),
-            "leading item: {code}"
-        );
-        assert!(
-            code.contains("__w3cos_array_items.extend((rest).iter())"),
-            "spread item: {code}"
-        );
-        assert!(
-            code.contains("__w3cos_array_items.push(last)"),
-            "trailing item: {code}"
+            code.contains("__w3cos_array_items.push(")
+                && code.contains("Value::string(\"first\")")
+                && code.contains("__w3cos_array_items.extend((")
+                && code.contains("Value::string(\"rest\")")
+                && code.contains("Value::string(\"last\")"),
+            "leading/spread/trailing items: {code}"
         );
         assert!(
             code.contains("Value::array(__w3cos_array_items)"),
@@ -5274,12 +5272,19 @@ mod tests {
         let code = ctx.lower_stmts(&stmts);
 
         assert!(
-            code.contains(".get_property_checked(\"next\")"),
+            code.contains("w3cos_core::intrinsics::get_property_checked(")
+                && code.contains("Value::string(\"next\")"),
             "direct member access must preserve JavaScript TypeError semantics: {code}"
         );
         assert!(
-            code.contains(".is_nullish()") && code.contains(".get_property(\"next\")"),
+            code.contains(".is_nullish()")
+                && code.contains("w3cos_core::intrinsics::get_property("),
             "optional chaining must keep its explicit nullish guard: {code}"
+        );
+        assert_eq!(
+            code.matches("get_property_checked").count(),
+            1,
+            "optional chaining must not use the throwing GetValue helper: {code}"
         );
     }
 
@@ -5292,9 +5297,11 @@ mod tests {
         let code = ctx.lower_stmts(&stmts);
 
         assert!(
-            code.contains("\"prototype\".to_string()")
-                && code.contains("\"hasOwnProperty\".to_string()")
-                && code.contains("__this.call_method(\"hasOwnProperty\", __args)"),
+            code.contains("w3cos_core::object_value()")
+                && code.contains("Value::string(\"prototype\")")
+                && code.contains("Value::string(\"hasOwnProperty\")")
+                && code.contains("w3cos_core::intrinsics::call_method(")
+                && code.contains("Value::string(\"call\")"),
             "Object.prototype.hasOwnProperty must remain extractable: {code}"
         );
     }
@@ -5306,7 +5313,9 @@ mod tests {
         let code = ctx.lower_stmts(&stmts);
 
         assert!(
-            code.contains("w3cos_core::math_value().get_property_checked(\"clz32\")"),
+            code.contains(
+                "w3cos_core::intrinsics::get_property_checked(&w3cos_core::math_value(), &w3cos_core::Value::string(\"clz32\"))"
+            ),
             "extracted Math methods must use the standard builtin facade: {code}"
         );
     }
@@ -5342,7 +5351,7 @@ mod tests {
         );
         assert!(
             code.contains("let mut ctx = ctx.clone();")
-                && code.contains("w3cos_core::intrinsics::get_property(&ctx.clone()"),
+                && code.contains("w3cos_core::intrinsics::get_property_checked(&ctx.clone()"),
             "nested JSX callback must clone ctx before use: {code}"
         );
     }
@@ -5394,7 +5403,8 @@ mod tests {
             "optionalPackageHook",
         ] {
             assert!(
-                code.contains(&format!("Value::string({name:?})")),
+                code.contains(&format!("Value::string({name:?})"))
+                    && code.contains("w3cos_runtime::jsdom::window_value()"),
                 "optional global {name}: {code}"
             );
         }
@@ -5435,7 +5445,8 @@ mod tests {
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::intrinsics::bitwise_not(&suspended)"),
+            code.contains("w3cos_core::intrinsics::bitwise_not(")
+                && code.contains("Value::string(\"suspended\")"),
             "bitwise not must not degrade to the operand: {code}"
         );
     }
@@ -5764,7 +5775,8 @@ const sel = getSelection();"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("let _ = w3cos_core::intrinsics::call(&reload"),
+            code.contains("let _ = w3cos_core::intrinsics::call(")
+                && code.contains("Value::string(\"reload\")"),
             "void operand must still be evaluated: {code}"
         );
         assert!(
@@ -5889,7 +5901,8 @@ const params = new URLSearchParams("a=1");"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("let __assign_value = arr")
+            code.contains("let __assign_value =")
+                && code.contains("Value::string(\"arr\")")
                 && code.contains("a = w3cos_core::intrinsics::get_property(&__assign_value")
                 && code.contains("b = w3cos_core::intrinsics::get_property(&__assign_value"),
             "array destructuring assignment: {code}"
@@ -5966,7 +5979,9 @@ const params = new URLSearchParams("a=1");"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("for (__index, __item) in items.iter().enumerate()"),
+            code.contains("for (__index, __item) in")
+                && code.contains(".iter().enumerate()")
+                && code.contains("Value::string(\"items\")"),
             "enumerate loop: {code}"
         );
         assert!(
@@ -6154,12 +6169,12 @@ function f(window) { return window.x; }"#,
             "local `document` shadows the global: {code}"
         );
         assert!(
-            code.contains("w3cos_core::intrinsics::get_property(&document.clone()")
+            code.contains("w3cos_core::intrinsics::get_property_checked(&document.clone()")
                 && code.contains("Value::string(\"title\")"),
             "shadowed member read: {code}"
         );
         assert!(
-            code.contains("return w3cos_core::intrinsics::get_property(&window")
+            code.contains("return w3cos_core::intrinsics::get_property_checked(&window")
                 && code.contains("Value::string(\"x\")"),
             "fn param `window` shadows the global: {code}"
         );
@@ -6332,7 +6347,7 @@ function f(window) { return window.x; }"#,
             "regexp literal → runtime value: {code}"
         );
         assert!(
-            code.contains("w3cos_core::intrinsics::call_method(&value")
+            code.contains("w3cos_core::intrinsics::call_method(")
                 && code.contains("Value::string(\"match\")"),
             "reserved Rust words must remain unchanged as JS property keys: {code}"
         );
@@ -6344,9 +6359,10 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::intrinsics::delete_property(&options")
+            code.contains("w3cos_core::intrinsics::delete_property(")
                 && code.contains("Value::string(\"model\")")
-                && code.contains("&key)"),
+                && code.contains("Value::string(\"options\")")
+                && code.contains("Value::string(\"key\")"),
             "delete must perform a runtime property mutation: {code}"
         );
     }
@@ -6445,7 +6461,7 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]).with_classes(class_names(&["Animal"]));
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::intrinsics::instance_of(&dog, &Animal())"),
+            code.contains("w3cos_core::intrinsics::instance_of(") && code.contains("&Animal()"),
             "instanceof → shared instance_of intrinsic: {code}"
         );
     }
@@ -6643,7 +6659,7 @@ function f(window) { return window.x; }"#,
             "member update: {code}"
         );
         assert!(
-            code.contains("return w3cos_core::intrinsics::get_property(&__this.clone()"),
+            code.contains("return w3cos_core::intrinsics::get_property_checked(&__this.clone()"),
             "this read: {code}"
         );
     }

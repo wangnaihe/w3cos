@@ -2049,11 +2049,15 @@ createRoot(document.getElementById("root")!).render(App());"#,
             !bundle_rs.contains("host_modules::call(\"react"),
             "framework packages must compile from their real sources: {bundle_rs}"
         );
-        let main_marker = format!("/// ESM module: {}", root.join("src/main.tsx").display());
+        let main_marker = "/// ESM module: /__w3cos_bundle__/main.tsx";
         assert_eq!(
-            bundle_rs.matches(&main_marker).count(),
+            bundle_rs.matches(main_marker).count(),
             1,
             "a path containing `..` must not create a phantom duplicate entry module: {bundle_rs}"
+        );
+        assert!(
+            !bundle_rs.contains("nested/../main.tsx") && !bundle_rs.contains("/src/nested/"),
+            "lexically nested `..` paths must collapse to one virtual entry: {bundle_rs}"
         );
         std::fs::remove_dir_all(&root).ok();
     }

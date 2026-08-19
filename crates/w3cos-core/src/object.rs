@@ -42,6 +42,10 @@ pub struct JsObject {
     pub(crate) class_brand: Option<u64>,
     pub(crate) private_brands: HashSet<u64>,
     pub(crate) private_elements: HashMap<(u64, String), PrivateElement>,
+    /// Own keys that are not enumerable. Ordinary data properties default to
+    /// enumerable; `Object.defineProperty` can clear the flag so `for-in` and
+    /// `CopyDataProperties` skip them, matching ECMAScript.
+    non_enumerable: HashSet<String>,
     heap_allocation: HeapAllocation,
 }
 
@@ -59,6 +63,7 @@ impl JsObject {
             class_brand: None,
             private_brands: HashSet::new(),
             private_elements: HashMap::new(),
+            non_enumerable: HashSet::new(),
             heap_allocation,
         }
     }
@@ -79,6 +84,7 @@ impl JsObject {
             class_brand: None,
             private_brands: HashSet::new(),
             private_elements: HashMap::new(),
+            non_enumerable: HashSet::new(),
             heap_allocation,
         };
         object.refresh_heap_accounting();
@@ -104,6 +110,7 @@ impl JsObject {
             class_brand: None,
             private_brands: HashSet::new(),
             private_elements: HashMap::new(),
+            non_enumerable: HashSet::new(),
             heap_allocation,
         };
         object.refresh_heap_accounting();
@@ -130,6 +137,7 @@ impl JsObject {
             class_brand: None,
             private_brands: HashSet::new(),
             private_elements: HashMap::new(),
+            non_enumerable: HashSet::new(),
             heap_allocation,
         };
         object.refresh_heap_accounting();
@@ -228,6 +236,7 @@ impl JsObject {
         let removed = self.properties.remove(key).is_some();
         if removed {
             self.property_order.retain(|candidate| candidate != key);
+            self.non_enumerable.remove(key);
         }
         if removed && key.starts_with("__w3cos_getter_") {
             self.has_getter_properties = self
@@ -269,7 +278,10 @@ impl JsObject {
             let mut desc = HashMap::new();
             desc.insert("value".into(), self.properties[key].clone());
             desc.insert("writable".into(), Value::Bool(true));
-            desc.insert("enumerable".into(), Value::Bool(true));
+            desc.insert(
+                "enumerable".into(),
+                Value::Bool(!self.non_enumerable.contains(key)),
+            );
             desc.insert("configurable".into(), Value::Bool(true));
             Value::object(desc)
         } else {
@@ -288,7 +300,10 @@ impl JsObject {
             if let Some(setter) = setter {
                 desc.insert("set".into(), setter.clone());
             }
-            desc.insert("enumerable".into(), Value::Bool(true));
+            desc.insert(
+                "enumerable".into(),
+                Value::Bool(!self.non_enumerable.contains(key)),
+            );
             desc.insert("configurable".into(), Value::Bool(true));
             Value::object(desc)
         }
@@ -310,6 +325,13 @@ impl JsObject {
                 }
                 self.properties.insert(key.to_string(), val.clone());
                 self.refresh_heap_accounting();
+            }
+            if let Some(enumerable) = desc.properties.get("enumerable") {
+                if enumerable.to_bool() {
+                    self.non_enumerable.remove(key);
+                } else {
+                    self.non_enumerable.insert(key.to_string());
+                }
             }
         }
         true
@@ -434,6 +456,7 @@ impl JsObject {
         clone.prototype = self.prototype.clone();
         clone.has_getter_properties = self.has_getter_properties;
         clone.call_slot = self.call_slot.clone();
+        clone.non_enumerable = self.non_enumerable.clone();
         Value::Object(Rc::new(RefCell::new(clone)))
     }
 }
@@ -465,6 +488,29 @@ mod tests {
         assert!(!obj.has_direct("b"));
         obj.delete("a");
         assert!(!obj.has_direct("a"));
+    }
+
+    #[test]
+    fn define_property_can_clear_enumerable() {
+        let mut obj =
+            JsObject::from_map(HashMap::from([("hidden".to_string(), Value::Number(1.0))]));
+        assert!(
+            obj.get_own_property_descriptor("hidden")
+                .get_property("enumerable")
+                .to_bool()
+        );
+        obj.define_property(
+            "hidden",
+            &Value::object(HashMap::from([
+                ("value".into(), Value::Number(1.0)),
+                ("enumerable".into(), Value::Bool(false)),
+            ])),
+        );
+        assert!(
+            !obj.get_own_property_descriptor("hidden")
+                .get_property("enumerable")
+                .to_bool()
+        );
     }
 
     #[test]

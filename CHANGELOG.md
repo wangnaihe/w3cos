@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **AOT Fetch in-flight abort** — without a page document URL, `fetch` with an AbortSignal runs native I/O on a worker and pumps timers/microtasks, so `Promise.then` / timer abort returns AbortError without waiting for the transport deadline. Background ureq I/O may still finish.
+
+### Fixed
+- **Main compiler CI** — `cargo test -p w3cos-compiler --lib --tests` now matches current ESM lowering (unbound names through the window intrinsic, `GetValue` via `get_property_checked`) and `for-in` skips non-enumerable `Object.prototype` methods. These suites were unreachable on `main` until #40 unblocked `cargo check`.
 - **ReadableStream BYOB filling** — `ReadableStreamBYOBReader.read(view)` now copies queued bytes into the supplied ArrayBufferView and returns a same-buffer prefix view. Byte-stream controllers expose a live `byobRequest`; `respond()` / `respondWithNewView()` complete in-flight BYOB reads. Leftover queued bytes stay available for the next read.
 - **Compiled `for await...of`** — W3IR/AOT lowering of `for await...of` over async iterables and `ReadableStream` is covered by compiled-JS and AOT/W3VM differential tests.
 - **Web Workers** (`w3cos_runtime::worker`) — W3C-standard background execution mapped onto native OS threads:
