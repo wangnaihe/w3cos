@@ -1,8 +1,9 @@
 //! Isolated dedicated-worker realms for inline `blob:` / `data:` scripts.
 //!
 //! Ordinary AOT `Worker` hosts still echo structured-clone messages. This
-//! module is compiled only with `dynamic-js`: it lowers the captured source
-//! with SWC → W3IR, then runs a fresh W3VM on the worker OS thread so parent
+//! module is compiled only with `dynamic-js`: the parent thread resolves the
+//! inline URL (object URLs are thread-local), then the worker OS thread
+//! lowers the captured source with SWC → W3IR and runs a fresh W3VM so parent
 //! `Value` graphs (`Rc`) never cross the thread boundary.
 
 use std::collections::HashMap;
