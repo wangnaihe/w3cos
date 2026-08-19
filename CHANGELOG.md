@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **ReadableStream BYOB filling** — `ReadableStreamBYOBReader.read(view)` now copies queued bytes into the supplied ArrayBufferView and returns a same-buffer prefix view. Byte-stream controllers expose a live `byobRequest`; `respond()` / `respondWithNewView()` complete in-flight BYOB reads. Leftover queued bytes stay available for the next read.
+- **Compiled `for await...of`** — W3IR/AOT lowering of `for await...of` over async iterables and `ReadableStream` is covered by compiled-JS and AOT/W3VM differential tests.
 - **Web Workers** (`w3cos_runtime::worker`) — W3C-standard background execution mapped onto native OS threads:
   - `Worker::spawn(opts, body)` runs a Rust closure on a dedicated thread; the closure receives a `WorkerScope` with browser-equivalent `recv` / `try_recv` / `post_message` / `report_error` methods.
   - `Worker::post_message` / `try_recv` / `poll_events` mirror the parent-side `MessageEvent` / `ErrorEvent` queue.

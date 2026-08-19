@@ -11,6 +11,7 @@ use w3cos_core::Value;
 struct PendingRead {
     resolve: Value,
     reject: Value,
+    view: Option<Value>,
 }
 
 struct ReadableState {
@@ -23,6 +24,7 @@ struct ReadableState {
     controller: Value,
     on_disturb: Value,
     disturbed: bool,
+    byob_request: Value,
 }
 
 struct WritableState {
@@ -72,7 +74,6 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
     static VALUE_CELLS: RefCell<Vec<Weak<RefCell<Value>>>> =
         const { RefCell::new(Vec::new()) };
-    static BYOB_WARNING_EMITTED: RefCell<bool> = const { RefCell::new(false) };
     static COMPRESSION_BUFFERING_WARNING_EMITTED: RefCell<bool> = const { RefCell::new(false) };
 }
 
@@ -105,6 +106,182 @@ fn read_result(value: Value, done: bool) -> Value {
     ]))
 }
 
+fn typed_array_from_bytes(bytes: &[u8]) -> Value {
+    w3cos_core::binary::typed_array_value(
+        bytes
+            .iter()
+            .map(|byte| Value::Number(*byte as f64))
+            .collect(),
+    )
+}
+
+fn view_byte_length(view: &Value) -> usize {
+    w3cos_core::binary::array_buffer_view_range(view)
+        .map(|(_, _, length)| length)
+        .unwrap_or(0)
+}
+
+fn take_queued_bytes(state: &mut ReadableState, max: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while out.len() < max {
+        let Some(chunk) = state.queue.pop_front() else {
+            break;
+        };
+        let Some(bytes) = w3cos_core::binary::bytes_of(&chunk) else {
+            continue;
+        };
+        let need = max - out.len();
+        if bytes.len() <= need {
+            out.extend_from_slice(&bytes);
+        } else {
+            out.extend_from_slice(&bytes[..need]);
+            state
+                .queue
+                .push_front(typed_array_from_bytes(&bytes[need..]));
+            break;
+        }
+    }
+    out
+}
+
+fn fulfill_pending(pending: PendingRead, value: Value, done: bool) {
+    pending
+        .resolve
+        .call(Value::Undefined, vec![read_result(value, done)]);
+}
+
+fn closed_byob_result(view: &Value) -> Value {
+    w3cos_core::binary::slice_array_buffer_view(view, 0).unwrap_or(Value::Undefined)
+}
+
+fn enqueue_chunk(state: &Rc<RefCell<ReadableState>>, chunk: Value) {
+    let is_byte_stream = {
+        let current = state.borrow();
+        if current.closed || current.error.is_some() {
+            type_error("ReadableStreamDefaultController cannot enqueue after close");
+        }
+        current.source.get_property("type").to_js_string() == "bytes"
+    };
+    if is_byte_stream {
+        if let Some(bytes) = w3cos_core::binary::bytes_of(&chunk) {
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                let pending = state.borrow_mut().pending.pop_front();
+                let Some(pending) = pending else {
+                    state
+                        .borrow_mut()
+                        .queue
+                        .push_back(typed_array_from_bytes(&remaining));
+                    return;
+                };
+                if let Some(view) = pending.view.clone() {
+                    let filled = w3cos_core::binary::fill_array_buffer_view(&view, &remaining)
+                        .unwrap_or(view);
+                    let written = view_byte_length(&filled);
+                    remaining = remaining.get(written..).unwrap_or(&[]).to_vec();
+                    state.borrow_mut().byob_request = Value::Null;
+                    fulfill_pending(pending, filled, false);
+                } else {
+                    fulfill_pending(pending, typed_array_from_bytes(&remaining), false);
+                    return;
+                }
+            }
+            return;
+        }
+    }
+    if let Some(pending) = state.borrow_mut().pending.pop_front() {
+        if pending.view.is_some() {
+            type_error("A byte ReadableStream BYOB read requires an ArrayBufferView chunk");
+        }
+        fulfill_pending(pending, chunk, false);
+    } else {
+        state.borrow_mut().queue.push_back(chunk);
+    }
+}
+
+fn close_readable(state: &Rc<RefCell<ReadableState>>) {
+    let pending = {
+        let mut current = state.borrow_mut();
+        if current.closed || current.error.is_some() {
+            type_error("ReadableStreamDefaultController is already closed");
+        }
+        current.closed = true;
+        current.byob_request = Value::Null;
+        current.pending.drain(..).collect::<Vec<_>>()
+    };
+    for pending in pending {
+        if let Some(view) = pending.view.clone() {
+            fulfill_pending(pending, closed_byob_result(&view), true);
+        } else {
+            fulfill_pending(pending, Value::Undefined, true);
+        }
+    }
+}
+
+fn byob_request_value(state: &Rc<RefCell<ReadableState>>, view: Value) -> Value {
+    let consumed = Rc::new(Cell::new(false));
+    let view_cell = Rc::new(RefCell::new(view.clone()));
+    let state_for_respond = Rc::clone(state);
+    let consumed_for_respond = Rc::clone(&consumed);
+    let view_for_respond = Rc::clone(&view_cell);
+    let respond = realm_stream_function(move |_, args| {
+        if consumed_for_respond.replace(true) {
+            type_error("ReadableStreamBYOBRequest has already been responded to");
+        }
+        let written = args.first().map(Value::to_u32).unwrap_or(0) as usize;
+        let view = view_for_respond.borrow().clone();
+        let capacity = view_byte_length(&view);
+        if written > capacity {
+            type_error("BYOB respond byte length is larger than the supplied view");
+        }
+        let filled = w3cos_core::binary::slice_array_buffer_view(&view, written).unwrap_or(view);
+        let pending = {
+            let mut current = state_for_respond.borrow_mut();
+            current.byob_request = Value::Null;
+            current.pending.pop_front()
+        };
+        let done = written == 0 && state_for_respond.borrow().closed;
+        if let Some(pending) = pending {
+            fulfill_pending(pending, filled, done);
+        }
+        Value::Undefined
+    });
+    let state_for_new_view = Rc::clone(state);
+    let consumed_for_new_view = Rc::clone(&consumed);
+    let respond_with_new_view = realm_stream_function(move |_, args| {
+        if consumed_for_new_view.replace(true) {
+            type_error("ReadableStreamBYOBRequest has already been responded to");
+        }
+        let view = args.first().cloned().unwrap_or(Value::Undefined);
+        if !w3cos_core::binary::is_array_buffer_view(&view) {
+            type_error("respondWithNewView requires an ArrayBufferView");
+        }
+        let pending = {
+            let mut current = state_for_new_view.borrow_mut();
+            current.byob_request = Value::Null;
+            current.pending.pop_front()
+        };
+        if let Some(pending) = pending {
+            fulfill_pending(pending, view, false);
+        }
+        Value::Undefined
+    });
+    let view_for_getter = Rc::clone(&view_cell);
+    let request = Value::object(HashMap::from([
+        (
+            "__w3cos_getter_view".into(),
+            realm_stream_function(move |_, _| view_for_getter.borrow().clone()),
+        ),
+        ("respond".into(), respond),
+        ("respondWithNewView".into(), respond_with_new_view),
+    ]));
+    w3cos_core::class::set_prototype_of(
+        &request,
+        &readable_stream_byob_request_class().get_property("prototype"),
+    );
+    request
+}
+
 fn type_error(message: &str) -> ! {
     w3cos_core::throw_value(Value::object(HashMap::from([
         ("name".into(), Value::string("TypeError")),
@@ -129,39 +306,16 @@ fn disturb(state: &Rc<RefCell<ReadableState>>) {
 fn controller_value(state: &Rc<RefCell<ReadableState>>) -> Value {
     let state_for_enqueue = Rc::clone(state);
     let enqueue = realm_stream_function(move |_, args| {
-        let chunk = args.first().cloned().unwrap_or(Value::Undefined);
-        let pending = {
-            let mut state = state_for_enqueue.borrow_mut();
-            if state.closed || state.error.is_some() {
-                type_error("ReadableStreamDefaultController cannot enqueue after close");
-            }
-            state.pending.pop_front()
-        };
-        if let Some(pending) = pending {
-            pending
-                .resolve
-                .call(Value::Undefined, vec![read_result(chunk, false)]);
-        } else {
-            state_for_enqueue.borrow_mut().queue.push_back(chunk);
-        }
+        enqueue_chunk(
+            &state_for_enqueue,
+            args.first().cloned().unwrap_or(Value::Undefined),
+        );
         Value::Undefined
     });
 
     let state_for_close = Rc::clone(state);
     let close = realm_stream_function(move |_, _| {
-        let pending = {
-            let mut state = state_for_close.borrow_mut();
-            if state.closed || state.error.is_some() {
-                type_error("ReadableStreamDefaultController is already closed");
-            }
-            state.closed = true;
-            state.pending.drain(..).collect::<Vec<_>>()
-        };
-        for pending in pending {
-            pending
-                .resolve
-                .call(Value::Undefined, vec![read_result(Value::Undefined, true)]);
-        }
+        close_readable(&state_for_close);
         Value::Undefined
     });
 
@@ -175,6 +329,7 @@ fn controller_value(state: &Rc<RefCell<ReadableState>>) -> Value {
             }
             state.error = Some(reason.clone());
             state.queue.clear();
+            state.byob_request = Value::Null;
             state.pending.drain(..).collect::<Vec<_>>()
         };
         for pending in pending {
@@ -199,7 +354,20 @@ fn controller_value(state: &Rc<RefCell<ReadableState>>) -> Value {
                 }
             }),
         ),
-        ("byobRequest".into(), Value::Null),
+        (
+            "__w3cos_getter_byobRequest".into(),
+            realm_stream_function({
+                let state_for_byob = Rc::clone(state);
+                move |_, _| {
+                    let request = state_for_byob.borrow().byob_request.clone();
+                    if request.is_null() || request.is_undefined() {
+                        Value::Null
+                    } else {
+                        request
+                    }
+                }
+            }),
+        ),
     ]));
     let byte_stream = state.borrow().source.get_property("type").to_js_string() == "bytes";
     w3cos_core::class::set_prototype_of(
@@ -216,12 +384,35 @@ fn controller_value(state: &Rc<RefCell<ReadableState>>) -> Value {
 
 fn reader_value(state: Rc<RefCell<ReadableState>>) -> Value {
     let state_for_read = Rc::clone(&state);
-    let read = realm_stream_function(move |_, _| {
+    let read = realm_stream_function(move |_, args| {
         disturb(&state_for_read);
+        let view = args
+            .first()
+            .cloned()
+            .filter(|value| !value.is_undefined() && !value.is_null());
+        if let Some(view) = view.clone() {
+            if !w3cos_core::binary::is_array_buffer_view(&view) {
+                type_error("BYOB read requires an ArrayBufferView");
+            }
+            if view_byte_length(&view) == 0 {
+                type_error("BYOB view must have a non-zero byteLength");
+            }
+        }
         let immediate = {
             let mut state = state_for_read.borrow_mut();
             if let Some(reason) = state.error.clone() {
                 Some(Err(reason))
+            } else if let Some(view) = view.clone() {
+                let available = take_queued_bytes(&mut state, view_byte_length(&view));
+                if !available.is_empty() {
+                    let filled = w3cos_core::binary::fill_array_buffer_view(&view, &available)
+                        .unwrap_or(view);
+                    Some(Ok(read_result(filled, false)))
+                } else if state.closed {
+                    Some(Ok(read_result(closed_byob_result(&view), true)))
+                } else {
+                    None
+                }
             } else if let Some(chunk) = state.queue.pop_front() {
                 Some(Ok(read_result(chunk, false)))
             } else if state.closed {
@@ -235,6 +426,35 @@ fn reader_value(state: Rc<RefCell<ReadableState>>) -> Value {
                 Ok(value) => w3cos_core::promise::resolve(vec![value]),
                 Err(reason) => w3cos_core::promise::reject(vec![reason]),
             };
+        }
+
+        if view.is_some() {
+            let view = view.clone();
+            let state_for_executor = Rc::clone(&state_for_read);
+            let promise = w3cos_core::promise::new(vec![realm_stream_function(move |_, args| {
+                state_for_executor
+                    .borrow_mut()
+                    .pending
+                    .push_back(PendingRead {
+                        resolve: args.first().cloned().unwrap_or(Value::Undefined),
+                        reject: args.get(1).cloned().unwrap_or(Value::Undefined),
+                        view: view.clone(),
+                    });
+                Value::Undefined
+            })]);
+            if let Some(view) = view {
+                state_for_read.borrow_mut().byob_request =
+                    byob_request_value(&state_for_read, view);
+            }
+            let (source, controller) = {
+                let state = state_for_read.borrow();
+                (state.source.clone(), state.controller.clone())
+            };
+            let pull = source.get_property("pull");
+            if pull.is_function() {
+                pull.call(source, vec![controller]);
+            }
+            return promise;
         }
 
         let (source, controller) = {
@@ -272,6 +492,7 @@ fn reader_value(state: Rc<RefCell<ReadableState>>) -> Value {
                 .push_back(PendingRead {
                     resolve: args.first().cloned().unwrap_or(Value::Undefined),
                     reject: args.get(1).cloned().unwrap_or(Value::Undefined),
+                    view: None,
                 });
             Value::Undefined
         })])
@@ -852,6 +1073,7 @@ fn stream_value(source: Value, on_disturb: Value) -> Value {
         controller: Value::Undefined,
         on_disturb,
         disturbed: false,
+        byob_request: Value::Null,
     }));
     track_readable_state(&state);
     let controller = controller_value(&state);
@@ -870,14 +1092,6 @@ fn stream_value(source: Value, on_disturb: Value) -> Value {
                 .first()
                 .is_some_and(|value| value.get_property("mode").to_js_string() == "byob")
             {
-                BYOB_WARNING_EMITTED.with(|emitted| {
-                    if !std::mem::replace(&mut *emitted.borrow_mut(), true) {
-                        eprintln!(
-                            "[w3cos] warning: ReadableStream BYOB reads preserve compatible \
-                             locking and delivery but do not yet write chunks into the supplied view"
-                        );
-                    }
-                });
                 {
                     let mut state = state_for_reader.borrow_mut();
                     if state.locked {
@@ -1712,18 +1926,15 @@ pub fn text_decoder_stream_class() -> Value {
                             args.get(1)
                                 .cloned()
                                 .unwrap_or(Value::Undefined)
-                                .call_method(
-                                    "error",
-                                    vec![Value::object(HashMap::from([
-                                        ("name".into(), Value::string("TypeError")),
-                                        (
-                                            "message".into(),
-                                            Value::string(
-                                                "TextDecoderStream chunks must be BufferSource values",
-                                            ),
+                                .call_method("error", vec![Value::object(HashMap::from([
+                                    ("name".into(), Value::string("TypeError")),
+                                    (
+                                        "message".into(),
+                                        Value::string(
+                                            "TextDecoderStream chunks must be BufferSource values",
                                         ),
-                                    ]))],
-                                );
+                                    ),
+                                ]))]);
                             return Value::Undefined;
                         };
                         buffered_for_transform.borrow_mut().extend(bytes);
@@ -1740,8 +1951,7 @@ pub fn text_decoder_stream_class() -> Value {
                                 .map(|byte| Value::Number(byte as f64))
                                 .collect(),
                         );
-                        let decoded =
-                            decoder_for_flush.call_method("decode", vec![chunk]);
+                        let decoded = decoder_for_flush.call_method("decode", vec![chunk]);
                         if !decoded.to_js_string().is_empty() {
                             args.first()
                                 .cloned()
@@ -1752,8 +1962,7 @@ pub fn text_decoder_stream_class() -> Value {
                     }),
                 ),
             ]));
-            let value =
-                w3cos_core::class::construct(&transform_stream_class(), vec![transformer]);
+            let value = w3cos_core::class::construct(&transform_stream_class(), vec![transformer]);
             value.set_property("encoding", encoding);
             value.set_property("fatal", Value::Bool(fatal));
             value.set_property("ignoreBOM", Value::Bool(ignore_bom));
@@ -1870,18 +2079,15 @@ fn compression_stream_class_inner(decompress: bool) -> Value {
                             args.get(1)
                                 .cloned()
                                 .unwrap_or(Value::Undefined)
-                                .call_method(
-                                    "error",
-                                    vec![Value::object(HashMap::from([
-                                        ("name".into(), Value::string("TypeError")),
-                                        (
-                                            "message".into(),
-                                            Value::string(
-                                                "Compression stream chunks must be BufferSource values",
-                                            ),
+                                .call_method("error", vec![Value::object(HashMap::from([
+                                    ("name".into(), Value::string("TypeError")),
+                                    (
+                                        "message".into(),
+                                        Value::string(
+                                            "Compression stream chunks must be BufferSource values",
                                         ),
-                                    ]))],
-                                );
+                                    ),
+                                ]))]);
                             return Value::Undefined;
                         };
                         buffered_for_transform.borrow_mut().extend(bytes);
@@ -1920,8 +2126,7 @@ fn compression_stream_class_inner(decompress: bool) -> Value {
                     }),
                 ),
             ]));
-            let value =
-                w3cos_core::class::construct(&transform_stream_class(), vec![transformer]);
+            let value = w3cos_core::class::construct(&transform_stream_class(), vec![transformer]);
             value.set_property("format", Value::string(&format));
             w3cos_core::class::set_prototype_of(
                 &value,
@@ -2096,6 +2301,7 @@ pub fn reset_realm() {
                 state.controller = Value::Undefined;
                 state.on_disturb = Value::Undefined;
                 state.disturbed = true;
+                state.byob_request = Value::Null;
             }
         }
     });
@@ -2900,8 +3106,117 @@ mod tests {
             &reader,
             &readable_stream_byob_reader_class()
         ));
+        let dest = w3cos_core::binary::typed_array_value(vec![
+            Value::Number(0.0),
+            Value::Number(0.0),
+            Value::Number(9.0),
+        ]);
         let result = Rc::new(RefCell::new(Value::Undefined));
         let result_for_callback = Rc::clone(&result);
+        reader.call_method("read", vec![dest.clone()]).call_method(
+            "then",
+            vec![Value::function(move |_, args| {
+                *result_for_callback.borrow_mut() = args[0].get_property("value");
+                Value::Undefined
+            })],
+        );
+        w3cos_core::promise::drain_microtasks();
+        let filled = result.borrow().clone();
+        assert_eq!(w3cos_core::binary::bytes_of(&filled).unwrap(), vec![1, 2]);
+        assert!(
+            filled
+                .get_property("buffer")
+                .strict_eq(&dest.get_property("buffer"))
+        );
+        assert_eq!(filled.get_property("byteLength").to_number(), 2.0);
+        assert_eq!(dest.get_property("0").to_number(), 1.0);
+        assert_eq!(dest.get_property("1").to_number(), 2.0);
+        assert_eq!(dest.get_property("2").to_number(), 9.0);
+    }
+
+    #[test]
+    fn byte_stream_byob_request_respond_fills_the_supplied_view() {
+        let source = Value::object(HashMap::from([("type".into(), Value::string("bytes"))]));
+        source.set_property(
+            "pull",
+            Value::function(|_, args| {
+                let request = args[0].get_property("byobRequest");
+                assert!(w3cos_core::class::instance_of(
+                    &request,
+                    &readable_stream_byob_request_class()
+                ));
+                let view = request.get_property("view");
+                view.set_property("0", Value::Number(11.0));
+                view.set_property("1", Value::Number(12.0));
+                request.call_method("respond", vec![Value::Number(2.0)]);
+                Value::Undefined
+            }),
+        );
+        let stream = w3cos_core::class::construct(&readable_stream_class(), vec![source]);
+        let reader = stream.call_method(
+            "getReader",
+            vec![Value::object(HashMap::from([(
+                "mode".into(),
+                Value::string("byob"),
+            )]))],
+        );
+        let dest = w3cos_core::binary::typed_array_value(vec![
+            Value::Number(0.0),
+            Value::Number(0.0),
+            Value::Number(0.0),
+            Value::Number(0.0),
+        ]);
+        let result = Rc::new(RefCell::new(Value::Undefined));
+        let result_for_callback = Rc::clone(&result);
+        reader.call_method("read", vec![dest.clone()]).call_method(
+            "then",
+            vec![Value::function(move |_, args| {
+                *result_for_callback.borrow_mut() = args[0].clone();
+                Value::Undefined
+            })],
+        );
+        w3cos_core::promise::drain_microtasks();
+        let result = result.borrow().clone();
+        let value = result.get_property("value");
+        assert!(!result.get_property("done").to_bool());
+        assert_eq!(w3cos_core::binary::bytes_of(&value).unwrap(), vec![11, 12]);
+        assert!(
+            value
+                .get_property("buffer")
+                .strict_eq(&dest.get_property("buffer"))
+        );
+        assert_eq!(dest.get_property("0").to_number(), 11.0);
+        assert_eq!(dest.get_property("1").to_number(), 12.0);
+        assert_eq!(dest.get_property("2").to_number(), 0.0);
+    }
+
+    #[test]
+    fn byte_stream_byob_read_keeps_leftover_queued_bytes() {
+        let source = Value::object(HashMap::from([("type".into(), Value::string("bytes"))]));
+        source.set_property(
+            "start",
+            Value::function(|_, args| {
+                args[0].call_method(
+                    "enqueue",
+                    vec![w3cos_core::binary::typed_array_value(vec![
+                        Value::Number(4.0),
+                        Value::Number(5.0),
+                        Value::Number(6.0),
+                    ])],
+                );
+                Value::Undefined
+            }),
+        );
+        let stream = w3cos_core::class::construct(&readable_stream_class(), vec![source]);
+        let reader = stream.call_method(
+            "getReader",
+            vec![Value::object(HashMap::from([(
+                "mode".into(),
+                Value::string("byob"),
+            )]))],
+        );
+        let first = Rc::new(RefCell::new(Value::Undefined));
+        let first_for_callback = Rc::clone(&first);
         reader
             .call_method(
                 "read",
@@ -2913,14 +3228,34 @@ mod tests {
             .call_method(
                 "then",
                 vec![Value::function(move |_, args| {
-                    *result_for_callback.borrow_mut() = args[0].get_property("value");
+                    *first_for_callback.borrow_mut() = args[0].get_property("value");
+                    Value::Undefined
+                })],
+            );
+        let second = Rc::new(RefCell::new(Value::Undefined));
+        let second_for_callback = Rc::clone(&second);
+        reader
+            .call_method(
+                "read",
+                vec![w3cos_core::binary::typed_array_value(vec![Value::Number(
+                    0.0,
+                )])],
+            )
+            .call_method(
+                "then",
+                vec![Value::function(move |_, args| {
+                    *second_for_callback.borrow_mut() = args[0].get_property("value");
                     Value::Undefined
                 })],
             );
         w3cos_core::promise::drain_microtasks();
         assert_eq!(
-            w3cos_core::binary::bytes_of(&result.borrow()).unwrap(),
-            vec![1, 2]
+            w3cos_core::binary::bytes_of(&first.borrow()).unwrap(),
+            vec![4, 5]
+        );
+        assert_eq!(
+            w3cos_core::binary::bytes_of(&second.borrow()).unwrap(),
+            vec![6]
         );
     }
 }
