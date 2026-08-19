@@ -512,9 +512,12 @@ precede ecosystem breadth or migration tooling.
 - [x] Propagate request signals, reject pre-aborted fetches before native I/O,
   bound native work with request/`AbortSignal.timeout()` deadlines, and expose
   `AbortSignal.abort()`, `any()`, `timeout()`, and `throwIfAborted()`.
-- [ ] Interrupt an already-running native request when asynchronous Promise
-  execution permits JavaScript to abort concurrently; the synchronous AOT
-  facade currently reports a warning and relies on its native deadline.
+- [x] Interrupt an already-running native request when asynchronous Promise
+  execution aborts concurrently. The AOT `fetch` facade now runs native I/O on
+  a worker and pumps timers/microtasks, so `AbortController.abort()` from
+  `Promise.then` / `queueMicrotask` / timers returns AbortError without waiting
+  for the transport deadline. A platform I/O call may still finish in the
+  background.
 - [x] Add an ESM integration test against a local WebSocket fixture.
 - [x] Add an ESM integration test against a local HTTP fixture for Fetch and
   its companion constructors.

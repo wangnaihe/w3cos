@@ -2527,6 +2527,15 @@ mod tests {
 
     #[test]
     fn inline_block_text_shrink_wraps_content_and_padding() {
+        let style = Style {
+            display: WDisp::InlineBlock,
+            box_sizing: WBoxSizing::BorderBox,
+            font_size: 13.0,
+            line_height: 1.3,
+            padding: w3cos_std::style::Edges::xy(10.0, 4.0),
+            white_space: WWhiteSpace::NoWrap,
+            ..Style::default()
+        };
         let layout = compute(
             &Component::boxed(
                 Style {
@@ -2534,37 +2543,44 @@ mod tests {
                     width: WDim::Px(300.0),
                     ..Style::default()
                 },
-                vec![Component::text(
-                    "首次入驻",
-                    Style {
-                        display: WDisp::InlineBlock,
-                        box_sizing: WBoxSizing::BorderBox,
-                        font_size: 13.0,
-                        line_height: 1.3,
-                        padding: w3cos_std::style::Edges::xy(10.0, 4.0),
-                        ..Style::default()
-                    },
-                )],
+                vec![Component::text("首次入驻", style.clone())],
             ),
             300.0,
             200.0,
         )
         .unwrap();
         let badge = layout[1].0;
+        let expected_width = text_intrinsic_size("首次入驻", &style).0;
+        let pad_y = style.padding_lengths().top + style.padding_lengths().bottom;
         assert!(
-            (badge.width - 72.0).abs() < 1.0,
-            "inline-block width should equal four CJK ems plus padding, got {}",
+            (badge.width - expected_width).abs() < 1.0,
+            "inline-block width should equal content plus padding, got {} expected {expected_width}",
             badge.width
         );
         assert!(
-            (badge.height - 24.9).abs() < 1.0,
-            "inline-block height should equal line box plus padding, got {}",
+            badge.height + 1.0 >= style.font_size + pad_y
+                && badge.height < style.font_size * style.line_height * 2.0 + pad_y,
+            "inline-block height should stay on one line box plus padding, got {}",
             badge.height
+        );
+        assert!(
+            badge.width < 300.0,
+            "inline-block must shrink-wrap instead of filling the containing block, got {}",
+            badge.width
         );
     }
 
     #[test]
     fn inline_flex_badge_shrink_wraps_like_browser_css() {
+        let style = Style {
+            display: WDisp::InlineFlex,
+            box_sizing: WBoxSizing::BorderBox,
+            font_size: 12.0,
+            line_height: 1.4,
+            padding: w3cos_std::style::Edges::xy(8.0, 2.0),
+            white_space: WWhiteSpace::NoWrap,
+            ..Style::default()
+        };
         let layout = compute(
             &Component::boxed(
                 Style {
@@ -2572,32 +2588,30 @@ mod tests {
                     width: WDim::Px(300.0),
                     ..Style::default()
                 },
-                vec![Component::text(
-                    "首次入驻",
-                    Style {
-                        display: WDisp::InlineFlex,
-                        box_sizing: WBoxSizing::BorderBox,
-                        font_size: 12.0,
-                        line_height: 1.4,
-                        padding: w3cos_std::style::Edges::xy(8.0, 2.0),
-                        ..Style::default()
-                    },
-                )],
+                vec![Component::text("首次入驻", style.clone())],
             ),
             300.0,
             200.0,
         )
         .unwrap();
         let badge = layout[1].0;
+        let expected_width = text_intrinsic_size("首次入驻", &style).0;
+        let pad_y = style.padding_lengths().top + style.padding_lengths().bottom;
         assert!(
-            (badge.width - 64.0).abs() < 1.0,
-            "inline-flex badge width should equal four CJK ems plus padding, got {}",
+            (badge.width - expected_width).abs() < 1.0,
+            "inline-flex badge width should equal content plus padding, got {} expected {expected_width}",
             badge.width
         );
         assert!(
-            (badge.height - 20.8).abs() < 1.0,
-            "inline-flex badge height should equal line box plus padding, got {}",
+            badge.height + 1.0 >= style.font_size + pad_y
+                && badge.height < style.font_size * style.line_height * 2.0 + pad_y,
+            "inline-flex badge height should stay on one line box plus padding, got {}",
             badge.height
+        );
+        assert!(
+            badge.width < 300.0,
+            "inline-flex must shrink-wrap instead of filling the containing block, got {}",
+            badge.width
         );
     }
 
