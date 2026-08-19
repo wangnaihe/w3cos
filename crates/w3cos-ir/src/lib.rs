@@ -701,16 +701,16 @@ impl Function {
                             return Err(ValidationError::InvalidClosureCapture(self.id));
                         }
                     }
-                    Instruction::Await { suspension, .. } => {
-                        if !self.is_async || !suspension_ids.contains(suspension) {
-                            return Err(ValidationError::InvalidAwait(self.id, *suspension));
-                        }
+                    Instruction::Await { suspension, .. }
+                        if !self.is_async || !suspension_ids.contains(suspension) =>
+                    {
+                        return Err(ValidationError::InvalidAwait(self.id, *suspension));
                     }
                     Instruction::Yield { suspension, .. }
-                    | Instruction::YieldDelegate { suspension, .. } => {
-                        if !self.is_generator || !generator_suspension_ids.contains(suspension) {
-                            return Err(ValidationError::InvalidYield(self.id, *suspension));
-                        }
+                    | Instruction::YieldDelegate { suspension, .. }
+                        if !self.is_generator || !generator_suspension_ids.contains(suspension) =>
+                    {
+                        return Err(ValidationError::InvalidYield(self.id, *suspension));
                     }
                     _ => {}
                 }

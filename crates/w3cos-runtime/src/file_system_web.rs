@@ -380,10 +380,9 @@ fn async_iterator(values: Vec<Value>) -> Value {
         }),
     );
     let iterator_self = iterator.clone();
-    iterator.set_property(
-        "__w3cos_symbol_asyncIterator",
-        realm_file_system_function(move |_, _| iterator_self.clone()),
-    );
+    let async_iterator = realm_file_system_function(move |_, _| iterator_self.clone());
+    iterator.set_property("__w3cos_symbol_async_iterator", async_iterator.clone());
+    iterator.set_property("__w3cos_symbol_asyncIterator", async_iterator);
     register_file_system_value(&iterator);
     iterator
 }
@@ -570,6 +569,7 @@ pub fn reset() {
             }
             for reference in [
                 "__w3cos_path",
+                "__w3cos_symbol_async_iterator",
                 "__w3cos_symbol_asyncIterator",
                 "close",
                 "next",

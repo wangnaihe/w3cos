@@ -5245,6 +5245,60 @@ export function streamAsyncIteratorShape() {
 export function getStreamAsyncIteratorLog() {
   return streamAsyncIteratorLog;
 }
+let byobFillLog = "";
+export function byobStreamFillShape() {
+  const dest = new Uint8Array([0, 0, 0, 9]);
+  const stream = new ReadableStream({
+    type: "bytes",
+    start: (controller) => {
+      controller.enqueue(new Uint8Array([7, 8, 9]));
+      controller.close();
+    }
+  });
+  const reader = stream.getReader({ mode: "byob" });
+  reader.read(dest).then((result) => {
+    byobFillLog = result.done + ":" + dest[0] + ":" + dest[1] + ":" + dest[2] + ":" +
+      dest[3] + ":" + (result.value.buffer === dest.buffer) + ":" +
+      result.value.byteLength + ":" + (reader instanceof ReadableStreamBYOBReader);
+  });
+  return typeof ReadableStreamBYOBReader + ":" +
+    (window.ReadableStreamBYOBReader === ReadableStreamBYOBReader);
+}
+export function getByobStreamFillLog() {
+  return byobFillLog;
+}
+let byobRespondLog = "";
+let controllerByobWasRequest = false;
+export function byobStreamRespondShape() {
+  const dest = new Uint8Array(4);
+  const stream = new ReadableStream({
+    type: "bytes",
+    pull: (controller) => {
+      const request = controller.byobRequest;
+      controllerByobWasRequest = request instanceof ReadableStreamBYOBRequest;
+      request.view[0] = 11;
+      request.view[1] = 12;
+      request.respond(2);
+    }
+  });
+  const reader = stream.getReader({ mode: "byob" });
+  reader.read(dest).then((result) => {
+    byobRespondLog = result.done + ":" + dest[0] + ":" + dest[1] + ":" + dest[2] + ":" +
+      (result.value.buffer === dest.buffer) + ":" + result.value.byteLength + ":" +
+      (controllerByobWasRequest ? "1" : "0");
+  });
+  return typeof ReadableStreamBYOBRequest + ":" +
+    (window.ReadableStreamBYOBRequest === ReadableStreamBYOBRequest);
+}
+export function getByobStreamRespondLog() {
+  return byobRespondLog;
+}
+export async function streamForAwait() {
+  const stream = ReadableStream.from(["one", "two"]);
+  let out = "";
+  for await (const value of stream) out += value + ",";
+  return out;
+}
 let transformLog = "";
 export function transformStreamShape() {
   const transform = new TransformStream({
@@ -6656,7 +6710,9 @@ export function cryptoIdentityShape() {
   let subtleError = "";
   try { new Crypto(); } catch (error) { cryptoError = error.name; }
   try { new SubtleCrypto(); } catch (error) { subtleError = error.name; }
-  crypto.subtle.digest("SHA-256", new Uint8Array()).catch((error) => {
+  // SHA-256 digest is implemented via ring; an unimplemented SubtleCrypto
+  // method still rejects with NotSupportedError.
+  crypto.subtle.sign("HMAC", {}, new Uint8Array()).catch((error) => {
     subtleCryptoLog = error.name;
   });
   return typeof Crypto + ":" + typeof SubtleCrypto + ":" +
@@ -7480,6 +7536,49 @@ fn main() {
         matches!(&r, w3cos_core::Value::String(s) if s == "false:one|true:undefined:false"),
         "ReadableStream async iterator reads and releases its lock: {r:?}"
     );
+    let r = m0::m0_byobStreamFillShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:true"),
+        "ReadableStream BYOB reader identity: {r:?}"
+    );
+    w3cos_runtime::jsdom::drain_microtasks();
+    let r = m0::m0_getByobStreamFillLog(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "false:7:8:9:9:true:3:true"),
+        "ReadableStream BYOB read fills the supplied view: {r:?}"
+    );
+    let r = m0::m0_byobStreamRespondShape(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "function:true"),
+        "ReadableStreamBYOBRequest identity: {r:?}"
+    );
+    w3cos_runtime::jsdom::drain_microtasks();
+    let r = m0::m0_getByobStreamRespondLog(vec![]);
+    assert!(
+        matches!(&r, w3cos_core::Value::String(s) if s == "false:11:12:0:true:2:1"),
+        "ReadableStream BYOB request respond writes into the supplied view: {r:?}"
+    );
+    let for_await = m0::m0_streamForAwait(vec![]);
+    w3cos_runtime::jsdom::drain_microtasks();
+    match w3cos_core::promise::status(&for_await) {
+        Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) => {
+            assert_eq!(
+                value.to_js_string(),
+                "one,two,",
+                "compiled for-await-of should consume a ReadableStream"
+            );
+        }
+        Some(w3cos_core::promise::PromiseStatus::Rejected(reason)) => {
+            panic!(
+                "compiled for-await-of should fulfill, rejected: {}",
+                reason.to_js_string()
+            )
+        }
+        Some(w3cos_core::promise::PromiseStatus::Pending) => {
+            panic!("compiled for-await-of should fulfill, still pending")
+        }
+        None => panic!("compiled for-await-of should fulfill, not a promise"),
+    }
     let r = m0::m0_transformStreamShape(vec![]);
     assert!(
         matches!(&r, w3cos_core::Value::String(s) if s == "function:function:true:true:true:true:true:true:3:1:true:16:2:"),
@@ -9995,6 +10094,113 @@ fn main() {{
             "same async fixture must match AOT and W3VM"
         );
         assert_eq!(aot_result, "fulfilled:5|rejected:async-failed");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_aot_matches_w3vm_for_await_of() {
+        use std::collections::HashMap;
+
+        let root = fixture_root("w3cos_esm_codegen_for_await_of");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.js");
+        let source = r#"
+export async function main() {
+  async function* source() {
+    yield "a";
+    yield "b";
+  }
+  let out = "";
+  for await (const value of source()) out += value;
+  return out;
+}
+"#;
+        std::fs::write(&entry, source).unwrap();
+
+        let w3ir = crate::w3ir_lowering::lower_module(source, "app:///for-await-of.js").unwrap();
+        let main_function = w3ir
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("main"))
+            .expect("W3IR async main")
+            .id;
+        let callable = w3cos_vm::Vm::new(w3ir, w3cos_vm::Limits::default())
+            .unwrap()
+            .callable(main_function, HashMap::new())
+            .unwrap();
+        let vm_promise = callable.call(w3cos_core::Value::Undefined, vec![]);
+        w3cos_core::promise::drain_microtasks();
+        let vm_result = match w3cos_core::promise::status(&vm_promise) {
+            Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) => {
+                format!("fulfilled:{}", value.to_js_string())
+            }
+            Some(w3cos_core::promise::PromiseStatus::Rejected(value)) => {
+                format!("rejected:{}", value.to_js_string())
+            }
+            Some(w3cos_core::promise::PromiseStatus::Pending) => "pending".into(),
+            None => "not-a-promise".into(),
+        };
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+        let code = generate_with_bodies(&bundle);
+        assert!(code.contains("__w3cos_symbol_async_iterator"));
+        assert!(code.contains("__w3cos_async_iterator_next"));
+        assert!(code.contains("compiled from W3IR suspension metadata"));
+        assert!(!code.contains("/* await */"));
+        assert!(!code.contains("w3cos_vm"));
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"for_await_of_bundle_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    let promise = m0::m0_main(vec![]);
+    w3cos_core::promise::drain_microtasks();
+    match w3cos_core::promise::status(&promise) {{
+        Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) =>
+            println!("fulfilled:{{}}", value.to_js_string()),
+        Some(w3cos_core::promise::PromiseStatus::Rejected(value)) =>
+            println!("rejected:{{}}", value.to_js_string()),
+        Some(w3cos_core::promise::PromiseStatus::Pending) => println!("pending"),
+        None => println!("not-a-promise"),
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success(),
+            "generated for-await AOT fixture should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let aot_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            aot_result, vm_result,
+            "same for-await fixture must match AOT and W3VM"
+        );
+        assert_eq!(aot_result, "fulfilled:ab");
 
         std::fs::remove_dir_all(root).ok();
     }

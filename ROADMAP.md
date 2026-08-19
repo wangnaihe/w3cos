@@ -156,8 +156,9 @@ suite is red.
 - [x] Add mutable text-track/cue lists, constructible `VTTCue`, media-element
   `addTextTrack()` integration and neutral `VideoPlaybackQuality` records.
 - [x] Expose byte-stream controller/BYOB identities and compatible byte-stream
-  reader locking/delivery. Supplied BYOB views are not filled yet and emit a
-  warning instead of silently claiming zero-copy semantics.
+  reader locking/delivery. Supplied BYOB views are filled from queued chunks
+  or `ReadableStreamBYOBRequest.respond()` / `respondWithNewView()`, sharing
+  the caller buffer. Exact queuing backpressure remains an explicit partial.
 - [x] Back File System Access handles and `navigator.storage.getDirectory()`
   with a runtime-local OPFS directory, including file read/write streams,
   directory creation/traversal/removal/resolve and permission-compatible
@@ -331,9 +332,10 @@ precede ecosystem breadth or migration tooling.
   `values()` and `Symbol.asyncIterator` expose promise-based `next()`/`return()`,
   `preventCancel`, source cancellation and deterministic reader-lock release.
   Compression currently buffers until close. Byte streams expose the standard
-  controller/BYOB reader/request identities and compatible locking/delivery;
-  BYOB reads warn because supplied views are not filled yet. Compiler lowering
-  for `for await...of` syntax and exact backpressure remain explicit partials.
+  controller/BYOB reader/request identities, fill supplied views from queued
+  chunks or `byobRequest.respond()` / `respondWithNewView()`, and keep leftover
+  bytes queued. Compiler W3IR/AOT lowering for `for await...of` is covered by
+  compiled-JS tests. Exact stream backpressure remains an explicit partial.
 - [x] Expose `CustomElementRegistry` / `customElements` with autonomous
   element definition lookup, `whenDefined()`, explicit/subsequent creation
   upgrades, and connected/disconnected callbacks. Customized built-ins and

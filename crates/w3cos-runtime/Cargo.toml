@@ -106,7 +106,9 @@ nix = { workspace = true }
 tempfile = { workspace = true }
 glob = { workspace = true }
 tungstenite = { workspace = true }
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal"] }
+# rfd 0.15.4+ enables xdg-portal by default on Linux; that backend's build.rs
+# requires an async runtime feature even when we only call the sync FileDialog API.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 
 [dev-dependencies]
 w3cos-a11y = { workspace = true }

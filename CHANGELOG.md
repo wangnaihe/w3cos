@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **ReadableStream BYOB filling** — `ReadableStreamBYOBReader.read(view)` now copies queued bytes into the supplied ArrayBufferView and returns a same-buffer prefix view. Byte-stream controllers expose a live `byobRequest`; `respond()` / `respondWithNewView()` complete in-flight BYOB reads. Leftover queued bytes stay available for the next read.
+- **Compiled `for await...of`** — W3IR/AOT lowering of `for await...of` over async iterables and `ReadableStream` is covered by compiled-JS and AOT/W3VM differential tests.
 - **Web Workers** (`w3cos_runtime::worker`) — W3C-standard background execution mapped onto native OS threads:
   - `Worker::spawn(opts, body)` runs a Rust closure on a dedicated thread; the closure receives a `WorkerScope` with browser-equivalent `recv` / `try_recv` / `post_message` / `report_error` methods.
   - `Worker::post_message` / `try_recv` / `poll_events` mirror the parent-side `MessageEvent` / `ErrorEvent` queue.
@@ -41,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `w3cos-ai-bridge::server::start` retained for backwards compatibility; new `start_with_provider(port, Arc<dyn ScreenshotProvider>)` lets hosts plug in custom screenshot capture (the runtime supplies a `FrameCacheScreenshot` provider automatically when the `ai-bridge` feature is enabled).
 
 ### Fixed
+- Linux `rfd` 0.15.4 `xdg-portal` builds enable the required `tokio` feature so `cargo check --workspace` compiles on current crates.io.
+- ReadableStream / FileSystem async iterators publish `__w3cos_symbol_async_iterator` so compiled `for await...of` matches the W3IR protocol (the camelCase alias remains).
+- Compiled jsdom SubtleCrypto smoke now exercises an unimplemented operation (`sign`); `digest` is implemented and no longer rejects.
+- AI PR Review workflow writes a single `test_count=` line when `grep -c` finds zero tests (avoids GitHub Actions `Invalid format '0'`).
+- `libc::mq_attr` initialization no longer names the removed `__pad` field (current `libc` / rustc 1.97).
 - README screenshot now renders as inline image instead of text link
 
 ## [0.1.0] - 2025-03-17
