@@ -17,6 +17,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = "0.4"
 
+[dev-dependencies]
+w3cos-core = { workspace = true }
+w3cos-dom = { workspace = true }
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 android_logger = "0.14"

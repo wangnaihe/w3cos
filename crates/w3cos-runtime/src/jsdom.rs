@@ -6198,6 +6198,56 @@ pub(crate) fn dispatch_native_pointer(
     prevented
 }
 
+fn hit_tested_touch_target(x: f32, y: f32) -> Option<u32> {
+    let node = deepest_node_at_point(document_element_id(), x, y)?;
+    let rect = dom::bounding_rect(node);
+    (rect.width > 0.0 && rect.height > 0.0).then_some(node)
+}
+
+fn active_touch_target(pointer_id: i64) -> Option<u32> {
+    ACTIVE_TOUCHES.with(|touches| {
+        touches
+            .borrow()
+            .iter()
+            .find(|touch| touch.identifier == pointer_id)
+            .map(|touch| touch.target)
+    })
+}
+
+/// Hit-test the live document and dispatch a paired PointerEvent/TouchEvent
+/// lifecycle.
+///
+/// Hosts without a compositor (including `w3cos-mobile::TouchEvent::dispatch`)
+/// use CSSOM layout boxes via the same geometry as `document.elementFromPoint`.
+/// A `down` that misses every box with positive width/height is ignored. Later `move`/`up`/`cancel` for an
+/// active contact stay on that contact's target even if the point has left the
+/// box. Android MotionEvent / iOS UITouch adapters are separate work.
+pub fn dispatch_hit_tested_touch(
+    phase: &str,
+    client_x: f32,
+    client_y: f32,
+    pointer_id: i64,
+    pressure: f32,
+) -> bool {
+    let hit = hit_tested_touch_target(client_x, client_y);
+    let target = match phase {
+        "down" => hit,
+        "move" | "up" | "cancel" => active_touch_target(pointer_id).or(hit),
+        _ => return false,
+    };
+    let Some(target) = target else {
+        return false;
+    };
+    let (button, buttons, pressure) = match phase {
+        "down" | "move" => (0_i16, 1_u16, pressure),
+        _ => (0, 0, 0.0),
+    };
+    dispatch_native_pointer(
+        target, phase, client_x, client_y, pointer_id, "touch", button, buttons, pressure, true,
+        false, false, false, false,
+    )
+}
+
 pub(crate) fn dispatch_native_click(target: u32) -> bool {
     let prevented = !dispatch_sync(target, EventType::Click, EventData::None);
     #[cfg(target_os = "ios")]
@@ -13884,6 +13934,68 @@ mod tests {
                 "touchcancel:0:0:1:12:false",
             ]
         );
+    }
+
+    #[test]
+    fn hit_tested_touch_uses_layout_boxes_and_retargets_active_contacts() {
+        setup();
+        let target = create_in_body("div");
+        let target_id = node_id_of(&target).unwrap();
+        let miss_log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let hit_log = Rc::new(RefCell::new(Vec::<String>::new()));
+        dom::with_document_mut(|tree| {
+            tree.set_layout_rect(
+                NodeId::from_u32(target_id),
+                w3cos_dom::DOMRect::new(10.0, 10.0, 40.0, 40.0),
+            );
+        });
+        let log = Rc::clone(&hit_log);
+        target.call_method(
+            "addEventListener",
+            vec![
+                Value::string("touchstart"),
+                func(move |_, args| {
+                    log.borrow_mut()
+                        .push(args[0].get_property("type").to_js_string());
+                    Value::Undefined
+                }),
+            ],
+        );
+        let log = Rc::clone(&hit_log);
+        target.call_method(
+            "addEventListener",
+            vec![
+                Value::string("touchend"),
+                func(move |_, args| {
+                    log.borrow_mut()
+                        .push(args[0].get_property("type").to_js_string());
+                    Value::Undefined
+                }),
+            ],
+        );
+        document_value().call_method(
+            "addEventListener",
+            vec![
+                Value::string("touchstart"),
+                func({
+                    let miss_log = Rc::clone(&miss_log);
+                    move |_, args| {
+                        miss_log
+                            .borrow_mut()
+                            .push(args[0].get_property("type").to_js_string());
+                        Value::Undefined
+                    }
+                }),
+            ],
+        );
+
+        assert!(!dispatch_hit_tested_touch("down", 0.0, 0.0, 21, 0.5));
+        assert!(!dispatch_hit_tested_touch("down", 1000.0, 1000.0, 21, 0.5));
+        assert!(miss_log.borrow().is_empty());
+        assert!(!dispatch_hit_tested_touch("down", 20.0, 20.0, 21, 0.5));
+        assert!(!dispatch_hit_tested_touch("move", 0.0, 0.0, 21, 0.5));
+        assert!(!dispatch_hit_tested_touch("up", 0.0, 0.0, 21, 0.0));
+        assert_eq!(hit_log.borrow().as_slice(), &["touchstart", "touchend"]);
     }
 
     #[test]
