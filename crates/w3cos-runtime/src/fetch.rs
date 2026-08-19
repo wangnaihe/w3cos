@@ -4907,10 +4907,18 @@ mod tests {
             stream.flush().expect("flush first body chunk");
             body_started_tx.send(()).expect("signal body start");
             release_rx.recv().expect("release remaining body");
-            for _ in 0..1024 {
-                if stream.write_all(&vec![b'b'; 1024]).is_err() {
+            // Unblock the client's pending `read()` so it can observe cancel
+            // and drop the socket. A full 1 MiB burst can sit in kernel
+            // buffers before that happens, which is not proof the client
+            // buffered the body.
+            let _ = stream.write_all(&[b'b'; 1024]);
+            let _ = stream.flush();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            for _ in 0..32 {
+                if stream.write_all(&[b'b'; 1024]).is_err() {
                     return true;
                 }
+                let _ = stream.flush();
             }
             false
         });
