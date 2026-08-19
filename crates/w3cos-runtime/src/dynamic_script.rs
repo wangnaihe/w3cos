@@ -8590,6 +8590,47 @@ mod tests {
     }
 
     #[test]
+    fn blob_worker_executes_isolated_script_from_compiled_javascript() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::worker_web::reset_realm();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .execute_source(
+                r#"
+const source = "self.onmessage = function(event) { postMessage(event.data + 1); };";
+const blob = new Blob([source], { type: "text/javascript" });
+const worker = new Worker(URL.createObjectURL(blob));
+worker.onmessage = function(event) {
+  globalThis.__isolatedWorkerReply = event.data;
+};
+worker.postMessage(40);
+"#,
+                "inline:isolated-worker",
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::jsdom::window_value()
+            .get_property("__isolatedWorkerReply")
+            .is_undefined()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "compiled Worker(blob:) did not deliver an isolated-realm reply"
+            );
+            crate::worker_web::poll_js_events();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__isolatedWorkerReply")
+                .to_number(),
+            41.0
+        );
+        crate::worker_web::reset_realm();
+    }
+
+    #[test]
     fn script_protocol_selects_w3vm_or_precompiled_aot() {
         assert_eq!(
             script_execution_route("http://example.test/runtime.js"),

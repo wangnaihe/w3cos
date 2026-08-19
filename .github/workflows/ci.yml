@@ -30,7 +30,10 @@ jobs:
       - name: Test required runtime suites
         run: cargo test -p w3cos-runtime --lib --tests
       - name: Test optional dynamic JavaScript path
-        run: cargo test -p w3cos-runtime --no-default-features --features dynamic-js dynamic_script::tests --lib
+        run: |
+          cargo test -p w3cos-runtime --no-default-features --features dynamic-js dynamic_script::tests --lib
+          cargo test -p w3cos-runtime --no-default-features --features dynamic-js --lib worker_realm::
+          cargo test -p w3cos-runtime --no-default-features --features dynamic-js --lib worker_web::tests
       - name: Test map-style dynamic SDK loading
         run: cargo test -p w3cos-runtime --no-default-features --features dynamic-js --test map_sdk_compat
       - name: Verify ordinary AOT dependency boundary

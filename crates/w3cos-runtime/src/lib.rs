@@ -171,6 +171,8 @@ pub mod webrtc_web;
 pub mod websocket;
 pub mod webxr_web;
 pub mod worker;
+#[cfg(feature = "dynamic-js")]
+pub(crate) mod worker_realm;
 pub mod worker_web;
 pub mod xhr;
 pub mod xpath_web;

@@ -694,10 +694,18 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
     structured-clone codec for cycles, collections, Error, Blob/File and other
     supported platform values, including exact ArrayBuffer/SharedArrayBuffer,
     TypedArray/DataView types, ranges, and shared backing-buffer topology.
-  - [ ] Execute referenced Worker scripts and create isolated worker realms.
-    The current Worker host remains an explicit echo profile; MessagePort
-    transfer into that missing realm warns once and raises `DataCloneError`
-    without detaching the source.
+  - [x] Execute `blob:` and `data:` Worker scripts in an isolated W3VM realm
+    when the `dynamic-js` feature is enabled. The parent thread captures the
+    source (object URLs are thread-local) and the worker OS thread lowers it
+    through SWC → W3IR → W3VM with its own `self` / `postMessage` globals.
+    Top-level `onmessage = …` is still rejected by W3IR as an undeclared
+    assignment; worker scripts should set `self.onmessage`. HTTP, file, and
+    dummy URLs keep the existing structured-clone echo host.
+    Ordinary AOT builds do not link the compiler or W3VM for this path.
+  - [ ] Fetch and execute HTTP/file Worker scripts, compile Worker scripts on
+    the ordinary AOT path, run SharedWorker realms, and transfer MessagePort
+    objects into a worker thread. MessagePort transfer into a Worker still
+    warns once and raises `DataCloneError` without detaching the source.
 
 ### R2.4 Remaining network/browser services
 

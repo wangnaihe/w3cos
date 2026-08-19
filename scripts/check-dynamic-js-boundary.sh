@@ -2,6 +2,8 @@
 set -euo pipefail
 
 runtime_source="crates/w3cos-runtime/src/dynamic_script.rs"
+worker_realm_source="crates/w3cos-runtime/src/worker_realm.rs"
+allowed_consumers="$(printf '%s\n' "$runtime_source" "$worker_realm_source" | sort)"
 
 ordinary_tree="$(cargo tree -p w3cos-runtime --no-default-features -e normal)"
 for forbidden in w3cos-compiler w3cos-vm w3cos-ir swc_; do
@@ -33,8 +35,8 @@ runtime_consumers="$(
         crates/w3cos-runtime/src \
         | sort
 )"
-if [[ "$runtime_consumers" != "$runtime_source" ]]; then
-    echo "dynamic compiler/IR/VM references escaped the single ScriptLoader boundary:" >&2
+if [[ "$runtime_consumers" != "$allowed_consumers" ]]; then
+    echo "dynamic compiler/IR/VM references escaped ScriptLoader and the dedicated worker realm:" >&2
     echo "$runtime_consumers" >&2
     exit 1
 fi
