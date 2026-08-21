@@ -654,7 +654,7 @@ pub fn date_class() -> Value {
             let milliseconds = args
                 .first()
                 .map(|value| match value {
-                    Value::String(text) => parse_iso_instant(&text),
+                    value if value.is_string() => parse_iso_instant(&value.to_js_string()),
                     _ => value.to_number(),
                 })
                 .unwrap_or_else(now_milliseconds);
@@ -1016,7 +1016,7 @@ fn currency_name(currency: &str, locale: &str) -> &'static str {
 
 fn date_milliseconds(value: &Value) -> f64 {
     match value {
-        Value::String(text) => parse_iso_instant(text),
+        _ if value.is_string() => parse_iso_instant(&value.to_js_string()),
         Value::Object(_) => value.get_property("__w3cos_date_milliseconds").to_number(),
         _ => value.to_number(),
     }
@@ -2412,7 +2412,7 @@ pub fn url_search_params_new(args: Vec<Value>) -> Value {
     let init = args.first().cloned().unwrap_or(Value::Undefined);
     let pairs = match &init {
         _ if init.is_nullish() => Vec::new(),
-        Value::String(query) => parse_query(query),
+        _ if init.is_string() => parse_query(&init.to_js_string()),
         Value::Array(items) => items
             .borrow()
             .iter()

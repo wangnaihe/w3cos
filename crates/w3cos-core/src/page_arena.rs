@@ -166,6 +166,24 @@ pub(crate) fn intern(s: &str) -> PageString {
     })
 }
 
+/// Resolve a live intern handle. Panics if the handle belongs to a
+/// previous page (same contract as [`PageString::as_str`]).
+pub(crate) fn get(handle: u32) -> Option<PageString> {
+    if handle == 0 {
+        return None;
+    }
+    ARENA.with(|arena| {
+        let arena = arena.borrow();
+        let Some(slot) = arena.slots.get(handle as usize).copied() else {
+            panic!("page-interned string used after reset_bridge");
+        };
+        if slot.handle != handle || slot.epoch != arena.epoch {
+            panic!("page-interned string used after reset_bridge");
+        }
+        Some(slot)
+    })
+}
+
 /// Drop interned page strings. Called from `reset_bridge` / navigation.
 pub fn reset() {
     ARENA.with(|arena| {

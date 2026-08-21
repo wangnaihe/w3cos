@@ -280,7 +280,7 @@ impl JsObject {
         let keys: Vec<Value> = self
             .property_order
             .iter()
-            .map(|k| Value::String(k.clone()))
+            .map(|k| Value::from(k.clone()))
             .collect();
         Value::array(keys)
     }

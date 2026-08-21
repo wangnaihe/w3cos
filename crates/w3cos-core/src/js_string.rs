@@ -75,6 +75,11 @@ impl JsString {
         }
     }
 
+    /// Rebuild a page-interned `JsString` from a NaN-box handle.
+    pub(crate) fn from_page_handle(handle: u32) -> Option<Self> {
+        page_arena::get(handle).map(|interned| Self(Repr::Interned(interned)))
+    }
+
     /// `Rc` strong-count for long heap strings. `None` for page-interned
     /// handles, which do not clone through `Rc`.
     pub fn heap_strong_count(&self) -> Option<usize> {

@@ -217,9 +217,12 @@ pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
             .filter(|(_, value)| !crate::value::is_array_hole(value))
             .map(|(index, _)| index.to_string())
             .collect(),
-        Value::String(value) => (0..value.encode_utf16().count())
-            .map(|index| index.to_string())
-            .collect(),
+        _ if source.is_string() => {
+            let value = source.as_js_string().expect("string");
+            (0..value.encode_utf16().count())
+                .map(|index| index.to_string())
+                .collect()
+        }
         Value::Function(function) => function
             .keys()
             .into_iter()

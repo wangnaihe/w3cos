@@ -12,13 +12,14 @@ use crate::js_string::JsString;
 
 /// JavaScript-compatible dynamic value type.
 ///
-/// First-cut ABI: Undefined / Null / Bool / Number are a Copy tagged
-/// word ([`Immediate`], NaN-box). Clone of those immediates is a
-/// register move of the 8-byte word and does not touch `Rc`.
+/// First-cut ABI: Undefined / Null / Bool / Number and interned short
+/// strings are a Copy tagged word ([`Immediate`], NaN-box). Clone of
+/// those immediates is a register move of the 8-byte word and does not
+/// touch `Rc`.
 ///
-/// Heap values (strings, arrays, objects, functions) stay as a remaining
-/// enum of pointers / `Rc` and are **not** packed into the same word
-/// yet. Symbols remain interned strings (`__w3cos_symbol_…`).
+/// Long `Rc<str>` strings, arrays, objects, and functions stay as a
+/// remaining enum of pointers / `Rc`. Symbols remain interned strings
+/// (`__w3cos_symbol_…`).
 ///
 /// Constructors `Value::Undefined`, `Value::Null`, `Value::Bool`, and
 /// `Value::Number` are unchanged so AOT emission (`num_regs` / `bool_regs`
@@ -29,9 +30,9 @@ use crate::js_string::JsString;
 /// counters), so string intern is thread-local as well.
 #[derive(Clone)]
 pub enum Value {
-    /// NaN-boxed undefined / null / bool / number. Prefer
-    /// `Value::Undefined` / `Value::Bool` / `Value::Number` constructors
-    /// over matching this arm.
+    /// NaN-boxed undefined / null / bool / number / interned short string.
+    /// Prefer `Value::Undefined` / `Value::Bool` / `Value::Number` /
+    /// `Value::string` constructors over matching this arm.
     Imm(Immediate),
     String(JsString),
     Array(Rc<RefCell<ArrayStorage>>),
@@ -53,13 +54,15 @@ impl Default for Value {
 ///
 /// - **Number:** IEEE-754 bits. Every NaN is canonicalized to
 ///   `0x7FF8_0000_0000_0000` so payloads never collide with tags.
-/// - **Tagged** quiet-NaN with low-3-bit payload `QNAN | tag`:
+/// - **Tagged** quiet-NaN with low-3-bit tag `QNAN | tag | (payload << 3)`:
 ///   - `1` undefined
 ///   - `2` null
 ///   - `3` false
 ///   - `4` true
+///   - `5` interned page-arena string (`u32` handle payload)
 ///
-/// Heap pointers are **not** in this word yet (remaining `Value` enum).
+/// Long `Rc<str>` and heap pointers are **not** in this word (remaining
+/// `Value` enum).
 #[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct Immediate(u64);
@@ -71,6 +74,8 @@ impl Immediate {
     const TAG_NULL: u64 = 2;
     const TAG_FALSE: u64 = 3;
     const TAG_TRUE: u64 = 4;
+    const TAG_STR: u64 = 5;
+    const HANDLE_SHIFT: u64 = 3;
 
     pub const UNDEFINED: Self = Self(Self::QNAN | Self::TAG_UNDEF);
     pub const NULL: Self = Self(Self::QNAN | Self::TAG_NULL);
@@ -91,6 +96,12 @@ impl Immediate {
         } else {
             Self(n.to_bits())
         }
+    }
+
+    /// Pack a page-arena intern handle into the tagged word.
+    #[inline]
+    pub const fn from_interned_string(handle: u32) -> Self {
+        Self(Self::QNAN | Self::TAG_STR | ((handle as u64) << Self::HANDLE_SHIFT))
     }
 
     /// Raw tagged bits. Documented transmute target.
@@ -154,6 +165,25 @@ impl Immediate {
             None
         }
     }
+
+    #[inline]
+    pub const fn is_interned_string(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_STR
+    }
+
+    #[inline]
+    pub const fn interned_handle(self) -> Option<u32> {
+        if self.is_interned_string() {
+            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn as_js_string(self) -> Option<JsString> {
+        self.interned_handle().and_then(JsString::from_page_handle)
+    }
 }
 
 impl PartialEq for Immediate {
@@ -209,6 +239,27 @@ impl Value {
         match self {
             Value::Imm(imm) => Some(*imm),
             _ => None,
+        }
+    }
+
+    /// Interned page-arena handle or long heap `JsString`.
+    #[inline]
+    pub fn as_js_string(&self) -> Option<JsString> {
+        match self {
+            Value::Imm(imm) => imm.as_js_string(),
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Pack interned short strings into [`Immediate`]; long `Rc<str>` stay
+    /// on the `String` arm.
+    #[inline]
+    pub fn from_js_string(s: JsString) -> Self {
+        if let Some(handle) = s.page_handle() {
+            Value::Imm(Immediate::from_interned_string(handle))
+        } else {
+            Value::String(s)
         }
     }
 }
@@ -333,7 +384,7 @@ pub(crate) enum ValueUnpack<'a> {
     Null,
     Bool(bool),
     Number(f64),
-    String(&'a JsString),
+    String(JsString),
     Array(&'a Rc<RefCell<ArrayStorage>>),
     Object(&'a Rc<RefCell<crate::JsObject>>),
     Function(&'a JsFunction),
@@ -346,8 +397,12 @@ impl Value {
             Value::Imm(imm) if imm.is_undefined() => ValueUnpack::Undefined,
             Value::Imm(imm) if imm.is_null() => ValueUnpack::Null,
             Value::Imm(imm) if imm.is_bool() => ValueUnpack::Bool(imm.as_bool().unwrap_or(false)),
+            Value::Imm(imm) if imm.is_interned_string() => ValueUnpack::String(
+                imm.as_js_string()
+                    .expect("interned string handle"),
+            ),
             Value::Imm(imm) => ValueUnpack::Number(imm.as_number().unwrap_or(f64::NAN)),
-            Value::String(s) => ValueUnpack::String(s),
+            Value::String(s) => ValueUnpack::String(s.clone()),
             Value::Array(a) => ValueUnpack::Array(a),
             Value::Object(o) => ValueUnpack::Object(o),
             Value::Function(f) => ValueUnpack::Function(f),
@@ -470,9 +525,11 @@ impl Iterator for ValueIterator {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (self.as_js_string(), other.as_js_string()) {
+            return left == right;
+        }
         match (self, other) {
             (Value::Imm(left), Value::Imm(right)) => left == right,
-            (Value::String(left), Value::String(right)) => left == right,
             (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
             (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
             (Value::Function(_), Value::Function(_)) => false,
@@ -748,17 +805,17 @@ impl Value {
             }
             ValueUnpack::Object(_) => {
                 let to_string = self.get_property("toString");
-                if to_string.is_function()
-                    && let Value::String(value) = to_string.call(self.clone(), vec![])
-                {
-                    return value.as_str().to_string();
+                if to_string.is_function() {
+                    if let Some(value) = to_string.call(self.clone(), vec![]).as_js_string() {
+                        return value.as_str().to_string();
+                    }
                 }
                 "[object Object]".into()
             }
             ValueUnpack::Function(function) => {
                 let to_string = function.get_property("toString");
                 if matches!(to_string, Value::Function(_) | Value::Object(_)) {
-                    if let Value::String(value) = to_string.call(self.clone(), vec![]) {
+                    if let Some(value) = to_string.call(self.clone(), vec![]).as_js_string() {
                         return value.as_str().to_string();
                     }
                 }
@@ -781,7 +838,11 @@ impl Value {
         matches!(self, Value::Imm(imm) if imm.is_number())
     }
     pub fn is_string(&self) -> bool {
-        matches!(self, Value::String(_))
+        match self {
+            Value::String(_) => true,
+            Value::Imm(imm) => imm.is_interned_string(),
+            _ => false,
+        }
     }
     pub fn is_bool(&self) -> bool {
         matches!(self, Value::Imm(imm) if imm.is_bool())
@@ -869,7 +930,8 @@ impl Value {
                     Value::Undefined
                 }
             }
-            Value::String(s) => {
+            _ if self.is_string() => {
+                let s = self.as_js_string().expect("string");
                 if let Ok(idx) = key.parse::<usize>() {
                     s.encode_utf16()
                         .nth(idx)
@@ -1001,7 +1063,7 @@ impl Value {
         Value::Bool(b)
     }
     pub fn string(s: &str) -> Self {
-        Value::String(JsString::intern(s))
+        Value::from_js_string(JsString::intern(s))
     }
 
     pub fn array(items: Vec<Value>) -> Self {
@@ -1231,13 +1293,15 @@ impl Value {
                     target.call(this_arg.clone(), combined)
                 });
             }
-            (Value::String(value), "endsWith") => {
+            (this, "endsWith") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 return Value::Bool(
                     args.first()
                         .is_some_and(|suffix| value.ends_with(&suffix.to_js_string())),
                 );
             }
-            (Value::String(value), "slice") => {
+            (this, "slice") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let units = value.encode_utf16().collect::<Vec<_>>();
                 let length = units.len() as i64;
                 let normalize = |argument: Option<&Value>, fallback: i64| {
@@ -1256,7 +1320,8 @@ impl Value {
                 let end = normalize(args.get(1), length).max(start);
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
-            (Value::String(value), "substr") => {
+            (this, "substr") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let units = value.encode_utf16().collect::<Vec<_>>();
                 let length = units.len() as i64;
                 let raw_start = args
@@ -1279,22 +1344,25 @@ impl Value {
                 let end = start.saturating_add(count).min(units.len());
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
-            (Value::String(value), "startsWith") => {
+            (this, "startsWith") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
                 let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-                let start = string_index_to_byte(value, start);
+                let start = string_index_to_byte(&value, start);
                 return Value::Bool(value[start..].starts_with(&needle));
             }
-            (Value::String(value), "includes") => {
+            (this, "includes") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
                 let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-                let start = string_index_to_byte(value, start);
+                let start = string_index_to_byte(&value, start);
                 return Value::Bool(value[start..].contains(&needle));
             }
-            (Value::String(value), "indexOf") => {
+            (this, "indexOf") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
                 let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-                let start_byte = string_index_to_byte(value, start);
+                let start_byte = string_index_to_byte(&value, start);
                 let index = value
                     .get(start_byte..)
                     .and_then(|tail| tail.find(&needle).map(|offset| start_byte + offset))
@@ -1302,7 +1370,8 @@ impl Value {
                     .unwrap_or(-1.0);
                 return Value::Number(index);
             }
-            (Value::String(value), "charCodeAt") => {
+            (this, "charCodeAt") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
                 if !index.is_finite() || index < 0.0 {
                     return Value::Number(f64::NAN);
@@ -1315,7 +1384,8 @@ impl Value {
                         .unwrap_or(f64::NAN),
                 );
             }
-            (Value::String(value), "charAt") => {
+            (this, "charAt") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
                 if !index.is_finite() || index < 0.0 {
                     return Value::from(String::new());
@@ -1328,7 +1398,8 @@ impl Value {
                         .unwrap_or_default(),
                 );
             }
-            (Value::String(value), "substring") => {
+            (this, "substring") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let len = value.chars().count();
                 let mut start = args.first().map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
                 let mut end = args
@@ -1341,17 +1412,20 @@ impl Value {
                 if start > end {
                     std::mem::swap(&mut start, &mut end);
                 }
-                let start = string_index_to_byte(value, start);
-                let end = string_index_to_byte(value, end);
+                let start = string_index_to_byte(&value, start);
+                let end = string_index_to_byte(&value, end);
                 return Value::from(value[start..end].to_string());
             }
-            (Value::String(value), "toUpperCase") => {
+            (this, "toUpperCase") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 return Value::from(value.to_uppercase());
             }
-            (Value::String(value), "toLowerCase") => {
+            (this, "toLowerCase") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 return Value::from(value.to_lowercase());
             }
-            (Value::String(value), "localeCompare") => {
+            (this, "localeCompare") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let other = args.first().cloned().unwrap_or_default().to_js_string();
                 return Value::Number(match value.as_str().cmp(other.as_str()) {
                     std::cmp::Ordering::Less => -1.0,
@@ -1359,21 +1433,23 @@ impl Value {
                     std::cmp::Ordering::Greater => 1.0,
                 });
             }
-            (Value::String(value), "trim") => {
+            (this, "trim") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 return Value::from(value.trim().to_string());
             }
-            (Value::String(value), "split") => {
+            (this, "split") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let Some(separator) = args.first() else {
-                    return Value::array(vec![Value::String(value.clone())]);
+                    return Value::array(vec![Value::from(value.clone())]);
                 };
                 if separator.is_undefined() {
-                    return Value::array(vec![Value::String(value.clone())]);
+                    return Value::array(vec![Value::from(value.clone())]);
                 }
                 let limit = args
                     .get(1)
                     .map(|value| value.to_number().max(0.0) as usize)
                     .unwrap_or(usize::MAX);
-                if let Some(result) = crate::regexp::string_split(value, separator, limit) {
+                if let Some(result) = crate::regexp::string_split(&value, separator, limit) {
                     return result;
                 }
                 let separator = separator.to_js_string();
@@ -1392,24 +1468,27 @@ impl Value {
                 };
                 return Value::array(parts);
             }
-            (Value::String(value), "match") => {
+            (this, "match") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let pattern = args.first().cloned().unwrap_or(Value::Undefined);
-                if let Some(result) = crate::regexp::string_match(value, &pattern) {
+                if let Some(result) = crate::regexp::string_match(&value, &pattern) {
                     return result;
                 }
             }
-            (Value::String(value), "matchAll") => {
+            (this, "matchAll") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let pattern = args.first().cloned().unwrap_or(Value::Undefined);
-                if let Some(result) = crate::regexp::string_match_all(value, &pattern) {
+                if let Some(result) = crate::regexp::string_match_all(&value, &pattern) {
                     return result;
                 }
                 let global = crate::regexp::create(&pattern.to_js_string(), "g");
-                return crate::regexp::string_match_all(value, &global)
+                return crate::regexp::string_match_all(&value, &global)
                     .expect("fresh global regexp always produces an iterator");
             }
-            (Value::String(value), "search") => {
+            (this, "search") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let pattern = args.first().cloned().unwrap_or(Value::Undefined);
-                if let Some(result) = crate::regexp::string_search(value, &pattern) {
+                if let Some(result) = crate::regexp::string_search(&value, &pattern) {
                     return result;
                 }
                 return Value::Number(
@@ -1419,10 +1498,11 @@ impl Value {
                         .unwrap_or(-1.0),
                 );
             }
-            (Value::String(value), "replace") => {
+            (this, "replace") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let pattern = args.first().cloned().unwrap_or(Value::Undefined);
                 let replacement = args.get(1).cloned().unwrap_or(Value::Undefined);
-                if let Some(result) = crate::regexp::string_replace(value, &pattern, &replacement) {
+                if let Some(result) = crate::regexp::string_replace(&value, &pattern, &replacement) {
                     return result;
                 }
                 if replacement.is_function()
@@ -1434,7 +1514,7 @@ impl Value {
                         vec![
                             pattern,
                             Value::Number(value[..byte].encode_utf16().count() as f64),
-                            Value::String(value.clone()),
+                            Value::from(value.clone()),
                         ],
                     );
                     return Value::from(format!(
@@ -1524,7 +1604,8 @@ impl Value {
             return true;
         }
         match self {
-            Value::Array(_) | Value::String(_) => true,
+            Value::Array(_) => true,
+            _ if self.is_string() => true,
             Value::Object(object) => {
                 crate::collections::iter_collection(self).is_some()
                     || object
@@ -1560,13 +1641,16 @@ impl Value {
                 values: Rc::clone(values),
                 index: 0,
             }),
-            Value::String(value) => ValueIterator::new(
-                value
-                    .chars()
-                    .map(|character| Value::from(character.to_string()))
-                    .collect::<Vec<_>>()
-                    .into_iter(),
-            ),
+            _ if self.is_string() => {
+                let value = self.as_js_string().expect("string");
+                ValueIterator::new(
+                    value
+                        .chars()
+                        .map(|character| Value::from(character.to_string()))
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                )
+            }
             // First use the standards-oriented Map/Set registry. Retain the
             // host runtime's snapshot hook as a fallback for its lightweight
             // built-in Map used by compiled application paths.
@@ -2129,19 +2213,19 @@ fn array_call_method(
 
 impl From<&str> for Value {
     fn from(value: &str) -> Self {
-        Value::String(JsString::intern(value))
+        Value::from_js_string(JsString::intern(value))
     }
 }
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
-        Value::String(JsString::from(value))
+        Value::from_js_string(JsString::from(value))
     }
 }
 
 impl From<JsString> for Value {
     fn from(value: JsString) -> Self {
-        Value::String(value)
+        Value::from_js_string(value)
     }
 }
 
@@ -2321,11 +2405,13 @@ impl Value {
                     _ => false,
                 }
             }
-            (Value::String(a), Value::String(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
             (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
-            _ => false,
+            _ => match (self.as_js_string(), other.as_js_string()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            },
         }
     }
 
@@ -2343,11 +2429,13 @@ impl Value {
                 (None, None) => a == b,
                 _ => false,
             },
-            (Value::String(a), Value::String(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
             (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
-            _ => false,
+            _ => match (self.as_js_string(), other.as_js_string()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            },
         }
     }
 
@@ -2381,7 +2469,7 @@ impl Value {
             return ordering.is_lt();
         }
         match (self, other) {
-            (Value::String(left), Value::String(right)) => left < right,
+            (left, right) if left.is_string() && right.is_string() => left.as_js_string() < right.as_js_string(),
             _ => self.to_number() < other.to_number(),
         }
     }
@@ -2391,7 +2479,7 @@ impl Value {
             return ordering.is_gt();
         }
         match (self, other) {
-            (Value::String(left), Value::String(right)) => left > right,
+            (left, right) if left.is_string() && right.is_string() => left.as_js_string() > right.as_js_string(),
             _ => self.to_number() > other.to_number(),
         }
     }
@@ -2401,7 +2489,7 @@ impl Value {
             return !ordering.is_gt();
         }
         match (self, other) {
-            (Value::String(left), Value::String(right)) => left <= right,
+            (left, right) if left.is_string() && right.is_string() => left.as_js_string() <= right.as_js_string(),
             _ => self.to_number() <= other.to_number(),
         }
     }
@@ -2411,7 +2499,7 @@ impl Value {
             return !ordering.is_lt();
         }
         match (self, other) {
-            (Value::String(left), Value::String(right)) => left >= right,
+            (left, right) if left.is_string() && right.is_string() => left.as_js_string() >= right.as_js_string(),
             _ => self.to_number() >= other.to_number(),
         }
     }
@@ -2576,11 +2664,22 @@ mod tests {
             ),
             _ => panic!("number must be the tagged immediate word"),
         }
+        // Direct String-arm construction stays a heap variant; interned
+        // short strings created via Value::string are packed below.
         assert!(
             Value::String(JsString::intern("heap-or-intern"))
                 .as_immediate()
                 .is_none()
         );
+        match Value::string("imm-intern") {
+            Value::Imm(word) => {
+                let copied = assert_copy(word);
+                assert!(copied.is_interned_string());
+                assert_eq!(std::mem::size_of_val(&copied), 8);
+                assert!(!std::mem::needs_drop::<Immediate>());
+            }
+            _ => panic!("interned short string must be the tagged immediate word"),
+        }
         assert!(Value::array(vec![]).as_immediate().is_none());
         assert!(Value::object(HashMap::new()).as_immediate().is_none());
         assert!(
@@ -3364,8 +3463,13 @@ mod tests {
         let a = Value::string("interned-clone-test");
         let b = a.clone();
         match (&a, &b) {
-            (Value::String(left), Value::String(right)) => assert!(left.ptr_eq(right)),
-            _ => panic!("expected strings"),
+            (Value::Imm(left), Value::Imm(right)) => {
+                assert_copy(*left);
+                assert_eq!(left.interned_handle(), right.interned_handle());
+                assert!(left.is_interned_string());
+                assert_eq!(left.as_js_string().unwrap().heap_strong_count(), None);
+            }
+            _ => panic!("interned short string clone must stay Imm, not Rc"),
         }
         assert_eq!(a, b);
         assert_eq!(a.to_js_string(), "interned-clone-test");
@@ -3376,8 +3480,80 @@ mod tests {
         let a = Value::string("length");
         let b = Value::string("length");
         match (&a, &b) {
-            (Value::String(left), Value::String(right)) => assert!(left.ptr_eq(right)),
-            _ => panic!("expected strings"),
+            (Value::Imm(left), Value::Imm(right)) => {
+                assert_eq!(left.interned_handle(), right.interned_handle());
+            }
+            _ => panic!("interned literals must pack into Immediate"),
         }
+    }
+
+    #[test]
+    fn interned_short_string_value_is_imm_copy_word() {
+        let s = Value::string("short-intern-imm");
+        assert!(s.is_string());
+        match s {
+            Value::Imm(word) => {
+                let copied = assert_copy(word);
+                assert_eq!(std::mem::size_of::<Immediate>(), 8);
+                assert_eq!(std::mem::size_of_val(&copied), 8);
+                assert!(!std::mem::needs_drop::<Immediate>());
+                assert!(copied.is_interned_string());
+                let js = copied.as_js_string().expect("handle");
+                assert_eq!(js.as_str(), "short-intern-imm");
+                assert!(js.page_handle().is_some());
+                assert_eq!(js.heap_strong_count(), None);
+                assert_eq!(copied.interned_handle(), js.page_handle());
+                // tag 5 in low 3 bits, handle in bits 3..35
+                assert_eq!(copied.bits() & 7, 5);
+                assert_eq!(
+                    ((copied.bits() >> 3) as u32),
+                    js.page_handle().unwrap()
+                );
+            }
+            _ => panic!("interned short string Value must be Imm"),
+        }
+        let cloned = s.clone();
+        match cloned {
+            Value::Imm(word) => {
+                assert_copy(word);
+                assert!(word.is_interned_string());
+                assert_eq!(word.as_js_string().unwrap().heap_strong_count(), None);
+            }
+            _ => panic!("clone of interned short string must not take the String arm"),
+        }
+    }
+
+    #[test]
+    fn long_string_value_stays_on_heap_arm() {
+        let raw = "L".repeat(257);
+        let s = Value::string(&raw);
+        assert!(s.is_string());
+        assert!(s.as_immediate().is_none());
+        match &s {
+            Value::String(js) => {
+                assert!(js.page_handle().is_none());
+                assert_eq!(js.heap_strong_count(), Some(1));
+            }
+            _ => panic!("long string must stay on the String arm"),
+        }
+        let cloned = s.clone();
+        match (&s, &cloned) {
+            (Value::String(left), Value::String(right)) => {
+                assert!(left.ptr_eq(right));
+                assert_eq!(left.heap_strong_count(), Some(2));
+            }
+            _ => panic!("long string clone must stay heap"),
+        }
+        assert_eq!(s.to_js_string(), raw);
+    }
+
+    #[test]
+    fn interned_string_handles_drop_on_page_reset() {
+        crate::page_arena::reset();
+        let s = Value::string("reset-drops-imm-handle");
+        assert!(matches!(s, Value::Imm(word) if word.is_interned_string()));
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_handles(), 0);
+        assert_eq!(JsString::interned_table_bytes(), 0);
     }
 }

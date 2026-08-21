@@ -103,7 +103,7 @@ pub fn stringify(args: Vec<Value>) -> Value {
     let gap_value = args.get(2).cloned().unwrap_or(Value::Undefined);
     let gap = if let Some(n) = gap_value.as_number() {
         " ".repeat((n.max(0.0) as usize).min(10))
-    } else if let Value::String(s) = &gap_value {
+    } else if let Some(s) = gap_value.as_js_string() {
         s.chars().take(10).collect()
     } else {
         String::new()
@@ -162,7 +162,7 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
         crate::value::ValueUnpack::Null => Some("null".to_string()),
         crate::value::ValueUnpack::Bool(b) => Some(b.to_string()),
         crate::value::ValueUnpack::Number(n) => Some(serialize_number(n)),
-        crate::value::ValueUnpack::String(s) => Some(serialize_string(s)),
+        crate::value::ValueUnpack::String(s) => Some(serialize_string(s.as_str())),
         crate::value::ValueUnpack::Array(items) => {
             let pointer = Rc::as_ptr(items) as usize;
             context.enter(pointer);
