@@ -17,6 +17,57 @@ pub struct PaintNode {
     pub kind: ComponentKind,
     pub style: Style,
     pub parent: Option<usize>,
+    pub sticky_counter_signal: Option<usize>,
+}
+
+/// Rebuild paint nodes, cloning `Style` only for slots that actually changed.
+///
+/// Returns the node list and the number of Style clones performed. A clean
+/// subtree (same length, same parent/kind/style) reuses the previous
+/// allocation and reports 0 clones.
+pub fn reuse_or_clone_paint_nodes<'a>(
+    existing: Vec<PaintNode>,
+    incoming: impl IntoIterator<
+        Item = (&'a ComponentKind, &'a Style, Option<usize>, Option<usize>),
+    >,
+) -> (Vec<PaintNode>, usize) {
+    let incoming: Vec<_> = incoming.into_iter().collect();
+    if existing.len() != incoming.len() {
+        let clones = incoming.len();
+        let nodes = incoming
+            .into_iter()
+            .map(|(kind, style, parent, sticky)| PaintNode {
+                kind: kind.clone(),
+                style: style.clone(),
+                parent,
+                sticky_counter_signal: sticky,
+            })
+            .collect();
+        return (nodes, clones);
+    }
+    let mut existing: Vec<Option<PaintNode>> = existing.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(incoming.len());
+    let mut clones = 0;
+    for (i, (kind, style, parent, sticky)) in incoming.into_iter().enumerate() {
+        let reusable = existing[i].as_ref().is_some_and(|old| {
+            old.parent == parent
+                && old.sticky_counter_signal == sticky
+                && old.kind == *kind
+                && (std::ptr::eq(&old.style, style) || old.style == *style)
+        });
+        if reusable {
+            out.push(existing[i].take().expect("paint node slot"));
+        } else {
+            clones += 1;
+            out.push(PaintNode {
+                kind: kind.clone(),
+                style: style.clone(),
+                parent,
+                sticky_counter_signal: sticky,
+            });
+        }
+    }
+    (out, clones)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -246,6 +297,7 @@ mod tests {
             kind: ComponentKind::Column,
             style: Style::default(),
             parent: None,
+            sticky_counter_signal: None,
         };
         let mut scroll_style = Style::default();
         scroll_style.overflow = Overflow::Scroll;
@@ -253,6 +305,7 @@ mod tests {
             kind: ComponentKind::Column,
             style: scroll_style,
             parent: Some(0),
+            sticky_counter_signal: None,
         };
         let mut child_style = Style::default();
         child_style.opacity = 0.5;
@@ -263,6 +316,7 @@ mod tests {
             },
             style: child_style,
             parent: Some(1),
+            sticky_counter_signal: None,
         };
 
         let artifact = PaintArtifact::build(
@@ -293,11 +347,13 @@ mod tests {
                 kind: ComponentKind::Column,
                 style: Style::default(),
                 parent: None,
+                sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Column,
                 style: sticky_style,
                 parent: Some(0),
+                sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Text {
@@ -305,6 +361,7 @@ mod tests {
                 },
                 style: Style::default(),
                 parent: Some(1),
+                sticky_counter_signal: None,
             },
         ];
         let artifact =
@@ -312,5 +369,27 @@ mod tests {
 
         assert_eq!(artifact.sticky_owner, vec![None, Some(1), Some(1)]);
         assert_eq!(artifact.z_order, vec![0, 3, 3]);
+    }
+
+    #[test]
+    fn clean_subtree_does_not_clone_style() {
+        let mut style = Style::default();
+        style.filter = Some("blur(2px)".into());
+        let kind = ComponentKind::Column;
+        let incoming = [(&kind, &style, None, None)];
+        let (first, clones) = reuse_or_clone_paint_nodes(Vec::new(), incoming);
+        assert_eq!(clones, 1);
+        let first_ptr = first[0].style.filter.as_ref().map(|s| s.as_ptr());
+        let (second, clones) = reuse_or_clone_paint_nodes(first, incoming);
+        assert_eq!(clones, 0);
+        assert_eq!(
+            second[0].style.filter.as_ref().map(|s| s.as_ptr()),
+            first_ptr
+        );
+        let mut dirty = style.clone();
+        dirty.opacity = 0.5;
+        let incoming_dirty = [(&kind, &dirty, None, None)];
+        let (_, dirty_clones) = reuse_or_clone_paint_nodes(second, incoming_dirty);
+        assert_eq!(dirty_clones, 1);
     }
 }

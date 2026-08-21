@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::dom;
-use crate::paint_artifact::{PaintArtifact, PaintNode};
+use crate::paint_artifact::{reuse_or_clone_paint_nodes, PaintArtifact, PaintNode};
 use crate::text_layout;
 use crate::tile_manager::{TileManager, TileRequest};
 
@@ -1806,7 +1806,7 @@ impl App {
         }
         let lookahead = (scrollport.height * 1.5 + damage.delta_y.abs() * 4.0)
             .clamp(scrollport.height, scrollport.height * 3.0);
-        let flat = layout::pre_flatten(&self.root);
+        let flat = self.paint_artifact.nodes.as_slice();
         let mut requests = Vec::new();
         for &(rect, index) in &self.layout_cache {
             if index == damage.index
@@ -2538,13 +2538,31 @@ impl App {
             self.needs_tree_rebuild = true;
         }
 
-        let flat = layout::pre_flatten(&self.root);
+        let dummy_action = EventAction::None;
+        let old_paint_nodes = std::mem::take(&mut self.paint_artifact.nodes);
+        let reuse_flatten = !self.needs_tree_rebuild
+            && !self.needs_style_refresh
+            && !old_paint_nodes.is_empty();
+        let retained_flat = if reuse_flatten {
+            Some(paint_nodes_as_flat(&old_paint_nodes, &dummy_action))
+        } else {
+            None
+        };
+        let walked_flat = if !reuse_flatten {
+            Some(layout::pre_flatten(&self.root))
+        } else {
+            None
+        };
+        let flat: &[layout::FlatNodeInfo<'_>] = retained_flat
+            .as_deref()
+            .or(walked_flat.as_deref())
+            .expect("layout flatten");
         if self.needs_tree_rebuild {
             self.layout_engine.invalidate();
             self.needs_tree_rebuild = false;
             self.needs_style_refresh = false;
         } else if self.needs_style_refresh && self.layout_engine.tree_valid() {
-            let _ = self.layout_engine.patch_display_styles(&flat);
+            let _ = self.layout_engine.patch_display_styles(flat);
             self.needs_style_refresh = false;
         }
 
@@ -2630,38 +2648,52 @@ impl App {
             viewport,
         );
 
-        self.hit_nodes.clear();
-        self.focusable_indices.clear();
-        for &(rect, idx) in &self.layout_cache {
-            if let Some(node) = flat.get(idx) {
-                if !layout::is_node_visible(&flat, idx) {
-                    continue;
+        if reuse_flatten {
+            let rects: HashMap<usize, LayoutRect> = self
+                .layout_cache
+                .iter()
+                .map(|(rect, idx)| (*idx, *rect))
+                .collect();
+            for hit in &mut self.hit_nodes {
+                if let Some(rect) = rects.get(&hit.index) {
+                    hit.rect = *rect;
                 }
-                let disabled = dom_host_disabled(&node.on_click);
-                let is_interactive = (matches!(node.kind, ComponentKind::Button { .. })
-                    || matches!(node.kind, ComponentKind::TextInput { .. })
-                    || node.on_click.has_pointer_interaction())
-                    && !disabled;
-                let is_host_target =
-                    is_interactive || matches!(node.on_click, EventAction::NativeHost { .. });
-                let is_focusable = (matches!(node.kind, ComponentKind::Button { .. })
-                    || matches!(node.kind, ComponentKind::TextInput { .. }))
-                    && !disabled;
-                if is_focusable {
-                    self.focusable_indices.push(idx);
-                }
-                self.hit_nodes.push(HitNode {
-                    rect,
-                    index: idx,
-                    is_interactive,
-                    is_host_target,
-                    is_focusable,
-                    on_click: node.on_click.clone(),
-                });
             }
-        }
+            self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
+        } else {
+            self.hit_nodes.clear();
+            self.focusable_indices.clear();
+            for &(rect, idx) in &self.layout_cache {
+                if let Some(node) = flat.get(idx) {
+                    if !layout::is_node_visible(&flat, idx) {
+                        continue;
+                    }
+                    let disabled = dom_host_disabled(&node.on_click);
+                    let is_interactive = (matches!(node.kind, ComponentKind::Button { .. })
+                        || matches!(node.kind, ComponentKind::TextInput { .. })
+                        || node.on_click.has_pointer_interaction())
+                        && !disabled;
+                    let is_host_target =
+                        is_interactive || matches!(node.on_click, EventAction::NativeHost { .. });
+                    let is_focusable = (matches!(node.kind, ComponentKind::Button { .. })
+                        || matches!(node.kind, ComponentKind::TextInput { .. }))
+                        && !disabled;
+                    if is_focusable {
+                        self.focusable_indices.push(idx);
+                    }
+                    self.hit_nodes.push(HitNode {
+                        rect,
+                        index: idx,
+                        is_interactive,
+                        is_host_target,
+                        is_focusable,
+                        on_click: node.on_click.clone(),
+                    });
+                }
+            }
 
-        self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
+            self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
+        }
         crate::uitest::set_hit_targets(
             self.hit_nodes
                 .iter()
@@ -2795,7 +2827,9 @@ impl App {
             // Re-materialize spacers and recompute layout before presenting
             // this frame so a newly encountered tall/short row never exposes
             // the intermediate estimated geometry for one refresh interval.
-            drop(flat);
+            drop(retained_flat);
+            drop(walked_flat);
+            self.paint_artifact.nodes = old_paint_nodes;
             for (scroll_index, correction) in virtual_anchor_corrections {
                 self.queue_scroll_damage(scroll_index, correction);
             }
@@ -2804,12 +2838,28 @@ impl App {
             self.ensure_layout_pass(measurement_pass + 1);
             return;
         }
+        drop(retained_flat);
+        let (paint_nodes, _style_clones) = if reuse_flatten {
+            (old_paint_nodes, 0usize)
+        } else {
+            reuse_or_clone_paint_nodes(
+                old_paint_nodes,
+                walked_flat
+                    .as_ref()
+                    .expect("walked flatten")
+                    .iter()
+                    .map(|node| {
+                        (
+                            node.kind,
+                            node.style,
+                            node.parent,
+                            node.sticky_counter_signal,
+                        )
+                    }),
+            )
+        };
         self.paint_artifact = PaintArtifact::build(
-            flat.iter().map(|node| PaintNode {
-                kind: node.kind.clone(),
-                style: node.style.clone(),
-                parent: node.parent,
-            }),
+            paint_nodes,
             &self.layout_cache,
             self.layout_generation + 1,
         );
@@ -4198,7 +4248,7 @@ impl App {
     }
 
     fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
-        let flat = layout::pre_flatten(&self.root);
+        let flat = self.paint_artifact.nodes.as_slice();
         let mut visual_host_fallback = None;
         if flat
             .iter()
@@ -4375,7 +4425,7 @@ impl App {
     }
 
     fn hit_test_scroll(&self, x: f32, y: f32) -> Option<usize> {
-        let flat = layout::pre_flatten(&self.root);
+        let flat = self.paint_artifact.nodes.as_slice();
         let scroll_info = build_scroll_info_fast(
             &self.scroll_ancestor,
             &self.scrollable_nodes,
@@ -5977,6 +6027,23 @@ fn replace_virtual_index(component: &mut Component, index: usize) {
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let t = t.clamp(0.0, 1.0);
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+fn paint_nodes_as_flat<'a>(
+    nodes: &'a [PaintNode],
+    dummy_action: &'a EventAction,
+) -> Vec<layout::FlatNodeInfo<'a>> {
+    nodes
+        .iter()
+        .map(|node| layout::FlatNodeInfo {
+            stable_id: 0,
+            kind: &node.kind,
+            style: &node.style,
+            on_click: dummy_action,
+            sticky_counter_signal: node.sticky_counter_signal,
+            parent: node.parent,
+        })
+        .collect()
 }
 
 trait PaintNodeView {

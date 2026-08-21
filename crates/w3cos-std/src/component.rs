@@ -100,7 +100,7 @@ fn default_svg_pointer_events() -> String {
     "auto".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ComponentKind {
     Root,
     Column,
