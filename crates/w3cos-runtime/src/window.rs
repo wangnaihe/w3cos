@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 
 use crate::dom;
 use crate::paint_artifact::{reuse_or_clone_paint_nodes, PaintArtifact, PaintNode};
+use crate::retained_layers::{
+    CompositorOverrides, LayerPaintAction, RetainedLayerTree,
+};
 use crate::text_layout;
 use crate::tile_manager::{TileManager, TileRequest};
 
@@ -436,6 +439,8 @@ struct ScrollDamage {
 enum RepaintMode {
     Full,
     ScrollOnly(Vec<ScrollDamage>),
+    /// Opacity / transform only; GPU/Skia replay retained layer recordings.
+    CompositorOnly,
     ScrollContentChanged(Vec<ScrollDamage>),
     ExternalAfterScroll {
         scroll_indices: Vec<usize>,
@@ -455,7 +460,7 @@ impl RepaintMode {
                     damages.push(ScrollDamage { index, delta_y });
                 }
             }
-            RepaintMode::Clean => {
+            RepaintMode::Clean | RepaintMode::CompositorOnly => {
                 *self = RepaintMode::ScrollOnly(vec![ScrollDamage { index, delta_y }]);
             }
             RepaintMode::ExternalAfterScroll { .. } => {
@@ -481,6 +486,7 @@ fn repaint_after_host_tree_rebuild(current: RepaintMode) -> RepaintMode {
             damage_indices,
         },
         RepaintMode::Clean => RepaintMode::Clean,
+        RepaintMode::CompositorOnly => RepaintMode::CompositorOnly,
         RepaintMode::Full => RepaintMode::Full,
     }
 }
@@ -522,6 +528,7 @@ fn repaint_after_host_tree_content_change(
         },
         RepaintMode::Full
         | RepaintMode::Clean
+        | RepaintMode::CompositorOnly
         | RepaintMode::ScrollOnly(_)
         | RepaintMode::ScrollContentChanged(_) => RepaintMode::Full,
     }
@@ -1319,6 +1326,9 @@ struct App {
     scroll_ancestor: Vec<Option<usize>>,
     flat_parents: Vec<Option<usize>>,
     paint_artifact: PaintArtifact,
+    retained_layers: RetainedLayerTree,
+    #[cfg(feature = "gpu")]
+    retained_layer_scenes: Vec<Scene>,
     tile_manager: TileManager,
     // Performance: spatial grid for O(1) hit testing
     spatial_grid: SpatialGrid,
@@ -1470,6 +1480,9 @@ impl App {
             scroll_ancestor: Vec::new(),
             flat_parents: Vec::new(),
             paint_artifact: PaintArtifact::default(),
+            retained_layers: RetainedLayerTree::default(),
+            #[cfg(feature = "gpu")]
+            retained_layer_scenes: Vec::new(),
             tile_manager: TileManager::default(),
             spatial_grid: SpatialGrid::empty(),
             paint_generation: 0,
@@ -3282,8 +3295,22 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
-        let has_active_animations = !self.animations.is_empty();
-        let repaint_mode = take_repaint_for_present(&mut self.repaint_mode, has_active_animations);
+        let paint_anims = self.animations.iter().any(|animation| {
+            !matches!(
+                animation.property(),
+                AnimatedProperty::Opacity | AnimatedProperty::Transform
+            )
+        });
+        let compositor_anims = self.animations.iter().any(|animation| {
+            matches!(
+                animation.property(),
+                AnimatedProperty::Opacity | AnimatedProperty::Transform
+            )
+        });
+        let mut repaint_mode = take_repaint_for_present(&mut self.repaint_mode, paint_anims);
+        if matches!(repaint_mode, RepaintMode::Clean) && compositor_anims {
+            repaint_mode = RepaintMode::CompositorOnly;
+        }
         let Some((tile_requests, tile_clients)) =
             prepare_for_repaint(&repaint_mode, || self.prepare_compositor_tiles())
         else {
@@ -3351,43 +3378,30 @@ impl App {
             self.viewport.layout_w,
             self.viewport.layout_h,
         );
-        // Blink computes cull rects during PrePaint. Do the equivalent before
-        // building Vello display items so offscreen list nodes never enter the
-        // scene or its z-sort. Keep a small overscan for shadows/transforms.
-        let mut render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> =
-            layout_cache
-                .iter()
-                .filter_map(|&(rect, idx)| {
-                    if !node_intersects_paint_cull(
-                        idx,
-                        rect,
-                        &scroll_info,
-                        self.viewport.layout_w,
-                        self.viewport.layout_h,
-                        64.0,
-                    ) {
-                        return None;
-                    }
-                    let node = flat.get(idx)?;
-                    let style = style_overrides.get(&idx).unwrap_or(&node.style);
-                    Some((idx, rect, &node.kind, style))
-                })
-                .collect();
-        let paint_z = &self.paint_artifact.z_order;
-        render_nodes.sort_by_key(|(idx, _, _, _)| paint_z[*idx]);
+        let compositor_overrides = CompositorOverrides::from_style_map(&style_overrides);
+        if self.hovered_index.is_some() || self.pressed_index.is_some() {
+            self.retained_layers.invalidate_recordings();
+        }
+        let layer_action = self.retained_layers.sync(
+            &self.paint_artifact,
+            &self.scroll_offsets,
+            &compositor_overrides,
+        );
+        let can_replay = matches!(layer_action, LayerPaintAction::Replay)
+            && self.retained_layers.recordings_valid()
+            && self.retained_layer_scenes.len() == self.retained_layers.layers.len();
 
         let scale = self.scale_factor as f32;
-        // Blink performs interest-rect prepaint before raster/submit. Do the
-        // same here so a virtual-window swap cannot make the first visible
-        // frame synchronously build every new text display chunk.
-        let display_chunks = self.collect_scroll_interest_display_chunks(&tile_clients);
-        if !display_chunks.is_empty() {
-            self.glyph_cache.prepaint_display_chunks(
-                &display_chunks,
-                &self.font_data,
-                &self.font,
-                Duration::from_micros(1_500),
-            );
+        if !can_replay {
+            let display_chunks = self.collect_scroll_interest_display_chunks(&tile_clients);
+            if !display_chunks.is_empty() {
+                self.glyph_cache.prepaint_display_chunks(
+                    &display_chunks,
+                    &self.font_data,
+                    &self.font,
+                    Duration::from_micros(1_500),
+                );
+            }
         }
 
         let device_handle = &self.render_cx.devices[dev_id];
@@ -3398,38 +3412,86 @@ impl App {
         }
 
         self.scene.reset();
-        {
-            let pipelines = self.gpu_filter_pipelines.as_mut().unwrap();
-            let layer_pool = &mut self.gpu_layer_textures;
-            let output_pool = &mut self.gpu_output_texture_pool;
-            let renderer = self
-                .renderers
-                .get_mut(dev_id)
-                .and_then(|r| r.as_mut())
-                .expect("gpu renderer");
-            let mut filter_ctx = crate::gpu_filter::GpuFilterCtx {
-                device: &device_handle.device,
-                queue: &device_handle.queue,
-                renderer,
-                antialiasing_method: gpu_aa_config(),
-                pipelines,
-                layer_pool,
-                output_pool,
-                scale_factor: scale,
-            };
-            render_gpu::render_frame(
+        if can_replay {
+            self.retained_layers.note_replay();
+            crate::perf::record_paint_path("retained-layer-replay");
+            render_gpu::composite_retained_layers(
                 &mut self.scene,
-                width,
-                height,
-                &render_nodes,
-                &self.font_data,
-                &self.font,
+                &self.retained_layer_scenes,
+                &self.retained_layers.layers,
+                &self.paint_artifact,
                 &scroll_info,
-                &self.text_input_values,
-                self.focused_index,
-                &mut self.glyph_cache,
+                &compositor_overrides,
                 scale,
-                Some(&mut filter_ctx),
+            );
+        } else {
+            let layer_nodes: Vec<
+                Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)>,
+            > = self
+                .retained_layers
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .client_indices
+                        .iter()
+                        .filter_map(|&idx| {
+                            let node = self.paint_artifact.nodes.get(idx)?;
+                            let rect = self
+                                .paint_artifact
+                                .rect_by_index
+                                .get(idx)
+                                .copied()
+                                .flatten()?;
+                            let style = style_overrides.get(&idx).unwrap_or(&node.style);
+                            Some((idx, rect, &node.kind, style))
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut recordings = Vec::with_capacity(layer_nodes.len());
+            {
+                let pipelines = self.gpu_filter_pipelines.as_mut().unwrap();
+                let layer_pool = &mut self.gpu_layer_textures;
+                let output_pool = &mut self.gpu_output_texture_pool;
+                let renderer = self
+                    .renderers
+                    .get_mut(dev_id)
+                    .and_then(|r| r.as_mut())
+                    .expect("gpu renderer");
+                let mut filter_ctx = crate::gpu_filter::GpuFilterCtx {
+                    device: &device_handle.device,
+                    queue: &device_handle.queue,
+                    renderer,
+                    antialiasing_method: gpu_aa_config(),
+                    pipelines,
+                    layer_pool,
+                    output_pool,
+                    scale_factor: scale,
+                };
+                for nodes in &layer_nodes {
+                    recordings.push(render_gpu::record_layer_scene(
+                        nodes,
+                        &self.font_data,
+                        &self.font,
+                        &self.text_input_values,
+                        self.focused_index,
+                        &mut self.glyph_cache,
+                        Some(&mut filter_ctx),
+                    ));
+                }
+            }
+            self.retained_layer_scenes = recordings;
+            self.retained_layers.note_rebuild();
+            crate::perf::record_paint_path("full-scene-rebuild");
+            render_gpu::composite_retained_layers(
+                &mut self.scene,
+                &self.retained_layer_scenes,
+                &self.retained_layers.layers,
+                &self.paint_artifact,
+                &scroll_info,
+                &compositor_overrides,
+                scale,
             );
         }
 
@@ -3461,7 +3523,6 @@ impl App {
             }
         }
 
-        drop(render_nodes);
         drop(style_overrides);
 
         // Cleanup animations
@@ -3823,6 +3884,8 @@ impl App {
                             focused_index: self.focused_index,
                             background: canvas_background,
                             artifact: Some(&self.paint_artifact),
+                            retained: None,
+                            compositor_overrides: None,
                         },
                     )
                 });
@@ -3965,6 +4028,18 @@ impl App {
                         );
                         crate::perf::record_paint_path("full-external-fallback");
                     }
+                }
+                RepaintMode::CompositorOnly => {
+                    render_cpu::render_frame(
+                        &mut pixmap,
+                        &render_nodes,
+                        &self.font,
+                        &scroll_info,
+                        &self.text_input_values,
+                        self.focused_index,
+                        &mut self.cpu.as_mut().unwrap().clip_masks,
+                    );
+                    crate::perf::record_paint_path("full-compositor-cpu");
                 }
                 RepaintMode::Full => {
                     render_cpu::render_frame(

@@ -20,6 +20,12 @@ use crate::filter::{self, CssFilter};
 use crate::gpu_filter::{self, GpuFilterCtx};
 
 use crate::layout::LayoutRect;
+use crate::paint_artifact::PaintArtifact;
+use crate::retained_layers::{
+    layer_css_transform, layer_opacity as compositor_layer_opacity, layer_scroll_translation,
+    CompositorLayer, CompositorOverrides,
+};
+use w3cos_std::style::Transform2D;
 
 // ---------------------------------------------------------------------------
 // GlyphCache — avoid repeated font parsing, charmap lookup, and rasterization
@@ -204,6 +210,7 @@ impl GlyphCache {
             self,
             Affine::IDENTITY,
             true,
+            true,
             #[cfg(feature = "gpu")]
             None,
         );
@@ -343,6 +350,7 @@ fn render_node_gpu_layer(
         glyph_cache,
         dpi,
         true,
+        true,
         None,
     );
     if let Some(layer) = filter_ctx.rasterize_filtered_layer(&layer_scene, lw, lh, chain) {
@@ -460,6 +468,7 @@ pub fn render_frame(
             glyph_cache,
             dpi,
             false,
+            true,
             #[cfg(feature = "gpu")]
             gpu_filter.as_deref_mut(),
         );
@@ -480,6 +489,7 @@ fn render_node(
     glyph_cache: &mut GlyphCache,
     dpi: Affine,
     in_layer: bool,
+    bake_compositor_props: bool,
     #[cfg(feature = "gpu")] mut gpu_filter: Option<&mut GpuFilterCtx<'_>>,
 ) {
     if style.opacity <= 0.0 {
@@ -496,19 +506,22 @@ fn render_node(
         scene.push_clip_layer(Fill::NonZero, dpi, &clip_shape);
     }
 
-    let tx = style.transform.translate_x;
-    let ty = style.transform.translate_y;
-    let rect = LayoutRect {
-        x: rect.x + tx,
-        y: rect.y + ty,
-        width: rect.width * style.transform.scale_x,
-        height: rect.height * style.transform.scale_y,
+    let (rect, opacity) = if bake_compositor_props {
+        (
+            LayoutRect {
+                x: rect.x + style.transform.translate_x,
+                y: rect.y + style.transform.translate_y,
+                width: rect.width * style.transform.scale_x,
+                height: rect.height * style.transform.scale_y,
+            },
+            style.opacity,
+        )
+    } else {
+        (rect, 1.0)
     };
-
-    let opacity = style.opacity;
     let css_filter = style.filter.as_deref().and_then(filter::parse_css_filter);
 
-    let needs_compositor_layer = promotes_compositor_layer(style);
+    let needs_compositor_layer = bake_compositor_props && promotes_compositor_layer(style);
     if needs_compositor_layer {
         let bounds = Rect::new(
             rect.x as f64,
@@ -1306,6 +1319,107 @@ pub fn draw_focus_ring(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
         (rect.y + rect.height) as f64,
     );
     scene.stroke(&stroke, dpi, color, None, &r);
+}
+
+
+fn css_transform_affine(transform: Transform2D, origin: (f64, f64)) -> Affine {
+    Affine::translate((
+        origin.0 + transform.translate_x as f64,
+        origin.1 + transform.translate_y as f64,
+    )) * Affine::rotate((transform.rotate_deg as f64).to_radians())
+        * Affine::scale_non_uniform(transform.scale_x as f64, transform.scale_y as f64)
+        * Affine::translate((-origin.0, -origin.1))
+}
+
+/// Record one compositor layer in layout space. Scroll, opacity, and CSS
+/// transform are applied later by [`composite_retained_layers`].
+#[allow(clippy::too_many_arguments)]
+pub fn record_layer_scene(
+    nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
+    font_data: &FontData,
+    font: &fontdue::Font,
+    text_input_values: &HashMap<usize, String>,
+    focused_index: Option<usize>,
+    glyph_cache: &mut GlyphCache,
+    #[cfg(feature = "gpu")] mut gpu_filter: Option<&mut GpuFilterCtx<'_>>,
+) -> Scene {
+    let mut scene = Scene::new();
+    for &(idx, rect, kind, style) in nodes {
+        let text_value = match kind {
+            ComponentKind::TextInput { value, .. } => Some(
+                text_input_values
+                    .get(&idx)
+                    .map(|s| s.as_str())
+                    .unwrap_or_else(|| value.as_str()),
+            ),
+            _ => None,
+        };
+        render_node(
+            &mut scene,
+            rect,
+            kind,
+            style,
+            font_data,
+            font,
+            None,
+            text_value,
+            focused_index == Some(idx),
+            glyph_cache,
+            Affine::IDENTITY,
+            false,
+            false,
+            #[cfg(feature = "gpu")]
+            gpu_filter.as_deref_mut(),
+        );
+    }
+    scene
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn composite_retained_layers(
+    scene: &mut Scene,
+    recordings: &[Scene],
+    layers: &[CompositorLayer],
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    scale_factor: f32,
+) {
+    let dpi = Affine::scale(scale_factor as f64);
+    for (layer, recording) in layers.iter().zip(recordings) {
+        let (scroll_x, scroll_y, clip) = layer_scroll_translation(layer, scroll_info);
+        let css = layer_css_transform(layer, artifact, overrides);
+        let origin = (layer.bounds.x as f64, layer.bounds.y as f64);
+        let transform = dpi
+            * Affine::translate((scroll_x as f64, scroll_y as f64))
+            * css_transform_affine(css, origin);
+        let opacity = compositor_layer_opacity(layer, artifact, overrides);
+        if let Some(clip_rect) = clip {
+            let clip_shape = Rect::new(
+                clip_rect.x as f64,
+                clip_rect.y as f64,
+                (clip_rect.x + clip_rect.width) as f64,
+                (clip_rect.y + clip_rect.height) as f64,
+            );
+            scene.push_clip_layer(Fill::NonZero, dpi, &clip_shape);
+        }
+        if opacity < 0.999 {
+            let bounds = Rect::new(
+                layer.bounds.x as f64,
+                layer.bounds.y as f64,
+                (layer.bounds.x + layer.bounds.width) as f64,
+                (layer.bounds.y + layer.bounds.height) as f64,
+            );
+            scene.push_layer(Fill::NonZero, vello::peniko::Mix::Normal, opacity, transform, &bounds);
+            scene.append(recording, Some(transform));
+            scene.pop_layer();
+        } else {
+            scene.append(recording, Some(transform));
+        }
+        if clip.is_some() {
+            scene.pop_layer();
+        }
+    }
 }
 
 #[cfg(test)]
