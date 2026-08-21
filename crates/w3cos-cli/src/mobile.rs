@@ -2,9 +2,11 @@
 
 use crate::dev;
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use w3cos_compiler::CompileOptions;
 
 fn w3cos_root() -> Result<PathBuf> {
@@ -141,6 +143,8 @@ w3cos build app.tsx -o app --release && ./app
 ```bash
 w3cos mobile build --platform android   # APK (needs SDK + NDK)
 w3cos mobile build --platform ios       # Simulator (needs Xcode)
+w3cos mobile build --platform ios --ios-target device --release \
+  --report target/mobile-ios-device.json # Unsigned arm64 slice + evidence
 w3cos mobile build --platform harmony   # HAP (needs DevEco/OHOS SDK)
 w3cos mobile build --platform both      # Android + iOS
 ```
@@ -190,16 +194,137 @@ pub fn mobile_build(
     release: bool,
     devtools: bool,
 ) -> Result<()> {
+    mobile_build_with_evidence(project_dir, platform, release, devtools, "simulator", None)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IosBuildTarget {
+    Simulator,
+    Device,
+}
+
+impl IosBuildTarget {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "simulator" => Ok(Self::Simulator),
+            "device" => Ok(Self::Device),
+            other => bail!("unknown iOS target: {other} (use simulator|device)"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Simulator => "simulator",
+            Self::Device => "device",
+        }
+    }
+
+    fn rust_target(self) -> &'static str {
+        match self {
+            Self::Simulator => "aarch64-apple-ios-sim",
+            Self::Device => "aarch64-apple-ios",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MobileBuildArtifactReport {
+    kind: &'static str,
+    path: String,
+    bytes: u64,
+    device_slice: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MobileBuildReport {
+    schema_version: u32,
+    platform: &'static str,
+    target: &'static str,
+    rust_target: &'static str,
+    profile: &'static str,
+    generation_ms: u64,
+    native_build_and_package_ms: u64,
+    total_ms: u64,
+    artifact: MobileBuildArtifactReport,
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn write_ios_build_report(
+    report_path: &Path,
+    ios_target: IosBuildTarget,
+    release: bool,
+    generation: Duration,
+    native_build_and_package: Duration,
+    total: Duration,
+    artifact: &Path,
+) -> Result<()> {
+    let bytes = fs::metadata(artifact)
+        .with_context(|| format!("inspect iOS artifact {}", artifact.display()))?
+        .len();
+    let report = MobileBuildReport {
+        schema_version: 1,
+        platform: "ios",
+        target: ios_target.name(),
+        rust_target: ios_target.rust_target(),
+        profile: if release { "release-size" } else { "dev-fast" },
+        generation_ms: duration_ms(generation),
+        native_build_and_package_ms: duration_ms(native_build_and_package),
+        total_ms: duration_ms(total),
+        artifact: MobileBuildArtifactReport {
+            kind: "executable",
+            path: artifact.display().to_string(),
+            bytes,
+            device_slice: ios_target == IosBuildTarget::Device,
+        },
+    };
+    if let Some(parent) = report_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&report)?;
+    fs::write(report_path, format!("{json}\n"))?;
+    println!("📊 Mobile build report: {}", report_path.display());
+    Ok(())
+}
+
+pub fn mobile_build_with_evidence(
+    project_dir: &Path,
+    platform: &str,
+    release: bool,
+    devtools: bool,
+    ios_target: &str,
+    report_path: Option<&Path>,
+) -> Result<()> {
+    let ios_target = IosBuildTarget::parse(ios_target)?;
+    if platform != "ios" && report_path.is_some() {
+        bail!("--report currently requires --platform ios");
+    }
+    if !matches!(platform, "ios" | "both") && ios_target != IosBuildTarget::Simulator {
+        bail!("--ios-target device requires --platform ios or both");
+    }
     if platform == "all" {
         bail!(
             "--platform all is available for `mobile init` only; build android|ios|harmony|both explicitly"
         );
     }
     if platform == "both" {
-        mobile_build(project_dir, "android", release, devtools)?;
-        mobile_build(project_dir, "ios", release, devtools)?;
+        mobile_build_with_evidence(project_dir, "android", release, devtools, "simulator", None)?;
+        mobile_build_with_evidence(
+            project_dir,
+            "ios",
+            release,
+            devtools,
+            ios_target.name(),
+            None,
+        )?;
         return Ok(());
     }
+    let total_started = Instant::now();
     let (_, _, entry, safe_area, interactive_widget, _, manifest_document_base_url) =
         read_app_manifest(project_dir);
     let document_base_url = std::env::var("W3COS_DOCUMENT_BASE_URL")
@@ -228,6 +353,7 @@ pub fn mobile_build(
     }
 
     println!("⚡ Transpiling {} → mobile cdylib...", app_tsx.display());
+    let generation_started = Instant::now();
     w3cos_compiler::compile_mobile_from_file_with_options(
         &app_tsx,
         &build_dir,
@@ -243,12 +369,33 @@ pub fn mobile_build(
     if preserve_generated_sources {
         restore_unchanged_generated_mtimes(&generated_snapshots)?;
     }
+    let generation = generation_started.elapsed();
 
-    match platform {
-        "android" => build_android(project_dir, &build_dir, release)?,
-        "ios" => build_ios(project_dir, &build_dir, release)?,
-        "harmony" => build_harmony(project_dir, &build_dir, release)?,
+    let native_started = Instant::now();
+    let ios_artifact = match platform {
+        "android" => {
+            build_android(project_dir, &build_dir, release)?;
+            None
+        }
+        "ios" => Some(build_ios(project_dir, &build_dir, release, ios_target)?),
+        "harmony" => {
+            build_harmony(project_dir, &build_dir, release)?;
+            None
+        }
         other => bail!("unknown platform: {other} (use android|ios|harmony|both)"),
+    };
+    let native_build_and_package = native_started.elapsed();
+
+    if let (Some(report_path), Some(artifact)) = (report_path, ios_artifact.as_deref()) {
+        write_ios_build_report(
+            report_path,
+            ios_target,
+            release,
+            generation,
+            native_build_and_package,
+            total_started.elapsed(),
+            artifact,
+        )?;
     }
 
     Ok(())
@@ -1091,10 +1238,55 @@ fn write_ios_plist(
 #[cfg(test)]
 mod tests {
     use super::{
-        manifest_entry_supports_platform, prepare_mobile_build_dir, read_app_manifest,
-        restore_unchanged_generated_mtimes, snapshot_generated_files,
+        IosBuildTarget, manifest_entry_supports_platform, prepare_mobile_build_dir,
+        read_app_manifest, restore_unchanged_generated_mtimes, snapshot_generated_files,
+        write_ios_build_report,
     };
     use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn ios_build_target_distinguishes_simulator_and_device_slices() {
+        assert_eq!(
+            IosBuildTarget::parse("simulator").unwrap().rust_target(),
+            "aarch64-apple-ios-sim"
+        );
+        assert_eq!(
+            IosBuildTarget::parse("device").unwrap().rust_target(),
+            "aarch64-apple-ios"
+        );
+        assert!(IosBuildTarget::parse("universal").is_err());
+    }
+
+    #[test]
+    fn ios_device_build_report_records_timing_and_slice_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("W3cosApp");
+        std::fs::write(&artifact, b"aot-device-slice").unwrap();
+        let report_path = root.path().join("reports/device.json");
+
+        write_ios_build_report(
+            &report_path,
+            IosBuildTarget::Device,
+            true,
+            Duration::from_millis(12),
+            Duration::from_millis(34),
+            Duration::from_millis(50),
+            &artifact,
+        )
+        .unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["target"], "device");
+        assert_eq!(report["rust_target"], "aarch64-apple-ios");
+        assert_eq!(report["profile"], "release-size");
+        assert_eq!(report["generation_ms"], 12);
+        assert_eq!(report["native_build_and_package_ms"], 34);
+        assert_eq!(report["total_ms"], 50);
+        assert_eq!(report["artifact"]["bytes"], 16);
+        assert_eq!(report["artifact"]["device_slice"], true);
+    }
 
     #[test]
     fn native_manifest_entries_can_be_scoped_to_one_mobile_platform() {
@@ -1177,7 +1369,25 @@ mod tests {
     }
 }
 
-fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> {
+fn cargo_target_dir(build_dir: &Path) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|target_dir| {
+            if target_dir.is_absolute() {
+                target_dir
+            } else {
+                build_dir.join(target_dir)
+            }
+        })
+        .unwrap_or_else(|| build_dir.join("target"))
+}
+
+fn build_ios(
+    project_dir: &Path,
+    build_dir: &Path,
+    release: bool,
+    ios_target: IosBuildTarget,
+) -> Result<PathBuf> {
     let ios_dir = project_dir.join("ios");
     if !ios_dir.exists() {
         bail!("ios/ not found — run: w3cos mobile init . --platform ios");
@@ -1189,14 +1399,17 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         );
     }
 
-    let target = "aarch64-apple-ios-sim";
+    let target = ios_target.rust_target();
     println!("🔧 Adding Rust target {target} (if needed)...");
     let _ = Command::new("rustup")
         .args(["target", "add", target])
         .status();
 
     let profile = if release { "release" } else { "debug" };
-    println!("🔨 Building iOS simulator binary ({profile})...");
+    println!(
+        "🔨 Building iOS {} binary ({profile})...",
+        ios_target.name()
+    );
     let inherited_rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
     let rustflags = if inherited_rustflags.trim().is_empty() {
         "-C link-arg=-ObjC".to_string()
@@ -1217,8 +1430,7 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         bail!("iOS native build failed for target {target}");
     }
 
-    let bin = build_dir
-        .join("target")
+    let bin = cargo_target_dir(build_dir)
         .join(target)
         .join(profile)
         .join("W3cosApp");
@@ -1236,7 +1448,8 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         fs::remove_dir_all(&app_bundle)?;
     }
     fs::create_dir_all(&app_bundle)?;
-    fs::copy(&bin, app_bundle.join("W3cosApp"))?;
+    let packaged_bin = app_bundle.join("W3cosApp");
+    fs::copy(&bin, &packaged_bin)?;
     write_ios_plist(
         &app_bundle.join("Info.plist"),
         &display_name,
@@ -1250,9 +1463,14 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         display_name
     );
 
+    if ios_target == IosBuildTarget::Device {
+        println!("ℹ️  Device slice is unsigned; sign it in the downstream app archive pipeline");
+        return Ok(packaged_bin);
+    }
+
     if std::env::var("W3COS_SKIP_IOS_INSTALL").ok().as_deref() == Some("1") {
         println!("ℹ️  Skipping simulator install (W3COS_SKIP_IOS_INSTALL=1)");
-        return Ok(());
+        return Ok(packaged_bin);
     }
 
     let udid = std::env::var("W3COS_IOS_SIM").unwrap_or_else(|_| "iPhone 17".to_string());
@@ -1304,5 +1522,5 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         );
     }
 
-    Ok(())
+    Ok(packaged_bin)
 }

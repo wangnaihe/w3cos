@@ -965,6 +965,9 @@ Rust-only modules are no longer advertised as browser APIs.
 - [x] Android/iOS project templates.
 - [x] `w3cos mobile init`.
 - [x] `w3cos mobile build` for Android and iOS simulator artifacts.
+- [x] Select a feature-minimal Skia mobile runtime, generate the size-oriented
+  release profile, and emit reproducible unsigned iOS device-slice timing/size
+  reports without claiming signing or App Store completion.
 - [x] `w3cos mobile dev` with debug DevTools plumbing.
 - [x] Safe-area inset storage and native setter.
 - [x] HarmonyOS ArkUI/XComponent shell scaffold with fail-closed build.

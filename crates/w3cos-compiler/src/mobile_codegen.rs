@@ -1,8 +1,16 @@
-use crate::codegen::{CompileOptions, GENERATED_DEV_PROFILE, find_workspace_root, gen_node};
+use crate::codegen::{
+    CompileOptions, GENERATED_DEV_PROFILE, GENERATED_RELEASE_PROFILE, find_workspace_root, gen_node,
+};
 use crate::css_parser::Stylesheet;
 use crate::parser::{AppTree, SignalDecl};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MobileRuntimeCapabilities {
+    pub(crate) web_graphics_advanced: bool,
+    pub(crate) web_media_advanced: bool,
+}
 
 fn write_if_changed(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     let contents = contents.as_ref();
@@ -131,6 +139,7 @@ pub fn write_mobile_project(
     interactive_widget: &str,
     options: &CompileOptions,
 ) -> Result<()> {
+    let runtime_capabilities = MobileRuntimeCapabilities::default();
     std::fs::create_dir_all(output_dir.join("src"))?;
     let body = generate_app_body(tree, stylesheet)?;
     if platform == "ios" {
@@ -143,7 +152,7 @@ pub fn write_mobile_project(
         write_if_changed(&output_dir.join("src/main.rs"), main)?;
         write_if_changed(
             &output_dir.join("Cargo.toml"),
-            generate_ios_cargo_toml(options)?,
+            generate_ios_cargo_toml_with_capabilities(options, runtime_capabilities)?,
         )?;
     } else if platform == "harmony" {
         write_if_changed(
@@ -161,7 +170,7 @@ pub fn write_mobile_project(
         )?;
         write_if_changed(
             &output_dir.join("Cargo.toml"),
-            generate_android_cargo_toml(options)?,
+            generate_android_cargo_toml_with_capabilities(options, runtime_capabilities)?,
         )?;
     }
     Ok(())
@@ -174,6 +183,26 @@ pub fn write_mobile_dom_project(
     safe_area: bool,
     interactive_widget: &str,
     options: &CompileOptions,
+) -> Result<()> {
+    write_mobile_dom_project_with_capabilities(
+        bundle,
+        output_dir,
+        platform,
+        safe_area,
+        interactive_widget,
+        options,
+        MobileRuntimeCapabilities::default(),
+    )
+}
+
+pub(crate) fn write_mobile_dom_project_with_capabilities(
+    bundle: &str,
+    output_dir: &Path,
+    platform: &str,
+    safe_area: bool,
+    interactive_widget: &str,
+    options: &CompileOptions,
+    runtime_capabilities: MobileRuntimeCapabilities,
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir.join("src"))?;
     write_split_bundle_if_changed(&output_dir.join("src"), bundle)?;
@@ -205,7 +234,7 @@ pub fn write_mobile_dom_project(
         write_if_changed(&output_dir.join("src/main.rs"), main)?;
         write_if_changed(
             &output_dir.join("Cargo.toml"),
-            generate_ios_cargo_toml(options)?,
+            generate_ios_cargo_toml_with_capabilities(options, runtime_capabilities)?,
         )?;
     } else if platform == "harmony" {
         let viewport_init = gen_viewport_init(interactive_widget);
@@ -228,7 +257,7 @@ pub fn write_mobile_dom_project(
         write_if_changed(&output_dir.join("src/lib.rs"), lib)?;
         write_if_changed(
             &output_dir.join("Cargo.toml"),
-            generate_android_cargo_toml(options)?,
+            generate_android_cargo_toml_with_capabilities(options, runtime_capabilities)?,
         )?;
     }
     Ok(())
@@ -480,15 +509,39 @@ fn gen_signal_inits(signals: &[SignalDecl]) -> String {
     )
 }
 
-fn deps_block(root: &Path, options: &CompileOptions) -> String {
-    let runtime_features = if options.devtools {
-        r#", features = ["devtools"]"#
-    } else {
-        ""
-    };
+fn mobile_runtime_features(
+    options: &CompileOptions,
+    capabilities: MobileRuntimeCapabilities,
+) -> Vec<&'static str> {
+    // The mobile window path presents through Skia Metal/Vulkan. The current
+    // presenter is hosted by the cpu-render window owner, so both features are
+    // required while Vello/WGPU remains opt-in for WebGPU/WebGL/WebXR usage.
+    let mut features = vec!["cpu-render", "skia"];
+    if capabilities.web_graphics_advanced {
+        features.extend(["gpu", "web-graphics-advanced"]);
+    }
+    if capabilities.web_media_advanced {
+        features.push("web-media-advanced");
+    }
+    if options.devtools {
+        features.push("devtools");
+    }
+    features
+}
+
+fn deps_block(
+    root: &Path,
+    options: &CompileOptions,
+    capabilities: MobileRuntimeCapabilities,
+) -> String {
+    let runtime_features = mobile_runtime_features(options, capabilities)
+        .into_iter()
+        .map(|feature| format!(r#""{feature}""#))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        r#"w3cos-mobile = {{ path = "{mobile}" }}
-w3cos-runtime = {{ path = "{runtime}"{runtime_features} }}
+        r#"w3cos-mobile = {{ path = "{mobile}", default-features = false }}
+w3cos-runtime = {{ path = "{runtime}", default-features = false, features = [{runtime_features}] }}
 w3cos-std = {{ path = "{std}" }}
 w3cos-core = {{ path = "{core}" }}
 log = "0.4""#,
@@ -500,6 +553,13 @@ log = "0.4""#,
 }
 
 pub fn generate_ios_cargo_toml(options: &CompileOptions) -> Result<String> {
+    generate_ios_cargo_toml_with_capabilities(options, MobileRuntimeCapabilities::default())
+}
+
+fn generate_ios_cargo_toml_with_capabilities(
+    options: &CompileOptions,
+    capabilities: MobileRuntimeCapabilities,
+) -> Result<String> {
     let root = find_workspace_root()?;
     Ok(format!(
         r#"[package]
@@ -516,16 +576,25 @@ name = "layout-export"
 path = "src/layout_export.rs"
 
 {dev_profile}
+{release_profile}
 [dependencies]
 {deps}
 serde_json = "1"
 "#,
-        deps = deps_block(&root, options),
+        deps = deps_block(&root, options, capabilities),
         dev_profile = GENERATED_DEV_PROFILE,
+        release_profile = GENERATED_RELEASE_PROFILE,
     ))
 }
 
 pub fn generate_android_cargo_toml(options: &CompileOptions) -> Result<String> {
+    generate_android_cargo_toml_with_capabilities(options, MobileRuntimeCapabilities::default())
+}
+
+fn generate_android_cargo_toml_with_capabilities(
+    options: &CompileOptions,
+    capabilities: MobileRuntimeCapabilities,
+) -> Result<String> {
     let root = find_workspace_root()?;
     Ok(format!(
         r#"[package]
@@ -538,6 +607,7 @@ name = "w3cos_mobile_app"
 crate-type = ["cdylib"]
 
 {dev_profile}
+{release_profile}
 [dependencies]
 {deps}
 
@@ -545,8 +615,9 @@ crate-type = ["cdylib"]
 android_logger = "0.14"
 winit = {{ version = "0.30", features = ["android-native-activity"] }}
 "#,
-        deps = deps_block(&root, options),
+        deps = deps_block(&root, options, capabilities),
         dev_profile = GENERATED_DEV_PROFILE,
+        release_profile = GENERATED_RELEASE_PROFILE,
     ))
 }
 
@@ -585,7 +656,12 @@ log = "0.4"
 
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_embedded_bundle_root, split_bundle_modules};
+    use super::{
+        MobileRuntimeCapabilities, canonicalize_embedded_bundle_root,
+        generate_android_cargo_toml_with_capabilities, generate_ios_cargo_toml_with_capabilities,
+        split_bundle_modules,
+    };
+    use crate::codegen::CompileOptions;
 
     #[test]
     fn generated_bundle_root_is_stable_across_vite_processes() {
@@ -621,5 +697,51 @@ pub fn run_entry() { m0::init(); m1::init(); }\n";
         assert_eq!(modules.len(), 2);
         assert!(modules[0].1.contains("fn init() {}"));
         assert!(modules[1].1.contains("let value = \"}\";"));
+    }
+
+    #[test]
+    fn mobile_manifests_link_only_the_skia_renderer_and_release_profile() {
+        let options = CompileOptions {
+            devtools: true,
+            ..CompileOptions::default()
+        };
+        for manifest in [
+            generate_ios_cargo_toml_with_capabilities(
+                &options,
+                MobileRuntimeCapabilities::default(),
+            )
+            .unwrap(),
+            generate_android_cargo_toml_with_capabilities(
+                &options,
+                MobileRuntimeCapabilities::default(),
+            )
+            .unwrap(),
+        ] {
+            assert!(manifest.contains(r#"w3cos-runtime = { path = "#));
+            assert!(manifest.contains(
+                r#"default-features = false, features = ["cpu-render", "skia", "devtools"]"#
+            ));
+            assert!(!manifest.contains(r#"features = ["gpu""#));
+            assert!(manifest.contains("[profile.release]"));
+            assert!(manifest.contains("opt-level = \"z\""));
+            assert!(manifest.contains("lto = \"fat\""));
+            assert!(manifest.contains("strip = \"symbols\""));
+        }
+    }
+
+    #[test]
+    fn mobile_manifest_restores_advanced_runtime_capabilities_when_referenced() {
+        let manifest = generate_ios_cargo_toml_with_capabilities(
+            &CompileOptions::default(),
+            MobileRuntimeCapabilities {
+                web_graphics_advanced: true,
+                web_media_advanced: true,
+            },
+        )
+        .unwrap();
+
+        assert!(manifest.contains(
+            r#"features = ["cpu-render", "skia", "gpu", "web-graphics-advanced", "web-media-advanced"]"#
+        ));
     }
 }

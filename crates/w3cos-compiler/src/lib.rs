@@ -117,13 +117,20 @@ pub fn compile_mobile_from_file_with_options(
         let bundle = artifacts
             .bundle_code
             .ok_or_else(|| anyhow::anyhow!("AOT mobile entry did not produce an ESM bundle"))?;
-        return mobile_codegen::write_mobile_dom_project(
+        let runtime_capabilities = mobile_codegen::MobileRuntimeCapabilities {
+            web_graphics_advanced: uses_advanced_web_graphics(&bundle)
+                || artifacts.has_dynamic_global_access,
+            web_media_advanced: uses_advanced_web_media(&bundle)
+                || artifacts.has_dynamic_global_access,
+        };
+        return mobile_codegen::write_mobile_dom_project_with_capabilities(
             &bundle,
             output_dir,
             platform,
             safe_area,
             interactive_widget,
             options,
+            runtime_capabilities,
         );
     }
     let source_dir = source_path.parent();

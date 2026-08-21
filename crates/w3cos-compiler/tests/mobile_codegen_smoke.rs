@@ -51,6 +51,10 @@ fn mobile_ios_writes_main_rs() {
     assert!(cargo.contains("[profile.dev.package.w3cos-mobile-app]"));
     assert!(cargo.contains("opt-level = 1"));
     assert!(cargo.contains("lto = \"off\""));
+    assert!(cargo.contains("[profile.release]"));
+    assert!(cargo.contains("opt-level = \"z\""));
+    assert!(cargo.contains("strip = \"symbols\""));
+    assert!(cargo.contains(r#"default-features = false, features = ["cpu-render", "skia"]"#));
 }
 
 #[test]
@@ -96,9 +100,37 @@ fn mobile_android_devtools_cargo_feature() {
 
     let cargo = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
     assert!(
-        cargo.contains(r#"features = ["devtools"]"#),
+        cargo
+            .contains(r#"default-features = false, features = ["cpu-render", "skia", "devtools"]"#),
         "devtools feature missing: {cargo}"
     );
+}
+
+#[test]
+fn mobile_dom_restores_referenced_advanced_capabilities() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("app.ts");
+    std::fs::write(
+        &source,
+        "export function main() { return [navigator.gpu, navigator.mediaDevices]; }",
+    )
+    .unwrap();
+    let output = tempfile::tempdir().unwrap();
+
+    w3cos_compiler::compile_mobile_from_file_with_options(
+        &source,
+        output.path(),
+        "ios",
+        false,
+        "resizes-content",
+        &w3cos_compiler::CompileOptions::default(),
+    )
+    .expect("compile advanced mobile DOM project");
+
+    let cargo = std::fs::read_to_string(output.path().join("Cargo.toml")).unwrap();
+    assert!(cargo.contains(
+        r#"features = ["cpu-render", "skia", "gpu", "web-graphics-advanced", "web-media-advanced"]"#
+    ));
 }
 
 #[test]

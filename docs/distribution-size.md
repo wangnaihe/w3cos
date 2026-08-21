@@ -124,3 +124,17 @@ application assets, ABI packaging overhead, or platform native libraries.
 Mobile release gates must audit an Android App Bundle device/ABI split and an iOS
 App Store device slice. Universal simulator builds are diagnostic only and must
 not become product baselines.
+
+W3COS can produce the unsigned iOS device slice and its build/size receipt
+without claiming signing or App Store completion:
+
+```sh
+w3cos mobile build path/to/application --platform ios \
+  --ios-target device --release \
+  --report target/mobile-ios-device.json
+```
+
+The report records generation, Native build/package and total elapsed
+milliseconds plus the exact executable bytes. Use a fixed Rust toolchain,
+generated `Cargo.lock`, target directory and application revision when comparing
+reports; simulator and device receipts are intentionally not interchangeable.
