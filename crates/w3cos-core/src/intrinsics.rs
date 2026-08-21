@@ -121,6 +121,10 @@ pub fn get_property(object: &Value, key: &Value) -> Value {
     object.get_property(&key.to_js_string())
 }
 
+pub fn get_property_checked(object: &Value, key: &Value) -> Value {
+    object.get_property_checked(&key.to_js_string())
+}
+
 pub fn delete_property(object: &Value, key: &Value) -> Value {
     object.delete_property(&key.to_js_string())
 }
@@ -311,6 +315,14 @@ pub fn for_in_keys(value: &Value) -> Value {
         };
         for key in own_keys {
             let key = key.to_js_string();
+            let enumerable = {
+                let object = object.borrow();
+                let descriptor = object.get_own_property_descriptor(&key);
+                !descriptor.is_undefined() && descriptor.get_property("enumerable").to_bool()
+            };
+            if !enumerable {
+                continue;
+            }
             if seen_keys.insert(key.clone()) {
                 keys.push(Value::from(key));
             }
@@ -713,5 +725,15 @@ mod tests {
             .collect::<Vec<_>>();
         keys.sort();
         assert_eq!(keys, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn for_in_keys_skip_non_enumerable_object_prototype_methods() {
+        let object = create_object(vec![(Value::string("only"), Value::Number(1.0))]);
+        let keys = for_in_keys(&object)
+            .iter()
+            .map(|value| value.to_js_string())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["only"]);
     }
 }

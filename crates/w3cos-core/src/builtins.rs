@@ -44,6 +44,17 @@ fn build_object_value() -> Value {
         "hasOwnProperty".to_string(),
         Value::function(|this, arguments| this.call_method("hasOwnProperty", arguments)),
     )]));
+    let has_own_property = prototype.get_property("hasOwnProperty");
+    crate::class::define_property(
+        &prototype,
+        "hasOwnProperty",
+        &Value::object(HashMap::from([
+            ("value".into(), has_own_property),
+            ("writable".into(), Value::Bool(true)),
+            ("enumerable".into(), Value::Bool(false)),
+            ("configurable".into(), Value::Bool(true)),
+        ])),
+    );
     properties.insert("prototype".to_string(), prototype);
     for name in ["keys", "values", "is"] {
         let method = name.to_string();

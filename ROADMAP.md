@@ -156,8 +156,9 @@ suite is red.
 - [x] Add mutable text-track/cue lists, constructible `VTTCue`, media-element
   `addTextTrack()` integration and neutral `VideoPlaybackQuality` records.
 - [x] Expose byte-stream controller/BYOB identities and compatible byte-stream
-  reader locking/delivery. Supplied BYOB views are not filled yet and emit a
-  warning instead of silently claiming zero-copy semantics.
+  reader locking/delivery. Supplied BYOB views are filled from queued chunks
+  or `ReadableStreamBYOBRequest.respond()` / `respondWithNewView()`, sharing
+  the caller buffer. Exact queuing backpressure remains an explicit partial.
 - [x] Back File System Access handles and `navigator.storage.getDirectory()`
   with a runtime-local OPFS directory, including file read/write streams,
   directory creation/traversal/removal/resolve and permission-compatible
@@ -331,9 +332,10 @@ precede ecosystem breadth or migration tooling.
   `values()` and `Symbol.asyncIterator` expose promise-based `next()`/`return()`,
   `preventCancel`, source cancellation and deterministic reader-lock release.
   Compression currently buffers until close. Byte streams expose the standard
-  controller/BYOB reader/request identities and compatible locking/delivery;
-  BYOB reads warn because supplied views are not filled yet. Compiler lowering
-  for `for await...of` syntax and exact backpressure remain explicit partials.
+  controller/BYOB reader/request identities, fill supplied views from queued
+  chunks or `byobRequest.respond()` / `respondWithNewView()`, and keep leftover
+  bytes queued. Compiler W3IR/AOT lowering for `for await...of` is covered by
+  compiled-JS tests. Exact stream backpressure remains an explicit partial.
 - [x] Expose `CustomElementRegistry` / `customElements` with autonomous
   element definition lookup, `whenDefined()`, explicit/subsequent creation
   upgrades, and connected/disconnected callbacks. Customized built-ins and
@@ -510,9 +512,12 @@ precede ecosystem breadth or migration tooling.
 - [x] Propagate request signals, reject pre-aborted fetches before native I/O,
   bound native work with request/`AbortSignal.timeout()` deadlines, and expose
   `AbortSignal.abort()`, `any()`, `timeout()`, and `throwIfAborted()`.
-- [ ] Interrupt an already-running native request when asynchronous Promise
-  execution permits JavaScript to abort concurrently; the synchronous AOT
-  facade currently reports a warning and relies on its native deadline.
+- [x] Interrupt an already-running native request when asynchronous Promise
+  execution aborts concurrently. The AOT `fetch` facade now runs native I/O on
+  a worker and pumps timers/microtasks, so `AbortController.abort()` from
+  `Promise.then` / `queueMicrotask` / timers returns AbortError without waiting
+  for the transport deadline. A platform I/O call may still finish in the
+  background.
 - [x] Add an ESM integration test against a local WebSocket fixture.
 - [x] Add an ESM integration test against a local HTTP fixture for Fetch and
   its companion constructors.
@@ -689,10 +694,18 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
     structured-clone codec for cycles, collections, Error, Blob/File and other
     supported platform values, including exact ArrayBuffer/SharedArrayBuffer,
     TypedArray/DataView types, ranges, and shared backing-buffer topology.
-  - [ ] Execute referenced Worker scripts and create isolated worker realms.
-    The current Worker host remains an explicit echo profile; MessagePort
-    transfer into that missing realm warns once and raises `DataCloneError`
-    without detaching the source.
+  - [x] Execute `blob:` and `data:` Worker scripts in an isolated W3VM realm
+    when the `dynamic-js` feature is enabled. The parent thread captures the
+    source (object URLs are thread-local) and the worker OS thread lowers it
+    through SWC → W3IR → W3VM with its own `self` / `postMessage` globals.
+    Top-level `onmessage = …` is still rejected by W3IR as an undeclared
+    assignment; worker scripts should set `self.onmessage`. HTTP, file, and
+    dummy URLs keep the existing structured-clone echo host.
+    Ordinary AOT builds do not link the compiler or W3VM for this path.
+  - [ ] Fetch and execute HTTP/file Worker scripts, compile Worker scripts on
+    the ordinary AOT path, run SharedWorker realms, and transfer MessagePort
+    objects into a worker thread. MessagePort transfer into a Worker still
+    warns once and raises `DataCloneError` without detaching the source.
 
 ### R2.4 Remaining network/browser services
 
@@ -929,8 +942,13 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
     is retained only for geometry hit modes; painted instances continue to use
     the display tree. Nested clip-path children and clip-path-on-clip-path
     chains are intersected on isolated local-coordinate layers.
-  - [ ] Complete animation-aware subtree invalidation, tile-granular
-    rerasterization, and an optional direct GPU vector path.
+  - [x] Animation-aware subtree invalidation and 32px tile-granular
+    rerasterization when SVG topology and geometry stay the same. Paint-only
+    source mutations (typical of DOM `setAttribute` / presentation animation)
+    copy clean tiles and rerasterize only dirty bounding boxes. Topology or
+    geometry changes still take a full tiled raster. SMIL and Web Animations
+    still do not write computed values into this raster path.
+  - [ ] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
 - [x] Define cookie behavior: real per-origin session store instead of inert
   assignment.
 
@@ -947,6 +965,9 @@ Rust-only modules are no longer advertised as browser APIs.
 - [x] Android/iOS project templates.
 - [x] `w3cos mobile init`.
 - [x] `w3cos mobile build` for Android and iOS simulator artifacts.
+- [x] Select a feature-minimal Skia mobile runtime, generate the size-oriented
+  release profile, and emit reproducible unsigned iOS device-slice timing/size
+  reports without claiming signing or App Store completion.
 - [x] `w3cos mobile dev` with debug DevTools plumbing.
 - [x] Safe-area inset storage and native setter.
 - [x] HarmonyOS ArkUI/XComponent shell scaffold with fail-closed build.
@@ -959,10 +980,14 @@ Rust-only modules are no longer advertised as browser APIs.
   `PointerEvent` and `TouchEvent` lifecycles, including stable identifiers,
   active/target/changed `TouchList` snapshots, pressure, cancel, primary-touch
   selection, and `preventDefault()` feedback.
-- [ ] Replace the standalone `w3cos-mobile::touch::TouchEvent::dispatch()`
-  compatibility placeholder and wire Android MotionEvent / iOS UITouch direct
-  surface adapters; the placeholder now emits a one-time warning instead of
-  silently succeeding.
+- [x] Replace the standalone `w3cos-mobile::touch::TouchEvent::dispatch()`
+  compatibility placeholder with hit-tested dispatch into the shared jsdom
+  PointerEvent/TouchEvent path (CSSOM boxes, same geometry as
+  `document.elementFromPoint`). A miss on `Start` is ignored; active contacts
+  keep their target through later phases.
+- [ ] Wire Android MotionEvent / iOS UITouch direct surface adapters; the
+  shared DTO path does not replace those host contact adapters. Exact hardware
+  simultaneous-contact reporting and gesture arbitration remain pending.
 - [x] Implement explicit pointer capture by pointer id, event retargeting,
   `gotpointercapture` / `lostpointercapture`, implicit release, and
   `NotFoundError` for inactive pointers.

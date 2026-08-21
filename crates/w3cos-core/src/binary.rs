@@ -532,6 +532,81 @@ pub fn bytes_of(value: &Value) -> Option<Vec<u8>> {
     Some(bytes.borrow()[offset..end].to_vec())
 }
 
+/// Returns true when `value` is a TypedArray or DataView.
+pub fn is_array_buffer_view(value: &Value) -> bool {
+    view_descriptor(value).is_some()
+}
+
+/// Byte range of a TypedArray or DataView within its backing ArrayBuffer.
+pub fn array_buffer_view_range(value: &Value) -> Option<(Value, usize, usize)> {
+    let (buffer, offset, byte_length, _) = view_descriptor(value)?;
+    Some((buffer, offset, byte_length))
+}
+
+/// Copy `source` into `view` and return a same-kind view over the written prefix.
+///
+/// The returned view shares `view`'s ArrayBuffer. Extra source bytes are not
+/// copied. Multi-byte TypedArrays keep only a whole-element prefix.
+pub fn fill_array_buffer_view(view: &Value, source: &[u8]) -> Option<Value> {
+    let (buffer, offset, byte_length, kind) = view_descriptor(view)?;
+    let bytes = buffer_state(&buffer)?;
+    if offset
+        .checked_add(byte_length)
+        .is_none_or(|end| end > bytes.borrow().len())
+    {
+        return None;
+    }
+    let written = match kind {
+        Some(kind) => {
+            let aligned = source.len().min(byte_length);
+            aligned - (aligned % kind.bytes())
+        }
+        None => source.len().min(byte_length),
+    };
+    bytes.borrow_mut()[offset..offset + written].copy_from_slice(&source[..written]);
+    sync_views(&bytes);
+    Some(slice_array_buffer_view(view, written).unwrap_or_else(|| view.clone()))
+}
+
+/// Return a same-kind TypedArray or DataView covering the first `byte_length`
+/// bytes of `view`. The result shares the original ArrayBuffer.
+pub fn slice_array_buffer_view(view: &Value, byte_length: usize) -> Option<Value> {
+    let (buffer, offset, capacity, kind) = view_descriptor(view)?;
+    if byte_length > capacity {
+        return None;
+    }
+    match kind {
+        Some(kind) => {
+            if byte_length % kind.bytes() != 0 {
+                return None;
+            }
+            Some(new_view(buffer, offset, byte_length / kind.bytes(), kind))
+        }
+        None => Some(crate::class::construct(
+            &data_view_class(),
+            vec![
+                buffer,
+                Value::Number(offset as f64),
+                Value::Number(byte_length as f64),
+            ],
+        )),
+    }
+}
+
+fn view_descriptor(value: &Value) -> Option<(Value, usize, usize, Option<Kind>)> {
+    if let Some((_, offset, length, kind, buffer)) = view_for(value) {
+        return Some((buffer, offset, length * kind.bytes(), Some(kind)));
+    }
+    if !value.get_property("__w3cos_data_view").to_bool() {
+        return None;
+    }
+    let buffer = value.get_property("buffer");
+    buffer_state(&buffer)?;
+    let offset = value.get_property("byteOffset").to_number().max(0.0) as usize;
+    let byte_length = value.get_property("byteLength").to_number().max(0.0) as usize;
+    Some((buffer, offset, byte_length, None))
+}
+
 pub enum BinaryCloneDescriptor {
     ArrayBuffer {
         shared: bool,
@@ -1648,6 +1723,27 @@ mod tests {
                 .to_number(),
             0xabcd as f64
         );
+    }
+
+    #[test]
+    fn fill_array_buffer_view_writes_into_the_supplied_typed_array() {
+        let dest =
+            crate::class::construct(&typed_array_class("Uint8Array"), vec![Value::Number(4.0)]);
+        dest.set_property("3", Value::Number(99.0));
+        let filled = fill_array_buffer_view(&dest, &[7, 8, 9]).expect("fill typed array");
+        assert!(is_array_buffer_view(&dest));
+        assert!(
+            filled
+                .get_property("buffer")
+                .strict_eq(&dest.get_property("buffer"))
+        );
+        assert_eq!(filled.get_property("byteLength").to_number(), 3.0);
+        assert_eq!(dest.get_property("0").to_number(), 7.0);
+        assert_eq!(dest.get_property("1").to_number(), 8.0);
+        assert_eq!(dest.get_property("2").to_number(), 9.0);
+        assert_eq!(dest.get_property("3").to_number(), 99.0);
+        assert_eq!(filled.get_property("0").to_number(), 7.0);
+        assert_eq!(bytes_of(&filled).unwrap(), vec![7, 8, 9]);
     }
 
     #[test]

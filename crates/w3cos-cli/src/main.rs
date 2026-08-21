@@ -126,7 +126,7 @@ enum MobileCommands {
         #[arg(long, default_value = "android")]
         platform: String,
     },
-    /// Build mobile artifact (APK / iOS simulator).
+    /// Build mobile artifact (APK / iOS simulator or unsigned device slice).
     Build {
         /// Project directory (contains app.tsx, android/, ios/).
         #[arg(default_value = ".")]
@@ -142,6 +142,13 @@ enum MobileCommands {
         /// Disable Chrome DevTools even in debug builds.
         #[arg(long)]
         no_devtools: bool,
+        /// iOS Rust target: simulator or device. Ignored by other platforms.
+        #[arg(long, default_value = "simulator", value_parser = ["simulator", "device"])]
+        ios_target: String,
+        /// Write machine-readable build timing and artifact-size evidence.
+        /// Currently supported for --platform ios.
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
     /// Watch entry + CSS, rebuild and reinstall on change.
     Dev {
@@ -187,7 +194,10 @@ fn main() -> Result<()> {
                 strip,
                 lto,
                 &target,
-                CompileOptions { devtools },
+                CompileOptions {
+                    devtools,
+                    ..CompileOptions::default()
+                },
             )?;
         }
         Commands::Run {
@@ -204,7 +214,10 @@ fn main() -> Result<()> {
                 None,
                 false,
                 "native",
-                CompileOptions { devtools },
+                CompileOptions {
+                    devtools,
+                    ..CompileOptions::default()
+                },
             )?;
             println!("▶  Running...");
             let config = dev::DevConfig {
@@ -253,9 +266,18 @@ fn main() -> Result<()> {
                 release,
                 devtools,
                 no_devtools,
+                ios_target,
+                report,
             } => {
                 let devtools = mobile::resolve_mobile_devtools(release, devtools, no_devtools);
-                mobile::mobile_build(&project, &platform, release, devtools)?;
+                mobile::mobile_build_with_evidence(
+                    &project,
+                    &platform,
+                    release,
+                    devtools,
+                    &ios_target,
+                    report.as_deref(),
+                )?;
             }
             MobileCommands::Dev {
                 project,
@@ -517,11 +539,12 @@ fn dev_watch_native(input: &PathBuf, config: &dev::DevConfig) -> Result<()> {
     let bin = tmp.join("target").join("debug").join("w3cos-app");
     let options = CompileOptions {
         devtools: config.devtools,
+        ..CompileOptions::default()
     };
 
     loop {
         println!("⚡ Building...");
-        if let Err(e) = build(&input, &bin, false, None, false, "native", options) {
+        if let Err(e) = build(&input, &bin, false, None, false, "native", options.clone()) {
             eprintln!("❌ Build failed: {e}");
             dev::wait_for_change(&watch_paths, &mut last_mtimes);
             continue;

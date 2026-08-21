@@ -661,7 +661,7 @@ impl Document {
         component
     }
 
-    fn descendant_text_content(&self, id: NodeId) -> String {
+    pub fn descendant_text_content(&self, id: NodeId) -> String {
         let node = self.get_node(id);
         let mut text = node.text_content.clone().unwrap_or_default();
         for child in self.children_ids(id) {
@@ -876,7 +876,23 @@ impl Document {
                 // inline element's own computed typography when lowering a
                 // simple `<span>text</span>` instead of wrapping the text in
                 // a zero-width container with an unrelated default style.
-                let child_ids = self.children_ids(id);
+                let mut child_ids = self.children_ids(id);
+                if tag == "details"
+                    && !node
+                        .attributes
+                        .iter()
+                        .any(|(name, _)| name.as_str().eq_ignore_ascii_case("open"))
+                {
+                    child_ids = child_ids
+                        .into_iter()
+                        .find(|child_id| {
+                            let child = self.get_node(*child_id);
+                            child.node_type == NodeType::Element
+                                && child.tag.as_str().eq_ignore_ascii_case("summary")
+                        })
+                        .into_iter()
+                        .collect();
+                }
                 if matches!(
                     tag.as_str(),
                     "abbr"
@@ -949,8 +965,7 @@ impl Document {
                 } else {
                     false
                 };
-                let children: Vec<w3cos_std::Component> = self
-                    .children_ids(id)
+                let children: Vec<w3cos_std::Component> = child_ids
                     .iter()
                     .map(|&child_id| self.node_to_component(child_id, ancestors, Some(&style)))
                     .collect();
@@ -1045,12 +1060,17 @@ impl Document {
                     "button" => {
                         let label = self.descendant_text_content(id);
                         let has_visual_children = !children.is_empty();
-                        let label = if label.is_empty() && !has_visual_children {
+                        let paint_label = if has_visual_children {
+                            ""
+                        } else if label.is_empty() {
                             "Button"
                         } else {
                             &label
                         };
-                        let mut button = w3cos_std::Component::button(label, style);
+                        // A non-leaf DOM button paints through its child nodes.
+                        // Keeping the descendant text in Button::label would
+                        // make every renderer paint it a second time.
+                        let mut button = w3cos_std::Component::button(paint_label, style);
                         button.children = children;
                         button
                     }
@@ -2031,7 +2051,7 @@ fn inherit_text_style(
     if !declares("white-space") {
         style.white_space = parent.white_space;
     }
-    if !declares("word-break") {
+    if !declares("word-break") && !declares("overflow-wrap") && !declares("word-wrap") {
         style.word_break = parent.word_break;
     }
 }
@@ -2148,5 +2168,57 @@ mod image_component_tests {
             Some("fallback.png"),
             "responsive selection must remain internal rendering state"
         );
+    }
+}
+
+#[cfg(test)]
+mod details_component_tests {
+    use super::*;
+
+    fn descendant_text(component: &w3cos_std::Component) -> String {
+        let own = match &component.kind {
+            w3cos_std::component::ComponentKind::Text { content } => content.as_str(),
+            w3cos_std::component::ComponentKind::Button { label } => label.as_str(),
+            _ => "",
+        };
+        component
+            .children
+            .iter()
+            .fold(own.to_string(), |mut text, child| {
+                text.push_str(&descendant_text(child));
+                text
+            })
+    }
+
+    fn details_document(open: bool) -> Document {
+        let mut document = Document::new();
+        let details = document.create_element("details");
+        if open {
+            details.set_attribute(&mut document, "open", "");
+        }
+        let summary = document.create_element("summary");
+        summary.set_text_content(&mut document, "Completed actions");
+        let content = document.create_element("div");
+        content.set_text_content(&mut document, "Hidden history event");
+        details.append_child(&mut document, summary);
+        details.append_child(&mut document, content);
+        document.body().append_child(&mut document, details);
+        document
+    }
+
+    #[test]
+    fn closed_details_only_lowers_its_summary() {
+        let tree = details_document(false).to_component_tree();
+        let text = descendant_text(&tree);
+        assert!(text.contains("Completed actions"));
+        assert!(!text.contains("Hidden history event"));
+    }
+
+    #[test]
+    fn open_details_lowers_summary_and_content() {
+        let tree = details_document(true).to_component_tree();
+        let text = descendant_text(&tree);
+        assert!(text.contains("Completed actions"));
+        assert!(text.contains("Hidden history event"));
     }
 }

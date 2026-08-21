@@ -1072,7 +1072,21 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "background-clip" => style.background_clip = Some(value.to_string()),
         "background-attachment" => style.background_attachment = Some(value.to_string()),
         "background-blend-mode" => style.background_blend_mode = Some(value.to_string()),
-        "border-radius" => style.border_radius = css_parse_px(value),
+        "border-radius" => {
+            let values = value
+                .split_ascii_whitespace()
+                .filter_map(css_parse_px)
+                .collect::<Vec<_>>();
+            if let Some([top_left, top_right, bottom_right, bottom_left]) =
+                expand_border_radius(&values)
+            {
+                style.border_radius = Some(top_left);
+                style.border_top_left_radius = Some(top_left);
+                style.border_top_right_radius = Some(top_right);
+                style.border_bottom_right_radius = Some(bottom_right);
+                style.border_bottom_left_radius = Some(bottom_left);
+            }
+        }
         "border-width" => style.border_width = css_parse_px(value),
         "border-top-width" => style.border_top_width = css_parse_px(value),
         "border-right-width" => style.border_right_width = css_parse_px(value),
@@ -1157,6 +1171,15 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "text-decoration" => style.text_decoration = Some(value.to_string()),
         "text-overflow" => style.text_overflow = Some(value.to_string()),
         "word-break" => style.word_break = Some(value.to_string()),
+        "overflow-wrap" | "word-wrap" => {
+            style.word_break = Some(
+                match value.trim() {
+                    "anywhere" | "break-word" => "break-word",
+                    _ => "normal",
+                }
+                .to_string(),
+            )
+        }
         "outline-width" => style.outline_width = css_parse_px(value),
         "outline-color" => style.outline_color = Some(value.to_string()),
         "outline-style" => style.outline_style = Some(value.to_string()),
@@ -1283,6 +1306,20 @@ fn css_parse_spacing(value: &str) -> Option<Spacing> {
 
 fn css_parse_px(value: &str) -> Option<f32> {
     crate::css_values::parse_plain_px(value)
+}
+
+fn expand_border_radius(values: &[f32]) -> Option<[f32; 4]> {
+    match values {
+        [all] => Some([*all; 4]),
+        [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
+        [top_left, opposite, bottom_right] => {
+            Some([*top_left, *opposite, *bottom_right, *opposite])
+        }
+        [top_left, top_right, bottom_right, bottom_left] => {
+            Some([*top_left, *top_right, *bottom_right, *bottom_left])
+        }
+        _ => None,
+    }
 }
 
 /// CSS box-edge shorthand: 1–4 values (top [right [bottom [left]]]).
@@ -1495,6 +1532,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_three_value_border_radius_preserves_each_css_corner() {
+        let sheet = parse_css(".message { border-radius: 4px 16px 16px; }");
+        let style = &sheet.rules[0].style;
+        assert_eq!(style.border_top_left_radius, Some(4.0));
+        assert_eq!(style.border_top_right_radius, Some(16.0));
+        assert_eq!(style.border_bottom_right_radius, Some(16.0));
+        assert_eq!(style.border_bottom_left_radius, Some(16.0));
+    }
+
+    #[test]
     fn parse_modern_box_model_shorthands() {
         let sheet = parse_css(
             ".card { box-sizing: border-box; margin: 1rem auto 12px 5%; gap: 8px 16px; overflow-y: auto; flex: 1 1 0%; grid-template-columns: 1fr 1fr; grid-column: 1 / -1; justify-self: end; border-bottom: 3px solid #1677ff; }",
@@ -1586,6 +1633,15 @@ mod tests {
         assert_eq!(
             sheet.rules[0].style.overscroll_behavior.as_deref(),
             Some("contain")
+        );
+    }
+
+    #[test]
+    fn overflow_wrap_anywhere_lowers_to_break_word() {
+        let sheet = parse_css(".message { overflow-wrap: anywhere; }");
+        assert_eq!(
+            sheet.rules[0].style.word_break.as_deref(),
+            Some("break-word")
         );
     }
 

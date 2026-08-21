@@ -118,13 +118,20 @@ pub fn compile_mobile_from_file_with_options(
         let bundle = artifacts
             .bundle_code
             .ok_or_else(|| anyhow::anyhow!("AOT mobile entry did not produce an ESM bundle"))?;
-        return mobile_codegen::write_mobile_dom_project(
+        let runtime_capabilities = mobile_codegen::MobileRuntimeCapabilities {
+            web_graphics_advanced: uses_advanced_web_graphics(&bundle)
+                || artifacts.has_dynamic_global_access,
+            web_media_advanced: uses_advanced_web_media(&bundle)
+                || artifacts.has_dynamic_global_access,
+        };
+        return mobile_codegen::write_mobile_dom_project_with_capabilities(
             &bundle,
             output_dir,
             platform,
             safe_area,
             interactive_widget,
             options,
+            runtime_capabilities,
         );
     }
     let source_dir = source_path.parent();
@@ -1089,7 +1096,13 @@ console.log("Done!");
             needs_dom: false,
             needs_std: true,
         };
-        let toml = generate_standalone_cargo_toml(&flags, &CompileOptions { devtools: true });
+        let toml = generate_standalone_cargo_toml(
+            &flags,
+            &CompileOptions {
+                devtools: true,
+                ..CompileOptions::default()
+            },
+        );
         assert!(
             toml.contains(r#"default-features = false, features = ["gpu", "devtools"]"#),
             "ESM applications must link one renderer: {toml}"
@@ -2050,11 +2063,15 @@ createRoot(document.getElementById("root")!).render(App());"#,
             !bundle_rs.contains("host_modules::call(\"react"),
             "framework packages must compile from their real sources: {bundle_rs}"
         );
-        let main_marker = format!("/// ESM module: {}", root.join("src/main.tsx").display());
+        let main_marker = "/// ESM module: /__w3cos_bundle__/main.tsx";
         assert_eq!(
-            bundle_rs.matches(&main_marker).count(),
+            bundle_rs.matches(main_marker).count(),
             1,
             "a path containing `..` must not create a phantom duplicate entry module: {bundle_rs}"
+        );
+        assert!(
+            !bundle_rs.contains("nested/../main.tsx") && !bundle_rs.contains("/src/nested/"),
+            "lexically nested `..` paths must collapse to one virtual entry: {bundle_rs}"
         );
         std::fs::remove_dir_all(&root).ok();
     }

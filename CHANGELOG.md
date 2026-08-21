@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Shared DOM touch dispatch** — `w3cos-mobile::TouchEvent::dispatch()` hit-tests the live document (CSSOM boxes / `elementFromPoint` geometry) and delivers paired PointerEvent/TouchEvent lifecycles. A `Start` that misses every box is ignored; later phases stay on the active contact target. Android MotionEvent, iOS UITouch, click generation, and gesture arbitration are still not wired through this DTO.
+- **SVG paint-only tile invalidation** — retained SVG rasters reuse 32px tiles when document topology and geometry stay the same and only paint (fill/stroke/opacity/visibility/text chunks) changes. Dirty bounding boxes are rerasterized with an 8px pad; topology or geometry changes still take a full tiled raster. SMIL/Web Animations still do not write computed values into this path, and there is no GPU vector tessellation.
+- **Isolated dedicated Worker realms (dynamic-js)** — `new Worker(blob:)` / `new Worker(data:)` capture script bytes on the parent thread and execute them on the worker OS thread with a fresh W3VM (`self`, `postMessage`, `self.onmessage`). W3IR still rejects top-level undeclared `onmessage = …`. HTTP/file/dummy URLs still echo structured-clone messages. SharedWorker, AOT-compiled worker scripts, and MessagePort transfer into a worker are still unimplemented.
+- **AOT Fetch in-flight abort** — without a page document URL, `fetch` with an AbortSignal runs native I/O on a worker and pumps timers/microtasks, so `Promise.then` / timer abort returns AbortError without waiting for the transport deadline. Background ureq I/O may still finish.
+
+### Fixed
+- **Main compiler CI** — `cargo test -p w3cos-compiler --lib --tests` now matches current ESM lowering (unbound names through the window intrinsic, `GetValue` via `get_property_checked`) and `for-in` skips non-enumerable `Object.prototype` methods. These suites were unreachable on `main` until #40 unblocked `cargo check`.
+- **Runtime CI** — script-fetch cancel no longer races a 1 MiB kernel write burst; inline-block/flex shrink-wrap tests compare against the host font instead of assuming CJK em metrics.
+- **ReadableStream BYOB filling** — `ReadableStreamBYOBReader.read(view)` now copies queued bytes into the supplied ArrayBufferView and returns a same-buffer prefix view. Byte-stream controllers expose a live `byobRequest`; `respond()` / `respondWithNewView()` complete in-flight BYOB reads. Leftover queued bytes stay available for the next read.
+- **Compiled `for await...of`** — W3IR/AOT lowering of `for await...of` over async iterables and `ReadableStream` is covered by compiled-JS and AOT/W3VM differential tests.
 - **Web Workers** (`w3cos_runtime::worker`) — W3C-standard background execution mapped onto native OS threads:
   - `Worker::spawn(opts, body)` runs a Rust closure on a dedicated thread; the closure receives a `WorkerScope` with browser-equivalent `recv` / `try_recv` / `post_message` / `report_error` methods.
   - `Worker::post_message` / `try_recv` / `poll_events` mirror the parent-side `MessageEvent` / `ErrorEvent` queue.
@@ -41,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `w3cos-ai-bridge::server::start` retained for backwards compatibility; new `start_with_provider(port, Arc<dyn ScreenshotProvider>)` lets hosts plug in custom screenshot capture (the runtime supplies a `FrameCacheScreenshot` provider automatically when the `ai-bridge` feature is enabled).
 
 ### Fixed
+- Linux `rfd` 0.15.4 `xdg-portal` builds enable the required `tokio` feature so `cargo check --workspace` compiles on current crates.io.
+- ReadableStream / FileSystem async iterators publish `__w3cos_symbol_async_iterator` so compiled `for await...of` matches the W3IR protocol (the camelCase alias remains).
+- Compiled jsdom SubtleCrypto smoke now exercises an unimplemented operation (`sign`); `digest` is implemented and no longer rejects.
+- AI PR Review workflow writes a single `test_count=` line when `grep -c` finds zero tests (avoids GitHub Actions `Invalid format '0'`).
+- `libc::mq_attr` initialization no longer names the removed `__pad` field (current `libc` / rustc 1.97).
 - README screenshot now renders as inline image instead of text link
 
 ## [0.1.0] - 2025-03-17

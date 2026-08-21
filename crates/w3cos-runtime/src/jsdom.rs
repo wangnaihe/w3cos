@@ -3380,6 +3380,50 @@ fn scroll_element_into_view(node: u32, options: Value) {
     }
 }
 
+fn forced_scroll_size(node: u32) -> (f64, f64) {
+    let live = dom::with_document(|document| {
+        let element = Element::new(NodeId::from_u32(node));
+        (
+            element.scroll_width(document) as f64,
+            element.scroll_height(document) as f64,
+        )
+    });
+    if live.0 > 0.0 || live.1 > 0.0 {
+        return live;
+    }
+
+    // CSSOM layout reads are synchronous in browsers. React relies on that
+    // when it reads scrollHeight in an effect that can run before our first
+    // native paint, so compute an ephemeral layout rather than exposing zero.
+    let root = dom::with_document(|document| document.to_component_tree());
+    let flat = crate::layout::pre_flatten(&root);
+    let Some(target_index) = flat.iter().position(|info| {
+        matches!(
+            info.on_click,
+            w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(node)
+        )
+    }) else {
+        return live;
+    };
+    let (viewport_width, viewport_height, _) = viewport();
+    let Ok((layouts, scrollable, _)) =
+        crate::layout::compute_with_scroll(&root, viewport_width as f32, viewport_height as f32)
+    else {
+        return live;
+    };
+    let Some((rect, _)) = layouts.iter().find(|(_, index)| *index == target_index) else {
+        return live;
+    };
+    let extent = scrollable
+        .iter()
+        .find(|(index, _, _)| *index == target_index)
+        .map(|(_, _, extent)| *extent);
+    (
+        f64::from(rect.width + extent.map_or(0.0, |value| value.max_x)),
+        f64::from(rect.height + extent.map_or(0.0, |value| value.max_y)),
+    )
+}
+
 fn element_computed_get(node: u32, key: &str) -> Value {
     if let Some(value) = svg_computed_get(node, key) {
         return value;
@@ -4069,12 +4113,10 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "getClientRects" => func(move |_, _| {
             crate::geometry_web::rect_list(vec![rect_value(dom::bounding_rect(node))])
         }),
-        "offsetWidth" | "clientWidth" | "scrollWidth" => {
-            Value::Number(dom::bounding_rect(node).width as f64)
-        }
-        "offsetHeight" | "clientHeight" | "scrollHeight" => {
-            Value::Number(dom::bounding_rect(node).height as f64)
-        }
+        "offsetWidth" | "clientWidth" => Value::Number(dom::bounding_rect(node).width as f64),
+        "offsetHeight" | "clientHeight" => Value::Number(dom::bounding_rect(node).height as f64),
+        "scrollWidth" => Value::Number(forced_scroll_size(node).0),
+        "scrollHeight" => Value::Number(forced_scroll_size(node).1),
         "offsetTop" => Value::Number(dom::bounding_rect(node).y as f64),
         "offsetLeft" => Value::Number(dom::bounding_rect(node).x as f64),
         "offsetParent" => Value::Null,
@@ -6325,8 +6367,61 @@ pub(crate) fn dispatch_native_pointer(
     prevented
 }
 
+fn hit_tested_touch_target(x: f32, y: f32) -> Option<u32> {
+    let node = deepest_node_at_point(document_element_id(), x, y)?;
+    let rect = dom::bounding_rect(node);
+    (rect.width > 0.0 && rect.height > 0.0).then_some(node)
+}
+
+fn active_touch_target(pointer_id: i64) -> Option<u32> {
+    ACTIVE_TOUCHES.with(|touches| {
+        touches
+            .borrow()
+            .iter()
+            .find(|touch| touch.identifier == pointer_id)
+            .map(|touch| touch.target)
+    })
+}
+
+/// Hit-test the live document and dispatch a paired PointerEvent/TouchEvent
+/// lifecycle.
+///
+/// Hosts without a compositor (including `w3cos-mobile::TouchEvent::dispatch`)
+/// use CSSOM layout boxes via the same geometry as `document.elementFromPoint`.
+/// A `down` that misses every box with positive width/height is ignored. Later `move`/`up`/`cancel` for an
+/// active contact stay on that contact's target even if the point has left the
+/// box. Android MotionEvent / iOS UITouch adapters are separate work.
+pub fn dispatch_hit_tested_touch(
+    phase: &str,
+    client_x: f32,
+    client_y: f32,
+    pointer_id: i64,
+    pressure: f32,
+) -> bool {
+    let hit = hit_tested_touch_target(client_x, client_y);
+    let target = match phase {
+        "down" => hit,
+        "move" | "up" | "cancel" => active_touch_target(pointer_id).or(hit),
+        _ => return false,
+    };
+    let Some(target) = target else {
+        return false;
+    };
+    let (button, buttons, pressure) = match phase {
+        "down" | "move" => (0_i16, 1_u16, pressure),
+        _ => (0, 0, 0.0),
+    };
+    dispatch_native_pointer(
+        target, phase, client_x, client_y, pointer_id, "touch", button, buttons, pressure, true,
+        false, false, false, false,
+    )
+}
+
 pub(crate) fn dispatch_native_click(target: u32) -> bool {
     let prevented = !dispatch_sync(target, EventType::Click, EventData::None);
+    if !prevented {
+        apply_details_summary_default_action(target);
+    }
     #[cfg(target_os = "ios")]
     if !prevented
         && dom::tag_name(target) == "input"
@@ -6336,6 +6431,27 @@ pub(crate) fn dispatch_native_click(target: u32) -> bool {
         request_ios_file_picker(target);
     }
     prevented
+}
+
+fn apply_details_summary_default_action(target: u32) {
+    let mut current = Some(target);
+    while let Some(node) = current {
+        if dom::tag_name(node).eq_ignore_ascii_case("summary") {
+            let Some(details) = dom::parent_node(node) else {
+                return;
+            };
+            if !dom::tag_name(details).eq_ignore_ascii_case("details") {
+                return;
+            }
+            if dom::has_attribute(details, "open") {
+                dom::remove_attribute(details, "open");
+            } else {
+                dom::set_attribute(details, "open", "");
+            }
+            return;
+        }
+        current = dom::parent_node(node);
+    }
 }
 
 /// Apply the HTML default action for an activated submit button.
@@ -13530,6 +13646,22 @@ mod tests {
     }
 
     #[test]
+    fn trusted_summary_click_toggles_parent_details_open_state() {
+        setup();
+        let details = create_in_body("details");
+        let summary = document_value().call_method("createElement", vec![Value::string("summary")]);
+        details.call_method("appendChild", vec![summary.clone()]);
+        let details_id = node_id_of(&details).expect("details node");
+        let summary_id = node_id_of(&summary).expect("summary node");
+
+        assert!(!dom::has_attribute(details_id, "open"));
+        assert!(!dispatch_native_click(summary_id));
+        assert!(dom::has_attribute(details_id, "open"));
+        assert!(!dispatch_native_click(summary_id));
+        assert!(!dom::has_attribute(details_id, "open"));
+    }
+
+    #[test]
     fn dataset_is_a_live_dom_string_map() {
         setup();
         let div = create_in_body("div");
@@ -14060,6 +14192,68 @@ mod tests {
                 "touchcancel:0:0:1:12:false",
             ]
         );
+    }
+
+    #[test]
+    fn hit_tested_touch_uses_layout_boxes_and_retargets_active_contacts() {
+        setup();
+        let target = create_in_body("div");
+        let target_id = node_id_of(&target).unwrap();
+        let miss_log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let hit_log = Rc::new(RefCell::new(Vec::<String>::new()));
+        dom::with_document_mut(|tree| {
+            tree.set_layout_rect(
+                NodeId::from_u32(target_id),
+                w3cos_dom::DOMRect::new(10.0, 10.0, 40.0, 40.0),
+            );
+        });
+        let log = Rc::clone(&hit_log);
+        target.call_method(
+            "addEventListener",
+            vec![
+                Value::string("touchstart"),
+                func(move |_, args| {
+                    log.borrow_mut()
+                        .push(args[0].get_property("type").to_js_string());
+                    Value::Undefined
+                }),
+            ],
+        );
+        let log = Rc::clone(&hit_log);
+        target.call_method(
+            "addEventListener",
+            vec![
+                Value::string("touchend"),
+                func(move |_, args| {
+                    log.borrow_mut()
+                        .push(args[0].get_property("type").to_js_string());
+                    Value::Undefined
+                }),
+            ],
+        );
+        document_value().call_method(
+            "addEventListener",
+            vec![
+                Value::string("touchstart"),
+                func({
+                    let miss_log = Rc::clone(&miss_log);
+                    move |_, args| {
+                        miss_log
+                            .borrow_mut()
+                            .push(args[0].get_property("type").to_js_string());
+                        Value::Undefined
+                    }
+                }),
+            ],
+        );
+
+        assert!(!dispatch_hit_tested_touch("down", 0.0, 0.0, 21, 0.5));
+        assert!(!dispatch_hit_tested_touch("down", 1000.0, 1000.0, 21, 0.5));
+        assert!(miss_log.borrow().is_empty());
+        assert!(!dispatch_hit_tested_touch("down", 20.0, 20.0, 21, 0.5));
+        assert!(!dispatch_hit_tested_touch("move", 0.0, 0.0, 21, 0.5));
+        assert!(!dispatch_hit_tested_touch("up", 0.0, 0.0, 21, 0.0));
+        assert_eq!(hit_log.borrow().as_slice(), &["touchstart", "touchend"]);
     }
 
     #[test]
@@ -16450,6 +16644,50 @@ mod tests {
         div.set_property("scrollLeft", Value::Number(7.0));
         assert_eq!(div.get_property("scrollTop").to_number(), 33.0);
         assert_eq!(div.get_property("scrollLeft").to_number(), 7.0);
+    }
+
+    #[test]
+    fn scroll_extent_includes_descendant_layout_beyond_client_box() {
+        setup();
+        let document = document_value();
+        let container = create_in_body("div");
+        let target = document.call_method("createElement", vec![Value::string("div")]);
+        container.call_method("appendChild", vec![target.clone()]);
+        let container_id = node_id_of(&container).unwrap();
+        let target_id = node_id_of(&target).unwrap();
+        dom::with_document_mut(|document| {
+            document.set_layout_rect(
+                NodeId::from_u32(container_id),
+                w3cos_dom::DOMRect::new(10.0, 20.0, 100.0, 100.0),
+            );
+            document.set_layout_rect(
+                NodeId::from_u32(target_id),
+                w3cos_dom::DOMRect::new(10.0, 250.0, 180.0, 40.0),
+            );
+        });
+        assert_eq!(container.get_property("clientWidth").to_number(), 100.0);
+        assert_eq!(container.get_property("clientHeight").to_number(), 100.0);
+        assert_eq!(container.get_property("scrollWidth").to_number(), 180.0);
+        assert_eq!(container.get_property("scrollHeight").to_number(), 270.0);
+    }
+
+    #[test]
+    fn scroll_extent_flushes_layout_before_first_paint() {
+        setup();
+        set_viewport(100.0, 100.0);
+        let document = document_value();
+        let container = create_in_body("div");
+        let container_style = container.get_property("style");
+        container_style.set_property("width", Value::string("100px"));
+        container_style.set_property("height", Value::string("100px"));
+        container_style.set_property("overflowY", Value::string("auto"));
+        let target = document.call_method("createElement", vec![Value::string("div")]);
+        let target_style = target.get_property("style");
+        target_style.set_property("width", Value::string("100px"));
+        target_style.set_property("height", Value::string("270px"));
+        container.call_method("appendChild", vec![target]);
+
+        assert_eq!(container.get_property("scrollHeight").to_number(), 270.0);
     }
 
     #[test]

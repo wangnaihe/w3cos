@@ -805,13 +805,13 @@ impl MessageQueue {
         use std::ffi::CString;
 
         let cname = CString::new(name).map_err(|e| e.to_string())?;
-        let attr = libc::mq_attr {
-            mq_flags: 0,
-            mq_maxmsg: max_msgs,
-            mq_msgsize: max_msg_size,
-            mq_curmsgs: 0,
-            __pad: [0; 4],
-        };
+        // Current `libc` no longer exposes `mq_attr.__pad`; zero the ABI-sized
+        // struct and fill the documented fields.
+        let mut attr: libc::mq_attr = unsafe { std::mem::zeroed() };
+        attr.mq_flags = 0;
+        attr.mq_maxmsg = max_msgs;
+        attr.mq_msgsize = max_msg_size;
+        attr.mq_curmsgs = 0;
         let mqd = unsafe {
             mq_open(
                 cname.as_ptr(),
@@ -897,13 +897,11 @@ impl MessageQueue {
 
     /// Get current queue attributes (current message count, etc.).
     pub fn attributes(&self) -> Result<(i64, i64, i64), String> {
-        let mut attr = libc::mq_attr {
-            mq_flags: 0,
-            mq_maxmsg: 0,
-            mq_msgsize: 0,
-            mq_curmsgs: 0,
-            __pad: [0; 4],
-        };
+        let mut attr: libc::mq_attr = unsafe { std::mem::zeroed() };
+        attr.mq_flags = 0;
+        attr.mq_maxmsg = 0;
+        attr.mq_msgsize = 0;
+        attr.mq_curmsgs = 0;
         if unsafe { libc::mq_getattr(self.mqd, &mut attr) } == 0 {
             Ok((attr.mq_maxmsg, attr.mq_msgsize, attr.mq_curmsgs))
         } else {

@@ -306,17 +306,18 @@ impl CSSStyleDeclaration {
                 }
             }
             "border-radius" | "borderRadius" => {
-                // The shared Style currently stores a uniform radius. Preserve
-                // modern 2/3/4-value syntax by using the largest corner radius
-                // instead of dropping the complete declaration when more than
-                // one token is present. This keeps the rounded envelope even
-                // when per-corner asymmetry cannot yet be represented.
-                if let Some(v) = split_css_whitespace(value)
+                let values = split_css_whitespace(value)
                     .iter()
                     .filter_map(|part| parse_px(part))
-                    .reduce(f32::max)
+                    .collect::<Vec<_>>();
+                if let Some([top_left, top_right, bottom_right, bottom_left]) =
+                    expand_border_radius(&values)
                 {
-                    self.inner.border_radius = v
+                    self.inner.border_radius = top_left;
+                    self.inner.border_top_left_radius = Some(top_left);
+                    self.inner.border_top_right_radius = Some(top_right);
+                    self.inner.border_bottom_right_radius = Some(bottom_right);
+                    self.inner.border_bottom_left_radius = Some(bottom_left);
                 }
             }
             "border-width" | "borderWidth" => {
@@ -453,6 +454,9 @@ impl CSSStyleDeclaration {
             }
             "font-style" | "fontStyle" => self.inner.font_style = parse_font_style(value),
             "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
+            "overflow-wrap" | "overflowWrap" | "word-wrap" | "wordWrap" => {
+                self.inner.word_break = parse_overflow_wrap(value)
+            }
 
             // Interaction
             "cursor" => self.inner.cursor = parse_cursor(value),
@@ -646,6 +650,25 @@ fn parse_edge_spacing(value: &str) -> Option<Spacing> {
         return Some(Spacing::SafeAreaInset(*edge));
     }
     if let Some(inner) = value
+        .strip_prefix("max(")
+        .and_then(|value| value.strip_suffix(')'))
+        && let Some((first, second)) = split_top_level_once(inner, ',')
+    {
+        for (length, environment) in [(first.trim(), second.trim()), (second.trim(), first.trim())]
+        {
+            if let Some(px) = parse_px(length)
+                && let Some((_, edge)) = environments
+                    .iter()
+                    .find(|(candidate, _)| environment == *candidate)
+            {
+                return Some(Spacing::Maximum {
+                    px,
+                    safe_area: *edge,
+                });
+            }
+        }
+    }
+    if let Some(inner) = value
         .strip_prefix("calc(")
         .and_then(|value| value.strip_suffix(')'))
     {
@@ -667,6 +690,21 @@ fn parse_edge_spacing(value: &str) -> Option<Spacing> {
         }
     }
     parse_spacing(value)
+}
+
+fn split_top_level_once(value: &str, separator: char) -> Option<(&str, &str)> {
+    let mut depth = 0_u32;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if character == separator && depth == 0 => {
+                return Some((&value[..index], &value[index + character.len_utf8()..]));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_edge_shorthand(value: &str) -> Option<Edges> {
@@ -1005,6 +1043,20 @@ fn split_css_whitespace(value: &str) -> Vec<String> {
     parts
 }
 
+fn expand_border_radius(values: &[f32]) -> Option<[f32; 4]> {
+    match values {
+        [all] => Some([*all; 4]),
+        [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
+        [top_left, opposite, bottom_right] => {
+            Some([*top_left, *opposite, *bottom_right, *opposite])
+        }
+        [top_left, top_right, bottom_right, bottom_left] => {
+            Some([*top_left, *top_right, *bottom_right, *bottom_left])
+        }
+        _ => None,
+    }
+}
+
 fn apply_border_shorthand(style: &mut Style, value: &str) {
     for part in split_css_whitespace(value) {
         if let Some(width) = parse_px(&part) {
@@ -1179,6 +1231,29 @@ fn parse_word_break(value: &str) -> w3cos_std::style::WordBreak {
         "keep-all" => WordBreak::KeepAll,
         "break-word" => WordBreak::BreakWord,
         _ => WordBreak::Normal,
+    }
+}
+
+fn parse_overflow_wrap(value: &str) -> w3cos_std::style::WordBreak {
+    use w3cos_std::style::WordBreak;
+    match value.trim() {
+        "anywhere" | "break-word" => WordBreak::BreakWord,
+        _ => WordBreak::Normal,
+    }
+}
+
+#[cfg(test)]
+mod overflow_wrap_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_wrap_anywhere_updates_line_breaking_style() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("overflow-wrap", "anywhere");
+        assert_eq!(
+            declaration.to_style().word_break,
+            w3cos_std::style::WordBreak::BreakWord
+        );
     }
 }
 
@@ -1360,10 +1435,13 @@ mod tests {
     }
 
     #[test]
-    fn multi_value_border_radius_preserves_rounded_envelope() {
+    fn multi_value_border_radius_preserves_css_corner_order() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("border-radius", "4px 16px 16px");
-        assert_eq!(declaration.inner.border_radius, 16.0);
+        assert_eq!(
+            declaration.inner.border_corner_radii(),
+            [4.0, 16.0, 16.0, 16.0]
+        );
     }
 
     #[test]
@@ -1491,6 +1569,33 @@ mod tests {
                     keyboard_inset: false,
                 },
                 left: Spacing::Px(22.0),
+            }
+        );
+    }
+
+    #[test]
+    fn box_edge_shorthand_preserves_safe_area_maximum_values() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property(
+            "padding",
+            "max(8px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 8px max(16px, env(safe-area-inset-left))",
+        );
+        assert_eq!(
+            declaration.inner.padding,
+            Edges {
+                top: Spacing::Maximum {
+                    px: 8.0,
+                    safe_area: SafeAreaEdge::Top,
+                },
+                right: Spacing::Maximum {
+                    px: 16.0,
+                    safe_area: SafeAreaEdge::Right,
+                },
+                bottom: Spacing::Px(8.0),
+                left: Spacing::Maximum {
+                    px: 16.0,
+                    safe_area: SafeAreaEdge::Left,
+                },
             }
         );
     }

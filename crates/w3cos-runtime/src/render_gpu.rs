@@ -107,7 +107,7 @@ impl GlyphCache {
         fontdue_font: &fontdue::Font,
         budget: Duration,
     ) -> usize {
-        let Ok(font_ref) = skrifa::FontRef::from_index(font_data.data.as_ref().as_ref(), 0) else {
+        let Ok(font_ref) = font_ref(font_data) else {
             return 0;
         };
         let charmap = font_ref.charmap();
@@ -243,6 +243,10 @@ impl GlyphCache {
             }
         }
     }
+}
+
+fn font_ref(font_data: &FontData) -> Result<skrifa::FontRef<'_>, skrifa::raw::ReadError> {
+    skrifa::FontRef::from_index(font_data.data.as_ref().as_ref(), font_data.index)
 }
 
 fn display_chunk_key(kind: &ComponentKind, style: &Style, width: f32, height: f32) -> Option<u64> {
@@ -1087,8 +1091,7 @@ fn draw_text_run(
     dpi: Affine,
 ) -> f32 {
     let vc = color_to_vello(color);
-    let font_ref = skrifa::FontRef::from_index(font_data.data.as_ref().as_ref(), 0);
-    let font_ref = match font_ref {
+    let font_ref = match font_ref(font_data) {
         Ok(f) => f,
         Err(_) => return 0.0,
     };
@@ -1138,23 +1141,12 @@ fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
 }
 
 fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
-    if style.background.a > 0 {
-        let border = style.border_width;
-        LayoutRect {
-            x: rect.x + border,
-            y: rect.y + border,
-            width: (rect.width - border * 2.0).max(1.0),
-            height: (rect.height - border * 2.0).max(0.0),
-        }
-    } else {
-        text_content_box(rect, style)
-    }
+    text_content_box(rect, style)
 }
 
 fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
     match style.text_align {
         TextAlign::Center | TextAlign::Right => style.text_align,
-        TextAlign::Left if style.background.a > 0 => TextAlign::Center,
         TextAlign::Left
             if matches!(
                 style.white_space,
@@ -1319,6 +1311,23 @@ pub fn draw_focus_ring(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_font_lookup_uses_the_selected_collection_face() {
+        let host = crate::font_face::host_ui_font();
+        let font_data = make_owned_font_data(host.data.clone(), host.index);
+        let font_ref = font_ref(&font_data).expect("selected host font face");
+
+        for character in ['A', '中'] {
+            let expected = host.font.lookup_glyph_index(character) as u32;
+            let actual = font_ref
+                .charmap()
+                .map(character)
+                .map(|glyph| glyph.to_u32())
+                .unwrap_or_default();
+            assert_eq!(actual, expected, "glyph id mismatch for {character}");
+        }
+    }
 
     #[test]
     fn display_chunk_key_tracks_payload_style_and_geometry() {

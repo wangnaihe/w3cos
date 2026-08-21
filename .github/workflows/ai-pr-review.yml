@@ -34,13 +34,15 @@ jobs:
           cargo test --workspace 2>&1 | tee /tmp/test.log
           TEST_EXIT=$?
 
-          echo "check_exit=$CHECK_EXIT" >> $GITHUB_OUTPUT
-          echo "clippy_exit=$CLIPPY_EXIT" >> $GITHUB_OUTPUT
-          echo "fmt_exit=$FMT_EXIT" >> $GITHUB_OUTPUT
-          echo "test_exit=$TEST_EXIT" >> $GITHUB_OUTPUT
+          echo "check_exit=$CHECK_EXIT" >> "$GITHUB_OUTPUT"
+          echo "clippy_exit=$CLIPPY_EXIT" >> "$GITHUB_OUTPUT"
+          echo "fmt_exit=$FMT_EXIT" >> "$GITHUB_OUTPUT"
+          echo "test_exit=$TEST_EXIT" >> "$GITHUB_OUTPUT"
 
-          TEST_COUNT=$(grep -c '^test .* ok$' /tmp/test.log || echo 0)
-          echo "test_count=$TEST_COUNT" >> $GITHUB_OUTPUT
+          # grep -c exits 1 when the count is 0. `|| echo 0` then appends a second
+          # line, so GITHUB_OUTPUT becomes `test_count=0\n0` (Invalid format '0').
+          TEST_COUNT=$(grep -c '^test .* ok$' /tmp/test.log || true)
+          echo "test_count=${TEST_COUNT:-0}" >> "$GITHUB_OUTPUT"
 
       - name: Post review comment
         uses: actions/github-script@v7
