@@ -2288,6 +2288,35 @@ pub fn throw_value(value: Value) -> ! {
     std::panic::panic_any(PanicValue(value))
 }
 
+/// JS completion record used by AOT state machines: `Ok` is normal
+/// completion, `Err` is throw. Host/DOM seams may still panic via
+/// [`throw_value`].
+pub type Completion = Result<Value, Value>;
+
+fn panic_payload_to_throw(payload: Box<dyn std::any::Any + Send>) -> Value {
+    if let Some(value) = payload.downcast_ref::<PanicValue>() {
+        value.0.clone()
+    } else {
+        std::panic::resume_unwind(payload)
+    }
+}
+
+/// Catch a [`throw_value`] panic as a Throw completion. Non-JS panics resume.
+pub fn catch_js<F: FnOnce() -> Value>(f: F) -> Completion {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => Ok(value),
+        Err(payload) => Err(panic_payload_to_throw(payload)),
+    }
+}
+
+/// Like [`catch_js`], but the closure may itself return a completion.
+pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Value> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => Err(panic_payload_to_throw(payload)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

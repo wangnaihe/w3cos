@@ -5,9 +5,9 @@
 //! therefore consume the same suspension/control-flow records without placing
 //! a second JavaScript semantic implementation in ordinary AOT artifacts.
 
+use crate::unique_back_edges::{UniqueBackEdgePlan, analyze_unique_back_edges};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
-use crate::unique_back_edges::{UniqueBackEdgePlan, analyze_unique_back_edges};
 use w3cos_ir::{
     BinaryOperator, BindingKind, BlockId, Constant, Function, FunctionId, Instruction, Module,
     Register, UnaryOperator,
@@ -132,6 +132,49 @@ fn bool_index(plan: &EscapePlan, ir: u32) -> u32 {
 
 fn val_index(plan: &EscapePlan, ir: u32) -> u32 {
     val_slot(plan, ir).unwrap_or_else(|| panic!("missing value slot for IR register {ir}"))
+}
+
+fn emit_caught_stmt(
+    stmt: &str,
+    exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
+    plan: &EscapePlan,
+) -> String {
+    let Some((exception, target)) = exception_target else {
+        return stmt.to_string();
+    };
+    format!(
+        "if let Err(__w3cos_exception) = w3cos_core::catch_js(|| {{ {stmt} w3cos_core::Value::Undefined }}) {{ {}; self.block = {}; continue 'drive; }}",
+        store_boxed(plan, exception.0, "__w3cos_exception"),
+        target.0,
+    )
+}
+
+fn emit_caught_value(
+    expr: &str,
+    dst_store: &str,
+    exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
+    plan: &EscapePlan,
+) -> String {
+    match exception_target {
+        None => dst_store.replace("__w3cos_value", expr),
+        Some((exception, target)) => format!(
+            "match w3cos_core::catch_js(|| {expr}) {{ Ok(__w3cos_value) => {{ {dst_store} }} Err(__w3cos_exception) => {{ {}; self.block = {}; continue 'drive; }} }}",
+            store_boxed(plan, exception.0, "__w3cos_exception"),
+            target.0,
+        ),
+    }
+}
+
+fn is_call_like(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::Call { .. }
+            | Instruction::CallWithArguments { .. }
+            | Instruction::CallMethod { .. }
+            | Instruction::CallMethodWithArguments { .. }
+            | Instruction::Construct { .. }
+            | Instruction::ConstructWithArguments { .. }
+    )
 }
 
 fn store_boxed(plan: &EscapePlan, ir: u32, expr: &str) -> String {
@@ -307,7 +350,6 @@ fn emit_bool_operand(plan: &EscapePlan, register: u32) -> String {
         format!("{}.to_bool()", emit_boxed_value(plan, register))
     }
 }
-
 
 fn emit_boxed_value(plan: &EscapePlan, register: u32) -> String {
     if let Some(slot) = num_slot(plan, register) {
@@ -630,7 +672,6 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
     }
 }
 
-
 fn read_registers(instruction: &Instruction) -> Vec<u32> {
     match instruction {
         Instruction::LoadConstant { .. }
@@ -676,7 +717,9 @@ fn read_registers(instruction: &Instruction) -> Vec<u32> {
             ..
         } => vec![object.0, brand.0, name.0, value.0],
         Instruction::HasPrivate { object, brand, .. } => vec![object.0, brand.0],
-        Instruction::DefinePrivateMethod { brand, name, value, .. } => {
+        Instruction::DefinePrivateMethod {
+            brand, name, value, ..
+        } => {
             vec![brand.0, name.0, value.0]
         }
         Instruction::DefinePrivateAccessor {
@@ -699,9 +742,13 @@ fn read_registers(instruction: &Instruction) -> Vec<u32> {
             elements.iter().map(|element| element.0).collect()
         }
         Instruction::AppendArrayElement { array, value, .. } => vec![array.0, value.0],
-        Instruction::AppendIterable { array, iterable, .. } => vec![array.0, iterable.0],
+        Instruction::AppendIterable {
+            array, iterable, ..
+        } => vec![array.0, iterable.0],
         Instruction::ArrayRest { value, .. } => vec![value.0],
-        Instruction::ObjectRest { value, excluded, .. } => {
+        Instruction::ObjectRest {
+            value, excluded, ..
+        } => {
             let mut registers = vec![value.0];
             registers.extend(excluded.iter().map(|key| key.0));
             registers
@@ -1097,7 +1144,6 @@ fn generate_sync_function_with_factories(
             EmissionMode::Sync,
             module_specifier,
             &type_name,
-            false,
             storage,
             &plan,
             &back_edges,
@@ -1118,71 +1164,17 @@ fn generate_sync_function_with_factories(
         blocks.push_str(&emitted);
         blocks.push_str("                }\n");
     }
-    let mut exception_handler_groups: Vec<(u32, u32, Vec<u32>)> = Vec::new();
-    for (block_id, _) in &sync_blocks {
-        let exception_target = exception_target_for_block(function, *block_id);
-        if let Some((exception, target)) = exception_target {
-            if let Some((_, _, blocks)) = exception_handler_groups
-                .iter_mut()
-                .find(|(register, handler, _)| *register == exception.0 && *handler == target.0)
-            {
-                blocks.push(block_id.0);
-            } else {
-                exception_handler_groups.push((exception.0, target.0, vec![block_id.0]));
-            }
-        }
-    }
-    let mut exception_handlers = String::new();
-    for (exception, target, mut protected_blocks) in exception_handler_groups {
-        protected_blocks.sort_unstable();
-        exception_handlers.push_str(&format!(
-            "                    {} => {{ {}; self.block = {}; }}\n",
-            compact_block_patterns(&protected_blocks),
-            store_boxed(&plan, exception, "__w3cos_exception"),
-            target,
-        ));
-    }
     let is_direct = direct_body.is_some();
     let run_body = if let Some(direct_body) = &direct_body {
         direct_body.clone()
-    } else if exception_handlers.is_empty() {
+    } else {
         format!(
             r#"
         'drive: loop {{
             match self.block {{
-{blocks}                _ => return w3cos_core::throw_value(
+{blocks}                _ => return Err(
                     w3cos_core::Value::string("invalid synchronous W3IR block")
                 ),
-            }}
-        }}"#
-        )
-    } else {
-        format!(
-            r#"
-        loop {{
-            let __w3cos_outcome = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| {{
-                    'drive: loop {{
-                        match self.block {{
-{blocks}                            _ => return w3cos_core::throw_value(
-                                w3cos_core::Value::string("invalid synchronous W3IR block")
-                            ),
-                        }}
-                    }}
-                }}),
-            );
-            let __w3cos_payload = match __w3cos_outcome {{
-                Ok(__w3cos_value) => return __w3cos_value,
-                Err(__w3cos_payload) => __w3cos_payload,
-            }};
-            let __w3cos_exception =
-                if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {{
-                    value.0.clone()
-                }} else {{
-                    std::panic::resume_unwind(__w3cos_payload);
-                }};
-            match self.block {{
-{exception_handlers}                _ => std::panic::resume_unwind(__w3cos_payload),
             }}
         }}"#
         )
@@ -1251,7 +1243,7 @@ struct {type_name} {{
 }}
 
 impl {type_name} {{
-    fn run(&mut self) -> w3cos_core::Value {{
+    fn run(&mut self) -> Result<w3cos_core::Value, w3cos_core::Value> {{
 {run_body}
     }}
 }}
@@ -1270,7 +1262,7 @@ pub fn {rust_name}(
         capture_getters,
         capture_setters,
 {block_initializer}
-    }}.run()
+    }}.run().unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))
 }}
 "#,
         registers = plan.n_val,
@@ -1316,7 +1308,6 @@ fn generate_async_function_with_factories(
             EmissionMode::Async,
             module_specifier,
             &type_name,
-            true,
             storage,
             &plan,
             &back_edges,
@@ -1409,10 +1400,10 @@ impl {type_name} {{
         }}
     }}
 
-    fn run(&mut self) -> {type_name}Outcome {{
+    fn run(&mut self) -> Result<{type_name}Outcome, w3cos_core::Value> {{
         'drive: loop {{
             match self.block {{
-{blocks}                _ => return w3cos_core::throw_value(
+{blocks}                _ => return Err(
                     w3cos_core::Value::string("invalid async W3IR block")
                 ),
             }}
@@ -1424,19 +1415,9 @@ impl {type_name} {{
         resolve: w3cos_core::Value,
         reject: w3cos_core::Value,
     ) {{
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
-            frame.borrow_mut().run()
-        }}));
-        let outcome = match outcome {{
+        let outcome = match w3cos_core::catch_js_result(|| frame.borrow_mut().run()) {{
             Ok(outcome) => outcome,
-            Err(payload) => {{
-                let reason = if let Some(value) =
-                    payload.downcast_ref::<w3cos_core::PanicValue>()
-                {{
-                    value.0.clone()
-                }} else {{
-                    std::panic::resume_unwind(payload);
-                }};
+            Err(reason) => {{
                 reject.call(w3cos_core::Value::Undefined, vec![reason]);
                 return;
             }}
@@ -1584,7 +1565,6 @@ fn generate_generator_with_factories(
             EmissionMode::Generator,
             module_specifier,
             &type_name,
-            true,
             storage,
             &plan,
             &back_edges,
@@ -1859,7 +1839,6 @@ fn generate_async_generator_with_factories(
             EmissionMode::AsyncGenerator,
             module_specifier,
             &type_name,
-            true,
             storage,
             &plan,
             &back_edges,
@@ -2079,17 +2058,9 @@ impl {type_name} {{
                 "TypeError: delegated iterator method is not callable"
             ));
         }}
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
-            method.call(iterator.clone(), arguments)
-        }})) {{
+        match w3cos_core::catch_js(|| method.call(iterator.clone(), arguments)) {{
             Ok(value) => Ok(Some(value)),
-            Err(payload) => {{
-                if let Some(value) = payload.downcast_ref::<w3cos_core::PanicValue>() {{
-                    Err(value.0.clone())
-                }} else {{
-                    std::panic::resume_unwind(payload);
-                }}
-            }}
+            Err(value) => Err(value),
         }}
     }}
 
@@ -2356,21 +2327,13 @@ impl {type_name} {{
     }}
 
     fn continue_active(frame: std::rc::Rc<std::cell::RefCell<Self>>) {{
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
+        match w3cos_core::catch_js(|| {{
             frame
                 .borrow_mut()
                 .resume(0, w3cos_core::Value::Undefined)
-        }}));
-        match outcome {{
+        }}) {{
             Ok(outcome) => Self::handle(frame, outcome),
-            Err(payload) => {{
-                let reason = if let Some(value) =
-                    payload.downcast_ref::<w3cos_core::PanicValue>()
-                {{
-                    value.0.clone()
-                }} else {{
-                    std::panic::resume_unwind(payload);
-                }};
+            Err(reason) => {{
                 frame.borrow_mut().state = {type_name}State::Completed;
                 Self::settle_active(frame, false, reason);
             }}
@@ -2391,19 +2354,11 @@ impl {type_name} {{
             frame.active = Some(request);
             (kind, input)
         }};
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
+        match w3cos_core::catch_js(|| {{
             frame.borrow_mut().resume(request.0, request.1)
-        }}));
-        match outcome {{
+        }}) {{
             Ok(outcome) => Self::handle(frame, outcome),
-            Err(payload) => {{
-                let reason = if let Some(value) =
-                    payload.downcast_ref::<w3cos_core::PanicValue>()
-                {{
-                    value.0.clone()
-                }} else {{
-                    std::panic::resume_unwind(payload);
-                }};
+            Err(reason) => {{
                 frame.borrow_mut().state = {type_name}State::Completed;
                 Self::settle_active(frame, false, reason);
             }}
@@ -2561,7 +2516,6 @@ fn emit_block_instructions(
     mode: EmissionMode,
     module_specifier: Option<&str>,
     type_name: &str,
-    wrap_exceptions: bool,
     storage: SlotStorage,
     plan: &EscapePlan,
     back_edges: &UniqueBackEdgePlan,
@@ -2598,64 +2552,21 @@ fn emit_block_instructions(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let protected_end = instructions
-        .iter()
-        .position(|instruction| is_direct_control_flow(instruction, mode))
-        .unwrap_or(instructions.len());
     let mut output = String::new();
-    if wrap_exceptions
-        && let Some((exception, target)) = exception_target
-        && protected_end > 0
-    {
-        output.push_str(
-            "                    let __w3cos_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
-        );
-        for instruction in &emitted[..protected_end] {
-            output.push_str("                        ");
-            output.push_str(instruction);
-            output.push('\n');
-        }
-        output.push_str(
-            "                    }));\n                    if let Err(__w3cos_payload) = __w3cos_outcome {\n                        let __w3cos_exception = if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {\n                            value.0.clone()\n                        } else {\n                            std::panic::resume_unwind(__w3cos_payload);\n                        };\n",
-        );
-        output.push_str(&format!(
-            "                        {};\n                        self.block = {};\n                        continue 'drive;\n                    }}\n",
-            store_boxed(plan, exception.0, "__w3cos_exception"),
-            target.0,
-        ));
-    } else {
-        for instruction in &emitted[..protected_end] {
-            output.push_str("                    ");
-            output.push_str(instruction);
-            output.push('\n');
-        }
-    }
-    for instruction in &emitted[protected_end..] {
+    for (instruction, emitted) in instructions.iter().zip(&emitted) {
+        let line = if exception_target.is_some()
+            && !is_direct_control_flow(instruction, mode)
+            && !is_call_like(instruction)
+        {
+            emit_caught_stmt(emitted, exception_target, plan)
+        } else {
+            emitted.clone()
+        };
         output.push_str("                    ");
-        output.push_str(instruction);
+        output.push_str(&line);
         output.push('\n');
     }
     Ok(output)
-}
-
-fn compact_block_patterns(blocks: &[u32]) -> String {
-    let mut patterns = Vec::new();
-    let mut index = 0;
-    while index < blocks.len() {
-        let start = blocks[index];
-        let mut end = start;
-        index += 1;
-        while index < blocks.len() && blocks[index] == end + 1 {
-            end = blocks[index];
-            index += 1;
-        }
-        if start == end {
-            patterns.push(start.to_string());
-        } else {
-            patterns.push(format!("{start}..={end}"));
-        }
-    }
-    patterns.join(" | ")
 }
 
 fn is_direct_control_flow(instruction: &Instruction, mode: EmissionMode) -> bool {
@@ -3100,12 +3011,17 @@ fn emit_instruction(
             let mut reads = vec![callee.0, this_value.0];
             reads.extend(arguments.iter().map(|argument| argument.0));
             let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
-            format!(
-                "self.registers[{}] = w3cos_core::intrinsics::call(&{}, {}, vec![{}]);",
-                register(*dst),
+            let expr = format!(
+                "w3cos_core::intrinsics::call(&{}, {}, vec![{}])",
                 uses.emit(callee.0),
                 uses.emit(this_value.0),
                 emit_arguments_from(&mut uses, arguments)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
             )
         }
         Instruction::CallWithArguments {
@@ -3116,12 +3032,17 @@ fn emit_instruction(
         } => {
             let mut uses =
                 ValueUseEmitter::new(plan, last_uses, [callee.0, this_value.0, arguments.0]);
-            format!(
-                "self.registers[{}] = w3cos_core::intrinsics::call_with_arguments(&{}, {}, &{});",
-                register(*dst),
+            let expr = format!(
+                "w3cos_core::intrinsics::call_with_arguments(&{}, {}, &{})",
                 uses.emit(callee.0),
                 uses.emit(this_value.0),
                 uses.emit(arguments.0)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
             )
         }
         Instruction::CallMethod {
@@ -3134,22 +3055,32 @@ fn emit_instruction(
                 let mut reads = vec![object.0];
                 reads.extend(arguments.iter().map(|argument| argument.0));
                 let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
-                format!(
-                    "self.registers[{}] = {}.call_method({literal:?}, vec![{}]);",
-                    register(*dst),
+                let expr = format!(
+                    "{}.call_method({literal:?}, vec![{}])",
                     uses.emit(object.0),
                     emit_arguments_from(&mut uses, arguments)
+                );
+                emit_caught_value(
+                    &expr,
+                    &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                    exception_target,
+                    plan,
                 )
             } else {
                 let mut reads = vec![object.0, key.0];
                 reads.extend(arguments.iter().map(|argument| argument.0));
                 let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
-                format!(
-                    "self.registers[{}] = w3cos_core::intrinsics::call_method(&{}, &{}, vec![{}]);",
-                    register(*dst),
+                let expr = format!(
+                    "w3cos_core::intrinsics::call_method(&{}, &{}, vec![{}])",
                     uses.emit(object.0),
                     uses.emit(key.0),
                     emit_arguments_from(&mut uses, arguments)
+                );
+                emit_caught_value(
+                    &expr,
+                    &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                    exception_target,
+                    plan,
                 )
             }
         }
@@ -3159,14 +3090,18 @@ fn emit_instruction(
             key,
             arguments,
         } => {
-            let mut uses =
-                ValueUseEmitter::new(plan, last_uses, [object.0, key.0, arguments.0]);
-            format!(
-                "self.registers[{}] = w3cos_core::intrinsics::call_method_with_arguments(&{}, &{}, &{});",
-                register(*dst),
+            let mut uses = ValueUseEmitter::new(plan, last_uses, [object.0, key.0, arguments.0]);
+            let expr = format!(
+                "w3cos_core::intrinsics::call_method_with_arguments(&{}, &{}, &{})",
                 uses.emit(object.0),
                 uses.emit(key.0),
                 uses.emit(arguments.0)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
             )
         }
         Instruction::Construct {
@@ -3177,11 +3112,16 @@ fn emit_instruction(
             let mut reads = vec![constructor.0];
             reads.extend(arguments.iter().map(|argument| argument.0));
             let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
-            format!(
-                "self.registers[{}] = w3cos_core::intrinsics::construct(&{}, vec![{}]);",
-                register(*dst),
+            let expr = format!(
+                "w3cos_core::intrinsics::construct(&{}, vec![{}])",
                 uses.emit(constructor.0),
                 emit_arguments_from(&mut uses, arguments)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
             )
         }
         Instruction::ConstructWithArguments {
@@ -3190,11 +3130,16 @@ fn emit_instruction(
             arguments,
         } => {
             let mut uses = ValueUseEmitter::new(plan, last_uses, [constructor.0, arguments.0]);
-            format!(
-                "self.registers[{}] = w3cos_core::intrinsics::construct_with_arguments(&{}, &{});",
-                register(*dst),
+            let expr = format!(
+                "w3cos_core::intrinsics::construct_with_arguments(&{}, &{})",
                 uses.emit(constructor.0),
                 uses.emit(arguments.0)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
             )
         }
         Instruction::DynamicImport { dst, specifier } => {
@@ -3239,13 +3184,23 @@ fn emit_instruction(
                 .iter()
                 .find(|point| point.id == *suspension)
                 .ok_or_else(|| anyhow!("missing W3IR await suspension point"))?;
-            let awaited = format!(
-                "return Self::awaited({}, {}, {}, {});",
-                emit_boxed_value(plan, value.0),
-                register(*dst),
-                point.resume_block.0,
-                point.reject_block.0,
-            );
+            let awaited = if matches!(mode, EmissionMode::Async) {
+                format!(
+                    "return Ok(Self::awaited({}, {}, {}, {}));",
+                    emit_boxed_value(plan, value.0),
+                    register(*dst),
+                    point.resume_block.0,
+                    point.reject_block.0,
+                )
+            } else {
+                format!(
+                    "return Self::awaited({}, {}, {}, {});",
+                    emit_boxed_value(plan, value.0),
+                    register(*dst),
+                    point.resume_block.0,
+                    point.reject_block.0,
+                )
+            };
             if matches!(mode, EmissionMode::Async) {
                 awaited.replace("Self::", "__W3COS_ASYNC_FRAME__::")
             } else {
@@ -3322,9 +3277,9 @@ fn emit_instruction(
                 "self.state = __W3COS_STATE__::Completed; return Self::result({}, true);",
                 emit_boxed_value(plan, value.0)
             ),
-            EmissionMode::Sync => format!("return {};", emit_boxed_value(plan, value.0)),
+            EmissionMode::Sync => format!("return Ok({});", emit_boxed_value(plan, value.0)),
             EmissionMode::Async => format!(
-                "return __W3COS_ASYNC_FRAME__::completed({});",
+                "return Ok(__W3COS_ASYNC_FRAME__::completed({}));",
                 emit_boxed_value(plan, value.0)
             ),
         },
@@ -3341,10 +3296,9 @@ fn emit_instruction(
                         "self.state = __W3COS_STATE__::Completed; return w3cos_core::throw_value({});",
                         emit_boxed_value(plan, value.0)
                     ),
-                    EmissionMode::Sync | EmissionMode::Async => format!(
-                        "return w3cos_core::throw_value({});",
-                        emit_boxed_value(plan, value.0)
-                    ),
+                    EmissionMode::Sync | EmissionMode::Async => {
+                        format!("return Err({});", emit_boxed_value(plan, value.0))
+                    }
                 }
             }
         }
@@ -4161,14 +4115,126 @@ fn main() {{
         let generated = generate_sync_function_from_module(&module, function, "read_aot").unwrap();
 
         assert!(protected_instructions > 1);
-        assert_eq!(
-            generated
-                .matches("let __w3cos_outcome = std::panic::catch_unwind")
-                .count(),
-            1,
-            "one exception boundary should cover all protected blocks in a sync function: {generated}"
+        assert!(
+            !generated.contains("catch_unwind"),
+            "sync try/catch AOT must not emit catch_unwind: {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::catch_js"),
+            "protected calls should match a JS completion: {generated}"
         );
         assert!(generated.contains("match self.block"));
+    }
+
+    #[test]
+    fn emits_js_exceptions_as_result_without_catch_unwind() {
+        let throw_module = crate::w3ir_lowering::lower_script(
+            r#"
+                function boom() {
+                    throw "boom";
+                }
+                boom;
+            "#,
+            "app:///sync-aot-throw.js",
+        )
+        .unwrap();
+        let throw_function = throw_module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("boom"))
+            .unwrap();
+        let throw_generated =
+            generate_sync_function_from_module(&throw_module, throw_function, "boom_aot").unwrap();
+        assert!(
+            !throw_generated.contains("catch_unwind"),
+            "throwing AOT must not emit catch_unwind: {throw_generated}"
+        );
+        assert!(
+            throw_generated.contains("return Err("),
+            "uncaught JS throw should be a Result Err: {throw_generated}"
+        );
+
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function run() {
+                    try {
+                        throw "boom";
+                    } catch (error) {
+                        return error;
+                    }
+                }
+                run;
+            "#,
+            "app:///sync-aot-try-catch-throw.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("run"))
+            .unwrap()
+            .clone();
+        let generated = generate_sync_function_from_module(&module, &function, "run_aot").unwrap();
+        assert!(
+            !generated.contains("catch_unwind"),
+            "try/catch throw AOT must not emit catch_unwind: {generated}"
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("src")).unwrap();
+        let core_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../w3cos-core")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_aot_try_catch_throw_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {:?} }}\n",
+                core_path
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("src/main.rs"),
+            format!(
+                r#"
+{generated}
+fn main() {{
+    println!(
+        "{{}}",
+        run_aot(
+            w3cos_core::Value::Undefined,
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+        .to_js_string(),
+    );
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--manifest-path",
+                fixture.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .env(
+                "CARGO_TARGET_DIR",
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/w3ir-aot-fixtures"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated try/catch throw fixture failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "boom");
     }
 
     #[test]
@@ -4289,6 +4355,10 @@ fn main() {{
             .call(Value::Undefined, vec![Value::Null])
             .to_js_string();
         let generated = generate_sync_function_from_module(&module, &function, "read_aot").unwrap();
+        assert!(
+            !generated.contains("catch_unwind"),
+            "runtime exception try/catch must not emit catch_unwind: {generated}"
+        );
 
         let fixture = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(fixture.path().join("src")).unwrap();
@@ -4751,7 +4821,6 @@ fn main() {{
         }
     }
 
-
     fn last_use_fixture(instructions: Vec<Instruction>, registers: u32) -> Function {
         Function {
             id: FunctionId(0),
@@ -4843,10 +4912,11 @@ fn main() {{
         );
         let generated = emit_slice(&function);
         assert!(
-            generated.contains("vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined)]")
-                || generated.contains(
-                    "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined),"
-                ),
+            generated.contains(
+                "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined)]"
+            ) || generated.contains(
+                "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined),"
+            ),
             "last-use Call argument must be taken, not cloned: {generated}"
         );
         assert!(
