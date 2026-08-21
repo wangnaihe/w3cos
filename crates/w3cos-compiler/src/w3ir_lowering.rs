@@ -10109,4 +10109,120 @@ mod tests {
             .unwrap();
         assert_eq!(observed.borrow().as_str(), "function:ready");
     }
+
+    #[test]
+    fn unique_self_install_create_closure_is_stored_on_captured_binding() {
+        // Hypothesis: CreateClosure capture lists plus an immediate store of
+        // that closure onto the captured object are enough for unique
+        // self-install. This test locks the IR shape the AOT WeakRef rewrite
+        // matches; it does not rewrite IR (AOT emit owns that).
+        let module = lower_script(
+            r#"
+                function install() {
+                    const obj = { x: 1 };
+                    obj.fn = () => obj.x;
+                    return obj;
+                }
+                install;
+            "#,
+            "app:///unique-self-install-ir.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("install"))
+            .unwrap();
+        let instructions = function
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .collect::<Vec<_>>();
+        let (closure_dst, captures) = instructions
+            .iter()
+            .find_map(|instruction| match instruction {
+                Instruction::CreateClosure { dst, captures, .. } => Some((*dst, captures.clone())),
+                _ => None,
+            })
+            .expect("self-install must lower to CreateClosure");
+        assert!(
+            !captures.is_empty(),
+            "self-install closure must capture the installed-on object"
+        );
+        let mut origin: std::collections::HashMap<u32, w3cos_ir::BindingId> =
+            std::collections::HashMap::new();
+        let mut stored_on_capture = false;
+        for instruction in &instructions {
+            match instruction {
+                Instruction::LoadBinding { dst, binding } => {
+                    origin.insert(dst.0, *binding);
+                }
+                Instruction::Move { dst, src } => {
+                    if let Some(binding) = origin.get(&src.0).copied() {
+                        origin.insert(dst.0, binding);
+                    } else {
+                        origin.remove(&dst.0);
+                    }
+                }
+                Instruction::SetProperty { object, value, .. }
+                | Instruction::DefineField { object, value, .. }
+                    if *value == closure_dst =>
+                {
+                    if let Some(binding) = origin.get(&object.0) {
+                        if captures.contains(binding) {
+                            stored_on_capture = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            stored_on_capture,
+            "CreateClosure must be stored onto a captured binding for unique self-install"
+        );
+        let plan = crate::unique_back_edges::analyze_unique_back_edges(
+            function,
+            Some("app:///unique-self-install-ir.js"),
+        );
+        assert!(
+            !plan.weak_captures.is_empty(),
+            "AOT plan must rewrite this unique IR shape: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_assignment_ir_does_not_qualify_as_unique_self_install() {
+        let module = lower_script(
+            r#"
+                function assign(obj, key) {
+                    obj[key] = () => obj.x;
+                    return obj;
+                }
+                assign;
+            "#,
+            "app:///dynamic-assignment-ir.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("assign"))
+            .unwrap();
+        let plan = crate::unique_back_edges::analyze_unique_back_edges(
+            function,
+            Some("app:///dynamic-assignment-ir.js"),
+        );
+        assert!(
+            plan.weak_captures.is_empty(),
+            "dynamic assignment must not be a unique WeakRef rewrite: {plan:?}"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("dynamic property assignment")),
+            "dynamic assignment must warn: {:?}",
+            plan.warnings
+        );
+    }
 }

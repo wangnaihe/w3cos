@@ -5,6 +5,7 @@
 //! therefore consume the same suspension/control-flow records without placing
 //! a second JavaScript semantic implementation in ordinary AOT artifacts.
 
+use crate::unique_back_edges::{UniqueBackEdgePlan, analyze_unique_back_edges};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use w3cos_ir::{
@@ -604,6 +605,14 @@ fn proven_string_keys(instructions: &[Instruction], index: usize) -> HashMap<u32
     known
 }
 
+fn analyze_and_warn(function: &Function, specifier: Option<&str>) -> UniqueBackEdgePlan {
+    let plan = analyze_unique_back_edges(function, specifier);
+    for warning in &plan.warnings {
+        eprintln!("warning: {warning}");
+    }
+    plan
+}
+
 /// Emit a native synchronous-generator factory for one W3IR function.
 ///
 /// The initial backend covers the ordinary scalar/object instructions needed
@@ -766,6 +775,7 @@ fn generate_sync_function_with_factories(
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
+    let back_edges = analyze_and_warn(function, module_specifier);
     let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
     let slot_fields = emit_slot_fields(storage);
@@ -787,6 +797,7 @@ fn generate_sync_function_with_factories(
             false,
             storage,
             &plan,
+            &back_edges,
         )?;
         if sync_blocks.len() == 1
             && *block_id == function.entry
@@ -975,6 +986,7 @@ fn generate_async_function_with_factories(
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
+    let back_edges = analyze_and_warn(function, module_specifier);
     let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
     let slot_fields = emit_slot_fields(storage);
@@ -1004,6 +1016,7 @@ fn generate_async_function_with_factories(
             true,
             storage,
             &plan,
+            &back_edges,
         )?);
         blocks.push_str("                }\n");
     }
@@ -1240,6 +1253,7 @@ fn generate_generator_with_factories(
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
+    let back_edges = analyze_and_warn(function, module_specifier);
     let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
     let slot_fields = emit_slot_fields(storage);
@@ -1270,6 +1284,7 @@ fn generate_generator_with_factories(
             true,
             storage,
             &plan,
+            &back_edges,
         )?);
         blocks.push_str("                }\n");
     }
@@ -1512,6 +1527,7 @@ fn generate_async_generator_with_factories(
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
+    let back_edges = analyze_and_warn(function, module_specifier);
     let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
     let slot_fields = emit_slot_fields(storage);
@@ -1543,6 +1559,7 @@ fn generate_async_generator_with_factories(
             true,
             storage,
             &plan,
+            &back_edges,
         )?);
         blocks.push_str("                }\n");
     }
@@ -2244,6 +2261,7 @@ fn emit_block_instructions(
     wrap_exceptions: bool,
     storage: SlotStorage,
     plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
 ) -> Result<String> {
     let reaching = reaching_number_constants(instructions);
     let emitted = instructions
@@ -2261,6 +2279,7 @@ fn emit_block_instructions(
                 storage,
                 &proven,
                 plan,
+                back_edges,
                 &reaching[index],
             )
             .map(|emitted| match mode {
@@ -2352,6 +2371,15 @@ fn is_direct_control_flow(instruction: &Instruction, mode: EmissionMode) -> bool
     )
 }
 
+fn emit_capture_pair_store(capture_id: u32, weaken: bool) -> String {
+    if !weaken {
+        return format!("__w3cos_nested_captures.insert({capture_id}, __w3cos_pair);");
+    }
+    format!(
+        "let __w3cos_target = __w3cos_pair.0.call(w3cos_core::Value::Undefined, Vec::new()); if __w3cos_target.is_object() || __w3cos_target.is_array() || __w3cos_target.is_function() {{ let __w3cos_weak = w3cos_core::intrinsics::construct(&w3cos_core::weak::weak_ref_class(), vec![__w3cos_target]); let __w3cos_getter = w3cos_core::Value::function(move |_, _| __w3cos_weak.call_method(\"deref\", Vec::new())); __w3cos_nested_captures.insert({capture_id}, (__w3cos_getter, w3cos_core::Value::Undefined)); }} else {{ __w3cos_nested_captures.insert({capture_id}, __w3cos_pair); }}"
+    )
+}
+
 fn emit_instruction(
     instruction: &Instruction,
     exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
@@ -2362,6 +2390,7 @@ fn emit_instruction(
     storage: SlotStorage,
     proven_strings: &HashMap<u32, String>,
     plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
     reaching_nums: &HashMap<u32, f64>,
 ) -> Result<String> {
     let register = |register: w3cos_ir::Register| val_index(plan, register.0);
@@ -2722,12 +2751,13 @@ fn emit_instruction(
                 } else {
                     "w3cos_core::Value::Undefined".into()
                 };
+                let weaken = back_edges.weak_captures.contains(&(*nested, *capture));
                 adapters.push_str(&format!(
-                    "let __w3cos_pair = if let Some(getter) = {} {{ (getter, {}.unwrap_or(w3cos_core::Value::Undefined)) }} else if let Some(cell) = {} {{ let getter = {{ let cell = std::rc::Rc::clone(&cell); w3cos_core::Value::function(move |_, _| {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}) }}; let setter = {local_setter}; (getter, setter) }} else {{ return w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing nested generator capture\")); }}; __w3cos_nested_captures.insert({}, __w3cos_pair);",
+                    "let __w3cos_pair = if let Some(getter) = {} {{ (getter, {}.unwrap_or(w3cos_core::Value::Undefined)) }} else if let Some(cell) = {} {{ let getter = {{ let cell = std::rc::Rc::clone(&cell); w3cos_core::Value::function(move |_, _| {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}) }}; let setter = {local_setter}; (getter, setter) }} else {{ return w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing nested generator capture\")); }}; {}",
                     emit_capture_get_cloned(storage, capture.0),
                     emit_capture_setter_get_cloned(storage, capture.0),
                     emit_binding_get_cloned(storage, capture.0),
-                    capture.0
+                    emit_capture_pair_store(capture.0, weaken)
                 ));
             }
             format!(
