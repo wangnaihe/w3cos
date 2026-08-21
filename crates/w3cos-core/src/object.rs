@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::heap::{HeapAllocation, HeapKind};
+use crate::js_string::JsString;
 use crate::proxy::ProxyHandler;
 use crate::value::{JsFunction, Value};
 
@@ -27,8 +28,8 @@ pub(crate) enum PrivateElement {
 /// `call_slot` makes the object callable (like a JS class or function
 /// object): `Value::call` on an object with a call slot invokes it.
 pub struct JsObject {
-    pub(crate) properties: HashMap<String, Value>,
-    property_order: Vec<String>,
+    pub(crate) properties: HashMap<JsString, Value>,
+    property_order: Vec<JsString>,
     pub(crate) prototype: Option<Rc<RefCell<JsObject>>>,
     pub(crate) proxy_handler: Option<ProxyHandler>,
     has_getter_properties: bool,
@@ -69,12 +70,22 @@ impl JsObject {
     }
 
     pub fn from_map(map: HashMap<String, Value>) -> Self {
-        let mut property_order = map.keys().cloned().collect::<Vec<_>>();
+        let properties: HashMap<JsString, Value> = map
+            .into_iter()
+            .map(|(key, value)| (JsString::intern(&key), value))
+            .collect();
+        Self::from_interned_map(properties)
+    }
+
+    fn from_interned_map(properties: HashMap<JsString, Value>) -> Self {
+        let mut property_order = properties.keys().cloned().collect::<Vec<_>>();
         property_order.sort();
-        let has_getter_properties = map.keys().any(|key| key.starts_with("__w3cos_getter_"));
+        let has_getter_properties = property_order
+            .iter()
+            .any(|key| key.as_str().starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
-            properties: map,
+            properties,
             property_order,
             prototype: None,
             proxy_handler: None,
@@ -93,11 +104,15 @@ impl JsObject {
 
     /// Create a proxied object: `new Proxy(target_props, handler)`.
     pub fn with_proxy(properties: HashMap<String, Value>, handler: ProxyHandler) -> Self {
+        let properties: HashMap<JsString, Value> = properties
+            .into_iter()
+            .map(|(key, value)| (JsString::intern(&key), value))
+            .collect();
         let mut property_order = properties.keys().cloned().collect::<Vec<_>>();
         property_order.sort();
-        let has_getter_properties = properties
-            .keys()
-            .any(|key| key.starts_with("__w3cos_getter_"));
+        let has_getter_properties = property_order
+            .iter()
+            .any(|key| key.as_str().starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
@@ -120,11 +135,15 @@ impl JsObject {
     /// Create a callable object (a JS class / constructor): plain properties
     /// plus a call slot invoked by `Value::call` / `class::construct`.
     pub fn with_call_slot(properties: HashMap<String, Value>, call: JsFunction) -> Self {
+        let properties: HashMap<JsString, Value> = properties
+            .into_iter()
+            .map(|(key, value)| (JsString::intern(&key), value))
+            .collect();
         let mut property_order = properties.keys().cloned().collect::<Vec<_>>();
         property_order.sort();
-        let has_getter_properties = properties
-            .keys()
-            .any(|key| key.starts_with("__w3cos_getter_"));
+        let has_getter_properties = property_order
+            .iter()
+            .any(|key| key.as_str().starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
@@ -190,9 +209,9 @@ impl JsObject {
             self.has_getter_properties = true;
         }
         if !self.properties.contains_key(key) {
-            self.property_order.push(key.to_string());
+            self.property_order.push(JsString::intern(key));
         }
-        self.properties.insert(key.to_string(), value);
+        self.properties.insert(JsString::intern(key), value);
         self.refresh_heap_accounting();
     }
 
@@ -242,7 +261,7 @@ impl JsObject {
             self.has_getter_properties = self
                 .properties
                 .keys()
-                .any(|key| key.starts_with("__w3cos_getter_"));
+                .any(|key| key.as_str().starts_with("__w3cos_getter_"));
         }
         if removed {
             self.refresh_heap_accounting();
@@ -288,8 +307,8 @@ impl JsObject {
             // Getter/setter convention: a `__w3cos_getter_{key}` /
             // `__w3cos_setter_{key}` own function is an accessor property
             // named `key` (see esm_codegen class emission).
-            let getter = self.properties.get(&format!("__w3cos_getter_{key}"));
-            let setter = self.properties.get(&format!("__w3cos_setter_{key}"));
+            let getter = self.properties.get(format!("__w3cos_getter_{key}").as_str());
+            let setter = self.properties.get(format!("__w3cos_setter_{key}").as_str());
             if getter.is_none() && setter.is_none() {
                 return Value::Undefined;
             }
@@ -321,9 +340,9 @@ impl JsObject {
             let desc = desc.borrow();
             if let Some(val) = desc.properties.get("value") {
                 if !self.properties.contains_key(key) {
-                    self.property_order.push(key.to_string());
+                    self.property_order.push(JsString::intern(key));
                 }
-                self.properties.insert(key.to_string(), val.clone());
+                self.properties.insert(JsString::intern(key), val.clone());
                 self.refresh_heap_accounting();
             }
             if let Some(enumerable) = desc.properties.get("enumerable") {
@@ -397,7 +416,10 @@ impl JsObject {
     // ── Helpers ────────────────────────────────────────────────────────
 
     pub fn keys(&self) -> Vec<String> {
-        self.property_order.clone()
+        self.property_order
+            .iter()
+            .map(|key| key.as_str().to_string())
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -416,13 +438,8 @@ impl JsObject {
         let property_bytes = self
             .properties
             .capacity()
-            .saturating_mul(std::mem::size_of::<(String, Value)>())
-            .saturating_add(
-                self.properties
-                    .keys()
-                    .map(String::capacity)
-                    .fold(0usize, usize::saturating_add),
-            );
+            .saturating_mul(std::mem::size_of::<(JsString, Value)>())
+            .saturating_add(self.properties.len().saturating_mul(std::mem::size_of::<JsString>()));
         let pending_bytes = self
             .pending_class_initializers
             .capacity()
@@ -452,7 +469,7 @@ impl JsObject {
 
     /// Snapshot the raw properties as a `Value::Object` (used as `target` arg for traps).
     fn target_value(&self) -> Value {
-        let mut clone = JsObject::from_map(self.properties.clone());
+        let mut clone = JsObject::from_interned_map(self.properties.clone());
         clone.prototype = self.prototype.clone();
         clone.has_getter_properties = self.has_getter_properties;
         clone.call_slot = self.call_slot.clone();
@@ -564,6 +581,18 @@ mod tests {
         let obj = JsObject::with_proxy(HashMap::new(), handler);
         assert!(obj.has("magic"));
         assert!(!obj.has("other"));
+    }
+
+    #[test]
+    fn property_keys_are_interned_across_objects() {
+        let mut left = JsObject::new();
+        let mut right = JsObject::new();
+        left.set_direct("shared-key", Value::Number(1.0));
+        right.set_direct("shared-key", Value::Number(2.0));
+        let left_key = left.properties.keys().next().cloned().unwrap();
+        let right_key = right.properties.keys().next().cloned().unwrap();
+        assert!(left_key.ptr_eq(&right_key));
+        assert_eq!(left.keys(), vec!["shared-key".to_string()]);
     }
 
     #[test]

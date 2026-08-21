@@ -8,11 +8,21 @@ use std::rc::{Rc, Weak};
 use std::slice::SliceIndex;
 
 use crate::heap::{HeapAllocation, HeapKind};
+use crate::js_string::JsString;
 
 /// JavaScript-compatible dynamic value type.
 ///
 /// Maps the full ECMAScript value space into Rust with reference-counted
-/// sharing for heap types (Array, Object, Function).
+/// sharing for heap types (Array, Object, Function, String).
+///
+/// `Value` is `Clone` but not `Copy`: `String` / `Array` / `Object` /
+/// `Function` all carry `Rc`. Number / Bool / Null / Undefined stay as
+/// they are in this slice; NaN-boxing those primitives is the next step.
+/// Core heap values are thread-confined (`Rc` + thread-local heap
+/// counters), so string intern is thread-local as well.
+///
+/// VM and AOT share this type. Public methods (`string`, `to_js_string`,
+/// `clone`, `eq`) and the `String` variant name are unchanged.
 #[derive(Clone, Default)]
 pub enum Value {
     #[default]
@@ -20,7 +30,7 @@ pub enum Value {
     Null,
     Bool(bool),
     Number(f64),
-    String(String),
+    String(JsString),
     Array(Rc<RefCell<ArrayStorage>>),
     Object(Rc<RefCell<crate::JsObject>>),
     Function(JsFunction),
@@ -165,19 +175,14 @@ pub(crate) fn array_slot_value(value: Value) -> Value {
     }
 }
 
-fn function_heap_bytes(props: &HashMap<String, Value>) -> usize {
+fn function_heap_bytes(props: &HashMap<JsString, Value>) -> usize {
     std::mem::size_of::<JsFunction>()
         .saturating_add(
             props
                 .capacity()
-                .saturating_mul(std::mem::size_of::<(String, Value)>()),
+                .saturating_mul(std::mem::size_of::<(JsString, Value)>()),
         )
-        .saturating_add(
-            props
-                .keys()
-                .map(String::capacity)
-                .fold(0usize, usize::saturating_add),
-        )
+        .saturating_add(props.len().saturating_mul(std::mem::size_of::<JsString>()))
 }
 
 pub struct ValueIterator {
@@ -279,13 +284,13 @@ pub struct JsFunction {
     /// Properties assigned on the function value. JS functions are objects:
     /// `id.toString = () => name` (monaco's service decorators), static
     /// methods installed on constructor functions, etc.
-    props: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+    props: Rc<RefCell<std::collections::HashMap<JsString, Value>>>,
     allocation: Rc<HeapAllocation>,
 }
 
 pub(crate) struct WeakJsFunction {
     inner: Weak<dyn Fn(Value, Vec<Value>) -> Value>,
-    props: Weak<RefCell<std::collections::HashMap<String, Value>>>,
+    props: Weak<RefCell<std::collections::HashMap<JsString, Value>>>,
     allocation: Weak<HeapAllocation>,
 }
 
@@ -307,7 +312,7 @@ impl JsFunction {
         // compiler uses these Values for function declarations/constructors;
         // Libraries install methods on constructor prototypes before
         // constructing instances.
-        props.insert("prototype".to_string(), Value::object(HashMap::new()));
+        props.insert(JsString::intern("prototype"), Value::object(HashMap::new()));
         let allocation = Rc::new(HeapAllocation::new(
             HeapKind::Function,
             function_heap_bytes(&props),
@@ -338,13 +343,17 @@ impl JsFunction {
 
     /// Own property names installed on this function object.
     pub fn keys(&self) -> Vec<String> {
-        self.props.borrow().keys().cloned().collect()
+        self.props
+            .borrow()
+            .keys()
+            .map(|key| key.as_str().to_string())
+            .collect()
     }
 
     /// Assign a property on the function object.
     pub fn set_property(&self, key: &str, value: Value) {
         let mut props = self.props.borrow_mut();
-        props.insert(key.to_string(), value);
+        props.insert(JsString::intern(key), value);
         self.allocation.set_bytes(function_heap_bytes(&props));
     }
 
@@ -518,7 +527,7 @@ impl Value {
                     format!("{}", n)
                 }
             }
-            Value::String(s) => s.clone(),
+            Value::String(s) => s.as_str().to_string(),
             Value::Array(arr) => {
                 let elems: Vec<String> = arr
                     .borrow()
@@ -538,7 +547,7 @@ impl Value {
                 if to_string.is_function()
                     && let Value::String(value) = to_string.call(self.clone(), vec![])
                 {
-                    return value;
+                    return value.as_str().to_string();
                 }
                 "[object Object]".into()
             }
@@ -546,7 +555,7 @@ impl Value {
                 let to_string = function.get_property("toString");
                 if matches!(to_string, Value::Function(_) | Value::Object(_)) {
                     if let Value::String(value) = to_string.call(self.clone(), vec![]) {
-                        return value;
+                        return value.as_str().to_string();
                     }
                 }
                 "function() { [native code] }".into()
@@ -661,7 +670,7 @@ impl Value {
                     s.encode_utf16()
                         .nth(idx)
                         .and_then(|unit| String::from_utf16(&[unit]).ok())
-                        .map(Value::String)
+                        .map(Value::from)
                         .unwrap_or(Value::Undefined)
                 } else if key == "length" {
                     Value::Number(s.encode_utf16().count() as f64)
@@ -788,7 +797,7 @@ impl Value {
         Value::Bool(b)
     }
     pub fn string(s: &str) -> Self {
-        Value::String(s.to_string())
+        Value::String(JsString::intern(s))
     }
 
     pub fn array(items: Vec<Value>) -> Self {
@@ -966,7 +975,7 @@ impl Value {
                 .unwrap_or(Value::Undefined)
                 .to_js_string();
             return Value::Bool(match self {
-                Value::Object(object) => object.borrow().properties.contains_key(&property),
+                Value::Object(object) => object.borrow().properties.contains_key(property.as_str()),
                 Value::Array(values) => {
                     property == "length"
                         || property.parse::<usize>().is_ok_and(|index| {
@@ -1041,7 +1050,7 @@ impl Value {
                 };
                 let start = normalize(args.first(), 0);
                 let end = normalize(args.get(1), length).max(start);
-                return Value::String(String::from_utf16_lossy(&units[start..end]));
+                return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
             (Value::String(value), "substr") => {
                 let units = value.encode_utf16().collect::<Vec<_>>();
@@ -1064,7 +1073,7 @@ impl Value {
                     .map(|number| number.trunc().max(0.0) as usize)
                     .unwrap_or(units.len() - start);
                 let end = start.saturating_add(count).min(units.len());
-                return Value::String(String::from_utf16_lossy(&units[start..end]));
+                return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
             (Value::String(value), "startsWith") => {
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
@@ -1105,9 +1114,9 @@ impl Value {
             (Value::String(value), "charAt") => {
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
                 if !index.is_finite() || index < 0.0 {
-                    return Value::String(String::new());
+                    return Value::from(String::new());
                 }
-                return Value::String(
+                return Value::from(
                     value
                         .chars()
                         .nth(index as usize)
@@ -1130,13 +1139,13 @@ impl Value {
                 }
                 let start = string_index_to_byte(value, start);
                 let end = string_index_to_byte(value, end);
-                return Value::String(value[start..end].to_string());
+                return Value::from(value[start..end].to_string());
             }
             (Value::String(value), "toUpperCase") => {
-                return Value::String(value.to_uppercase());
+                return Value::from(value.to_uppercase());
             }
             (Value::String(value), "toLowerCase") => {
-                return Value::String(value.to_lowercase());
+                return Value::from(value.to_lowercase());
             }
             (Value::String(value), "localeCompare") => {
                 let other = args.first().cloned().unwrap_or_default().to_js_string();
@@ -1147,7 +1156,7 @@ impl Value {
                 });
             }
             (Value::String(value), "trim") => {
-                return Value::String(value.trim().to_string());
+                return Value::from(value.trim().to_string());
             }
             (Value::String(value), "split") => {
                 let Some(separator) = args.first() else {
@@ -1168,13 +1177,13 @@ impl Value {
                     value
                         .chars()
                         .take(limit)
-                        .map(|ch| Value::String(ch.to_string()))
+                        .map(|ch| Value::from(ch.to_string()))
                         .collect()
                 } else {
                     value
                         .split(&separator)
                         .take(limit)
-                        .map(|part| Value::String(part.to_string()))
+                        .map(|part| Value::from(part.to_string()))
                         .collect()
                 };
                 return Value::array(parts);
@@ -1224,14 +1233,14 @@ impl Value {
                             Value::String(value.clone()),
                         ],
                     );
-                    return Value::String(format!(
+                    return Value::from(format!(
                         "{}{}{}",
                         &value[..byte],
                         result.to_js_string(),
                         &value[byte + matched.len()..]
                     ));
                 }
-                return Value::String(value.replacen(
+                return Value::from(value.replacen(
                     &pattern.to_js_string(),
                     &replacement.to_js_string(),
                     1,
@@ -1350,7 +1359,7 @@ impl Value {
             Value::String(value) => ValueIterator::new(
                 value
                     .chars()
-                    .map(|character| Value::String(character.to_string()))
+                    .map(|character| Value::from(character.to_string()))
                     .collect::<Vec<_>>()
                     .into_iter(),
             ),
@@ -1916,12 +1925,18 @@ fn array_call_method(
 
 impl From<&str> for Value {
     fn from(value: &str) -> Self {
-        Value::String(value.to_string())
+        Value::String(JsString::intern(value))
     }
 }
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
+        Value::String(JsString::from(value))
+    }
+}
+
+impl From<JsString> for Value {
+    fn from(value: JsString) -> Self {
         Value::String(value)
     }
 }
@@ -1979,7 +1994,7 @@ impl Value {
     /// ECMAScript `+` (addition or string concatenation).
     pub fn js_add(&self, other: &Value) -> Value {
         if self.is_string() || other.is_string() {
-            Value::String(format!("{}{}", self.to_js_string(), other.to_js_string()))
+            Value::from(format!("{}{}", self.to_js_string(), other.to_js_string()))
         } else if let Some(value) = crate::bigint::add(self, other) {
             value
         } else {
@@ -2224,7 +2239,7 @@ impl fmt::Debug for Value {
 
 /// Standalone `type_of` function matching the generated code's `type_of(expr)` calls.
 pub fn type_of(val: &Value) -> Value {
-    Value::String(val.type_of().to_string())
+    Value::string(val.type_of())
 }
 
 /// An Error-shaped object (`{ message }`) for runtime failures. Compiled JS
@@ -2234,7 +2249,7 @@ pub fn type_of(val: &Value) -> Value {
 /// a JS-style error value.
 pub(crate) fn js_error(message: &str) -> Value {
     let mut properties = HashMap::new();
-    properties.insert("message".to_string(), Value::String(message.to_string()));
+    properties.insert("message".to_string(), Value::string(message));
     Value::object(properties)
 }
 
@@ -3044,5 +3059,27 @@ mod tests {
         assert!(value.delete_property("model").to_bool());
         assert!(value.get_property("model").is_undefined());
         assert!(value.delete_property("model").to_bool());
+    }
+
+    #[test]
+    fn string_clone_shares_rc_bytes() {
+        let a = Value::string("interned-clone-test");
+        let b = a.clone();
+        match (&a, &b) {
+            (Value::String(left), Value::String(right)) => assert!(left.ptr_eq(right)),
+            _ => panic!("expected strings"),
+        }
+        assert_eq!(a, b);
+        assert_eq!(a.to_js_string(), "interned-clone-test");
+    }
+
+    #[test]
+    fn string_intern_reuses_same_literal() {
+        let a = Value::string("length");
+        let b = Value::string("length");
+        match (&a, &b) {
+            (Value::String(left), Value::String(right)) => assert!(left.ptr_eq(right)),
+            _ => panic!("expected strings"),
+        }
     }
 }

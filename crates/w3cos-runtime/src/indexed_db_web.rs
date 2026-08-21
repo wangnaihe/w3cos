@@ -1244,8 +1244,9 @@ fn key_path_from_web(value: &Value, optional: bool) -> indexed_db::Result<String
         });
     }
     if let Value::String(path) = value {
+        let path = path.to_string();
         return Ok(indexed_db::encode_key_path(Some(std::slice::from_ref(
-            path,
+            &path,
         ))));
     }
     if let Value::Array(paths) = value {
@@ -1253,7 +1254,7 @@ fn key_path_from_web(value: &Value, optional: bool) -> indexed_db::Result<String
             .borrow()
             .iter()
             .map(|path| match path {
-                Value::String(path) => Ok(path.clone()),
+                Value::String(path) => Ok(path.to_string()),
                 _ => Err(IndexedDbError {
                     name: "SyntaxError".into(),
                     message: "Compound key paths must contain only strings.".into(),
@@ -3082,7 +3083,7 @@ fn value_to_json_inner(
                 },
                 Ok,
             ),
-        Value::String(value) => Ok(JsonValue::String(value.clone())),
+        Value::String(value) => Ok(JsonValue::String(value.to_string())),
         Value::Array(values) => {
             let pointer = Rc::as_ptr(values) as usize;
             if !active.insert(pointer) {
@@ -3264,7 +3265,7 @@ pub(crate) fn json_to_value(value: JsonValue) -> Value {
         JsonValue::Null => Value::Null,
         JsonValue::Bool(value) => Value::Bool(value),
         JsonValue::Number(value) => Value::Number(value.as_f64().unwrap_or(f64::NAN)),
-        JsonValue::String(value) => Value::String(value),
+        JsonValue::String(value) => Value::from(value),
         JsonValue::Array(values) => Value::array(values.into_iter().map(json_to_value).collect()),
         JsonValue::Object(mut values) => {
             if let Some(bigint) = values.get(BIGINT_TAG).and_then(JsonValue::as_str) {

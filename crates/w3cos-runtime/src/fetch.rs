@@ -132,6 +132,7 @@ thread_local! {
     static HEADERS_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static RESPONSE_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static REQUEST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static FETCH_FUNCTION: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 fn realm_fetch_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
@@ -234,14 +235,27 @@ pub fn fetch(url: &str, options: FetchOptions) -> FetchResponse {
     }
 }
 
+/// Interned JavaScript `fetch` callable.
+///
+/// ESM lowering clones this instead of allocating a fresh `Value::function`
+/// on every global read. The host I/O behind [`fetch_value`] stays blocking;
+/// W3IR AOT `await` suspends through Promise reactions, not a Tokio runtime.
+pub fn fetch_function() -> Value {
+    FETCH_FUNCTION.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| Value::function(|_this, arguments| fetch_value(arguments)))
+            .clone()
+    })
+}
+
 /// JavaScript-facing `fetch` facade used by the ESM AOT pipeline.
 ///
-/// The current ESM lowering executes `await` expressions synchronously, so
-/// the returned value keeps the browser-shaped `Response` properties directly
-/// available. It is also a thenable backed by a resolved W3COS Promise so
-/// browser-style `fetch(...).then(...).catch(...).finally(...)` chains run as
-/// microtasks. Promise callbacks receive the underlying Response rather than
-/// the compatibility facade.
+/// Typed ESM lowering emits Rust `.await`. W3IR AOT `await` suspends through
+/// `Frame::drive` Promise reactions and takes a fulfilled-promise fast path
+/// when `promise::status` is already `Fulfilled`. This helper still returns a
+/// thenable Response facade so `fetch(...).then(...)` and property reads
+/// (`response.ok`) share one object. The I/O itself remains host-blocking
+/// (`ureq`); it is not rewritten into a Tokio future.
 pub fn fetch_value(arguments: Vec<Value>) -> Value {
     let input = arguments.first().cloned().unwrap_or(Value::Undefined);
     let init = arguments.get(1).cloned().unwrap_or(Value::Undefined);
@@ -1626,12 +1640,12 @@ fn fetch_error_value(url: &str, name: &str, message: &str) -> Value {
     )
 }
 
-/// Bridge the synchronous AOT `await` lowering and the browser Promise shape.
+/// Thenable Response facade used by both Promise `then` and property access.
 ///
-/// The facade copies the Response's own properties for synchronous access and
-/// forwards Promise methods to a resolved promise containing the untouched
-/// Response. Keeping the fulfilled value separate prevents Promise resolution
-/// from recursively assimilating the facade's own `then` method.
+/// The facade copies the Response's own properties and forwards Promise
+/// methods to a resolved promise containing the untouched Response.
+/// Keeping the fulfilled value separate prevents Promise resolution from
+/// recursively assimilating the facade's own `then` method.
 fn fetch_promise_facade(response: Value) -> Value {
     let properties = match &response {
         Value::Object(object) => {

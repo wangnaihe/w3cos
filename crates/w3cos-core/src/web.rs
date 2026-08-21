@@ -107,7 +107,7 @@ fn initialize_dom_exception(this: &Value, args: &[Value]) {
     this.set_property("code", Value::Number(dom_exception_code(&name)));
     this.set_property(
         "stack",
-        Value::String(if message.is_empty() {
+        Value::from(if message.is_empty() {
             name
         } else {
             format!("{name}: {message}")
@@ -134,7 +134,7 @@ pub fn dom_exception_class() -> Value {
             Value::function(|this, _| {
                 let name = this.get_property("name").to_js_string();
                 let message = this.get_property("message").to_js_string();
-                Value::String(if message.is_empty() {
+                Value::from(if message.is_empty() {
                     name
                 } else {
                     format!("{name}: {message}")
@@ -465,7 +465,7 @@ pub fn text_decoder_class() -> Value {
                             let units: Vec<u16> =
                                 input.iter().map(|value| value.to_number() as u16).collect();
                             return match String::from_utf16(&units) {
-                                Ok(text) => Value::String(text),
+                                Ok(text) => Value::from(text),
                                 Err(_) if fatal => {
                                     crate::throw_value(Value::object(HashMap::from([
                                         ("name".into(), Value::string("TypeError")),
@@ -475,7 +475,7 @@ pub fn text_decoder_class() -> Value {
                                         ),
                                     ])))
                                 }
-                                Err(_) => Value::String(String::from_utf16_lossy(&units)),
+                                Err(_) => Value::from(String::from_utf16_lossy(&units)),
                             };
                         }
                         let bytes = crate::binary::bytes_of(&input).unwrap_or_else(|| {
@@ -489,7 +489,7 @@ pub fn text_decoder_class() -> Value {
                             bytes,
                             stream,
                         ) {
-                            Ok(text) => Value::String(text),
+                            Ok(text) => Value::from(text),
                             Err(message) => crate::throw_value(Value::object(HashMap::from([
                                 ("name".into(), Value::string("TypeError")),
                                 ("message".into(), Value::string(&message)),
@@ -654,7 +654,7 @@ pub fn date_class() -> Value {
             let milliseconds = args
                 .first()
                 .map(|value| match value {
-                    Value::String(text) => parse_iso_instant(text),
+                    Value::String(text) => parse_iso_instant(&text),
                     _ => value.to_number(),
                 })
                 .unwrap_or_else(now_milliseconds);
@@ -685,7 +685,7 @@ pub fn date_value(milliseconds: f64) -> Value {
                     .single()
                     .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
                     .unwrap_or_else(|| "Invalid Date".to_string());
-                Value::String(text)
+                Value::from(text)
             }),
         ),
     ]))
@@ -1244,7 +1244,7 @@ pub fn atob(args: Vec<Value>) -> Value {
         .to_js_string();
     let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     match BASE64.decode(cleaned.as_bytes()) {
-        Ok(bytes) => Value::String(bytes.iter().map(|b| char::from(*b)).collect()),
+        Ok(bytes) => Value::from(bytes.iter().map(|b| char::from(*b)).collect::<String>()),
         Err(_) => crate::throw_value(js_error(
             "InvalidCharacterError: the string to be decoded is not correctly encoded",
         )),
@@ -1269,7 +1269,7 @@ pub fn btoa(args: Vec<Value>) -> Value {
         }
         bytes.push(c as u8);
     }
-    Value::String(BASE64.encode(bytes))
+    Value::from(BASE64.encode(bytes))
 }
 
 // ── structuredClone ────────────────────────────────────────────────────
@@ -2218,7 +2218,7 @@ fn params_value(
                     .borrow()
                     .iter()
                     .find(|(k, _)| *k == key)
-                    .map(|(_, v)| Value::String(v.clone()))
+                    .map(|(_, v)| Value::from(v.clone()))
                     .unwrap_or(Value::Null)
             }),
         );
@@ -2238,7 +2238,7 @@ fn params_value(
                         .borrow()
                         .iter()
                         .filter(|(k, _)| *k == key)
-                        .map(|(_, v)| Value::String(v.clone()))
+                        .map(|(_, v)| Value::from(v.clone()))
                         .collect(),
                 )
             }),
@@ -2324,7 +2324,7 @@ fn params_value(
         let state = state.clone();
         params.set_property(
             "toString",
-            Value::function(move |_, _| Value::String(serialize_pairs(&state.borrow()))),
+            Value::function(move |_, _| Value::from(serialize_pairs(&state.borrow()))),
         );
     }
     {
@@ -2358,8 +2358,8 @@ fn params_value(
                     callback.call(
                         Value::Undefined,
                         vec![
-                            Value::String(value.clone()),
-                            Value::String(key.clone()),
+                            Value::from(value.clone()),
+                            Value::from(key.clone()),
                             receiver.clone(),
                         ],
                     );
@@ -2673,7 +2673,7 @@ fn url_value(parts: UrlParts) -> Value {
             let parts = shared.clone();
             url.set_property(
                 concat!("__w3cos_getter_", $name),
-                Value::function(move |_, _| Value::String(parts.borrow().$field.clone())),
+                Value::function(move |_, _| Value::from(parts.borrow().$field.clone())),
             );
             let parts = shared.clone();
             url.set_property(
@@ -2700,7 +2700,7 @@ fn url_value(parts: UrlParts) -> Value {
         let parts = shared.clone();
         url.set_property(
             "__w3cos_getter_protocol",
-            Value::function(move |_, _| Value::String(parts.borrow().protocol.clone())),
+            Value::function(move |_, _| Value::from(parts.borrow().protocol.clone())),
         );
         let parts = shared.clone();
         url.set_property(
@@ -2722,7 +2722,7 @@ fn url_value(parts: UrlParts) -> Value {
         let parts = shared.clone();
         url.set_property(
             "__w3cos_getter_host",
-            Value::function(move |_, _| Value::String(parts.borrow().host())),
+            Value::function(move |_, _| Value::from(parts.borrow().host())),
         );
         let parts = shared.clone();
         url.set_property(
@@ -2750,7 +2750,7 @@ fn url_value(parts: UrlParts) -> Value {
         let parts = shared.clone();
         url.set_property(
             "__w3cos_getter_pathname",
-            Value::function(move |_, _| Value::String(parts.borrow().pathname.clone())),
+            Value::function(move |_, _| Value::from(parts.borrow().pathname.clone())),
         );
         let parts = shared.clone();
         url.set_property(
@@ -2782,7 +2782,7 @@ fn url_value(parts: UrlParts) -> Value {
                     "search" => &borrowed.search,
                     _ => &borrowed.hash,
                 };
-                Value::String(value.clone())
+                Value::from(value.clone())
             }),
         );
         let parts = shared.clone();
@@ -2813,7 +2813,7 @@ fn url_value(parts: UrlParts) -> Value {
         let parts = shared.clone();
         url.set_property(
             "__w3cos_getter_origin",
-            Value::function(move |_, _| Value::String(parts.borrow().origin())),
+            Value::function(move |_, _| Value::from(parts.borrow().origin())),
         );
     }
     // href: full serialization; writing re-parses as an absolute URL.
@@ -2821,7 +2821,7 @@ fn url_value(parts: UrlParts) -> Value {
         let parts = shared.clone();
         url.set_property(
             "__w3cos_getter_href",
-            Value::function(move |_, _| Value::String(parts.borrow().href())),
+            Value::function(move |_, _| Value::from(parts.borrow().href())),
         );
         let parts = shared.clone();
         url.set_property(
@@ -2846,7 +2846,7 @@ fn url_value(parts: UrlParts) -> Value {
         let parts = shared.clone();
         url.set_property(
             "toString",
-            Value::function(move |_, _| Value::String(parts.borrow().href())),
+            Value::function(move |_, _| Value::from(parts.borrow().href())),
         );
     }
     // searchParams shares the parts back: mutations rewrite `search`.

@@ -260,6 +260,289 @@ impl Default for Style {
     }
 }
 
+
+impl Style {
+    /// Equality that ignores `display`.
+    ///
+    /// Layout's Show-slot path used to `clone` both styles, zero `display`,
+    /// then `PartialEq`. `Style` owns `Option<String>` layers and an optional
+    /// `HashMap`, so that clone ran on every reactive rebuild even when only
+    /// visibility toggled. Destructuring so a newly added field fails to
+    /// compile here instead of silently dropping out of the comparison.
+    pub fn eq_except_display(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        if self.display == other.display {
+            return self == other;
+        }
+        let Style {
+            display: _,
+            position,
+            flex_direction,
+            justify_content,
+            align_items,
+            flex_wrap,
+            flex_grow,
+            flex_shrink,
+            top,
+            right,
+            bottom,
+            left,
+            z_index,
+            gap,
+            row_gap,
+            column_gap,
+            padding,
+            margin,
+            box_sizing,
+            width,
+            height,
+            min_width,
+            min_height,
+            max_width,
+            max_height,
+            overflow,
+            overflow_x,
+            overflow_y,
+            overscroll_behavior,
+            scroll_initial_target,
+            overflow_anchor,
+            background,
+            background_image,
+            background_size,
+            background_position,
+            background_repeat,
+            background_origin,
+            background_clip,
+            background_attachment,
+            background_blend_mode,
+            color,
+            font_size,
+            font_weight,
+            border_radius,
+            border_width,
+            border_color,
+            border_top_width,
+            border_right_width,
+            border_bottom_width,
+            border_left_width,
+            border_top_color,
+            border_right_color,
+            border_bottom_color,
+            border_left_color,
+            opacity,
+            text_align,
+            white_space,
+            line_height,
+            letter_spacing,
+            text_decoration,
+            text_overflow,
+            font_family,
+            font_style,
+            word_break,
+            custom_properties,
+            contain,
+            will_change,
+            filter,
+            box_shadow,
+            transform,
+            transition,
+            animation,
+            flex_basis,
+            order,
+            align_self,
+            align_content,
+            justify_self,
+            justify_items,
+            grid_template_columns,
+            grid_column,
+            cursor,
+            pointer_events,
+            user_select,
+            visibility,
+            outline_width,
+            outline_color,
+            outline_style,
+        } = self;
+        let Style {
+            display: _,
+            position: position_b,
+            flex_direction: flex_direction_b,
+            justify_content: justify_content_b,
+            align_items: align_items_b,
+            flex_wrap: flex_wrap_b,
+            flex_grow: flex_grow_b,
+            flex_shrink: flex_shrink_b,
+            top: top_b,
+            right: right_b,
+            bottom: bottom_b,
+            left: left_b,
+            z_index: z_index_b,
+            gap: gap_b,
+            row_gap: row_gap_b,
+            column_gap: column_gap_b,
+            padding: padding_b,
+            margin: margin_b,
+            box_sizing: box_sizing_b,
+            width: width_b,
+            height: height_b,
+            min_width: min_width_b,
+            min_height: min_height_b,
+            max_width: max_width_b,
+            max_height: max_height_b,
+            overflow: overflow_b,
+            overflow_x: overflow_x_b,
+            overflow_y: overflow_y_b,
+            overscroll_behavior: overscroll_behavior_b,
+            scroll_initial_target: scroll_initial_target_b,
+            overflow_anchor: overflow_anchor_b,
+            background: background_b,
+            background_image: background_image_b,
+            background_size: background_size_b,
+            background_position: background_position_b,
+            background_repeat: background_repeat_b,
+            background_origin: background_origin_b,
+            background_clip: background_clip_b,
+            background_attachment: background_attachment_b,
+            background_blend_mode: background_blend_mode_b,
+            color: color_b,
+            font_size: font_size_b,
+            font_weight: font_weight_b,
+            border_radius: border_radius_b,
+            border_width: border_width_b,
+            border_color: border_color_b,
+            border_top_width: border_top_width_b,
+            border_right_width: border_right_width_b,
+            border_bottom_width: border_bottom_width_b,
+            border_left_width: border_left_width_b,
+            border_top_color: border_top_color_b,
+            border_right_color: border_right_color_b,
+            border_bottom_color: border_bottom_color_b,
+            border_left_color: border_left_color_b,
+            opacity: opacity_b,
+            text_align: text_align_b,
+            white_space: white_space_b,
+            line_height: line_height_b,
+            letter_spacing: letter_spacing_b,
+            text_decoration: text_decoration_b,
+            text_overflow: text_overflow_b,
+            font_family: font_family_b,
+            font_style: font_style_b,
+            word_break: word_break_b,
+            custom_properties: custom_properties_b,
+            contain: contain_b,
+            will_change: will_change_b,
+            filter: filter_b,
+            box_shadow: box_shadow_b,
+            transform: transform_b,
+            transition: transition_b,
+            animation: animation_b,
+            flex_basis: flex_basis_b,
+            order: order_b,
+            align_self: align_self_b,
+            align_content: align_content_b,
+            justify_self: justify_self_b,
+            justify_items: justify_items_b,
+            grid_template_columns: grid_template_columns_b,
+            grid_column: grid_column_b,
+            cursor: cursor_b,
+            pointer_events: pointer_events_b,
+            user_select: user_select_b,
+            visibility: visibility_b,
+            outline_width: outline_width_b,
+            outline_color: outline_color_b,
+            outline_style: outline_style_b,
+        } = other;
+        position == position_b
+            && flex_direction == flex_direction_b
+            && justify_content == justify_content_b
+            && align_items == align_items_b
+            && flex_wrap == flex_wrap_b
+            && flex_grow == flex_grow_b
+            && flex_shrink == flex_shrink_b
+            && top == top_b
+            && right == right_b
+            && bottom == bottom_b
+            && left == left_b
+            && z_index == z_index_b
+            && gap == gap_b
+            && row_gap == row_gap_b
+            && column_gap == column_gap_b
+            && padding == padding_b
+            && margin == margin_b
+            && box_sizing == box_sizing_b
+            && width == width_b
+            && height == height_b
+            && min_width == min_width_b
+            && min_height == min_height_b
+            && max_width == max_width_b
+            && max_height == max_height_b
+            && overflow == overflow_b
+            && overflow_x == overflow_x_b
+            && overflow_y == overflow_y_b
+            && overscroll_behavior == overscroll_behavior_b
+            && scroll_initial_target == scroll_initial_target_b
+            && overflow_anchor == overflow_anchor_b
+            && background == background_b
+            && background_image == background_image_b
+            && background_size == background_size_b
+            && background_position == background_position_b
+            && background_repeat == background_repeat_b
+            && background_origin == background_origin_b
+            && background_clip == background_clip_b
+            && background_attachment == background_attachment_b
+            && background_blend_mode == background_blend_mode_b
+            && color == color_b
+            && font_size == font_size_b
+            && font_weight == font_weight_b
+            && border_radius == border_radius_b
+            && border_width == border_width_b
+            && border_color == border_color_b
+            && border_top_width == border_top_width_b
+            && border_right_width == border_right_width_b
+            && border_bottom_width == border_bottom_width_b
+            && border_left_width == border_left_width_b
+            && border_top_color == border_top_color_b
+            && border_right_color == border_right_color_b
+            && border_bottom_color == border_bottom_color_b
+            && border_left_color == border_left_color_b
+            && opacity == opacity_b
+            && text_align == text_align_b
+            && white_space == white_space_b
+            && line_height == line_height_b
+            && letter_spacing == letter_spacing_b
+            && text_decoration == text_decoration_b
+            && text_overflow == text_overflow_b
+            && font_family == font_family_b
+            && font_style == font_style_b
+            && word_break == word_break_b
+            && custom_properties == custom_properties_b
+            && contain == contain_b
+            && will_change == will_change_b
+            && filter == filter_b
+            && box_shadow == box_shadow_b
+            && transform == transform_b
+            && transition == transition_b
+            && animation == animation_b
+            && flex_basis == flex_basis_b
+            && order == order_b
+            && align_self == align_self_b
+            && align_content == align_content_b
+            && justify_self == justify_self_b
+            && justify_items == justify_items_b
+            && grid_template_columns == grid_template_columns_b
+            && grid_column == grid_column_b
+            && cursor == cursor_b
+            && pointer_events == pointer_events_b
+            && user_select == user_select_b
+            && visibility == visibility_b
+            && outline_width == outline_width_b
+            && outline_color == outline_color_b
+            && outline_style == outline_style_b
+    }
+}
+
 const fn default_overflow_anchor() -> bool {
     true
 }
@@ -947,5 +1230,27 @@ impl Dimension {
             Dimension::Vw(v) => Some(*v * viewport_w / 100.0),
             Dimension::Vh(v) => Some(*v * viewport_h / 100.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod eq_except_display_tests {
+    use super::*;
+
+    #[test]
+    fn ignores_display_and_does_not_require_equal_display() {
+        let mut a = Style::default();
+        let mut b = Style::default();
+        a.display = Display::None;
+        b.display = Display::Flex;
+        assert!(a.eq_except_display(&b));
+        b.font_size = 18.0;
+        assert!(!a.eq_except_display(&b));
+    }
+
+    #[test]
+    fn pointer_equal_styles_are_equal() {
+        let a = Style::default();
+        assert!(a.eq_except_display(&a));
     }
 }

@@ -2548,7 +2548,9 @@ impl App {
             self.needs_style_refresh = false;
         }
 
-        let old_layout_cache = self.layout_cache.clone();
+        // compute() replaces layout_cache. Move the previous rects aside for
+        // FLIP transitions instead of cloning the whole vec every pass.
+        let old_layout_cache = std::mem::take(&mut self.layout_cache);
         let results = self
             .layout_engine
             .compute(&self.root, &flat, w, layout_h)
@@ -3638,20 +3640,33 @@ impl App {
             })
             .collect();
 
-        // Scale visible layout rects (logical) → physical Pixmap pixels and
-        // clone only the styles that can contribute to this frame.
-        let scaled_styles: Vec<w3cos_std::style::Style> = visible_layout
-            .iter()
-            .filter_map(|&(_, idx)| {
-                let node = flat.get(idx)?;
-                let base = style_overrides.get(&idx).unwrap_or(&node.style);
+        // Scale visible layout rects (logical) → physical Pixmap pixels.
+        // Clone Style only when DPI scale is not 1 and the node actually
+        // reads font_size / border_* from Style. Container boxes with no
+        // radius or border keep a borrow of the paint-artifact style.
+        let scale_pixels = (scale - 1.0).abs() >= f32::EPSILON;
+        let mut scaled_styles: Vec<w3cos_std::style::Style> = Vec::new();
+        let mut scaled_slot: Vec<Option<usize>> = Vec::with_capacity(visible_layout.len());
+        if scale_pixels {
+            scaled_styles.reserve(visible_layout.len());
+        }
+        for &(_, idx) in &visible_layout {
+            let Some(node) = flat.get(idx) else {
+                scaled_slot.push(None);
+                continue;
+            };
+            let base = style_overrides.get(&idx).unwrap_or(&node.style);
+            if scale_pixels && cpu_paint_style_needs_scale(&node.kind, base) {
                 let mut s = base.clone();
                 s.font_size *= scale;
                 s.border_radius *= scale;
                 s.border_width *= scale;
-                Some(s)
-            })
-            .collect();
+                scaled_slot.push(Some(scaled_styles.len()));
+                scaled_styles.push(s);
+            } else {
+                scaled_slot.push(None);
+            }
+        }
 
         let mut render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> =
             visible_layout
@@ -3665,7 +3680,13 @@ impl App {
                         width: rect.width * scale,
                         height: rect.height * scale,
                     };
-                    Some((idx, scaled_rect, &node.kind, scaled_styles.get(i)?))
+                    let style = scaled_slot
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .and_then(|slot| scaled_styles.get(slot))
+                        .unwrap_or_else(|| style_overrides.get(&idx).unwrap_or(&node.style));
+                    Some((idx, scaled_rect, &node.kind, style))
                 })
                 .collect();
         let paint_z = &self.paint_artifact.z_order;
@@ -3944,7 +3965,7 @@ impl App {
         #[cfg(any(feature = "devtools", feature = "ai-bridge"))]
         {
             if !direct_skia_present {
-                crate::frame_cache::store(w, h, pixmap.data().to_vec());
+                crate::frame_cache::store_from_slice(w, h, pixmap.data());
             }
         }
 
@@ -6507,10 +6528,88 @@ impl CpuPresenter {
             Ok(b) => b,
             Err(_) => return,
         };
-        for (dst, chunk) in buffer.iter_mut().zip(pixmap.data().chunks_exact(4)) {
-            *dst = (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8 | (chunk[2] as u32);
-        }
+        // tiny-skia pixmap is RGBA and is retained for scroll-damage copies.
+        // Swizzle into the softbuffer in place (0x00RRGGBB); do not mutate
+        // the pixmap and do not allocate a third framebuffer.
+        rgba8_to_softbuffer_xrgb(pixmap.data(), &mut buffer);
         let _ = buffer.present();
+    }
+}
+
+/// Pack tiny-skia RGBA8888 into softbuffer native `0x00RRGGBB` u32s.
+///
+/// softbuffer's buffer is already the swapchain. A separate BGRA pixmap
+/// would add a full-screen RSS copy and would break CPU retained-scroll,
+/// which reads the RGBA pixmap on the next frame.
+#[cfg(feature = "cpu-render")]
+fn rgba8_to_softbuffer_xrgb(src: &[u8], dst: &mut [u32]) {
+    let n = dst.len().min(src.len() / 4);
+    if n == 0 {
+        return;
+    }
+    let src = &src[..n * 4];
+    let dst = &mut dst[..n];
+    if src.as_ptr() as usize % std::mem::align_of::<u32>() == 0 {
+        let src32 = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u32>(), n) };
+        for (out, &px) in dst.iter_mut().zip(src32) {
+            #[cfg(target_endian = "little")]
+            {
+                // bytes [R,G,B,A] as LE u32 = 0xAABBGGRR → 0x00RRGGBB
+                *out = ((px & 0x0000_00FF) << 16) | (px & 0x0000_FF00) | ((px >> 16) & 0xFF);
+            }
+            #[cfg(target_endian = "big")]
+            {
+                // bytes [R,G,B,A] as BE u32 = 0xRRGGBBAA → 0x00RRGGBB
+                *out = px >> 8;
+            }
+        }
+    } else {
+        for (out, chunk) in dst.iter_mut().zip(src.chunks_exact(4)) {
+            *out = (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8 | (chunk[2] as u32);
+        }
+    }
+}
+
+#[cfg(feature = "cpu-render")]
+fn cpu_paint_style_needs_scale(kind: &ComponentKind, style: &w3cos_std::style::Style) -> bool {
+    if style.border_radius != 0.0
+        || style.border_width != 0.0
+        || style.border_top_width.is_some()
+        || style.border_right_width.is_some()
+        || style.border_bottom_width.is_some()
+        || style.border_left_width.is_some()
+    {
+        return true;
+    }
+    matches!(
+        kind,
+        ComponentKind::Text { .. }
+            | ComponentKind::Button { .. }
+            | ComponentKind::TextInput { .. }
+            | ComponentKind::Image { .. }
+    )
+}
+
+#[cfg(all(test, feature = "cpu-render"))]
+mod cpu_present_swizzle_tests {
+    use super::rgba8_to_softbuffer_xrgb;
+
+    #[test]
+    fn packs_rgba_bytes_as_xrgb() {
+        let src = [0x11u8, 0x22, 0x33, 0x44, 0xAA, 0xBB, 0xCC, 0xDD];
+        let mut dst = [0u32; 2];
+        rgba8_to_softbuffer_xrgb(&src, &mut dst);
+        assert_eq!(dst[0], 0x0011_2233);
+        assert_eq!(dst[1], 0x00AA_BBCC);
+    }
+
+    #[test]
+    fn empty_src_or_dst_is_a_no_op() {
+        let mut dst = [0xFFFFu32; 1];
+        rgba8_to_softbuffer_xrgb(&[], &mut dst);
+        assert_eq!(dst[0], 0xFFFF);
+        let mut empty: [u32; 0] = [];
+        rgba8_to_softbuffer_xrgb(&[1, 2, 3, 4], &mut empty);
     }
 }
 

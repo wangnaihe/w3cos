@@ -196,7 +196,7 @@ fn create_dynamic_proxy(target: Value, handler: Value) -> Value {
                 handler.clone(),
                 vec![
                     original_target.clone(),
-                    Value::String(key.to_string()),
+                    Value::from(key.to_string()),
                     receiver.clone(),
                 ],
             )
@@ -212,7 +212,7 @@ fn create_dynamic_proxy(target: Value, handler: Value) -> Value {
                 handler.clone(),
                 vec![
                     original_target.clone(),
-                    Value::String(key.to_string()),
+                    Value::from(key.to_string()),
                     value,
                     receiver.clone(),
                 ],
@@ -228,7 +228,7 @@ fn create_dynamic_proxy(target: Value, handler: Value) -> Value {
         traps.has = Some(Rc::new(move |_snapshot, key| {
             has.call(
                 handler.clone(),
-                vec![original_target.clone(), Value::String(key.to_string())],
+                vec![original_target.clone(), Value::from(key.to_string())],
             )
             .to_bool()
         }));
@@ -242,7 +242,7 @@ fn create_dynamic_proxy(target: Value, handler: Value) -> Value {
             delete_property
                 .call(
                     handler.clone(),
-                    vec![original_target.clone(), Value::String(key.to_string())],
+                    vec![original_target.clone(), Value::from(key.to_string())],
                 )
                 .to_bool()
         }));

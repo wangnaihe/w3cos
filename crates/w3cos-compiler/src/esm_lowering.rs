@@ -4473,7 +4473,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         // Dynamic Proxy constructor backed by w3cos-core's proxy traps.
         "Proxy" => "w3cos_core::proxy_class()".to_string(),
         "Date" => "w3cos_core::web::date_class()".to_string(),
-        "fetch" => "w3cos_core::Value::function(|_this, __args| w3cos_runtime::fetch::fetch_value(__args))".to_string(),
+        "fetch" => "w3cos_runtime::fetch::fetch_function()".to_string(),
         "WebSocket" => {
             "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value(), &w3cos_core::Value::string(\"WebSocket\"))".to_string()
         }
@@ -5837,8 +5837,12 @@ const params = new URLSearchParams("a=1");"#,
             "structuredClone: {code}"
         );
         assert!(
-            code.contains("w3cos_runtime::fetch::fetch_value(__args)"),
-            "fetch facade: {code}"
+            code.contains("w3cos_runtime::fetch::fetch_function()"),
+            "interned fetch facade: {code}"
+        );
+        assert!(
+            !code.contains("w3cos_core::Value::function(|_this, __args| w3cos_runtime::fetch::fetch_value(__args))"),
+            "fetch must not allocate a new function Value on every read: {code}"
         );
         assert!(
             code.contains("Value::string(\"WebSocket\")"),

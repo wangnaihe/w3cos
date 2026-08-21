@@ -40,7 +40,7 @@ fn from_json(json: &serde_json::Value) -> Value {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(f64::NAN)),
-        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::String(s) => Value::from(s.clone()),
         serde_json::Value::Array(items) => Value::array(items.iter().map(from_json).collect()),
         serde_json::Value::Object(map) => {
             let value = Value::object(
@@ -95,7 +95,7 @@ fn walk_reviver(reviver: &Value, key: &str, value: Value) -> Value {
     };
     reviver.call(
         Value::Undefined,
-        vec![Value::String(key.to_string()), value],
+        vec![Value::from(key.to_string()), value],
     )
 }
 
@@ -115,7 +115,7 @@ pub fn stringify(args: Vec<Value>) -> Value {
         stack: HashSet::new(),
     };
     match serialize(&mut context, "", &value) {
-        Some(text) => Value::String(text),
+        Some(text) => Value::from(text),
         None => Value::Undefined,
     }
 }
@@ -152,7 +152,7 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
     let value = if context.replacer.is_function() {
         context.replacer.call(
             Value::Undefined,
-            vec![Value::String(key.to_string()), value.clone()],
+            vec![Value::from(key.to_string()), value.clone()],
         )
     } else {
         value.clone()

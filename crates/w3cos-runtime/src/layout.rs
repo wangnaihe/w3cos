@@ -545,13 +545,9 @@ pub fn layout_styles_unchanged_except_display(
     if old.len() != new.len() {
         return false;
     }
-    old.iter().zip(new.iter()).all(|(old, new)| {
-        let mut old_style = old.style.clone();
-        let mut new_style = new.style.clone();
-        old_style.display = WDisplay::Flex;
-        new_style.display = WDisplay::Flex;
-        old_style == new_style
-    })
+    old.iter()
+        .zip(new.iter())
+        .all(|(old, new)| old.style.eq_except_display(new.style))
 }
 
 /// Walk ancestors — false when any `display: none` (Show stable slots).
