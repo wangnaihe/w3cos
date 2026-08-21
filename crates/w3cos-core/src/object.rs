@@ -340,7 +340,7 @@ impl JsObject {
                 return trap(&target, key, descriptor);
             }
         }
-        if let Value::Object(desc) = descriptor {
+        if let Some(desc) = descriptor.as_object() {
             let desc = desc.borrow();
             if let Some(val) = desc.properties.get("value") {
                 if !self.properties.contains_key(key) {
@@ -383,8 +383,8 @@ impl JsObject {
             }
         }
         match proto {
-            Value::Object(obj) => {
-                self.prototype = Some(obj.clone());
+            _ if proto.as_object().is_some() => {
+                self.prototype = Some(proto.as_object().expect("object"));
                 true
             }
             _ if proto.is_null() => {

@@ -49,7 +49,7 @@ pub fn parse(input: &str) -> Value {
 }
 
 pub fn get(value: &Value) -> Option<BigInt> {
-    let Value::Object(object) = value else {
+    let Some(object) = value.as_object() else {
         return None;
     };
     let encoded = object.borrow().get_direct(VALUE);

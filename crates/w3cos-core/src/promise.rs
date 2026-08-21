@@ -90,7 +90,7 @@ fn register_state(state: Rc<RefCell<PromiseState>>) -> u64 {
 
 /// The shared state behind `value`, when `value` is one of our promises.
 fn state_of(value: &Value) -> Option<Rc<RefCell<PromiseState>>> {
-    if let Value::Object(object) = value {
+    if let Some(object) = value.as_object() {
         if let Some(id) = object.borrow().get_direct(STATE_KEY).as_number() {
             return PROMISE_STATES
                 .with(|registry| registry.borrow().get(&(id as u64)).and_then(Weak::upgrade));
@@ -845,6 +845,7 @@ mod tests {
                 Some(PromiseStatus::Fulfilled(Value::Function(_)))
             ));
         }
+        crate::page_arena::reset();
         drop(marker);
 
         assert!(marker_weak.upgrade().is_none());

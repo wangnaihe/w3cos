@@ -71,13 +71,10 @@ fn illegal_canvas_class(
 }
 
 fn path_id(value: &Value) -> Option<u64> {
-    let Value::Object(object) = value else {
+    let Some(object) = value.as_object() else {
         return None;
     };
-    match object.borrow().get_direct(PATH_ID) {
-        Value::Number(id) => Some(id as u64),
-        _ => None,
-    }
+    object.borrow().get_direct(PATH_ID).as_number().map(|id| id as u64)
 }
 
 pub fn path_ops(value: &Value) -> Option<Vec<PathOp>> {

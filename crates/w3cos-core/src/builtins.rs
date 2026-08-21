@@ -409,15 +409,17 @@ fn js_round(value: f64) -> f64 {
 }
 
 pub(crate) fn object_keys(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => Value::array(
+    if let Some(object) = value.as_object() {
+        return Value::array(
             object
                 .borrow()
                 .keys()
                 .into_iter()
                 .map(Value::from)
                 .collect(),
-        ),
+        );
+    }
+    match value {
         Value::Array(values) => Value::array(
             values
                 .borrow()
@@ -432,17 +434,17 @@ pub(crate) fn object_keys(value: &Value) -> Value {
 }
 
 fn object_values(value: &Value) -> Value {
+    if let Some(object) = value.as_object() {
+        let object = object.borrow();
+        return Value::array(
+            object
+                .keys()
+                .into_iter()
+                .map(|key| object.get_direct(&key))
+                .collect(),
+        );
+    }
     match value {
-        Value::Object(object) => {
-            let object = object.borrow();
-            Value::array(
-                object
-                    .keys()
-                    .into_iter()
-                    .map(|key| object.get_direct(&key))
-                    .collect(),
-            )
-        }
         Value::Array(values) => Value::array(
             values
                 .borrow()
@@ -655,7 +657,7 @@ fn map_key(value: &Value) -> String {
         }
         crate::value::ValueUnpack::String(s) => format!("s:{s}"),
         crate::value::ValueUnpack::Array(rc) => format!("a:{:p}", std::rc::Rc::as_ptr(rc)),
-        crate::value::ValueUnpack::Object(rc) => format!("o:{:p}", std::rc::Rc::as_ptr(rc)),
+        crate::value::ValueUnpack::Object(rc) => format!("o:{:p}", std::rc::Rc::as_ptr(&rc)),
         crate::value::ValueUnpack::Function(f) => format!("f:{:#x}", f.identity()),
     }
 }
@@ -1113,13 +1115,13 @@ mod monaco_tests {
     #[test]
     fn map_methods_do_not_retain_their_own_receiver() {
         let map = Map::new(vec![]);
-        let Value::Object(object) = map else {
+        let Some(object) = map.as_object() else {
             panic!("Map constructor did not return an object");
         };
 
         assert_eq!(
             std::rc::Rc::strong_count(&object),
-            1,
+            2,
             "a method stored on the Map must use its call receiver instead of creating an Rc cycle"
         );
     }

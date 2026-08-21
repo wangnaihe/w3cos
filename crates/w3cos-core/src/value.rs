@@ -17,8 +17,10 @@ use crate::js_string::JsString;
 /// those immediates is a register move of the 8-byte word and does not
 /// touch `Rc`.
 ///
-/// Long `Rc<str>` strings, arrays, objects, and functions stay as a
-/// remaining enum of pointers / `Rc`. Symbols remain interned strings
+/// Long `Rc<str>` strings, arrays, host/DOM objects, and functions stay as
+/// a remaining enum of pointers / `Rc`. Page-local objects created via
+/// [`Value::object`] / literals are a `u32` handle packed in [`Immediate`]
+/// (clone is a register move). Symbols remain interned strings
 /// (`__w3cos_symbol_…`).
 ///
 /// Constructors `Value::Undefined`, `Value::Null`, `Value::Bool`, and
@@ -60,6 +62,7 @@ impl Default for Value {
 ///   - `3` false
 ///   - `4` true
 ///   - `5` interned page-arena string (`u32` handle payload)
+///   - `6` page-arena object (`u32` handle payload)
 ///
 /// Long `Rc<str>` and heap pointers are **not** in this word (remaining
 /// `Value` enum).
@@ -75,6 +78,7 @@ impl Immediate {
     const TAG_FALSE: u64 = 3;
     const TAG_TRUE: u64 = 4;
     const TAG_STR: u64 = 5;
+    const TAG_OBJ: u64 = 6;
     const HANDLE_SHIFT: u64 = 3;
 
     pub const UNDEFINED: Self = Self(Self::QNAN | Self::TAG_UNDEF);
@@ -102,6 +106,12 @@ impl Immediate {
     #[inline]
     pub const fn from_interned_string(handle: u32) -> Self {
         Self(Self::QNAN | Self::TAG_STR | ((handle as u64) << Self::HANDLE_SHIFT))
+    }
+
+    /// Pack a page-arena object handle into the tagged word.
+    #[inline]
+    pub const fn from_object_handle(handle: u32) -> Self {
+        Self(Self::QNAN | Self::TAG_OBJ | ((handle as u64) << Self::HANDLE_SHIFT))
     }
 
     /// Raw tagged bits. Documented transmute target.
@@ -184,6 +194,20 @@ impl Immediate {
     pub fn as_js_string(self) -> Option<JsString> {
         self.interned_handle().and_then(JsString::from_page_handle)
     }
+
+    #[inline]
+    pub const fn is_object_handle(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_OBJ
+    }
+
+    #[inline]
+    pub const fn object_handle(self) -> Option<u32> {
+        if self.is_object_handle() {
+            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
 }
 
 impl PartialEq for Immediate {
@@ -260,6 +284,37 @@ impl Value {
             Value::Imm(Immediate::from_interned_string(handle))
         } else {
             Value::String(s)
+        }
+    }
+
+    /// Page-arena object handle or host `Rc` object.
+    #[inline]
+    pub fn as_object(&self) -> Option<std::rc::Rc<std::cell::RefCell<crate::JsObject>>> {
+        match self {
+            Value::Imm(imm) => imm
+                .object_handle()
+                .map(crate::page_arena::get_object),
+            Value::Object(object) => Some(std::rc::Rc::clone(object)),
+            _ => None,
+        }
+    }
+
+    /// Packed page-arena object handle, when this value is not a host `Rc`.
+    #[inline]
+    pub fn object_handle(&self) -> Option<u32> {
+        match self {
+            Value::Imm(imm) => imm.object_handle(),
+            _ => None,
+        }
+    }
+
+    fn object_identity_eq(left: &Value, right: &Value) -> bool {
+        match (left.object_handle(), right.object_handle()) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (left.as_object(), right.as_object()) {
+                (Some(a), Some(b)) => std::rc::Rc::ptr_eq(&a, &b),
+                _ => false,
+            },
         }
     }
 }
@@ -386,7 +441,7 @@ pub(crate) enum ValueUnpack<'a> {
     Number(f64),
     String(JsString),
     Array(&'a Rc<RefCell<ArrayStorage>>),
-    Object(&'a Rc<RefCell<crate::JsObject>>),
+    Object(Rc<RefCell<crate::JsObject>>),
     Function(&'a JsFunction),
 }
 
@@ -401,10 +456,15 @@ impl Value {
                 imm.as_js_string()
                     .expect("interned string handle"),
             ),
+            Value::Imm(imm) if imm.is_object_handle() => ValueUnpack::Object(
+                crate::page_arena::get_object(
+                    imm.object_handle().expect("object handle"),
+                ),
+            ),
             Value::Imm(imm) => ValueUnpack::Number(imm.as_number().unwrap_or(f64::NAN)),
             Value::String(s) => ValueUnpack::String(s.clone()),
             Value::Array(a) => ValueUnpack::Array(a),
-            Value::Object(o) => ValueUnpack::Object(o),
+            Value::Object(o) => ValueUnpack::Object(Rc::clone(o)),
             Value::Function(f) => ValueUnpack::Function(f),
         }
     }
@@ -531,7 +591,7 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Imm(left), Value::Imm(right)) => left == right,
             (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
-            (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
+            (left, right) if Value::object_identity_eq(left, right) => true,
             (Value::Function(_), Value::Function(_)) => false,
             _ => false,
         }
@@ -694,7 +754,7 @@ impl Value {
             }
             ValueUnpack::Object(value) => {
                 6_u8.hash(&mut hasher);
-                (Rc::as_ptr(value) as usize).hash(&mut hasher);
+                (Rc::as_ptr(&value) as usize).hash(&mut hasher);
             }
             ValueUnpack::Function(value) => {
                 7_u8.hash(&mut hasher);
@@ -814,7 +874,7 @@ impl Value {
             }
             ValueUnpack::Function(function) => {
                 let to_string = function.get_property("toString");
-                if matches!(to_string, Value::Function(_) | Value::Object(_)) {
+                if to_string.is_function() || to_string.is_object() || to_string.is_callable() {
                     if let Some(value) = to_string.call(self.clone(), vec![]).as_js_string() {
                         return value.as_str().to_string();
                     }
@@ -848,7 +908,7 @@ impl Value {
         matches!(self, Value::Imm(imm) if imm.is_bool())
     }
     pub fn is_object(&self) -> bool {
-        matches!(self, Value::Object(_)) && crate::bigint::get(self).is_none()
+        self.as_object().is_some() && crate::bigint::get(self).is_none()
     }
     pub fn is_array(&self) -> bool {
         matches!(self, Value::Array(_))
@@ -859,8 +919,9 @@ impl Value {
     pub fn is_callable(&self) -> bool {
         match self {
             Value::Function(_) => true,
-            Value::Object(object) => object.borrow().call_slot().is_some(),
-            _ => false,
+            _ => self
+                .as_object()
+                .is_some_and(|object| object.borrow().call_slot().is_some()),
         }
     }
 
@@ -882,8 +943,10 @@ impl Value {
     /// ECMAScript `in` operator: `key in obj`.
     pub fn js_in(&self, obj: &Value) -> Value {
         let key = self.to_js_string();
+        if let Some(o) = obj.as_object() {
+            return Value::Bool(o.borrow().has(&key));
+        }
         match obj {
-            Value::Object(o) => Value::Bool(o.borrow().has(&key)),
             Value::Array(arr) => {
                 if let Ok(idx) = key.parse::<usize>() {
                     Value::Bool(
@@ -901,19 +964,19 @@ impl Value {
 
     /// Property access: `obj[key]` or `obj.key`.
     pub fn get_property(&self, key: &str) -> Value {
+        if let Some(o) = self.as_object() {
+            let value = o.borrow().get(key, self).clone();
+            return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
+                value
+            } else {
+                let getter = o
+                    .borrow()
+                    .get(&format!("__w3cos_getter_{key}"), self)
+                    .clone();
+                getter.call(self.clone(), vec![])
+            };
+        }
         match self {
-            Value::Object(o) => {
-                let value = o.borrow().get(key, self).clone();
-                if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
-                    value
-                } else {
-                    let getter = o
-                        .borrow()
-                        .get(&format!("__w3cos_getter_{key}"), self)
-                        .clone();
-                    getter.call(self.clone(), vec![])
-                }
-            }
             Value::Array(arr) => {
                 if let Some(value) = crate::binary::typed_array_property(self, key) {
                     return value;
@@ -972,7 +1035,7 @@ impl Value {
     /// Only own enumerable string properties are copied; the prototype and
     /// excluded bindings are not carried into the result.
     pub fn object_rest(&self, excluded: &[&str]) -> Value {
-        let Value::Object(object) = self else {
+        let Some(object) = self.as_object() else {
             return Value::object(HashMap::new());
         };
         let object = object.borrow();
@@ -995,21 +1058,22 @@ impl Value {
     /// function is reachable through the prototype chain, the setter is
     /// invoked with the object as receiver instead of storing directly.
     pub fn set_property(&self, key: &str, value: Value) {
-        match self {
-            Value::Object(o) => {
-                let has_own = o.borrow().properties.contains_key(key);
-                if !has_own {
-                    let setter = o
-                        .borrow()
-                        .get(&format!("__w3cos_setter_{key}"), self)
-                        .clone();
-                    if !setter.is_undefined() {
-                        setter.call(self.clone(), vec![value]);
-                        return;
-                    }
+        if let Some(o) = self.as_object() {
+            let has_own = o.borrow().properties.contains_key(key);
+            if !has_own {
+                let setter = o
+                    .borrow()
+                    .get(&format!("__w3cos_setter_{key}"), self)
+                    .clone();
+                if !setter.is_undefined() {
+                    setter.call(self.clone(), vec![value]);
+                    return;
                 }
-                o.borrow_mut().set(key, value, &Value::Undefined);
             }
+            o.borrow_mut().set(key, value, &Value::Undefined);
+            return;
+        }
+        match self {
             Value::Array(arr) => {
                 if let Ok(idx) = key.parse::<usize>() {
                     if crate::binary::set_typed_array_index(self, idx, value.clone()) {
@@ -1032,7 +1096,9 @@ impl Value {
     /// Delete an own property and return the JavaScript-style success value.
     pub fn delete_property(&self, key: &str) -> Value {
         let deleted = match self {
-            Value::Object(object) => object.borrow_mut().delete(key),
+            _ if self.as_object().is_some() => {
+                self.as_object().expect("object").borrow_mut().delete(key)
+            }
             Value::Array(array) => {
                 if let Ok(index) = key.parse::<usize>() {
                     if let Some(slot) = array.borrow_mut().get_mut(index) {
@@ -1071,13 +1137,15 @@ impl Value {
     }
 
     pub fn object(props: HashMap<String, Value>) -> Self {
-        Value::Object(Rc::new(RefCell::new(crate::JsObject::from_map(props))))
+        let rc = Rc::new(RefCell::new(crate::JsObject::from_map(props)));
+        let handle = crate::page_arena::alloc_object(Rc::clone(&rc));
+        Value::Imm(Immediate::from_object_handle(handle))
     }
 
     pub fn object_from_parts(parts: Vec<Value>) -> Self {
         let mut properties = HashMap::new();
         for part in parts {
-            if let Value::Object(object) = part {
+            if let Some(object) = part.as_object() {
                 let object = object.borrow();
                 for key in object.keys() {
                     properties.insert(key.clone(), object.get_direct(&key));
@@ -1106,7 +1174,8 @@ impl Value {
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         match self {
             Value::Function(function) => function.call(this, args),
-            Value::Object(object) => {
+            _ if self.as_object().is_some() => {
+                let object = self.as_object().expect("object");
                 let slot = object.borrow().call_slot().cloned();
                 match slot {
                     Some(function) => function.call(this, args),
@@ -1241,7 +1310,12 @@ impl Value {
                 .unwrap_or(Value::Undefined)
                 .to_js_string();
             return Value::Bool(match self {
-                Value::Object(object) => object.borrow().properties.contains_key(property.as_str()),
+                _ if self.as_object().is_some() => self
+                    .as_object()
+                    .expect("object")
+                    .borrow()
+                    .properties
+                    .contains_key(property.as_str()),
                 Value::Array(values) => {
                     property == "length"
                         || property.parse::<usize>().is_ok_and(|index| {
@@ -1606,7 +1680,8 @@ impl Value {
         match self {
             Value::Array(_) => true,
             _ if self.is_string() => true,
-            Value::Object(object) => {
+            _ if self.as_object().is_some() => {
+                let object = self.as_object().expect("object");
                 crate::collections::iter_collection(self).is_some()
                     || object
                         .borrow()
@@ -1654,7 +1729,8 @@ impl Value {
             // First use the standards-oriented Map/Set registry. Retain the
             // host runtime's snapshot hook as a fallback for its lightweight
             // built-in Map used by compiled application paths.
-            Value::Object(object) => {
+            _ if self.as_object().is_some() => {
+                let object = self.as_object().expect("object");
                 if let Some(iterator) = crate::collections::iter_collection(self) {
                     return ValueIterator::boxed(iterator);
                 }
@@ -1815,10 +1891,8 @@ fn close_async_iterator_chain(
 }
 
 fn is_iterator_object(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Object(_) | Value::Array(_) | Value::Function(_)
-    ) && crate::bigint::get(value).is_none()
+    (value.is_object() || value.is_array() || value.is_function())
+        && crate::bigint::get(value).is_none()
 }
 
 pub(crate) fn type_error(message: &str) -> Value {
@@ -2406,7 +2480,7 @@ impl Value {
                 }
             }
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
-            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (left, right) if Value::object_identity_eq(left, right) => true,
             (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
             _ => match (self.as_js_string(), other.as_js_string()) {
                 (Some(a), Some(b)) => a == b,
@@ -2430,7 +2504,7 @@ impl Value {
                 _ => false,
             },
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
-            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (left, right) if Value::object_identity_eq(left, right) => true,
             (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
             _ => match (self.as_js_string(), other.as_js_string()) {
                 (Some(a), Some(b)) => a == b,
@@ -2681,7 +2755,13 @@ mod tests {
             _ => panic!("interned short string must be the tagged immediate word"),
         }
         assert!(Value::array(vec![]).as_immediate().is_none());
-        assert!(Value::object(HashMap::new()).as_immediate().is_none());
+        match Value::object(HashMap::new()) {
+            Value::Imm(word) => {
+                assert!(word.is_object_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+            }
+            _ => panic!("Value::object must pack a page-arena handle"),
+        }
         assert!(
             Value::function(|_, _| Value::Undefined)
                 .as_immediate()
@@ -3545,6 +3625,35 @@ mod tests {
             _ => panic!("long string clone must stay heap"),
         }
         assert_eq!(s.to_js_string(), raw);
+    }
+
+    #[test]
+    fn object_handle_clone_does_not_increase_rc_and_reset_empties_table() {
+        crate::page_arena::reset();
+        let obj = Value::object(HashMap::from([("k".into(), Value::Number(1.0))]));
+        match &obj {
+            Value::Imm(word) => {
+                assert!(word.is_object_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+                let handle = word.object_handle().unwrap();
+                let rc = crate::page_arena::get_object(handle);
+                let before = Rc::strong_count(&rc);
+                let cloned = obj.clone();
+                assert_eq!(Rc::strong_count(&rc), before);
+                match cloned {
+                    Value::Imm(copy) => {
+                        assert_eq!(copy.object_handle(), word.object_handle())
+                    }
+                    _ => panic!("clone must stay Imm handle"),
+                }
+                assert_eq!(obj.get_property("k").to_number(), 1.0);
+                assert_eq!(cloned.get_property("k").to_number(), 1.0);
+            }
+            _ => panic!("Value::object must pack a page-arena handle"),
+        }
+        assert!(crate::page_arena::live_objects() >= 1);
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_objects(), 0);
     }
 
     #[test]

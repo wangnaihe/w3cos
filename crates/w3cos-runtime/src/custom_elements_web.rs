@@ -995,24 +995,19 @@ mod tests {
                 .get_property("realmMarker")
                 .to_bool()
         );
-        assert!(matches!(
-            new_registry.call_method("get", vec![Value::string("old-widget")]),
-            Value::Undefined
-        ));
+        assert!(new_registry
+            .call_method("get", vec![Value::string("old-widget")])
+            .is_undefined());
 
         let stale_constructor = Value::function(|_, _| Value::Undefined);
         old_registry.call_method(
             "define",
             vec![Value::string("stale-widget"), stale_constructor],
         );
-        assert!(matches!(
-            new_registry.call_method("get", vec![Value::string("stale-widget")]),
-            Value::Undefined
-        ));
-        assert!(matches!(
-            old_class.call(Value::Undefined, vec![]),
-            Value::Undefined
-        ));
+        assert!(new_registry
+            .call_method("get", vec![Value::string("stale-widget")])
+            .is_undefined());
+        assert!(old_class.call(Value::Undefined, vec![]).is_undefined());
         assert!(old_class.get_property("prototype").is_undefined());
         assert!(old_registry.get_property("define").is_undefined());
 

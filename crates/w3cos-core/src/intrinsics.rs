@@ -200,7 +200,8 @@ pub fn create_object(properties: Vec<(Value, Value)>) -> Value {
 pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
     let keys = match source {
         _ if source.is_nullish() => Vec::new(),
-        Value::Object(object) => {
+        _ if source.as_object().is_some() => {
+            let object = source.as_object().expect("object");
             let own_keys = object.borrow().own_keys();
             let Value::Array(keys) = own_keys else {
                 return target.clone();
@@ -241,7 +242,7 @@ pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
         if !seen.insert(key.clone()) {
             continue;
         }
-        if let Value::Object(object) = source {
+        if let Some(object) = source.as_object() {
             let descriptor = object.borrow().get_own_property_descriptor(&key);
             if descriptor.is_undefined() || !descriptor.get_property("enumerable").to_bool() {
                 continue;
@@ -305,7 +306,7 @@ pub fn for_in_keys(value: &Value) -> Value {
     let mut seen_keys = HashSet::new();
     let mut seen_objects = HashSet::new();
     let mut current = value.clone();
-    while let Value::Object(object) = current {
+    while let Some(object) = current.as_object() {
         if !seen_objects.insert(std::rc::Rc::as_ptr(&object) as usize) {
             break;
         }

@@ -572,24 +572,17 @@ mod tests {
 
         let stale_ran = Rc::new(Cell::new(false));
         let stale_ran_for_task = Rc::clone(&stale_ran);
-        assert!(matches!(
-            old_scheduler.call_method(
+        assert!(old_scheduler
+            .call_method(
                 "postTask",
                 vec![Value::function(move |_, _| {
                     stale_ran_for_task.set(true);
                     Value::Undefined
                 })],
-            ),
-            Value::Undefined
-        ));
-        assert!(matches!(
-            old_controller_class.call(Value::Undefined, vec![]),
-            Value::Undefined
-        ));
-        assert!(matches!(
-            old_signal_class.call(Value::Undefined, vec![]),
-            Value::Undefined
-        ));
+            )
+            .is_undefined());
+        assert!(old_controller_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(old_signal_class.call(Value::Undefined, vec![]).is_undefined());
         crate::jsdom::tick_timers();
         crate::jsdom::drain_microtasks();
         assert!(!stale_ran.get());

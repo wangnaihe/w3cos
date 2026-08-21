@@ -23,7 +23,11 @@ impl WeakValue {
     fn new(value: &Value) -> Option<Self> {
         match value {
             Value::Array(value) => Some(Self::Array(Rc::downgrade(value))),
-            Value::Object(value) => Some(Self::Object(Rc::downgrade(value))),
+            _ if value.as_object().is_some() => {
+                Some(Self::Object(Rc::downgrade(
+                    &value.as_object().expect("object"),
+                )))
+            }
             Value::Function(value) => Some(Self::Function(value.downgrade())),
             _ => None,
         }
@@ -467,7 +471,8 @@ mod tests {
     fn weak_map_and_set_do_not_keep_object_keys_alive() {
         let map = construct(&weak_map_class(), vec![]);
         let set = construct(&weak_set_class(), vec![]);
-        let key = Value::object(HashMap::new());
+        // Host Rc object: page-local arena objects stay pinned until reset.
+        let key = Value::Object(Rc::new(RefCell::new(crate::JsObject::new())));
         let weak = match &key {
             Value::Object(value) => Rc::downgrade(value),
             _ => unreachable!(),
@@ -505,7 +510,7 @@ mod tests {
                 Value::Undefined
             })],
         );
-        let target = Value::object(HashMap::new());
+        let target = Value::Object(Rc::new(RefCell::new(crate::JsObject::new())));
         registry.call_method("register", vec![target.clone(), Value::string("shipment")]);
         drop(target);
         registry.call_method("cleanupSome", vec![]);

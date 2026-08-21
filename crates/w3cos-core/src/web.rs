@@ -217,7 +217,7 @@ pub fn image_data_value(data: Value, width: u32, height: u32, color_space: &str)
 }
 
 fn blob_state(value: &Value) -> Option<Rc<BlobState>> {
-    let Value::Object(object) = value else {
+    let Some(object) = value.as_object() else {
         return None;
     };
     let Some(id) = object.borrow().get_direct(BLOB_STATE_KEY).as_number() else {
@@ -1017,7 +1017,7 @@ fn currency_name(currency: &str, locale: &str) -> &'static str {
 fn date_milliseconds(value: &Value) -> f64 {
     match value {
         _ if value.is_string() => parse_iso_instant(&value.to_js_string()),
-        Value::Object(_) => value.get_property("__w3cos_date_milliseconds").to_number(),
+        _ if value.is_object() => value.get_property("__w3cos_date_milliseconds").to_number(),
         _ => value.to_number(),
     }
 }
@@ -1351,7 +1351,9 @@ pub fn structured_clone(args: Vec<Value>) -> Value {
 fn heap_pointer(value: &Value) -> Option<usize> {
     match value {
         Value::Array(items) => Some(Rc::as_ptr(items) as usize),
-        Value::Object(object) => Some(Rc::as_ptr(object) as usize),
+        _ if value.as_object().is_some() => {
+            Some(Rc::as_ptr(&value.as_object().expect("object")) as usize)
+        }
         _ => None,
     }
 }
@@ -1431,7 +1433,8 @@ fn clone_value(value: &Value, clones: &mut HashMap<usize, Value>) -> Value {
             }
             cloned
         }
-        Value::Object(object) => {
+        _ if value.as_object().is_some() => {
+            let object = value.as_object().expect("object");
             let milliseconds = value.get_property("__w3cos_date_milliseconds");
             if !milliseconds.is_undefined() {
                 let cloned = date_value(milliseconds.to_number());
@@ -2184,10 +2187,10 @@ fn params_value(
 ) -> Value {
     let state: PairList = Rc::new(RefCell::new(pairs));
     let params = Value::object(HashMap::new());
-    let weak_self: Weak<RefCell<crate::JsObject>> = match &params {
-        Value::Object(object) => Rc::downgrade(object),
-        _ => unreachable!(),
-    };
+    let weak_self: Weak<RefCell<crate::JsObject>> = params
+        .as_object()
+        .map(|object| Rc::downgrade(&object))
+        .expect("URLSearchParams object");
 
     /// After-mutation hook: push the new serialization into the URL.
     macro_rules! sync_to_url {
@@ -2436,7 +2439,8 @@ pub fn url_search_params_new(args: Vec<Value>) -> Value {
                 }
             })
             .collect(),
-        Value::Object(object) => {
+        _ if init.as_object().is_some() => {
+            let object = init.as_object().expect("object");
             let object = object.borrow();
             object
                 .keys()

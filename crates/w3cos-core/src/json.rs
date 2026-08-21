@@ -78,7 +78,8 @@ fn walk_reviver(reviver: &Value, key: &str, value: Value) -> Value {
             }
             value
         }
-        Value::Object(object) => {
+        _ if value.as_object().is_some() => {
+            let object = value.as_object().expect("object");
             let keys = object.borrow().keys();
             for child_key in keys {
                 let child = object.borrow().get_direct(&child_key);
@@ -184,7 +185,7 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
             Some(render_container('[', ']', &parts, &inner, &outer))
         }
         crate::value::ValueUnpack::Object(object) => {
-            let pointer = Rc::as_ptr(object) as usize;
+            let pointer = Rc::as_ptr(&object) as usize;
             context.enter(pointer);
             let whitelist: Option<Vec<String>> = match &context.replacer {
                 Value::Array(keys) => Some(keys.borrow().iter().map(Value::to_js_string).collect()),

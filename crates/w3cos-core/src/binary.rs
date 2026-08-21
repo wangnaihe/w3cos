@@ -264,7 +264,7 @@ thread_local! {
 }
 
 fn buffer_state(value: &Value) -> Option<Rc<RefCell<Vec<u8>>>> {
-    let Value::Object(object) = value else {
+    let Some(object) = value.as_object() else {
         return None;
     };
     let Some(id) = object.borrow().get_direct(BUFFER_STATE_KEY).as_number() else {

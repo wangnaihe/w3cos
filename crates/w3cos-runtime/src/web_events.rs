@@ -215,10 +215,15 @@ fn arg(args: &[Value], index: usize) -> Value {
 }
 
 fn bool_option(options: &Value, name: &str) -> bool {
-    match options {
-        Value::Bool(value) if name == "capture" => *value,
-        Value::Object(_) => options.get_property(name).to_bool(),
-        _ => false,
+    if name == "capture" {
+        if let Some(value) = options.as_bool() {
+            return value;
+        }
+    }
+    if options.is_object() {
+        options.get_property(name).to_bool()
+    } else {
+        false
     }
 }
 

@@ -197,6 +197,7 @@ mod tests {
     #[test]
     fn owner_and_global_snapshots_track_shared_core_allocations() {
         let global_before = heap_snapshot();
+        crate::page_arena::reset();
         let owner = HeapOwner::new();
         let owner_before = owner.snapshot();
 
@@ -243,6 +244,7 @@ mod tests {
         );
 
         drop((object, array, function));
+        crate::page_arena::reset();
         assert_eq!(owner.snapshot().live_bytes, owner_before.live_bytes);
         assert_eq!(
             owner.snapshot().live_allocations(),

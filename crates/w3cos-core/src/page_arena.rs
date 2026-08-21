@@ -1,8 +1,11 @@
-//! Page-scoped bump arena and integer string handles.
+//! Page-scoped bump arena, interned string handles, and JS object slots.
 //!
-//! Short interned JS strings live here so clones copy a `u32` handle instead
-//! of `Rc::clone`. The bump is dropped on [`reset`] (`reset_bridge` /
-//! document navigation). Size-class slabs wait for a later cut.
+//! Short interned JS strings and page-local [`crate::JsObject`]s live here so
+//! clones copy a `u32` handle instead of `Rc::clone`. The bump and object
+//! table are dropped on [`reset`] (`reset_bridge` / document navigation).
+//! Host / DOM wrappers keep the `Value::Object(Rc)` path so WeakRef intern
+//! can drop unreferenced wrappers without a page reset. Size-class slabs
+//! wait for a later cut.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -46,6 +49,8 @@ struct PageArena {
     slots: Vec<PageString>,
     intern: HashMap<u64, Vec<u32>>,
     allocated: usize,
+    /// 1-based object slots; index 0 is unused so handle `0` is never valid.
+    objects: Vec<Option<std::rc::Rc<std::cell::RefCell<crate::JsObject>>>>,
 }
 
 impl PageArena {
@@ -63,6 +68,7 @@ impl PageArena {
             }],
             intern: HashMap::new(),
             allocated: 0,
+            objects: vec![None],
         }
     }
 
@@ -134,6 +140,28 @@ impl PageArena {
         self.intern.clear();
         self.intern.shrink_to_fit();
         self.allocated = 0;
+        self.objects.clear();
+        self.objects.push(None);
+        self.objects.shrink_to_fit();
+    }
+
+    fn alloc_object(
+        &mut self,
+        object: std::rc::Rc<std::cell::RefCell<crate::JsObject>>,
+    ) -> u32 {
+        let handle = self.objects.len() as u32;
+        self.objects.push(Some(object));
+        handle
+    }
+
+    fn get_object(
+        &self,
+        handle: u32,
+    ) -> std::rc::Rc<std::cell::RefCell<crate::JsObject>> {
+        let Some(Some(object)) = self.objects.get(handle as usize) else {
+            panic!("page object handle used after reset_bridge");
+        };
+        object.clone()
     }
 }
 
@@ -203,6 +231,30 @@ pub fn live_handles() -> usize {
     ARENA.with(|arena| arena.borrow().slots.len().saturating_sub(1))
 }
 
+/// Store a page-local object. Clone of the returned handle does not
+/// `Rc::clone`.
+pub(crate) fn alloc_object(
+    object: std::rc::Rc<std::cell::RefCell<crate::JsObject>>,
+) -> u32 {
+    ARENA.with(|arena| arena.borrow_mut().alloc_object(object))
+}
+
+/// Resolve a live object handle. Panics if the handle belongs to a
+/// previous page (same contract as interned strings).
+pub(crate) fn get_object(
+    handle: u32,
+) -> std::rc::Rc<std::cell::RefCell<crate::JsObject>> {
+    if handle == 0 {
+        panic!("page object handle used after reset_bridge");
+    }
+    ARENA.with(|arena| arena.borrow().get_object(handle))
+}
+
+/// Live page-local objects (empty after [`reset`]).
+pub fn live_objects() -> usize {
+    ARENA.with(|arena| arena.borrow().objects.len().saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +264,7 @@ mod tests {
         reset();
         assert_eq!(allocated_bytes(), 0);
         assert_eq!(live_handles(), 0);
+        assert_eq!(live_objects(), 0);
 
         let a = intern("page-arena-unique-key");
         let b = intern("page-arena-unique-key");
@@ -231,9 +284,27 @@ mod tests {
         reset();
         assert_eq!(allocated_bytes(), 0);
         assert_eq!(live_handles(), 0);
+        assert_eq!(live_objects(), 0);
 
         let again = intern("page-arena-unique-key");
         assert_eq!(again.as_str(), "page-arena-unique-key");
         assert_ne!(again.epoch, a.epoch);
+    }
+
+    #[test]
+    fn object_table_alloc_and_reset_empties() {
+        reset();
+        assert_eq!(live_objects(), 0);
+        let rc = std::rc::Rc::new(std::cell::RefCell::new(crate::JsObject::new()));
+        let handle = alloc_object(rc.clone());
+        assert_eq!(handle, 1);
+        assert_eq!(std::rc::Rc::strong_count(&rc), 2);
+        let resolved = get_object(handle);
+        assert!(std::rc::Rc::ptr_eq(&rc, &resolved));
+        drop(resolved);
+        assert_eq!(live_objects(), 1);
+        reset();
+        assert_eq!(live_objects(), 0);
+        assert_eq!(std::rc::Rc::strong_count(&rc), 1);
     }
 }

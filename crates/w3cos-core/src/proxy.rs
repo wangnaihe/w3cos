@@ -178,7 +178,7 @@ pub fn proxy_class() -> Value {
 
 fn create_dynamic_proxy(target: Value, handler: Value) -> Value {
     let mut properties = HashMap::new();
-    if let Value::Object(object) = &target {
+    if let Some(object) = target.as_object() {
         let object = object.borrow();
         for key in object.keys() {
             properties.insert(key.clone(), object.get_direct(&key));

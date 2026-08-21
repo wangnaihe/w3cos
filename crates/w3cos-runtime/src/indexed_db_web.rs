@@ -3050,7 +3050,7 @@ fn value_to_json_inner(
         )])));
     }
     match value {
-        Value::Undefined => Ok(JsonValue::Object(serde_json::Map::from_iter([(
+        value if value.is_undefined() => Ok(JsonValue::Object(serde_json::Map::from_iter([(
             CLONE_TAG.into(),
             JsonValue::String("undefined".into()),
         )]))),
@@ -3058,9 +3058,11 @@ fn value_to_json_inner(
             name: "DataCloneError".into(),
             message: "The value cannot be structured cloned.".into(),
         }),
-        Value::Null => Ok(JsonValue::Null),
-        Value::Bool(value) => Ok(JsonValue::Bool(*value)),
-        Value::Number(value) => serde_json::Number::from_f64(*value)
+        value if value.is_null() => Ok(JsonValue::Null),
+        value if value.as_bool().is_some() => Ok(JsonValue::Bool(value.as_bool().unwrap())),
+        value if value.as_number().is_some() => {
+            let number = value.as_number().unwrap();
+            serde_json::Number::from_f64(number)
             .map(JsonValue::Number)
             .map_or_else(
                 || {
@@ -3069,9 +3071,9 @@ fn value_to_json_inner(
                         (
                             "value".into(),
                             JsonValue::String(
-                                if value.is_nan() {
+                                if number.is_nan() {
                                     "NaN"
-                                } else if value.is_sign_positive() {
+                                } else if number.is_sign_positive() {
                                     "Infinity"
                                 } else {
                                     "-Infinity"
@@ -3082,7 +3084,9 @@ fn value_to_json_inner(
                     ])))
                 },
                 Ok,
-            ),
+            )
+        }
+        value if value.is_string() => Ok(JsonValue::String(value.to_js_string())),
         Value::String(value) => Ok(JsonValue::String(value.to_string())),
         Value::Array(values) => {
             let pointer = Rc::as_ptr(values) as usize;
@@ -3101,7 +3105,8 @@ fn value_to_json_inner(
             active.remove(&pointer);
             result
         }
-        Value::Object(object) => {
+        value if value.as_object().is_some() => {
+            let object = value.as_object().expect("object");
             if let Some(bigint) = w3cos_core::bigint::get(value) {
                 return Ok(JsonValue::Object(serde_json::Map::from_iter([(
                     BIGINT_TAG.into(),
@@ -3126,7 +3131,7 @@ fn value_to_json_inner(
                 )])));
             }
             if let Some(snapshot) = w3cos_core::collections::collection_snapshot(value) {
-                let pointer = Rc::as_ptr(object) as usize;
+                let pointer = Rc::as_ptr(&object) as usize;
                 if !active.insert(pointer) {
                     return Err(IndexedDbError {
                         name: "DataCloneError".into(),
@@ -3224,7 +3229,7 @@ fn value_to_json_inner(
                     ])),
                 )])));
             }
-            let pointer = Rc::as_ptr(object) as usize;
+            let pointer = Rc::as_ptr(&object) as usize;
             if !active.insert(pointer) {
                 return Err(IndexedDbError {
                     name: "DataCloneError".into(),
@@ -3257,6 +3262,10 @@ fn value_to_json_inner(
             }
             Ok(JsonValue::Object(cloned))
         }
+        _ => Err(IndexedDbError {
+            name: "DataCloneError".into(),
+            message: "The value cannot be structured cloned.".into(),
+        }),
     }
 }
 

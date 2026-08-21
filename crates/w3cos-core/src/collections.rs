@@ -93,7 +93,7 @@ fn register_set(values: Rc<RefCell<SetValues>>) -> u64 {
 
 /// The shared entries behind `value`, when `value` is one of our Maps.
 fn map_state_of(value: &Value) -> Option<Rc<RefCell<MapEntries>>> {
-    if let Value::Object(object) = value {
+    if let Some(object) = value.as_object() {
         if let Some(id) = object.borrow().get_direct(MAP_STATE_KEY).as_number() {
             return MAP_STATES.with(|registry| registry.borrow().get(&(id as u64)).cloned());
         }
@@ -103,7 +103,7 @@ fn map_state_of(value: &Value) -> Option<Rc<RefCell<MapEntries>>> {
 
 /// The shared values behind `value`, when `value` is one of our Sets.
 fn set_state_of(value: &Value) -> Option<Rc<RefCell<SetValues>>> {
-    if let Value::Object(object) = value {
+    if let Some(object) = value.as_object() {
         if let Some(id) = object.borrow().get_direct(SET_STATE_KEY).as_number() {
             return SET_STATES.with(|registry| registry.borrow().get(&(id as u64)).cloned());
         }

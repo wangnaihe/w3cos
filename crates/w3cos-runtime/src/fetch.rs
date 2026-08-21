@@ -389,9 +389,12 @@ pub fn fetch_value(arguments: Vec<Value>) -> Value {
         body: multipart
             .as_ref()
             .map(|(body, _)| body.clone())
-            .or_else(|| match body {
-                Value::Undefined | Value::Null => None,
-                body => Some(body.to_js_string()),
+            .or_else(|| {
+                if body.is_nullish() {
+                    None
+                } else {
+                    Some(body.to_js_string())
+                }
             }),
         ..FetchOptions::default()
     };
@@ -1683,7 +1686,8 @@ pub fn response_class() -> Value {
         }
         let constructor = realm_fetch_function(|_, args| {
             let body = match args.first() {
-                None | Some(Value::Undefined) | Some(Value::Null) => String::new(),
+                None => String::new(),
+                Some(body) if body.is_nullish() => String::new(),
                 Some(body) => body.to_js_string(),
             };
             let init = args.get(1).cloned().unwrap_or(Value::Undefined);
@@ -1692,9 +1696,13 @@ pub fn response_class() -> Value {
             } else {
                 200
             };
-            let status_text = match init.get_property("statusText") {
-                Value::Undefined => String::new(),
-                value => value.to_js_string(),
+            let status_text = {
+                let value = init.get_property("statusText");
+                if value.is_undefined() {
+                    String::new()
+                } else {
+                    value.to_js_string()
+                }
             };
             let headers =
                 headers_value_from_list(collect_header_init(&init.get_property("headers")));
@@ -1935,9 +1943,10 @@ fn request_value(input: Value, init: Value) -> Value {
             if let Some((body, _)) = crate::form_data::serialize(&text_body) {
                 return Value::string(&body);
             }
-            match &text_body {
-                Value::Undefined | Value::Null => Value::from(""),
-                value => Value::from(value.to_js_string()),
+            if text_body.is_nullish() {
+                Value::from("")
+            } else {
+                Value::from(text_body.to_js_string())
             }
         }),
     );
