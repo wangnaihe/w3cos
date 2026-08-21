@@ -91,7 +91,7 @@ fn register_state(state: Rc<RefCell<PromiseState>>) -> u64 {
 /// The shared state behind `value`, when `value` is one of our promises.
 fn state_of(value: &Value) -> Option<Rc<RefCell<PromiseState>>> {
     if let Value::Object(object) = value {
-        if let Value::Number(id) = object.borrow().get_direct(STATE_KEY) {
+        if let Some(id) = object.borrow().get_direct(STATE_KEY).as_number() {
             return PROMISE_STATES
                 .with(|registry| registry.borrow().get(&(id as u64)).and_then(Weak::upgrade));
         }
@@ -395,7 +395,8 @@ pub fn reject(args: Vec<Value>) -> Value {
 /// item fulfills, or rejected with the first rejection. Empty → `[]`.
 pub fn all(args: Vec<Value>) -> Value {
     let items = match args.first() {
-        None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
+        None => Vec::new(),
+        Some(v) if v.is_nullish() => Vec::new(),
         Some(Value::Array(items)) => items
             .borrow()
             .iter()
@@ -577,10 +578,13 @@ mod tests {
             args[0].call(Value::Undefined, vec![Value::Number(42.0)]);
             Value::Undefined
         })]);
-        assert!(matches!(
-            status(&promise),
-            Some(PromiseStatus::Fulfilled(Value::Number(42.0)))
-        ));
+        assert_eq!(
+            status(&promise).and_then(|status| match status {
+                PromiseStatus::Fulfilled(value) => value.as_number(),
+                _ => None,
+            }),
+            Some(42.0)
+        );
         promise.call_method("then", vec![recorder(log.clone())]);
         // Reactions are microtasks: nothing ran yet even though `promise`
         // settled synchronously inside the executor.

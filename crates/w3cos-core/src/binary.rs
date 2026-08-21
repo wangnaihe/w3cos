@@ -267,7 +267,7 @@ fn buffer_state(value: &Value) -> Option<Rc<RefCell<Vec<u8>>>> {
     let Value::Object(object) = value else {
         return None;
     };
-    let Value::Number(id) = object.borrow().get_direct(BUFFER_STATE_KEY) else {
+    let Some(id) = object.borrow().get_direct(BUFFER_STATE_KEY).as_number() else {
         return None;
     };
     BUFFERS.with(|buffers| buffers.borrow().get(&(id as u64)).cloned())

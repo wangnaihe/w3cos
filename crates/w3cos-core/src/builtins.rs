@@ -182,13 +182,14 @@ pub fn array_value() -> Value {
         Value::function(|_, arguments| Value::array(arguments)),
     );
     Value::callable(properties, |_, arguments| {
-        if let [Value::Number(length)] = arguments.as_slice()
+        if let [length] = arguments.as_slice()
+            && let Some(length) = length.as_number()
             && length.is_finite()
-            && *length >= 0.0
+            && length >= 0.0
             && length.fract() == 0.0
         {
             return Value::array(
-                (0..*length as usize)
+                (0..length as usize)
                     .map(|_| crate::value::array_hole())
                     .collect(),
             );
@@ -638,24 +639,24 @@ pub struct Map;
 /// values by (type-tagged) value, objects/arrays/functions by reference
 /// identity (Rc pointer).
 fn map_key(value: &Value) -> String {
-    match value {
-        Value::Undefined => "u:".to_string(),
-        Value::Null => "z:".to_string(),
-        Value::Bool(b) => format!("b:{b}"),
+    match value.unpack() {
+        crate::value::ValueUnpack::Undefined => "u:".to_string(),
+        crate::value::ValueUnpack::Null => "z:".to_string(),
+        crate::value::ValueUnpack::Bool(b) => format!("b:{b}"),
         // Canonicalize -0 to +0 (SameValueZero) and let all NaNs share a key.
-        Value::Number(n) => {
+        crate::value::ValueUnpack::Number(n) => {
             if n.is_nan() {
                 "n:NaN".to_string()
-            } else if *n == 0.0 {
+            } else if n == 0.0 {
                 "n:0".to_string()
             } else {
                 format!("n:{n}")
             }
         }
-        Value::String(s) => format!("s:{s}"),
-        Value::Array(rc) => format!("a:{:p}", std::rc::Rc::as_ptr(rc)),
-        Value::Object(rc) => format!("o:{:p}", std::rc::Rc::as_ptr(rc)),
-        Value::Function(f) => format!("f:{:#x}", f.identity()),
+        crate::value::ValueUnpack::String(s) => format!("s:{s}"),
+        crate::value::ValueUnpack::Array(rc) => format!("a:{:p}", std::rc::Rc::as_ptr(rc)),
+        crate::value::ValueUnpack::Object(rc) => format!("o:{:p}", std::rc::Rc::as_ptr(rc)),
+        crate::value::ValueUnpack::Function(f) => format!("f:{:#x}", f.identity()),
     }
 }
 

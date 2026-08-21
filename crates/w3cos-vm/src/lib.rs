@@ -2140,7 +2140,7 @@ fn generator_optional_iterator_step(
     arguments: Vec<Value>,
 ) -> Result<Option<(Value, bool)>, VmError> {
     let method_value = iterator.get_property(method);
-    if matches!(method_value, Value::Undefined | Value::Null) {
+    if method_value.is_nullish() {
         return Ok(None);
     }
     if !method_value.is_callable() {
@@ -2177,7 +2177,7 @@ fn generator_optional_iterator_call(
     arguments: Vec<Value>,
 ) -> Result<Option<Value>, VmError> {
     let method_value = iterator.get_property(method);
-    if matches!(method_value, Value::Undefined | Value::Null) {
+    if method_value.is_nullish() {
         return Ok(None);
     }
     if !method_value.is_callable() {

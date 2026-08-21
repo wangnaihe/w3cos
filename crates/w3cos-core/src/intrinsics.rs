@@ -199,7 +199,7 @@ pub fn create_object(properties: Vec<(Value, Value)>) -> Value {
 /// without invoking inherited setters on the destination.
 pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
     let keys = match source {
-        Value::Undefined | Value::Null => Vec::new(),
+        _ if source.is_nullish() => Vec::new(),
         Value::Object(object) => {
             let own_keys = object.borrow().own_keys();
             let Value::Array(keys) = own_keys else {
@@ -225,7 +225,7 @@ pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
             .into_iter()
             .filter(|key| key != "prototype")
             .collect(),
-        Value::Bool(_) | Value::Number(_) => Vec::new(),
+        _ => Vec::new(),
     };
 
     let mut seen = HashSet::new();
@@ -538,12 +538,13 @@ mod tests {
         );
 
         let awaited = await_value(&Value::Number(42.0));
-        assert!(matches!(
-            crate::promise::status(&awaited),
-            Some(crate::promise::PromiseStatus::Fulfilled(Value::Number(
-                42.0
-            )))
-        ));
+        assert_eq!(
+            crate::promise::status(&awaited).and_then(|status| match status {
+                crate::promise::PromiseStatus::Fulfilled(value) => value.as_number(),
+                _ => None,
+            }),
+            Some(42.0)
+        );
     }
 
     #[test]

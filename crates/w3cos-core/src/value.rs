@@ -12,28 +12,205 @@ use crate::js_string::JsString;
 
 /// JavaScript-compatible dynamic value type.
 ///
-/// Maps the full ECMAScript value space into Rust with reference-counted
-/// sharing for heap types (Array, Object, Function, String).
+/// First-cut ABI: Undefined / Null / Bool / Number are a Copy tagged
+/// word ([`Immediate`], NaN-box). Clone of those immediates is a
+/// register move of the 8-byte word and does not touch `Rc`.
 ///
-/// `Value` is `Clone` but not `Copy`: `String` / `Array` / `Object` /
-/// `Function` all carry `Rc`. Number / Bool / Null / Undefined stay as
-/// they are in this slice; NaN-boxing those primitives is the next step.
+/// Heap values (strings, arrays, objects, functions) stay as a remaining
+/// enum of pointers / `Rc` and are **not** packed into the same word
+/// yet. Symbols remain interned strings (`__w3cos_symbol_…`).
+///
+/// Constructors `Value::Undefined`, `Value::Null`, `Value::Bool`, and
+/// `Value::Number` are unchanged so AOT emission (`num_regs` / `bool_regs`
+/// boxing) stays valid. `String` / `Array` / `Object` / `Function`
+/// variant names are unchanged.
+///
 /// Core heap values are thread-confined (`Rc` + thread-local heap
 /// counters), so string intern is thread-local as well.
-///
-/// VM and AOT share this type. Public methods (`string`, `to_js_string`,
-/// `clone`, `eq`) and the `String` variant name are unchanged.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub enum Value {
-    #[default]
-    Undefined,
-    Null,
-    Bool(bool),
-    Number(f64),
+    /// NaN-boxed undefined / null / bool / number. Prefer
+    /// `Value::Undefined` / `Value::Bool` / `Value::Number` constructors
+    /// over matching this arm.
+    Imm(Immediate),
     String(JsString),
     Array(Rc<RefCell<ArrayStorage>>),
     Object(Rc<RefCell<crate::JsObject>>),
     Function(JsFunction),
+}
+
+impl Default for Value {
+    #[inline]
+    fn default() -> Self {
+        Value::Undefined
+    }
+}
+
+/// Copy tagged word for JS immediates (NaN-box).
+///
+/// Encoding (`u64` bits, `#[repr(transparent)]` so `transmute` to/from
+/// `u64` is the identity):
+///
+/// - **Number:** IEEE-754 bits. Every NaN is canonicalized to
+///   `0x7FF8_0000_0000_0000` so payloads never collide with tags.
+/// - **Tagged** quiet-NaN with low-3-bit payload `QNAN | tag`:
+///   - `1` undefined
+///   - `2` null
+///   - `3` false
+///   - `4` true
+///
+/// Heap pointers are **not** in this word yet (remaining `Value` enum).
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct Immediate(u64);
+
+impl Immediate {
+    const QNAN: u64 = 0x7FF8_0000_0000_0000;
+    const TAG_NAN: u64 = 0;
+    const TAG_UNDEF: u64 = 1;
+    const TAG_NULL: u64 = 2;
+    const TAG_FALSE: u64 = 3;
+    const TAG_TRUE: u64 = 4;
+
+    pub const UNDEFINED: Self = Self(Self::QNAN | Self::TAG_UNDEF);
+    pub const NULL: Self = Self(Self::QNAN | Self::TAG_NULL);
+
+    #[inline]
+    pub const fn from_bool(b: bool) -> Self {
+        if b {
+            Self(Self::QNAN | Self::TAG_TRUE)
+        } else {
+            Self(Self::QNAN | Self::TAG_FALSE)
+        }
+    }
+
+    #[inline]
+    pub fn from_number(n: f64) -> Self {
+        if n.is_nan() {
+            Self(Self::QNAN | Self::TAG_NAN)
+        } else {
+            Self(n.to_bits())
+        }
+    }
+
+    /// Raw tagged bits. Documented transmute target.
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    #[inline]
+    const fn is_tagged(self) -> bool {
+        (self.0 & Self::QNAN) == Self::QNAN
+    }
+
+    #[inline]
+    const fn tag(self) -> u64 {
+        self.0 & 7
+    }
+
+    #[inline]
+    pub const fn is_undefined(self) -> bool {
+        self.0 == Self::UNDEFINED.0
+    }
+
+    #[inline]
+    pub const fn is_null(self) -> bool {
+        self.0 == Self::NULL.0
+    }
+
+    #[inline]
+    pub const fn is_bool(self) -> bool {
+        self.is_tagged() && (self.tag() == Self::TAG_FALSE || self.tag() == Self::TAG_TRUE)
+    }
+
+    #[inline]
+    pub const fn is_number(self) -> bool {
+        !self.is_tagged() || self.tag() == Self::TAG_NAN
+    }
+
+    #[inline]
+    pub const fn as_bool(self) -> Option<bool> {
+        if !self.is_tagged() {
+            return None;
+        }
+        match self.tag() {
+            Self::TAG_FALSE => Some(false),
+            Self::TAG_TRUE => Some(true),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_number(self) -> Option<f64> {
+        if self.is_number() {
+            Some(f64::from_bits(self.0))
+        } else {
+            None
+        }
+    }
+}
+
+impl PartialEq for Immediate {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.as_number(), other.as_number()) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => self.0 == other.0,
+            _ => false,
+        }
+    }
+}
+
+impl Value {
+    /// Unit-like constructor kept so AOT / host code can write `Value::Undefined`.
+    #[allow(non_upper_case_globals)]
+    pub const Undefined: Value = Value::Imm(Immediate::UNDEFINED);
+    /// Unit-like constructor kept so AOT / host code can write `Value::Null`.
+    #[allow(non_upper_case_globals)]
+    pub const Null: Value = Value::Imm(Immediate::NULL);
+
+    /// Tuple-like constructor kept so AOT can write `Value::Bool(self.bool_regs[i])`.
+    #[allow(non_snake_case)]
+    #[inline]
+    pub const fn Bool(b: bool) -> Self {
+        Value::Imm(Immediate::from_bool(b))
+    }
+
+    /// Tuple-like constructor kept so AOT can write `Value::Number(self.num_regs[i])`.
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn Number(n: f64) -> Self {
+        Value::Imm(Immediate::from_number(n))
+    }
+
+    #[inline]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Imm(imm) => imm.as_bool(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Value::Imm(imm) => imm.as_number(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_immediate(&self) -> Option<Immediate> {
+        match self {
+            Value::Imm(imm) => Some(*imm),
+            _ => None,
+        }
+    }
 }
 
 /// Shared backing storage for [`Value::Array`].
@@ -146,6 +323,35 @@ where
 impl fmt::Debug for ArrayStorage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.values.fmt(formatter)
+    }
+}
+
+/// View of a [`Value`] with the historical variant names. Used internally
+/// so match sites can stay exhaustive without NaN-box tag tests.
+pub(crate) enum ValueUnpack<'a> {
+    Undefined,
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(&'a JsString),
+    Array(&'a Rc<RefCell<ArrayStorage>>),
+    Object(&'a Rc<RefCell<crate::JsObject>>),
+    Function(&'a JsFunction),
+}
+
+impl Value {
+    #[inline]
+    pub(crate) fn unpack(&self) -> ValueUnpack<'_> {
+        match self {
+            Value::Imm(imm) if imm.is_undefined() => ValueUnpack::Undefined,
+            Value::Imm(imm) if imm.is_null() => ValueUnpack::Null,
+            Value::Imm(imm) if imm.is_bool() => ValueUnpack::Bool(imm.as_bool().unwrap_or(false)),
+            Value::Imm(imm) => ValueUnpack::Number(imm.as_number().unwrap_or(f64::NAN)),
+            Value::String(s) => ValueUnpack::String(s),
+            Value::Array(a) => ValueUnpack::Array(a),
+            Value::Object(o) => ValueUnpack::Object(o),
+            Value::Function(f) => ValueUnpack::Function(f),
+        }
     }
 }
 
@@ -265,9 +471,7 @@ impl Iterator for ValueIterator {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
-            (Value::Bool(left), Value::Bool(right)) => left == right,
-            (Value::Number(left), Value::Number(right)) => left == right,
+            (Value::Imm(left), Value::Imm(right)) => left == right,
             (Value::String(left), Value::String(right)) => left == right,
             (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
             (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
@@ -408,14 +612,14 @@ impl Value {
             value.to_string().hash(&mut hasher);
             return hasher.finish();
         }
-        match self {
-            Value::Undefined => 0_u8.hash(&mut hasher),
-            Value::Null => 1_u8.hash(&mut hasher),
-            Value::Bool(value) => {
+        match self.unpack() {
+            ValueUnpack::Undefined => 0_u8.hash(&mut hasher),
+            ValueUnpack::Null => 1_u8.hash(&mut hasher),
+            ValueUnpack::Bool(value) => {
                 2_u8.hash(&mut hasher);
                 value.hash(&mut hasher);
             }
-            Value::Number(value) => {
+            ValueUnpack::Number(value) => {
                 3_u8.hash(&mut hasher);
                 if value.is_nan() {
                     u64::MAX.hash(&mut hasher);
@@ -423,19 +627,19 @@ impl Value {
                     value.to_bits().hash(&mut hasher);
                 }
             }
-            Value::String(value) => {
+            ValueUnpack::String(value) => {
                 4_u8.hash(&mut hasher);
                 value.hash(&mut hasher);
             }
-            Value::Array(value) => {
+            ValueUnpack::Array(value) => {
                 5_u8.hash(&mut hasher);
                 (Rc::as_ptr(value) as usize).hash(&mut hasher);
             }
-            Value::Object(value) => {
+            ValueUnpack::Object(value) => {
                 6_u8.hash(&mut hasher);
                 (Rc::as_ptr(value) as usize).hash(&mut hasher);
             }
-            Value::Function(value) => {
+            ValueUnpack::Function(value) => {
                 7_u8.hash(&mut hasher);
                 value.identity().hash(&mut hasher);
             }
@@ -448,15 +652,15 @@ impl Value {
         if crate::bigint::get(self).is_some() {
             return "bigint";
         }
-        match self {
-            Value::Undefined => "undefined",
-            Value::Null => "object",
-            Value::Bool(_) => "boolean",
-            Value::Number(_) => "number",
-            Value::String(value) if value.starts_with("__w3cos_symbol_") => "symbol",
-            Value::String(_) => "string",
-            Value::Array(_) | Value::Object(_) => "object",
-            Value::Function(_) => "function",
+        match self.unpack() {
+            ValueUnpack::Undefined => "undefined",
+            ValueUnpack::Null => "object",
+            ValueUnpack::Bool(_) => "boolean",
+            ValueUnpack::Number(_) => "number",
+            ValueUnpack::String(value) if value.starts_with("__w3cos_symbol_") => "symbol",
+            ValueUnpack::String(_) => "string",
+            ValueUnpack::Array(_) | ValueUnpack::Object(_) => "object",
+            ValueUnpack::Function(_) => "function",
         }
     }
 
@@ -465,12 +669,12 @@ impl Value {
         if let Some(zero) = crate::bigint::is_zero(self) {
             return !zero;
         }
-        match self {
-            Value::Undefined | Value::Null => false,
-            Value::Bool(b) => *b,
-            Value::Number(n) => *n != 0.0 && !n.is_nan(),
-            Value::String(s) => !s.is_empty(),
-            Value::Array(_) | Value::Object(_) | Value::Function(_) => true,
+        match self.unpack() {
+            ValueUnpack::Undefined | ValueUnpack::Null => false,
+            ValueUnpack::Bool(b) => b,
+            ValueUnpack::Number(n) => n != 0.0 && !n.is_nan(),
+            ValueUnpack::String(s) => !s.is_empty(),
+            ValueUnpack::Array(_) | ValueUnpack::Object(_) | ValueUnpack::Function(_) => true,
         }
     }
 
@@ -485,18 +689,18 @@ impl Value {
                 }
             });
         }
-        match self {
-            Value::Undefined => f64::NAN,
-            Value::Null => 0.0,
-            Value::Bool(b) => {
-                if *b {
+        match self.unpack() {
+            ValueUnpack::Undefined => f64::NAN,
+            ValueUnpack::Null => 0.0,
+            ValueUnpack::Bool(b) => {
+                if b {
                     1.0
                 } else {
                     0.0
                 }
             }
-            Value::Number(n) => *n,
-            Value::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
+            ValueUnpack::Number(n) => n,
+            ValueUnpack::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
             _ => f64::NAN,
         }
     }
@@ -506,29 +710,29 @@ impl Value {
         if let Some(value) = crate::bigint::get(self) {
             return value.to_string();
         }
-        match self {
-            Value::Undefined => "undefined".into(),
-            Value::Null => "null".into(),
-            Value::Bool(b) => b.to_string(),
-            Value::Number(n) => {
+        match self.unpack() {
+            ValueUnpack::Undefined => "undefined".into(),
+            ValueUnpack::Null => "null".into(),
+            ValueUnpack::Bool(b) => b.to_string(),
+            ValueUnpack::Number(n) => {
                 if n.is_nan() {
                     "NaN".into()
                 } else if n.is_infinite() {
-                    if *n > 0.0 {
+                    if n > 0.0 {
                         "Infinity".into()
                     } else {
                         "-Infinity".into()
                     }
-                } else if *n == 0.0 {
+                } else if n == 0.0 {
                     "0".into()
                 } else if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
-                    format!("{}", *n as i64)
+                    format!("{}", n as i64)
                 } else {
                     format!("{}", n)
                 }
             }
-            Value::String(s) => s.as_str().to_string(),
-            Value::Array(arr) => {
+            ValueUnpack::String(s) => s.as_str().to_string(),
+            ValueUnpack::Array(arr) => {
                 let elems: Vec<String> = arr
                     .borrow()
                     .iter()
@@ -542,7 +746,7 @@ impl Value {
                     .collect();
                 elems.join(",")
             }
-            Value::Object(_) => {
+            ValueUnpack::Object(_) => {
                 let to_string = self.get_property("toString");
                 if to_string.is_function()
                     && let Value::String(value) = to_string.call(self.clone(), vec![])
@@ -551,7 +755,7 @@ impl Value {
                 }
                 "[object Object]".into()
             }
-            Value::Function(function) => {
+            ValueUnpack::Function(function) => {
                 let to_string = function.get_property("toString");
                 if matches!(to_string, Value::Function(_) | Value::Object(_)) {
                     if let Value::String(value) = to_string.call(self.clone(), vec![]) {
@@ -564,23 +768,23 @@ impl Value {
     }
 
     pub fn is_undefined(&self) -> bool {
-        matches!(self, Value::Undefined)
+        matches!(self, Value::Imm(imm) if imm.is_undefined())
     }
     pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        matches!(self, Value::Imm(imm) if imm.is_null())
     }
     pub fn is_nullish(&self) -> bool {
-        matches!(self, Value::Undefined | Value::Null)
+        matches!(self, Value::Imm(imm) if imm.is_undefined() || imm.is_null())
     }
 
     pub fn is_number(&self) -> bool {
-        matches!(self, Value::Number(_))
+        matches!(self, Value::Imm(imm) if imm.is_number())
     }
     pub fn is_string(&self) -> bool {
         matches!(self, Value::String(_))
     }
     pub fn is_bool(&self) -> bool {
-        matches!(self, Value::Bool(_))
+        matches!(self, Value::Imm(imm) if imm.is_bool())
     }
     pub fn is_object(&self) -> bool {
         matches!(self, Value::Object(_)) && crate::bigint::get(self).is_none()
@@ -2110,14 +2314,11 @@ impl Value {
             return equal;
         }
         match (self, other) {
-            (Value::Undefined, Value::Undefined) => true,
-            (Value::Null, Value::Null) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => {
-                if a.is_nan() || b.is_nan() {
-                    false
-                } else {
-                    a == b
+            (Value::Imm(a), Value::Imm(b)) => {
+                match (a.as_number(), b.as_number()) {
+                    (Some(x), Some(y)) => x == y, // NaN !== NaN
+                    (None, None) => a == b,
+                    _ => false,
                 }
             }
             (Value::String(a), Value::String(b)) => a == b,
@@ -2137,11 +2338,11 @@ impl Value {
             return equal;
         }
         match (self, other) {
-            (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            // f64 `==` already identifies -0.0 with +0.0 (SameValueZero
-            // agrees); NaN needs the explicit special-case.
-            (Value::Number(a), Value::Number(b)) => a == b || (a.is_nan() && b.is_nan()),
+            (Value::Imm(a), Value::Imm(b)) => match (a.as_number(), b.as_number()) {
+                (Some(x), Some(y)) => x == y || (x.is_nan() && y.is_nan()),
+                (None, None) => a == b,
+                _ => false,
+            },
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
@@ -2152,19 +2353,25 @@ impl Value {
 
     /// ECMAScript `==` (abstract equality — simplified).
     pub fn abstract_eq(&self, other: &Value) -> bool {
-        if std::mem::discriminant(self) == std::mem::discriminant(other) {
-            return self.strict_eq(other);
-        }
-        match (self, other) {
-            (Value::Null, Value::Undefined) | (Value::Undefined, Value::Null) => true,
-            (Value::Number(_), Value::String(_)) => {
+        match (self.unpack(), other.unpack()) {
+            (ValueUnpack::Undefined, ValueUnpack::Undefined)
+            | (ValueUnpack::Null, ValueUnpack::Null)
+            | (ValueUnpack::Bool(_), ValueUnpack::Bool(_))
+            | (ValueUnpack::Number(_), ValueUnpack::Number(_))
+            | (ValueUnpack::String(_), ValueUnpack::String(_))
+            | (ValueUnpack::Array(_), ValueUnpack::Array(_))
+            | (ValueUnpack::Object(_), ValueUnpack::Object(_))
+            | (ValueUnpack::Function(_), ValueUnpack::Function(_)) => self.strict_eq(other),
+            (ValueUnpack::Null, ValueUnpack::Undefined)
+            | (ValueUnpack::Undefined, ValueUnpack::Null) => true,
+            (ValueUnpack::Number(_), ValueUnpack::String(_)) => {
                 self.strict_eq(&Value::Number(other.to_number()))
             }
-            (Value::String(_), Value::Number(_)) => {
+            (ValueUnpack::String(_), ValueUnpack::Number(_)) => {
                 Value::Number(self.to_number()).strict_eq(other)
             }
-            (Value::Bool(_), _) => Value::Number(self.to_number()).abstract_eq(other),
-            (_, Value::Bool(_)) => self.abstract_eq(&Value::Number(other.to_number())),
+            (ValueUnpack::Bool(_), _) => Value::Number(self.to_number()).abstract_eq(other),
+            (_, ValueUnpack::Bool(_)) => self.abstract_eq(&Value::Number(other.to_number())),
             _ => false,
         }
     }
@@ -2224,15 +2431,15 @@ impl fmt::Display for Value {
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Undefined => write!(f, "undefined"),
-            Value::Null => write!(f, "null"),
-            Value::Bool(b) => write!(f, "{b}"),
-            Value::Number(n) => write!(f, "{n}"),
-            Value::String(s) => write!(f, "{s:?}"),
-            Value::Array(arr) => write!(f, "{:?}", arr.borrow()),
-            Value::Object(_) => write!(f, "{{...}}"),
-            Value::Function(_) => write!(f, "[Function]"),
+        match self.unpack() {
+            ValueUnpack::Undefined => write!(f, "undefined"),
+            ValueUnpack::Null => write!(f, "null"),
+            ValueUnpack::Bool(b) => write!(f, "{b}"),
+            ValueUnpack::Number(n) => write!(f, "{n}"),
+            ValueUnpack::String(s) => write!(f, "{s:?}"),
+            ValueUnpack::Array(arr) => write!(f, "{:?}", arr.borrow()),
+            ValueUnpack::Object(_) => write!(f, "{{...}}"),
+            ValueUnpack::Function(_) => write!(f, "[Function]"),
         }
     }
 }
@@ -2320,6 +2527,68 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_copy<T: Copy>(value: T) -> T {
+        value
+    }
+
+    /// Immediates are a Copy tagged word: clone is a register move, no `Rc`,
+    /// no allocation. Heap strings/arrays/objects/functions stay as pointers.
+    #[test]
+    fn immediates_are_copy_tagged_words_without_allocation() {
+        assert_eq!(std::mem::size_of::<Immediate>(), 8);
+        assert!(!std::mem::needs_drop::<Immediate>());
+        let undef = assert_copy(Immediate::UNDEFINED);
+        let null = assert_copy(Immediate::NULL);
+        let flag = assert_copy(Immediate::from_bool(true));
+        let num = assert_copy(Immediate::from_number(42.0));
+        let nan = assert_copy(Immediate::from_number(f64::NAN));
+        assert!(undef.is_undefined());
+        assert!(null.is_null());
+        assert_eq!(flag.as_bool(), Some(true));
+        assert_eq!(num.as_number(), Some(42.0));
+        assert!(nan.as_number().unwrap().is_nan());
+        // Payload NaNs collapse to the canonical quiet-NaN so tags stay unique.
+        assert_eq!(
+            nan.bits(),
+            Immediate::from_number(f64::from_bits(0x7FF8_0000_0000_0001)).bits()
+        );
+
+        let a = Value::Undefined;
+        let b = a.clone();
+        assert!(b.is_undefined());
+        // Clone of an immediate Value does not allocate: the Imm arm is Copy.
+        match a {
+            Value::Imm(word) => {
+                let copied = assert_copy(word);
+                assert!(copied.is_undefined());
+            }
+            _ => panic!("undefined must be the tagged immediate word"),
+        }
+        match Value::Bool(false) {
+            Value::Imm(word) => assert_eq!(assert_copy(word).as_bool(), Some(false)),
+            _ => panic!("bool must be the tagged immediate word"),
+        }
+        match Value::Number(-0.0) {
+            Value::Imm(word) => assert_eq!(
+                assert_copy(word).as_number().unwrap().to_bits(),
+                (-0.0_f64).to_bits()
+            ),
+            _ => panic!("number must be the tagged immediate word"),
+        }
+        assert!(
+            Value::String(JsString::intern("heap-or-intern"))
+                .as_immediate()
+                .is_none()
+        );
+        assert!(Value::array(vec![]).as_immediate().is_none());
+        assert!(Value::object(HashMap::new()).as_immediate().is_none());
+        assert!(
+            Value::function(|_, _| Value::Undefined)
+                .as_immediate()
+                .is_none()
+        );
+    }
 
     #[test]
     fn type_coercion() {

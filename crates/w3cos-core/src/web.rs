@@ -220,7 +220,7 @@ fn blob_state(value: &Value) -> Option<Rc<BlobState>> {
     let Value::Object(object) = value else {
         return None;
     };
-    let Value::Number(id) = object.borrow().get_direct(BLOB_STATE_KEY) else {
+    let Some(id) = object.borrow().get_direct(BLOB_STATE_KEY).as_number() else {
         return None;
     };
     BLOBS.with(|states| states.borrow().get(&(id as u64)).cloned())
@@ -855,17 +855,17 @@ fn canonical_locale(value: Option<&Value>) -> String {
 
 fn string_option(options: &Value, key: &str) -> Option<String> {
     let value = options.get_property(key);
-    (!matches!(value, Value::Undefined | Value::Null)).then(|| value.to_js_string())
+    (!value.is_nullish()).then(|| value.to_js_string())
 }
 
 fn usize_option(options: &Value, key: &str) -> Option<usize> {
     let value = options.get_property(key);
-    (!matches!(value, Value::Undefined | Value::Null)).then(|| value.to_number().max(0.0) as usize)
+    (!value.is_nullish()).then(|| value.to_number().max(0.0) as usize)
 }
 
 fn bool_option(options: &Value, key: &str) -> Option<bool> {
     let value = options.get_property(key);
-    (!matches!(value, Value::Undefined | Value::Null)).then(|| value.to_bool())
+    (!value.is_nullish()).then(|| value.to_bool())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2411,7 +2411,7 @@ fn params_value(
 pub fn url_search_params_new(args: Vec<Value>) -> Value {
     let init = args.first().cloned().unwrap_or(Value::Undefined);
     let pairs = match &init {
-        Value::Undefined | Value::Null => Vec::new(),
+        _ if init.is_nullish() => Vec::new(),
         Value::String(query) => parse_query(query),
         Value::Array(items) => items
             .borrow()

@@ -387,7 +387,7 @@ impl JsObject {
                 self.prototype = Some(obj.clone());
                 true
             }
-            Value::Null => {
+            _ if proto.is_null() => {
                 self.prototype = None;
                 true
             }

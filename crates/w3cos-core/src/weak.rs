@@ -94,10 +94,10 @@ fn next_id() -> u64 {
 }
 
 fn state_id(value: &Value) -> Option<u64> {
-    match value.get_property(STATE_KEY) {
-        Value::Number(id) => Some(id as u64),
-        _ => None,
-    }
+    value
+        .get_property(STATE_KEY)
+        .as_number()
+        .map(|id| id as u64)
 }
 
 fn instance(proto: &Value) -> Value {

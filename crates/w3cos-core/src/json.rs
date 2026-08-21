@@ -100,10 +100,13 @@ fn walk_reviver(reviver: &Value, key: &str, value: Value) -> Value {
 pub fn stringify(args: Vec<Value>) -> Value {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let replacer = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let gap = match args.get(2).cloned().unwrap_or(Value::Undefined) {
-        Value::Number(n) => " ".repeat((n.max(0.0) as usize).min(10)),
-        Value::String(s) => s.chars().take(10).collect(),
-        _ => String::new(),
+    let gap_value = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let gap = if let Some(n) = gap_value.as_number() {
+        " ".repeat((n.max(0.0) as usize).min(10))
+    } else if let Value::String(s) = &gap_value {
+        s.chars().take(10).collect()
+    } else {
+        String::new()
     };
     let mut context = SerializeContext {
         replacer,
@@ -154,13 +157,13 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
     } else {
         value.clone()
     };
-    match &value {
-        Value::Undefined | Value::Function(_) => None,
-        Value::Null => Some("null".to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Number(n) => Some(serialize_number(*n)),
-        Value::String(s) => Some(serialize_string(s)),
-        Value::Array(items) => {
+    match value.unpack() {
+        crate::value::ValueUnpack::Undefined | crate::value::ValueUnpack::Function(_) => None,
+        crate::value::ValueUnpack::Null => Some("null".to_string()),
+        crate::value::ValueUnpack::Bool(b) => Some(b.to_string()),
+        crate::value::ValueUnpack::Number(n) => Some(serialize_number(n)),
+        crate::value::ValueUnpack::String(s) => Some(serialize_string(s)),
+        crate::value::ValueUnpack::Array(items) => {
             let pointer = Rc::as_ptr(items) as usize;
             context.enter(pointer);
             // Children serialize with the deeper indent already applied so
@@ -180,7 +183,7 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
             context.leave(pointer);
             Some(render_container('[', ']', &parts, &inner, &outer))
         }
-        Value::Object(object) => {
+        crate::value::ValueUnpack::Object(object) => {
             let pointer = Rc::as_ptr(object) as usize;
             context.enter(pointer);
             let whitelist: Option<Vec<String>> = match &context.replacer {
