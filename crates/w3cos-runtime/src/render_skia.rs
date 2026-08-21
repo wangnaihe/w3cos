@@ -16,13 +16,14 @@ use skia_safe::{
 };
 use w3cos_std::SvgPathCommand;
 use w3cos_std::component::ComponentKind;
-use w3cos_std::style::{JustifyContent, Style, TextAlign};
+use w3cos_std::style::{JustifyContent, Style, TextAlign, Transform2D};
 
 use crate::filter::{FilterChain, FilterOp, parse_css_filter};
 use crate::layout::LayoutRect;
 use crate::paint_artifact::PaintArtifact;
 use crate::retained_layers::{
-    CompositorOverrides, LayerPaintAction, RetainedLayerTree, layer_scroll_translation,
+    CompositorOverrides, LayerPaintAction, RetainedLayerTree, layer_css_transform,
+    layer_opacity as compositor_layer_opacity, layer_scroll_translation,
 };
 use crate::text_layout;
 
@@ -142,13 +143,29 @@ pub(crate) struct ReplayFrame<'a> {
     pub artifact: Option<&'a PaintArtifact>,
     pub retained: Option<&'a mut RetainedSkiaCache>,
     pub compositor_overrides: Option<&'a CompositorOverrides>,
+    pub scale_factor: f32,
 }
 
 #[derive(Default)]
 pub struct RetainedSkiaCache {
     tree: RetainedLayerTree,
     pictures: Vec<Picture>,
-    last_prop_key: u64,
+}
+
+impl RetainedSkiaCache {
+    pub fn invalidate_recordings(&mut self) {
+        self.tree.invalidate_recordings();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_scene_rebuilds(&self) -> u64 {
+        self.tree.full_scene_rebuilds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compositor_replays(&self) -> u64 {
+        self.tree.compositor_replays
+    }
 }
 
 pub struct SkiaRasterizer {
@@ -182,6 +199,20 @@ impl SkiaRasterizer {
         })
     }
 
+    pub fn invalidate_recordings(&mut self) {
+        self.retained.invalidate_recordings();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_rebuilds(&self) -> u64 {
+        self.retained.full_scene_rebuilds()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_replays(&self) -> u64 {
+        self.retained.compositor_replays()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &mut self,
@@ -194,6 +225,8 @@ impl SkiaRasterizer {
         focused_index: Option<usize>,
         background: w3cos_std::color::Color,
         artifact: Option<&PaintArtifact>,
+        compositor_overrides: Option<&CompositorOverrides>,
+        scale_factor: f32,
     ) -> Option<&[u8]> {
         self.ensure_surface(width, height)?;
         let surface = self.surface.as_mut()?;
@@ -209,7 +242,8 @@ impl SkiaRasterizer {
                 background,
                 artifact,
                 retained: Some(&mut self.retained),
-                compositor_overrides: None,
+                compositor_overrides,
+                scale_factor,
             },
         );
         let expected = width as usize * height as usize * 4;
@@ -237,33 +271,20 @@ impl SkiaRasterizer {
     }
 }
 
-fn skia_prop_key(artifact: &PaintArtifact, overrides: &CompositorOverrides) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for effect in &artifact.properties.effects {
-        effect.opacity.to_bits().hash(&mut hasher);
+fn paint_display_list(
+    canvas: &Canvas,
+    typeface: &Typeface,
+    frame: ReplayFrame<'_>,
+    bake_compositor_props: bool,
+) {
+    // Layer recordings must not bake a background clear; composite applies
+    // the canvas background, then opacity / transform / scroll.
+    if bake_compositor_props {
+        canvas.clear(to_skia_color(frame.background, 1.0));
     }
-    for transform in &artifact.properties.transforms {
-        transform.transform.translate_x.to_bits().hash(&mut hasher);
-        transform.transform.translate_y.to_bits().hash(&mut hasher);
-        transform.transform.scale_x.to_bits().hash(&mut hasher);
-        transform.transform.scale_y.to_bits().hash(&mut hasher);
-        transform.transform.rotate_deg.to_bits().hash(&mut hasher);
-    }
-    let mut opacity: Vec<_> = overrides.opacity.iter().collect();
-    opacity.sort_by_key(|(id, _)| *id);
-    for (id, value) in opacity {
-        id.hash(&mut hasher);
-        value.to_bits().hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-fn paint_display_list(canvas: &Canvas, typeface: &Typeface, frame: ReplayFrame<'_>) {
-    canvas.clear(to_skia_color(frame.background, 1.0));
     let mut active_filters = Vec::new();
     for &(idx, rect, kind, style) in frame.nodes {
-        let filter_path = effect_path(frame.artifact, idx);
+        let filter_path = effect_path(frame.artifact, idx, bake_compositor_props);
         let common = active_filters
             .iter()
             .zip(&filter_path)
@@ -281,7 +302,9 @@ fn paint_display_list(canvas: &Canvas, typeface: &Typeface, frame: ReplayFrame<'
                 continue;
             };
             let mut paint = Paint::default();
-            paint.set_alpha_f(effect.opacity.clamp(0.0, 1.0));
+            if bake_compositor_props {
+                paint.set_alpha_f(effect.opacity.clamp(0.0, 1.0));
+            }
             if let Some(filter) = effect
                 .filter
                 .as_deref()
@@ -345,6 +368,7 @@ fn paint_display_list(canvas: &Canvas, typeface: &Typeface, frame: ReplayFrame<'
             frame.metrics_font,
             frame.text_input_values.get(&idx).map(String::as_str),
             frame.focused_index == Some(idx),
+            bake_compositor_props,
         );
         if matches!(local_filter, Some(Some(_))) {
             canvas.restore();
@@ -359,6 +383,11 @@ fn paint_display_list(canvas: &Canvas, typeface: &Typeface, frame: ReplayFrame<'
 pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: ReplayFrame<'_>) {
     let retained = frame.retained.take();
     let overrides = frame.compositor_overrides;
+    let scale_factor = if frame.scale_factor > 0.0 {
+        frame.scale_factor
+    } else {
+        1.0
+    };
     if let (Some(artifact), Some(cache)) = (frame.artifact, retained) {
         let mut scrolls = HashMap::new();
         for (idx, info) in frame.scroll_info.iter().enumerate() {
@@ -369,13 +398,9 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         let default_overrides = CompositorOverrides::default();
         let overrides = overrides.unwrap_or(&default_overrides);
         let action = cache.tree.sync(artifact, &scrolls, overrides);
-        let prop_key = skia_prop_key(artifact, overrides);
-        let props_unchanged = prop_key == cache.last_prop_key;
-        cache.last_prop_key = prop_key;
         let can_replay = matches!(action, LayerPaintAction::Replay)
             && cache.tree.recordings_valid()
-            && cache.pictures.len() == cache.tree.layers.len()
-            && props_unchanged;
+            && cache.pictures.len() == cache.tree.layers.len();
         if can_replay {
             cache.tree.note_replay();
             crate::perf::record_paint_path("retained-layer-replay");
@@ -387,6 +412,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 frame.scroll_info,
                 overrides,
                 frame.background,
+                scale_factor,
             );
             return;
         }
@@ -400,10 +426,10 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 .collect();
             let mut recorder = PictureRecorder::new();
             let bounds = Rect::new(
-                layer.bounds.x - 64.0,
-                layer.bounds.y - 64.0,
-                layer.bounds.x + layer.bounds.width + 64.0,
-                layer.bounds.y + layer.bounds.height + 64.0,
+                layer.bounds.x * scale_factor - 64.0,
+                layer.bounds.y * scale_factor - 64.0,
+                (layer.bounds.x + layer.bounds.width) * scale_factor + 64.0,
+                (layer.bounds.y + layer.bounds.height) * scale_factor + 64.0,
             );
             let recording = recorder.begin_recording(bounds, false);
             paint_display_list(
@@ -419,7 +445,9 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                     artifact: Some(artifact),
                     retained: None,
                     compositor_overrides: None,
+                    scale_factor,
                 },
+                false,
             );
             if let Some(picture) = recorder.finish_recording_as_picture(None) {
                 pictures.push(picture);
@@ -436,30 +464,65 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             frame.scroll_info,
             overrides,
             frame.background,
+            scale_factor,
         );
         return;
     }
-    paint_display_list(canvas, typeface, frame);
+    paint_display_list(canvas, typeface, frame, true);
+}
+
+fn compositor_layer_matrix(
+    layer: &crate::retained_layers::CompositorLayer,
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    scale_factor: f32,
+) -> Matrix {
+    let (scroll_x, scroll_y, _) = layer_scroll_translation(layer, scroll_info);
+    let css = layer_css_transform(layer, artifact, overrides);
+    let mut matrix = Matrix::new_identity();
+    if !css.is_identity() {
+        let origin = (layer.bounds.x * scale_factor, layer.bounds.y * scale_factor);
+        matrix.post_translate((-origin.0, -origin.1));
+        if (css.scale_x - 1.0).abs() > f32::EPSILON || (css.scale_y - 1.0).abs() > f32::EPSILON {
+            matrix.post_scale((css.scale_x, css.scale_y), None);
+        }
+        if css.rotate_deg.abs() > f32::EPSILON {
+            matrix.post_rotate(css.rotate_deg, None);
+        }
+        matrix.post_translate((
+            origin.0 + css.translate_x * scale_factor,
+            origin.1 + css.translate_y * scale_factor,
+        ));
+    }
+    matrix.post_translate((scroll_x, scroll_y));
+    matrix
 }
 
 fn composite_skia_layers(
     canvas: &Canvas,
     pictures: &[Picture],
     layers: &[crate::retained_layers::CompositorLayer],
-    _artifact: &PaintArtifact,
+    artifact: &PaintArtifact,
     scroll_info: &[Option<(f32, f32, LayoutRect)>],
-    _overrides: &CompositorOverrides,
+    overrides: &CompositorOverrides,
     background: w3cos_std::color::Color,
+    scale_factor: f32,
 ) {
     canvas.clear(to_skia_color(background, 1.0));
     for (layer, picture) in layers.iter().zip(pictures) {
-        let (tx, ty, clip) = layer_scroll_translation(layer, scroll_info);
+        let (_, _, clip) = layer_scroll_translation(layer, scroll_info);
+        let matrix = compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale_factor);
+        let opacity = compositor_layer_opacity(layer, artifact, overrides);
         let save = canvas.save();
         if let Some(clip_rect) = clip {
             canvas.clip_rect(to_rect(clip_rect), None, Some(false));
         }
-        let mut matrix = Matrix::new_identity();
-        matrix.post_translate((tx, ty));
+        if opacity < 0.999 {
+            let mut paint = Paint::default();
+            paint.set_alpha_f(opacity);
+            canvas.save_layer(&SaveLayerRec::default().paint(&paint));
+        }
         canvas.draw_picture(picture, Some(&matrix), None);
         canvas.restore_to_count(save);
     }
@@ -527,6 +590,10 @@ impl SkiaMetalPresenter {
         })
     }
 
+    pub fn invalidate_recordings(&mut self) {
+        self.retained.invalidate_recordings();
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &mut self,
@@ -539,6 +606,8 @@ impl SkiaMetalPresenter {
         focused_index: Option<usize>,
         background: w3cos_std::color::Color,
         artifact: Option<&PaintArtifact>,
+        compositor_overrides: Option<&CompositorOverrides>,
+        scale_factor: f32,
     ) -> bool {
         use objc2_06::rc::Retained;
         use objc2_06::runtime::ProtocolObject;
@@ -580,7 +649,8 @@ impl SkiaMetalPresenter {
                     background,
                     artifact,
                     retained: Some(&mut self.retained),
-                    compositor_overrides: None,
+                    compositor_overrides,
+                    scale_factor,
                 },
             );
             self.context.flush_and_submit();
@@ -609,8 +679,13 @@ fn render_node(
     metrics_font: &fontdue::Font,
     text_input_value: Option<&str>,
     focused: bool,
+    bake_compositor_props: bool,
 ) {
-    let transform = style.transform;
+    let transform = if bake_compositor_props {
+        style.transform
+    } else {
+        Transform2D::IDENTITY
+    };
     let rect = LayoutRect {
         x: rect.x + transform.translate_x,
         y: rect.y + transform.translate_y,
@@ -876,7 +951,11 @@ fn draw_svg_path(
     }
 }
 
-fn effect_path(artifact: Option<&PaintArtifact>, client_index: usize) -> Vec<usize> {
+fn effect_path(
+    artifact: Option<&PaintArtifact>,
+    client_index: usize,
+    bake_compositor_props: bool,
+) -> Vec<usize> {
     let Some(artifact) = artifact else {
         return Vec::new();
     };
@@ -890,7 +969,7 @@ fn effect_path(artifact: Option<&PaintArtifact>, client_index: usize) -> Vec<usi
         let Some(effect) = artifact.properties.effects.get(current) else {
             break;
         };
-        if effect.opacity < 0.999 || effect.filter.is_some() {
+        if effect.filter.is_some() || (bake_compositor_props && effect.opacity < 0.999) {
             path.push(current);
         }
         if effect.parent == current {
@@ -1936,6 +2015,8 @@ mod tests {
                 None,
                 w3cos_std::color::Color::WHITE,
                 None,
+                None,
+                1.0,
             )
             .unwrap();
         let center = (4 * 8 + 4) * 4;
@@ -1965,6 +2046,8 @@ mod tests {
                 None,
                 w3cos_std::color::Color::WHITE,
                 None,
+                None,
+                1.0,
             )
             .unwrap();
         let pixel = &pixels[center..center + 4];
@@ -2050,6 +2133,8 @@ mod tests {
                 None,
                 w3cos_std::color::Color::WHITE,
                 Some(&artifact),
+                None,
+                1.0,
             )
             .unwrap();
         let left = &pixels[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 4];
@@ -2094,6 +2179,8 @@ mod tests {
                 None,
                 w3cos_std::color::Color::WHITE,
                 None,
+                None,
+                1.0,
             )
             .unwrap();
         assert!((pixels[0] as i16 - 10).abs() <= 2);

@@ -3851,6 +3851,8 @@ impl App {
                 )
             })
             .collect();
+        #[cfg(feature = "skia")]
+        let compositor_overrides = CompositorOverrides::from_style_map(&style_overrides);
         #[cfg(all(feature = "skia", target_os = "ios"))]
         let painted_with_skia_metal = skia_backend_requested()
             && self
@@ -3868,6 +3870,8 @@ impl App {
                         self.focused_index,
                         canvas_background,
                         Some(&self.paint_artifact),
+                        Some(&compositor_overrides),
+                        scale,
                     )
                 });
         #[cfg(not(all(feature = "skia", target_os = "ios")))]
@@ -3892,7 +3896,8 @@ impl App {
                             background: canvas_background,
                             artifact: Some(&self.paint_artifact),
                             retained: None,
-                            compositor_overrides: None,
+                            compositor_overrides: Some(&compositor_overrides),
+                            scale_factor: scale,
                         },
                     )
                 });
@@ -3918,6 +3923,8 @@ impl App {
                         self.focused_index,
                         canvas_background,
                         Some(&self.paint_artifact),
+                        Some(&compositor_overrides),
+                        scale,
                     )
                 })
                 .is_some_and(|rgba| {

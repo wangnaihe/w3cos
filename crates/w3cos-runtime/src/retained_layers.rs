@@ -145,8 +145,11 @@ pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
             .get(chunk.properties.scroll)
             .and_then(|node| node.host_index);
         let effect_owner = property_owner(artifact, |props| props.effect, chunk.properties.effect);
-        let transform_owner =
-            property_owner(artifact, |props| props.transform, chunk.properties.transform);
+        let transform_owner = property_owner(
+            artifact,
+            |props| props.transform,
+            chunk.properties.transform,
+        );
         layers.push(CompositorLayer {
             id: layers.len(),
             bounds: chunk.bounds,
@@ -176,16 +179,17 @@ fn property_owner(
         .enumerate()
         .find(|(index, props)| {
             slot(props) == id
-                && artifact.nodes.get(*index).and_then(|node| node.parent).map_or(
-                    true,
-                    |parent| {
+                && artifact
+                    .nodes
+                    .get(*index)
+                    .and_then(|node| node.parent)
+                    .map_or(true, |parent| {
                         artifact
                             .node_properties
                             .get(parent)
                             .map(|parent_props| slot(parent_props) != id)
                             .unwrap_or(true)
-                    },
-                )
+                    })
         })
         .map(|(index, _)| index)
 }
@@ -223,7 +227,12 @@ fn content_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> 
         node.parent.hash(&mut hasher);
         hash_kind(&node.kind, &mut hasher);
         hash_paint_style(&node.style, &mut hasher);
-        artifact.z_order.get(index).copied().unwrap_or(0).hash(&mut hasher);
+        artifact
+            .z_order
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .hash(&mut hasher);
         artifact.sticky_owner.get(index).copied().hash(&mut hasher);
     }
     for clip in &artifact.properties.clips {
@@ -448,7 +457,7 @@ pub fn layer_opacity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use w3cos_std::style::{Overflow, Style};
+    use w3cos_std::style::{Overflow, Style, Transform2D};
 
     use crate::paint_artifact::PaintNode;
 
@@ -605,5 +614,163 @@ mod tests {
         note(&mut tree, action);
         assert_eq!(tree.full_scene_rebuilds, 2);
         assert_eq!(tree.compositor_replays, 0);
+    }
+
+    #[cfg(feature = "skia")]
+    fn skia_nodes(artifact: &PaintArtifact) -> Vec<(usize, LayoutRect, &ComponentKind, &Style)> {
+        artifact
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, node)| {
+                let rect = artifact.rect_by_index.get(idx).copied().flatten()?;
+                Some((idx, rect, &node.kind, &node.style))
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "skia")]
+    fn paint_skia(
+        rasterizer: &mut crate::render_skia::SkiaRasterizer,
+        artifact: &PaintArtifact,
+        scroll_info: &[Option<(f32, f32, LayoutRect)>],
+        overrides: Option<&CompositorOverrides>,
+    ) -> Vec<u8> {
+        let nodes = skia_nodes(artifact);
+        let font = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf").as_slice(),
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        rasterizer
+            .render_frame(
+                8,
+                8,
+                &nodes,
+                &font,
+                scroll_info,
+                &std::collections::HashMap::new(),
+                None,
+                w3cos_std::color::Color::WHITE,
+                Some(artifact),
+                overrides,
+                1.0,
+            )
+            .unwrap()
+            .to_vec()
+    }
+
+    #[cfg(feature = "skia")]
+    fn red_layer_tree() -> PaintArtifact {
+        let mut child_style = Style::default();
+        child_style.background = w3cos_std::color::Color::rgb(255, 0, 0);
+        child_style.opacity = 0.5;
+        child_style.transform.translate_y = 1.0;
+        PaintArtifact::build(
+            [
+                PaintNode {
+                    kind: ComponentKind::Column,
+                    style: Style::default(),
+                    parent: None,
+                    sticky_counter_signal: None,
+                },
+                PaintNode {
+                    kind: ComponentKind::Box,
+                    style: child_style,
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                },
+            ],
+            &[
+                (
+                    LayoutRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 8.0,
+                        height: 8.0,
+                    },
+                    0,
+                ),
+                (
+                    LayoutRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 8.0,
+                        height: 8.0,
+                    },
+                    1,
+                ),
+            ],
+            1,
+        )
+    }
+
+    #[cfg(feature = "skia")]
+    #[test]
+    fn opacity_only_skips_skia_picture_rerecord() {
+        let artifact = red_layer_tree();
+        let mut rasterizer =
+            crate::render_skia::SkiaRasterizer::new(include_bytes!("../assets/Inter-Regular.ttf"))
+                .unwrap();
+        let first = paint_skia(&mut rasterizer, &artifact, &[], None);
+        assert_eq!(rasterizer.retained_rebuilds(), 1);
+        assert_eq!(rasterizer.retained_replays(), 0);
+
+        let mut overrides = CompositorOverrides::default();
+        overrides.opacity.insert(1, 0.2);
+        let second = paint_skia(&mut rasterizer, &artifact, &[], Some(&overrides));
+        assert_eq!(rasterizer.retained_rebuilds(), 1);
+        assert_eq!(rasterizer.retained_replays(), 1);
+        assert_ne!(first, second, "opacity replay must still change pixels");
+        let center = (4 * 8 + 4) * 4;
+        let first_px = &first[center..center + 4];
+        let second_px = &second[center..center + 4];
+        assert!(
+            second_px[1] > first_px[1] && second_px[3] == 255 && first_px[3] == 255,
+            "lower opacity over white should lighten red: first={first_px:?} second={second_px:?}"
+        );
+    }
+
+    #[cfg(feature = "skia")]
+    #[test]
+    fn transform_only_skips_skia_picture_rerecord() {
+        let artifact = red_layer_tree();
+        let mut rasterizer =
+            crate::render_skia::SkiaRasterizer::new(include_bytes!("../assets/Inter-Regular.ttf"))
+                .unwrap();
+        let first = paint_skia(&mut rasterizer, &artifact, &[], None);
+        assert_eq!(rasterizer.retained_rebuilds(), 1);
+
+        let mut overrides = CompositorOverrides::default();
+        overrides.transform.insert(
+            1,
+            Transform2D {
+                translate_y: 4.0,
+                ..Transform2D::IDENTITY
+            },
+        );
+        let second = paint_skia(&mut rasterizer, &artifact, &[], Some(&overrides));
+        assert_eq!(rasterizer.retained_rebuilds(), 1);
+        assert_eq!(rasterizer.retained_replays(), 1);
+        assert_ne!(first, second, "transform replay must still move pixels");
+        assert_eq!(&second[0..4], &[255, 255, 255, 255]);
+    }
+
+    #[cfg(feature = "skia")]
+    #[test]
+    fn scroll_only_skips_skia_picture_rerecord() {
+        let artifact = scroll_tree();
+        let mut rasterizer =
+            crate::render_skia::SkiaRasterizer::new(include_bytes!("../assets/Inter-Regular.ttf"))
+                .unwrap();
+        let clip = rect(0.0);
+        let mut scroll_info = vec![None, None, Some((0.0, 0.0, clip))];
+        paint_skia(&mut rasterizer, &artifact, &scroll_info, None);
+        assert_eq!(rasterizer.retained_rebuilds(), 1);
+
+        scroll_info[2] = Some((0.0, 48.0, clip));
+        paint_skia(&mut rasterizer, &artifact, &scroll_info, None);
+        assert_eq!(rasterizer.retained_rebuilds(), 1);
+        assert_eq!(rasterizer.retained_replays(), 1);
     }
 }
