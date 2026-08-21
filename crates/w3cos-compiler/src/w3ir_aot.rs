@@ -2890,7 +2890,7 @@ fn emit_instruction(
             )
         }
         Instruction::CreateArray { dst, elements } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::create_array(vec![{}]);",
+            "self.registers[{}] = w3cos_core::Value::array(vec![{}]);",
             register(*dst),
             elements
                 .iter()
@@ -2928,19 +2928,25 @@ fn emit_instruction(
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Instruction::CreateObject { dst, properties } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::create_object(vec![{}]);",
-            register(*dst),
-            properties
-                .iter()
-                .map(|(key, value)| format!(
-                    "({}, {})",
-                    emit_boxed_value(plan, key.0),
-                    emit_boxed_value(plan, value.0)
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        Instruction::CreateObject { dst, properties } => {
+            let object = if properties.is_empty() {
+                "w3cos_core::Value::object(std::collections::HashMap::new())".into()
+            } else {
+                format!(
+                    "w3cos_core::Value::object(std::collections::HashMap::from([{}]))",
+                    properties
+                        .iter()
+                        .map(|(key, value)| format!(
+                            "({}.to_js_string(), {})",
+                            emit_boxed_value(plan, key.0),
+                            emit_boxed_value(plan, value.0)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            format!("self.registers[{}] = {object};", register(*dst))
+        }
         Instruction::CopyDataProperties { target, source } => format!(
             "w3cos_core::intrinsics::copy_data_properties(&{}, &{});",
             emit_boxed_value(plan, target.0),
@@ -4515,6 +4521,51 @@ fn main() {{
         assert!(generated.contains("w3cos_core::intrinsics::call_with_arguments"));
         assert!(generated.contains("w3cos_core::intrinsics::call_method_with_arguments"));
         assert!(generated.contains("w3cos_core::intrinsics::construct_with_arguments"));
+        assert!(!generated.contains("w3cos_vm"));
+        assert!(!generated.contains("w3cos_ir"));
+    }
+
+    #[test]
+    fn emits_object_and_array_literals_as_arena_handles() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function build() {
+                    const object = { a: 1 };
+                    const items = [1];
+                    return [object, items];
+                }
+                build;
+            "#,
+            "app:///literal-handles-aot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("build"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "build_aot").unwrap();
+
+        assert!(
+            generated.contains("w3cos_core::Value::object"),
+            "object literals must intern through Value::object: {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::Value::array"),
+            "array literals must intern through Value::array: {generated}"
+        );
+        assert!(
+            !generated.contains("Value::Object(") && !generated.contains("Value::Array("),
+            "object/array literals must not emit Value::Object/Array(Rc::new(...)): {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::Value::object(std::collections::HashMap::new())"),
+            "empty object literals must intern via Value::object(HashMap::new()): {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::Value::array(vec!["),
+            "array literals must intern via Value::array(vec![...]): {generated}"
+        );
         assert!(!generated.contains("w3cos_vm"));
         assert!(!generated.contains("w3cos_ir"));
     }
