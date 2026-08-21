@@ -4,12 +4,12 @@
 //! Vello and tiny-skia backends. It does not perform layout or invent native
 //! widget defaults: CSS-derived geometry and style remain the source of truth.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use skia_safe::canvas::SaveLayerRec;
 use skia_safe::{
-    AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, FontStyle,
+    AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, FontStyle, Image,
     ImageFilter, ImageInfo, MaskFilter, Matrix, Paint, PathBuilder, Picture, PictureRecorder,
     RRect, Rect, Surface, TileMode, Typeface, Vector, color_filters, gradient_shader,
     image_filters, images, paint,
@@ -22,14 +22,16 @@ use crate::filter::{FilterChain, FilterOp, parse_css_filter};
 use crate::layout::LayoutRect;
 use crate::paint_artifact::PaintArtifact;
 use crate::retained_layers::{
-    layer_scroll_translation, CompositorOverrides,
-    LayerPaintAction, RetainedLayerTree,
+    CompositorOverrides, LayerPaintAction, RetainedLayerTree, layer_scroll_translation,
 };
 use crate::text_layout;
 
 const FONT_FALLBACK_CACHE_CAPACITY: usize = 2048;
 
+const IMAGE_TEXTURE_CACHE_LIMIT: usize = 256;
+
 thread_local! {
+    static SKIA_IMAGES: RefCell<HashMap<usize, Image>> = RefCell::new(HashMap::new());
     /// System font matching is comparatively expensive on Apple platforms.
     /// Cache Skia typeface references for characters missing from the primary
     /// face; this does not copy the underlying system font into application memory.
@@ -46,6 +48,61 @@ thread_local! {
             host_typeface().expect("host Skia font")
         }
     };
+    static SKIA_IMAGE_UPLOADS: Cell<u64> = const { Cell::new(0) };
+    static SKIA_IMAGE_REUSES: Cell<u64> = const { Cell::new(0) };
+}
+
+pub(crate) fn skia_image_upload_count() -> u64 {
+    SKIA_IMAGE_UPLOADS.with(Cell::get)
+}
+
+pub(crate) fn skia_image_reuse_count() -> u64 {
+    SKIA_IMAGE_REUSES.with(Cell::get)
+}
+
+pub(crate) fn reset_image_texture_stats() {
+    SKIA_IMAGE_UPLOADS.with(|count| count.set(0));
+    SKIA_IMAGE_REUSES.with(|count| count.set(0));
+}
+
+pub(crate) fn clear_image_texture_cache() {
+    SKIA_IMAGES.with(|cache| cache.borrow_mut().clear());
+}
+
+pub(crate) fn invalidate_image_texture(pixels_id: usize) {
+    SKIA_IMAGES.with(|cache| {
+        cache.borrow_mut().remove(&pixels_id);
+    });
+}
+
+fn cached_skia_image(decoded: &crate::image_loader::DecodedImage) -> Option<Image> {
+    let pixels_id = decoded.pixels_id();
+    SKIA_IMAGES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(image) = cache.get(&pixels_id) {
+            SKIA_IMAGE_REUSES.with(|count| count.set(count.get().saturating_add(1)));
+            return Some(image.clone());
+        }
+        if cache.len() >= IMAGE_TEXTURE_CACHE_LIMIT {
+            cache.clear();
+        }
+        let pixels = decoded.data.as_slice();
+        let width = decoded.width;
+        let height = decoded.height;
+        if width == 0 || height == 0 || pixels.len() != width as usize * height as usize * 4 {
+            return None;
+        }
+        let info = ImageInfo::new(
+            (width as i32, height as i32),
+            ColorType::RGBA8888,
+            AlphaType::Unpremul,
+            None,
+        );
+        let image = images::raster_from_data(&info, Data::new_copy(pixels), width as usize * 4)?;
+        SKIA_IMAGE_UPLOADS.with(|count| count.set(count.get().saturating_add(1)));
+        cache.insert(pixels_id, image.clone());
+        Some(image)
+    })
 }
 
 fn primary_typeface(font_bytes: &[u8]) -> Option<Typeface> {
@@ -761,14 +818,7 @@ fn render_node(
             ..
         } => {
             if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
-                draw_rgba_pixels(
-                    canvas,
-                    rect,
-                    raster.width,
-                    raster.height,
-                    raster.data.as_slice(),
-                    style.opacity,
-                );
+                draw_decoded_image(canvas, rect, &raster, style.opacity);
             }
         }
         ComponentKind::Root
@@ -856,14 +906,22 @@ fn draw_image(canvas: &Canvas, rect: LayoutRect, src: &str, opacity: f32) {
     let Some(decoded) = crate::image_loader::get_or_load(src) else {
         return;
     };
-    draw_rgba_pixels(
-        canvas,
-        rect,
-        decoded.width,
-        decoded.height,
-        decoded.data.as_slice(),
-        opacity,
-    );
+    draw_decoded_image(canvas, rect, &decoded, opacity);
+}
+
+fn draw_decoded_image(
+    canvas: &Canvas,
+    rect: LayoutRect,
+    decoded: &crate::image_loader::DecodedImage,
+    opacity: f32,
+) {
+    let Some(image) = cached_skia_image(decoded) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_alpha_f(opacity.clamp(0.0, 1.0));
+    canvas.draw_image_rect(image, None, to_rect(rect), &paint);
 }
 
 fn draw_canvas(canvas: &Canvas, client_index: usize, rect: LayoutRect, opacity: f32) {
@@ -2042,5 +2100,25 @@ mod tests {
         assert!((pixels[1] as i16 - 20).abs() <= 2);
         assert!(pixels[2] >= 238);
         assert_eq!(pixels[3], 255);
+    }
+
+    #[test]
+    fn skia_image_is_reused_for_unchanged_decoded_pixels() {
+        crate::image_loader::clear_cache();
+        crate::image_loader::reset_cache_stats();
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([12, 34, 56, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let decoded =
+            crate::image_loader::decode_and_install("skia-cache.png", &bytes.into_inner()).unwrap();
+        let first = super::cached_skia_image(&decoded).expect("skia image");
+        let second = super::cached_skia_image(&decoded).expect("skia image");
+        assert_eq!(first.unique_id(), second.unique_id());
+        assert_eq!(skia_image_upload_count(), 1);
+        assert_eq!(skia_image_reuse_count(), 1);
+        crate::image_loader::clear_cache();
+        assert!(super::SKIA_IMAGES.with(|cache| cache.borrow().is_empty()));
     }
 }

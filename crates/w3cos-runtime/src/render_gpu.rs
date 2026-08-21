@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -33,6 +34,63 @@ use crate::retained_layers::{
     layer_opacity as compositor_layer_opacity, layer_scroll_translation,
 };
 use w3cos_std::style::Transform2D;
+
+const IMAGE_TEXTURE_CACHE_LIMIT: usize = 256;
+
+thread_local! {
+    static IMAGE_BRUSHES: RefCell<HashMap<usize, ImageBrush>> = RefCell::new(HashMap::new());
+    static GPU_IMAGE_UPLOADS: Cell<u64> = const { Cell::new(0) };
+    static GPU_IMAGE_REUSES: Cell<u64> = const { Cell::new(0) };
+}
+
+pub(crate) fn gpu_image_upload_count() -> u64 {
+    GPU_IMAGE_UPLOADS.with(Cell::get)
+}
+
+pub(crate) fn gpu_image_reuse_count() -> u64 {
+    GPU_IMAGE_REUSES.with(Cell::get)
+}
+
+pub(crate) fn reset_image_texture_stats() {
+    GPU_IMAGE_UPLOADS.with(|count| count.set(0));
+    GPU_IMAGE_REUSES.with(|count| count.set(0));
+}
+
+pub(crate) fn clear_image_texture_cache() {
+    IMAGE_BRUSHES.with(|cache| cache.borrow_mut().clear());
+}
+
+pub(crate) fn invalidate_image_texture(pixels_id: usize) {
+    IMAGE_BRUSHES.with(|cache| {
+        cache.borrow_mut().remove(&pixels_id);
+    });
+}
+
+fn cached_image_brush(decoded: &crate::image_loader::DecodedImage) -> ImageBrush {
+    let pixels_id = decoded.pixels_id();
+    IMAGE_BRUSHES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(brush) = cache.get(&pixels_id) {
+            GPU_IMAGE_REUSES.with(|count| count.set(count.get().saturating_add(1)));
+            return brush.clone();
+        }
+        if cache.len() >= IMAGE_TEXTURE_CACHE_LIMIT {
+            cache.clear();
+        }
+        GPU_IMAGE_UPLOADS.with(|count| count.set(count.get().saturating_add(1)));
+        let blob = Blob::new(decoded.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
+        let image_data = ImageData {
+            data: blob,
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: decoded.width,
+            height: decoded.height,
+        };
+        let brush = ImageBrush::new(image_data);
+        cache.insert(pixels_id, brush.clone());
+        brush
+    })
+}
 
 // ---------------------------------------------------------------------------
 // GlyphCache — avoid repeated font parsing, charmap lookup, and rasterization
@@ -811,21 +869,7 @@ fn render_node(
             ..
         } => {
             if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
-                let blob = Blob::new(raster.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
-                let image_data = ImageData {
-                    data: blob,
-                    format: ImageFormat::Rgba8,
-                    alpha_type: ImageAlphaType::Alpha,
-                    width: raster.width,
-                    height: raster.height,
-                };
-                let image_brush = ImageBrush::new(image_data);
-                let transform = Affine::translate((rect.x as f64, rect.y as f64))
-                    * Affine::scale_non_uniform(
-                        rect.width as f64 / raster.width as f64,
-                        rect.height as f64 / raster.height as f64,
-                    );
-                scene.draw_image(image_brush.as_ref(), transform);
+                draw_decoded_image(scene, rect, &raster);
             }
         }
         _ => {}
@@ -862,15 +906,15 @@ fn draw_image_source(scene: &mut Scene, rect: LayoutRect, src: &str) {
     let Some(decoded) = crate::image_loader::get_or_load(src) else {
         return;
     };
-    let blob = Blob::new(decoded.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
-    let image_data = ImageData {
-        data: blob,
-        format: ImageFormat::Rgba8,
-        alpha_type: ImageAlphaType::Alpha,
-        width: decoded.width,
-        height: decoded.height,
-    };
-    let image_brush = ImageBrush::new(image_data);
+    draw_decoded_image(scene, rect, &decoded);
+}
+
+fn draw_decoded_image(
+    scene: &mut Scene,
+    rect: LayoutRect,
+    decoded: &crate::image_loader::DecodedImage,
+) {
+    let image_brush = cached_image_brush(decoded);
     let scale_x = rect.width as f64 / decoded.width as f64;
     let scale_y = rect.height as f64 / decoded.height as f64;
     let transform = Affine::translate((rect.x as f64, rect.y as f64))
@@ -1561,5 +1605,25 @@ mod tests {
             "an unused subset must not invalidate unrelated retained text"
         );
         crate::font_face::FontRegistry::global().clear_owner(OWNER);
+    }
+
+    #[test]
+    fn gpu_image_brush_is_reused_for_unchanged_decoded_pixels() {
+        crate::image_loader::clear_cache();
+        crate::image_loader::reset_cache_stats();
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([12, 34, 56, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let decoded =
+            crate::image_loader::decode_and_install("gpu-cache.png", &bytes.into_inner()).unwrap();
+        let first = super::cached_image_brush(&decoded);
+        let second = super::cached_image_brush(&decoded);
+        assert_eq!(first.image.data.id(), second.image.data.id());
+        assert_eq!(gpu_image_upload_count(), 1);
+        assert_eq!(gpu_image_reuse_count(), 1);
+        crate::image_loader::clear_cache();
+        assert!(super::IMAGE_BRUSHES.with(|cache| cache.borrow().is_empty()));
     }
 }
