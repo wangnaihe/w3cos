@@ -3,10 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::dom;
-use crate::paint_artifact::{reuse_or_clone_paint_nodes, PaintArtifact, PaintNode};
-use crate::retained_layers::{
-    CompositorOverrides, LayerPaintAction, RetainedLayerTree,
-};
+use crate::paint_artifact::{PaintArtifact, PaintNode, reuse_or_clone_paint_nodes};
+use crate::retained_layers::{CompositorOverrides, LayerPaintAction, RetainedLayerTree};
 use crate::text_layout;
 use crate::tile_manager::{TileManager, TileRequest};
 
@@ -1197,6 +1195,7 @@ struct FrameCacheScreenshot;
 #[cfg(feature = "ai-bridge")]
 impl w3cos_ai_bridge::server::ScreenshotProvider for FrameCacheScreenshot {
     fn capture_png(&self) -> Option<Vec<u8>> {
+        crate::frame_cache::request_screenshot();
         crate::frame_cache::encode_png()
     }
 }
@@ -2553,9 +2552,8 @@ impl App {
 
         let dummy_action = EventAction::None;
         let old_paint_nodes = std::mem::take(&mut self.paint_artifact.nodes);
-        let reuse_flatten = !self.needs_tree_rebuild
-            && !self.needs_style_refresh
-            && !old_paint_nodes.is_empty();
+        let reuse_flatten =
+            !self.needs_tree_rebuild && !self.needs_style_refresh && !old_paint_nodes.is_empty();
         let retained_flat = if reuse_flatten {
             Some(paint_nodes_as_flat(&old_paint_nodes, &dummy_action))
         } else {
@@ -2871,11 +2869,8 @@ impl App {
                     }),
             )
         };
-        self.paint_artifact = PaintArtifact::build(
-            paint_nodes,
-            &self.layout_cache,
-            self.layout_generation + 1,
-        );
+        self.paint_artifact =
+            PaintArtifact::build(paint_nodes, &self.layout_cache, self.layout_generation + 1);
         for (scroll_index, correction) in virtual_anchor_corrections {
             self.queue_scroll_damage(scroll_index, correction);
         }
@@ -3588,12 +3583,24 @@ impl App {
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default()),
             );
-            device_handle.queue.submit([encoder.finish()]);
-            surface_texture.present();
+            let screenshot_requested = crate::frame_cache::take_screenshot_request();
+            let plan = render_gpu::gpu_present_plan(screenshot_requested);
+            render_gpu::present_swapchain(&device_handle.queue, encoder, surface_texture);
             presented = true;
             if !self.first_frame_presented {
                 self.first_frame_presented = true;
                 eprintln!("[W3C OS] first frame presented");
+            }
+            if plan.copy_framebuffer_to_cpu {
+                if let Some(rgba) = render_gpu::copy_texture_view_to_cpu(
+                    &device_handle.device,
+                    &device_handle.queue,
+                    &surface.target_view,
+                    width,
+                    height,
+                ) {
+                    crate::frame_cache::store_from_slice(width, height, &rgba);
+                }
             }
             let _ = device_handle.device.poll(wgpu::PollType::Poll);
         }
@@ -4096,7 +4103,7 @@ impl App {
 
         #[cfg(any(feature = "devtools", feature = "ai-bridge"))]
         {
-            if !direct_skia_present {
+            if !direct_skia_present && crate::frame_cache::take_screenshot_request() {
                 crate::frame_cache::store_from_slice(w, h, pixmap.data());
             }
         }
@@ -5699,6 +5706,9 @@ impl App {
             crate::dom::with_document_mut(|doc| {
                 handle.poll_and_respond(doc);
             });
+        }
+        if crate::frame_cache::screenshot_request_pending() {
+            self.request_repaint();
         }
     }
 

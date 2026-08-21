@@ -1,14 +1,14 @@
-//! Latest-frame snapshot cache.
+//! Optional screenshot cache.
 //!
-//! Both renderers (CPU `tiny-skia` and GPU `vello`) call [`store`] after
-//! presenting a frame so consumers — most notably the AI Bridge `/screenshot`
-//! endpoint — can grab a PNG snapshot without coordinating with the render
-//! loop or running a separate offscreen pass.
+//! The vsync present path must not copy the framebuffer here. Call
+//! [`request_screenshot`] so the next present stores once for the AI Bridge
+//! `/screenshot` endpoint.
 //!
 //! The cache holds raw RGBA bytes plus the framebuffer dimensions, and a
 //! monotonically-increasing generation counter so consumers can detect
 //! whether a new frame has been produced since the last poll.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Default, Clone)]
@@ -24,6 +24,23 @@ fn cache() -> &'static Mutex<Frame> {
     CACHE.get_or_init(|| Mutex::new(Frame::default()))
 }
 
+static SCREENSHOT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Ask the next vsync present to copy the framebuffer for a screenshot.
+pub fn request_screenshot() {
+    SCREENSHOT_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Whether a screenshot copy is pending. Does not consume the request.
+pub fn screenshot_request_pending() -> bool {
+    SCREENSHOT_REQUESTED.load(Ordering::Acquire)
+}
+
+/// Consume a pending screenshot request. Present copies only when this is true.
+pub fn take_screenshot_request() -> bool {
+    SCREENSHOT_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
 /// Replace the cached frame. `rgba` must be `width*height*4` bytes
 /// in non-premultiplied RGBA order.
 pub fn store(width: u32, height: u32, rgba: Vec<u8>) {
@@ -31,9 +48,8 @@ pub fn store(width: u32, height: u32, rgba: Vec<u8>) {
 }
 
 /// Copy `rgba` into the cache, reusing the previous allocation when the
-/// framebuffer size is unchanged. The paint loop should call this instead of
-/// `pixmap.data().to_vec()` so a static-size window does not allocate a
-/// second full-screen buffer every frame.
+/// framebuffer size is unchanged. Call this only when a screenshot was
+/// requested — never from the vsync present hot path.
 pub fn store_from_slice(width: u32, height: u32, rgba: &[u8]) {
     let expected = (width as usize) * (height as usize) * 4;
     if rgba.len() != expected {
@@ -161,5 +177,17 @@ mod tests {
         let png = encode_png().unwrap();
         // PNG magic number = 89 50 4E 47
         assert_eq!(&png[..4], &[0x89, 0x50, 0x4E, 0x47]);
+    }
+
+    #[test]
+    fn screenshot_request_is_consumed_by_present() {
+        let _g = FC_TEST_LOCK.lock().unwrap();
+        let _ = take_screenshot_request();
+        assert!(!screenshot_request_pending());
+        request_screenshot();
+        assert!(screenshot_request_pending());
+        assert!(take_screenshot_request());
+        assert!(!screenshot_request_pending());
+        assert!(!take_screenshot_request());
     }
 }

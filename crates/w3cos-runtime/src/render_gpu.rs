@@ -9,6 +9,13 @@ use vello::peniko::{
     Blob, Color, Fill, FontData, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
 };
 use vello::{Glyph, Scene};
+
+#[path = "gpu_present.rs"]
+mod gpu_present;
+pub use gpu_present::{
+    GpuPresentPlan, copy_texture_view_to_cpu, gpu_cpu_readback_count, gpu_present_count,
+    gpu_present_plan, present_swapchain,
+};
 use w3cos_std::SvgPathCommand;
 use w3cos_std::color::Color as AppColor;
 use w3cos_std::component::ComponentKind;
@@ -22,8 +29,8 @@ use crate::gpu_filter::{self, GpuFilterCtx};
 use crate::layout::LayoutRect;
 use crate::paint_artifact::PaintArtifact;
 use crate::retained_layers::{
-    layer_css_transform, layer_opacity as compositor_layer_opacity, layer_scroll_translation,
-    CompositorLayer, CompositorOverrides,
+    CompositorLayer, CompositorOverrides, layer_css_transform,
+    layer_opacity as compositor_layer_opacity, layer_scroll_translation,
 };
 use w3cos_std::style::Transform2D;
 
@@ -1321,7 +1328,6 @@ pub fn draw_focus_ring(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
     scene.stroke(&stroke, dpi, color, None, &r);
 }
 
-
 fn css_transform_affine(transform: Transform2D, origin: (f64, f64)) -> Affine {
     Affine::translate((
         origin.0 + transform.translate_x as f64,
@@ -1410,7 +1416,13 @@ pub fn composite_retained_layers(
                 (layer.bounds.x + layer.bounds.width) as f64,
                 (layer.bounds.y + layer.bounds.height) as f64,
             );
-            scene.push_layer(Fill::NonZero, vello::peniko::Mix::Normal, opacity, transform, &bounds);
+            scene.push_layer(
+                Fill::NonZero,
+                vello::peniko::Mix::Normal,
+                opacity,
+                transform,
+                &bounds,
+            );
             scene.append(recording, Some(transform));
             scene.pop_layer();
         } else {
