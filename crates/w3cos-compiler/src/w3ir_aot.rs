@@ -5,6 +5,7 @@
 //! therefore consume the same suspension/control-flow records without placing
 //! a second JavaScript semantic implementation in ordinary AOT artifacts.
 
+use crate::unique_back_edges::{UniqueBackEdgePlan, analyze_unique_back_edges};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use w3cos_ir::{
@@ -40,8 +41,19 @@ fn join_class(left: RegClass, right: RegClass) -> RegClass {
 /// Per-function register lattice. A register is `Number` only when every
 /// definition is Number. Nested closures and bindings stay `Unknown`
 /// (interprocedural analysis is out of scope).
+///
+/// Number and Bool registers occupy compact banks (`num_regs` / `bool_regs`)
+/// and never keep a `Value` slot. Every other IR register maps into the
+/// dense `registers` Value bank.
 struct EscapePlan {
     number: HashSet<u32>,
+    bools: HashSet<u32>,
+    num_of: Vec<Option<u32>>,
+    bool_of: Vec<Option<u32>>,
+    val_of: Vec<Option<u32>>,
+    n_num: u32,
+    n_bool: u32,
+    n_val: u32,
 }
 
 fn analyze_function(function: &Function) -> EscapePlan {
@@ -60,12 +72,75 @@ fn analyze_function(function: &Function) -> EscapePlan {
             changed = true;
         }
     }
+    let mut number = HashSet::new();
+    let mut bools = HashSet::new();
+    let mut num_of = vec![None; len];
+    let mut bool_of = vec![None; len];
+    let mut val_of = vec![None; len];
+    let mut n_num = 0;
+    let mut n_bool = 0;
+    let mut n_val = 0;
+    for (index, class) in classes.iter().enumerate() {
+        match class {
+            RegClass::Number => {
+                number.insert(index as u32);
+                num_of[index] = Some(n_num);
+                n_num += 1;
+            }
+            RegClass::Bool => {
+                bools.insert(index as u32);
+                bool_of[index] = Some(n_bool);
+                n_bool += 1;
+            }
+            _ => {
+                val_of[index] = Some(n_val);
+                n_val += 1;
+            }
+        }
+    }
     EscapePlan {
-        number: classes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, class)| (*class == RegClass::Number).then_some(index as u32))
-            .collect(),
+        number,
+        bools,
+        num_of,
+        bool_of,
+        val_of,
+        n_num,
+        n_bool,
+        n_val,
+    }
+}
+
+fn num_slot(plan: &EscapePlan, ir: u32) -> Option<u32> {
+    plan.num_of.get(ir as usize).copied().flatten()
+}
+
+fn bool_slot(plan: &EscapePlan, ir: u32) -> Option<u32> {
+    plan.bool_of.get(ir as usize).copied().flatten()
+}
+
+fn val_slot(plan: &EscapePlan, ir: u32) -> Option<u32> {
+    plan.val_of.get(ir as usize).copied().flatten()
+}
+
+fn num_index(plan: &EscapePlan, ir: u32) -> u32 {
+    num_slot(plan, ir).unwrap_or_else(|| panic!("missing number slot for IR register {ir}"))
+}
+
+fn bool_index(plan: &EscapePlan, ir: u32) -> u32 {
+    bool_slot(plan, ir).unwrap_or_else(|| panic!("missing bool slot for IR register {ir}"))
+}
+
+fn val_index(plan: &EscapePlan, ir: u32) -> u32 {
+    val_slot(plan, ir).unwrap_or_else(|| panic!("missing value slot for IR register {ir}"))
+}
+
+fn store_boxed(plan: &EscapePlan, ir: u32, expr: &str) -> String {
+    if let Some(slot) = num_slot(plan, ir) {
+        format!("self.num_regs[{slot}] = ({expr}).to_number()")
+    } else if let Some(slot) = bool_slot(plan, ir) {
+        format!("self.bool_regs[{slot}] = ({expr}).to_bool()")
+    } else {
+        format!("self.registers[{}] = {expr}", val_index(plan, ir))
     }
 }
 
@@ -185,44 +260,83 @@ fn apply_register_def(classes: &mut [RegClass], instruction: &Instruction) {
     }
 }
 
-fn emit_num_reg_storage(plan: &EscapePlan, registers: u32) -> (String, String) {
-    if plan.number.is_empty() {
-        (String::new(), String::new())
-    } else {
-        (
-            "    num_regs: Vec<f64>,\n".into(),
-            format!("        num_regs: vec![0.0_f64; {registers}],\n"),
-        )
+fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
+    let mut fields = String::new();
+    let mut inits = String::new();
+    if plan.n_num > 0 {
+        fields.push_str("    num_regs: Vec<f64>,\n");
+        inits.push_str(&format!(
+            "        num_regs: vec![0.0_f64; {}],\n",
+            plan.n_num
+        ));
     }
+    if plan.n_bool > 0 {
+        fields.push_str("    bool_regs: Vec<bool>,\n");
+        inits.push_str(&format!(
+            "        bool_regs: vec![false; {}],\n",
+            plan.n_bool
+        ));
+    }
+    (fields, inits)
 }
 
 fn known_number(plan: &EscapePlan, reaching: &HashMap<u32, f64>, register: u32) -> bool {
     plan.number.contains(&register) || reaching.contains_key(&register)
 }
 
+fn known_bool(plan: &EscapePlan, register: u32) -> bool {
+    plan.bools.contains(&register)
+}
+
 fn emit_f64_operand(plan: &EscapePlan, reaching: &HashMap<u32, f64>, register: u32) -> String {
     if let Some(value) = reaching.get(&register) {
         format!("{value:?}_f64")
-    } else if plan.number.contains(&register) {
-        format!("self.num_regs[{register}]")
+    } else if let Some(slot) = num_slot(plan, register) {
+        format!("self.num_regs[{slot}]")
     } else {
-        format!("self.registers[{register}].to_number()")
+        format!("self.registers[{}].to_number()", val_index(plan, register))
+    }
+}
+
+fn emit_bool_operand(plan: &EscapePlan, register: u32) -> String {
+    if let Some(slot) = bool_slot(plan, register) {
+        format!("self.bool_regs[{slot}]")
+    } else if let Some(slot) = num_slot(plan, register) {
+        format!("(self.num_regs[{slot}] != 0.0_f64 && !self.num_regs[{slot}].is_nan())")
+    } else {
+        format!("{}.to_bool()", emit_boxed_value(plan, register))
     }
 }
 
 fn emit_boxed_value(plan: &EscapePlan, register: u32) -> String {
-    if plan.number.contains(&register) {
-        format!("w3cos_core::Value::Number(self.num_regs[{register}])")
+    if let Some(slot) = num_slot(plan, register) {
+        format!("w3cos_core::Value::Number(self.num_regs[{slot}])")
+    } else if let Some(slot) = bool_slot(plan, register) {
+        format!("w3cos_core::Value::Bool(self.bool_regs[{slot}])")
     } else {
-        format!("self.registers[{register}].clone()")
+        format!("self.registers[{}].clone()", val_index(plan, register))
     }
 }
 
 fn write_f64(plan: &EscapePlan, dst: u32, expr: &str) -> String {
-    if plan.number.contains(&dst) {
-        format!("self.num_regs[{dst}] = {expr};")
+    if let Some(slot) = num_slot(plan, dst) {
+        format!("self.num_regs[{slot}] = {expr};")
     } else {
-        format!("self.registers[{dst}] = w3cos_core::Value::Number({expr});")
+        format!(
+            "self.registers[{}] = w3cos_core::Value::Number({expr});",
+            val_index(plan, dst)
+        )
+    }
+}
+
+fn write_bool(plan: &EscapePlan, dst: u32, expr: &str) -> String {
+    if let Some(slot) = bool_slot(plan, dst) {
+        format!("self.bool_regs[{slot}] = {expr};")
+    } else {
+        format!(
+            "self.registers[{}] = w3cos_core::Value::Bool({expr});",
+            val_index(plan, dst)
+        )
     }
 }
 
@@ -491,6 +605,14 @@ fn proven_string_keys(instructions: &[Instruction], index: usize) -> HashMap<u32
     known
 }
 
+fn analyze_and_warn(function: &Function, specifier: Option<&str>) -> UniqueBackEdgePlan {
+    let plan = analyze_unique_back_edges(function, specifier);
+    for warning in &plan.warnings {
+        eprintln!("warning: {warning}");
+    }
+    plan
+}
+
 /// Emit a native synchronous-generator factory for one W3IR function.
 ///
 /// The initial backend covers the ordinary scalar/object instructions needed
@@ -653,7 +775,8 @@ fn generate_sync_function_with_factories(
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
-    let (num_field, num_init) = emit_num_reg_storage(&plan, function.registers);
+    let back_edges = analyze_and_warn(function, module_specifier);
+    let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
     let slot_fields = emit_slot_fields(storage);
     let slot_bindings_new = emit_bindings_new(storage);
@@ -674,6 +797,7 @@ fn generate_sync_function_with_factories(
             false,
             storage,
             &plan,
+            &back_edges,
         )?;
         if sync_blocks.len() == 1
             && *block_id == function.entry
@@ -709,9 +833,9 @@ fn generate_sync_function_with_factories(
     for (exception, target, mut protected_blocks) in exception_handler_groups {
         protected_blocks.sort_unstable();
         exception_handlers.push_str(&format!(
-            "                    {} => {{ self.registers[{}] = __w3cos_exception; self.block = {}; }}\n",
+            "                    {} => {{ {}; self.block = {}; }}\n",
             compact_block_patterns(&protected_blocks),
-            exception,
+            store_boxed(&plan, exception, "__w3cos_exception"),
             target,
         ));
     }
@@ -846,7 +970,7 @@ pub fn {rust_name}(
     }}.run()
 }}
 "#,
-        registers = function.registers,
+        registers = plan.n_val,
     ))
 }
 
@@ -862,7 +986,8 @@ fn generate_async_function_with_factories(
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
-    let (num_field, num_init) = emit_num_reg_storage(&plan, function.registers);
+    let back_edges = analyze_and_warn(function, module_specifier);
+    let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
     let slot_fields = emit_slot_fields(storage);
     let slot_bindings_new = emit_bindings_new(storage);
@@ -891,6 +1016,7 @@ fn generate_async_function_with_factories(
             true,
             storage,
             &plan,
+            &back_edges,
         )?);
         blocks.push_str("                }\n");
     }
@@ -1102,7 +1228,7 @@ pub fn {rust_name}(
     }})])
 }}
 "#,
-        registers = function.registers,
+        registers = plan.n_val,
         entry = function.entry.0,
     ))
 }
@@ -1127,7 +1253,8 @@ fn generate_generator_with_factories(
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
-    let (num_field, num_init) = emit_num_reg_storage(&plan, function.registers);
+    let back_edges = analyze_and_warn(function, module_specifier);
+    let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
     let slot_fields = emit_slot_fields(storage);
     let slot_bindings_new = emit_bindings_new(storage);
@@ -1157,6 +1284,7 @@ fn generate_generator_with_factories(
             true,
             storage,
             &plan,
+            &back_edges,
         )?);
         blocks.push_str("                }\n");
     }
@@ -1165,9 +1293,9 @@ fn generate_generator_with_factories(
     let mut delegate_suspension_arms = String::new();
     for point in &function.generator_suspension_points {
         suspension_arms.push_str(&format!(
-            "                    {} => {{ self.registers[{}] = input; self.block = match kind {{ 0 => {}, 1 => {}, _ => {} }}; }}\n",
+            "                    {} => {{ {}; self.block = match kind {{ 0 => {}, 1 => {}, _ => {} }}; }}\n",
             point.id.0,
-            point.result.0,
+            store_boxed(&plan, point.result.0, "input"),
             point.resume_block.0,
             point.return_block.0,
             point.throw_block.0,
@@ -1201,7 +1329,7 @@ fn generate_generator_with_factories(
                     }}
 "#,
             suspension = point.id.0,
-            result = point.result.0,
+            result = val_index(&plan, point.result.0),
             throw_block = point.throw_block.0,
             return_block = point.return_block.0,
             resume_block = point.resume_block.0,
@@ -1385,7 +1513,7 @@ pub fn {rust_name}(
     generator
 }}
 "#,
-        registers = function.registers,
+        registers = plan.n_val,
         entry = function.entry.0,
     ))
 }
@@ -1399,7 +1527,8 @@ fn generate_async_generator_with_factories(
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
-    let (num_field, num_init) = emit_num_reg_storage(&plan, function.registers);
+    let back_edges = analyze_and_warn(function, module_specifier);
+    let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
     let slot_fields = emit_slot_fields(storage);
     let slot_bindings_new = emit_bindings_new(storage);
@@ -1430,6 +1559,7 @@ fn generate_async_generator_with_factories(
             true,
             storage,
             &plan,
+            &back_edges,
         )?);
         blocks.push_str("                }\n");
     }
@@ -1440,16 +1570,18 @@ fn generate_async_generator_with_factories(
     let mut delegate_result_arms = String::new();
     for point in &function.generator_suspension_points {
         suspension_arms.push_str(&format!(
-            "                    {} => {{ self.registers[{}] = input; self.block = match kind {{ 0 => {}, 1 => {}, _ => {} }}; }}\n",
+            "                    {} => {{ {}; self.block = match kind {{ 0 => {}, 1 => {}, _ => {} }}; }}\n",
             point.id.0,
-            point.result.0,
+            store_boxed(&plan, point.result.0, "input"),
             point.resume_block.0,
             point.return_block.0,
             point.throw_block.0,
         ));
         rejected_yield_arms.push_str(&format!(
-            "            {} => {{ self.registers[{}] = reason; self.block = {}; self.state = {type_name}State::Ready; }}\n",
-            point.id.0, point.result.0, point.throw_block.0
+            "            {} => {{ {}; self.block = {}; self.state = {type_name}State::Ready; }}\n",
+            point.id.0,
+            store_boxed(&plan, point.result.0, "reason"),
+            point.throw_block.0
         ));
         delegate_resume_arms.push_str(&format!(
             r#"                    {suspension} => {{
@@ -1491,7 +1623,7 @@ fn generate_async_generator_with_factories(
                     }}
 "#,
             suspension = point.id.0,
-            result = point.result.0,
+            result = val_index(&plan, point.result.0),
             return_block = point.return_block.0,
             throw_block = point.throw_block.0,
         ));
@@ -1510,7 +1642,7 @@ fn generate_async_generator_with_factories(
             }}
 "#,
             suspension = point.id.0,
-            result = point.result.0,
+            result = val_index(&plan, point.result.0),
             throw_block = point.throw_block.0,
             return_block = point.return_block.0,
             resume_block = point.resume_block.0,
@@ -2030,7 +2162,7 @@ pub fn {rust_name}(
     generator
 }}
 "#,
-        registers = function.registers,
+        registers = plan.n_val,
         entry = function.entry.0,
     ))
 }
@@ -2129,6 +2261,7 @@ fn emit_block_instructions(
     wrap_exceptions: bool,
     storage: SlotStorage,
     plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
 ) -> Result<String> {
     let reaching = reaching_number_constants(instructions);
     let emitted = instructions
@@ -2146,6 +2279,7 @@ fn emit_block_instructions(
                 storage,
                 &proven,
                 plan,
+                back_edges,
                 &reaching[index],
             )
             .map(|emitted| match mode {
@@ -2179,8 +2313,9 @@ fn emit_block_instructions(
             "                    }));\n                    if let Err(__w3cos_payload) = __w3cos_outcome {\n                        let __w3cos_exception = if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {\n                            value.0.clone()\n                        } else {\n                            std::panic::resume_unwind(__w3cos_payload);\n                        };\n",
         );
         output.push_str(&format!(
-            "                        self.registers[{}] = __w3cos_exception;\n                        self.block = {};\n                        continue 'drive;\n                    }}\n",
-            exception.0, target.0,
+            "                        {};\n                        self.block = {};\n                        continue 'drive;\n                    }}\n",
+            store_boxed(plan, exception.0, "__w3cos_exception"),
+            target.0,
         ));
     } else {
         for instruction in &emitted[..protected_end] {
@@ -2236,6 +2371,15 @@ fn is_direct_control_flow(instruction: &Instruction, mode: EmissionMode) -> bool
     )
 }
 
+fn emit_capture_pair_store(capture_id: u32, weaken: bool) -> String {
+    if !weaken {
+        return format!("__w3cos_nested_captures.insert({capture_id}, __w3cos_pair);");
+    }
+    format!(
+        "let __w3cos_target = __w3cos_pair.0.call(w3cos_core::Value::Undefined, Vec::new()); if __w3cos_target.is_object() || __w3cos_target.is_array() || __w3cos_target.is_function() {{ let __w3cos_weak = w3cos_core::intrinsics::construct(&w3cos_core::weak::weak_ref_class(), vec![__w3cos_target]); let __w3cos_getter = w3cos_core::Value::function(move |_, _| __w3cos_weak.call_method(\"deref\", Vec::new())); __w3cos_nested_captures.insert({capture_id}, (__w3cos_getter, w3cos_core::Value::Undefined)); }} else {{ __w3cos_nested_captures.insert({capture_id}, __w3cos_pair); }}"
+    )
+}
+
 fn emit_instruction(
     instruction: &Instruction,
     exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
@@ -2246,13 +2390,17 @@ fn emit_instruction(
     storage: SlotStorage,
     proven_strings: &HashMap<u32, String>,
     plan: &EscapePlan,
+    back_edges: &UniqueBackEdgePlan,
     reaching_nums: &HashMap<u32, f64>,
 ) -> Result<String> {
-    let register = |register: w3cos_ir::Register| register.0;
+    let register = |register: w3cos_ir::Register| val_index(plan, register.0);
     Ok(match instruction {
         Instruction::LoadConstant { dst, value } => match value {
-            Constant::Number(value) if plan.number.contains(&dst.0) => {
-                format!("self.num_regs[{}] = {value:?}_f64;", register(*dst))
+            Constant::Number(value) if num_slot(plan, dst.0).is_some() => {
+                format!("self.num_regs[{}] = {value:?}_f64;", num_index(plan, dst.0))
+            }
+            Constant::Bool(value) if known_bool(plan, dst.0) => {
+                format!("self.bool_regs[{}] = {value};", bool_index(plan, dst.0))
             }
             Constant::Number(value) => format!(
                 "self.registers[{}] = w3cos_core::Value::Number({value:?});",
@@ -2265,18 +2413,48 @@ fn emit_instruction(
             ),
         },
         Instruction::Move { dst, src }
-            if plan.number.contains(&dst.0) && plan.number.contains(&src.0) =>
+            if num_slot(plan, dst.0).is_some() && num_slot(plan, src.0).is_some() =>
         {
             format!(
                 "self.num_regs[{}] = self.num_regs[{}];",
-                register(*dst),
-                register(*src)
+                num_index(plan, dst.0),
+                num_index(plan, src.0)
             )
         }
-        Instruction::Move { dst, src } if plan.number.contains(&src.0) => format!(
-            "self.registers[{}] = w3cos_core::Value::Number(self.num_regs[{}]);",
-            register(*dst),
-            register(*src)
+        Instruction::Move { dst, src } if known_bool(plan, dst.0) && known_bool(plan, src.0) => {
+            format!(
+                "self.bool_regs[{}] = self.bool_regs[{}];",
+                bool_index(plan, dst.0),
+                bool_index(plan, src.0)
+            )
+        }
+        Instruction::Move { dst, src }
+            if num_slot(plan, src.0).is_some() && val_slot(plan, dst.0).is_some() =>
+        {
+            format!(
+                "self.registers[{}] = w3cos_core::Value::Number(self.num_regs[{}]);",
+                register(*dst),
+                num_index(plan, src.0)
+            )
+        }
+        Instruction::Move { dst, src }
+            if known_bool(plan, src.0) && val_slot(plan, dst.0).is_some() =>
+        {
+            format!(
+                "self.registers[{}] = w3cos_core::Value::Bool(self.bool_regs[{}]);",
+                register(*dst),
+                bool_index(plan, src.0)
+            )
+        }
+        Instruction::Move { dst, src } if num_slot(plan, dst.0).is_some() => format!(
+            "self.num_regs[{}] = {}.to_number();",
+            num_index(plan, dst.0),
+            emit_boxed_value(plan, src.0)
+        ),
+        Instruction::Move { dst, src } if known_bool(plan, dst.0) => format!(
+            "self.bool_regs[{}] = {}.to_bool();",
+            bool_index(plan, dst.0),
+            emit_boxed_value(plan, src.0)
         ),
         Instruction::Move { dst, src } => format!(
             "self.registers[{}] = {};",
@@ -2361,9 +2539,7 @@ fn emit_instruction(
                 emit_boxed_value(plan, lhs.0),
                 emit_boxed_value(plan, rhs.0)
             ),
-            operator => {
-                emit_binary_operator(plan, reaching_nums, register(*dst), *operator, lhs.0, rhs.0)
-            }
+            operator => emit_binary_operator(plan, reaching_nums, dst.0, *operator, lhs.0, rhs.0),
         },
         Instruction::Unary {
             dst,
@@ -2575,12 +2751,13 @@ fn emit_instruction(
                 } else {
                     "w3cos_core::Value::Undefined".into()
                 };
+                let weaken = back_edges.weak_captures.contains(&(*nested, *capture));
                 adapters.push_str(&format!(
-                    "let __w3cos_pair = if let Some(getter) = {} {{ (getter, {}.unwrap_or(w3cos_core::Value::Undefined)) }} else if let Some(cell) = {} {{ let getter = {{ let cell = std::rc::Rc::clone(&cell); w3cos_core::Value::function(move |_, _| {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}) }}; let setter = {local_setter}; (getter, setter) }} else {{ return w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing nested generator capture\")); }}; __w3cos_nested_captures.insert({}, __w3cos_pair);",
+                    "let __w3cos_pair = if let Some(getter) = {} {{ (getter, {}.unwrap_or(w3cos_core::Value::Undefined)) }} else if let Some(cell) = {} {{ let getter = {{ let cell = std::rc::Rc::clone(&cell); w3cos_core::Value::function(move |_, _| {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}) }}; let setter = {local_setter}; (getter, setter) }} else {{ return w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing nested generator capture\")); }}; {}",
                     emit_capture_get_cloned(storage, capture.0),
                     emit_capture_setter_get_cloned(storage, capture.0),
                     emit_binding_get_cloned(storage, capture.0),
-                    capture.0
+                    emit_capture_pair_store(capture.0, weaken)
                 ));
             }
             format!(
@@ -2778,10 +2955,20 @@ fn emit_instruction(
             condition,
             then_block,
             else_block,
-        } if plan.number.contains(&condition.0) => format!(
+        } if known_bool(plan, condition.0) => format!(
+            "self.block = if {} {{ {} }} else {{ {} }}; continue 'drive;",
+            emit_bool_operand(plan, condition.0),
+            then_block.0,
+            else_block.0
+        ),
+        Instruction::Branch {
+            condition,
+            then_block,
+            else_block,
+        } if num_slot(plan, condition.0).is_some() => format!(
             "self.block = if self.num_regs[{}] != 0.0_f64 && !self.num_regs[{}].is_nan() {{ {} }} else {{ {} }}; continue 'drive;",
-            register(*condition),
-            register(*condition),
+            num_index(plan, condition.0),
+            num_index(plan, condition.0),
             then_block.0,
             else_block.0
         ),
@@ -2809,9 +2996,8 @@ fn emit_instruction(
         Instruction::Throw { value } => {
             if let Some((exception, target)) = exception_target {
                 format!(
-                    "self.registers[{}] = {}; self.block = {}; continue 'drive;",
-                    register(exception),
-                    emit_boxed_value(plan, value.0),
+                    "{}; self.block = {}; continue 'drive;",
+                    store_boxed(plan, exception.0, &emit_boxed_value(plan, value.0)),
                     target.0
                 )
             } else {
@@ -2899,34 +3085,30 @@ fn emit_binary_operator(
             };
             write_f64(plan, dst, &expr)
         }
-        BinaryOperator::LessThan if both => {
-            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} < {right});")
-        }
+        BinaryOperator::LessThan if both => write_bool(plan, dst, &format!("{left} < {right}")),
         BinaryOperator::LessThanOrEqual if both => {
-            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} <= {right});")
+            write_bool(plan, dst, &format!("{left} <= {right}"))
         }
-        BinaryOperator::GreaterThan if both => {
-            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} > {right});")
-        }
+        BinaryOperator::GreaterThan if both => write_bool(plan, dst, &format!("{left} > {right}")),
         BinaryOperator::GreaterThanOrEqual if both => {
-            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} >= {right});")
+            write_bool(plan, dst, &format!("{left} >= {right}"))
         }
         BinaryOperator::AbstractEqual | BinaryOperator::StrictEqual if both => {
-            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} == {right});")
+            write_bool(plan, dst, &format!("{left} == {right}"))
         }
         operator => {
             let boxed_lhs = emit_boxed_value(plan, lhs);
             let boxed_rhs = emit_boxed_value(plan, rhs);
-            if plan.number.contains(&dst) {
-                format!(
-                    "self.num_regs[{dst}] = w3cos_core::intrinsics::{}(&{boxed_lhs}, &{boxed_rhs}).to_number();",
-                    binary_intrinsic(operator)
-                )
+            let call = format!(
+                "w3cos_core::intrinsics::{}(&{boxed_lhs}, &{boxed_rhs})",
+                binary_intrinsic(operator)
+            );
+            if let Some(slot) = num_slot(plan, dst) {
+                format!("self.num_regs[{slot}] = {call}.to_number();")
+            } else if let Some(slot) = bool_slot(plan, dst) {
+                format!("self.bool_regs[{slot}] = {call}.to_bool();")
             } else {
-                format!(
-                    "self.registers[{dst}] = w3cos_core::intrinsics::{}(&{boxed_lhs}, &{boxed_rhs});",
-                    binary_intrinsic(operator)
-                )
+                format!("self.registers[{}] = {call};", val_index(plan, dst))
             }
         }
     }
@@ -2934,14 +3116,17 @@ fn emit_binary_operator(
 
 #[allow(dead_code)]
 fn binary_call(
+    plan: &EscapePlan,
     dst: w3cos_ir::Register,
     lhs: w3cos_ir::Register,
     rhs: w3cos_ir::Register,
     intrinsic: &str,
 ) -> String {
     format!(
-        "self.registers[{}] = w3cos_core::intrinsics::{intrinsic}(&self.registers[{}], &self.registers[{}]);",
-        dst.0, lhs.0, rhs.0
+        "self.registers[{}] = w3cos_core::intrinsics::{intrinsic}(&{}, &{});",
+        val_index(plan, dst.0),
+        emit_boxed_value(plan, lhs.0),
+        emit_boxed_value(plan, rhs.0)
     )
 }
 
@@ -4102,6 +4287,25 @@ fn main() {{
                 || generated.contains("Value::Number(self.num_regs"),
             "result must box back to Value at return: {generated}"
         );
+        let ir_count = function.registers;
+        let val_len = parse_undefined_vec_len(&generated);
+        let num_len = parse_vec_len(&generated, "num_regs: vec![0.0_f64; ");
+        let bool_len = parse_vec_len(&generated, "bool_regs: vec![false; ").unwrap_or(0);
+        assert!(
+            generated.contains("num_regs: vec![0.0_f64; "),
+            "compact num_regs init should be emitted: {generated}"
+        );
+        if let (Some(val_len), Some(num_len)) = (val_len, num_len) {
+            assert!(
+                val_len < ir_count,
+                "Value bank must not keep a full IR-sized frame when numbers unbox; val={val_len} ir={ir_count}: {generated}"
+            );
+            assert_eq!(
+                val_len + num_len + bool_len,
+                ir_count,
+                "compact banks should partition IR registers; val={val_len} num={num_len} bool={bool_len} ir={ir_count}: {generated}"
+            );
+        }
         assert!(!generated.contains("w3cos_vm"));
     }
 
@@ -4127,5 +4331,103 @@ fn main() {{
             generated.contains("w3cos_core::intrinsics::add"),
             "JS + must stay on the add intrinsic when an operand may be string: {generated}"
         );
+    }
+
+    #[test]
+    fn unboxes_pure_bool_compare_to_bool_regs() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function pred() {
+                    return 1 < 2;
+                }
+                pred;
+            "#,
+            "app:///bool-escape.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("pred"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "pred_aot").unwrap();
+
+        assert!(
+            generated.contains("bool_regs"),
+            "pure bool compare should emit bool_regs: {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::Value::Bool(self.bool_regs")
+                || generated.contains("Value::Bool(self.bool_regs"),
+            "result must box back from bool_regs at return: {generated}"
+        );
+        // Compare result must not live only as Value::Bool stored in the Value bank.
+        let boxed_bool_in_registers = generated.contains("self.registers[")
+            && generated
+                .lines()
+                .any(|line| line.contains("self.registers[") && line.contains("Value::Bool"));
+        assert!(
+            !boxed_bool_in_registers,
+            "compare result should not be stored as Value::Bool in registers: {generated}"
+        );
+        assert!(!generated.contains("w3cos_vm"));
+    }
+
+    #[test]
+    fn omits_value_slot_for_unboxed_number() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function sum() {
+                    return 1 + 2 + 3;
+                }
+                sum;
+            "#,
+            "app:///omit-value-slot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("sum"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "sum_aot").unwrap();
+        let ir_count = function.registers;
+        let val_len = parse_undefined_vec_len(&generated);
+        assert!(
+            generated.contains("num_regs") && generated.contains("_f64"),
+            "pure numeric sum should unbox to num_regs: {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::Value::Number(self.num_regs")
+                || generated.contains("Value::Number(self.num_regs"),
+            "return should box from num_regs: {generated}"
+        );
+        assert!(
+            val_len == Some(0)
+                || generated.contains("vec![w3cos_core::Value::Undefined; 0]")
+                || !generated.contains("self.registers["),
+            "unboxed number arithmetic must not keep Value slots; val_len={val_len:?} ir={ir_count}: {generated}"
+        );
+        if let Some(val_len) = val_len {
+            assert!(
+                val_len < ir_count,
+                "Value bank must be smaller than the IR register count: {generated}"
+            );
+        }
+    }
+
+    fn parse_undefined_vec_len(generated: &str) -> Option<u32> {
+        parse_vec_len(generated, "registers: vec![w3cos_core::Value::Undefined; ")
+            .or_else(|| parse_vec_len(generated, "registers: vec![Value::Undefined; "))
+    }
+
+    fn parse_vec_len(generated: &str, prefix: &str) -> Option<u32> {
+        let start = generated.find(prefix)?;
+        let rest = &generated[start + prefix.len()..];
+        let digits: String = rest
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
+        digits.parse().ok()
     }
 }

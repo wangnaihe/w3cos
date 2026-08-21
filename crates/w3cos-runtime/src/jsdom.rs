@@ -142,13 +142,21 @@ struct ShadowRootInfo {
     mode: String,
 }
 
+/// JS wrapper intern: nodes still in a tree (document or fragment) stay
+/// strong so `===` holds; parentless orphans are Weak so the cache does
+/// not pin them after the last JS handle drops.
+enum ElementMemo {
+    Strong(Value),
+    Weak(Weak<RefCell<JsObject>>),
+}
+
 thread_local! {
     /// Monotonic identity for the active document Realm. Every node-backed JS
     /// facade captures this value so an externally retained facade cannot
     /// address a recycled node id after navigation.
     static BRIDGE_REALM_GENERATION: Cell<u32> = const { Cell::new(1) };
     /// node id → memoized element Value (identity: `a === b` via Rc::ptr_eq).
-    static ELEMENT_VALUES: RefCell<HashMap<u32, Value>> = RefCell::new(HashMap::new());
+    static ELEMENT_VALUES: RefCell<HashMap<u32, ElementMemo>> = RefCell::new(HashMap::new());
     /// (node, key) → JS expando properties assigned through the set trap
     /// (plus bridge-cached "style"/"classList"/"__ctx2d" values).
     static ELEMENT_PROPS: RefCell<HashMap<(u32, String), Value>> = RefCell::new(HashMap::new());
@@ -1139,15 +1147,127 @@ fn query_live_document_all(selector: &str) -> Vec<u32> {
 
 // ── Element values ─────────────────────────────────────────────────────────
 
+/// True when the native node still belongs to a live tree. Template
+/// contents are never `is_connected`, but their children have parents.
+/// Those wrappers stay Strong so intern does not drop identity or wipe
+/// expandos such as `template.content`.
+fn js_wrapper_should_pin(node: u32) -> bool {
+    dom::is_connected(node) || dom::parent_node(node).is_some()
+}
+
 /// Get (or create) the JS `Value` for a DOM node. Memoized per node so
 /// identity comparisons (`parent.appendChild(x) === x`) hold.
+///
+/// Tree-owned nodes intern Strong. Parentless orphans intern Weak so
+/// dropping the last JS handle can collect the wrapper without
+/// `reset_bridge()`.
 pub fn element_value(node: u32) -> Value {
-    if let Some(v) = ELEMENT_VALUES.with(|c| c.borrow().get(&node).cloned()) {
-        return v;
+    let cached = ELEMENT_VALUES.with(|c| {
+        let mut map = c.borrow_mut();
+        match map.get(&node) {
+            Some(ElementMemo::Strong(value)) => Some(value.clone()),
+            Some(ElementMemo::Weak(weak)) => match upgrade_realm_object(weak) {
+                Some(value) => {
+                    if js_wrapper_should_pin(node) {
+                        map.insert(node, ElementMemo::Strong(value.clone()));
+                    }
+                    Some(value)
+                }
+                None => {
+                    map.remove(&node);
+                    None
+                }
+            },
+            None => None,
+        }
+    });
+    // Do not purge expandos/listeners on a cache miss. A dead Weak can
+    // still belong to a native node the parser or a template fragment
+    // owns; wiping `template.content` would orphan the real tree. Purge
+    // happens in `release_element_wrapper` after detach when no JS
+    // handle remains.
+    if let Some(value) = cached {
+        return value;
     }
     let value = build_element_value(node);
-    ELEMENT_VALUES.with(|c| c.borrow_mut().insert(node, value.clone()));
+    intern_element_value(node, value.clone());
     value
+}
+
+fn intern_element_value(node: u32, value: Value) {
+    ELEMENT_VALUES.with(|c| {
+        c.borrow_mut().insert(
+            node,
+            if js_wrapper_should_pin(node) {
+                ElementMemo::Strong(value)
+            } else {
+                ElementMemo::Weak(weak_realm_object(&value))
+            },
+        );
+    });
+}
+
+fn walk_subtree(root: u32, visit: &mut impl FnMut(u32)) {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        visit(id);
+        let mut child = dom::first_child(id);
+        while let Some(cid) = child {
+            stack.push(cid);
+            child = dom::next_sibling(cid);
+        }
+    }
+}
+
+fn pin_element_subtree(root: u32) {
+    walk_subtree(root, &mut pin_element_wrapper);
+}
+
+fn pin_element_wrapper(node: u32) {
+    if !js_wrapper_should_pin(node) {
+        return;
+    }
+    ELEMENT_VALUES.with(|c| {
+        let mut map = c.borrow_mut();
+        if let Some(ElementMemo::Weak(weak)) = map.get(&node) {
+            if let Some(value) = upgrade_realm_object(weak) {
+                map.insert(node, ElementMemo::Strong(value));
+            }
+        }
+    });
+}
+
+fn release_element_subtree(root: u32) {
+    walk_subtree(root, &mut release_element_wrapper);
+}
+
+fn release_element_wrapper(node: u32) {
+    if js_wrapper_should_pin(node) {
+        return;
+    }
+    ELEMENT_VALUES.with(|c| {
+        let mut map = c.borrow_mut();
+        match map.remove(&node) {
+            Some(ElementMemo::Strong(value)) => {
+                map.insert(node, ElementMemo::Weak(weak_realm_object(&value)));
+            }
+            Some(ElementMemo::Weak(weak)) => {
+                if weak.strong_count() == 0 {
+                    purge_detached_node_js(node);
+                } else {
+                    map.insert(node, ElementMemo::Weak(weak));
+                }
+            }
+            None => {}
+        }
+    });
+}
+
+fn purge_detached_node_js(node: u32) {
+    ELEMENT_PROPS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
+    STYLE_CACHE.with(|cache| cache.borrow_mut().retain(|(id, _), _| *id != node));
+    LISTENERS.with(|listeners| listeners.borrow_mut().retain(|listener| listener.node != node));
+    NATIVELY_REGISTERED.with(|registered| registered.borrow_mut().retain(|(id, _)| *id != node));
 }
 
 pub(crate) fn create_namespaced_element(namespace: &str, tag: &str) -> u32 {
@@ -1379,6 +1499,7 @@ fn sibling_element(node: u32, next: bool) -> Option<u32> {
 fn clear_children(node: u32) {
     for c in dom::children(node) {
         dom::remove_child(node, c);
+        release_element_subtree(c);
     }
 }
 
@@ -3727,6 +3848,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             let child = arg(&args, 0);
             if let Some(cid) = node_id_of(&child) {
                 dom::append_child(node, cid);
+                pin_element_subtree(cid);
                 if dom::is_connected(cid) {
                     crate::custom_elements_web::connected_subtree(&child);
                 }
@@ -3738,6 +3860,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             if let Some(cid) = node_id_of(&child) {
                 let was_connected = dom::is_connected(cid);
                 dom::remove_child(node, cid);
+                release_element_subtree(cid);
                 if was_connected {
                     crate::custom_elements_web::disconnected_subtree(&child);
                 }
@@ -3752,6 +3875,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                     Some(rid) => dom::insert_before(node, nid, rid),
                     None => dom::append_child(node, nid),
                 }
+                pin_element_subtree(nid);
                 if dom::is_connected(nid) {
                     crate::custom_elements_web::connected_subtree(&new_child);
                 }
@@ -3764,6 +3888,8 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             if let (Some(nid), Some(oid)) = (node_id_of(&new_child), node_id_of(&old_child)) {
                 let old_was_connected = dom::is_connected(oid);
                 dom::replace_child(node, nid, oid);
+                release_element_subtree(oid);
+                pin_element_subtree(nid);
                 if old_was_connected {
                     crate::custom_elements_web::disconnected_subtree(&old_child);
                 }
@@ -3782,6 +3908,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 let element = element_value(node);
                 let was_connected = dom::is_connected(node);
                 dom::remove_child(parent, node);
+                release_element_subtree(node);
                 if was_connected {
                     crate::custom_elements_web::disconnected_subtree(&element);
                 }
@@ -12449,6 +12576,55 @@ mod tests {
         doc.get_property("body")
             .call_method("appendChild", vec![el.clone()]);
         el
+    }
+
+    fn wrapper_weak(value: &Value) -> std::rc::Weak<RefCell<JsObject>> {
+        match value {
+            Value::Object(object) => Rc::downgrade(object),
+            _ => panic!("expected object wrapper"),
+        }
+    }
+
+    #[test]
+    fn create_element_cache_does_not_pin_unreferenced_wrapper() {
+        setup();
+        let el = document_value().call_method("createElement", vec![Value::string("div")]);
+        let weak = wrapper_weak(&el);
+        drop(el);
+        assert!(
+            weak.upgrade().is_none(),
+            "detached createElement wrapper must drop without reset_bridge"
+        );
+    }
+
+    #[test]
+    fn remove_child_drops_unreferenced_wrapper() {
+        setup();
+        let el = create_in_body("div");
+        let weak = wrapper_weak(&el);
+        document_value()
+            .get_property("body")
+            .call_method("removeChild", vec![el.clone()]);
+        drop(el);
+        assert!(
+            weak.upgrade().is_none(),
+            "removed node wrapper must drop when JS does not hold it"
+        );
+    }
+
+    #[test]
+    fn remove_child_keeps_identity_while_js_holds_wrapper() {
+        setup();
+        let el = create_in_body("div");
+        document_value()
+            .get_property("body")
+            .call_method("removeChild", vec![el.clone()]);
+        let id = node_id_of(&el).expect("node id");
+        let again = element_value(id);
+        assert!(
+            matches!((&el, &again), (Value::Object(a), Value::Object(b)) if Rc::ptr_eq(a, b)),
+            "held detached wrapper must keep === identity"
+        );
     }
 
     #[test]

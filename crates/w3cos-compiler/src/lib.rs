@@ -13,6 +13,7 @@ pub mod scope_analysis;
 pub mod style_matcher;
 pub mod ts_transpiler;
 pub mod ts_types;
+pub mod unique_back_edges;
 pub mod w3ir_aot;
 pub mod w3ir_lowering;
 pub mod web_api_skeleton;
