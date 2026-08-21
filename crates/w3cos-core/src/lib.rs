@@ -4,6 +4,7 @@ mod builtins;
 pub mod class;
 pub mod collections;
 pub mod heap;
+pub mod page_arena;
 pub mod js_string;
 pub mod host;
 pub mod host_modules;

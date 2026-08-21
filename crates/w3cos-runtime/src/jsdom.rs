@@ -12554,6 +12554,7 @@ pub fn reset_bridge() {
     SELECTION_VALUE.with(|value| {
         value.borrow_mut().take();
     });
+    w3cos_core::page_arena::reset();
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -12625,6 +12626,22 @@ mod tests {
             matches!((&el, &again), (Value::Object(a), Value::Object(b)) if Rc::ptr_eq(a, b)),
             "held detached wrapper must keep === identity"
         );
+    }
+
+    #[test]
+    fn page_arena_drops_interned_strings_on_reset_bridge() {
+        setup();
+        let unique = "page-arena-nav-key";
+        let interned = w3cos_core::JsString::intern(unique);
+        assert!(interned.page_handle().is_some());
+        assert_eq!(interned.heap_strong_count(), None);
+        let cloned = interned.clone();
+        assert!(interned.ptr_eq(&cloned));
+        assert!(w3cos_core::page_arena::live_handles() >= 1);
+        assert!(w3cos_core::page_arena::allocated_bytes() >= unique.len());
+        reset_bridge();
+        assert_eq!(w3cos_core::page_arena::live_handles(), 0);
+        assert_eq!(w3cos_core::page_arena::allocated_bytes(), 0);
     }
 
     #[test]
