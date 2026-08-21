@@ -846,7 +846,7 @@ mod tests {
             let promise = resolve(vec![settled_value]);
             assert!(matches!(
                 status(&promise),
-                Some(PromiseStatus::Fulfilled(Value::Function(_)))
+                Some(PromiseStatus::Fulfilled(value)) if value.is_function()
             ));
         }
         crate::page_arena::reset();

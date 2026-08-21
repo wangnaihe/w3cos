@@ -17,12 +17,15 @@ use crate::js_string::JsString;
 /// those immediates is a register move of the 8-byte word and does not
 /// touch `Rc`.
 ///
-/// Long `Rc<str>` strings, host/DOM objects, host arrays, and functions stay
-/// as a remaining enum of pointers / `Rc`. Page-local objects created via
-/// [`Value::object`] / literals and constructor / literal arrays created via
-/// [`Value::array`] are `u32` handles packed in [`Immediate`] (clone is a
-/// register move). `array_hole` stays a host `Rc` object. Symbols remain
-/// interned strings (`__w3cos_symbol_…`).
+/// Long `Rc<str>` strings, host/DOM objects, host arrays, and host/DOM
+/// callables stay as a remaining enum of pointers / `Rc`. Page-local objects
+/// created via [`Value::object`] / literals, constructor / literal arrays
+/// created via [`Value::array`], and ordinary JS closures created via
+/// [`Value::function`] / AOT `CreateClosure` are `u32` handles packed in
+/// [`Immediate`] (clone is a register move). `array_hole` stays a host `Rc`
+/// object. Host/DOM callables (`Value::callable`, jsdom call slots) stay
+/// `Value::Object(Rc)` / `Value::Function(Rc)`. Symbols remain interned
+/// strings (`__w3cos_symbol_…`).
 ///
 /// Constructors `Value::Undefined`, `Value::Null`, `Value::Bool`, and
 /// `Value::Number` are unchanged so AOT emission (`num_regs` / `bool_regs`
@@ -57,7 +60,7 @@ impl Default for Value {
 ///
 /// - **Number:** IEEE-754 bits. Every NaN is canonicalized to
 ///   `0x7FF8_0000_0000_0000` so payloads never collide with tags.
-/// - **Tagged** quiet-NaN with low-3-bit tag `QNAN | tag | (payload << 3)`:
+/// - **Tagged** quiet-NaN with low-4-bit tag `QNAN | tag | (payload << 4)`:
 ///   - `1` undefined
 ///   - `2` null
 ///   - `3` false
@@ -65,9 +68,10 @@ impl Default for Value {
 ///   - `5` interned page-arena string (`u32` handle payload)
 ///   - `6` page-arena object (`u32` handle payload)
 ///   - `7` page-arena array (`u32` handle payload)
+///   - `8` page-arena function (`u32` handle payload)
 ///
 /// Long `Rc<str>` and heap pointers are **not** in this word (remaining
-/// `Value` enum).
+/// `Value` enum). Tagged payloads use a 4-bit tag (`HANDLE_SHIFT = 4`).
 #[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct Immediate(u64);
@@ -82,7 +86,9 @@ impl Immediate {
     const TAG_STR: u64 = 5;
     const TAG_OBJ: u64 = 6;
     const TAG_ARR: u64 = 7;
-    const HANDLE_SHIFT: u64 = 3;
+    const TAG_FN: u64 = 8;
+    const TAG_MASK: u64 = 0xF;
+    const HANDLE_SHIFT: u64 = 4;
 
     pub const UNDEFINED: Self = Self(Self::QNAN | Self::TAG_UNDEF);
     pub const NULL: Self = Self(Self::QNAN | Self::TAG_NULL);
@@ -123,6 +129,12 @@ impl Immediate {
         Self(Self::QNAN | Self::TAG_ARR | ((handle as u64) << Self::HANDLE_SHIFT))
     }
 
+    /// Pack a page-arena function handle into the tagged word.
+    #[inline]
+    pub const fn from_function_handle(handle: u32) -> Self {
+        Self(Self::QNAN | Self::TAG_FN | ((handle as u64) << Self::HANDLE_SHIFT))
+    }
+
     /// Raw tagged bits. Documented transmute target.
     #[inline]
     pub const fn bits(self) -> u64 {
@@ -141,7 +153,7 @@ impl Immediate {
 
     #[inline]
     const fn tag(self) -> u64 {
-        self.0 & 7
+        self.0 & Self::TAG_MASK
     }
 
     #[inline]
@@ -226,6 +238,20 @@ impl Immediate {
     #[inline]
     pub const fn array_handle(self) -> Option<u32> {
         if self.is_array_handle() {
+            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn is_function_handle(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_FN
+    }
+
+    #[inline]
+    pub const fn function_handle(self) -> Option<u32> {
+        if self.is_function_handle() {
             Some((self.0 >> Self::HANDLE_SHIFT) as u32)
         } else {
             None
@@ -371,6 +397,37 @@ impl Value {
             },
         }
     }
+
+    /// Page-arena function handle or host `Rc` function.
+    #[inline]
+    pub fn as_function(&self) -> Option<JsFunction> {
+        match self {
+            Value::Imm(imm) => imm
+                .function_handle()
+                .map(crate::page_arena::get_function),
+            Value::Function(function) => Some(function.clone()),
+            _ => None,
+        }
+    }
+
+    /// Packed page-arena function handle, when this value is not a host `Rc`.
+    #[inline]
+    pub fn function_handle(&self) -> Option<u32> {
+        match self {
+            Value::Imm(imm) => imm.function_handle(),
+            _ => None,
+        }
+    }
+
+    fn function_identity_eq(left: &Value, right: &Value) -> bool {
+        match (left.function_handle(), right.function_handle()) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (left.as_function(), right.as_function()) {
+                (Some(a), Some(b)) => a.ptr_eq(&b),
+                _ => false,
+            },
+        }
+    }
 }
 
 /// Shared backing storage for [`Value::Array`].
@@ -488,7 +545,7 @@ impl fmt::Debug for ArrayStorage {
 
 /// View of a [`Value`] with the historical variant names. Used internally
 /// so match sites can stay exhaustive without NaN-box tag tests.
-pub(crate) enum ValueUnpack<'a> {
+pub(crate) enum ValueUnpack {
     Undefined,
     Null,
     Bool(bool),
@@ -496,12 +553,12 @@ pub(crate) enum ValueUnpack<'a> {
     String(JsString),
     Array(Rc<RefCell<ArrayStorage>>),
     Object(Rc<RefCell<crate::JsObject>>),
-    Function(&'a JsFunction),
+    Function(JsFunction),
 }
 
 impl Value {
     #[inline]
-    pub(crate) fn unpack(&self) -> ValueUnpack<'_> {
+    pub(crate) fn unpack(&self) -> ValueUnpack {
         match self {
             Value::Imm(imm) if imm.is_undefined() => ValueUnpack::Undefined,
             Value::Imm(imm) if imm.is_null() => ValueUnpack::Null,
@@ -520,11 +577,16 @@ impl Value {
                     imm.array_handle().expect("array handle"),
                 ),
             ),
+            Value::Imm(imm) if imm.is_function_handle() => ValueUnpack::Function(
+                crate::page_arena::get_function(
+                    imm.function_handle().expect("function handle"),
+                ),
+            ),
             Value::Imm(imm) => ValueUnpack::Number(imm.as_number().unwrap_or(f64::NAN)),
             Value::String(s) => ValueUnpack::String(s.clone()),
             Value::Array(a) => ValueUnpack::Array(Rc::clone(a)),
             Value::Object(o) => ValueUnpack::Object(Rc::clone(o)),
-            Value::Function(f) => ValueUnpack::Function(f),
+            Value::Function(f) => ValueUnpack::Function(f.clone()),
         }
     }
 }
@@ -651,7 +713,7 @@ impl PartialEq for Value {
             (Value::Imm(left), Value::Imm(right)) => left == right,
             (left, right) if Value::array_identity_eq(left, right) => true,
             (left, right) if Value::object_identity_eq(left, right) => true,
-            (Value::Function(_), Value::Function(_)) => false,
+            (left, right) if Value::function_identity_eq(left, right) => true,
             _ => false,
         }
     }
@@ -747,6 +809,16 @@ impl JsFunction {
     /// share the inner closure allocation (clones of one value do).
     pub fn ptr_eq(&self, other: &JsFunction) -> bool {
         Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Strong counts of the three inner `Rc`s (closure, props, allocation).
+    #[cfg(test)]
+    pub(crate) fn strong_counts(&self) -> (usize, usize, usize) {
+        (
+            Rc::strong_count(&self.inner),
+            Rc::strong_count(&self.props),
+            Rc::strong_count(&self.allocation),
+        )
     }
 
     pub(crate) fn downgrade(&self) -> WeakJsFunction {
@@ -973,11 +1045,16 @@ impl Value {
         self.as_array().is_some()
     }
     pub fn is_function(&self) -> bool {
-        matches!(self, Value::Function(_))
+        match self {
+            Value::Function(_) => true,
+            Value::Imm(imm) => imm.is_function_handle(),
+            _ => false,
+        }
     }
     pub fn is_callable(&self) -> bool {
         match self {
             Value::Function(_) => true,
+            Value::Imm(imm) if imm.is_function_handle() => true,
             _ => self
                 .as_object()
                 .is_some_and(|object| object.borrow().call_slot().is_some()),
@@ -1065,7 +1142,9 @@ impl Value {
                 }
             }
             // JS functions are objects: read attached properties.
-            Value::Function(f) => f.get_property(key),
+            _ if self.as_function().is_some() => {
+                self.as_function().expect("function").get_property(key)
+            }
             _ => Value::Undefined,
         }
     }
@@ -1146,7 +1225,9 @@ impl Value {
         match self {
             // JS functions are objects: properties attach to the function
             // value (decorator ids, constructor statics).
-            Value::Function(f) => f.set_property(key, value),
+            _ if self.as_function().is_some() => {
+                self.as_function().expect("function").set_property(key, value)
+            }
             _ => {}
         }
     }
@@ -1166,7 +1247,8 @@ impl Value {
                 }
                 true
             }
-            Value::Function(function) => {
+            _ if self.as_function().is_some() => {
+                let function = self.as_function().expect("function");
                 let mut props = function.props.borrow_mut();
                 props.remove(key);
                 function.allocation.set_bytes(function_heap_bytes(&props));
@@ -1217,7 +1299,9 @@ impl Value {
     }
 
     pub fn function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
-        Value::Function(JsFunction::new(f))
+        let js = JsFunction::new(f);
+        let handle = crate::page_arena::alloc_function(js);
+        Value::Imm(Immediate::from_function_handle(handle))
     }
 
     /// A plain object that is also callable (a JS class / constructor object).
@@ -1235,6 +1319,9 @@ impl Value {
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         match self {
             Value::Function(function) => function.call(this, args),
+            _ if self.as_function().is_some() => {
+                self.as_function().expect("function").call(this, args)
+            }
             _ if self.as_object().is_some() => {
                 let object = self.as_object().expect("object");
                 let slot = object.borrow().call_slot().cloned();
@@ -1387,7 +1474,10 @@ impl Value {
                                 .is_some_and(|value| !is_array_hole(value))
                         })
                 }
-                Value::Function(function) => function.has_own_property(&property),
+                _ if self.as_function().is_some() => self
+                    .as_function()
+                    .expect("function")
+                    .has_own_property(&property),
                 _ => false,
             });
         }
@@ -1402,11 +1492,11 @@ impl Value {
             return result;
         }
         match (self, key) {
-            (Value::Function(_), "call") => {
+            (this, "call") if this.is_function() => {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 return self.call(this_arg, args.into_iter().skip(1).collect());
             }
-            (Value::Function(_), "apply") => {
+            (this, "apply") if this.is_function() => {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 let applied_args = match args.get(1).and_then(Value::as_array) {
                     Some(values) => values
@@ -1419,7 +1509,7 @@ impl Value {
                 };
                 return self.call(this_arg, applied_args);
             }
-            (Value::Function(_), "bind") => {
+            (this, "bind") if this.is_function() => {
                 let target = self.clone();
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 let bound_args: Vec<Value> = args.into_iter().skip(1).collect();
@@ -2551,7 +2641,7 @@ impl Value {
             }
             (left, right) if Value::array_identity_eq(left, right) => true,
             (left, right) if Value::object_identity_eq(left, right) => true,
-            (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
+            (left, right) if Value::function_identity_eq(left, right) => true,
             _ => match (self.as_js_string(), other.as_js_string()) {
                 (Some(a), Some(b)) => a == b,
                 _ => false,
@@ -2575,7 +2665,7 @@ impl Value {
             },
             (left, right) if Value::array_identity_eq(left, right) => true,
             (left, right) if Value::object_identity_eq(left, right) => true,
-            (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
+            (left, right) if Value::function_identity_eq(left, right) => true,
             _ => match (self.as_js_string(), other.as_js_string()) {
                 (Some(a), Some(b)) => a == b,
                 _ => false,
@@ -2838,11 +2928,13 @@ mod tests {
             }
             _ => panic!("Value::object must pack a page-arena handle"),
         }
-        assert!(
-            Value::function(|_, _| Value::Undefined)
-                .as_immediate()
-                .is_none()
-        );
+        match Value::function(|_, _| Value::Undefined) {
+            Value::Imm(word) => {
+                assert!(word.is_function_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+            }
+            _ => panic!("Value::function must pack a page-arena handle"),
+        }
     }
 
     #[test]
@@ -3659,10 +3751,10 @@ mod tests {
                 assert!(js.page_handle().is_some());
                 assert_eq!(js.heap_strong_count(), None);
                 assert_eq!(copied.interned_handle(), js.page_handle());
-                // tag 5 in low 3 bits, handle in bits 3..35
-                assert_eq!(copied.bits() & 7, 5);
+                // tag 5 in low 4 bits, handle in bits 4..36
+                assert_eq!(copied.bits() & 0xF, 5);
                 assert_eq!(
-                    ((copied.bits() >> 3) as u32),
+                    ((copied.bits() >> 4) as u32),
                     js.page_handle().unwrap()
                 );
             }
@@ -3760,6 +3852,37 @@ mod tests {
         assert!(crate::page_arena::live_arrays() >= 1);
         crate::page_arena::reset();
         assert_eq!(crate::page_arena::live_arrays(), 0);
+    }
+
+    #[test]
+    fn function_handle_clone_does_not_increase_rc_and_reset_empties_table() {
+        crate::page_arena::reset();
+        let func = Value::function(|_, _| Value::Number(7.0));
+        match &func {
+            Value::Imm(word) => {
+                assert!(word.is_function_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+                let handle = word.function_handle().unwrap();
+                let js = crate::page_arena::get_function(handle);
+                let before = js.strong_counts();
+                let cloned = func.clone();
+                assert_eq!(js.strong_counts(), before);
+                match cloned {
+                    Value::Imm(copy) => {
+                        assert_eq!(copy.function_handle(), word.function_handle())
+                    }
+                    _ => panic!("clone must stay Imm handle"),
+                }
+                assert_eq!(func.call(Value::Undefined, vec![]).to_number(), 7.0);
+                assert_eq!(cloned.call(Value::Undefined, vec![]).to_number(), 7.0);
+                // tag 8 in low 4 bits
+                assert_eq!(word.bits() & 0xF, 8);
+            }
+            _ => panic!("Value::function must pack a page-arena handle"),
+        }
+        assert!(crate::page_arena::live_functions() >= 1);
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_functions(), 0);
     }
 
     #[test]

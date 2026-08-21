@@ -32,7 +32,9 @@ impl WeakValue {
                     &value.as_object().expect("object"),
                 )))
             }
-            Value::Function(value) => Some(Self::Function(value.downgrade())),
+            _ if value.as_function().is_some() => Some(Self::Function(
+                value.as_function().expect("function").downgrade(),
+            )),
             _ => None,
         }
     }

@@ -1361,7 +1361,7 @@ fn heap_pointer(value: &Value) -> Option<usize> {
 }
 
 fn clone_value(value: &Value, clones: &mut HashMap<usize, Value>) -> Value {
-    if matches!(value, Value::Function(_)) {
+    if value.is_function() {
         crate::throw_value(js_error("DataCloneError: functions cannot be cloned"));
     }
     let pointer = match heap_pointer(value) {

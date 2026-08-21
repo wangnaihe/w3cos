@@ -446,8 +446,10 @@ fn request_value() -> (Value, Rc<RefCell<RequestState>>, ListenerMap) {
 }
 
 fn same_callback(left: &Value, right: &Value) -> bool {
+    if left.is_function() || right.is_function() {
+        return left.strict_eq(right);
+    }
     match (left, right) {
-        (Value::Function(left), Value::Function(right)) => left.ptr_eq(right),
         (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
         _ => left == right,
     }
@@ -3058,7 +3060,7 @@ fn value_to_json_inner(
             CLONE_TAG.into(),
             JsonValue::String("undefined".into()),
         )]))),
-        Value::Function(_) => Err(IndexedDbError {
+        value if value.is_function() => Err(IndexedDbError {
             name: "DataCloneError".into(),
             message: "The value cannot be structured cloned.".into(),
         }),

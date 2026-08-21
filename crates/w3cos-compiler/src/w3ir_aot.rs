@@ -4571,6 +4571,38 @@ fn main() {{
     }
 
     #[test]
+    fn emits_create_closure_through_value_function_intern() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function build() {
+                    const add = (value) => value + 1;
+                    return add;
+                }
+                build;
+            "#,
+            "app:///closure-handles-aot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("build"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "build_aot").unwrap();
+
+        assert!(
+            generated.contains("w3cos_core::Value::function"),
+            "CreateClosure must intern through Value::function: {generated}"
+        );
+        assert!(
+            !generated.contains("Value::Function("),
+            "CreateClosure must not emit Value::Function(Rc): {generated}"
+        );
+        assert!(!generated.contains("w3cos_vm"));
+        assert!(!generated.contains("w3cos_ir"));
+    }
+
+    #[test]
     fn emits_object_methods_and_accessors_as_core_only_w3ir_closures() {
         let module = crate::w3ir_lowering::lower_script(
             r#"

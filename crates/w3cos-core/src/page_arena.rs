@@ -1,13 +1,15 @@
-//! Page-scoped bump arena, interned string handles, and JS object/array slots.
+//! Page-scoped bump arena, interned string handles, and JS object/array/function slots.
 //!
-//! Short interned JS strings, page-local [`crate::JsObject`]s, and constructor
-//! / literal arrays live here so clones copy a `u32` handle instead of
-//! `Rc::clone`. The bump and tables are dropped on [`reset`] (`reset_bridge` /
-//! document navigation). Host / DOM wrappers keep the `Value::Object(Rc)`
-//! path so WeakRef intern can drop unreferenced wrappers without a page
-//! reset. `array_hole` and host arrays keep `Value::Array(Rc)` when they
-//! must be collectable without a page reset. Size-class slabs wait for a
-//! later cut.
+//! Short interned JS strings, page-local [`crate::JsObject`]s, constructor
+//! / literal arrays, and ordinary JS closures created via [`crate::Value::function`]
+//! live here so clones copy a `u32` handle instead of `Rc::clone`. The bump
+//! and tables are dropped on [`reset`] (`reset_bridge` / document navigation).
+//! Host / DOM wrappers keep the `Value::Object(Rc)` path so WeakRef intern
+//! can drop unreferenced wrappers without a page reset. `array_hole` and host
+//! arrays keep `Value::Array(Rc)` when they must be collectable without a
+//! page reset. Host/DOM callables (`Value::callable`, jsdom call slots) stay
+//! on the `Value::Function(Rc)` / object call-slot path. Size-class slabs
+//! wait for a later cut.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -55,6 +57,8 @@ struct PageArena {
     objects: Vec<Option<std::rc::Rc<std::cell::RefCell<crate::JsObject>>>>,
     /// 1-based array slots; index 0 is unused so handle `0` is never valid.
     arrays: Vec<Option<std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>>>>,
+    /// 1-based function slots; index 0 is unused so handle `0` is never valid.
+    functions: Vec<Option<crate::value::JsFunction>>,
 }
 
 impl PageArena {
@@ -74,6 +78,7 @@ impl PageArena {
             allocated: 0,
             objects: vec![None],
             arrays: vec![None],
+            functions: vec![None],
         }
     }
 
@@ -151,6 +156,9 @@ impl PageArena {
         self.arrays.clear();
         self.arrays.push(None);
         self.arrays.shrink_to_fit();
+        self.functions.clear();
+        self.functions.push(None);
+        self.functions.shrink_to_fit();
     }
 
     fn alloc_object(
@@ -189,6 +197,19 @@ impl PageArena {
             panic!("page array handle used after reset_bridge");
         };
         array.clone()
+    }
+
+    fn alloc_function(&mut self, function: crate::value::JsFunction) -> u32 {
+        let handle = self.functions.len() as u32;
+        self.functions.push(Some(function));
+        handle
+    }
+
+    fn get_function(&self, handle: u32) -> crate::value::JsFunction {
+        let Some(Some(function)) = self.functions.get(handle as usize) else {
+            panic!("page function handle used after reset_bridge");
+        };
+        function.clone()
     }
 }
 
@@ -306,6 +327,26 @@ pub fn live_arrays() -> usize {
     ARENA.with(|arena| arena.borrow().arrays.len().saturating_sub(1))
 }
 
+/// Store a page-local JS function. Clone of the returned handle does not
+/// `Rc::clone` the closure / props / allocation.
+pub(crate) fn alloc_function(function: crate::value::JsFunction) -> u32 {
+    ARENA.with(|arena| arena.borrow_mut().alloc_function(function))
+}
+
+/// Resolve a live function handle. Panics if the handle belongs to a
+/// previous page (same contract as interned strings).
+pub(crate) fn get_function(handle: u32) -> crate::value::JsFunction {
+    if handle == 0 {
+        panic!("page function handle used after reset_bridge");
+    }
+    ARENA.with(|arena| arena.borrow().get_function(handle))
+}
+
+/// Live page-local functions (empty after [`reset`]).
+pub fn live_functions() -> usize {
+    ARENA.with(|arena| arena.borrow().functions.len().saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +358,7 @@ mod tests {
         assert_eq!(live_handles(), 0);
         assert_eq!(live_objects(), 0);
         assert_eq!(live_arrays(), 0);
+        assert_eq!(live_functions(), 0);
 
         let a = intern("page-arena-unique-key");
         let b = intern("page-arena-unique-key");
@@ -338,6 +380,7 @@ mod tests {
         assert_eq!(live_handles(), 0);
         assert_eq!(live_objects(), 0);
         assert_eq!(live_arrays(), 0);
+        assert_eq!(live_functions(), 0);
 
         let again = intern("page-arena-unique-key");
         assert_eq!(again.as_str(), "page-arena-unique-key");
@@ -378,5 +421,27 @@ mod tests {
         reset();
         assert_eq!(live_arrays(), 0);
         assert_eq!(std::rc::Rc::strong_count(&rc), 1);
+    }
+
+    #[test]
+    fn function_table_alloc_and_reset_empties() {
+        reset();
+        assert_eq!(live_functions(), 0);
+        let js = crate::value::JsFunction::new(|_, _| crate::Value::Undefined);
+        let before = js.strong_counts();
+        let handle = alloc_function(js.clone());
+        assert_eq!(handle, 1);
+        let after_alloc = js.strong_counts();
+        assert_eq!(after_alloc.0, before.0 + 1);
+        assert_eq!(after_alloc.1, before.1 + 1);
+        assert_eq!(after_alloc.2, before.2 + 1);
+        let resolved = get_function(handle);
+        assert!(resolved.ptr_eq(&js));
+        drop(resolved);
+        assert_eq!(live_functions(), 1);
+        reset();
+        assert_eq!(live_functions(), 0);
+        let after_reset = js.strong_counts();
+        assert_eq!(after_reset, before);
     }
 }

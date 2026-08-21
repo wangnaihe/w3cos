@@ -226,7 +226,9 @@ pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
                 .map(|index| index.to_string())
                 .collect()
         }
-        Value::Function(function) => function
+        _ if source.as_function().is_some() => source
+            .as_function()
+            .expect("function")
             .keys()
             .into_iter()
             .filter(|key| key != "prototype")

@@ -203,10 +203,12 @@ fn runtime_inventory() -> JsonValue {
             }
             _ => continue,
         };
-        let mut statics = match constructor {
-            Value::Function(function) => function.keys(),
-            Value::Object(object) => object.borrow().keys(),
-            _ => Vec::new(),
+        let mut statics = if let Some(function) = constructor.as_function() {
+            function.keys()
+        } else if let Some(object) = constructor.as_object() {
+            object.borrow().keys()
+        } else {
+            Vec::new()
         };
         statics.sort();
         interfaces.insert(

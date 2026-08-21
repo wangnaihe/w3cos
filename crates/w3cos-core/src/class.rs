@@ -113,22 +113,19 @@ pub fn construct(class_value: &Value, args: Vec<Value>) -> Value {
     if class_value.as_object().is_some() {
         return class_value.call(Value::Undefined, args);
     }
-    match class_value {
-        Value::Function(function) => {
-            let instance = Value::object(HashMap::new());
-            let prototype = class_value.get_property("prototype");
-            if prototype.is_object() {
-                set_prototype_of(&instance, &prototype);
-            }
-            let result = function.call(instance.clone(), args);
-            if result.is_object() || result.is_array() || result.is_function() {
-                result
-            } else {
-                instance
-            }
+    if let Some(function) = class_value.as_function() {
+        let instance = Value::object(HashMap::new());
+        let prototype = class_value.get_property("prototype");
+        if prototype.is_object() {
+            set_prototype_of(&instance, &prototype);
         }
-        _ => Value::Undefined,
+        let result = function.call(instance.clone(), args);
+        if result.is_object() || result.is_array() || result.is_function() {
+            return result;
+        }
+        return instance;
     }
+    Value::Undefined
 }
 
 /// `obj instanceof X` — walk `obj`'s prototype chain looking for identity
