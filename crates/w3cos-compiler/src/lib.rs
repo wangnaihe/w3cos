@@ -1088,7 +1088,13 @@ console.log("Done!");
             needs_dom: false,
             needs_std: true,
         };
-        let toml = generate_standalone_cargo_toml(&flags, &CompileOptions { devtools: true });
+        let toml = generate_standalone_cargo_toml(
+            &flags,
+            &CompileOptions {
+                devtools: true,
+                ..CompileOptions::default()
+            },
+        );
         assert!(
             toml.contains(r#"default-features = false, features = ["gpu", "devtools"]"#),
             "ESM applications must link one renderer: {toml}"

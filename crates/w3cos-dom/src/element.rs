@@ -419,11 +419,25 @@ impl Element {
 
     /// W3C `Element.scrollWidth` / `scrollHeight` — full scrollable size.
     pub fn scroll_width(&self, doc: &Document) -> f32 {
-        doc.get_layout_rect(self.id).width
+        self.scroll_extent(doc).0
     }
 
     pub fn scroll_height(&self, doc: &Document) -> f32 {
-        doc.get_layout_rect(self.id).height
+        self.scroll_extent(doc).1
+    }
+
+    fn scroll_extent(&self, doc: &Document) -> (f32, f32) {
+        let root = doc.get_layout_rect(self.id);
+        let mut width = root.width;
+        let mut height = root.height;
+        let mut pending = doc.children_ids(self.id);
+        while let Some(id) = pending.pop() {
+            let rect = doc.get_layout_rect(id);
+            width = width.max(rect.x + rect.width - root.x);
+            height = height.max(rect.y + rect.height - root.y);
+            pending.extend(doc.children_ids(id));
+        }
+        (width.max(0.0), height.max(0.0))
     }
 
     /// W3C `Element.clientWidth` / `clientHeight` — visible content size.

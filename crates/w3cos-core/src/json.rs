@@ -93,10 +93,7 @@ fn walk_reviver(reviver: &Value, key: &str, value: Value) -> Value {
         }
         _ => value,
     };
-    reviver.call(
-        Value::Undefined,
-        vec![Value::from(key.to_string()), value],
-    )
+    reviver.call(Value::Undefined, vec![Value::from(key.to_string()), value])
 }
 
 /// `JSON.stringify(value[, replacer[, space]])`.

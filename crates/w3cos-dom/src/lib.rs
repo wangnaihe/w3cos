@@ -940,6 +940,30 @@ mod tests {
     }
 
     #[test]
+    fn non_leaf_button_paints_its_text_child_once() {
+        let mut doc = Document::new();
+        let button = doc.create_element("button");
+        let label = doc.create_element("span");
+        let label_text = doc.create_text_node("Enter workspace");
+        label.append_child(&mut doc, label_text);
+        let icon = doc.create_element("span");
+        button.append_child(&mut doc, label);
+        button.append_child(&mut doc, icon);
+        doc.body().append_child(&mut doc, button);
+
+        let component = doc.to_component_subtree(button.id);
+        assert!(matches!(
+            component.kind,
+            w3cos_std::ComponentKind::Button { ref label } if label.is_empty()
+        ));
+        assert_eq!(component.children.len(), 2);
+        assert!(matches!(
+            component.children[0].kind,
+            w3cos_std::ComponentKind::Text { ref content } if content == "Enter workspace"
+        ));
+    }
+
+    #[test]
     fn test_stylesheet_specificity_id_beats_class() {
         crate::stylesheet::clear_rules();
         // Class registered after id on purpose — specificity must win over order.

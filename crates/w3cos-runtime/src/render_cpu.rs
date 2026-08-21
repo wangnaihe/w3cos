@@ -1281,17 +1281,7 @@ fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
 }
 
 fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
-    if style.background.a > 0 {
-        let border = style.border_width;
-        LayoutRect {
-            x: rect.x + border,
-            y: rect.y + border,
-            width: (rect.width - border * 2.0).max(1.0),
-            height: (rect.height - border * 2.0).max(0.0),
-        }
-    } else {
-        text_content_box(rect, style)
-    }
+    text_content_box(rect, style)
 }
 
 fn draw_text_ink_in_box(
@@ -1326,7 +1316,6 @@ fn draw_text_ink_in_box(
 fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
     match style.text_align {
         TextAlign::Center | TextAlign::Right => style.text_align,
-        TextAlign::Left if style.background.a > 0 => TextAlign::Center,
         TextAlign::Left
             if matches!(
                 style.white_space,

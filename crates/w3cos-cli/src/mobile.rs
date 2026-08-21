@@ -200,7 +200,15 @@ pub fn mobile_build(
         mobile_build(project_dir, "ios", release, devtools)?;
         return Ok(());
     }
-    let (_, _, entry, safe_area, interactive_widget, _) = read_app_manifest(project_dir);
+    let (_, _, entry, safe_area, interactive_widget, _, manifest_document_base_url) =
+        read_app_manifest(project_dir);
+    let document_base_url = std::env::var("W3COS_DOCUMENT_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or(manifest_document_base_url)
+        .map(|value| w3cos_runtime::document_context::normalize_document_base_url(&value))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     let app_tsx = project_dir.join(&entry);
     if !app_tsx.exists() {
         bail!("missing entry {} in {}", entry, project_dir.display());
@@ -226,7 +234,10 @@ pub fn mobile_build(
         platform,
         safe_area,
         &interactive_widget,
-        &CompileOptions { devtools },
+        &CompileOptions {
+            devtools,
+            document_base_url,
+        },
     )?;
     apply_native_extensions(project_dir, &build_dir, platform)?;
     if preserve_generated_sources {
@@ -508,7 +519,7 @@ pub fn mobile_dev(
     devtools_port: u16,
 ) -> Result<()> {
     let devtools = resolve_mobile_devtools(release, devtools, no_devtools);
-    let (_, bundle_id, entry, _, _, _) = read_app_manifest(project_dir);
+    let (_, bundle_id, entry, _, _, _, _) = read_app_manifest(project_dir);
     let app_tsx = project_dir.join(&entry);
     if !app_tsx.exists() {
         bail!("missing entry {} in {}", entry, project_dir.display());
@@ -635,7 +646,7 @@ fn reinstall_android(project_dir: &Path, release: bool) -> Result<()> {
         .status()
         .context("adb install failed")?;
     if status.success() {
-        let (_, bundle_id, _, _, _, _) = read_app_manifest(project_dir);
+        let (_, bundle_id, _, _, _, _, _) = read_app_manifest(project_dir);
         let _ = Command::new("adb")
             .args(["shell", "am", "force-stop", &bundle_id])
             .status();
@@ -764,7 +775,17 @@ fn xcode_available() -> bool {
         .unwrap_or(false)
 }
 
-fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, String, Vec<String>) {
+fn read_app_manifest(
+    project_dir: &Path,
+) -> (
+    String,
+    String,
+    String,
+    bool,
+    String,
+    Vec<String>,
+    Option<String>,
+) {
     let manifest_path = project_dir.join("w3cos.app.json");
     let mut display_name = "W3cosApp".to_string();
     let mut bundle_id = "com.example.w3cos.app".to_string();
@@ -772,6 +793,7 @@ fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, Strin
     let mut safe_area = true;
     let mut interactive_widget = "resizes-content".to_string();
     let mut permissions = Vec::new();
+    let mut document_base_url = None;
     if let Ok(raw) = fs::read_to_string(&manifest_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
@@ -789,6 +811,9 @@ fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, Strin
             if let Some(iw) = json.get("interactive_widget").and_then(|v| v.as_str()) {
                 interactive_widget = iw.to_string();
             }
+            if let Some(base_url) = json.get("document_base_url").and_then(|v| v.as_str()) {
+                document_base_url = Some(base_url.to_string());
+            }
             if let Some(values) = json.get("permissions").and_then(|v| v.as_array()) {
                 permissions = values
                     .iter()
@@ -804,6 +829,7 @@ fn read_app_manifest(project_dir: &Path) -> (String, String, String, bool, Strin
         safe_area,
         interactive_widget,
         permissions,
+        document_base_url,
     )
 }
 
@@ -1065,7 +1091,7 @@ fn write_ios_plist(
 #[cfg(test)]
 mod tests {
     use super::{
-        manifest_entry_supports_platform, prepare_mobile_build_dir,
+        manifest_entry_supports_platform, prepare_mobile_build_dir, read_app_manifest,
         restore_unchanged_generated_mtimes, snapshot_generated_files,
     };
     use serde_json::json;
@@ -1089,6 +1115,28 @@ mod tests {
             error
                 .to_string()
                 .contains("unsupported manifest entry platform")
+        );
+    }
+
+    #[test]
+    fn mobile_manifest_reads_document_base_url() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("w3cos.app.json"),
+            serde_json::to_vec(&json!({
+                "name": "Example",
+                "bundle_id": "com.example.app",
+                "entry": "app.tsx",
+                "document_base_url": "https://app.example.test/mobile/"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (_, _, _, _, _, _, document_base_url) = read_app_manifest(root.path());
+        assert_eq!(
+            document_base_url.as_deref(),
+            Some("https://app.example.test/mobile/")
         );
     }
 
@@ -1178,7 +1226,7 @@ fn build_ios(project_dir: &Path, build_dir: &Path, release: bool) -> Result<()> 
         bail!("missing iOS binary: {}", bin.display());
     }
 
-    let (display_name, bundle_id, _, _, _, permissions) = read_app_manifest(project_dir);
+    let (display_name, bundle_id, _, _, _, permissions, _) = read_app_manifest(project_dir);
 
     let plist_src = ios_dir.join("W3cosApp/Info.plist");
     write_ios_plist(&plist_src, &display_name, &bundle_id, &permissions)?;

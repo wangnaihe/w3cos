@@ -139,7 +139,7 @@ pub fn write_mobile_project(
             &output_dir.join("src/layout_export.rs"),
             generate_layout_export(tree, safe_area)?,
         )?;
-        let main = generate_ios_main(safe_area, interactive_widget)?;
+        let main = generate_ios_main(safe_area, interactive_widget, options)?;
         write_if_changed(&output_dir.join("src/main.rs"), main)?;
         write_if_changed(
             &output_dir.join("Cargo.toml"),
@@ -148,7 +148,7 @@ pub fn write_mobile_project(
     } else if platform == "harmony" {
         write_if_changed(
             &output_dir.join("src/lib.rs"),
-            generate_harmony_component_lib(&body, interactive_widget)?,
+            generate_harmony_component_lib(&body, interactive_widget, options)?,
         )?;
         write_if_changed(
             &output_dir.join("Cargo.toml"),
@@ -157,7 +157,7 @@ pub fn write_mobile_project(
     } else {
         write_if_changed(
             &output_dir.join("src/lib.rs"),
-            generate_android_lib(&body, interactive_widget)?,
+            generate_android_lib(&body, interactive_widget, options)?,
         )?;
         write_if_changed(
             &output_dir.join("Cargo.toml"),
@@ -198,8 +198,9 @@ pub fn write_mobile_dom_project(
             ""
         };
         let viewport_init = gen_viewport_init(interactive_widget);
+        let document_base_init = gen_document_base_init(options);
         let main = format!(
-            "//! Auto-generated iOS DOM app — do not edit.\nmod esm_bundle;\nmod app_ui;\n\nfn main() {{\n{safe_init}{viewport_init}    if let Err(error) = w3cos_mobile::run_mobile_app_dom(app_ui::setup) {{\n        eprintln!(\"w3cos iOS DOM app failed: {{error:#}}\");\n    }}\n}}\n"
+            "//! Auto-generated iOS DOM app — do not edit.\nmod esm_bundle;\nmod app_ui;\n\nfn main() {{\n{safe_init}{viewport_init}{document_base_init}    if let Err(error) = w3cos_mobile::run_mobile_app_dom(app_ui::setup) {{\n        eprintln!(\"w3cos iOS DOM app failed: {{error:#}}\");\n    }}\n}}\n"
         );
         write_if_changed(&output_dir.join("src/main.rs"), main)?;
         write_if_changed(
@@ -208,8 +209,9 @@ pub fn write_mobile_dom_project(
         )?;
     } else if platform == "harmony" {
         let viewport_init = gen_viewport_init(interactive_widget);
+        let document_base_init = gen_document_base_init(options);
         let lib = format!(
-            "//! Auto-generated HarmonyOS DOM app — do not edit.\nmod esm_bundle;\n{body}\n#[unsafe(no_mangle)]\npub extern \"C\" fn w3cos_harmony_surface_created(window: *mut core::ffi::c_void, width: u32, height: u32) -> i32 {{\n{viewport_init}    w3cos_mobile::harmony::surface_created_dom(window, width, height, setup)\n}}\n\n{harmony_common}",
+            "//! Auto-generated HarmonyOS DOM app — do not edit.\nmod esm_bundle;\n{body}\n#[unsafe(no_mangle)]\npub extern \"C\" fn w3cos_harmony_surface_created(window: *mut core::ffi::c_void, width: u32, height: u32) -> i32 {{\n{viewport_init}{document_base_init}    w3cos_mobile::harmony::surface_created_dom(window, width, height, setup)\n}}\n\n{harmony_common}",
             harmony_common = generate_harmony_common_exports(),
         );
         write_if_changed(&output_dir.join("src/lib.rs"), lib)?;
@@ -219,8 +221,9 @@ pub fn write_mobile_dom_project(
         )?;
     } else {
         let viewport_init = gen_viewport_init(interactive_widget);
+        let document_base_init = gen_document_base_init(options);
         let lib = format!(
-            "//! Auto-generated Android DOM app — do not edit.\nmod esm_bundle;\n{body}\n#[unsafe(no_mangle)]\npub extern \"C\" fn w3cos_app_run() -> i32 {{\n    match w3cos_mobile::run_mobile_app_dom(setup) {{\n        Ok(()) => 0,\n        Err(error) => {{ eprintln!(\"w3cos_app_run failed: {{error:#}}\"); 1 }}\n    }}\n}}\n\n#[cfg(target_os = \"android\")]\n#[unsafe(no_mangle)]\nfn android_main(app: winit::platform::android::activity::AndroidApp) {{\n    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info));\n{viewport_init}    if let Err(error) = w3cos_runtime::run_app_on_android_dom(app, setup) {{\n        log::error!(\"android_main failed: {{error:#}}\");\n    }}\n}}\n"
+            "//! Auto-generated Android DOM app — do not edit.\nmod esm_bundle;\n{body}\n#[unsafe(no_mangle)]\npub extern \"C\" fn w3cos_app_run() -> i32 {{\n{document_base_init}    match w3cos_mobile::run_mobile_app_dom(setup) {{\n        Ok(()) => 0,\n        Err(error) => {{ eprintln!(\"w3cos_app_run failed: {{error:#}}\"); 1 }}\n    }}\n}}\n\n#[cfg(target_os = \"android\")]\n#[unsafe(no_mangle)]\nfn android_main(app: winit::platform::android::activity::AndroidApp) {{\n    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info));\n{viewport_init}{document_base_init}    if let Err(error) = w3cos_runtime::run_app_on_android_dom(app, setup) {{\n        log::error!(\"android_main failed: {{error:#}}\");\n    }}\n}}\n"
         );
         write_if_changed(&output_dir.join("src/lib.rs"), lib)?;
         write_if_changed(
@@ -275,7 +278,23 @@ fn gen_viewport_init(interactive_widget: &str) -> String {
     format!("    w3cos_std::viewport::set_interactive_widget({mode});\n",)
 }
 
-fn generate_ios_main(safe_area: bool, interactive_widget: &str) -> Result<String> {
+fn gen_document_base_init(options: &CompileOptions) -> String {
+    options
+        .document_base_url
+        .as_deref()
+        .map(|url| {
+            format!(
+                "    w3cos_runtime::document_context::configure_document_base_url({url:?}).expect(\"invalid document_base_url\");\n"
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn generate_ios_main(
+    safe_area: bool,
+    interactive_widget: &str,
+    options: &CompileOptions,
+) -> Result<String> {
     let safe_init = if safe_area {
         r#"    w3cos_std::safe_area::set_enabled(true);
 "#
@@ -283,13 +302,14 @@ fn generate_ios_main(safe_area: bool, interactive_widget: &str) -> Result<String
         ""
     };
     let viewport_init = gen_viewport_init(interactive_widget);
+    let document_base_init = gen_document_base_init(options);
     Ok(format!(
         r#"//! Auto-generated iOS app — do not edit.
 mod app_ui;
 use app_ui::build_ui;
 
 fn main() {{
-{safe_init}{viewport_init}    if let Err(e) = w3cos_mobile::run_mobile_app(build_ui) {{
+{safe_init}{viewport_init}{document_base_init}    if let Err(e) = w3cos_mobile::run_mobile_app(build_ui) {{
         eprintln!("w3cos iOS app failed: {{e:#}}");
     }}
 }}
@@ -352,14 +372,19 @@ fn main() {{
     ))
 }
 
-fn generate_android_lib(body: &str, interactive_widget: &str) -> Result<String> {
+fn generate_android_lib(
+    body: &str,
+    interactive_widget: &str,
+    options: &CompileOptions,
+) -> Result<String> {
     let viewport_init = gen_viewport_init(interactive_widget);
+    let document_base_init = gen_document_base_init(options);
     Ok(format!(
         r#"//! Auto-generated Android lib — do not edit.
 {body}
 #[unsafe(no_mangle)]
 pub extern "C" fn w3cos_app_run() -> i32 {{
-    match w3cos_mobile::run_mobile_app(build_ui) {{
+{document_base_init}    match w3cos_mobile::run_mobile_app(build_ui) {{
         Ok(()) => 0,
         Err(e) => {{
             eprintln!("w3cos_app_run failed: {{e:#}}");
@@ -374,7 +399,7 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {{
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
-{viewport_init}    if let Err(e) = w3cos_runtime::run_app_on_android(app, build_ui) {{
+{viewport_init}{document_base_init}    if let Err(e) = w3cos_runtime::run_app_on_android(app, build_ui) {{
         log::error!("android_main failed: {{e:#}}");
     }}
 }}
@@ -382,8 +407,13 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {{
     ))
 }
 
-fn generate_harmony_component_lib(body: &str, interactive_widget: &str) -> Result<String> {
+fn generate_harmony_component_lib(
+    body: &str,
+    interactive_widget: &str,
+    options: &CompileOptions,
+) -> Result<String> {
     let viewport_init = gen_viewport_init(interactive_widget);
+    let document_base_init = gen_document_base_init(options);
     Ok(format!(
         r#"//! Auto-generated HarmonyOS component app — do not edit.
 {body}
@@ -393,7 +423,7 @@ pub extern "C" fn w3cos_harmony_surface_created(
     width: u32,
     height: u32,
 ) -> i32 {{
-{viewport_init}    w3cos_mobile::harmony::surface_created_component(window, width, height, build_ui)
+{viewport_init}{document_base_init}    w3cos_mobile::harmony::surface_created_component(window, width, height, build_ui)
 }}
 
 {common}

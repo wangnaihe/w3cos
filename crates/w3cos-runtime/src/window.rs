@@ -2670,6 +2670,14 @@ impl App {
                 .filter(|hit| hit.is_interactive || dom_host_disabled(&hit.on_click))
                 .map(|hit| {
                     let label = match self.get_kind_at(hit.index) {
+                        Some(ComponentKind::Button { label }) if label.is_empty() => {
+                            match hit.on_click {
+                                EventAction::NativeHost { id, .. } => {
+                                    crate::dom::get_descendant_text_content(id as u32)
+                                }
+                                _ => String::new(),
+                            }
+                        }
                         Some(ComponentKind::Button { label }) => label.clone(),
                         Some(ComponentKind::TextInput { placeholder, .. }) => placeholder.clone(),
                         _ => String::new(),
@@ -3621,7 +3629,6 @@ impl App {
             self.viewport.layout_w,
             self.viewport.layout_h,
         );
-
         // Cull before cloning/scaling styles. The previous raster path skipped
         // offscreen nodes only after allocating a Style and render tuple for
         // every node, which made long lists O(total nodes) in expensive work.
@@ -6321,27 +6328,35 @@ fn build_scroll_info_fast<T: PaintNodeView>(
                         && let Some(owner_rect) = rect_by_index.get(owner).copied().flatten()
                     {
                         let style = flat[owner].paint_style();
-                        if let Some(sticky_scroll_idx) = scroll_ancestor[owner]
-                            && let Some(&sticky_clip) = scrollable_rect.get(&sticky_scroll_idx)
+                        if let Some(sticky_scroll_idx) = nearest_scrollable_ancestor(
+                            scroll_ancestor.get(owner).copied().flatten(),
+                            scroll_ancestor,
+                            &scrollable_rect,
+                        ) && let Some(&sticky_clip) = scrollable_rect.get(&sticky_scroll_idx)
                         {
                             let (sticky_sx, sticky_sy) = offsets
                                 .get(&sticky_scroll_idx)
                                 .copied()
                                 .unwrap_or((0.0, 0.0));
-                            let top = style
-                                .top
-                                .resolve(
-                                    sticky_clip.height,
-                                    16.0,
-                                    style.font_size,
-                                    viewport_w,
-                                    viewport_h,
-                                )
-                                .unwrap_or(0.0);
-                            let sticky_effective_y = clamp_sticky_scroll_offset(
-                                owner_rect.y,
-                                sticky_clip.y,
+                            let top = style.top.resolve(
+                                sticky_clip.height,
+                                16.0,
+                                style.font_size,
+                                viewport_w,
+                                viewport_h,
+                            );
+                            let bottom = style.bottom.resolve(
+                                sticky_clip.height,
+                                16.0,
+                                style.font_size,
+                                viewport_w,
+                                viewport_h,
+                            );
+                            let sticky_effective_y = sticky_scroll_offset(
+                                owner_rect,
+                                sticky_clip,
                                 top,
+                                bottom,
                                 sticky_sy,
                             );
                             if sticky_scroll_idx == *anc_idx {
@@ -6393,29 +6408,37 @@ fn build_scroll_info_fast<T: PaintNodeView>(
                         sy = 0.0;
                         effective_clip = clip;
                         let style = flat[owner].paint_style();
-                        if let Some(sticky_scroll_idx) = scroll_ancestor[owner]
-                            && let Some(&sticky_clip) = scrollable_rect.get(&sticky_scroll_idx)
+                        if let Some(sticky_scroll_idx) = nearest_scrollable_ancestor(
+                            scroll_ancestor.get(owner).copied().flatten(),
+                            scroll_ancestor,
+                            &scrollable_rect,
+                        ) && let Some(&sticky_clip) = scrollable_rect.get(&sticky_scroll_idx)
                         {
                             let (sticky_sx, sticky_sy) = offsets
                                 .get(&sticky_scroll_idx)
                                 .copied()
                                 .unwrap_or((0.0, 0.0));
-                            let top = style
-                                .top
-                                .resolve(
-                                    sticky_clip.height,
-                                    16.0,
-                                    style.font_size,
-                                    viewport_w,
-                                    viewport_h,
-                                )
-                                .unwrap_or(0.0);
+                            let top = style.top.resolve(
+                                sticky_clip.height,
+                                16.0,
+                                style.font_size,
+                                viewport_w,
+                                viewport_h,
+                            );
+                            let bottom = style.bottom.resolve(
+                                sticky_clip.height,
+                                16.0,
+                                style.font_size,
+                                viewport_w,
+                                viewport_h,
+                            );
                             sx = sticky_sx;
                             sy =
-                                clamp_sticky_scroll_offset(
-                                    owner_rect.y,
-                                    sticky_clip.y,
+                                sticky_scroll_offset(
+                                    owner_rect,
+                                    sticky_clip,
                                     top,
+                                    bottom,
                                     sticky_sy,
                                 ) - overscroll_displacement_y(overscroll_states, sticky_scroll_idx);
                             effective_clip.x -= sx;
@@ -6450,6 +6473,20 @@ fn accumulated_outer_scroll_transform(
         ancestor = scroll_ancestor.get(index).copied().flatten();
     }
     (sx, sy)
+}
+
+fn nearest_scrollable_ancestor(
+    mut ancestor: Option<usize>,
+    scroll_ancestor: &[Option<usize>],
+    scrollable_rect: &HashMap<usize, LayoutRect>,
+) -> Option<usize> {
+    while let Some(index) = ancestor {
+        if scrollable_rect.contains_key(&index) {
+            return Some(index);
+        }
+        ancestor = scroll_ancestor.get(index).copied().flatten();
+    }
+    None
 }
 
 fn outer_scrollport_visual_clip(
@@ -6499,13 +6536,21 @@ fn overscroll_displacement_y(states: &HashMap<usize, OverscrollState>, scroll_id
         .unwrap_or(0.0)
 }
 
-fn clamp_sticky_scroll_offset(
-    owner_y: f32,
-    scrollport_y: f32,
-    sticky_top: f32,
+fn sticky_scroll_offset(
+    owner: LayoutRect,
+    scrollport: LayoutRect,
+    sticky_top: Option<f32>,
+    sticky_bottom: Option<f32>,
     scroll_y: f32,
 ) -> f32 {
-    scroll_y.min((owner_y - scrollport_y - sticky_top).max(0.0))
+    if let Some(top) = sticky_top {
+        return scroll_y.min((owner.y - scrollport.y - top).max(0.0));
+    }
+    if let Some(bottom) = sticky_bottom {
+        let bottom_limit = scrollport.y + scrollport.height - bottom - owner.height;
+        return scroll_y.max(owner.y - bottom_limit);
+    }
+    scroll_y
 }
 
 // ---------------------------------------------------------------------------
@@ -8855,8 +8900,66 @@ mod scroll_physics_tests {
 
     #[test]
     fn sticky_scroll_follows_flow_then_clamps_to_top_inset() {
-        assert_eq!(clamp_sticky_scroll_offset(180.0, 80.0, 12.0, 40.0), 40.0);
-        assert_eq!(clamp_sticky_scroll_offset(180.0, 80.0, 12.0, 140.0), 88.0);
+        let owner = LayoutRect {
+            x: 0.0,
+            y: 180.0,
+            width: 100.0,
+            height: 40.0,
+        };
+        let scrollport = LayoutRect {
+            x: 0.0,
+            y: 80.0,
+            width: 100.0,
+            height: 200.0,
+        };
+        assert_eq!(
+            sticky_scroll_offset(owner, scrollport, Some(12.0), None, 40.0),
+            40.0
+        );
+        assert_eq!(
+            sticky_scroll_offset(owner, scrollport, Some(12.0), None, 140.0),
+            88.0
+        );
+    }
+
+    #[test]
+    fn sticky_bottom_pins_to_scrollport_end_then_follows_flow() {
+        let owner = LayoutRect {
+            x: 0.0,
+            y: 500.0,
+            width: 100.0,
+            height: 48.0,
+        };
+        let scrollport = LayoutRect {
+            x: 0.0,
+            y: 100.0,
+            width: 100.0,
+            height: 300.0,
+        };
+        assert_eq!(
+            sticky_scroll_offset(owner, scrollport, None, Some(0.0), 0.0),
+            148.0
+        );
+        assert_eq!(
+            sticky_scroll_offset(owner, scrollport, None, Some(0.0), 240.0),
+            240.0
+        );
+    }
+
+    #[test]
+    fn sticky_skips_clip_only_ancestor_to_find_scrollport() {
+        let scrollport = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let scrollable = HashMap::from([(1, scrollport)]);
+        let ancestors = vec![None, None, Some(1), Some(2)];
+        assert_eq!(
+            nearest_scrollable_ancestor(Some(2), &ancestors, &scrollable),
+            Some(1)
+        );
     }
 
     #[test]

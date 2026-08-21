@@ -255,6 +255,10 @@ pub fn get_text_content(node: u32) -> Option<String> {
     })
 }
 
+pub fn get_descendant_text_content(node: u32) -> String {
+    with_document(|doc| doc.descendant_text_content(NodeId::from_u32(node)))
+}
+
 pub fn set_style_property(node: u32, prop: &str, value: &str) {
     let old_value = get_attribute(node, "style");
     with_document_mut(|doc| {

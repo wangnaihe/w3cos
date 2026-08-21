@@ -18,6 +18,25 @@ cd MyApp
 w3cos mobile build --platform both --release
 ```
 
+### Packaged document origin
+
+Packaged modules keep their `w3cos://` module identity, but applications that
+use browser-relative network URLs can declare an HTTP(S) document base in
+`w3cos.app.json`:
+
+```json
+{
+  "entry": "app.tsx",
+  "document_base_url": "https://app.example.com/"
+}
+```
+
+W3COS configures `window.location`, relative `fetch()`/resource resolution,
+cookies, CORS and same-origin checks from that URL before application code
+runs. The value must be an absolute `http` or `https` URL without credentials,
+a query or a fragment. `W3COS_DOCUMENT_BASE_URL` provides a build-time override
+for local and CI validation without changing the application manifest.
+
 ## Android
 
 - **Shell:** `templates/android/` — NativeActivity + `libw3cos_mobile_app.so`

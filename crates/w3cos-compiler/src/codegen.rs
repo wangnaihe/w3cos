@@ -71,10 +71,12 @@ fn gen_signal_inits(signals: &[SignalDecl]) -> String {
 }
 
 /// Options that influence generated Cargo.toml / runtime features.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CompileOptions {
     /// Enable Chrome DevTools Protocol (CDP) server in w3cos-runtime.
     pub devtools: bool,
+    /// HTTP(S) base URL for relative browser APIs in a packaged application.
+    pub document_base_url: Option<String>,
 }
 
 pub(crate) const GENERATED_RELEASE_PROFILE: &str = r#"
@@ -539,6 +541,15 @@ fn gen_spacing(s: Spacing) -> String {
         Spacing::SafeAreaInset(SafeAreaEdge::Left) => {
             "Spacing::SafeAreaInset(SafeAreaEdge::Left)".to_string()
         }
+        Spacing::Maximum { px, safe_area } => format!(
+            "Spacing::Maximum {{ px: {px}_f32, safe_area: {} }}",
+            match safe_area {
+                SafeAreaEdge::Top => "SafeAreaEdge::Top",
+                SafeAreaEdge::Right => "SafeAreaEdge::Right",
+                SafeAreaEdge::Bottom => "SafeAreaEdge::Bottom",
+                SafeAreaEdge::Left => "SafeAreaEdge::Left",
+            }
+        ),
         Spacing::KeyboardInsetHeight => "Spacing::KeyboardInsetHeight".to_string(),
         Spacing::Composite {
             px,
@@ -689,6 +700,16 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     }
     if let Some(br) = s.border_radius {
         fields.push(format!("border_radius: {br}_f32"));
+    }
+    for (field, value) in [
+        ("border_top_left_radius", s.border_top_left_radius),
+        ("border_top_right_radius", s.border_top_right_radius),
+        ("border_bottom_right_radius", s.border_bottom_right_radius),
+        ("border_bottom_left_radius", s.border_bottom_left_radius),
+    ] {
+        if let Some(value) = value {
+            fields.push(format!("{field}: Some({value}_f32)"));
+        }
     }
     if let Some(bw) = s.border_width {
         fields.push(format!("border_width: {bw}_f32"));
@@ -1069,6 +1090,7 @@ fn gen_text_overflow(s: &str) -> String {
 fn gen_word_break(s: &str) -> String {
     match s {
         "break-all" | "breakAll" => "WordBreak::BreakAll".to_string(),
+        "break-word" | "breakWord" | "anywhere" => "WordBreak::BreakWord".to_string(),
         "keep-all" | "keepAll" => "WordBreak::KeepAll".to_string(),
         _ => "WordBreak::Normal".to_string(),
     }
@@ -1384,7 +1406,15 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     if let Some(ref bg) = style.background {
         out.push_str(&sp("background-color", bg));
     }
-    if let Some(br) = style.border_radius {
+    if let Some(values) = compiler_border_radii(style) {
+        out.push_str(&sp(
+            "border-radius",
+            &format!(
+                "{}px {}px {}px {}px",
+                values[0], values[1], values[2], values[3]
+            ),
+        ));
+    } else if let Some(br) = style.border_radius {
         out.push_str(&sp("border-radius", &format!("{br}px")));
     }
     if let Some(bw) = style.border_width {
@@ -1499,6 +1529,20 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     }
 }
 
+fn compiler_border_radii(style: &StyleDecl) -> Option<[f32; 4]> {
+    let fallback = style.border_radius.unwrap_or(0.0);
+    let values = [
+        style.border_top_left_radius,
+        style.border_top_right_radius,
+        style.border_bottom_right_radius,
+        style.border_bottom_left_radius,
+    ];
+    values
+        .iter()
+        .any(Option::is_some)
+        .then(|| values.map(|value| value.unwrap_or(fallback)))
+}
+
 fn dom_edge_shorthand_css(
     all: Option<Spacing>,
     top: Option<Spacing>,
@@ -1545,6 +1589,10 @@ fn dom_spacing_css(value: Spacing) -> String {
                 SafeAreaEdge::Bottom => "bottom",
                 SafeAreaEdge::Left => "left",
             }
+        ),
+        Spacing::Maximum { px, safe_area } => format!(
+            "max({px}px, {})",
+            dom_spacing_css(Spacing::SafeAreaInset(safe_area))
         ),
         Spacing::KeyboardInsetHeight => "env(keyboard-inset-height)".to_string(),
         Spacing::Composite {
@@ -1602,7 +1650,10 @@ mod tests {
 
     #[test]
     fn codegen_cargo_toml_devtools_feature() {
-        let opts = CompileOptions { devtools: true };
+        let opts = CompileOptions {
+            devtools: true,
+            ..CompileOptions::default()
+        };
         let toml = generate_cargo_toml(std::path::Path::new("."), &opts).unwrap();
         assert!(
             toml.contains(r#"default-features = false, features = ["gpu", "devtools"]"#),

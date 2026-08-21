@@ -11,7 +11,7 @@ use skia_safe::canvas::SaveLayerRec;
 use skia_safe::{
     AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, FontStyle,
     ImageFilter, ImageInfo, MaskFilter, Paint, PathBuilder, RRect, Rect, Surface, TileMode,
-    Typeface, color_filters, gradient_shader, image_filters, images, paint,
+    Typeface, Vector, color_filters, gradient_shader, image_filters, images, paint,
 };
 use w3cos_std::SvgPathCommand;
 use w3cos_std::component::ComponentKind;
@@ -430,15 +430,20 @@ fn render_node(
                 false,
             ));
         }
-        draw_round_rect(canvas, shadow_rect, style.border_radius + spread, &paint);
+        draw_rounded_rect(
+            canvas,
+            shadow_rect,
+            style.border_corner_radii().map(|radius| radius + spread),
+            &paint,
+        );
     }
 
     let bg = style.background;
     if bg.a > 0 {
-        draw_round_rect(
+        draw_rounded_rect(
             canvas,
             rect,
-            style.border_radius,
+            style.border_corner_radii(),
             &color_paint(bg, style.opacity),
         );
     }
@@ -458,7 +463,7 @@ fn render_node(
         border.set_style(paint::Style::Stroke);
         border.set_stroke_width(style.border_width);
         let inset = style.border_width * 0.5;
-        draw_round_rect(
+        draw_rounded_rect(
             canvas,
             LayoutRect {
                 x: rect.x + inset,
@@ -466,7 +471,9 @@ fn render_node(
                 width: (rect.width - style.border_width).max(0.0),
                 height: (rect.height - style.border_width).max(0.0),
             },
-            style.border_radius,
+            style
+                .border_corner_radii()
+                .map(|radius| (radius - inset).max(0.0)),
             &border,
         );
     } else if has_edge_border {
@@ -1097,8 +1104,7 @@ fn draw_text_line(
     let paint = color_paint(color, opacity);
     let mut cursor_x = x;
     for run in css_font_runs(text, typeface, style) {
-        let mut font = Font::new(run.typeface, font_size);
-        font.set_embolden(style.font_weight >= 600);
+        let font = Font::new(run.typeface, font_size);
         canvas.draw_str(run.text, (cursor_x, top + font_size), &font, &paint);
         cursor_x += font.measure_str(run.text, Some(&paint)).0;
     }
@@ -1124,8 +1130,7 @@ fn measure_skia_text_ink_bounds(
         |style| css_font_runs(text, typeface, style),
     );
     for run in runs {
-        let mut font = Font::new(run.typeface, font_size);
-        font.set_embolden(font_weight >= 600);
+        let font = Font::new(run.typeface, font_size);
         let (advance, bounds) = font.measure_str(run.text, None);
         if bounds.width() > 0.0 || bounds.height() > 0.0 {
             saw_ink = true;
@@ -1159,8 +1164,7 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
         let mut width = 0.0_f32;
         let mut line_spacing = 0.0_f32;
         for run in css_font_runs(text, primary, style) {
-            let mut font = Font::new(run.typeface, style.font_size);
-            font.set_embolden(style.font_weight >= 600);
+            let font = Font::new(run.typeface, style.font_size);
             width += font.measure_str(run.text, None).0;
             let (spacing, metrics) = font.metrics();
             // CSS `normal` uses the font's full em line box, not only Skia's
@@ -1239,7 +1243,7 @@ fn fallback_font_runs<'a>(
 }
 
 fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16) -> Typeface {
-    if primary.unichar_to_glyph(character as i32) != 0 {
+    if font_weight < 600 && primary.unichar_to_glyph(character as i32) != 0 {
         return primary.clone();
     }
 
@@ -1254,7 +1258,7 @@ fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16)
                 FontStyle::normal()
             };
             let matched = FontMgr::default().match_family_style_character(
-                "",
+                &primary.family_name(),
                 style,
                 &["en", "zh-Hans"],
                 character as i32,
@@ -1284,17 +1288,7 @@ fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
 }
 
 fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
-    if style.background.a > 0 || style.background_image.is_some() {
-        let border = style.border_width;
-        LayoutRect {
-            x: rect.x + border,
-            y: rect.y + border,
-            width: (rect.width - border * 2.0).max(1.0),
-            height: (rect.height - border * 2.0).max(0.0),
-        }
-    } else {
-        text_content_box(rect, style)
-    }
+    text_content_box(rect, style)
 }
 
 fn draw_background_image(
@@ -1420,6 +1414,14 @@ fn draw_round_rect(canvas: &Canvas, rect: LayoutRect, radius: f32, paint: &Paint
     canvas.draw_round_rect(to_rect(rect), radius.max(0.0), radius.max(0.0), paint);
 }
 
+fn draw_rounded_rect(canvas: &Canvas, rect: LayoutRect, radii: [f32; 4], paint: &Paint) {
+    let radii = radii.map(|radius| {
+        let radius = radius.max(0.0);
+        Vector::new(radius, radius)
+    });
+    canvas.draw_rrect(RRect::new_rect_radii(to_rect(rect), &radii), paint);
+}
+
 fn to_rect(rect: LayoutRect) -> Rect {
     Rect::from_xywh(rect.x, rect.y, rect.width.max(0.0), rect.height.max(0.0))
 }
@@ -1504,6 +1506,30 @@ mod tests {
         let mut style = Style::default();
         style.justify_content = JustifyContent::Center;
         assert_eq!(effective_text_align(&style), TextAlign::Center);
+    }
+
+    #[test]
+    fn text_with_background_still_paints_inside_css_padding() {
+        let style = Style {
+            background: w3cos_std::color::Color::WHITE,
+            border_width: 1.0,
+            padding: w3cos_std::style::Edges::xy(14.0, 11.0),
+            ..Style::default()
+        };
+        let content = text_paint_box(
+            LayoutRect {
+                x: 20.0,
+                y: 30.0,
+                width: 200.0,
+                height: 80.0,
+            },
+            &style,
+        );
+
+        assert_eq!(content.x, 35.0);
+        assert_eq!(content.y, 42.0);
+        assert_eq!(content.width, 170.0);
+        assert_eq!(content.height, 56.0);
     }
 
     #[test]
@@ -1633,6 +1659,19 @@ mod tests {
         assert_eq!(runs[1].text, "丹丹");
         assert_eq!(runs[2].text, "B");
         assert_eq!(runs[1].typeface.unique_id(), fallback.unique_id());
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    #[test]
+    fn bold_cjk_uses_a_weighted_system_face() {
+        let primary = FontMgr::default()
+            .match_family_style("PingFang SC", FontStyle::normal())
+            .expect("PingFang regular");
+        let regular = typeface_for_character(&primary, '入', 400);
+        let bold = typeface_for_character(&primary, '入', 700);
+
+        assert_ne!(regular.unique_id(), bold.unique_id());
+        assert!(bold.font_style().weight() > regular.font_style().weight());
     }
 
     #[cfg(any(target_os = "ios", target_os = "macos"))]

@@ -83,6 +83,14 @@ pub struct Style {
     pub font_size: f32,
     pub font_weight: u16,
     pub border_radius: f32,
+    #[serde(default)]
+    pub border_top_left_radius: Option<f32>,
+    #[serde(default)]
+    pub border_top_right_radius: Option<f32>,
+    #[serde(default)]
+    pub border_bottom_right_radius: Option<f32>,
+    #[serde(default)]
+    pub border_bottom_left_radius: Option<f32>,
     pub border_width: f32,
     pub border_color: Color,
     #[serde(default)]
@@ -213,6 +221,10 @@ impl Default for Style {
             font_size: 16.0,
             font_weight: 400,
             border_radius: 0.0,
+            border_top_left_radius: None,
+            border_top_right_radius: None,
+            border_bottom_right_radius: None,
+            border_bottom_left_radius: None,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
             border_top_width: None,
@@ -259,7 +271,6 @@ impl Default for Style {
         }
     }
 }
-
 
 impl Style {
     /// Equality that ignores `display`.
@@ -321,6 +332,10 @@ impl Style {
             font_size,
             font_weight,
             border_radius,
+            border_top_left_radius,
+            border_top_right_radius,
+            border_bottom_right_radius,
+            border_bottom_left_radius,
             border_width,
             border_color,
             border_top_width,
@@ -410,6 +425,10 @@ impl Style {
             font_size: font_size_b,
             font_weight: font_weight_b,
             border_radius: border_radius_b,
+            border_top_left_radius: border_top_left_radius_b,
+            border_top_right_radius: border_top_right_radius_b,
+            border_bottom_right_radius: border_bottom_right_radius_b,
+            border_bottom_left_radius: border_bottom_left_radius_b,
             border_width: border_width_b,
             border_color: border_color_b,
             border_top_width: border_top_width_b,
@@ -497,6 +516,10 @@ impl Style {
             && font_size == font_size_b
             && font_weight == font_weight_b
             && border_radius == border_radius_b
+            && border_top_left_radius == border_top_left_radius_b
+            && border_top_right_radius == border_top_right_radius_b
+            && border_bottom_right_radius == border_bottom_right_radius_b
+            && border_bottom_left_radius == border_bottom_left_radius_b
             && border_width == border_width_b
             && border_color == border_color_b
             && border_top_width == border_top_width_b
@@ -661,6 +684,11 @@ pub enum Spacing {
     Vh(f32),
     Auto,
     SafeAreaInset(SafeAreaEdge),
+    /// `max(Npx, env(safe-area-inset-*))` — CSS safe-area fallback semantics.
+    Maximum {
+        px: f32,
+        safe_area: SafeAreaEdge,
+    },
     /// `env(keyboard-inset-height)` — virtual keyboard occlusion (logical px).
     KeyboardInsetHeight,
     /// `calc(Npx + env(...))` — one optional `safe-area` and/or `keyboard-inset` term.
@@ -686,6 +714,7 @@ impl Spacing {
             Spacing::Em(v) => *v * 16.0,
             Spacing::Vw(_) | Spacing::Vh(_) => 0.0,
             Spacing::SafeAreaInset(edge) => insets.value(*edge),
+            Spacing::Maximum { px, safe_area } => px.max(insets.value(*safe_area)),
             Spacing::KeyboardInsetHeight => keyboard_bottom,
             Spacing::Composite {
                 px,
@@ -762,6 +791,17 @@ impl Edges {
 }
 
 impl Style {
+    /// CSS corner radii in top-left, top-right, bottom-right, bottom-left order.
+    pub fn border_corner_radii(&self) -> [f32; 4] {
+        [
+            self.border_top_left_radius.unwrap_or(self.border_radius),
+            self.border_top_right_radius.unwrap_or(self.border_radius),
+            self.border_bottom_right_radius
+                .unwrap_or(self.border_radius),
+            self.border_bottom_left_radius.unwrap_or(self.border_radius),
+        ]
+    }
+
     pub fn padding_lengths(&self) -> EdgeLengths {
         self.padding.resolve_lengths(&crate::safe_area::current())
     }
@@ -1252,5 +1292,15 @@ mod eq_except_display_tests {
     fn pointer_equal_styles_are_equal() {
         let a = Style::default();
         assert!(a.eq_except_display(&a));
+    }
+
+    #[test]
+    fn corner_radii_participate_in_display_independent_equality() {
+        let mut a = Style::default();
+        let mut b = Style::default();
+        a.display = Display::None;
+        b.display = Display::Flex;
+        b.border_top_left_radius = Some(4.0);
+        assert!(!a.eq_except_display(&b));
     }
 }

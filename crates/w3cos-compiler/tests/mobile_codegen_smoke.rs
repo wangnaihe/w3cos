@@ -87,7 +87,10 @@ fn mobile_android_devtools_cargo_feature() {
         "android",
         false,
         "resizes-content",
-        &w3cos_compiler::CompileOptions { devtools: true },
+        &w3cos_compiler::CompileOptions {
+            devtools: true,
+            ..w3cos_compiler::CompileOptions::default()
+        },
     )
     .expect("write android project");
 
@@ -141,7 +144,10 @@ fn mobile_harmony_dom_writes_surface_entry() {
         "harmony",
         false,
         "overlays-content",
-        &w3cos_compiler::CompileOptions { devtools: true },
+        &w3cos_compiler::CompileOptions {
+            devtools: true,
+            ..w3cos_compiler::CompileOptions::default()
+        },
     )
     .expect("write HarmonyOS DOM project");
 
@@ -151,6 +157,36 @@ fn mobile_harmony_dom_writes_surface_entry() {
     assert!(lib_rs.contains("let _ = crate::esm_bundle::run_entry_async();"));
     let cargo = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
     assert!(cargo.contains(r#"features = ["skia", "devtools"]"#));
+}
+
+#[test]
+fn mobile_dom_configures_declared_document_base_url_before_app_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    mobile_codegen::write_mobile_dom_project(
+        "pub fn run_entry_async() {}",
+        dir.path(),
+        "ios",
+        false,
+        "resizes-content",
+        &w3cos_compiler::CompileOptions {
+            document_base_url: Some("https://app.example.test/mobile/".to_string()),
+            ..w3cos_compiler::CompileOptions::default()
+        },
+    )
+    .expect("write iOS DOM project");
+
+    let main_rs = std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
+    let configure = main_rs
+        .find("configure_document_base_url")
+        .expect("document base URL configuration");
+    let run = main_rs
+        .find("run_mobile_app_dom")
+        .expect("mobile DOM runner");
+    assert!(
+        configure < run,
+        "document base URL must be configured before setup"
+    );
+    assert!(main_rs.contains("https://app.example.test/mobile/"));
 }
 
 #[test]

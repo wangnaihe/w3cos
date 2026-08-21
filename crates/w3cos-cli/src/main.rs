@@ -187,7 +187,10 @@ fn main() -> Result<()> {
                 strip,
                 lto,
                 &target,
-                CompileOptions { devtools },
+                CompileOptions {
+                    devtools,
+                    ..CompileOptions::default()
+                },
             )?;
         }
         Commands::Run {
@@ -204,7 +207,10 @@ fn main() -> Result<()> {
                 None,
                 false,
                 "native",
-                CompileOptions { devtools },
+                CompileOptions {
+                    devtools,
+                    ..CompileOptions::default()
+                },
             )?;
             println!("▶  Running...");
             let config = dev::DevConfig {
@@ -517,11 +523,12 @@ fn dev_watch_native(input: &PathBuf, config: &dev::DevConfig) -> Result<()> {
     let bin = tmp.join("target").join("debug").join("w3cos-app");
     let options = CompileOptions {
         devtools: config.devtools,
+        ..CompileOptions::default()
     };
 
     loop {
         println!("⚡ Building...");
-        if let Err(e) = build(&input, &bin, false, None, false, "native", options) {
+        if let Err(e) = build(&input, &bin, false, None, false, "native", options.clone()) {
             eprintln!("❌ Build failed: {e}");
             dev::wait_for_change(&watch_paths, &mut last_mtimes);
             continue;

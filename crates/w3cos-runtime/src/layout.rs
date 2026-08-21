@@ -8,6 +8,7 @@ use w3cos_std::style::{
     AlignItems as WAlign, AlignSelf as WAlignSelf, BoxSizing as WBoxSizing, Dimension as WDim,
     Display as WDisplay, FlexDirection as WDir, FlexWrap as WWrap, JustifyContent as WJustify,
     Overflow as WOverflow, Position as WPos, Spacing as WSpacing, WhiteSpace as WWhiteSpace,
+    WordBreak as WWordBreak,
 };
 use w3cos_std::{Component, ComponentKind};
 
@@ -33,6 +34,7 @@ struct TextMeasureKey {
     padding_left: u32,
     min_width: Option<u32>,
     white_space: u8,
+    word_break: u8,
 }
 
 #[derive(Default)]
@@ -389,6 +391,12 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WWhiteSpace::Pre => 2,
             WWhiteSpace::PreWrap => 3,
             WWhiteSpace::PreLine => 4,
+        },
+        word_break: match style.word_break {
+            WWordBreak::Normal => 0,
+            WWordBreak::BreakAll => 1,
+            WWordBreak::BreakWord => 2,
+            WWordBreak::KeepAll => 3,
         },
     }
 }
@@ -872,7 +880,16 @@ fn build_taffy_tree(
                         if let WDim::Px(mw) = comp.style.min_width {
                             w = w.max(mw);
                         }
-                        (Dimension::length(w), Dimension::auto())
+                        let min_width = if matches!(
+                            comp.style.word_break,
+                            WWordBreak::BreakAll | WWordBreak::BreakWord
+                        ) {
+                            let padding = comp.style.padding_lengths();
+                            comp.style.font_size + padding.left + padding.right
+                        } else {
+                            w
+                        };
+                        (Dimension::length(min_width), Dimension::length(w))
                     } else if matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid))
                         || matches!(parent_direction, Some(WDir::Column | WDir::ColumnReverse))
                     {
@@ -937,7 +954,7 @@ fn build_taffy_tree(
             ),
         };
 
-        let leaf_style = Style {
+        let mut leaf_style = Style {
             size: Size {
                 width: size_w,
                 height: size.height,
@@ -948,6 +965,21 @@ fn build_taffy_tree(
             },
             ..style
         };
+        if matches!(comp.kind, ComponentKind::Text { .. })
+            && matches!(
+                comp.style.word_break,
+                WWordBreak::BreakAll | WWordBreak::BreakWord
+            )
+            && matches!(comp.style.max_width, WDim::Auto)
+        {
+            // Breakable shrink-to-fit text may use its max-content width, but
+            // the used width is still capped by the containing block.
+            leaf_style.max_size.width = Dimension::percent(1.0);
+            // This internal cap applies to the text leaf's margin box. Using
+            // content-box here would add horizontal padding after the 100%
+            // cap and overflow the grid track.
+            leaf_style.box_sizing = BoxSizing::BorderBox;
+        }
         tree.new_leaf_with_context(leaf_style, my_idx)
     } else {
         let mut child_nodes: Vec<(i32, usize, NodeId)> = comp
@@ -2841,6 +2873,69 @@ mod tests {
         )
         .unwrap();
         assert!((l[0].0.height - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn breakable_text_does_not_force_a_message_grid_past_its_percent_max_width() {
+        let avatar = Component::boxed(
+            Style {
+                width: WDim::Px(34.0),
+                height: WDim::Px(34.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let message_text = Component::text(
+            "app.error.individual_identity_verification_authority_invalid",
+            Style {
+                display: WDisplay::Block,
+                padding: w3cos_std::style::Edges::xy(14.0, 11.0),
+                word_break: w3cos_std::style::WordBreak::BreakWord,
+                ..Style::default()
+            },
+        );
+        let content = Component::column(
+            Style {
+                display: WDisplay::Flex,
+                flex_direction: WDir::Column,
+                align_items: WAlign::FlexStart,
+                min_width: WDim::Px(0.0),
+                gap: 4.0,
+                ..Style::default()
+            },
+            vec![Component::text("LogiDesk", Style::default()), message_text],
+        );
+        let message = Component::boxed(
+            Style {
+                display: WDisplay::Grid,
+                grid_template_columns: Some("34px minmax(0, 1fr)".to_string()),
+                column_gap: Some(10.0),
+                max_width: WDim::Percent(92.0),
+                ..Style::default()
+            },
+            vec![avatar, content],
+        );
+        let feed = Component::column(
+            Style {
+                width: WDim::Px(370.0),
+                flex_direction: WDir::Column,
+                ..Style::default()
+            },
+            vec![message],
+        );
+
+        let layout = compute(&feed, 402.0, 874.0).unwrap();
+        let message_rect = layout.iter().find(|(_, idx)| *idx == 1).unwrap().0;
+        let text_rect = layout.iter().find(|(_, idx)| *idx == 5).unwrap().0;
+        assert!(
+            message_rect.width <= 340.5,
+            "message width {} exceeded 92% of its 370px feed",
+            message_rect.width
+        );
+        assert!(
+            text_rect.x + text_rect.width <= message_rect.x + message_rect.width + 0.1,
+            "text rect {text_rect:?} overflowed message rect {message_rect:?}"
+        );
     }
 
     #[test]

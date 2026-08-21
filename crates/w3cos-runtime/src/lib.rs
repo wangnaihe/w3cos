@@ -31,6 +31,7 @@ pub mod device_access_web;
 #[cfg(feature = "devtools")]
 pub mod devtools;
 pub mod dialog;
+pub mod document_context;
 pub mod dom;
 pub mod dom_constructors;
 #[cfg(feature = "dynamic-js")]

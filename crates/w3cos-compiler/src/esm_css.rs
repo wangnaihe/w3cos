@@ -466,6 +466,13 @@ fn parse_at_rule(
                 block_str, path, warnings, rules, imports, font_faces, media, false,
             );
         }
+        "container" => {
+            if container_query_matches_mobile_viewport(&prelude) {
+                parse_block_into(
+                    block_str, path, warnings, rules, imports, font_faces, media, false,
+                );
+            }
+        }
         "font-face" => {
             if let Some(face) = parse_font_face_block(block_str, media) {
                 font_faces.push(face);
@@ -480,6 +487,42 @@ fn parse_at_rule(
         _ => {}
     }
     (pos, false)
+}
+
+fn container_query_matches_mobile_viewport(prelude: &str) -> bool {
+    const VIEWPORT_WIDTH: f32 = 402.0;
+    const VIEWPORT_HEIGHT: f32 = 874.0;
+
+    let conditions = prelude
+        .split(" and ")
+        .map(|part| {
+            let condition = part
+                .trim()
+                .trim_start_matches(|character| character != '(')
+                .trim_matches(|character| character == '(' || character == ')');
+            let (feature, value) = condition.split_once(':')?;
+            let value = value.trim();
+            let length = value
+                .strip_suffix("rem")
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .map(|value| value * 16.0)
+                .or_else(|| {
+                    value
+                        .strip_suffix("px")
+                        .and_then(|value| value.trim().parse::<f32>().ok())
+                })?;
+            Some(match feature.trim() {
+                "min-width" => VIEWPORT_WIDTH >= length,
+                "max-width" => VIEWPORT_WIDTH <= length,
+                "min-height" => VIEWPORT_HEIGHT >= length,
+                "max-height" => VIEWPORT_HEIGHT <= length,
+                _ => false,
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    conditions.is_some_and(|conditions| {
+        !conditions.is_empty() && conditions.into_iter().all(|matches| matches)
+    })
 }
 
 fn parse_import_prelude(prelude: &str) -> Option<StylesheetImport> {
@@ -1084,6 +1127,28 @@ mod tests {
                 .find(|rule| rule.selector == ".compact")
                 .and_then(|rule| rule.media.as_deref()),
             Some("(screen and (min-width: 400px)) and ((max-width: 900px))")
+        );
+    }
+
+    #[test]
+    fn container_query_group_retains_inner_rules() {
+        let sheet = parse_css_source(
+            "@container semantic-surface (min-width: 44rem) {\
+                .wide { grid-template-columns: 1fr 1fr; }\
+            }\
+            @container semantic-surface (max-width: 30rem) {\
+                .semantic-grid[data-collapse='auto'] { --semantic-grid-columns: 1; }\
+            }",
+            "container.css",
+        );
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(
+            sheet.rules[0].selector,
+            ".semantic-grid[data-collapse='auto']"
+        );
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![("--semantic-grid-columns".to_string(), "1".to_string())]
         );
     }
 

@@ -66,6 +66,37 @@ pub fn parse_plain_px(value: &str) -> Option<f32> {
 pub fn css_parse_spacing_value(value: &str) -> Option<Spacing> {
     let trimmed = value.trim().trim_end_matches(';');
     if let Some(inner) = trimmed
+        .strip_prefix("max(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let mut parts = inner.split(',').map(str::trim);
+        let first = parts.next()?;
+        let second = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        for (length, environment) in [(first, second), (second, first)] {
+            let Some(px) = parse_plain_px(length) else {
+                continue;
+            };
+            let Some(name) = environment
+                .strip_prefix("env(")
+                .and_then(|value| value.strip_suffix(')'))
+                .map(|value| value.split(',').next().unwrap_or(value).trim())
+            else {
+                continue;
+            };
+            let safe_area = match name {
+                "safe-area-inset-top" => SafeAreaEdge::Top,
+                "safe-area-inset-right" => SafeAreaEdge::Right,
+                "safe-area-inset-bottom" => SafeAreaEdge::Bottom,
+                "safe-area-inset-left" => SafeAreaEdge::Left,
+                _ => continue,
+            };
+            return Some(Spacing::Maximum { px, safe_area });
+        }
+    }
+    if let Some(inner) = trimmed
         .strip_prefix("calc(")
         .and_then(|s| s.strip_suffix(')'))
     {

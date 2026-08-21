@@ -307,8 +307,12 @@ impl JsObject {
             // Getter/setter convention: a `__w3cos_getter_{key}` /
             // `__w3cos_setter_{key}` own function is an accessor property
             // named `key` (see esm_codegen class emission).
-            let getter = self.properties.get(format!("__w3cos_getter_{key}").as_str());
-            let setter = self.properties.get(format!("__w3cos_setter_{key}").as_str());
+            let getter = self
+                .properties
+                .get(format!("__w3cos_getter_{key}").as_str());
+            let setter = self
+                .properties
+                .get(format!("__w3cos_setter_{key}").as_str());
             if getter.is_none() && setter.is_none() {
                 return Value::Undefined;
             }
@@ -439,7 +443,11 @@ impl JsObject {
             .properties
             .capacity()
             .saturating_mul(std::mem::size_of::<(JsString, Value)>())
-            .saturating_add(self.properties.len().saturating_mul(std::mem::size_of::<JsString>()));
+            .saturating_add(
+                self.properties
+                    .len()
+                    .saturating_mul(std::mem::size_of::<JsString>()),
+            );
         let pending_bytes = self
             .pending_class_initializers
             .capacity()

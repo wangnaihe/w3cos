@@ -348,7 +348,30 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
             let _ = b;
         }
     }
-    px!(s.border_radius, "border-radius");
+    if let Some(values) = [
+        s.border_top_left_radius,
+        s.border_top_right_radius,
+        s.border_bottom_right_radius,
+        s.border_bottom_left_radius,
+    ]
+    .iter()
+    .any(Option::is_some)
+    .then(|| {
+        let fallback = s.border_radius.unwrap_or(0.0);
+        [
+            s.border_top_left_radius.unwrap_or(fallback),
+            s.border_top_right_radius.unwrap_or(fallback),
+            s.border_bottom_right_radius.unwrap_or(fallback),
+            s.border_bottom_left_radius.unwrap_or(fallback),
+        ]
+    }) {
+        parts.push(format!(
+            "border-radius:{}px {}px {}px {}px",
+            values[0], values[1], values[2], values[3]
+        ));
+    } else {
+        px!(s.border_radius, "border-radius");
+    }
     px!(s.border_width, "border-width");
     if let Some(c) = s.border_color.as_ref() {
         parts.push(format!("border-color:{c}"));
@@ -502,6 +525,10 @@ fn spacing_css(s: Spacing) -> String {
         Spacing::SafeAreaInset(SafeAreaEdge::Right) => "env(safe-area-inset-right)".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Bottom) => "env(safe-area-inset-bottom)".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Left) => "env(safe-area-inset-left)".to_string(),
+        Spacing::Maximum { px, safe_area } => format!(
+            "max({px}px, {})",
+            spacing_css(Spacing::SafeAreaInset(safe_area))
+        ),
         Spacing::KeyboardInsetHeight => KB_ENV.to_string(),
         Spacing::Composite {
             px,

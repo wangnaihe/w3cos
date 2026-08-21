@@ -25,6 +25,9 @@ pub struct MobileAppManifest {
     pub name: String,
     pub bundle_id: String,
     pub entry: String,
+    /// HTTP(S) base URL used by relative browser APIs in the packaged app.
+    #[serde(default)]
+    pub document_base_url: Option<String>,
     #[serde(default = "default_orientation")]
     pub orientation: String,
     #[serde(default)]
