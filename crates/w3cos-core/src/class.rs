@@ -564,7 +564,7 @@ mod tests {
         parent.set_property(
             "describe",
             Value::function(|this_value, _| {
-                Value::String(format!(
+                Value::from(format!(
                     "{}!",
                     this_value.get_property("marker").to_js_string()
                 ))

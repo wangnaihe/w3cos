@@ -82,9 +82,9 @@ fn create_with_prototype(source: &str, flags: &str, prototype: &Value) -> Value 
     let string_flags = flags.clone();
     let value = Value::object(HashMap::from([
         (SOURCE.into(), Value::String(source.into())),
-        (FLAGS.into(), Value::String(flags.clone())),
-        ("source".into(), Value::String(display_source(source))),
-        ("flags".into(), Value::String(flags.clone())),
+        (FLAGS.into(), Value::from(flags.clone())),
+        ("source".into(), Value::from(display_source(source))),
+        ("flags".into(), Value::from(flags.clone())),
         ("global".into(), Value::Bool(flags.contains('g'))),
         ("ignoreCase".into(), Value::Bool(flags.contains('i'))),
         ("multiline".into(), Value::Bool(flags.contains('m'))),
@@ -213,7 +213,7 @@ pub fn string_split(input: &str, pattern: &Value, limit: usize) -> Option<Value>
             input
                 .chars()
                 .take(limit)
-                .map(|character| Value::String(character.to_string()))
+                .map(|character| Value::from(character.to_string()))
                 .collect(),
         ));
     }
@@ -375,7 +375,7 @@ pub fn string_replace(input: &str, pattern: &Value, replacement: &Value) -> Opti
         return Some(Value::String(input.into()));
     }
     output.push_str(&input[previous_end..]);
-    Some(Value::String(output))
+    Some(Value::from(output))
 }
 
 fn capture_groups(regex: &Regex, captures: &fancy_regex::Captures<'_>) -> Value {

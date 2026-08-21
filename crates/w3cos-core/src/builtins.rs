@@ -126,7 +126,7 @@ fn build_object_value() -> Value {
                 .iter()
                 .map(|key| {
                     let key = key.to_js_string();
-                    Value::array(vec![Value::String(key.clone()), object.get_property(&key)])
+                    Value::array(vec![Value::from(key.clone()), object.get_property(&key)])
                 })
                 .collect();
             Value::array(entries)
@@ -403,7 +403,7 @@ pub(crate) fn object_keys(value: &Value) -> Value {
                 .borrow()
                 .keys()
                 .into_iter()
-                .map(Value::String)
+                .map(Value::from)
                 .collect(),
         ),
         Value::Array(values) => Value::array(
@@ -412,7 +412,7 @@ pub(crate) fn object_keys(value: &Value) -> Value {
                 .iter()
                 .enumerate()
                 .filter(|(_, value)| !crate::value::is_array_hole(value))
-                .map(|(index, _)| Value::String(index.to_string()))
+                .map(|(index, _)| Value::from(index.to_string()))
                 .collect(),
         ),
         _ => Value::array(Vec::new()),
@@ -545,7 +545,7 @@ fn build_error_classes() -> HashMap<String, Value> {
         Value::function(|this, _| {
             let name = this.get_property("name").to_js_string();
             let message = this.get_property("message").to_js_string();
-            Value::String(if name.is_empty() {
+            Value::from(if name.is_empty() {
                 message
             } else if message.is_empty() {
                 name
@@ -599,7 +599,7 @@ pub fn error_instance(name: &str, arguments: Vec<Value>) -> Value {
         ("message".to_string(), Value::string(&message)),
         (
             "stack".to_string(),
-            Value::String(if message.is_empty() {
+            Value::from(if message.is_empty() {
                 name.to_string()
             } else {
                 format!("{name}: {message}")

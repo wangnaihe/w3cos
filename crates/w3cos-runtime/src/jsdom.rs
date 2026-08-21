@@ -1799,7 +1799,7 @@ fn xml_serializer_class() -> Value {
                         (!root.is_undefined()).then(|| root.to_u32())
                     });
                     root.map(dom::outer_html)
-                        .map(Value::String)
+                        .map(Value::from)
                         .unwrap_or_else(|| Value::string(""))
                 }),
             )]));
@@ -1821,7 +1821,7 @@ fn xml_serializer_class() -> Value {
                     (!root.is_undefined()).then(|| root.to_u32())
                 });
                 root.map(dom::outer_html)
-                    .map(Value::String)
+                    .map(Value::from)
                     .unwrap_or_else(|| Value::string(""))
             }),
         );
@@ -3573,7 +3573,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "getAttribute" => {
             func(
                 move |_, args| match dom::get_attribute(node, &arg(&args, 0).to_js_string()) {
-                    Some(v) => Value::String(v),
+                    Some(v) => Value::from(v),
                     None => Value::Null,
                 },
             )
@@ -3584,7 +3584,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 .then(|| namespace_value.to_js_string())
                 .filter(|namespace| !namespace.is_empty());
             match dom::get_attribute_ns(node, namespace.as_deref(), &arg(&args, 1).to_js_string()) {
-                Some(v) => Value::String(v),
+                Some(v) => Value::from(v),
                 None => Value::Null,
             }
         }),
@@ -4804,7 +4804,7 @@ fn dataset_value(node: u32) -> Value {
                 return inherited;
             }
             dom::get_attribute(node, &dataset_attribute_name(key))
-                .map(Value::String)
+                .map(Value::from)
                 .unwrap_or(Value::Undefined)
         })
         .set(move |_target, key, value, _receiver| {
@@ -4825,7 +4825,7 @@ fn dataset_value(node: u32) -> Value {
         })
         .own_keys(move |_target| {
             if bridge_realm_is_current(generation) {
-                Value::array(dataset_keys(node).into_iter().map(Value::String).collect())
+                Value::array(dataset_keys(node).into_iter().map(Value::from).collect())
             } else {
                 Value::array(Vec::new())
             }
@@ -9553,7 +9553,7 @@ fn event_counts_value() -> Value {
                 event_count_entries()
                     .into_iter()
                     .map(|(event_type, count)| {
-                        Value::array(vec![Value::String(event_type), Value::Number(count as f64)])
+                        Value::array(vec![Value::from(event_type), Value::Number(count as f64)])
                     })
                     .collect(),
             )
@@ -9569,7 +9569,7 @@ fn event_counts_value() -> Value {
                     Value::Undefined,
                     vec![
                         Value::Number(count as f64),
-                        Value::String(event_type),
+                        Value::from(event_type),
                         value_for_each.clone(),
                     ],
                 );
@@ -9703,7 +9703,7 @@ fn storage_value(persistent: bool) -> Value {
             } else {
                 SESSION_STORAGE.with(|s| s.borrow().get(&key).cloned())
             };
-            value.map(|v| Value::String(v)).unwrap_or(Value::Null)
+            value.map(|v| Value::from(v)).unwrap_or(Value::Null)
         }),
     );
     props.insert(
@@ -9748,7 +9748,7 @@ fn storage_value(persistent: bool) -> Value {
             let idx = arg(&args, 0).to_u32() as usize;
             if persistent {
                 crate::storage::key(idx)
-                    .map(|k| Value::String(k))
+                    .map(|k| Value::from(k))
                     .unwrap_or(Value::Null)
             } else {
                 SESSION_STORAGE.with(|s| {

@@ -4,6 +4,7 @@ mod builtins;
 pub mod class;
 pub mod collections;
 pub mod heap;
+pub mod js_string;
 pub mod host;
 pub mod host_modules;
 pub mod intrinsics;
@@ -26,4 +27,5 @@ pub use builtins::{
 pub use object::JsObject;
 pub use proxy::{ProxyBuilder, ProxyHandler, proxy_class};
 pub use reactive::{Computed, Effect, Signal, batch, watch};
+pub use js_string::JsString;
 pub use value::{ArrayStorage, JsFunction, PanicValue, Value, throw_value, type_of};

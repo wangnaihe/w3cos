@@ -290,7 +290,7 @@ pub fn for_in_keys(value: &Value) -> Value {
                 .iter()
                 .enumerate()
                 .filter(|(_, value)| !crate::value::is_array_hole(value))
-                .map(|(index, _)| Value::String(index.to_string()))
+                .map(|(index, _)| Value::from(index.to_string()))
                 .collect(),
         );
     }
@@ -312,7 +312,7 @@ pub fn for_in_keys(value: &Value) -> Value {
         for key in own_keys {
             let key = key.to_js_string();
             if seen_keys.insert(key.clone()) {
-                keys.push(Value::String(key));
+                keys.push(Value::from(key));
             }
         }
         current = prototype;

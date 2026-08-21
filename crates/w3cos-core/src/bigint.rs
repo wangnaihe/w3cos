@@ -65,7 +65,7 @@ fn from_bigint(value: BigInt) -> Value {
     let to_string_value = value.clone();
     let value_of_value = value.clone();
     Value::object(HashMap::from([
-        (VALUE.into(), Value::String(encoded)),
+        (VALUE.into(), Value::from(encoded)),
         (
             "toString".into(),
             Value::function(move |_, args| {

@@ -20,6 +20,477 @@ enum EmissionMode {
     Sync,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegClass {
+    Bottom,
+    Number,
+    Bool,
+    String,
+    Unknown,
+}
+
+fn join_class(left: RegClass, right: RegClass) -> RegClass {
+    match (left, right) {
+        (RegClass::Bottom, other) | (other, RegClass::Bottom) => other,
+        (left, right) if left == right => left,
+        _ => RegClass::Unknown,
+    }
+}
+
+/// Per-function register lattice. A register is `Number` only when every
+/// definition is Number. Nested closures and bindings stay `Unknown`
+/// (interprocedural analysis is out of scope).
+struct EscapePlan {
+    number: HashSet<u32>,
+}
+
+fn analyze_function(function: &Function) -> EscapePlan {
+    let len = function.registers as usize;
+    let mut classes = vec![RegClass::Bottom; len];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let before = classes.clone();
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                apply_register_def(&mut classes, instruction);
+            }
+        }
+        if classes != before {
+            changed = true;
+        }
+    }
+    EscapePlan {
+        number: classes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, class)| (*class == RegClass::Number).then_some(index as u32))
+            .collect(),
+    }
+}
+
+fn class_of(classes: &[RegClass], register: Register) -> RegClass {
+    classes
+        .get(register.0 as usize)
+        .copied()
+        .unwrap_or(RegClass::Unknown)
+}
+
+fn def_class(classes: &mut [RegClass], register: Register, class: RegClass) {
+    let index = register.0 as usize;
+    if index < classes.len() {
+        classes[index] = join_class(classes[index], class);
+    }
+}
+
+fn apply_register_def(classes: &mut [RegClass], instruction: &Instruction) {
+    match instruction {
+        Instruction::LoadConstant { dst, value } => {
+            let class = match value {
+                Constant::Number(_) => RegClass::Number,
+                Constant::Bool(_) => RegClass::Bool,
+                Constant::String(_) => RegClass::String,
+                Constant::Undefined | Constant::Null => RegClass::Unknown,
+            };
+            def_class(classes, *dst, class);
+        }
+        Instruction::Move { dst, src } => {
+            def_class(classes, *dst, class_of(classes, *src));
+        }
+        Instruction::Add { dst, lhs, rhs } => {
+            // JS `+` concatenates when either side may be a string.
+            let class = if class_of(classes, *lhs) == RegClass::Number
+                && class_of(classes, *rhs) == RegClass::Number
+            {
+                RegClass::Number
+            } else {
+                RegClass::Unknown
+            };
+            def_class(classes, *dst, class);
+        }
+        Instruction::Binary {
+            dst,
+            operator,
+            lhs,
+            rhs,
+        } => {
+            let both_number = class_of(classes, *lhs) == RegClass::Number
+                && class_of(classes, *rhs) == RegClass::Number;
+            let class = match operator {
+                BinaryOperator::Subtract
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Remainder
+                | BinaryOperator::Exponentiate
+                | BinaryOperator::LeftShift
+                | BinaryOperator::SignedRightShift
+                | BinaryOperator::UnsignedRightShift
+                | BinaryOperator::BitwiseOr
+                | BinaryOperator::BitwiseXor
+                | BinaryOperator::BitwiseAnd
+                    if both_number =>
+                {
+                    RegClass::Number
+                }
+                BinaryOperator::LessThan
+                | BinaryOperator::LessThanOrEqual
+                | BinaryOperator::GreaterThan
+                | BinaryOperator::GreaterThanOrEqual
+                | BinaryOperator::AbstractEqual
+                | BinaryOperator::StrictEqual
+                    if both_number =>
+                {
+                    RegClass::Bool
+                }
+                _ => RegClass::Unknown,
+            };
+            def_class(classes, *dst, class);
+        }
+        Instruction::Unary {
+            dst,
+            operator,
+            value,
+        } => {
+            let class = match operator {
+                UnaryOperator::Negate if class_of(classes, *value) == RegClass::Number => {
+                    RegClass::Number
+                }
+                UnaryOperator::TypeOf => RegClass::String,
+                _ => RegClass::Unknown,
+            };
+            def_class(classes, *dst, class);
+        }
+        Instruction::LoadBinding { dst, .. }
+        | Instruction::GetProperty { dst, .. }
+        | Instruction::DeleteProperty { dst, .. }
+        | Instruction::GetPrivate { dst, .. }
+        | Instruction::HasPrivate { dst, .. }
+        | Instruction::CreateArray { dst, .. }
+        | Instruction::ArrayRest { dst, .. }
+        | Instruction::ObjectRest { dst, .. }
+        | Instruction::CreateObject { dst, .. }
+        | Instruction::CreateClosure { dst, .. }
+        | Instruction::CreateClass { dst, .. }
+        | Instruction::Call { dst, .. }
+        | Instruction::CallWithArguments { dst, .. }
+        | Instruction::CallMethod { dst, .. }
+        | Instruction::CallMethodWithArguments { dst, .. }
+        | Instruction::Construct { dst, .. }
+        | Instruction::ConstructWithArguments { dst, .. }
+        | Instruction::DynamicImport { dst, .. }
+        | Instruction::ImportMeta { dst }
+        | Instruction::Await { dst, .. }
+        | Instruction::YieldDelegate { dst, .. } => def_class(classes, *dst, RegClass::Unknown),
+        _ => {}
+    }
+}
+
+fn emit_num_reg_storage(plan: &EscapePlan, registers: u32) -> (String, String) {
+    if plan.number.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            "    num_regs: Vec<f64>,\n".into(),
+            format!("        num_regs: vec![0.0_f64; {registers}],\n"),
+        )
+    }
+}
+
+fn known_number(plan: &EscapePlan, reaching: &HashMap<u32, f64>, register: u32) -> bool {
+    plan.number.contains(&register) || reaching.contains_key(&register)
+}
+
+fn emit_f64_operand(plan: &EscapePlan, reaching: &HashMap<u32, f64>, register: u32) -> String {
+    if let Some(value) = reaching.get(&register) {
+        format!("{value:?}_f64")
+    } else if plan.number.contains(&register) {
+        format!("self.num_regs[{register}]")
+    } else {
+        format!("self.registers[{register}].to_number()")
+    }
+}
+
+fn emit_boxed_value(plan: &EscapePlan, register: u32) -> String {
+    if plan.number.contains(&register) {
+        format!("w3cos_core::Value::Number(self.num_regs[{register}])")
+    } else {
+        format!("self.registers[{register}].clone()")
+    }
+}
+
+fn write_f64(plan: &EscapePlan, dst: u32, expr: &str) -> String {
+    if plan.number.contains(&dst) {
+        format!("self.num_regs[{dst}] = {expr};")
+    } else {
+        format!("self.registers[{dst}] = w3cos_core::Value::Number({expr});")
+    }
+}
+
+fn instruction_dst(instruction: &Instruction) -> Option<u32> {
+    match instruction {
+        Instruction::LoadConstant { dst, .. }
+        | Instruction::Move { dst, .. }
+        | Instruction::LoadBinding { dst, .. }
+        | Instruction::Add { dst, .. }
+        | Instruction::Binary { dst, .. }
+        | Instruction::Unary { dst, .. }
+        | Instruction::GetProperty { dst, .. }
+        | Instruction::DeleteProperty { dst, .. }
+        | Instruction::GetPrivate { dst, .. }
+        | Instruction::HasPrivate { dst, .. }
+        | Instruction::CreateArray { dst, .. }
+        | Instruction::ArrayRest { dst, .. }
+        | Instruction::ObjectRest { dst, .. }
+        | Instruction::CreateObject { dst, .. }
+        | Instruction::CreateClosure { dst, .. }
+        | Instruction::CreateClass { dst, .. }
+        | Instruction::Call { dst, .. }
+        | Instruction::CallWithArguments { dst, .. }
+        | Instruction::CallMethod { dst, .. }
+        | Instruction::CallMethodWithArguments { dst, .. }
+        | Instruction::Construct { dst, .. }
+        | Instruction::ConstructWithArguments { dst, .. }
+        | Instruction::DynamicImport { dst, .. }
+        | Instruction::ImportMeta { dst }
+        | Instruction::Await { dst, .. }
+        | Instruction::Yield { dst, .. }
+        | Instruction::YieldDelegate { dst, .. } => Some(dst.0),
+        _ => None,
+    }
+}
+
+fn reaching_number_constants(instructions: &[Instruction]) -> Vec<HashMap<u32, f64>> {
+    let mut current = HashMap::new();
+    let mut output = Vec::with_capacity(instructions.len());
+    for instruction in instructions {
+        output.push(current.clone());
+        match instruction {
+            Instruction::LoadConstant {
+                dst,
+                value: Constant::Number(value),
+            } => {
+                current.insert(dst.0, *value);
+            }
+            other => {
+                if let Some(dst) = instruction_dst(other) {
+                    current.remove(&dst);
+                }
+            }
+        }
+    }
+    output
+}
+
+#[derive(Clone, Copy)]
+enum SlotStorage {
+    Dense(usize),
+    Map,
+}
+
+fn slot_storage(function: &Function) -> SlotStorage {
+    let mut ids = Vec::new();
+    for binding in &function.bindings {
+        ids.push(binding.id.0);
+    }
+    for binding in &function.captures {
+        ids.push(binding.0);
+    }
+    for binding in &function.parameters {
+        ids.push(binding.0);
+    }
+    if let Some(binding) = function.rest_parameter {
+        ids.push(binding.0);
+    }
+    if let Some(binding) = function.arguments_binding {
+        ids.push(binding.0);
+    }
+    if let Some(binding) = function.this_binding {
+        ids.push(binding.0);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    match ids.as_slice() {
+        [] => SlotStorage::Dense(0),
+        [first, ..] if *first == 0 && ids.len() == (*ids.last().unwrap() as usize) + 1 => {
+            SlotStorage::Dense(ids.len())
+        }
+        _ => SlotStorage::Map,
+    }
+}
+
+fn emit_slot_fields(storage: SlotStorage) -> String {
+    match storage {
+        SlotStorage::Dense(_) => (
+            "    bindings: Vec<Option<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>>,\n    capture_getters: Vec<Option<w3cos_core::Value>>,\n    capture_setters: Vec<Option<w3cos_core::Value>>,\n"
+        )
+        .into(),
+        SlotStorage::Map => (
+            "    bindings: std::collections::HashMap<\n        u32,\n        std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>,\n    >,\n    capture_getters: std::collections::HashMap<u32, w3cos_core::Value>,\n    capture_setters: std::collections::HashMap<u32, w3cos_core::Value>,\n"
+        )
+        .into(),
+    }
+}
+
+fn emit_bindings_new(storage: SlotStorage) -> String {
+    match storage {
+        SlotStorage::Dense(len) => format!("    let mut bindings = vec![None; {len}];\n"),
+        SlotStorage::Map => "    let mut bindings = std::collections::HashMap::new();\n".into(),
+    }
+}
+
+fn emit_capture_init(storage: SlotStorage) -> String {
+    match storage {
+        SlotStorage::Dense(_) => (
+            "    let mut capture_getters = vec![None; bindings.len()];\n    let mut capture_setters = vec![None; bindings.len()];\n    for (binding, (getter, setter)) in __captures {\n        if let Some(slot) = capture_getters.get_mut(binding as usize) {\n            *slot = Some(getter);\n        }\n        if let Some(slot) = capture_setters.get_mut(binding as usize) {\n            *slot = Some(setter);\n        }\n    }\n"
+        )
+        .into(),
+        SlotStorage::Map => (
+            "    let mut capture_getters = std::collections::HashMap::new();\n    let mut capture_setters = std::collections::HashMap::new();\n    for (binding, (getter, setter)) in __captures {\n        capture_getters.insert(binding, getter);\n        capture_setters.insert(binding, setter);\n    }\n"
+        )
+        .into(),
+    }
+}
+
+fn emit_binding_assign(storage: SlotStorage, id: u32, value: &str) -> String {
+    match storage {
+        SlotStorage::Dense(_) => format!("        bindings[{id}] = Some({value});\n"),
+        SlotStorage::Map => format!("        bindings.insert({id}, {value});\n"),
+    }
+}
+
+fn emit_capture_get(storage: SlotStorage, id: u32) -> String {
+    match storage {
+        SlotStorage::Dense(_) => {
+            format!("self.capture_getters.get({id} as usize).and_then(|slot| slot.as_ref())")
+        }
+        SlotStorage::Map => format!("self.capture_getters.get(&{id})"),
+    }
+}
+
+fn emit_capture_get_cloned(storage: SlotStorage, id: u32) -> String {
+    match storage {
+        SlotStorage::Dense(_) => {
+            format!("self.capture_getters.get({id} as usize).and_then(|slot| slot.clone())")
+        }
+        SlotStorage::Map => format!("self.capture_getters.get(&{id}).cloned()"),
+    }
+}
+
+fn emit_capture_setter_get(storage: SlotStorage, id: u32) -> String {
+    match storage {
+        SlotStorage::Dense(_) => {
+            format!("self.capture_setters.get({id} as usize).and_then(|slot| slot.as_ref())")
+        }
+        SlotStorage::Map => format!("self.capture_setters.get(&{id})"),
+    }
+}
+
+fn emit_capture_setter_get_cloned(storage: SlotStorage, id: u32) -> String {
+    match storage {
+        SlotStorage::Dense(_) => {
+            format!("self.capture_setters.get({id} as usize).and_then(|slot| slot.clone())")
+        }
+        SlotStorage::Map => format!("self.capture_setters.get(&{id}).cloned()"),
+    }
+}
+
+fn emit_binding_get(storage: SlotStorage, id: u32) -> String {
+    match storage {
+        SlotStorage::Dense(_) => {
+            format!("self.bindings.get({id} as usize).and_then(|slot| slot.as_ref())")
+        }
+        SlotStorage::Map => format!("self.bindings.get(&{id})"),
+    }
+}
+
+fn emit_binding_get_cloned(storage: SlotStorage, id: u32) -> String {
+    match storage {
+        SlotStorage::Dense(_) => {
+            format!("self.bindings.get({id} as usize).and_then(|slot| slot.clone())")
+        }
+        SlotStorage::Map => format!("self.bindings.get(&{id}).cloned()"),
+    }
+}
+
+fn emit_binding_store_value(storage: SlotStorage, id: u32, rust_expr: &str) -> String {
+    match storage {
+        SlotStorage::Dense(_) => format!(
+            "if let Some(slot) = self.bindings.get_mut({id} as usize) {{ *slot = Some(std::rc::Rc::new(std::cell::RefCell::new({rust_expr}))); }}"
+        ),
+        SlotStorage::Map => format!(
+            "self.bindings.insert({id}, std::rc::Rc::new(std::cell::RefCell::new({rust_expr})));"
+        ),
+    }
+}
+
+fn written_register(instruction: &Instruction) -> Option<Register> {
+    match instruction {
+        Instruction::LoadConstant { dst, .. }
+        | Instruction::Move { dst, .. }
+        | Instruction::LoadBinding { dst, .. }
+        | Instruction::Add { dst, .. }
+        | Instruction::Binary { dst, .. }
+        | Instruction::Unary { dst, .. }
+        | Instruction::GetProperty { dst, .. }
+        | Instruction::DeleteProperty { dst, .. }
+        | Instruction::GetPrivate { dst, .. }
+        | Instruction::HasPrivate { dst, .. }
+        | Instruction::CreateArray { dst, .. }
+        | Instruction::ArrayRest { dst, .. }
+        | Instruction::ObjectRest { dst, .. }
+        | Instruction::CreateObject { dst, .. }
+        | Instruction::CreateClosure { dst, .. }
+        | Instruction::CreateClass { dst, .. }
+        | Instruction::Call { dst, .. }
+        | Instruction::CallWithArguments { dst, .. }
+        | Instruction::CallMethod { dst, .. }
+        | Instruction::CallMethodWithArguments { dst, .. }
+        | Instruction::Construct { dst, .. }
+        | Instruction::ConstructWithArguments { dst, .. }
+        | Instruction::DynamicImport { dst, .. }
+        | Instruction::ImportMeta { dst }
+        | Instruction::Await { dst, .. }
+        | Instruction::Yield { dst, .. }
+        | Instruction::YieldDelegate { dst, .. } => Some(*dst),
+        Instruction::InitializeBinding { .. }
+        | Instruction::StoreBinding { .. }
+        | Instruction::RefreshBinding { .. }
+        | Instruction::SetProperty { .. }
+        | Instruction::DefineField { .. }
+        | Instruction::DefinePrivate { .. }
+        | Instruction::SetPrivate { .. }
+        | Instruction::DefinePrivateMethod { .. }
+        | Instruction::DefinePrivateAccessor { .. }
+        | Instruction::AppendArrayElement { .. }
+        | Instruction::AppendIterable { .. }
+        | Instruction::CopyDataProperties { .. }
+        | Instruction::Jump { .. }
+        | Instruction::Branch { .. }
+        | Instruction::Return { .. }
+        | Instruction::Throw { .. } => None,
+    }
+}
+
+fn proven_string_keys(instructions: &[Instruction], index: usize) -> HashMap<u32, String> {
+    let mut known = HashMap::new();
+    for instruction in &instructions[..index] {
+        match instruction {
+            Instruction::LoadConstant {
+                dst,
+                value: Constant::String(value),
+            } => {
+                known.insert(dst.0, value.clone());
+            }
+            other => {
+                if let Some(dst) = written_register(other) {
+                    known.remove(&dst.0);
+                }
+            }
+        }
+    }
+    known
+}
+
 /// Emit a native synchronous-generator factory for one W3IR function.
 ///
 /// The initial backend covers the ordinary scalar/object instructions needed
@@ -181,6 +652,12 @@ fn generate_sync_function_with_factories(
 ) -> Result<String> {
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
+    let plan = analyze_function(function);
+    let (num_field, num_init) = emit_num_reg_storage(&plan, function.registers);
+    let storage = slot_storage(function);
+    let slot_fields = emit_slot_fields(storage);
+    let slot_bindings_new = emit_bindings_new(storage);
+    let slot_capture_init = emit_capture_init(storage);
     let sync_blocks = coalesce_sync_blocks(function);
     let mut blocks = String::new();
     let mut direct_body = None;
@@ -195,6 +672,8 @@ fn generate_sync_function_with_factories(
             module_specifier,
             &type_name,
             false,
+            storage,
+            &plan,
         )?;
         if sync_blocks.len() == 1
             && *block_id == function.entry
@@ -294,35 +773,46 @@ fn generate_sync_function_with_factories(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
         );
-        binding_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::Value::Undefined, {initialized}))));\n",
-            binding.id.0
+        binding_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.id.0,
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::Value::Undefined, {initialized})))"
+            ),
         ));
     }
     let mut parameter_initializers = String::new();
     for (index, binding) in function.parameters.iter().enumerate() {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true)))"
+            ),
         ));
     }
     if let Some(binding) = function.arguments_binding {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true)))",
         ));
     }
     if let Some(binding) = function.rest_parameter {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.iter().skip({}).cloned().collect()), true))));\n",
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
             binding.0,
-            function.parameters.len()
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.iter().skip({}).cloned().collect()), true)))",
+                function.parameters.len()
+            ),
         ));
     }
     if let Some(binding) = function.this_binding {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__this, true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            "std::rc::Rc::new(std::cell::RefCell::new((__this, true)))",
         ));
     }
 
@@ -330,13 +820,7 @@ fn generate_sync_function_with_factories(
         r#"
 struct {type_name} {{
     registers: Vec<w3cos_core::Value>,
-    bindings: std::collections::HashMap<
-        u32,
-        std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>,
-    >,
-    capture_getters: std::collections::HashMap<u32, w3cos_core::Value>,
-    capture_setters: std::collections::HashMap<u32, w3cos_core::Value>,
-{block_field}
+{num_field}{slot_fields}{block_field}
 }}
 
 impl {type_name} {{
@@ -353,16 +837,9 @@ pub fn {rust_name}(
         (w3cos_core::Value, w3cos_core::Value),
     >,
 ) -> w3cos_core::Value {{
-    let mut bindings = std::collections::HashMap::new();
-{binding_initializers}{parameter_initializers}    let mut capture_getters = std::collections::HashMap::new();
-    let mut capture_setters = std::collections::HashMap::new();
-    for (binding, (getter, setter)) in __captures {{
-        capture_getters.insert(binding, getter);
-        capture_setters.insert(binding, setter);
-    }}
-    {type_name} {{
+{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    {type_name} {{
         registers: vec![w3cos_core::Value::Undefined; {registers}],
-        bindings,
+{num_init}        bindings,
         capture_getters,
         capture_setters,
 {block_initializer}
@@ -384,6 +861,12 @@ fn generate_async_function_with_factories(
     }
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
+    let plan = analyze_function(function);
+    let (num_field, num_init) = emit_num_reg_storage(&plan, function.registers);
+    let storage = slot_storage(function);
+    let slot_fields = emit_slot_fields(storage);
+    let slot_bindings_new = emit_bindings_new(storage);
+    let slot_capture_init = emit_capture_init(storage);
     let mut blocks = String::new();
     for block in &function.blocks {
         let exception_target = function
@@ -406,6 +889,8 @@ fn generate_async_function_with_factories(
             module_specifier,
             &type_name,
             true,
+            storage,
+            &plan,
         )?);
         blocks.push_str("                }\n");
     }
@@ -416,57 +901,69 @@ fn generate_async_function_with_factories(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
         );
-        binding_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::Value::Undefined, {initialized}))));\n",
-            binding.id.0
+        binding_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.id.0,
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::Value::Undefined, {initialized})))"
+            ),
         ));
     }
     let mut parameter_initializers = String::new();
     for (index, binding) in function.parameters.iter().enumerate() {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true)))"
+            ),
         ));
     }
     if let Some(binding) = function.arguments_binding {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true)))",
         ));
     }
     if let Some(binding) = function.rest_parameter {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.iter().skip({}).cloned().collect()), true))));\n",
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
             binding.0,
-            function.parameters.len()
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.iter().skip({}).cloned().collect()), true)))",
+                function.parameters.len()
+            ),
         ));
     }
     if let Some(binding) = function.this_binding {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__this, true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            "std::rc::Rc::new(std::cell::RefCell::new((__this, true)))",
         ));
     }
 
     Ok(format!(
         r#"
+enum {type_name}Outcome {{
+    Await {{
+        value: w3cos_core::Value,
+        dst: u32,
+        resume: u32,
+        reject: u32,
+    }},
+    Complete(w3cos_core::Value),
+}}
+
 struct {type_name} {{
     registers: Vec<w3cos_core::Value>,
-    bindings: std::collections::HashMap<
-        u32,
-        std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>,
-    >,
-    capture_getters: std::collections::HashMap<u32, w3cos_core::Value>,
-    capture_setters: std::collections::HashMap<u32, w3cos_core::Value>,
-    block: u32,
+{num_field}{slot_fields}    block: u32,
 }}
 
 impl {type_name} {{
-    fn completed(value: w3cos_core::Value) -> w3cos_core::Value {{
-        w3cos_core::Value::object(std::collections::HashMap::from([
-            ("__w3cos_async_function_complete".to_string(), w3cos_core::Value::Bool(true)),
-            ("value".to_string(), value),
-        ]))
+    fn completed(value: w3cos_core::Value) -> {type_name}Outcome {{
+        {type_name}Outcome::Complete(value)
     }}
 
     fn awaited(
@@ -474,17 +971,16 @@ impl {type_name} {{
         dst: u32,
         resume_block: u32,
         reject_block: u32,
-    ) -> w3cos_core::Value {{
-        w3cos_core::Value::object(std::collections::HashMap::from([
-            ("__w3cos_async_function_await".to_string(), w3cos_core::Value::Bool(true)),
-            ("value".to_string(), value),
-            ("dst".to_string(), w3cos_core::Value::Number(dst as f64)),
-            ("resume".to_string(), w3cos_core::Value::Number(resume_block as f64)),
-            ("reject".to_string(), w3cos_core::Value::Number(reject_block as f64)),
-        ]))
+    ) -> {type_name}Outcome {{
+        {type_name}Outcome::Await {{
+            value,
+            dst,
+            resume: resume_block,
+            reject: reject_block,
+        }}
     }}
 
-    fn run(&mut self) -> w3cos_core::Value {{
+    fn run(&mut self) -> {type_name}Outcome {{
         'drive: loop {{
             match self.block {{
 {blocks}                _ => return w3cos_core::throw_value(
@@ -516,68 +1012,70 @@ impl {type_name} {{
                 return;
             }}
         }};
-        if outcome.get_property("__w3cos_async_function_complete").to_bool() {{
-            resolve.call(
-                w3cos_core::Value::Undefined,
-                vec![outcome.get_property("value")],
-            );
-            return;
-        }}
-        if !outcome.get_property("__w3cos_async_function_await").to_bool() {{
-            reject.call(
-                w3cos_core::Value::Undefined,
-                vec![w3cos_core::Value::string("invalid async W3IR outcome")],
-            );
-            return;
-        }}
-        let dst = outcome.get_property("dst").to_number() as usize;
-        let resume_block = outcome.get_property("resume").to_number() as u32;
-        let reject_block = outcome.get_property("reject").to_number() as u32;
-        let fulfilled_frame = std::rc::Rc::clone(&frame);
-        let fulfilled_resolve = resolve.clone();
-        let fulfilled_reject = reject.clone();
-        let on_fulfilled = w3cos_core::Value::function(move |_, arguments| {{
-            {{
-                let mut frame = fulfilled_frame.borrow_mut();
-                frame.registers[dst] =
-                    arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
-                frame.block = resume_block;
+        match outcome {{
+            {type_name}Outcome::Complete(value) => {{
+                resolve.call(w3cos_core::Value::Undefined, vec![value]);
             }}
-            Self::drive(
-                std::rc::Rc::clone(&fulfilled_frame),
-                fulfilled_resolve.clone(),
-                fulfilled_reject.clone(),
-            );
-            w3cos_core::Value::Undefined
-        }});
-        let rejected_frame = std::rc::Rc::clone(&frame);
-        let rejected_resolve = resolve.clone();
-        let rejected_reject = reject.clone();
-        let on_rejected = w3cos_core::Value::function(move |_, arguments| {{
-            {{
-                let mut frame = rejected_frame.borrow_mut();
-                frame.registers[dst] =
-                    arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
-                frame.block = reject_block;
+            {type_name}Outcome::Await {{
+                value,
+                dst,
+                resume,
+                reject: reject_block,
+            }} => {{
+                let dst = dst as usize;
+                let awaited = w3cos_core::intrinsics::await_value(&value);
+                if let Some(w3cos_core::promise::PromiseStatus::Fulfilled(ready)) =
+                    w3cos_core::promise::status(&awaited)
+                {{
+                    {{
+                        let mut frame = frame.borrow_mut();
+                        frame.registers[dst] = ready;
+                        frame.block = resume;
+                    }}
+                    Self::drive(frame, resolve, reject);
+                    return;
+                }}
+                let fulfilled_frame = std::rc::Rc::clone(&frame);
+                let fulfilled_resolve = resolve.clone();
+                let fulfilled_reject = reject.clone();
+                let on_fulfilled = w3cos_core::Value::function(move |_, arguments| {{
+                    {{
+                        let mut frame = fulfilled_frame.borrow_mut();
+                        frame.registers[dst] =
+                            arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
+                        frame.block = resume;
+                    }}
+                    Self::drive(
+                        std::rc::Rc::clone(&fulfilled_frame),
+                        fulfilled_resolve.clone(),
+                        fulfilled_reject.clone(),
+                    );
+                    w3cos_core::Value::Undefined
+                }});
+                let rejected_frame = std::rc::Rc::clone(&frame);
+                let rejected_resolve = resolve.clone();
+                let rejected_reject = reject.clone();
+                let on_rejected = w3cos_core::Value::function(move |_, arguments| {{
+                    {{
+                        let mut frame = rejected_frame.borrow_mut();
+                        frame.registers[dst] =
+                            arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
+                        frame.block = reject_block;
+                    }}
+                    Self::drive(
+                        std::rc::Rc::clone(&rejected_frame),
+                        rejected_resolve.clone(),
+                        rejected_reject.clone(),
+                    );
+                    w3cos_core::Value::Undefined
+                }});
+                w3cos_core::intrinsics::call_method(
+                    &awaited,
+                    &w3cos_core::Value::string("then"),
+                    vec![on_fulfilled, on_rejected],
+                );
             }}
-            Self::drive(
-                std::rc::Rc::clone(&rejected_frame),
-                rejected_resolve.clone(),
-                rejected_reject.clone(),
-            );
-            w3cos_core::Value::Undefined
-        }});
-        let awaited = w3cos_core::intrinsics::await_value(
-            &w3cos_core::intrinsics::get_property(
-                &outcome,
-                &w3cos_core::Value::string("value"),
-            ),
-        );
-        w3cos_core::intrinsics::call_method(
-            &awaited,
-            &w3cos_core::Value::string("then"),
-            vec![on_fulfilled, on_rejected],
-        );
+        }}
     }}
 }}
 
@@ -589,16 +1087,9 @@ pub fn {rust_name}(
         (w3cos_core::Value, w3cos_core::Value),
     >,
 ) -> w3cos_core::Value {{
-    let mut bindings = std::collections::HashMap::new();
-{binding_initializers}{parameter_initializers}    let mut capture_getters = std::collections::HashMap::new();
-    let mut capture_setters = std::collections::HashMap::new();
-    for (binding, (getter, setter)) in __captures {{
-        capture_getters.insert(binding, getter);
-        capture_setters.insert(binding, setter);
-    }}
-    let frame = std::rc::Rc::new(std::cell::RefCell::new({type_name} {{
+{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    let frame = std::rc::Rc::new(std::cell::RefCell::new({type_name} {{
         registers: vec![w3cos_core::Value::Undefined; {registers}],
-        bindings,
+{num_init}        bindings,
         capture_getters,
         capture_setters,
         block: {entry},
@@ -635,6 +1126,12 @@ fn generate_generator_with_factories(
     }
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
+    let plan = analyze_function(function);
+    let (num_field, num_init) = emit_num_reg_storage(&plan, function.registers);
+    let storage = slot_storage(function);
+    let slot_fields = emit_slot_fields(storage);
+    let slot_bindings_new = emit_bindings_new(storage);
+    let slot_capture_init = emit_capture_init(storage);
 
     let mut blocks = String::new();
     for block in &function.blocks {
@@ -658,6 +1155,8 @@ fn generate_generator_with_factories(
             module_specifier,
             &type_name,
             true,
+            storage,
+            &plan,
         )?);
         blocks.push_str("                }\n");
     }
@@ -715,35 +1214,46 @@ fn generate_generator_with_factories(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
         );
-        binding_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::Value::Undefined, {initialized}))));\n",
-            binding.id.0
+        binding_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.id.0,
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::Value::Undefined, {initialized})))"
+            ),
         ));
     }
     let mut parameter_initializers = String::new();
     for (index, binding) in function.parameters.iter().enumerate() {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true)))"
+            ),
         ));
     }
     if let Some(binding) = function.arguments_binding {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true)))",
         ));
     }
     if let Some(binding) = function.rest_parameter {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.iter().skip({}).cloned().collect()), true))));\n",
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
             binding.0,
-            function.parameters.len()
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.iter().skip({}).cloned().collect()), true)))",
+                function.parameters.len()
+            ),
         ));
     }
     if let Some(binding) = function.this_binding {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__this, true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            "std::rc::Rc::new(std::cell::RefCell::new((__this, true)))",
         ));
     }
 
@@ -761,13 +1271,7 @@ enum {type_name}State {{
 struct {type_name} {{
     state: {type_name}State,
     registers: Vec<w3cos_core::Value>,
-    bindings: std::collections::HashMap<
-        u32,
-        std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>,
-    >,
-    capture_getters: std::collections::HashMap<u32, w3cos_core::Value>,
-    capture_setters: std::collections::HashMap<u32, w3cos_core::Value>,
-    delegate_iterator: Option<w3cos_core::Value>,
+{num_field}{slot_fields}    delegate_iterator: Option<w3cos_core::Value>,
     block: u32,
 }}
 
@@ -856,17 +1360,10 @@ pub fn {rust_name}(
         (w3cos_core::Value, w3cos_core::Value),
     >,
 ) -> w3cos_core::Value {{
-    let mut bindings = std::collections::HashMap::new();
-{binding_initializers}{parameter_initializers}    let mut capture_getters = std::collections::HashMap::new();
-    let mut capture_setters = std::collections::HashMap::new();
-    for (binding, (getter, setter)) in __captures {{
-        capture_getters.insert(binding, getter);
-        capture_setters.insert(binding, setter);
-    }}
-    let frame = std::rc::Rc::new(std::cell::RefCell::new({type_name} {{
+{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    let frame = std::rc::Rc::new(std::cell::RefCell::new({type_name} {{
         state: {type_name}State::Start,
         registers: vec![w3cos_core::Value::Undefined; {registers}],
-        bindings,
+{num_init}        bindings,
         capture_getters,
         capture_setters,
         delegate_iterator: None,
@@ -901,6 +1398,12 @@ fn generate_async_generator_with_factories(
 ) -> Result<String> {
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
+    let plan = analyze_function(function);
+    let (num_field, num_init) = emit_num_reg_storage(&plan, function.registers);
+    let storage = slot_storage(function);
+    let slot_fields = emit_slot_fields(storage);
+    let slot_bindings_new = emit_bindings_new(storage);
+    let slot_capture_init = emit_capture_init(storage);
     let request_name = format!("{type_name}Request");
 
     let mut blocks = String::new();
@@ -925,6 +1428,8 @@ fn generate_async_generator_with_factories(
             module_specifier,
             &type_name,
             true,
+            storage,
+            &plan,
         )?);
         blocks.push_str("                }\n");
     }
@@ -1018,35 +1523,46 @@ fn generate_async_generator_with_factories(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
         );
-        binding_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::Value::Undefined, {initialized}))));\n",
-            binding.id.0
+        binding_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.id.0,
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::Value::Undefined, {initialized})))"
+            ),
         ));
     }
     let mut parameter_initializers = String::new();
     for (index, binding) in function.parameters.iter().enumerate() {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined), true)))"
+            ),
         ));
     }
     if let Some(binding) = function.arguments_binding {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.clone()), true)))",
         ));
     }
     if let Some(binding) = function.rest_parameter {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.iter().skip({}).cloned().collect()), true))));\n",
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
             binding.0,
-            function.parameters.len()
+            &format!(
+                "std::rc::Rc::new(std::cell::RefCell::new((w3cos_core::intrinsics::create_array(__args.iter().skip({}).cloned().collect()), true)))",
+                function.parameters.len()
+            ),
         ));
     }
     if let Some(binding) = function.this_binding {
-        parameter_initializers.push_str(&format!(
-            "        bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((__this, true))));\n",
-            binding.0
+        parameter_initializers.push_str(&emit_binding_assign(
+            storage,
+            binding.0,
+            "std::rc::Rc::new(std::cell::RefCell::new((__this, true)))",
         ));
     }
 
@@ -1072,13 +1588,7 @@ struct {request_name} {{
 struct {type_name} {{
     state: {type_name}State,
     registers: Vec<w3cos_core::Value>,
-    bindings: std::collections::HashMap<
-        u32,
-        std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>,
-    >,
-    capture_getters: std::collections::HashMap<u32, w3cos_core::Value>,
-    capture_setters: std::collections::HashMap<u32, w3cos_core::Value>,
-    delegate_iterator: Option<w3cos_core::Value>,
+{num_field}{slot_fields}    delegate_iterator: Option<w3cos_core::Value>,
     block: u32,
     queue: std::collections::VecDeque<{request_name}>,
     active: Option<{request_name}>,
@@ -1493,17 +2003,10 @@ pub fn {rust_name}(
         (w3cos_core::Value, w3cos_core::Value),
     >,
 ) -> w3cos_core::Value {{
-    let mut bindings = std::collections::HashMap::new();
-{binding_initializers}{parameter_initializers}    let mut capture_getters = std::collections::HashMap::new();
-    let mut capture_setters = std::collections::HashMap::new();
-    for (binding, (getter, setter)) in __captures {{
-        capture_getters.insert(binding, getter);
-        capture_setters.insert(binding, setter);
-    }}
-    let frame = std::rc::Rc::new(std::cell::RefCell::new({type_name} {{
+{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    let frame = std::rc::Rc::new(std::cell::RefCell::new({type_name} {{
         state: {type_name}State::Start,
         registers: vec![w3cos_core::Value::Undefined; {registers}],
-        bindings,
+{num_init}        bindings,
         capture_getters,
         capture_setters,
         delegate_iterator: None,
@@ -1624,10 +2127,15 @@ fn emit_block_instructions(
     module_specifier: Option<&str>,
     type_name: &str,
     wrap_exceptions: bool,
+    storage: SlotStorage,
+    plan: &EscapePlan,
 ) -> Result<String> {
+    let reaching = reaching_number_constants(instructions);
     let emitted = instructions
         .iter()
-        .map(|instruction| {
+        .enumerate()
+        .map(|(index, instruction)| {
+            let proven = proven_string_keys(instructions, index);
             emit_instruction(
                 instruction,
                 exception_target,
@@ -1635,6 +2143,10 @@ fn emit_block_instructions(
                 factories,
                 mode,
                 module_specifier,
+                storage,
+                &proven,
+                plan,
+                &reaching[index],
             )
             .map(|emitted| match mode {
                 EmissionMode::Async => emitted.replace("__W3COS_ASYNC_FRAME__", type_name),
@@ -1731,44 +2243,94 @@ fn emit_instruction(
     factories: &HashMap<FunctionId, String>,
     mode: EmissionMode,
     module_specifier: Option<&str>,
+    storage: SlotStorage,
+    proven_strings: &HashMap<u32, String>,
+    plan: &EscapePlan,
+    reaching_nums: &HashMap<u32, f64>,
 ) -> Result<String> {
     let register = |register: w3cos_ir::Register| register.0;
     Ok(match instruction {
-        Instruction::LoadConstant { dst, value } => format!(
-            "self.registers[{}] = {};",
-            register(*dst),
-            emit_constant(value)
-        ),
-        Instruction::Move { dst, src } => format!(
-            "self.registers[{}] = self.registers[{}].clone();",
+        Instruction::LoadConstant { dst, value } => match value {
+            Constant::Number(value) if plan.number.contains(&dst.0) => {
+                format!("self.num_regs[{}] = {value:?}_f64;", register(*dst))
+            }
+            Constant::Number(value) => format!(
+                "self.registers[{}] = w3cos_core::Value::Number({value:?});",
+                register(*dst)
+            ),
+            value => format!(
+                "self.registers[{}] = {};",
+                register(*dst),
+                emit_constant(value)
+            ),
+        },
+        Instruction::Move { dst, src }
+            if plan.number.contains(&dst.0) && plan.number.contains(&src.0) =>
+        {
+            format!(
+                "self.num_regs[{}] = self.num_regs[{}];",
+                register(*dst),
+                register(*src)
+            )
+        }
+        Instruction::Move { dst, src } if plan.number.contains(&src.0) => format!(
+            "self.registers[{}] = w3cos_core::Value::Number(self.num_regs[{}]);",
             register(*dst),
             register(*src)
         ),
-        Instruction::LoadBinding { dst, binding } => format!(
-            "self.registers[{}] = if let Some(getter) = self.capture_getters.get(&{}) {{ getter.call(w3cos_core::Value::Undefined, Vec::new()) }} else {{ match self.bindings.get(&{}) {{ Some(cell) => {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}, None => w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }};",
+        Instruction::Move { dst, src } => format!(
+            "self.registers[{}] = {};",
             register(*dst),
-            binding.0,
-            binding.0,
+            emit_boxed_value(plan, src.0)
+        ),
+        Instruction::LoadBinding { dst, binding } => format!(
+            "self.registers[{}] = if let Some(getter) = {} {{ getter.call(w3cos_core::Value::Undefined, Vec::new()) }} else {{ match {} {{ Some(cell) => {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}, None => w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }};",
+            register(*dst),
+            emit_capture_get(storage, binding.0),
+            emit_binding_get(storage, binding.0),
         ),
         Instruction::InitializeBinding { binding, value } => format!(
-            "if let Some(binding) = self.bindings.get(&{}) {{ *binding.borrow_mut() = (self.registers[{}].clone(), true); }} else {{ self.bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new((self.registers[{}].clone(), true)))); }}",
-            binding.0,
-            register(*value),
-            binding.0,
-            register(*value)
+            "if let Some(binding) = {} {{ *binding.borrow_mut() = ({}, true); }} else {{ {} }}",
+            emit_binding_get(storage, binding.0),
+            emit_boxed_value(plan, value.0),
+            emit_binding_store_value(
+                storage,
+                binding.0,
+                &format!("({}, true)", emit_boxed_value(plan, value.0)),
+            ),
         ),
         Instruction::StoreBinding { binding, value } => format!(
-            "if let Some(setter) = self.capture_setters.get(&{}) {{ if !setter.is_callable() {{ w3cos_core::throw_value(w3cos_core::intrinsics::type_error(\"captured binding is immutable\")); }} setter.call(w3cos_core::Value::Undefined, vec![self.registers[{}].clone()]); }} else if let Some(binding) = self.bindings.get(&{}) {{ let mut binding = binding.borrow_mut(); if !binding.1 {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")); }} binding.0 = self.registers[{}].clone(); }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing binding\")); }}",
-            binding.0,
-            register(*value),
-            binding.0,
-            register(*value),
+            "if let Some(setter) = {} {{ if !setter.is_callable() {{ w3cos_core::throw_value(w3cos_core::intrinsics::type_error(\"captured binding is immutable\")); }} setter.call(w3cos_core::Value::Undefined, vec![{}]); }} else if let Some(binding) = {} {{ let mut binding = binding.borrow_mut(); if !binding.1 {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")); }} binding.0 = {}; }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing binding\")); }}",
+            emit_capture_setter_get(storage, binding.0),
+            emit_boxed_value(plan, value.0),
+            emit_binding_get(storage, binding.0),
+            emit_boxed_value(plan, value.0),
         ),
         Instruction::RefreshBinding { binding } => format!(
-            "if let Some(binding) = self.bindings.get(&{}) {{ let refreshed = binding.borrow().clone(); self.bindings.insert({}, std::rc::Rc::new(std::cell::RefCell::new(refreshed))); }}",
-            binding.0, binding.0
+            "if let Some(binding) = {} {{ let refreshed = binding.borrow().clone(); {} }}",
+            emit_binding_get(storage, binding.0),
+            emit_binding_store_value(storage, binding.0, "refreshed"),
         ),
-        Instruction::Add { dst, lhs, rhs } => binary_call(*dst, *lhs, *rhs, "add"),
+        Instruction::Add { dst, lhs, rhs }
+            if known_number(plan, reaching_nums, lhs.0)
+                && known_number(plan, reaching_nums, rhs.0) =>
+        {
+            write_f64(
+                plan,
+                dst.0,
+                &format!(
+                    "{} + {}",
+                    emit_f64_operand(plan, reaching_nums, lhs.0),
+                    emit_f64_operand(plan, reaching_nums, rhs.0)
+                ),
+            )
+        }
+        Instruction::Add { dst, lhs, rhs } => format!(
+            "self.registers[{}] = w3cos_core::intrinsics::add(&{}, &{});",
+            register(*dst),
+            emit_boxed_value(plan, lhs.0),
+            emit_boxed_value(plan, rhs.0)
+        ),
         Instruction::Binary {
             dst,
             operator,
@@ -1776,64 +2338,95 @@ fn emit_instruction(
             rhs,
         } => match operator {
             BinaryOperator::AbstractNotEqual => format!(
-                "self.registers[{}] = w3cos_core::intrinsics::logical_not(&w3cos_core::intrinsics::abstract_equal(&self.registers[{}], &self.registers[{}]));",
+                "self.registers[{}] = w3cos_core::intrinsics::logical_not(&w3cos_core::intrinsics::abstract_equal(&{}, &{}));",
                 register(*dst),
-                register(*lhs),
-                register(*rhs)
+                emit_boxed_value(plan, lhs.0),
+                emit_boxed_value(plan, rhs.0)
             ),
             BinaryOperator::StrictNotEqual => format!(
-                "self.registers[{}] = w3cos_core::intrinsics::logical_not(&w3cos_core::intrinsics::strict_equal(&self.registers[{}], &self.registers[{}]));",
+                "self.registers[{}] = w3cos_core::intrinsics::logical_not(&w3cos_core::intrinsics::strict_equal(&{}, &{}));",
                 register(*dst),
-                register(*lhs),
-                register(*rhs)
+                emit_boxed_value(plan, lhs.0),
+                emit_boxed_value(plan, rhs.0)
             ),
             BinaryOperator::InstanceOf => format!(
-                "self.registers[{}] = w3cos_core::intrinsics::instance_of(&self.registers[{}], &self.registers[{}]);",
+                "self.registers[{}] = w3cos_core::intrinsics::instance_of(&{}, &{});",
                 register(*dst),
-                register(*lhs),
-                register(*rhs)
+                emit_boxed_value(plan, lhs.0),
+                emit_boxed_value(plan, rhs.0)
             ),
             BinaryOperator::In => format!(
-                "self.registers[{}] = w3cos_core::intrinsics::in_operator(&self.registers[{}], &self.registers[{}]);",
+                "self.registers[{}] = w3cos_core::intrinsics::in_operator(&{}, &{});",
                 register(*dst),
-                register(*lhs),
-                register(*rhs)
+                emit_boxed_value(plan, lhs.0),
+                emit_boxed_value(plan, rhs.0)
             ),
-            operator => binary_call(*dst, *lhs, *rhs, binary_intrinsic(*operator)),
+            operator => {
+                emit_binary_operator(plan, reaching_nums, register(*dst), *operator, lhs.0, rhs.0)
+            }
         },
+        Instruction::Unary {
+            dst,
+            operator: UnaryOperator::Negate,
+            value,
+        } if plan.number.contains(&value.0) => write_f64(
+            plan,
+            dst.0,
+            &format!("-{}", emit_f64_operand(plan, reaching_nums, value.0)),
+        ),
         Instruction::Unary {
             dst,
             operator,
             value,
         } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::{}(&self.registers[{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::{}(&{});",
             register(*dst),
             unary_intrinsic(*operator),
-            register(*value)
+            emit_boxed_value(plan, value.0)
         ),
-        Instruction::GetProperty { dst, object, key } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::get_property(&self.registers[{}], &self.registers[{}]);",
-            register(*dst),
-            register(*object),
-            register(*key)
-        ),
+        Instruction::GetProperty { dst, object, key } => {
+            if let Some(literal) = proven_strings.get(&key.0) {
+                format!(
+                    "self.registers[{}] = {}.get_property({literal:?});",
+                    register(*dst),
+                    emit_boxed_value(plan, object.0),
+                )
+            } else {
+                format!(
+                    "self.registers[{}] = w3cos_core::intrinsics::get_property(&{}, &{});",
+                    register(*dst),
+                    emit_boxed_value(plan, object.0),
+                    emit_boxed_value(plan, key.0)
+                )
+            }
+        }
         Instruction::DeleteProperty { dst, object, key } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::delete_property(&self.registers[{}], &self.registers[{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::delete_property(&{}, &{});",
             register(*dst),
-            register(*object),
-            register(*key)
+            emit_boxed_value(plan, object.0),
+            emit_boxed_value(plan, key.0)
         ),
-        Instruction::SetProperty { object, key, value } => format!(
-            "w3cos_core::intrinsics::set_property(&self.registers[{}], &self.registers[{}], self.registers[{}].clone());",
-            register(*object),
-            register(*key),
-            register(*value)
-        ),
+        Instruction::SetProperty { object, key, value } => {
+            if let Some(literal) = proven_strings.get(&key.0) {
+                format!(
+                    "{}.set_property({literal:?}, {});",
+                    emit_boxed_value(plan, object.0),
+                    emit_boxed_value(plan, value.0)
+                )
+            } else {
+                format!(
+                    "w3cos_core::intrinsics::set_property(&{}, &{}, {});",
+                    emit_boxed_value(plan, object.0),
+                    emit_boxed_value(plan, key.0),
+                    emit_boxed_value(plan, value.0)
+                )
+            }
+        }
         Instruction::DefineField { object, key, value } => format!(
-            "w3cos_core::intrinsics::define_field(&self.registers[{}], &self.registers[{}], self.registers[{}].clone());",
-            register(*object),
-            register(*key),
-            register(*value)
+            "w3cos_core::intrinsics::define_field(&{}, &{}, {});",
+            emit_boxed_value(plan, object.0),
+            emit_boxed_value(plan, key.0),
+            emit_boxed_value(plan, value.0)
         ),
         Instruction::DefinePrivate {
             object,
@@ -1841,11 +2434,11 @@ fn emit_instruction(
             name,
             value,
         } => format!(
-            "w3cos_core::intrinsics::define_private(&self.registers[{}], &self.registers[{}], &self.registers[{}], self.registers[{}].clone());",
-            register(*object),
-            register(*brand),
-            register(*name),
-            register(*value)
+            "w3cos_core::intrinsics::define_private(&{}, &{}, &{}, {});",
+            emit_boxed_value(plan, object.0),
+            emit_boxed_value(plan, brand.0),
+            emit_boxed_value(plan, name.0),
+            emit_boxed_value(plan, value.0)
         ),
         Instruction::GetPrivate {
             dst,
@@ -1853,11 +2446,11 @@ fn emit_instruction(
             brand,
             name,
         } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::get_private(&self.registers[{}], &self.registers[{}], &self.registers[{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::get_private(&{}, &{}, &{});",
             register(*dst),
-            register(*object),
-            register(*brand),
-            register(*name)
+            emit_boxed_value(plan, object.0),
+            emit_boxed_value(plan, brand.0),
+            emit_boxed_value(plan, name.0)
         ),
         Instruction::SetPrivate {
             object,
@@ -1865,23 +2458,23 @@ fn emit_instruction(
             name,
             value,
         } => format!(
-            "w3cos_core::intrinsics::set_private(&self.registers[{}], &self.registers[{}], &self.registers[{}], self.registers[{}].clone());",
-            register(*object),
-            register(*brand),
-            register(*name),
-            register(*value)
+            "w3cos_core::intrinsics::set_private(&{}, &{}, &{}, {});",
+            emit_boxed_value(plan, object.0),
+            emit_boxed_value(plan, brand.0),
+            emit_boxed_value(plan, name.0),
+            emit_boxed_value(plan, value.0)
         ),
         Instruction::HasPrivate { dst, object, brand } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::has_private(&self.registers[{}], &self.registers[{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::has_private(&{}, &{});",
             register(*dst),
-            register(*object),
-            register(*brand)
+            emit_boxed_value(plan, object.0),
+            emit_boxed_value(plan, brand.0)
         ),
         Instruction::DefinePrivateMethod { brand, name, value } => format!(
-            "w3cos_core::intrinsics::define_private_method(&self.registers[{}], &self.registers[{}], self.registers[{}].clone());",
-            register(*brand),
-            register(*name),
-            register(*value)
+            "w3cos_core::intrinsics::define_private_method(&{}, &{}, {});",
+            emit_boxed_value(plan, brand.0),
+            emit_boxed_value(plan, name.0),
+            emit_boxed_value(plan, value.0)
         ),
         Instruction::DefinePrivateAccessor {
             brand,
@@ -1890,15 +2483,15 @@ fn emit_instruction(
             setter,
         } => {
             let getter = getter
-                .map(|register| format!("Some(self.registers[{}].clone())", register.0))
+                .map(|register| format!("Some({})", emit_boxed_value(plan, register.0)))
                 .unwrap_or_else(|| "None".into());
             let setter = setter
-                .map(|register| format!("Some(self.registers[{}].clone())", register.0))
+                .map(|register| format!("Some({})", emit_boxed_value(plan, register.0)))
                 .unwrap_or_else(|| "None".into());
             format!(
-                "w3cos_core::intrinsics::define_private_accessor(&self.registers[{}], &self.registers[{}], {getter}, {setter});",
-                register(*brand),
-                register(*name)
+                "w3cos_core::intrinsics::define_private_accessor(&{}, &{}, {getter}, {setter});",
+                emit_boxed_value(plan, brand.0),
+                emit_boxed_value(plan, name.0)
             )
         }
         Instruction::CreateArray { dst, elements } => format!(
@@ -1906,24 +2499,24 @@ fn emit_instruction(
             register(*dst),
             elements
                 .iter()
-                .map(|element| format!("self.registers[{}].clone()", register(*element)))
+                .map(|element| emit_boxed_value(plan, element.0))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
         Instruction::AppendArrayElement { array, value } => format!(
-            "w3cos_core::intrinsics::append_array_element(&self.registers[{}], self.registers[{}].clone());",
-            register(*array),
-            register(*value)
+            "w3cos_core::intrinsics::append_array_element(&{}, {});",
+            emit_boxed_value(plan, array.0),
+            emit_boxed_value(plan, value.0)
         ),
         Instruction::AppendIterable { array, iterable } => format!(
-            "w3cos_core::intrinsics::append_iterable(&self.registers[{}], &self.registers[{}]);",
-            register(*array),
-            register(*iterable)
+            "w3cos_core::intrinsics::append_iterable(&{}, &{});",
+            emit_boxed_value(plan, array.0),
+            emit_boxed_value(plan, iterable.0)
         ),
         Instruction::ArrayRest { dst, value, start } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::array_rest(&self.registers[{}], {});",
+            "self.registers[{}] = w3cos_core::intrinsics::array_rest(&{}, {});",
             register(*dst),
-            register(*value),
+            emit_boxed_value(plan, value.0),
             *start as usize
         ),
         Instruction::ObjectRest {
@@ -1931,12 +2524,12 @@ fn emit_instruction(
             value,
             excluded,
         } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::object_rest(&self.registers[{}], &[{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::object_rest(&{}, &[{}]);",
             register(*dst),
-            register(*value),
+            emit_boxed_value(plan, value.0),
             excluded
                 .iter()
-                .map(|key| format!("self.registers[{}].clone()", register(*key)))
+                .map(|key| emit_boxed_value(plan, key.0))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -1946,17 +2539,17 @@ fn emit_instruction(
             properties
                 .iter()
                 .map(|(key, value)| format!(
-                    "(self.registers[{}].clone(), self.registers[{}].clone())",
-                    register(*key),
-                    register(*value)
+                    "({}, {})",
+                    emit_boxed_value(plan, key.0),
+                    emit_boxed_value(plan, value.0)
                 ))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
         Instruction::CopyDataProperties { target, source } => format!(
-            "w3cos_core::intrinsics::copy_data_properties(&self.registers[{}], &self.registers[{}]);",
-            register(*target),
-            register(*source)
+            "w3cos_core::intrinsics::copy_data_properties(&{}, &{});",
+            emit_boxed_value(plan, target.0),
+            emit_boxed_value(plan, source.0)
         ),
         Instruction::CreateClosure {
             dst,
@@ -1983,8 +2576,11 @@ fn emit_instruction(
                     "w3cos_core::Value::Undefined".into()
                 };
                 adapters.push_str(&format!(
-                    "let __w3cos_pair = if let Some(getter) = self.capture_getters.get(&{}).cloned() {{ (getter, self.capture_setters.get(&{}).cloned().unwrap_or(w3cos_core::Value::Undefined)) }} else if let Some(cell) = self.bindings.get(&{}).cloned() {{ let getter = {{ let cell = std::rc::Rc::clone(&cell); w3cos_core::Value::function(move |_, _| {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}) }}; let setter = {local_setter}; (getter, setter) }} else {{ return w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing nested generator capture\")); }}; __w3cos_nested_captures.insert({}, __w3cos_pair);",
-                    capture.0, capture.0, capture.0, capture.0
+                    "let __w3cos_pair = if let Some(getter) = {} {{ (getter, {}.unwrap_or(w3cos_core::Value::Undefined)) }} else if let Some(cell) = {} {{ let getter = {{ let cell = std::rc::Rc::clone(&cell); w3cos_core::Value::function(move |_, _| {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}) }}; let setter = {local_setter}; (getter, setter) }} else {{ return w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing nested generator capture\")); }}; __w3cos_nested_captures.insert({}, __w3cos_pair);",
+                    emit_capture_get_cloned(storage, capture.0),
+                    emit_capture_setter_get_cloned(storage, capture.0),
+                    emit_binding_get_cloned(storage, capture.0),
+                    capture.0
                 ));
             }
             format!(
@@ -1999,14 +2595,14 @@ fn emit_instruction(
             initializer,
         } => {
             let super_class = super_class
-                .map(|register| format!("Some(self.registers[{}].clone())", register.0))
+                .map(|register| format!("Some({})", emit_boxed_value(plan, register.0)))
                 .unwrap_or_else(|| "None".into());
             let initializer = initializer
-                .map(|register| format!("self.registers[{}].clone()", register.0))
+                .map(|register| emit_boxed_value(plan, register.0))
                 .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
             format!(
-                "let __w3cos_constructor = self.registers[{}].clone(); let __w3cos_super_class = {super_class}; let __w3cos_initializer = {initializer}; self.registers[{}] = w3cos_core::intrinsics::create_class_with_initializer(&__w3cos_constructor, __w3cos_super_class.as_ref(), &__w3cos_initializer);",
-                register(*constructor),
+                "let __w3cos_constructor = {}; let __w3cos_super_class = {super_class}; let __w3cos_initializer = {initializer}; self.registers[{}] = w3cos_core::intrinsics::create_class_with_initializer(&__w3cos_constructor, __w3cos_super_class.as_ref(), &__w3cos_initializer);",
+                emit_boxed_value(plan, constructor.0),
                 register(*dst),
             )
         }
@@ -2016,11 +2612,11 @@ fn emit_instruction(
             this_value,
             arguments,
         } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::call(&self.registers[{}], self.registers[{}].clone(), vec![{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::call(&{}, {}, vec![{}]);",
             register(*dst),
-            register(*callee),
-            register(*this_value),
-            emit_arguments(arguments)
+            emit_boxed_value(plan, callee.0),
+            emit_boxed_value(plan, this_value.0),
+            emit_arguments(arguments, plan)
         ),
         Instruction::CallWithArguments {
             dst,
@@ -2028,63 +2624,74 @@ fn emit_instruction(
             this_value,
             arguments,
         } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::call_with_arguments(&self.registers[{}], self.registers[{}].clone(), &self.registers[{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::call_with_arguments(&{}, {}, &{});",
             register(*dst),
-            register(*callee),
-            register(*this_value),
-            register(*arguments)
+            emit_boxed_value(plan, callee.0),
+            emit_boxed_value(plan, this_value.0),
+            emit_boxed_value(plan, arguments.0)
         ),
         Instruction::CallMethod {
             dst,
             object,
             key,
             arguments,
-        } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::call_method(&self.registers[{}], &self.registers[{}], vec![{}]);",
-            register(*dst),
-            register(*object),
-            register(*key),
-            emit_arguments(arguments)
-        ),
+        } => {
+            if let Some(literal) = proven_strings.get(&key.0) {
+                format!(
+                    "self.registers[{}] = {}.call_method({literal:?}, vec![{}]);",
+                    register(*dst),
+                    emit_boxed_value(plan, object.0),
+                    emit_arguments(arguments, plan)
+                )
+            } else {
+                format!(
+                    "self.registers[{}] = w3cos_core::intrinsics::call_method(&{}, &{}, vec![{}]);",
+                    register(*dst),
+                    emit_boxed_value(plan, object.0),
+                    emit_boxed_value(plan, key.0),
+                    emit_arguments(arguments, plan)
+                )
+            }
+        }
         Instruction::CallMethodWithArguments {
             dst,
             object,
             key,
             arguments,
         } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::call_method_with_arguments(&self.registers[{}], &self.registers[{}], &self.registers[{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::call_method_with_arguments(&{}, &{}, &{});",
             register(*dst),
-            register(*object),
-            register(*key),
-            register(*arguments)
+            emit_boxed_value(plan, object.0),
+            emit_boxed_value(plan, key.0),
+            emit_boxed_value(plan, arguments.0)
         ),
         Instruction::Construct {
             dst,
             constructor,
             arguments,
         } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::construct(&self.registers[{}], vec![{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::construct(&{}, vec![{}]);",
             register(*dst),
-            register(*constructor),
-            emit_arguments(arguments)
+            emit_boxed_value(plan, constructor.0),
+            emit_arguments(arguments, plan)
         ),
         Instruction::ConstructWithArguments {
             dst,
             constructor,
             arguments,
         } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::construct_with_arguments(&self.registers[{}], &self.registers[{}]);",
+            "self.registers[{}] = w3cos_core::intrinsics::construct_with_arguments(&{}, &{});",
             register(*dst),
-            register(*constructor),
-            register(*arguments)
+            emit_boxed_value(plan, constructor.0),
+            emit_boxed_value(plan, arguments.0)
         ),
         Instruction::DynamicImport { dst, specifier } => {
             let referrer = module_specifier
                 .ok_or_else(|| anyhow!("dynamic import AOT emission requires its W3IR module"))?;
             format!(
-                "self.registers[{}] = w3cos_core::host_modules::dynamic_import(self.registers[{}].clone(), w3cos_core::Value::string({referrer:?}));",
+                "self.registers[{}] = w3cos_core::host_modules::dynamic_import({}, w3cos_core::Value::string({referrer:?}));",
                 register(*dst),
-                register(*specifier)
+                emit_boxed_value(plan, specifier.0)
             )
         }
         Instruction::ImportMeta { dst } => {
@@ -2099,9 +2706,9 @@ fn emit_instruction(
             value, suspension, ..
         } => match mode {
             EmissionMode::Generator | EmissionMode::AsyncGenerator => format!(
-                "self.state = __W3COS_STATE__::Suspended({}); return Self::result(self.registers[{}].clone(), false);",
+                "self.state = __W3COS_STATE__::Suspended({}); return Self::result({}, false);",
                 suspension.0,
-                register(*value)
+                emit_boxed_value(plan, value.0)
             ),
             EmissionMode::Async | EmissionMode::Sync => {
                 bail!("ordinary W3IR AOT function contains yield")
@@ -2121,8 +2728,8 @@ fn emit_instruction(
                 .find(|point| point.id == *suspension)
                 .ok_or_else(|| anyhow!("missing W3IR await suspension point"))?;
             let awaited = format!(
-                "return Self::awaited(self.registers[{}].clone(), {}, {}, {});",
-                register(*value),
+                "return Self::awaited({}, {}, {}, {});",
+                emit_boxed_value(plan, value.0),
                 register(*dst),
                 point.resume_block.0,
                 point.reject_block.0,
@@ -2148,8 +2755,8 @@ fn emit_instruction(
                 .ok_or_else(|| anyhow!("missing W3IR generator delegation point"))?;
             if matches!(mode, EmissionMode::AsyncGenerator) {
                 format!(
-                    "let iterator = self.registers[{}].clone(); self.delegate_iterator = Some(iterator.clone()); match Self::delegate_call(&iterator, \"next\", Vec::new()) {{ Ok(Some(awaited)) => return Self::delegated(awaited, {}, 0), Ok(None) => {{ self.registers[{}] = w3cos_core::Value::string(\"TypeError: delegated iterator has no next method\"); self.delegate_iterator = None; self.block = {}; continue 'drive; }}, Err(reason) => {{ self.registers[{}] = reason; self.delegate_iterator = None; self.block = {}; continue 'drive; }} }}",
-                    register(*iterator),
+                    "let iterator = {}; self.delegate_iterator = Some(iterator.clone()); match Self::delegate_call(&iterator, \"next\", Vec::new()) {{ Ok(Some(awaited)) => return Self::delegated(awaited, {}, 0), Ok(None) => {{ self.registers[{}] = w3cos_core::Value::string(\"TypeError: delegated iterator has no next method\"); self.delegate_iterator = None; self.block = {}; continue 'drive; }}, Err(reason) => {{ self.registers[{}] = reason; self.delegate_iterator = None; self.block = {}; continue 'drive; }} }}",
+                    emit_boxed_value(plan, iterator.0),
                     suspension.0,
                     register(*dst),
                     point.throw_block.0,
@@ -2158,8 +2765,8 @@ fn emit_instruction(
                 )
             } else {
                 format!(
-                    "let iterator = self.registers[{}].clone(); let delegated = Self::delegate_step(&iterator, \"next\", Vec::new()).unwrap_or_else(|| w3cos_core::throw_value(w3cos_core::Value::string(\"TypeError: delegated iterator has no next method\"))); let value = delegated.get_property(\"value\"); if delegated.get_property(\"done\").to_bool() {{ self.registers[{}] = value; self.block = {}; continue 'drive; }} self.delegate_iterator = Some(iterator); self.state = __W3COS_STATE__::SuspendedDelegate({}); return Self::result(value, false);",
-                    register(*iterator),
+                    "let iterator = {}; let delegated = Self::delegate_step(&iterator, \"next\", Vec::new()).unwrap_or_else(|| w3cos_core::throw_value(w3cos_core::Value::string(\"TypeError: delegated iterator has no next method\"))); let value = delegated.get_property(\"value\"); if delegated.get_property(\"done\").to_bool() {{ self.registers[{}] = value; self.block = {}; continue 'drive; }} self.delegate_iterator = Some(iterator); self.state = __W3COS_STATE__::SuspendedDelegate({}); return Self::result(value, false);",
+                    emit_boxed_value(plan, iterator.0),
                     register(*dst),
                     point.resume_block.0,
                     suspension.0,
@@ -2171,46 +2778,51 @@ fn emit_instruction(
             condition,
             then_block,
             else_block,
-        } => format!(
-            "self.block = if self.registers[{}].to_bool() {{ {} }} else {{ {} }}; continue 'drive;",
+        } if plan.number.contains(&condition.0) => format!(
+            "self.block = if self.num_regs[{}] != 0.0_f64 && !self.num_regs[{}].is_nan() {{ {} }} else {{ {} }}; continue 'drive;",
             register(*condition),
+            register(*condition),
+            then_block.0,
+            else_block.0
+        ),
+        Instruction::Branch {
+            condition,
+            then_block,
+            else_block,
+        } => format!(
+            "self.block = if {}.to_bool() {{ {} }} else {{ {} }}; continue 'drive;",
+            emit_boxed_value(plan, condition.0),
             then_block.0,
             else_block.0
         ),
         Instruction::Return { value } => match mode {
             EmissionMode::Generator | EmissionMode::AsyncGenerator => format!(
-                "self.state = __W3COS_STATE__::Completed; return Self::result(self.registers[{}].clone(), true);",
-                register(*value)
+                "self.state = __W3COS_STATE__::Completed; return Self::result({}, true);",
+                emit_boxed_value(plan, value.0)
             ),
-            EmissionMode::Sync => {
-                format!("return self.registers[{}].clone();", register(*value))
-            }
+            EmissionMode::Sync => format!("return {};", emit_boxed_value(plan, value.0)),
             EmissionMode::Async => format!(
-                "return __W3COS_ASYNC_FRAME__::completed(self.registers[{}].clone());",
-                register(*value)
+                "return __W3COS_ASYNC_FRAME__::completed({});",
+                emit_boxed_value(plan, value.0)
             ),
         },
         Instruction::Throw { value } => {
             if let Some((exception, target)) = exception_target {
                 format!(
-                    "self.registers[{}] = self.registers[{}].clone(); self.block = {}; continue 'drive;",
+                    "self.registers[{}] = {}; self.block = {}; continue 'drive;",
                     register(exception),
-                    register(*value),
+                    emit_boxed_value(plan, value.0),
                     target.0
                 )
             } else {
                 match mode {
                     EmissionMode::Generator | EmissionMode::AsyncGenerator => format!(
-                        "self.state = __W3COS_STATE__::Completed; return w3cos_core::throw_value(self.registers[{}].clone());",
-                        register(*value)
+                        "self.state = __W3COS_STATE__::Completed; return w3cos_core::throw_value({});",
+                        emit_boxed_value(plan, value.0)
                     ),
-                    EmissionMode::Sync => format!(
-                        "return w3cos_core::throw_value(self.registers[{}].clone());",
-                        register(*value)
-                    ),
-                    EmissionMode::Async => format!(
-                        "return w3cos_core::throw_value(self.registers[{}].clone());",
-                        register(*value)
+                    EmissionMode::Sync | EmissionMode::Async => format!(
+                        "return w3cos_core::throw_value({});",
+                        emit_boxed_value(plan, value.0)
                     ),
                 }
             }
@@ -2228,6 +2840,99 @@ fn emit_constant(value: &Constant) -> String {
     }
 }
 
+fn emit_binary_operator(
+    plan: &EscapePlan,
+    reaching_nums: &HashMap<u32, f64>,
+    dst: u32,
+    operator: BinaryOperator,
+    lhs: u32,
+    rhs: u32,
+) -> String {
+    let both = known_number(plan, reaching_nums, lhs) && known_number(plan, reaching_nums, rhs);
+    let one_const = reaching_nums.contains_key(&lhs) || reaching_nums.contains_key(&rhs);
+    let left = emit_f64_operand(plan, reaching_nums, lhs);
+    let right = emit_f64_operand(plan, reaching_nums, rhs);
+    match operator {
+        BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide
+            if both || one_const =>
+        {
+            let op = match operator {
+                BinaryOperator::Subtract => "-",
+                BinaryOperator::Multiply => "*",
+                BinaryOperator::Divide => "/",
+                _ => unreachable!(),
+            };
+            write_f64(plan, dst, &format!("{left} {op} {right}"))
+        }
+        BinaryOperator::Remainder if both => write_f64(plan, dst, &format!("{left} % {right}")),
+        BinaryOperator::Exponentiate if both => {
+            write_f64(plan, dst, &format!("{left}.powf({right})"))
+        }
+        BinaryOperator::LeftShift
+        | BinaryOperator::SignedRightShift
+        | BinaryOperator::UnsignedRightShift
+        | BinaryOperator::BitwiseOr
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::BitwiseAnd
+            if both =>
+        {
+            let expr = match operator {
+                BinaryOperator::LeftShift => {
+                    format!("(({left} as i32) << (({right} as i32) as u32 & 31)) as f64")
+                }
+                BinaryOperator::SignedRightShift => {
+                    format!("(({left} as i32) >> (({right} as i32) as u32 & 31)) as f64")
+                }
+                BinaryOperator::UnsignedRightShift => {
+                    format!("(({left} as u32) >> (({right} as i32) as u32 & 31)) as f64")
+                }
+                BinaryOperator::BitwiseOr => {
+                    format!("(({left} as i32) | ({right} as i32)) as f64")
+                }
+                BinaryOperator::BitwiseXor => {
+                    format!("(({left} as i32) ^ ({right} as i32)) as f64")
+                }
+                BinaryOperator::BitwiseAnd => {
+                    format!("(({left} as i32) & ({right} as i32)) as f64")
+                }
+                _ => unreachable!(),
+            };
+            write_f64(plan, dst, &expr)
+        }
+        BinaryOperator::LessThan if both => {
+            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} < {right});")
+        }
+        BinaryOperator::LessThanOrEqual if both => {
+            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} <= {right});")
+        }
+        BinaryOperator::GreaterThan if both => {
+            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} > {right});")
+        }
+        BinaryOperator::GreaterThanOrEqual if both => {
+            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} >= {right});")
+        }
+        BinaryOperator::AbstractEqual | BinaryOperator::StrictEqual if both => {
+            format!("self.registers[{dst}] = w3cos_core::Value::Bool({left} == {right});")
+        }
+        operator => {
+            let boxed_lhs = emit_boxed_value(plan, lhs);
+            let boxed_rhs = emit_boxed_value(plan, rhs);
+            if plan.number.contains(&dst) {
+                format!(
+                    "self.num_regs[{dst}] = w3cos_core::intrinsics::{}(&{boxed_lhs}, &{boxed_rhs}).to_number();",
+                    binary_intrinsic(operator)
+                )
+            } else {
+                format!(
+                    "self.registers[{dst}] = w3cos_core::intrinsics::{}(&{boxed_lhs}, &{boxed_rhs});",
+                    binary_intrinsic(operator)
+                )
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn binary_call(
     dst: w3cos_ir::Register,
     lhs: w3cos_ir::Register,
@@ -2274,10 +2979,10 @@ fn unary_intrinsic(operator: UnaryOperator) -> &'static str {
     }
 }
 
-fn emit_arguments(arguments: &[w3cos_ir::Register]) -> String {
+fn emit_arguments(arguments: &[w3cos_ir::Register], plan: &EscapePlan) -> String {
     arguments
         .iter()
-        .map(|argument| format!("self.registers[{}].clone()", argument.0))
+        .map(|argument| emit_boxed_value(plan, argument.0))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2504,7 +3209,11 @@ fn main() {{
             .clone();
         let generated =
             generate_async_function_from_module(&module, &function, "calculate_aot").unwrap();
-        assert!(generated.contains("__w3cos_async_function_await"));
+        assert!(generated.contains("Outcome::Await"));
+        assert!(generated.contains("Outcome::Complete"));
+        assert!(generated.contains("w3cos_core::promise::PromiseStatus::Fulfilled"));
+        assert!(!generated.contains("__w3cos_async_function_await"));
+        assert!(!generated.contains("__w3cos_async_function_complete"));
         assert!(generated.contains("w3cos_core::intrinsics::await_value"));
         assert!(generated.contains("w3cos_core::intrinsics::promise_new"));
         assert!(generated.contains("w3cos_core::intrinsics::call_method"));
@@ -3250,5 +3959,173 @@ fn main() {{
         assert!(generated.matches("w3cos_core::Value::function").count() >= 3);
         assert!(!generated.contains("w3cos_vm"));
         assert!(!generated.contains("w3cos_ir"));
+    }
+    #[test]
+    fn peepholes_intra_block_string_property_keys() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function read(object) {
+                    object.flag = true;
+                    return object.name.toUpperCase();
+                }
+                read;
+            "#,
+            "app:///const-prop-key-aot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("read"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "read_aot").unwrap();
+        assert!(
+            generated.contains(".get_property(\"name\")"),
+            "constant GetProperty key should skip Value + to_js_string: {generated}"
+        );
+        assert!(
+            generated.contains(".set_property(\"flag\""),
+            "constant SetProperty key should skip Value + to_js_string: {generated}"
+        );
+        assert!(
+            generated.contains(".call_method(\"toUpperCase\""),
+            "constant CallMethod key should skip Value + to_js_string: {generated}"
+        );
+        assert!(
+            !generated.contains("w3cos_core::intrinsics::get_property(&self.registers"),
+            "proven string keys must not go through the Value-key intrinsic: {generated}"
+        );
+    }
+
+    #[test]
+    fn uses_dense_binding_vectors_only_when_ids_are_zero_based() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function add(left, right) {
+                    return left + right;
+                }
+                function outer(seed) {
+                    return function inner(extra) {
+                        return seed + extra;
+                    };
+                }
+                [add, outer];
+            "#,
+            "app:///dense-bindings-aot.js",
+        )
+        .unwrap();
+        let add = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("add"))
+            .unwrap();
+        let inner = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("inner"))
+            .unwrap();
+        let add_generated = generate_sync_function_from_module(&module, add, "add_aot").unwrap();
+        let inner_generated =
+            generate_sync_function_from_module(&module, inner, "inner_aot").unwrap();
+
+        match slot_storage(add) {
+            SlotStorage::Dense(_) => {
+                assert!(
+                    add_generated.contains("vec![None;"),
+                    "dense 0..n BindingIds should index a Vec: {add_generated}"
+                );
+            }
+            SlotStorage::Map => {
+                assert!(
+                    add_generated.contains("std::collections::HashMap::new()"),
+                    "non-dense add should keep HashMap slots: {add_generated}"
+                );
+            }
+        }
+        match slot_storage(inner) {
+            SlotStorage::Dense(_) => {
+                assert!(
+                    inner_generated.contains("vec![None;"),
+                    "unexpected dense inner captures: {inner_generated}"
+                );
+            }
+            SlotStorage::Map => {
+                assert!(
+                    inner_generated.contains("std::collections::HashMap<"),
+                    "sparse captured BindingIds must keep HashMap slots: {inner_generated}"
+                );
+                assert!(
+                    !inner_generated.contains("vec![None;"),
+                    "sparse inner must not switch captures to Vec: {inner_generated}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unboxes_pure_numeric_arithmetic_to_f64() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function calc() {
+                    return (1 + 2) * 3 - 4 / 2;
+                }
+                calc;
+            "#,
+            "app:///numeric-escape.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("calc"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "calc_aot").unwrap();
+
+        assert!(
+            generated.contains("num_regs") && generated.contains("_f64"),
+            "pure numeric function should emit f64 locals: {generated}"
+        );
+        assert!(
+            generated.contains(" + ")
+                && generated.contains(" * ")
+                && generated.contains(" - ")
+                && generated.contains(" / "),
+            "expected f64 arithmetic operators: {generated}"
+        );
+        let boxed = generated.matches("w3cos_core::Value::Number").count();
+        assert!(
+            boxed <= 2,
+            "inner arithmetic should stay unboxed; boxed {boxed} times: {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::Value::Number(self.num_regs")
+                || generated.contains("Value::Number(self.num_regs"),
+            "result must box back to Value at return: {generated}"
+        );
+        assert!(!generated.contains("w3cos_vm"));
+    }
+
+    #[test]
+    fn keeps_add_intrinsic_when_a_side_may_be_string() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function join(prefix) {
+                    return prefix + 1;
+                }
+                join;
+            "#,
+            "app:///string-add-escape.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("join"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "join_aot").unwrap();
+        assert!(
+            generated.contains("w3cos_core::intrinsics::add"),
+            "JS + must stay on the add intrinsic when an operand may be string: {generated}"
+        );
     }
 }
