@@ -203,7 +203,7 @@ pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
         _ if source.as_object().is_some() => {
             let object = source.as_object().expect("object");
             let own_keys = object.borrow().own_keys();
-            let Value::Array(keys) = own_keys else {
+            let Some(keys) = own_keys.as_array() else {
                 return target.clone();
             };
             keys.borrow()
@@ -211,7 +211,9 @@ pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
                 .map(Value::to_js_string)
                 .collect::<Vec<_>>()
         }
-        Value::Array(values) => values
+        _ if source.as_array().is_some() => source
+            .as_array()
+            .expect("array")
             .borrow()
             .iter()
             .enumerate()
@@ -259,7 +261,7 @@ pub fn create_array(elements: Vec<Value>) -> Value {
 }
 
 pub fn append_array_element(array: &Value, value: Value) -> Value {
-    let Value::Array(elements) = array else {
+    let Some(elements) = array.as_array() else {
         crate::throw_value(Value::string(
             "TypeError: array construction target is not an array",
         ));
@@ -291,7 +293,7 @@ pub fn object_rest(value: &Value, excluded: &[Value]) -> Value {
 }
 
 pub fn for_in_keys(value: &Value) -> Value {
-    if let Value::Array(values) = value {
+    if let Some(values) = value.as_array() {
         return Value::array(
             values
                 .borrow()
@@ -341,7 +343,7 @@ pub fn call(callee: &Value, this_value: Value, arguments: Vec<Value>) -> Value {
 }
 
 fn materialized_arguments(arguments: &Value) -> Vec<Value> {
-    let Value::Array(arguments) = arguments else {
+    let Some(arguments) = arguments.as_array() else {
         crate::throw_value(crate::value::type_error(
             "materialized call arguments are not an array",
         ));

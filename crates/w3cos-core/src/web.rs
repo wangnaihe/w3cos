@@ -1350,7 +1350,9 @@ pub fn structured_clone(args: Vec<Value>) -> Value {
 
 fn heap_pointer(value: &Value) -> Option<usize> {
     match value {
-        Value::Array(items) => Some(Rc::as_ptr(items) as usize),
+        _ if value.as_array().is_some() => {
+            Some(Rc::as_ptr(&value.as_array().expect("array")) as usize)
+        }
         _ if value.as_object().is_some() => {
             Some(Rc::as_ptr(&value.as_object().expect("object")) as usize)
         }
@@ -1417,7 +1419,8 @@ fn clone_value(value: &Value, clones: &mut HashMap<usize, Value>) -> Value {
     }
 
     match value {
-        Value::Array(items) => {
+        _ if value.as_array().is_some() => {
+            let items = value.as_array().expect("array");
             let children = items.borrow().clone();
             let cloned = Value::array(
                 (0..children.len())
@@ -2416,11 +2419,13 @@ pub fn url_search_params_new(args: Vec<Value>) -> Value {
     let pairs = match &init {
         _ if init.is_nullish() => Vec::new(),
         _ if init.is_string() => parse_query(&init.to_js_string()),
-        Value::Array(items) => items
+        _ if init.as_array().is_some() => init
+            .as_array()
+            .expect("array")
             .borrow()
             .iter()
             .map(|pair| {
-                if let Value::Array(entry) = pair {
+                if let Some(entry) = pair.as_array() {
                     let entry = entry.borrow();
                     (
                         entry

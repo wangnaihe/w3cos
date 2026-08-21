@@ -1,11 +1,13 @@
-//! Page-scoped bump arena, interned string handles, and JS object slots.
+//! Page-scoped bump arena, interned string handles, and JS object/array slots.
 //!
-//! Short interned JS strings and page-local [`crate::JsObject`]s live here so
-//! clones copy a `u32` handle instead of `Rc::clone`. The bump and object
-//! table are dropped on [`reset`] (`reset_bridge` / document navigation).
-//! Host / DOM wrappers keep the `Value::Object(Rc)` path so WeakRef intern
-//! can drop unreferenced wrappers without a page reset. Size-class slabs
-//! wait for a later cut.
+//! Short interned JS strings, page-local [`crate::JsObject`]s, and constructor
+//! / literal arrays live here so clones copy a `u32` handle instead of
+//! `Rc::clone`. The bump and tables are dropped on [`reset`] (`reset_bridge` /
+//! document navigation). Host / DOM wrappers keep the `Value::Object(Rc)`
+//! path so WeakRef intern can drop unreferenced wrappers without a page
+//! reset. `array_hole` and host arrays keep `Value::Array(Rc)` when they
+//! must be collectable without a page reset. Size-class slabs wait for a
+//! later cut.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -51,6 +53,8 @@ struct PageArena {
     allocated: usize,
     /// 1-based object slots; index 0 is unused so handle `0` is never valid.
     objects: Vec<Option<std::rc::Rc<std::cell::RefCell<crate::JsObject>>>>,
+    /// 1-based array slots; index 0 is unused so handle `0` is never valid.
+    arrays: Vec<Option<std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>>>>,
 }
 
 impl PageArena {
@@ -69,6 +73,7 @@ impl PageArena {
             intern: HashMap::new(),
             allocated: 0,
             objects: vec![None],
+            arrays: vec![None],
         }
     }
 
@@ -143,6 +148,9 @@ impl PageArena {
         self.objects.clear();
         self.objects.push(None);
         self.objects.shrink_to_fit();
+        self.arrays.clear();
+        self.arrays.push(None);
+        self.arrays.shrink_to_fit();
     }
 
     fn alloc_object(
@@ -162,6 +170,25 @@ impl PageArena {
             panic!("page object handle used after reset_bridge");
         };
         object.clone()
+    }
+
+    fn alloc_array(
+        &mut self,
+        array: std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>>,
+    ) -> u32 {
+        let handle = self.arrays.len() as u32;
+        self.arrays.push(Some(array));
+        handle
+    }
+
+    fn get_array(
+        &self,
+        handle: u32,
+    ) -> std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>> {
+        let Some(Some(array)) = self.arrays.get(handle as usize) else {
+            panic!("page array handle used after reset_bridge");
+        };
+        array.clone()
     }
 }
 
@@ -255,6 +282,30 @@ pub fn live_objects() -> usize {
     ARENA.with(|arena| arena.borrow().objects.len().saturating_sub(1))
 }
 
+/// Store a page-local array. Clone of the returned handle does not
+/// `Rc::clone`.
+pub(crate) fn alloc_array(
+    array: std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>>,
+) -> u32 {
+    ARENA.with(|arena| arena.borrow_mut().alloc_array(array))
+}
+
+/// Resolve a live array handle. Panics if the handle belongs to a
+/// previous page (same contract as interned strings).
+pub(crate) fn get_array(
+    handle: u32,
+) -> std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>> {
+    if handle == 0 {
+        panic!("page array handle used after reset_bridge");
+    }
+    ARENA.with(|arena| arena.borrow().get_array(handle))
+}
+
+/// Live page-local arrays (empty after [`reset`]).
+pub fn live_arrays() -> usize {
+    ARENA.with(|arena| arena.borrow().arrays.len().saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +316,7 @@ mod tests {
         assert_eq!(allocated_bytes(), 0);
         assert_eq!(live_handles(), 0);
         assert_eq!(live_objects(), 0);
+        assert_eq!(live_arrays(), 0);
 
         let a = intern("page-arena-unique-key");
         let b = intern("page-arena-unique-key");
@@ -285,6 +337,7 @@ mod tests {
         assert_eq!(allocated_bytes(), 0);
         assert_eq!(live_handles(), 0);
         assert_eq!(live_objects(), 0);
+        assert_eq!(live_arrays(), 0);
 
         let again = intern("page-arena-unique-key");
         assert_eq!(again.as_str(), "page-arena-unique-key");
@@ -305,6 +358,25 @@ mod tests {
         assert_eq!(live_objects(), 1);
         reset();
         assert_eq!(live_objects(), 0);
+        assert_eq!(std::rc::Rc::strong_count(&rc), 1);
+    }
+
+    #[test]
+    fn array_table_alloc_and_reset_empties() {
+        reset();
+        assert_eq!(live_arrays(), 0);
+        let rc = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::value::ArrayStorage::new(Vec::new()),
+        ));
+        let handle = alloc_array(rc.clone());
+        assert_eq!(handle, 1);
+        assert_eq!(std::rc::Rc::strong_count(&rc), 2);
+        let resolved = get_array(handle);
+        assert!(std::rc::Rc::ptr_eq(&rc, &resolved));
+        drop(resolved);
+        assert_eq!(live_arrays(), 1);
+        reset();
+        assert_eq!(live_arrays(), 0);
         assert_eq!(std::rc::Rc::strong_count(&rc), 1);
     }
 }

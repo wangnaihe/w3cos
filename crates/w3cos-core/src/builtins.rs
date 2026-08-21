@@ -419,8 +419,8 @@ pub(crate) fn object_keys(value: &Value) -> Value {
                 .collect(),
         );
     }
-    match value {
-        Value::Array(values) => Value::array(
+    if let Some(values) = value.as_array() {
+        return Value::array(
             values
                 .borrow()
                 .iter()
@@ -428,9 +428,9 @@ pub(crate) fn object_keys(value: &Value) -> Value {
                 .filter(|(_, value)| !crate::value::is_array_hole(value))
                 .map(|(index, _)| Value::from(index.to_string()))
                 .collect(),
-        ),
-        _ => Value::array(Vec::new()),
+        );
     }
+    Value::array(Vec::new())
 }
 
 fn object_values(value: &Value) -> Value {
@@ -444,17 +444,17 @@ fn object_values(value: &Value) -> Value {
                 .collect(),
         );
     }
-    match value {
-        Value::Array(values) => Value::array(
+    if let Some(values) = value.as_array() {
+        return Value::array(
             values
                 .borrow()
                 .iter()
                 .filter(|value| !crate::value::is_array_hole(value))
                 .cloned()
                 .collect(),
-        ),
-        _ => Value::array(Vec::new()),
+        );
     }
+    Value::array(Vec::new())
 }
 
 fn dom_element() -> Value {
@@ -656,7 +656,7 @@ fn map_key(value: &Value) -> String {
             }
         }
         crate::value::ValueUnpack::String(s) => format!("s:{s}"),
-        crate::value::ValueUnpack::Array(rc) => format!("a:{:p}", std::rc::Rc::as_ptr(rc)),
+        crate::value::ValueUnpack::Array(rc) => format!("a:{:p}", std::rc::Rc::as_ptr(&rc)),
         crate::value::ValueUnpack::Object(rc) => format!("o:{:p}", std::rc::Rc::as_ptr(&rc)),
         crate::value::ValueUnpack::Function(f) => format!("f:{:#x}", f.identity()),
     }
@@ -670,13 +670,13 @@ impl Map {
         let entries = iterable.get_property("__w3cosMapEntries");
         let source = if entries_snapshot.is_function() {
             entries_snapshot.call(iterable.clone(), vec![])
-        } else if matches!(entries, Value::Array(_)) {
+        } else if entries.is_array() {
             entries
         } else {
             iterable
         };
         for entry in source.iter() {
-            if let Value::Array(pair) = entry {
+            if let Some(pair) = entry.as_array() {
                 let pair = pair.borrow();
                 if let Some(key) = pair.first() {
                     initial.insert(

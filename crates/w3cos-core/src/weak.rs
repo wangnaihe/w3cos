@@ -22,7 +22,11 @@ enum WeakValue {
 impl WeakValue {
     fn new(value: &Value) -> Option<Self> {
         match value {
-            Value::Array(value) => Some(Self::Array(Rc::downgrade(value))),
+            _ if value.as_array().is_some() => {
+                Some(Self::Array(Rc::downgrade(
+                    &value.as_array().expect("array"),
+                )))
+            }
             _ if value.as_object().is_some() => {
                 Some(Self::Object(Rc::downgrade(
                     &value.as_object().expect("object"),
@@ -492,7 +496,10 @@ mod tests {
 
     #[test]
     fn weak_ref_deref_releases_target() {
-        let target = Value::array(vec![Value::Number(1.0)]);
+        // Host Rc array: page-local arena arrays stay pinned until reset.
+        let target = Value::Array(Rc::new(RefCell::new(ArrayStorage::new(vec![
+            Value::Number(1.0),
+        ]))));
         let reference = construct(&weak_ref_class(), vec![target.clone()]);
         assert_eq!(reference.call_method("deref", vec![]), target);
         drop(target);

@@ -1249,7 +1249,7 @@ fn key_path_from_web(value: &Value, optional: bool) -> indexed_db::Result<String
             &path,
         ))));
     }
-    if let Value::Array(paths) = value {
+    if let Some(paths) = value.as_array() {
         let paths = paths
             .borrow()
             .iter()
@@ -1403,13 +1403,14 @@ fn database_web_value(
                 ));
             }
             let names_value = arg(&args, 0);
-            let names = match names_value {
-                Value::Array(values) => values
+            let names = if let Some(values) = names_value.as_array() {
+                values
                     .borrow()
                     .iter()
                     .map(Value::to_js_string)
-                    .collect::<Vec<_>>(),
-                value => vec![value.to_js_string()],
+                    .collect::<Vec<_>>()
+            } else {
+                vec![names_value.to_js_string()]
             };
             let mode_value = arg(&args, 1);
             let mode = match mode_value.to_js_string().as_str() {
@@ -2751,7 +2752,7 @@ pub(crate) fn value_to_json(value: &Value) -> indexed_db::Result<JsonValue> {
         // heap roots, preserving non-cyclic sharing as well as cycles. Keys use
         // `key_to_json` below so their sortable compact representation remains
         // available to the SQLite adapter.
-        Value::Array(_) | Value::Object(_) => graph_clone_to_json(value),
+        value if value.is_array() || value.is_object() => graph_clone_to_json(value),
         _ => value_to_json_inner(value, &mut std::collections::HashSet::new()),
     }
 }
@@ -2782,10 +2783,12 @@ impl GraphCloneEncoder {
     fn encode(&mut self, value: &Value) -> indexed_db::Result<JsonValue> {
         match value {
             _ if w3cos_core::binary::clone_descriptor(value).is_some() => {
-                let identity = match value {
-                    Value::Array(values) => (0, Rc::as_ptr(values) as usize),
-                    Value::Object(object) => (1, Rc::as_ptr(object) as usize),
-                    _ => unreachable!("binary descriptors are heap values"),
+                let identity = if let Some(values) = value.as_array() {
+                    (0, Rc::as_ptr(&values) as usize)
+                } else if let Some(object) = value.as_object() {
+                    (1, Rc::as_ptr(&object) as usize)
+                } else {
+                    unreachable!("binary descriptors are heap values")
                 };
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
@@ -2837,8 +2840,9 @@ impl GraphCloneEncoder {
                 };
                 Ok(graph_reference(id))
             }
-            Value::Array(values) if !w3cos_core::collections::is_typed_array(value) => {
-                let identity = (0, Rc::as_ptr(values) as usize);
+            _ if value.as_array().is_some() && !w3cos_core::collections::is_typed_array(value) => {
+                let values = value.as_array().expect("array");
+                let identity = (0, Rc::as_ptr(&values) as usize);
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
                 }
@@ -3088,8 +3092,9 @@ fn value_to_json_inner(
         }
         value if value.is_string() => Ok(JsonValue::String(value.to_js_string())),
         Value::String(value) => Ok(JsonValue::String(value.to_string())),
-        Value::Array(values) => {
-            let pointer = Rc::as_ptr(values) as usize;
+        value if value.as_array().is_some() => {
+            let values = value.as_array().expect("array");
+            let pointer = Rc::as_ptr(&values) as usize;
             if !active.insert(pointer) {
                 return Err(IndexedDbError {
                     name: "DataCloneError".into(),
@@ -3524,7 +3529,7 @@ fn json_graph_to_value(graph: &serde_json::Map<String, JsonValue>) -> Value {
                     .flatten()
                     .map(|value| json_graph_part_to_value(value, &placeholders))
                     .collect::<Vec<_>>();
-                if let Value::Array(storage) = &placeholders[index] {
+                if let Some(storage) = placeholders[index].as_array() {
                     storage.borrow_mut().replace_values(items);
                 }
             }

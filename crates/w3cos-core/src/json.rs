@@ -60,7 +60,8 @@ fn from_json(json: &serde_json::Value) -> Value {
 /// Bottom-up reviver walk: children first, then `reviver(key, value)`.
 fn walk_reviver(reviver: &Value, key: &str, value: Value) -> Value {
     let value = match &value {
-        Value::Array(items) => {
+        _ if value.as_array().is_some() => {
+            let items = value.as_array().expect("array");
             let len = items.borrow().len();
             for index in 0..len {
                 let child = items
@@ -165,7 +166,7 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
         crate::value::ValueUnpack::Number(n) => Some(serialize_number(n)),
         crate::value::ValueUnpack::String(s) => Some(serialize_string(s.as_str())),
         crate::value::ValueUnpack::Array(items) => {
-            let pointer = Rc::as_ptr(items) as usize;
+            let pointer = Rc::as_ptr(&items) as usize;
             context.enter(pointer);
             // Children serialize with the deeper indent already applied so
             // nested containers line up.
@@ -188,7 +189,14 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
             let pointer = Rc::as_ptr(&object) as usize;
             context.enter(pointer);
             let whitelist: Option<Vec<String>> = match &context.replacer {
-                Value::Array(keys) => Some(keys.borrow().iter().map(Value::to_js_string).collect()),
+                keys if keys.as_array().is_some() => Some(
+                    keys.as_array()
+                        .expect("array")
+                        .borrow()
+                        .iter()
+                        .map(Value::to_js_string)
+                        .collect(),
+                ),
                 _ => None,
             };
             let inner = push_indent(context);

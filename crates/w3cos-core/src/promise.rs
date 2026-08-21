@@ -397,7 +397,9 @@ pub fn all(args: Vec<Value>) -> Value {
     let items = match args.first() {
         None => Vec::new(),
         Some(v) if v.is_nullish() => Vec::new(),
-        Some(Value::Array(items)) => items
+        Some(items) if items.as_array().is_some() => items
+            .as_array()
+            .expect("array")
             .borrow()
             .iter()
             .cloned()
@@ -446,7 +448,9 @@ pub fn all(args: Vec<Value>) -> Value {
 /// `Promise.race(iterable)` — settles with the first item that settles.
 pub fn race(args: Vec<Value>) -> Value {
     let items = match args.first() {
-        Some(Value::Array(items)) => items
+        Some(items) if items.as_array().is_some() => items
+            .as_array()
+            .expect("array")
             .borrow()
             .iter()
             .cloned()

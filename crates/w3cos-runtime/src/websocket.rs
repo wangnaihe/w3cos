@@ -346,7 +346,7 @@ fn js_websocket_value(socket: WebSocket) -> Value {
         "send".to_string(),
         realm_websocket_function(move |this, args| {
             let payload = args.first().cloned().unwrap_or(Value::Undefined);
-            let result = if let Value::Array(items) = payload {
+            let result = if let Some(items) = payload.as_array() {
                 socket_for_send.send_binary(
                     items
                         .borrow()

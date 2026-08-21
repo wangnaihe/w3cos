@@ -108,7 +108,7 @@ fn availability_value() -> Value {
 }
 
 fn request_urls(value: Value) -> Result<Vec<Value>, Value> {
-    let values = if matches!(value, Value::Array(_)) {
+    let values = if value.is_array() {
         value.iter().collect::<Vec<_>>()
     } else if value.is_undefined() || value.is_null() {
         vec![]

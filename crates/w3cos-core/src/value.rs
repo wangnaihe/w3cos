@@ -17,11 +17,12 @@ use crate::js_string::JsString;
 /// those immediates is a register move of the 8-byte word and does not
 /// touch `Rc`.
 ///
-/// Long `Rc<str>` strings, arrays, host/DOM objects, and functions stay as
-/// a remaining enum of pointers / `Rc`. Page-local objects created via
-/// [`Value::object`] / literals are a `u32` handle packed in [`Immediate`]
-/// (clone is a register move). Symbols remain interned strings
-/// (`__w3cos_symbol_…`).
+/// Long `Rc<str>` strings, host/DOM objects, host arrays, and functions stay
+/// as a remaining enum of pointers / `Rc`. Page-local objects created via
+/// [`Value::object`] / literals and constructor / literal arrays created via
+/// [`Value::array`] are `u32` handles packed in [`Immediate`] (clone is a
+/// register move). `array_hole` stays a host `Rc` object. Symbols remain
+/// interned strings (`__w3cos_symbol_…`).
 ///
 /// Constructors `Value::Undefined`, `Value::Null`, `Value::Bool`, and
 /// `Value::Number` are unchanged so AOT emission (`num_regs` / `bool_regs`
@@ -63,6 +64,7 @@ impl Default for Value {
 ///   - `4` true
 ///   - `5` interned page-arena string (`u32` handle payload)
 ///   - `6` page-arena object (`u32` handle payload)
+///   - `7` page-arena array (`u32` handle payload)
 ///
 /// Long `Rc<str>` and heap pointers are **not** in this word (remaining
 /// `Value` enum).
@@ -79,6 +81,7 @@ impl Immediate {
     const TAG_TRUE: u64 = 4;
     const TAG_STR: u64 = 5;
     const TAG_OBJ: u64 = 6;
+    const TAG_ARR: u64 = 7;
     const HANDLE_SHIFT: u64 = 3;
 
     pub const UNDEFINED: Self = Self(Self::QNAN | Self::TAG_UNDEF);
@@ -112,6 +115,12 @@ impl Immediate {
     #[inline]
     pub const fn from_object_handle(handle: u32) -> Self {
         Self(Self::QNAN | Self::TAG_OBJ | ((handle as u64) << Self::HANDLE_SHIFT))
+    }
+
+    /// Pack a page-arena array handle into the tagged word.
+    #[inline]
+    pub const fn from_array_handle(handle: u32) -> Self {
+        Self(Self::QNAN | Self::TAG_ARR | ((handle as u64) << Self::HANDLE_SHIFT))
     }
 
     /// Raw tagged bits. Documented transmute target.
@@ -203,6 +212,20 @@ impl Immediate {
     #[inline]
     pub const fn object_handle(self) -> Option<u32> {
         if self.is_object_handle() {
+            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn is_array_handle(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_ARR
+    }
+
+    #[inline]
+    pub const fn array_handle(self) -> Option<u32> {
+        if self.is_array_handle() {
             Some((self.0 >> Self::HANDLE_SHIFT) as u32)
         } else {
             None
@@ -317,6 +340,37 @@ impl Value {
             },
         }
     }
+
+    /// Page-arena array handle or host `Rc` array.
+    #[inline]
+    pub fn as_array(&self) -> Option<std::rc::Rc<std::cell::RefCell<ArrayStorage>>> {
+        match self {
+            Value::Imm(imm) => imm
+                .array_handle()
+                .map(crate::page_arena::get_array),
+            Value::Array(array) => Some(std::rc::Rc::clone(array)),
+            _ => None,
+        }
+    }
+
+    /// Packed page-arena array handle, when this value is not a host `Rc`.
+    #[inline]
+    pub fn array_handle(&self) -> Option<u32> {
+        match self {
+            Value::Imm(imm) => imm.array_handle(),
+            _ => None,
+        }
+    }
+
+    fn array_identity_eq(left: &Value, right: &Value) -> bool {
+        match (left.array_handle(), right.array_handle()) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (left.as_array(), right.as_array()) {
+                (Some(a), Some(b)) => std::rc::Rc::ptr_eq(&a, &b),
+                _ => false,
+            },
+        }
+    }
 }
 
 /// Shared backing storage for [`Value::Array`].
@@ -329,7 +383,7 @@ pub struct ArrayStorage {
 }
 
 impl ArrayStorage {
-    fn new(values: Vec<Value>) -> Self {
+    pub fn new(values: Vec<Value>) -> Self {
         let allocation = HeapAllocation::new(
             HeapKind::Array,
             std::mem::size_of::<Self>().saturating_add(
@@ -440,7 +494,7 @@ pub(crate) enum ValueUnpack<'a> {
     Bool(bool),
     Number(f64),
     String(JsString),
-    Array(&'a Rc<RefCell<ArrayStorage>>),
+    Array(Rc<RefCell<ArrayStorage>>),
     Object(Rc<RefCell<crate::JsObject>>),
     Function(&'a JsFunction),
 }
@@ -461,9 +515,14 @@ impl Value {
                     imm.object_handle().expect("object handle"),
                 ),
             ),
+            Value::Imm(imm) if imm.is_array_handle() => ValueUnpack::Array(
+                crate::page_arena::get_array(
+                    imm.array_handle().expect("array handle"),
+                ),
+            ),
             Value::Imm(imm) => ValueUnpack::Number(imm.as_number().unwrap_or(f64::NAN)),
             Value::String(s) => ValueUnpack::String(s.clone()),
-            Value::Array(a) => ValueUnpack::Array(a),
+            Value::Array(a) => ValueUnpack::Array(Rc::clone(a)),
             Value::Object(o) => ValueUnpack::Object(Rc::clone(o)),
             Value::Function(f) => ValueUnpack::Function(f),
         }
@@ -590,7 +649,7 @@ impl PartialEq for Value {
         }
         match (self, other) {
             (Value::Imm(left), Value::Imm(right)) => left == right,
-            (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
+            (left, right) if Value::array_identity_eq(left, right) => true,
             (left, right) if Value::object_identity_eq(left, right) => true,
             (Value::Function(_), Value::Function(_)) => false,
             _ => false,
@@ -750,7 +809,7 @@ impl Value {
             }
             ValueUnpack::Array(value) => {
                 5_u8.hash(&mut hasher);
-                (Rc::as_ptr(value) as usize).hash(&mut hasher);
+                (Rc::as_ptr(&value) as usize).hash(&mut hasher);
             }
             ValueUnpack::Object(value) => {
                 6_u8.hash(&mut hasher);
@@ -911,7 +970,7 @@ impl Value {
         self.as_object().is_some() && crate::bigint::get(self).is_none()
     }
     pub fn is_array(&self) -> bool {
-        matches!(self, Value::Array(_))
+        self.as_array().is_some()
     }
     pub fn is_function(&self) -> bool {
         matches!(self, Value::Function(_))
@@ -946,20 +1005,18 @@ impl Value {
         if let Some(o) = obj.as_object() {
             return Value::Bool(o.borrow().has(&key));
         }
-        match obj {
-            Value::Array(arr) => {
-                if let Ok(idx) = key.parse::<usize>() {
-                    Value::Bool(
-                        arr.borrow()
-                            .get(idx)
-                            .is_some_and(|value| !is_array_hole(value)),
-                    )
-                } else {
-                    Value::Bool(false)
-                }
-            }
-            _ => Value::Bool(false),
+        if let Some(arr) = obj.as_array() {
+            return if let Ok(idx) = key.parse::<usize>() {
+                Value::Bool(
+                    arr.borrow()
+                        .get(idx)
+                        .is_some_and(|value| !is_array_hole(value)),
+                )
+            } else {
+                Value::Bool(false)
+            };
         }
+        Value::Bool(false)
     }
 
     /// Property access: `obj[key]` or `obj.key`.
@@ -976,23 +1033,23 @@ impl Value {
                 getter.call(self.clone(), vec![])
             };
         }
-        match self {
-            Value::Array(arr) => {
-                if let Some(value) = crate::binary::typed_array_property(self, key) {
-                    return value;
-                }
-                if let Ok(idx) = key.parse::<usize>() {
-                    arr.borrow()
-                        .get(idx)
-                        .cloned()
-                        .map(array_slot_value)
-                        .unwrap_or(Value::Undefined)
-                } else if key == "length" {
-                    Value::Number(arr.borrow().len() as f64)
-                } else {
-                    Value::Undefined
-                }
+        if let Some(arr) = self.as_array() {
+            if let Some(value) = crate::binary::typed_array_property(self, key) {
+                return value;
             }
+            return if let Ok(idx) = key.parse::<usize>() {
+                arr.borrow()
+                    .get(idx)
+                    .cloned()
+                    .map(array_slot_value)
+                    .unwrap_or(Value::Undefined)
+            } else if key == "length" {
+                Value::Number(arr.borrow().len() as f64)
+            } else {
+                Value::Undefined
+            };
+        }
+        match self {
             _ if self.is_string() => {
                 let s = self.as_js_string().expect("string");
                 if let Ok(idx) = key.parse::<usize>() {
@@ -1073,19 +1130,20 @@ impl Value {
             o.borrow_mut().set(key, value, &Value::Undefined);
             return;
         }
-        match self {
-            Value::Array(arr) => {
-                if let Ok(idx) = key.parse::<usize>() {
-                    if crate::binary::set_typed_array_index(self, idx, value.clone()) {
-                        return;
-                    }
-                    let mut a = arr.borrow_mut();
-                    if idx >= a.len() {
-                        a.resize_with(idx + 1, array_hole);
-                    }
-                    a[idx] = value;
+        if let Some(arr) = self.as_array() {
+            if let Ok(idx) = key.parse::<usize>() {
+                if crate::binary::set_typed_array_index(self, idx, value.clone()) {
+                    return;
                 }
+                let mut a = arr.borrow_mut();
+                if idx >= a.len() {
+                    a.resize_with(idx + 1, array_hole);
+                }
+                a[idx] = value;
             }
+            return;
+        }
+        match self {
             // JS functions are objects: properties attach to the function
             // value (decorator ids, constructor statics).
             Value::Function(f) => f.set_property(key, value),
@@ -1099,7 +1157,8 @@ impl Value {
             _ if self.as_object().is_some() => {
                 self.as_object().expect("object").borrow_mut().delete(key)
             }
-            Value::Array(array) => {
+            _ if self.as_array().is_some() => {
+                let array = self.as_array().expect("array");
                 if let Ok(index) = key.parse::<usize>() {
                     if let Some(slot) = array.borrow_mut().get_mut(index) {
                         *slot = array_hole();
@@ -1133,7 +1192,9 @@ impl Value {
     }
 
     pub fn array(items: Vec<Value>) -> Self {
-        Value::Array(Rc::new(RefCell::new(ArrayStorage::new(items))))
+        let rc = Rc::new(RefCell::new(ArrayStorage::new(items)));
+        let handle = crate::page_arena::alloc_array(Rc::clone(&rc));
+        Value::Imm(Immediate::from_array_handle(handle))
     }
 
     pub fn object(props: HashMap<String, Value>) -> Self {
@@ -1316,7 +1377,8 @@ impl Value {
                     .borrow()
                     .properties
                     .contains_key(property.as_str()),
-                Value::Array(values) => {
+                _ if self.as_array().is_some() => {
+                    let values = self.as_array().expect("array");
                     property == "length"
                         || property.parse::<usize>().is_ok_and(|index| {
                             values
@@ -1334,8 +1396,8 @@ impl Value {
         {
             return result;
         }
-        if let Value::Array(values) = self
-            && let Some(result) = array_call_method(values, key, args.clone(), self)
+        if let Some(values) = self.as_array()
+            && let Some(result) = array_call_method(&values, key, args.clone(), self)
         {
             return result;
         }
@@ -1346,14 +1408,14 @@ impl Value {
             }
             (Value::Function(_), "apply") => {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-                let applied_args = match args.get(1) {
-                    Some(Value::Array(values)) => values
+                let applied_args = match args.get(1).and_then(Value::as_array) {
+                    Some(values) => values
                         .borrow()
                         .iter()
                         .cloned()
                         .map(array_slot_value)
                         .collect(),
-                    _ => Vec::new(),
+                    None => Vec::new(),
                 };
                 return self.call(this_arg, applied_args);
             }
@@ -1604,7 +1666,8 @@ impl Value {
                     1,
                 ));
             }
-            (Value::Array(values), "filter") => {
+            _ if self.as_array().is_some() && key == "filter" => {
+                let values = self.as_array().expect("array");
                 let predicate = args.first().cloned().unwrap_or(Value::Undefined);
                 let filtered = values
                     .borrow()
@@ -1625,12 +1688,14 @@ impl Value {
                     .collect();
                 return Value::array(filtered);
             }
-            (Value::Array(values), "push") => {
+            _ if self.as_array().is_some() && key == "push" => {
+                let values = self.as_array().expect("array");
                 let mut values = values.borrow_mut();
                 values.extend(args);
                 return Value::Number(values.len() as f64);
             }
-            (Value::Array(values), "set") => {
+            _ if self.as_array().is_some() && key == "set" => {
+                let values = self.as_array().expect("array");
                 let source: Vec<Value> = args
                     .first()
                     .cloned()
@@ -1652,7 +1717,8 @@ impl Value {
                 }
                 return Value::Undefined;
             }
-            (Value::Array(values), "forEach") => {
+            _ if self.as_array().is_some() && key == "forEach" => {
+                let values = self.as_array().expect("array");
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 for (index, value) in values.borrow().iter().cloned().enumerate() {
                     if is_array_hole(&value) {
@@ -1678,7 +1744,7 @@ impl Value {
             return true;
         }
         match self {
-            Value::Array(_) => true,
+            _ if self.is_array() => true,
             _ if self.is_string() => true,
             _ if self.as_object().is_some() => {
                 let object = self.as_object().expect("object");
@@ -1692,10 +1758,10 @@ impl Value {
                         .borrow()
                         .get_direct("__w3cosMapValuesSnapshot")
                         .is_function()
-                    || matches!(
-                        object.borrow().get_direct("__w3cosMapValues"),
-                        Value::Array(_)
-                    )
+                    || object
+                        .borrow()
+                        .get_direct("__w3cosMapValues")
+                        .is_array()
             }
             _ => false,
         }
@@ -1712,8 +1778,8 @@ impl Value {
             return iterator;
         }
         match self {
-            Value::Array(values) => ValueIterator::new(LiveArrayIterator {
-                values: Rc::clone(values),
+            _ if self.as_array().is_some() => ValueIterator::new(LiveArrayIterator {
+                values: self.as_array().expect("array"),
                 index: 0,
             }),
             _ if self.is_string() => {
@@ -1736,7 +1802,7 @@ impl Value {
                 }
                 let iterable_snapshot = object.borrow().get_direct("__w3cosIterableSnapshot");
                 if iterable_snapshot.is_function() {
-                    if let Value::Array(values) = iterable_snapshot.call(self.clone(), vec![]) {
+                    if let Some(values) = iterable_snapshot.call(self.clone(), vec![]).as_array() {
                         return ValueIterator::new(values.borrow().clone().into_iter());
                     }
                 }
@@ -1771,9 +1837,9 @@ impl Value {
                 } else {
                     object.borrow().get_direct("__w3cosMapValues")
                 };
-                match values {
-                    Value::Array(values) => ValueIterator::new(values.borrow().clone().into_iter()),
-                    _ => ValueIterator::new(Vec::new().into_iter()),
+                match values.as_array() {
+                    Some(values) => ValueIterator::new(values.borrow().clone().into_iter()),
+                    None => ValueIterator::new(Vec::new().into_iter()),
                 }
             }
             _ => ValueIterator::new(Vec::new().into_iter()),
@@ -2144,9 +2210,10 @@ fn array_call_method(
         "concat" => {
             let mut out = values.borrow().clone();
             for item in &args {
-                match item {
-                    Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
-                    other => out.push(other.clone()),
+                if let Some(inner) = item.as_array() {
+                    out.extend(inner.borrow().iter().cloned());
+                } else {
+                    out.push(item.clone());
                 }
             }
             Value::array(out)
@@ -2246,12 +2313,13 @@ fn array_call_method(
                     if is_array_hole(item) {
                         continue;
                     }
-                    match item {
-                        Value::Array(inner) if depth > 0 => {
-                            flatten(into, &inner.borrow(), depth - 1)
+                    if depth > 0 {
+                        if let Some(inner) = item.as_array() {
+                            flatten(into, &inner.borrow(), depth - 1);
+                            continue;
                         }
-                        other => into.push(other.clone()),
                     }
+                    into.push(item.clone());
                 }
             }
             let mut out = Vec::new();
@@ -2265,9 +2333,11 @@ fn array_call_method(
                 if is_array_hole(value) {
                     continue;
                 }
-                match f.call(Value::Undefined, callback_args(value, index)) {
-                    Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
-                    other => out.push(other),
+                let mapped = f.call(Value::Undefined, callback_args(value, index));
+                if let Some(inner) = mapped.as_array() {
+                    out.extend(inner.borrow().iter().cloned());
+                } else {
+                    out.push(mapped);
                 }
             }
             Value::array(out)
@@ -2479,7 +2549,7 @@ impl Value {
                     _ => false,
                 }
             }
-            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
+            (left, right) if Value::array_identity_eq(left, right) => true,
             (left, right) if Value::object_identity_eq(left, right) => true,
             (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
             _ => match (self.as_js_string(), other.as_js_string()) {
@@ -2503,7 +2573,7 @@ impl Value {
                 (None, None) => a == b,
                 _ => false,
             },
-            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
+            (left, right) if Value::array_identity_eq(left, right) => true,
             (left, right) if Value::object_identity_eq(left, right) => true,
             (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
             _ => match (self.as_js_string(), other.as_js_string()) {
@@ -2754,7 +2824,13 @@ mod tests {
             }
             _ => panic!("interned short string must be the tagged immediate word"),
         }
-        assert!(Value::array(vec![]).as_immediate().is_none());
+        match Value::array(vec![]) {
+            Value::Imm(word) => {
+                assert!(word.is_array_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+            }
+            _ => panic!("Value::array must pack a page-arena handle"),
+        }
         match Value::object(HashMap::new()) {
             Value::Imm(word) => {
                 assert!(word.is_object_handle());
@@ -3654,6 +3730,36 @@ mod tests {
         assert!(crate::page_arena::live_objects() >= 1);
         crate::page_arena::reset();
         assert_eq!(crate::page_arena::live_objects(), 0);
+    }
+
+    #[test]
+    fn array_handle_clone_does_not_increase_rc_and_reset_empties_table() {
+        crate::page_arena::reset();
+        let arr = Value::array(vec![Value::Number(1.0), Value::Number(2.0)]);
+        match &arr {
+            Value::Imm(word) => {
+                assert!(word.is_array_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+                let handle = word.array_handle().unwrap();
+                let rc = crate::page_arena::get_array(handle);
+                let before = Rc::strong_count(&rc);
+                let cloned = arr.clone();
+                assert_eq!(Rc::strong_count(&rc), before);
+                match cloned {
+                    Value::Imm(copy) => {
+                        assert_eq!(copy.array_handle(), word.array_handle())
+                    }
+                    _ => panic!("clone must stay Imm handle"),
+                }
+                assert_eq!(arr.get_property("0").to_number(), 1.0);
+                assert_eq!(cloned.get_property("1").to_number(), 2.0);
+                assert_eq!(arr.get_property("length").to_number(), 2.0);
+            }
+            _ => panic!("Value::array must pack a page-arena handle"),
+        }
+        assert!(crate::page_arena::live_arrays() >= 1);
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_arrays(), 0);
     }
 
     #[test]
