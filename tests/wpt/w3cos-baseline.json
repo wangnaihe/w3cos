@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "upstream": "https://github.com/web-platform-tests/wpt",
+  "revision": "fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0",
+  "viewport": {
+    "width": 800,
+    "height": 600
+  },
+  "tests": [
+    {
+      "path": "infrastructure/reftest/green.html",
+      "kind": "reftest",
+      "reference": "infrastructure/reftest/green.html",
+      "relation": "match"
+    },
+    {
+      "path": "dom/nodes/Element-childElementCount-nochild.html",
+      "kind": "testharness",
+      "expected_subtests_min": 1
+    },
+    {
+      "path": "dom/nodes/Element-setAttribute-crbug-1138487.html",
+      "kind": "testharness",
+      "expected_subtests_min": 1
+    },
+    {
+      "path": "dom/nodes/querySelector-empty-id.html",
+      "kind": "testharness",
+      "expected_subtests_min": 1
+    },
+    {
+      "path": "css/CSS2/stacking-context/opacity-affects-block-in-inline.html",
+      "kind": "reftest",
+      "reference": "css/CSS2/stacking-context/opacity-affects-block-in-inline-ref.html",
+      "relation": "match"
+    }
+  ]
+}

@@ -138,3 +138,9 @@ The report records generation, Native build/package and total elapsed
 milliseconds plus the exact executable bytes. Use a fixed Rust toolchain,
 generated `Cargo.lock`, target directory and application revision when comparing
 reports; simulator and device receipts are intentionally not interchangeable.
+
+The baseline `image` feature set intentionally omits `image/avif`: that feature
+links the `ravif`/`rav1e` encoder and does not supply AVIF decoding. A native
+embedding with a real AVIF encoding surface can opt in through
+`w3cos-runtime/image-avif-encode`; ordinary AOT and mobile applications do not
+pay for that encoder chain.

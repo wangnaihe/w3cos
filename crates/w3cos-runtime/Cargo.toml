@@ -12,6 +12,10 @@ cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe"]
 web-graphics-advanced = []
 web-media-advanced = []
+# `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
+# decoding. Keep it outside the ordinary browser/mobile raster closure until an
+# application exposes an actual AVIF encoding surface.
+image-avif-encode = ["image/avif"]
 devtools = []
 ai-bridge = ["dep:w3cos-ai-bridge"]
 dynamic-js = [

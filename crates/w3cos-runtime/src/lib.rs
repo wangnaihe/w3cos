@@ -63,6 +63,8 @@ pub mod geometry_web;
 pub mod gpu_filter;
 #[cfg(any(target_env = "ohos", feature = "ohos-check"))]
 pub mod harmony;
+#[cfg(feature = "skia")]
+pub mod headless;
 pub mod highlight_web;
 pub mod history;
 mod html_compat;

@@ -965,8 +965,29 @@ impl Document {
                 } else {
                     false
                 };
+                let block_in_inline = style.display == w3cos_std::style::Display::Inline
+                    && child_ids.iter().any(|child_id| {
+                        let child = self.get_node(*child_id);
+                        child.node_type == NodeType::Element
+                            && matches!(
+                                self.computed_style(*child_id, ancestors, Some(&style))
+                                    .display,
+                                w3cos_std::style::Display::Block
+                                    | w3cos_std::style::Display::Flex
+                                    | w3cos_std::style::Display::Grid
+                            )
+                    });
                 let children: Vec<w3cos_std::Component> = child_ids
                     .iter()
+                    .filter(|child_id| {
+                        let child = self.get_node(**child_id);
+                        !(block_in_inline
+                            && child.node_type == NodeType::Text
+                            && child
+                                .text_content
+                                .as_deref()
+                                .is_none_or(|text| text.trim().is_empty()))
+                    })
                     .map(|&child_id| self.node_to_component(child_id, ancestors, Some(&style)))
                     .collect();
                 if pushed {

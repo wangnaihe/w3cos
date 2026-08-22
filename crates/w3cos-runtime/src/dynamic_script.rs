@@ -3715,7 +3715,7 @@ impl ScriptLoader {
         let mut options = crate::fetch::FetchOptions::default();
         options.headers.insert(
             "accept".to_string(),
-            "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8".to_string(),
+            "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8".to_string(),
         );
         let request_headers = crate::fetch::browser_subresource_request_headers(
             request_url,
@@ -5307,8 +5307,7 @@ impl ScriptLoader {
             .call_method("hasAttribute", vec![Value::string("async")])
             .to_bool();
         let async_property = element.get_property("async");
-        let explicitly_ordered =
-            matches!(async_property, Value::Bool(false)) && !has_async_attribute;
+        let explicitly_ordered = async_property == Value::Bool(false) && !has_async_attribute;
         let is_async = if dynamically_inserted {
             !explicitly_ordered
         } else {
@@ -8334,7 +8333,6 @@ fn is_decodable_picture_type(content_type: &str) -> bool {
             | "image/bmp"
             | "image/x-icon"
             | "image/vnd.microsoft.icon"
-            | "image/avif"
     )
 }
 
@@ -11695,6 +11693,23 @@ worker.postMessage(40);
     }
 
     #[test]
+    fn browser_picture_mime_contract_matches_linked_decoders() {
+        for content_type in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/apng",
+            "image/bmp",
+            "image/x-icon",
+            "image/vnd.microsoft.icon",
+        ] {
+            assert!(is_decodable_picture_type(content_type), "{content_type}");
+        }
+        assert!(!is_decodable_picture_type("image/avif"));
+    }
+
+    #[test]
     fn browser_image_loads_into_shared_cache_exposes_intrinsics_and_blocks_document_load() {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
@@ -11724,7 +11739,8 @@ worker.postMessage(40);
             let (mut image, _) = listener.accept().expect("accept image subresource");
             let request = read_http_request(&mut image).to_ascii_lowercase();
             assert!(request.starts_with("get /assets/hero.png "));
-            assert!(request.contains("accept: image/avif,image/webp"));
+            assert!(request.contains("accept: image/webp,image/apng"));
+            assert!(!request.contains("image/avif"));
             requested_tx.send(()).expect("signal image request");
             release_rx.recv().expect("release image body");
             write!(

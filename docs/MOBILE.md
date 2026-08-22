@@ -88,6 +88,13 @@ LTO off and incremental code generation on. `--release` uses the generated
 size-oriented profile (`opt-level=z`, fat LTO, one codegen unit and symbol
 stripping); do not use it for the daily edit loop.
 
+The ordinary raster closure also excludes the AVIF encoder. In `image 0.25`,
+the `avif` feature is backed by `ravif`/`rav1e` and does not decode AVIF; W3COS
+does not currently expose an AVIF encoding API. Native embeddings that provide
+one must opt in explicitly with the `w3cos-runtime/image-avif-encode` feature.
+AVIF decoding remains a separate native-decoder capability and must not be
+inferred from this encoder feature.
+
 ## Reproducible iOS build and size evidence
 
 The simulator artifact is diagnostic. Build an unsigned App Store device slice

@@ -1,7 +1,7 @@
 # W3C OS Roadmap
 
-Last reconciled with implementation: **2026-08-13**
-Baseline: `main` @ `23808bc`
+Last reconciled with implementation: **2026-08-22**
+Baseline before this milestone: `main` @ `06bc454`
 
 ## North Star
 
@@ -81,6 +81,19 @@ suite is red.
 
 ### Green baseline
 
+- [x] Add a pinned raw-WPT runner with an exact-clean-checkout gate, upstream
+  `testharness.js`, isolated per-document workers, deterministic offscreen
+  Skia reftests, WPT fuzzy comparison, JSON results, and PNG diff artifacts.
+- [x] Establish a fail-closed two-case raw-WPT smoke gate and a broader
+  five-case baseline. The initial 2-pass/3-fail snapshot on 2026-08-22 was
+  closed to 5 pass and 0 fail without expected-result exemptions.
+- [x] Close the three recorded raw-WPT failures: HTML attribute-name
+  normalization, empty-value attribute selectors plus Window named access,
+  and block-in-inline opacity positioning.
+- [ ] Expand the selected DOM/CSS suites and add the WPT server/metadata
+  features required by those suites.
+- [ ] Add an independently pinned Test262 runner for ECMAScript language
+  semantics; do not infer Test262 coverage from WPT or direct Rust tests.
 - [x] Fix `w3cos-runtime --test w3c_feature_matrix`
   `dom_to_component_tree_smoke`.
 - [x] Fix `w3cos-compiler` `generated_bundle_runs_jsdom_globals`.
@@ -2830,6 +2843,9 @@ W3COS.
 - [ ] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
 - [ ] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
 - [ ] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+  - [x] Remove the unused AVIF encoder (`ravif`/`rav1e`) from the ordinary
+    raster closure and retain it as explicit `image-avif-encode` capability.
+    AVIF decoding is a separate native-decoder boundary.
 - [x] Keep compiler/SWC/W3VM out of ordinary AOT applications; include parser + W3VM only for Browser or explicitly dynamic targets
   - `scripts/check-aot-dependency-boundary.sh` enforces the default runtime boundary in CI
   - `dynamic-js` is an explicit opt-in runtime feature
