@@ -542,11 +542,11 @@ fn emit_bindings_new(storage: SlotStorage) -> String {
 fn emit_capture_init(storage: SlotStorage) -> String {
     match storage {
         SlotStorage::Dense(_) => (
-            "    let mut capture_getters = vec![None; bindings.len()];\n    let mut capture_setters = vec![None; bindings.len()];\n    for (binding, (getter, setter)) in __captures {\n        if let Some(slot) = capture_getters.get_mut(binding as usize) {\n            *slot = Some(getter);\n        }\n        if let Some(slot) = capture_setters.get_mut(binding as usize) {\n            *slot = Some(setter);\n        }\n    }\n"
+            "    let mut capture_getters = vec![None; bindings.len()];\n    let mut capture_setters = vec![None; bindings.len()];\n    for (binding, (getter, setter)) in __captures.iter() {\n        if let Some(slot) = capture_getters.get_mut(*binding as usize) {\n            *slot = Some(getter.clone());\n        }\n        if let Some(slot) = capture_setters.get_mut(*binding as usize) {\n            *slot = Some(setter.clone());\n        }\n    }\n"
         )
         .into(),
         SlotStorage::Map => (
-            "    let mut capture_getters = std::collections::HashMap::new();\n    let mut capture_setters = std::collections::HashMap::new();\n    for (binding, (getter, setter)) in __captures {\n        capture_getters.insert(binding, getter);\n        capture_setters.insert(binding, setter);\n    }\n"
+            "    let mut capture_getters = std::collections::HashMap::new();\n    let mut capture_setters = std::collections::HashMap::new();\n    for (binding, (getter, setter)) in __captures.iter() {\n        capture_getters.insert(*binding, getter.clone());\n        capture_setters.insert(*binding, setter.clone());\n    }\n"
         )
         .into(),
     }
@@ -1251,10 +1251,7 @@ impl {type_name} {{
 pub fn {rust_name}(
     __this: w3cos_core::Value,
     __args: Vec<w3cos_core::Value>,
-    __captures: std::collections::HashMap<
-        u32,
-        (w3cos_core::Value, w3cos_core::Value),
-    >,
+    __captures: &w3cos_core::AotCaptureMap,
 ) -> w3cos_core::Value {{
 {slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    {type_name} {{
         registers: vec![w3cos_core::Value::Undefined; {registers}],
@@ -1492,10 +1489,7 @@ impl {type_name} {{
 pub fn {rust_name}(
     __this: w3cos_core::Value,
     __args: Vec<w3cos_core::Value>,
-    __captures: std::collections::HashMap<
-        u32,
-        (w3cos_core::Value, w3cos_core::Value),
-    >,
+    __captures: &w3cos_core::AotCaptureMap,
 ) -> w3cos_core::Value {{
 {slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    let frame = std::rc::Rc::new(std::cell::RefCell::new({type_name} {{
         registers: vec![w3cos_core::Value::Undefined; {registers}],
@@ -1766,10 +1760,7 @@ impl {type_name} {{
 pub fn {rust_name}(
     __this: w3cos_core::Value,
     __args: Vec<w3cos_core::Value>,
-    __captures: std::collections::HashMap<
-        u32,
-        (w3cos_core::Value, w3cos_core::Value),
-    >,
+    __captures: &w3cos_core::AotCaptureMap,
 ) -> w3cos_core::Value {{
 {slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    let frame = std::rc::Rc::new(std::cell::RefCell::new({type_name} {{
         state: {type_name}State::Start,
@@ -2388,10 +2379,7 @@ impl {type_name} {{
 pub fn {rust_name}(
     __this: w3cos_core::Value,
     __args: Vec<w3cos_core::Value>,
-    __captures: std::collections::HashMap<
-        u32,
-        (w3cos_core::Value, w3cos_core::Value),
-    >,
+    __captures: &w3cos_core::AotCaptureMap,
 ) -> w3cos_core::Value {{
 {slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    let frame = std::rc::Rc::new(std::cell::RefCell::new({type_name} {{
         state: {type_name}State::Start,
@@ -2986,7 +2974,7 @@ fn emit_instruction(
                 ));
             }
             format!(
-                "let mut __w3cos_nested_captures = std::collections::HashMap::new(); {adapters} self.registers[{}] = w3cos_core::Value::function(move |__this, __args| {factory}(__this, __args, __w3cos_nested_captures.clone()));",
+                "let mut __w3cos_nested_captures = w3cos_core::AotCaptureMap::new(); {adapters} self.registers[{}] = w3cos_core::Value::aot_function({factory}, __w3cos_nested_captures);",
                 register(*dst)
             )
         }
@@ -3613,7 +3601,7 @@ fn main() {{
     let generator = values_aot(
         w3cos_core::Value::Undefined,
         Vec::new(),
-        std::collections::HashMap::new(),
+        &w3cos_core::AotCaptureMap::new(),
     );
     let first = generator.call_method("next", Vec::new());
     let second = generator.call_method(
@@ -3767,7 +3755,7 @@ fn main() {{
             w3cos_core::promise::resolve(vec![w3cos_core::Value::Number(2.0)]),
             w3cos_core::promise::resolve(vec![w3cos_core::Value::Number(3.0)]),
         ],
-        std::collections::HashMap::new(),
+        &w3cos_core::AotCaptureMap::new(),
     );
     let rejected = calculate_aot(
         w3cos_core::Value::Undefined,
@@ -3775,7 +3763,7 @@ fn main() {{
             w3cos_core::promise::resolve(vec![w3cos_core::Value::Number(2.0)]),
             w3cos_core::promise::reject(vec![w3cos_core::Value::string("second failed")]),
         ],
-        std::collections::HashMap::new(),
+        &w3cos_core::AotCaptureMap::new(),
     );
     w3cos_core::promise::drain_microtasks();
     println!("{{}}|{{}}", describe(&fulfilled), describe(&rejected));
@@ -3886,7 +3874,7 @@ fn main() {{
     let generator = values_aot(
         w3cos_core::Value::Undefined,
         vec![w3cos_core::promise::resolve(vec![w3cos_core::Value::Number(2.0)])],
-        std::collections::HashMap::new(),
+        &w3cos_core::AotCaptureMap::new(),
     );
     let first = generator.call_method("next", Vec::new());
     let second = generator.call_method(
@@ -4008,7 +3996,7 @@ fn main() {{
     let generator = outer_aot(
         w3cos_core::Value::Undefined,
         Vec::new(),
-        std::collections::HashMap::new(),
+        &w3cos_core::AotCaptureMap::new(),
     );
     let first = generator.call_method("next", Vec::new());
     let cleanup = generator.call_method(
@@ -4211,7 +4199,7 @@ fn main() {{
         run_aot(
             w3cos_core::Value::Undefined,
             Vec::new(),
-            std::collections::HashMap::new(),
+            &w3cos_core::AotCaptureMap::new(),
         )
         .to_js_string(),
     );
@@ -4391,7 +4379,7 @@ fn main() {{
         read_aot(
             w3cos_core::Value::Undefined,
             vec![w3cos_core::Value::Null],
-            std::collections::HashMap::new(),
+            &w3cos_core::AotCaptureMap::new(),
         )
         .to_js_string(),
     );
@@ -4571,7 +4559,7 @@ fn main() {{
     }
 
     #[test]
-    fn emits_create_closure_through_value_function_intern() {
+    fn emits_create_closure_through_aot_function_intern() {
         let module = crate::w3ir_lowering::lower_script(
             r#"
                 function build() {
@@ -4591,8 +4579,20 @@ fn main() {{
         let generated = generate_sync_function_from_module(&module, function, "build_aot").unwrap();
 
         assert!(
-            generated.contains("w3cos_core::Value::function"),
-            "CreateClosure must intern through Value::function: {generated}"
+            generated.contains("w3cos_core::Value::aot_function("),
+            "CreateClosure must intern through Value::aot_function: {generated}"
+        );
+        assert!(
+            !generated.contains("Value::function(move |__this, __args|"),
+            "CreateClosure must not box a dyn Fn wrapper around the factory: {generated}"
+        );
+        assert!(
+            !generated.contains("__w3cos_nested_captures.clone()"),
+            "CreateClosure must not clone captures on every call: {generated}"
+        );
+        assert!(
+            generated.contains("__captures: &w3cos_core::AotCaptureMap"),
+            "nested factory must borrow captures by ref: {generated}"
         );
         assert!(
             !generated.contains("Value::Function("),
@@ -4629,7 +4629,10 @@ fn main() {{
         assert!(generated.contains("__w3cos_getter_"));
         assert!(generated.contains("__w3cos_setter_"));
         assert!(generated.contains("w3cos_core::intrinsics::add"));
-        assert!(generated.matches("w3cos_core::Value::function").count() >= 3);
+        assert!(
+            generated.matches("w3cos_core::Value::aot_function").count() >= 3,
+            "object methods/accessors must emit aot_function CreateClosure: {generated}"
+        );
         assert!(!generated.contains("w3cos_vm"));
         assert!(!generated.contains("w3cos_ir"));
     }

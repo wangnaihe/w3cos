@@ -22,7 +22,7 @@ use crate::js_string::JsString;
 /// callables stay as a remaining enum of pointers / `Rc`. Page-local objects
 /// created via [`Value::object`] / literals, constructor / literal arrays
 /// created via [`Value::array`], and ordinary JS closures created via
-/// [`Value::function`] / AOT `CreateClosure` are `u32` handles packed in
+/// [`Value::function`] / [`Value::aot_function`] (AOT `CreateClosure`) are `u32` handles packed in
 /// [`Immediate`] (clone is a register move). `array_hole` stays a host `Rc`
 /// object. Host/DOM callables (`Value::callable`, jsdom call slots) stay
 /// `Value::Object(Rc)` / `Value::Function(Rc)`. Symbols remain interned
@@ -1001,14 +1001,28 @@ pub(crate) fn array_slot_value(value: Value) -> Value {
     }
 }
 
-fn function_heap_bytes(props: &HashMap<JsString, Value>) -> usize {
-    std::mem::size_of::<FunctionData>()
+fn function_heap_bytes(
+    props: &HashMap<JsString, Value>,
+    captures: Option<&AotCaptureMap>,
+) -> usize {
+    let mut bytes = std::mem::size_of::<FunctionData>()
         .saturating_add(
             props
                 .capacity()
                 .saturating_mul(std::mem::size_of::<(JsString, Value)>()),
         )
-        .saturating_add(props.len().saturating_mul(std::mem::size_of::<JsString>()))
+        .saturating_add(props.len().saturating_mul(std::mem::size_of::<JsString>()));
+    if let Some(captures) = captures {
+        // Box<AotCaptureMap> payload (the Box word itself sits in FunctionData).
+        bytes = bytes
+            .saturating_add(std::mem::size_of::<AotCaptureMap>())
+            .saturating_add(
+                captures
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u32, (Value, Value))>()),
+            );
+    }
+    bytes
 }
 
 pub struct ValueIterator {
@@ -1103,13 +1117,36 @@ impl PartialEq for Value {
     }
 }
 
+/// Capture environment for an AOT-emitted nested function factory.
+///
+/// Keys are W3IR binding ids; values are `(getter, setter)` callables (or
+/// `Undefined` setter for const captures).
+pub type AotCaptureMap = HashMap<u32, (Value, Value)>;
+
+/// Native AOT factory entrypoint. Captures are borrowed so a call does not
+/// clone the env map; the factory clones Values into its frame as needed.
+pub type AotFactory = fn(Value, Vec<Value>, &AotCaptureMap) -> Value;
+
+/// Callable body stored inside [`FunctionData`].
+///
+/// Host / DOM / capture-adapter closures keep [`FunctionBody::Dyn`]. AOT
+/// `CreateClosure` uses [`FunctionBody::Aot`] so the page slab holds a fn
+/// pointer + captures without an extra `Box<dyn Fn>` allocation per closure.
+enum FunctionBody {
+    Dyn(Box<dyn Fn(Value, Vec<Value>) -> Value>),
+    Aot {
+        factory: AotFactory,
+        captures: Box<AotCaptureMap>,
+    },
+}
+
 /// Payload of a JS function object.
 ///
-/// Page-local interned functions store one [`Box`] of this in the page
-/// arena. Host / DOM callables share [`Rc<FunctionData>`] on
-/// [`Value::Function`] and object call-slots.
+/// Page-local interned functions store one of these in the page arena. Host /
+/// DOM callables share [`Rc<FunctionData>`] on [`Value::Function`] and object
+/// call-slots.
 pub struct FunctionData {
-    inner: Box<dyn Fn(Value, Vec<Value>) -> Value>,
+    body: FunctionBody,
     props: RefCell<HashMap<JsString, Value>>,
     allocation: HeapAllocation,
 }
@@ -1145,27 +1182,51 @@ impl FunctionData {
     }
 
     /// Construct the common JS function object after erasing the concrete
-    /// Rust closure type. AOT bundles create thousands of distinct closures;
-    /// keeping prototype/allocation setup in the generic constructor causes
-    /// that body to be monomorphized once per closure before LTO can merge it.
+    /// Rust closure type. Host / DOM / adapter sites still go through this path;
+    /// AOT `CreateClosure` uses [`Self::from_aot`] instead.
     #[inline(never)]
     fn from_erased(inner: Box<dyn Fn(Value, Vec<Value>) -> Value>) -> Self {
+        Self::finish(FunctionBody::Dyn(inner))
+    }
+
+    /// Build a page-local function whose body is an AOT factory + captures.
+    ///
+    /// No `Box<dyn Fn>`: the factory is a thin fn pointer and captures live in
+    /// one owned map borrowed on each call.
+    #[inline(never)]
+    pub fn from_aot(factory: AotFactory, captures: AotCaptureMap) -> Self {
+        Self::finish(FunctionBody::Aot {
+            factory,
+            captures: Box::new(captures),
+        })
+    }
+
+    #[inline(never)]
+    fn finish(body: FunctionBody) -> Self {
+        let captures_ref = match &body {
+            FunctionBody::Dyn(_) => None,
+            FunctionBody::Aot { captures, .. } => Some(captures.as_ref()),
+        };
         let mut props = HashMap::new();
         // Ordinary JavaScript function objects own a prototype object. The
         // compiler uses these Values for function declarations/constructors;
         // Libraries install methods on constructor prototypes before
         // constructing instances.
         props.insert(JsString::intern("prototype"), Value::object(HashMap::new()));
-        let allocation = HeapAllocation::new(HeapKind::Function, function_heap_bytes(&props));
+        let allocation =
+            HeapAllocation::new(HeapKind::Function, function_heap_bytes(&props, captures_ref));
         Self {
-            inner,
+            body,
             props: RefCell::new(props),
             allocation,
         }
     }
 
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
-        (self.inner)(this, args)
+        match &self.body {
+            FunctionBody::Dyn(inner) => inner(this, args),
+            FunctionBody::Aot { factory, captures } => factory(this, args, captures),
+        }
     }
 
     pub fn get_property(&self, key: &str) -> Value {
@@ -1191,13 +1252,23 @@ impl FunctionData {
     pub fn set_property(&self, key: &str, value: Value) {
         let mut props = self.props.borrow_mut();
         props.insert(JsString::intern(key), value);
-        self.allocation.set_bytes(function_heap_bytes(&props));
+        self.allocation
+            .set_bytes(function_heap_bytes(&props, self.captures_for_heap()));
     }
 
     pub fn delete_property(&self, key: &str) {
         let mut props = self.props.borrow_mut();
         props.remove(key);
-        self.allocation.set_bytes(function_heap_bytes(&props));
+        self.allocation
+            .set_bytes(function_heap_bytes(&props, self.captures_for_heap()));
+    }
+
+    #[inline]
+    fn captures_for_heap(&self) -> Option<&AotCaptureMap> {
+        match &self.body {
+            FunctionBody::Dyn(_) => None,
+            FunctionBody::Aot { captures, .. } => Some(captures.as_ref()),
+        }
     }
 
     pub fn identity(&self) -> usize {
@@ -1818,6 +1889,14 @@ impl Value {
 
     pub fn function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
         let handle = crate::page_arena::alloc_function(FunctionData::new(f));
+        Value::Imm(Immediate::from_function_handle(handle))
+    }
+
+    /// Intern an AOT `CreateClosure` body without boxing a `dyn Fn`.
+    ///
+    /// Host / DOM sites should keep using [`Value::function`] / [`Value::callable`].
+    pub fn aot_function(factory: AotFactory, captures: AotCaptureMap) -> Self {
+        let handle = crate::page_arena::alloc_function(FunctionData::from_aot(factory, captures));
         Value::Imm(Immediate::from_function_handle(handle))
     }
 
@@ -4412,6 +4491,49 @@ mod tests {
             _ => panic!("Value::function must pack a page-arena handle"),
         }
         assert_eq!(crate::page_arena::live_functions(), 1);
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_functions(), 0);
+    }
+
+    #[test]
+    fn aot_function_calls_factory_with_borrowed_captures_without_dyn_box_path() {
+        crate::page_arena::reset();
+        fn factory(
+            this: Value,
+            args: Vec<Value>,
+            captures: &AotCaptureMap,
+        ) -> Value {
+            assert!(this.is_undefined());
+            let capture = captures
+                .get(&7)
+                .expect("capture 7")
+                .0
+                .call(Value::Undefined, Vec::new());
+            let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            Value::Number(capture.to_number() + arg.to_number())
+        }
+        let mut captures = AotCaptureMap::new();
+        captures.insert(
+            7,
+            (
+                Value::function(|_, _| Value::Number(10.0)),
+                Value::Undefined,
+            ),
+        );
+        let func = Value::aot_function(factory, captures);
+        assert!(func.is_function());
+        assert_eq!(
+            func.call(Value::Undefined, vec![Value::Number(3.0)]).to_number(),
+            13.0
+        );
+        // Second call must still see the same borrowed captures map.
+        assert_eq!(
+            func.call(Value::Undefined, vec![Value::Number(5.0)]).to_number(),
+            15.0
+        );
+        assert!(func.as_function().expect("function").has_own_property("prototype"));
+        // Dyn host function + AOT function + capture-adapter getter.
+        assert_eq!(crate::page_arena::live_functions(), 2);
         crate::page_arena::reset();
         assert_eq!(crate::page_arena::live_functions(), 0);
     }
