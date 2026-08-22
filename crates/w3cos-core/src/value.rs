@@ -669,10 +669,10 @@ impl JsObjectRef {
                 if epoch != crate::page_arena::current_epoch() || ptr.is_null() {
                     panic!("page object handle used after reset_bridge");
                 }
-                // Safety: `ptr` names a `RefCell<JsObject>` box in the
-                // current page object table. `reset` bumps the epoch before
-                // dropping those boxes. Callers must not hold the reference
-                // across a page reset.
+                // Safety: `ptr` names a `RefCell<JsObject>` in the current
+                // page object slab. `reset` bumps the epoch before dropping
+                // those slots. Callers must not hold the reference across a
+                // page reset.
                 unsafe { &*ptr }
             }
             JsObjectRepr::Host(ref rc) => rc,
@@ -830,9 +830,9 @@ impl JsArrayRef {
                 if epoch != crate::page_arena::current_epoch() || ptr.is_null() {
                     panic!("page array handle used after reset_bridge");
                 }
-                // Safety: `ptr` names a `RefCell<ArrayStorage>` box in the
-                // current page array table. `reset` bumps the epoch before
-                // dropping those boxes. Callers must not hold the reference
+                // Safety: `ptr` names a `RefCell<ArrayStorage>` in the
+                // current page array slab. `reset` bumps the epoch before
+                // dropping those slots. Callers must not hold the reference
                 // across a page reset.
                 unsafe { &*ptr }
             }
@@ -1260,10 +1260,10 @@ impl JsFunction {
                 if epoch != crate::page_arena::current_epoch() || ptr.is_null() {
                     panic!("page function handle used after reset_bridge");
                 }
-                // Safety: `ptr` names a `FunctionData` box in the current
-                // page function table. `reset` bumps the epoch before
-                // dropping those boxes. Callers must not hold the reference
-                // across a page reset.
+                // Safety: `ptr` names a `FunctionData` in the current page
+                // function slab. `reset` bumps the epoch before dropping
+                // those slots. Callers must not hold the reference across a
+                // page reset.
                 unsafe { &*ptr }
             }
             JsFunctionRepr::Host(ref rc) => rc,
