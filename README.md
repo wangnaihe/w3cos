@@ -214,6 +214,21 @@ filters ECMAScript built-ins and event-handler properties, but intentionally
 keeps experimental browser interfaces visible so roadmap decisions do not
 mistake an omitted subsystem for conformance.
 
+### Run raw Web Platform Tests
+
+Run a pinned, unmodified WPT smoke subset through the dynamic document and
+native rendering paths:
+
+```bash
+cargo run -p w3cos-wpt-runner -- \
+  --wpt-root ../wpt \
+  --suite tests/wpt/w3cos-smoke.json
+```
+
+Checkout preparation, the broader failure-preserving baseline, artifacts, and
+current runner boundaries are documented in
+[Raw Web Platform Tests](docs/wpt-conformance.md).
+
 ### Technology Stack
 
 

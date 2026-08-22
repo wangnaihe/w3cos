@@ -1,0 +1,22 @@
+[package]
+name = "w3cos-wpt-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pinned raw Web Platform Tests runner for W3COS"
+publish = false
+
+[[bin]]
+name = "w3cos-wpt"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+w3cos-runtime = { workspace = true, default-features = false, features = ["dynamic-js", "skia"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

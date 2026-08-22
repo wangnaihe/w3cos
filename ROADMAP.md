@@ -1,7 +1,7 @@
 # W3C OS Roadmap
 
-Last reconciled with implementation: **2026-08-13**
-Baseline: `main` @ `23808bc`
+Last reconciled with implementation: **2026-08-22**
+Baseline before this milestone: `main` @ `06bc454`
 
 ## North Star
 
@@ -81,6 +81,16 @@ suite is red.
 
 ### Green baseline
 
+- [x] Add a pinned raw-WPT runner with an exact-clean-checkout gate, upstream
+  `testharness.js`, isolated per-document workers, deterministic offscreen
+  Skia reftests, WPT fuzzy comparison, JSON results, and PNG diff artifacts.
+- [x] Establish a fail-closed two-case raw-WPT smoke gate and a broader
+  failure-preserving baseline: 2 pass and 3 fail on 2026-08-22. The three
+  failures remain DOM attribute/selector and CSS opacity work, not exemptions.
+- [ ] Close the three recorded raw-WPT failures, expand the selected DOM/CSS
+  suites, and add the WPT server/metadata features required by those suites.
+- [ ] Add an independently pinned Test262 runner for ECMAScript language
+  semantics; do not infer Test262 coverage from WPT or direct Rust tests.
 - [x] Fix `w3cos-runtime --test w3c_feature_matrix`
   `dom_to_component_tree_smoke`.
 - [x] Fix `w3cos-compiler` `generated_bundle_runs_jsdom_globals`.

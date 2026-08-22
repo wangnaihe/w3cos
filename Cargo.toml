@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "tools/size-audit",
     "tools/size-probes",
+    "tools/wpt-runner",
     "crates/w3cos-ir",
     "crates/w3cos-vm",
     "crates/w3cos-core",

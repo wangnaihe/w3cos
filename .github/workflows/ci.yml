@@ -34,6 +34,34 @@ jobs:
           cargo test -p w3cos-runtime --no-default-features --features dynamic-js dynamic_script::tests --lib
           cargo test -p w3cos-runtime --no-default-features --features dynamic-js --lib worker_realm::
           cargo test -p w3cos-runtime --no-default-features --features dynamic-js --lib worker_web::tests
+      - name: Checkout pinned Web Platform Tests subset
+        run: |
+          wpt_dir="$RUNNER_TEMP/wpt"
+          git init "$wpt_dir"
+          git -C "$wpt_dir" remote add origin https://github.com/web-platform-tests/wpt
+          git -C "$wpt_dir" sparse-checkout init --cone
+          git -C "$wpt_dir" sparse-checkout set resources infrastructure dom/nodes css/CSS2
+          git -C "$wpt_dir" fetch --depth=1 origin fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0
+          git -C "$wpt_dir" checkout --detach FETCH_HEAD
+      - name: Run raw WPT smoke gate and baseline report
+        run: |
+          cargo run --locked -p w3cos-wpt-runner -- \
+            --wpt-root "$RUNNER_TEMP/wpt" \
+            --suite tests/wpt/w3cos-smoke.json \
+            --artifacts target/wpt-smoke
+          cargo run --locked -p w3cos-wpt-runner -- \
+            --wpt-root "$RUNNER_TEMP/wpt" \
+            --suite tests/wpt/w3cos-baseline.json \
+            --artifacts target/wpt-baseline \
+            --report-only
+      - name: Upload raw WPT evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-wpt-evidence
+          path: |
+            target/wpt-smoke
+            target/wpt-baseline
       - name: Test map-style dynamic SDK loading
         run: cargo test -p w3cos-runtime --no-default-features --features dynamic-js --test map_sdk_compat
       - name: Verify ordinary AOT dependency boundary

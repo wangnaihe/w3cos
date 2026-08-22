@@ -5307,8 +5307,7 @@ impl ScriptLoader {
             .call_method("hasAttribute", vec![Value::string("async")])
             .to_bool();
         let async_property = element.get_property("async");
-        let explicitly_ordered =
-            matches!(async_property, Value::Bool(false)) && !has_async_attribute;
+        let explicitly_ordered = async_property == Value::Bool(false) && !has_async_attribute;
         let is_async = if dynamically_inserted {
             !explicitly_ordered
         } else {
