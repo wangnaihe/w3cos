@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -9,6 +10,13 @@ use vello::peniko::{
     Blob, Color, Fill, FontData, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
 };
 use vello::{Glyph, Scene};
+
+#[path = "gpu_present.rs"]
+mod gpu_present;
+pub use gpu_present::{
+    GpuPresentPlan, copy_texture_view_to_cpu, gpu_cpu_readback_count, gpu_present_count,
+    gpu_present_plan, present_swapchain,
+};
 use w3cos_std::SvgPathCommand;
 use w3cos_std::color::Color as AppColor;
 use w3cos_std::component::ComponentKind;
@@ -20,6 +28,69 @@ use crate::filter::{self, CssFilter};
 use crate::gpu_filter::{self, GpuFilterCtx};
 
 use crate::layout::LayoutRect;
+use crate::paint_artifact::PaintArtifact;
+use crate::retained_layers::{
+    CompositorLayer, CompositorOverrides, layer_css_transform,
+    layer_opacity as compositor_layer_opacity, layer_scroll_translation,
+};
+use w3cos_std::style::Transform2D;
+
+const IMAGE_TEXTURE_CACHE_LIMIT: usize = 256;
+
+thread_local! {
+    static IMAGE_BRUSHES: RefCell<HashMap<usize, ImageBrush>> = RefCell::new(HashMap::new());
+    static GPU_IMAGE_UPLOADS: Cell<u64> = const { Cell::new(0) };
+    static GPU_IMAGE_REUSES: Cell<u64> = const { Cell::new(0) };
+}
+
+pub(crate) fn gpu_image_upload_count() -> u64 {
+    GPU_IMAGE_UPLOADS.with(Cell::get)
+}
+
+pub(crate) fn gpu_image_reuse_count() -> u64 {
+    GPU_IMAGE_REUSES.with(Cell::get)
+}
+
+pub(crate) fn reset_image_texture_stats() {
+    GPU_IMAGE_UPLOADS.with(|count| count.set(0));
+    GPU_IMAGE_REUSES.with(|count| count.set(0));
+}
+
+pub(crate) fn clear_image_texture_cache() {
+    IMAGE_BRUSHES.with(|cache| cache.borrow_mut().clear());
+}
+
+pub(crate) fn invalidate_image_texture(pixels_id: usize) {
+    IMAGE_BRUSHES.with(|cache| {
+        cache.borrow_mut().remove(&pixels_id);
+    });
+}
+
+fn cached_image_brush(decoded: &crate::image_loader::DecodedImage) -> ImageBrush {
+    let pixels_id = decoded.pixels_id();
+    IMAGE_BRUSHES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(brush) = cache.get(&pixels_id) {
+            GPU_IMAGE_REUSES.with(|count| count.set(count.get().saturating_add(1)));
+            return brush.clone();
+        }
+        if cache.len() >= IMAGE_TEXTURE_CACHE_LIMIT {
+            cache.clear();
+        }
+        GPU_IMAGE_UPLOADS.with(|count| count.set(count.get().saturating_add(1)));
+        let blob = Blob::new(decoded.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
+        let image_data = ImageData {
+            data: blob,
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: decoded.width,
+            height: decoded.height,
+        };
+        let brush = ImageBrush::new(image_data);
+        cache.insert(pixels_id, brush.clone());
+        brush
+    })
+}
 
 // ---------------------------------------------------------------------------
 // GlyphCache — avoid repeated font parsing, charmap lookup, and rasterization
@@ -204,6 +275,7 @@ impl GlyphCache {
             self,
             Affine::IDENTITY,
             true,
+            true,
             #[cfg(feature = "gpu")]
             None,
         );
@@ -343,6 +415,7 @@ fn render_node_gpu_layer(
         glyph_cache,
         dpi,
         true,
+        true,
         None,
     );
     if let Some(layer) = filter_ctx.rasterize_filtered_layer(&layer_scene, lw, lh, chain) {
@@ -460,6 +533,7 @@ pub fn render_frame(
             glyph_cache,
             dpi,
             false,
+            true,
             #[cfg(feature = "gpu")]
             gpu_filter.as_deref_mut(),
         );
@@ -480,6 +554,7 @@ fn render_node(
     glyph_cache: &mut GlyphCache,
     dpi: Affine,
     in_layer: bool,
+    bake_compositor_props: bool,
     #[cfg(feature = "gpu")] mut gpu_filter: Option<&mut GpuFilterCtx<'_>>,
 ) {
     if style.opacity <= 0.0 {
@@ -496,19 +571,22 @@ fn render_node(
         scene.push_clip_layer(Fill::NonZero, dpi, &clip_shape);
     }
 
-    let tx = style.transform.translate_x;
-    let ty = style.transform.translate_y;
-    let rect = LayoutRect {
-        x: rect.x + tx,
-        y: rect.y + ty,
-        width: rect.width * style.transform.scale_x,
-        height: rect.height * style.transform.scale_y,
+    let (rect, opacity) = if bake_compositor_props {
+        (
+            LayoutRect {
+                x: rect.x + style.transform.translate_x,
+                y: rect.y + style.transform.translate_y,
+                width: rect.width * style.transform.scale_x,
+                height: rect.height * style.transform.scale_y,
+            },
+            style.opacity,
+        )
+    } else {
+        (rect, 1.0)
     };
-
-    let opacity = style.opacity;
     let css_filter = style.filter.as_deref().and_then(filter::parse_css_filter);
 
-    let needs_compositor_layer = promotes_compositor_layer(style);
+    let needs_compositor_layer = bake_compositor_props && promotes_compositor_layer(style);
     if needs_compositor_layer {
         let bounds = Rect::new(
             rect.x as f64,
@@ -791,21 +869,7 @@ fn render_node(
             ..
         } => {
             if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
-                let blob = Blob::new(raster.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
-                let image_data = ImageData {
-                    data: blob,
-                    format: ImageFormat::Rgba8,
-                    alpha_type: ImageAlphaType::Alpha,
-                    width: raster.width,
-                    height: raster.height,
-                };
-                let image_brush = ImageBrush::new(image_data);
-                let transform = Affine::translate((rect.x as f64, rect.y as f64))
-                    * Affine::scale_non_uniform(
-                        rect.width as f64 / raster.width as f64,
-                        rect.height as f64 / raster.height as f64,
-                    );
-                scene.draw_image(image_brush.as_ref(), transform);
+                draw_decoded_image(scene, rect, &raster);
             }
         }
         _ => {}
@@ -842,15 +906,15 @@ fn draw_image_source(scene: &mut Scene, rect: LayoutRect, src: &str) {
     let Some(decoded) = crate::image_loader::get_or_load(src) else {
         return;
     };
-    let blob = Blob::new(decoded.data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>);
-    let image_data = ImageData {
-        data: blob,
-        format: ImageFormat::Rgba8,
-        alpha_type: ImageAlphaType::Alpha,
-        width: decoded.width,
-        height: decoded.height,
-    };
-    let image_brush = ImageBrush::new(image_data);
+    draw_decoded_image(scene, rect, &decoded);
+}
+
+fn draw_decoded_image(
+    scene: &mut Scene,
+    rect: LayoutRect,
+    decoded: &crate::image_loader::DecodedImage,
+) {
+    let image_brush = cached_image_brush(decoded);
     let scale_x = rect.width as f64 / decoded.width as f64;
     let scale_y = rect.height as f64 / decoded.height as f64;
     let transform = Affine::translate((rect.x as f64, rect.y as f64))
@@ -1308,6 +1372,112 @@ pub fn draw_focus_ring(scene: &mut Scene, rect: LayoutRect, scale_factor: f32) {
     scene.stroke(&stroke, dpi, color, None, &r);
 }
 
+fn css_transform_affine(transform: Transform2D, origin: (f64, f64)) -> Affine {
+    Affine::translate((
+        origin.0 + transform.translate_x as f64,
+        origin.1 + transform.translate_y as f64,
+    )) * Affine::rotate((transform.rotate_deg as f64).to_radians())
+        * Affine::scale_non_uniform(transform.scale_x as f64, transform.scale_y as f64)
+        * Affine::translate((-origin.0, -origin.1))
+}
+
+/// Record one compositor layer in layout space. Scroll, opacity, and CSS
+/// transform are applied later by [`composite_retained_layers`].
+#[allow(clippy::too_many_arguments)]
+pub fn record_layer_scene(
+    nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
+    font_data: &FontData,
+    font: &fontdue::Font,
+    text_input_values: &HashMap<usize, String>,
+    focused_index: Option<usize>,
+    glyph_cache: &mut GlyphCache,
+    #[cfg(feature = "gpu")] mut gpu_filter: Option<&mut GpuFilterCtx<'_>>,
+) -> Scene {
+    let mut scene = Scene::new();
+    for &(idx, rect, kind, style) in nodes {
+        let text_value = match kind {
+            ComponentKind::TextInput { value, .. } => Some(
+                text_input_values
+                    .get(&idx)
+                    .map(|s| s.as_str())
+                    .unwrap_or_else(|| value.as_str()),
+            ),
+            _ => None,
+        };
+        render_node(
+            &mut scene,
+            rect,
+            kind,
+            style,
+            font_data,
+            font,
+            None,
+            text_value,
+            focused_index == Some(idx),
+            glyph_cache,
+            Affine::IDENTITY,
+            false,
+            false,
+            #[cfg(feature = "gpu")]
+            gpu_filter.as_deref_mut(),
+        );
+    }
+    scene
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn composite_retained_layers(
+    scene: &mut Scene,
+    recordings: &[Scene],
+    layers: &[CompositorLayer],
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    scale_factor: f32,
+) {
+    let dpi = Affine::scale(scale_factor as f64);
+    for (layer, recording) in layers.iter().zip(recordings) {
+        let (scroll_x, scroll_y, clip) = layer_scroll_translation(layer, scroll_info);
+        let css = layer_css_transform(layer, artifact, overrides);
+        let origin = (layer.bounds.x as f64, layer.bounds.y as f64);
+        let transform = dpi
+            * Affine::translate((scroll_x as f64, scroll_y as f64))
+            * css_transform_affine(css, origin);
+        let opacity = compositor_layer_opacity(layer, artifact, overrides);
+        if let Some(clip_rect) = clip {
+            let clip_shape = Rect::new(
+                clip_rect.x as f64,
+                clip_rect.y as f64,
+                (clip_rect.x + clip_rect.width) as f64,
+                (clip_rect.y + clip_rect.height) as f64,
+            );
+            scene.push_clip_layer(Fill::NonZero, dpi, &clip_shape);
+        }
+        if opacity < 0.999 {
+            let bounds = Rect::new(
+                layer.bounds.x as f64,
+                layer.bounds.y as f64,
+                (layer.bounds.x + layer.bounds.width) as f64,
+                (layer.bounds.y + layer.bounds.height) as f64,
+            );
+            scene.push_layer(
+                Fill::NonZero,
+                vello::peniko::Mix::Normal,
+                opacity,
+                transform,
+                &bounds,
+            );
+            scene.append(recording, Some(transform));
+            scene.pop_layer();
+        } else {
+            scene.append(recording, Some(transform));
+        }
+        if clip.is_some() {
+            scene.pop_layer();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1435,5 +1605,25 @@ mod tests {
             "an unused subset must not invalidate unrelated retained text"
         );
         crate::font_face::FontRegistry::global().clear_owner(OWNER);
+    }
+
+    #[test]
+    fn gpu_image_brush_is_reused_for_unchanged_decoded_pixels() {
+        crate::image_loader::clear_cache();
+        crate::image_loader::reset_cache_stats();
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([12, 34, 56, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let decoded =
+            crate::image_loader::decode_and_install("gpu-cache.png", &bytes.into_inner()).unwrap();
+        let first = super::cached_image_brush(&decoded);
+        let second = super::cached_image_brush(&decoded);
+        assert_eq!(first.image.data.id(), second.image.data.id());
+        assert_eq!(gpu_image_upload_count(), 1);
+        assert_eq!(gpu_image_reuse_count(), 1);
+        crate::image_loader::clear_cache();
+        assert!(super::IMAGE_BRUSHES.with(|cache| cache.borrow().is_empty()));
     }
 }

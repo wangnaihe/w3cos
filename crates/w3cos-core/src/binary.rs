@@ -264,10 +264,10 @@ thread_local! {
 }
 
 fn buffer_state(value: &Value) -> Option<Rc<RefCell<Vec<u8>>>> {
-    let Value::Object(object) = value else {
+    let Some(object) = value.as_object() else {
         return None;
     };
-    let Value::Number(id) = object.borrow().get_direct(BUFFER_STATE_KEY) else {
+    let Some(id) = object.borrow().get_direct(BUFFER_STATE_KEY).as_number() else {
         return None;
     };
     BUFFERS.with(|buffers| buffers.borrow().get(&(id as u64)).cloned())
@@ -807,7 +807,7 @@ pub fn shared_array_buffer_class() -> Value {
 }
 
 fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, Value)> {
-    let Value::Array(candidate) = value else {
+    let Some(candidate) = value.as_array() else {
         return None;
     };
     VIEWS.with(|views| {
@@ -815,7 +815,7 @@ fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, 
         views.retain(|view| view.storage.strong_count() > 0);
         views.iter().find_map(|view| {
             let storage = view.storage.upgrade()?;
-            Rc::ptr_eq(&storage, candidate).then(|| {
+            Rc::ptr_eq(&storage, &candidate).then(|| {
                 (
                     view.bytes.clone(),
                     view.offset,
@@ -865,12 +865,10 @@ fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
             .collect()
     };
     let value = Value::array(values);
-    let Value::Array(storage) = &value else {
-        unreachable!()
-    };
+    let storage = value.as_array().expect("typed array storage");
     VIEWS.with(|views| {
         views.borrow_mut().push(View {
-            storage: Rc::downgrade(storage),
+            storage: Rc::downgrade(&storage),
             buffer,
             bytes,
             offset,

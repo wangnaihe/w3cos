@@ -111,6 +111,7 @@ pub mod observers_web;
 pub mod orientation_web;
 mod overscroll;
 pub mod paint_artifact;
+pub mod retained_layers;
 pub mod payment_web;
 pub mod perf;
 pub mod permissions_web;

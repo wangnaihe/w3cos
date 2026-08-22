@@ -182,13 +182,14 @@ pub fn array_value() -> Value {
         Value::function(|_, arguments| Value::array(arguments)),
     );
     Value::callable(properties, |_, arguments| {
-        if let [Value::Number(length)] = arguments.as_slice()
+        if let [length] = arguments.as_slice()
+            && let Some(length) = length.as_number()
             && length.is_finite()
-            && *length >= 0.0
+            && length >= 0.0
             && length.fract() == 0.0
         {
             return Value::array(
-                (0..*length as usize)
+                (0..length as usize)
                     .map(|_| crate::value::array_hole())
                     .collect(),
             );
@@ -408,16 +409,18 @@ fn js_round(value: f64) -> f64 {
 }
 
 pub(crate) fn object_keys(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => Value::array(
+    if let Some(object) = value.as_object() {
+        return Value::array(
             object
                 .borrow()
                 .keys()
                 .into_iter()
                 .map(Value::from)
                 .collect(),
-        ),
-        Value::Array(values) => Value::array(
+        );
+    }
+    if let Some(values) = value.as_array() {
+        return Value::array(
             values
                 .borrow()
                 .iter()
@@ -425,33 +428,33 @@ pub(crate) fn object_keys(value: &Value) -> Value {
                 .filter(|(_, value)| !crate::value::is_array_hole(value))
                 .map(|(index, _)| Value::from(index.to_string()))
                 .collect(),
-        ),
-        _ => Value::array(Vec::new()),
+        );
     }
+    Value::array(Vec::new())
 }
 
 fn object_values(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => {
-            let object = object.borrow();
-            Value::array(
-                object
-                    .keys()
-                    .into_iter()
-                    .map(|key| object.get_direct(&key))
-                    .collect(),
-            )
-        }
-        Value::Array(values) => Value::array(
+    if let Some(object) = value.as_object() {
+        let object = object.borrow();
+        return Value::array(
+            object
+                .keys()
+                .into_iter()
+                .map(|key| object.get_direct(&key))
+                .collect(),
+        );
+    }
+    if let Some(values) = value.as_array() {
+        return Value::array(
             values
                 .borrow()
                 .iter()
                 .filter(|value| !crate::value::is_array_hole(value))
                 .cloned()
                 .collect(),
-        ),
-        _ => Value::array(Vec::new()),
+        );
     }
+    Value::array(Vec::new())
 }
 
 fn dom_element() -> Value {
@@ -638,24 +641,24 @@ pub struct Map;
 /// values by (type-tagged) value, objects/arrays/functions by reference
 /// identity (Rc pointer).
 fn map_key(value: &Value) -> String {
-    match value {
-        Value::Undefined => "u:".to_string(),
-        Value::Null => "z:".to_string(),
-        Value::Bool(b) => format!("b:{b}"),
+    match value.unpack() {
+        crate::value::ValueUnpack::Undefined => "u:".to_string(),
+        crate::value::ValueUnpack::Null => "z:".to_string(),
+        crate::value::ValueUnpack::Bool(b) => format!("b:{b}"),
         // Canonicalize -0 to +0 (SameValueZero) and let all NaNs share a key.
-        Value::Number(n) => {
+        crate::value::ValueUnpack::Number(n) => {
             if n.is_nan() {
                 "n:NaN".to_string()
-            } else if *n == 0.0 {
+            } else if n == 0.0 {
                 "n:0".to_string()
             } else {
                 format!("n:{n}")
             }
         }
-        Value::String(s) => format!("s:{s}"),
-        Value::Array(rc) => format!("a:{:p}", std::rc::Rc::as_ptr(rc)),
-        Value::Object(rc) => format!("o:{:p}", std::rc::Rc::as_ptr(rc)),
-        Value::Function(f) => format!("f:{:#x}", f.identity()),
+        crate::value::ValueUnpack::String(s) => format!("s:{s}"),
+        crate::value::ValueUnpack::Array(rc) => format!("a:{:p}", std::rc::Rc::as_ptr(&rc)),
+        crate::value::ValueUnpack::Object(rc) => format!("o:{:p}", std::rc::Rc::as_ptr(&rc)),
+        crate::value::ValueUnpack::Function(f) => format!("f:{:#x}", f.identity()),
     }
 }
 
@@ -667,13 +670,13 @@ impl Map {
         let entries = iterable.get_property("__w3cosMapEntries");
         let source = if entries_snapshot.is_function() {
             entries_snapshot.call(iterable.clone(), vec![])
-        } else if matches!(entries, Value::Array(_)) {
+        } else if entries.is_array() {
             entries
         } else {
             iterable
         };
         for entry in source.iter() {
-            if let Value::Array(pair) = entry {
+            if let Some(pair) = entry.as_array() {
                 let pair = pair.borrow();
                 if let Some(key) = pair.first() {
                     initial.insert(
@@ -1112,13 +1115,13 @@ mod monaco_tests {
     #[test]
     fn map_methods_do_not_retain_their_own_receiver() {
         let map = Map::new(vec![]);
-        let Value::Object(object) = map else {
+        let Some(object) = map.as_object() else {
             panic!("Map constructor did not return an object");
         };
 
         assert_eq!(
             std::rc::Rc::strong_count(&object),
-            1,
+            2,
             "a method stored on the Map must use its call receiver instead of creating an Rc cycle"
         );
     }

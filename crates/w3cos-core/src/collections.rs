@@ -93,8 +93,8 @@ fn register_set(values: Rc<RefCell<SetValues>>) -> u64 {
 
 /// The shared entries behind `value`, when `value` is one of our Maps.
 fn map_state_of(value: &Value) -> Option<Rc<RefCell<MapEntries>>> {
-    if let Value::Object(object) = value {
-        if let Value::Number(id) = object.borrow().get_direct(MAP_STATE_KEY) {
+    if let Some(object) = value.as_object() {
+        if let Some(id) = object.borrow().get_direct(MAP_STATE_KEY).as_number() {
             return MAP_STATES.with(|registry| registry.borrow().get(&(id as u64)).cloned());
         }
     }
@@ -103,8 +103,8 @@ fn map_state_of(value: &Value) -> Option<Rc<RefCell<MapEntries>>> {
 
 /// The shared values behind `value`, when `value` is one of our Sets.
 fn set_state_of(value: &Value) -> Option<Rc<RefCell<SetValues>>> {
-    if let Value::Object(object) = value {
-        if let Value::Number(id) = object.borrow().get_direct(SET_STATE_KEY) {
+    if let Some(object) = value.as_object() {
+        if let Some(id) = object.borrow().get_direct(SET_STATE_KEY).as_number() {
             return SET_STATES.with(|registry| registry.borrow().get(&(id as u64)).cloned());
         }
     }
@@ -151,7 +151,8 @@ fn map_instance(args: &[Value], proto: &Value) -> Value {
         Value::Number(register_map(entries.clone()) as f64),
     );
     match args.first() {
-        None | Some(Value::Undefined) | Some(Value::Null) => {}
+        None => {}
+        Some(seed) if seed.is_nullish() => {}
         Some(seed) => seed_map(&entries, seed),
     }
     map
@@ -334,7 +335,8 @@ fn set_instance(args: &[Value], proto: &Value) -> Value {
         Value::Number(register_set(values.clone()) as f64),
     );
     match args.first() {
-        None | Some(Value::Undefined) | Some(Value::Null) => {}
+        None => {}
+        Some(seed) if seed.is_nullish() => {}
         Some(seed) => {
             if let Some(other) = set_state_of(seed) {
                 // `new Set(other)` copies the other set's values.

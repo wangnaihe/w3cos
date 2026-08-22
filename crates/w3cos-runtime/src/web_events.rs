@@ -215,10 +215,15 @@ fn arg(args: &[Value], index: usize) -> Value {
 }
 
 fn bool_option(options: &Value, name: &str) -> bool {
-    match options {
-        Value::Bool(value) if name == "capture" => *value,
-        Value::Object(_) => options.get_property(name).to_bool(),
-        _ => false,
+    if name == "capture" {
+        if let Some(value) = options.as_bool() {
+            return value;
+        }
+    }
+    if options.is_object() {
+        options.get_property(name).to_bool()
+    } else {
+        false
     }
 }
 
@@ -1449,10 +1454,12 @@ pub(crate) fn reset_realm() {
         EVENT_TARGET_INSTANCES.with(|instances| std::mem::take(&mut *instances.borrow_mut()));
     for binding in bindings {
         binding.listeners.borrow_mut().clear();
-        let properties = match &binding.value {
-            Value::Object(object) => object.borrow().keys(),
-            Value::Function(function) => function.keys(),
-            _ => Vec::new(),
+        let properties = if let Some(object) = binding.value.as_object() {
+            object.borrow().keys()
+        } else if let Some(function) = binding.value.as_function() {
+            function.keys()
+        } else {
+            Vec::new()
         };
         for property in properties {
             if property.starts_with("on")

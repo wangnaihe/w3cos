@@ -49,7 +49,7 @@ pub fn parse(input: &str) -> Value {
 }
 
 pub fn get(value: &Value) -> Option<BigInt> {
-    let Value::Object(object) = value else {
+    let Some(object) = value.as_object() else {
         return None;
     };
     let encoded = object.borrow().get_direct(VALUE);
@@ -103,15 +103,17 @@ pub fn bigint_class() -> Value {
         if let Some(value) = get(&input) {
             return from_bigint(value);
         }
-        match input {
-            Value::Number(number) if number.is_finite() && number.fract() == 0.0 => {
+        match input.unpack() {
+            crate::value::ValueUnpack::Number(number)
+                if number.is_finite() && number.fract() == 0.0 =>
+            {
                 parse(&format!("{number:.0}"))
             }
-            Value::Number(_) => crate::throw_value(error(
+            crate::value::ValueUnpack::Number(_) => crate::throw_value(error(
                 "RangeError",
                 "The number cannot be converted to a BigInt because it is not an integer",
             )),
-            Value::Bool(value) => from_bigint(BigInt::from(u8::from(value))),
+            crate::value::ValueUnpack::Bool(value) => from_bigint(BigInt::from(u8::from(value))),
             _ => parse(&input.to_js_string()),
         }
     })

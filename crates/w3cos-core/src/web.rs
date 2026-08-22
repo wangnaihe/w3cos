@@ -217,10 +217,10 @@ pub fn image_data_value(data: Value, width: u32, height: u32, color_space: &str)
 }
 
 fn blob_state(value: &Value) -> Option<Rc<BlobState>> {
-    let Value::Object(object) = value else {
+    let Some(object) = value.as_object() else {
         return None;
     };
-    let Value::Number(id) = object.borrow().get_direct(BLOB_STATE_KEY) else {
+    let Some(id) = object.borrow().get_direct(BLOB_STATE_KEY).as_number() else {
         return None;
     };
     BLOBS.with(|states| states.borrow().get(&(id as u64)).cloned())
@@ -654,7 +654,7 @@ pub fn date_class() -> Value {
             let milliseconds = args
                 .first()
                 .map(|value| match value {
-                    Value::String(text) => parse_iso_instant(&text),
+                    value if value.is_string() => parse_iso_instant(&value.to_js_string()),
                     _ => value.to_number(),
                 })
                 .unwrap_or_else(now_milliseconds);
@@ -855,17 +855,17 @@ fn canonical_locale(value: Option<&Value>) -> String {
 
 fn string_option(options: &Value, key: &str) -> Option<String> {
     let value = options.get_property(key);
-    (!matches!(value, Value::Undefined | Value::Null)).then(|| value.to_js_string())
+    (!value.is_nullish()).then(|| value.to_js_string())
 }
 
 fn usize_option(options: &Value, key: &str) -> Option<usize> {
     let value = options.get_property(key);
-    (!matches!(value, Value::Undefined | Value::Null)).then(|| value.to_number().max(0.0) as usize)
+    (!value.is_nullish()).then(|| value.to_number().max(0.0) as usize)
 }
 
 fn bool_option(options: &Value, key: &str) -> Option<bool> {
     let value = options.get_property(key);
-    (!matches!(value, Value::Undefined | Value::Null)).then(|| value.to_bool())
+    (!value.is_nullish()).then(|| value.to_bool())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1016,8 +1016,8 @@ fn currency_name(currency: &str, locale: &str) -> &'static str {
 
 fn date_milliseconds(value: &Value) -> f64 {
     match value {
-        Value::String(text) => parse_iso_instant(text),
-        Value::Object(_) => value.get_property("__w3cos_date_milliseconds").to_number(),
+        _ if value.is_string() => parse_iso_instant(&value.to_js_string()),
+        _ if value.is_object() => value.get_property("__w3cos_date_milliseconds").to_number(),
         _ => value.to_number(),
     }
 }
@@ -1350,14 +1350,18 @@ pub fn structured_clone(args: Vec<Value>) -> Value {
 
 fn heap_pointer(value: &Value) -> Option<usize> {
     match value {
-        Value::Array(items) => Some(Rc::as_ptr(items) as usize),
-        Value::Object(object) => Some(Rc::as_ptr(object) as usize),
+        _ if value.as_array().is_some() => {
+            Some(Rc::as_ptr(&value.as_array().expect("array")) as usize)
+        }
+        _ if value.as_object().is_some() => {
+            Some(Rc::as_ptr(&value.as_object().expect("object")) as usize)
+        }
         _ => None,
     }
 }
 
 fn clone_value(value: &Value, clones: &mut HashMap<usize, Value>) -> Value {
-    if matches!(value, Value::Function(_)) {
+    if value.is_function() {
         crate::throw_value(js_error("DataCloneError: functions cannot be cloned"));
     }
     let pointer = match heap_pointer(value) {
@@ -1415,7 +1419,8 @@ fn clone_value(value: &Value, clones: &mut HashMap<usize, Value>) -> Value {
     }
 
     match value {
-        Value::Array(items) => {
+        _ if value.as_array().is_some() => {
+            let items = value.as_array().expect("array");
             let children = items.borrow().clone();
             let cloned = Value::array(
                 (0..children.len())
@@ -1431,7 +1436,8 @@ fn clone_value(value: &Value, clones: &mut HashMap<usize, Value>) -> Value {
             }
             cloned
         }
-        Value::Object(object) => {
+        _ if value.as_object().is_some() => {
+            let object = value.as_object().expect("object");
             let milliseconds = value.get_property("__w3cos_date_milliseconds");
             if !milliseconds.is_undefined() {
                 let cloned = date_value(milliseconds.to_number());
@@ -2184,10 +2190,10 @@ fn params_value(
 ) -> Value {
     let state: PairList = Rc::new(RefCell::new(pairs));
     let params = Value::object(HashMap::new());
-    let weak_self: Weak<RefCell<crate::JsObject>> = match &params {
-        Value::Object(object) => Rc::downgrade(object),
-        _ => unreachable!(),
-    };
+    let weak_self: Weak<RefCell<crate::JsObject>> = params
+        .as_object()
+        .map(|object| Rc::downgrade(&object))
+        .expect("URLSearchParams object");
 
     /// After-mutation hook: push the new serialization into the URL.
     macro_rules! sync_to_url {
@@ -2411,13 +2417,15 @@ fn params_value(
 pub fn url_search_params_new(args: Vec<Value>) -> Value {
     let init = args.first().cloned().unwrap_or(Value::Undefined);
     let pairs = match &init {
-        Value::Undefined | Value::Null => Vec::new(),
-        Value::String(query) => parse_query(query),
-        Value::Array(items) => items
+        _ if init.is_nullish() => Vec::new(),
+        _ if init.is_string() => parse_query(&init.to_js_string()),
+        _ if init.as_array().is_some() => init
+            .as_array()
+            .expect("array")
             .borrow()
             .iter()
             .map(|pair| {
-                if let Value::Array(entry) = pair {
+                if let Some(entry) = pair.as_array() {
                     let entry = entry.borrow();
                     (
                         entry
@@ -2436,7 +2444,8 @@ pub fn url_search_params_new(args: Vec<Value>) -> Value {
                 }
             })
             .collect(),
-        Value::Object(object) => {
+        _ if init.as_object().is_some() => {
+            let object = init.as_object().expect("object");
             let object = object.borrow();
             object
                 .keys()

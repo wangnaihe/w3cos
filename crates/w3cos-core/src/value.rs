@@ -12,28 +12,422 @@ use crate::js_string::JsString;
 
 /// JavaScript-compatible dynamic value type.
 ///
-/// Maps the full ECMAScript value space into Rust with reference-counted
-/// sharing for heap types (Array, Object, Function, String).
+/// First-cut ABI: Undefined / Null / Bool / Number and interned short
+/// strings are a Copy tagged word ([`Immediate`], NaN-box). Clone of
+/// those immediates is a register move of the 8-byte word and does not
+/// touch `Rc`.
 ///
-/// `Value` is `Clone` but not `Copy`: `String` / `Array` / `Object` /
-/// `Function` all carry `Rc`. Number / Bool / Null / Undefined stay as
-/// they are in this slice; NaN-boxing those primitives is the next step.
+/// Long `Rc<str>` strings, host/DOM objects, host arrays, and host/DOM
+/// callables stay as a remaining enum of pointers / `Rc`. Page-local objects
+/// created via [`Value::object`] / literals, constructor / literal arrays
+/// created via [`Value::array`], and ordinary JS closures created via
+/// [`Value::function`] / AOT `CreateClosure` are `u32` handles packed in
+/// [`Immediate`] (clone is a register move). `array_hole` stays a host `Rc`
+/// object. Host/DOM callables (`Value::callable`, jsdom call slots) stay
+/// `Value::Object(Rc)` / `Value::Function(Rc)`. Symbols remain interned
+/// strings (`__w3cos_symbol_…`).
+///
+/// Constructors `Value::Undefined`, `Value::Null`, `Value::Bool`, and
+/// `Value::Number` are unchanged so AOT emission (`num_regs` / `bool_regs`
+/// boxing) stays valid. `String` / `Array` / `Object` / `Function`
+/// variant names are unchanged.
+///
 /// Core heap values are thread-confined (`Rc` + thread-local heap
 /// counters), so string intern is thread-local as well.
-///
-/// VM and AOT share this type. Public methods (`string`, `to_js_string`,
-/// `clone`, `eq`) and the `String` variant name are unchanged.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub enum Value {
-    #[default]
-    Undefined,
-    Null,
-    Bool(bool),
-    Number(f64),
+    /// NaN-boxed undefined / null / bool / number / interned short string.
+    /// Prefer `Value::Undefined` / `Value::Bool` / `Value::Number` /
+    /// `Value::string` constructors over matching this arm.
+    Imm(Immediate),
     String(JsString),
     Array(Rc<RefCell<ArrayStorage>>),
     Object(Rc<RefCell<crate::JsObject>>),
     Function(JsFunction),
+}
+
+impl Default for Value {
+    #[inline]
+    fn default() -> Self {
+        Value::Undefined
+    }
+}
+
+/// Copy tagged word for JS immediates (NaN-box).
+///
+/// Encoding (`u64` bits, `#[repr(transparent)]` so `transmute` to/from
+/// `u64` is the identity):
+///
+/// - **Number:** IEEE-754 bits. Every NaN is canonicalized to
+///   `0x7FF8_0000_0000_0000` so payloads never collide with tags.
+/// - **Tagged** quiet-NaN with low-4-bit tag `QNAN | tag | (payload << 4)`:
+///   - `1` undefined
+///   - `2` null
+///   - `3` false
+///   - `4` true
+///   - `5` interned page-arena string (`u32` handle payload)
+///   - `6` page-arena object (`u32` handle payload)
+///   - `7` page-arena array (`u32` handle payload)
+///   - `8` page-arena function (`u32` handle payload)
+///
+/// Long `Rc<str>` and heap pointers are **not** in this word (remaining
+/// `Value` enum). Tagged payloads use a 4-bit tag (`HANDLE_SHIFT = 4`).
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct Immediate(u64);
+
+impl Immediate {
+    const QNAN: u64 = 0x7FF8_0000_0000_0000;
+    const TAG_NAN: u64 = 0;
+    const TAG_UNDEF: u64 = 1;
+    const TAG_NULL: u64 = 2;
+    const TAG_FALSE: u64 = 3;
+    const TAG_TRUE: u64 = 4;
+    const TAG_STR: u64 = 5;
+    const TAG_OBJ: u64 = 6;
+    const TAG_ARR: u64 = 7;
+    const TAG_FN: u64 = 8;
+    const TAG_MASK: u64 = 0xF;
+    const HANDLE_SHIFT: u64 = 4;
+
+    pub const UNDEFINED: Self = Self(Self::QNAN | Self::TAG_UNDEF);
+    pub const NULL: Self = Self(Self::QNAN | Self::TAG_NULL);
+
+    #[inline]
+    pub const fn from_bool(b: bool) -> Self {
+        if b {
+            Self(Self::QNAN | Self::TAG_TRUE)
+        } else {
+            Self(Self::QNAN | Self::TAG_FALSE)
+        }
+    }
+
+    #[inline]
+    pub fn from_number(n: f64) -> Self {
+        if n.is_nan() {
+            Self(Self::QNAN | Self::TAG_NAN)
+        } else {
+            Self(n.to_bits())
+        }
+    }
+
+    /// Pack a page-arena intern handle into the tagged word.
+    #[inline]
+    pub const fn from_interned_string(handle: u32) -> Self {
+        Self(Self::QNAN | Self::TAG_STR | ((handle as u64) << Self::HANDLE_SHIFT))
+    }
+
+    /// Pack a page-arena object handle into the tagged word.
+    #[inline]
+    pub const fn from_object_handle(handle: u32) -> Self {
+        Self(Self::QNAN | Self::TAG_OBJ | ((handle as u64) << Self::HANDLE_SHIFT))
+    }
+
+    /// Pack a page-arena array handle into the tagged word.
+    #[inline]
+    pub const fn from_array_handle(handle: u32) -> Self {
+        Self(Self::QNAN | Self::TAG_ARR | ((handle as u64) << Self::HANDLE_SHIFT))
+    }
+
+    /// Pack a page-arena function handle into the tagged word.
+    #[inline]
+    pub const fn from_function_handle(handle: u32) -> Self {
+        Self(Self::QNAN | Self::TAG_FN | ((handle as u64) << Self::HANDLE_SHIFT))
+    }
+
+    /// Raw tagged bits. Documented transmute target.
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    #[inline]
+    const fn is_tagged(self) -> bool {
+        (self.0 & Self::QNAN) == Self::QNAN
+    }
+
+    #[inline]
+    const fn tag(self) -> u64 {
+        self.0 & Self::TAG_MASK
+    }
+
+    #[inline]
+    pub const fn is_undefined(self) -> bool {
+        self.0 == Self::UNDEFINED.0
+    }
+
+    #[inline]
+    pub const fn is_null(self) -> bool {
+        self.0 == Self::NULL.0
+    }
+
+    #[inline]
+    pub const fn is_bool(self) -> bool {
+        self.is_tagged() && (self.tag() == Self::TAG_FALSE || self.tag() == Self::TAG_TRUE)
+    }
+
+    #[inline]
+    pub const fn is_number(self) -> bool {
+        !self.is_tagged() || self.tag() == Self::TAG_NAN
+    }
+
+    #[inline]
+    pub const fn as_bool(self) -> Option<bool> {
+        if !self.is_tagged() {
+            return None;
+        }
+        match self.tag() {
+            Self::TAG_FALSE => Some(false),
+            Self::TAG_TRUE => Some(true),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_number(self) -> Option<f64> {
+        if self.is_number() {
+            Some(f64::from_bits(self.0))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn is_interned_string(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_STR
+    }
+
+    #[inline]
+    pub const fn interned_handle(self) -> Option<u32> {
+        if self.is_interned_string() {
+            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn as_js_string(self) -> Option<JsString> {
+        self.interned_handle().and_then(JsString::from_page_handle)
+    }
+
+    #[inline]
+    pub const fn is_object_handle(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_OBJ
+    }
+
+    #[inline]
+    pub const fn object_handle(self) -> Option<u32> {
+        if self.is_object_handle() {
+            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn is_array_handle(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_ARR
+    }
+
+    #[inline]
+    pub const fn array_handle(self) -> Option<u32> {
+        if self.is_array_handle() {
+            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn is_function_handle(self) -> bool {
+        self.is_tagged() && self.tag() == Self::TAG_FN
+    }
+
+    #[inline]
+    pub const fn function_handle(self) -> Option<u32> {
+        if self.is_function_handle() {
+            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
+}
+
+impl PartialEq for Immediate {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.as_number(), other.as_number()) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => self.0 == other.0,
+            _ => false,
+        }
+    }
+}
+
+impl Value {
+    /// Unit-like constructor kept so AOT / host code can write `Value::Undefined`.
+    #[allow(non_upper_case_globals)]
+    pub const Undefined: Value = Value::Imm(Immediate::UNDEFINED);
+    /// Unit-like constructor kept so AOT / host code can write `Value::Null`.
+    #[allow(non_upper_case_globals)]
+    pub const Null: Value = Value::Imm(Immediate::NULL);
+
+    /// Tuple-like constructor kept so AOT can write `Value::Bool(self.bool_regs[i])`.
+    #[allow(non_snake_case)]
+    #[inline]
+    pub const fn Bool(b: bool) -> Self {
+        Value::Imm(Immediate::from_bool(b))
+    }
+
+    /// Tuple-like constructor kept so AOT can write `Value::Number(self.num_regs[i])`.
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn Number(n: f64) -> Self {
+        Value::Imm(Immediate::from_number(n))
+    }
+
+    #[inline]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Imm(imm) => imm.as_bool(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Value::Imm(imm) => imm.as_number(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_immediate(&self) -> Option<Immediate> {
+        match self {
+            Value::Imm(imm) => Some(*imm),
+            _ => None,
+        }
+    }
+
+    /// Interned page-arena handle or long heap `JsString`.
+    #[inline]
+    pub fn as_js_string(&self) -> Option<JsString> {
+        match self {
+            Value::Imm(imm) => imm.as_js_string(),
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Pack interned short strings into [`Immediate`]; long `Rc<str>` stay
+    /// on the `String` arm.
+    #[inline]
+    pub fn from_js_string(s: JsString) -> Self {
+        if let Some(handle) = s.page_handle() {
+            Value::Imm(Immediate::from_interned_string(handle))
+        } else {
+            Value::String(s)
+        }
+    }
+
+    /// Page-arena object handle or host `Rc` object.
+    #[inline]
+    pub fn as_object(&self) -> Option<std::rc::Rc<std::cell::RefCell<crate::JsObject>>> {
+        match self {
+            Value::Imm(imm) => imm
+                .object_handle()
+                .map(crate::page_arena::get_object),
+            Value::Object(object) => Some(std::rc::Rc::clone(object)),
+            _ => None,
+        }
+    }
+
+    /// Packed page-arena object handle, when this value is not a host `Rc`.
+    #[inline]
+    pub fn object_handle(&self) -> Option<u32> {
+        match self {
+            Value::Imm(imm) => imm.object_handle(),
+            _ => None,
+        }
+    }
+
+    fn object_identity_eq(left: &Value, right: &Value) -> bool {
+        match (left.object_handle(), right.object_handle()) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (left.as_object(), right.as_object()) {
+                (Some(a), Some(b)) => std::rc::Rc::ptr_eq(&a, &b),
+                _ => false,
+            },
+        }
+    }
+
+    /// Page-arena array handle or host `Rc` array.
+    #[inline]
+    pub fn as_array(&self) -> Option<std::rc::Rc<std::cell::RefCell<ArrayStorage>>> {
+        match self {
+            Value::Imm(imm) => imm
+                .array_handle()
+                .map(crate::page_arena::get_array),
+            Value::Array(array) => Some(std::rc::Rc::clone(array)),
+            _ => None,
+        }
+    }
+
+    /// Packed page-arena array handle, when this value is not a host `Rc`.
+    #[inline]
+    pub fn array_handle(&self) -> Option<u32> {
+        match self {
+            Value::Imm(imm) => imm.array_handle(),
+            _ => None,
+        }
+    }
+
+    fn array_identity_eq(left: &Value, right: &Value) -> bool {
+        match (left.array_handle(), right.array_handle()) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (left.as_array(), right.as_array()) {
+                (Some(a), Some(b)) => std::rc::Rc::ptr_eq(&a, &b),
+                _ => false,
+            },
+        }
+    }
+
+    /// Page-arena function handle or host `Rc` function.
+    #[inline]
+    pub fn as_function(&self) -> Option<JsFunction> {
+        match self {
+            Value::Imm(imm) => imm
+                .function_handle()
+                .map(crate::page_arena::get_function),
+            Value::Function(function) => Some(function.clone()),
+            _ => None,
+        }
+    }
+
+    /// Packed page-arena function handle, when this value is not a host `Rc`.
+    #[inline]
+    pub fn function_handle(&self) -> Option<u32> {
+        match self {
+            Value::Imm(imm) => imm.function_handle(),
+            _ => None,
+        }
+    }
+
+    fn function_identity_eq(left: &Value, right: &Value) -> bool {
+        match (left.function_handle(), right.function_handle()) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (left.as_function(), right.as_function()) {
+                (Some(a), Some(b)) => a.ptr_eq(&b),
+                _ => false,
+            },
+        }
+    }
 }
 
 /// Shared backing storage for [`Value::Array`].
@@ -46,7 +440,7 @@ pub struct ArrayStorage {
 }
 
 impl ArrayStorage {
-    fn new(values: Vec<Value>) -> Self {
+    pub fn new(values: Vec<Value>) -> Self {
         let allocation = HeapAllocation::new(
             HeapKind::Array,
             std::mem::size_of::<Self>().saturating_add(
@@ -146,6 +540,54 @@ where
 impl fmt::Debug for ArrayStorage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.values.fmt(formatter)
+    }
+}
+
+/// View of a [`Value`] with the historical variant names. Used internally
+/// so match sites can stay exhaustive without NaN-box tag tests.
+pub(crate) enum ValueUnpack {
+    Undefined,
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(JsString),
+    Array(Rc<RefCell<ArrayStorage>>),
+    Object(Rc<RefCell<crate::JsObject>>),
+    Function(JsFunction),
+}
+
+impl Value {
+    #[inline]
+    pub(crate) fn unpack(&self) -> ValueUnpack {
+        match self {
+            Value::Imm(imm) if imm.is_undefined() => ValueUnpack::Undefined,
+            Value::Imm(imm) if imm.is_null() => ValueUnpack::Null,
+            Value::Imm(imm) if imm.is_bool() => ValueUnpack::Bool(imm.as_bool().unwrap_or(false)),
+            Value::Imm(imm) if imm.is_interned_string() => ValueUnpack::String(
+                imm.as_js_string()
+                    .expect("interned string handle"),
+            ),
+            Value::Imm(imm) if imm.is_object_handle() => ValueUnpack::Object(
+                crate::page_arena::get_object(
+                    imm.object_handle().expect("object handle"),
+                ),
+            ),
+            Value::Imm(imm) if imm.is_array_handle() => ValueUnpack::Array(
+                crate::page_arena::get_array(
+                    imm.array_handle().expect("array handle"),
+                ),
+            ),
+            Value::Imm(imm) if imm.is_function_handle() => ValueUnpack::Function(
+                crate::page_arena::get_function(
+                    imm.function_handle().expect("function handle"),
+                ),
+            ),
+            Value::Imm(imm) => ValueUnpack::Number(imm.as_number().unwrap_or(f64::NAN)),
+            Value::String(s) => ValueUnpack::String(s.clone()),
+            Value::Array(a) => ValueUnpack::Array(Rc::clone(a)),
+            Value::Object(o) => ValueUnpack::Object(Rc::clone(o)),
+            Value::Function(f) => ValueUnpack::Function(f.clone()),
+        }
     }
 }
 
@@ -264,14 +706,14 @@ impl Iterator for ValueIterator {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (self.as_js_string(), other.as_js_string()) {
+            return left == right;
+        }
         match (self, other) {
-            (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
-            (Value::Bool(left), Value::Bool(right)) => left == right,
-            (Value::Number(left), Value::Number(right)) => left == right,
-            (Value::String(left), Value::String(right)) => left == right,
-            (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
-            (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
-            (Value::Function(_), Value::Function(_)) => false,
+            (Value::Imm(left), Value::Imm(right)) => left == right,
+            (left, right) if Value::array_identity_eq(left, right) => true,
+            (left, right) if Value::object_identity_eq(left, right) => true,
+            (left, right) if Value::function_identity_eq(left, right) => true,
             _ => false,
         }
     }
@@ -369,6 +811,16 @@ impl JsFunction {
         Rc::ptr_eq(&self.inner, &other.inner)
     }
 
+    /// Strong counts of the three inner `Rc`s (closure, props, allocation).
+    #[cfg(test)]
+    pub(crate) fn strong_counts(&self) -> (usize, usize, usize) {
+        (
+            Rc::strong_count(&self.inner),
+            Rc::strong_count(&self.props),
+            Rc::strong_count(&self.allocation),
+        )
+    }
+
     pub(crate) fn downgrade(&self) -> WeakJsFunction {
         WeakJsFunction {
             inner: Rc::downgrade(&self.inner),
@@ -408,14 +860,14 @@ impl Value {
             value.to_string().hash(&mut hasher);
             return hasher.finish();
         }
-        match self {
-            Value::Undefined => 0_u8.hash(&mut hasher),
-            Value::Null => 1_u8.hash(&mut hasher),
-            Value::Bool(value) => {
+        match self.unpack() {
+            ValueUnpack::Undefined => 0_u8.hash(&mut hasher),
+            ValueUnpack::Null => 1_u8.hash(&mut hasher),
+            ValueUnpack::Bool(value) => {
                 2_u8.hash(&mut hasher);
                 value.hash(&mut hasher);
             }
-            Value::Number(value) => {
+            ValueUnpack::Number(value) => {
                 3_u8.hash(&mut hasher);
                 if value.is_nan() {
                     u64::MAX.hash(&mut hasher);
@@ -423,19 +875,19 @@ impl Value {
                     value.to_bits().hash(&mut hasher);
                 }
             }
-            Value::String(value) => {
+            ValueUnpack::String(value) => {
                 4_u8.hash(&mut hasher);
                 value.hash(&mut hasher);
             }
-            Value::Array(value) => {
+            ValueUnpack::Array(value) => {
                 5_u8.hash(&mut hasher);
-                (Rc::as_ptr(value) as usize).hash(&mut hasher);
+                (Rc::as_ptr(&value) as usize).hash(&mut hasher);
             }
-            Value::Object(value) => {
+            ValueUnpack::Object(value) => {
                 6_u8.hash(&mut hasher);
-                (Rc::as_ptr(value) as usize).hash(&mut hasher);
+                (Rc::as_ptr(&value) as usize).hash(&mut hasher);
             }
-            Value::Function(value) => {
+            ValueUnpack::Function(value) => {
                 7_u8.hash(&mut hasher);
                 value.identity().hash(&mut hasher);
             }
@@ -448,15 +900,15 @@ impl Value {
         if crate::bigint::get(self).is_some() {
             return "bigint";
         }
-        match self {
-            Value::Undefined => "undefined",
-            Value::Null => "object",
-            Value::Bool(_) => "boolean",
-            Value::Number(_) => "number",
-            Value::String(value) if value.starts_with("__w3cos_symbol_") => "symbol",
-            Value::String(_) => "string",
-            Value::Array(_) | Value::Object(_) => "object",
-            Value::Function(_) => "function",
+        match self.unpack() {
+            ValueUnpack::Undefined => "undefined",
+            ValueUnpack::Null => "object",
+            ValueUnpack::Bool(_) => "boolean",
+            ValueUnpack::Number(_) => "number",
+            ValueUnpack::String(value) if value.starts_with("__w3cos_symbol_") => "symbol",
+            ValueUnpack::String(_) => "string",
+            ValueUnpack::Array(_) | ValueUnpack::Object(_) => "object",
+            ValueUnpack::Function(_) => "function",
         }
     }
 
@@ -465,12 +917,12 @@ impl Value {
         if let Some(zero) = crate::bigint::is_zero(self) {
             return !zero;
         }
-        match self {
-            Value::Undefined | Value::Null => false,
-            Value::Bool(b) => *b,
-            Value::Number(n) => *n != 0.0 && !n.is_nan(),
-            Value::String(s) => !s.is_empty(),
-            Value::Array(_) | Value::Object(_) | Value::Function(_) => true,
+        match self.unpack() {
+            ValueUnpack::Undefined | ValueUnpack::Null => false,
+            ValueUnpack::Bool(b) => b,
+            ValueUnpack::Number(n) => n != 0.0 && !n.is_nan(),
+            ValueUnpack::String(s) => !s.is_empty(),
+            ValueUnpack::Array(_) | ValueUnpack::Object(_) | ValueUnpack::Function(_) => true,
         }
     }
 
@@ -485,18 +937,18 @@ impl Value {
                 }
             });
         }
-        match self {
-            Value::Undefined => f64::NAN,
-            Value::Null => 0.0,
-            Value::Bool(b) => {
-                if *b {
+        match self.unpack() {
+            ValueUnpack::Undefined => f64::NAN,
+            ValueUnpack::Null => 0.0,
+            ValueUnpack::Bool(b) => {
+                if b {
                     1.0
                 } else {
                     0.0
                 }
             }
-            Value::Number(n) => *n,
-            Value::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
+            ValueUnpack::Number(n) => n,
+            ValueUnpack::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
             _ => f64::NAN,
         }
     }
@@ -506,29 +958,29 @@ impl Value {
         if let Some(value) = crate::bigint::get(self) {
             return value.to_string();
         }
-        match self {
-            Value::Undefined => "undefined".into(),
-            Value::Null => "null".into(),
-            Value::Bool(b) => b.to_string(),
-            Value::Number(n) => {
+        match self.unpack() {
+            ValueUnpack::Undefined => "undefined".into(),
+            ValueUnpack::Null => "null".into(),
+            ValueUnpack::Bool(b) => b.to_string(),
+            ValueUnpack::Number(n) => {
                 if n.is_nan() {
                     "NaN".into()
                 } else if n.is_infinite() {
-                    if *n > 0.0 {
+                    if n > 0.0 {
                         "Infinity".into()
                     } else {
                         "-Infinity".into()
                     }
-                } else if *n == 0.0 {
+                } else if n == 0.0 {
                     "0".into()
                 } else if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
-                    format!("{}", *n as i64)
+                    format!("{}", n as i64)
                 } else {
                     format!("{}", n)
                 }
             }
-            Value::String(s) => s.as_str().to_string(),
-            Value::Array(arr) => {
+            ValueUnpack::String(s) => s.as_str().to_string(),
+            ValueUnpack::Array(arr) => {
                 let elems: Vec<String> = arr
                     .borrow()
                     .iter()
@@ -542,19 +994,19 @@ impl Value {
                     .collect();
                 elems.join(",")
             }
-            Value::Object(_) => {
+            ValueUnpack::Object(_) => {
                 let to_string = self.get_property("toString");
-                if to_string.is_function()
-                    && let Value::String(value) = to_string.call(self.clone(), vec![])
-                {
-                    return value.as_str().to_string();
+                if to_string.is_function() {
+                    if let Some(value) = to_string.call(self.clone(), vec![]).as_js_string() {
+                        return value.as_str().to_string();
+                    }
                 }
                 "[object Object]".into()
             }
-            Value::Function(function) => {
+            ValueUnpack::Function(function) => {
                 let to_string = function.get_property("toString");
-                if matches!(to_string, Value::Function(_) | Value::Object(_)) {
-                    if let Value::String(value) = to_string.call(self.clone(), vec![]) {
+                if to_string.is_function() || to_string.is_object() || to_string.is_callable() {
+                    if let Some(value) = to_string.call(self.clone(), vec![]).as_js_string() {
                         return value.as_str().to_string();
                     }
                 }
@@ -564,38 +1016,48 @@ impl Value {
     }
 
     pub fn is_undefined(&self) -> bool {
-        matches!(self, Value::Undefined)
+        matches!(self, Value::Imm(imm) if imm.is_undefined())
     }
     pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        matches!(self, Value::Imm(imm) if imm.is_null())
     }
     pub fn is_nullish(&self) -> bool {
-        matches!(self, Value::Undefined | Value::Null)
+        matches!(self, Value::Imm(imm) if imm.is_undefined() || imm.is_null())
     }
 
     pub fn is_number(&self) -> bool {
-        matches!(self, Value::Number(_))
+        matches!(self, Value::Imm(imm) if imm.is_number())
     }
     pub fn is_string(&self) -> bool {
-        matches!(self, Value::String(_))
+        match self {
+            Value::String(_) => true,
+            Value::Imm(imm) => imm.is_interned_string(),
+            _ => false,
+        }
     }
     pub fn is_bool(&self) -> bool {
-        matches!(self, Value::Bool(_))
+        matches!(self, Value::Imm(imm) if imm.is_bool())
     }
     pub fn is_object(&self) -> bool {
-        matches!(self, Value::Object(_)) && crate::bigint::get(self).is_none()
+        self.as_object().is_some() && crate::bigint::get(self).is_none()
     }
     pub fn is_array(&self) -> bool {
-        matches!(self, Value::Array(_))
+        self.as_array().is_some()
     }
     pub fn is_function(&self) -> bool {
-        matches!(self, Value::Function(_))
+        match self {
+            Value::Function(_) => true,
+            Value::Imm(imm) => imm.is_function_handle(),
+            _ => false,
+        }
     }
     pub fn is_callable(&self) -> bool {
         match self {
             Value::Function(_) => true,
-            Value::Object(object) => object.borrow().call_slot().is_some(),
-            _ => false,
+            Value::Imm(imm) if imm.is_function_handle() => true,
+            _ => self
+                .as_object()
+                .is_some_and(|object| object.borrow().call_slot().is_some()),
         }
     }
 
@@ -617,55 +1079,56 @@ impl Value {
     /// ECMAScript `in` operator: `key in obj`.
     pub fn js_in(&self, obj: &Value) -> Value {
         let key = self.to_js_string();
-        match obj {
-            Value::Object(o) => Value::Bool(o.borrow().has(&key)),
-            Value::Array(arr) => {
-                if let Ok(idx) = key.parse::<usize>() {
-                    Value::Bool(
-                        arr.borrow()
-                            .get(idx)
-                            .is_some_and(|value| !is_array_hole(value)),
-                    )
-                } else {
-                    Value::Bool(false)
-                }
-            }
-            _ => Value::Bool(false),
+        if let Some(o) = obj.as_object() {
+            return Value::Bool(o.borrow().has(&key));
         }
+        if let Some(arr) = obj.as_array() {
+            return if let Ok(idx) = key.parse::<usize>() {
+                Value::Bool(
+                    arr.borrow()
+                        .get(idx)
+                        .is_some_and(|value| !is_array_hole(value)),
+                )
+            } else {
+                Value::Bool(false)
+            };
+        }
+        Value::Bool(false)
     }
 
     /// Property access: `obj[key]` or `obj.key`.
     pub fn get_property(&self, key: &str) -> Value {
+        if let Some(o) = self.as_object() {
+            let value = o.borrow().get(key, self).clone();
+            return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
+                value
+            } else {
+                let getter = o
+                    .borrow()
+                    .get(&format!("__w3cos_getter_{key}"), self)
+                    .clone();
+                getter.call(self.clone(), vec![])
+            };
+        }
+        if let Some(arr) = self.as_array() {
+            if let Some(value) = crate::binary::typed_array_property(self, key) {
+                return value;
+            }
+            return if let Ok(idx) = key.parse::<usize>() {
+                arr.borrow()
+                    .get(idx)
+                    .cloned()
+                    .map(array_slot_value)
+                    .unwrap_or(Value::Undefined)
+            } else if key == "length" {
+                Value::Number(arr.borrow().len() as f64)
+            } else {
+                Value::Undefined
+            };
+        }
         match self {
-            Value::Object(o) => {
-                let value = o.borrow().get(key, self).clone();
-                if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
-                    value
-                } else {
-                    let getter = o
-                        .borrow()
-                        .get(&format!("__w3cos_getter_{key}"), self)
-                        .clone();
-                    getter.call(self.clone(), vec![])
-                }
-            }
-            Value::Array(arr) => {
-                if let Some(value) = crate::binary::typed_array_property(self, key) {
-                    return value;
-                }
-                if let Ok(idx) = key.parse::<usize>() {
-                    arr.borrow()
-                        .get(idx)
-                        .cloned()
-                        .map(array_slot_value)
-                        .unwrap_or(Value::Undefined)
-                } else if key == "length" {
-                    Value::Number(arr.borrow().len() as f64)
-                } else {
-                    Value::Undefined
-                }
-            }
-            Value::String(s) => {
+            _ if self.is_string() => {
+                let s = self.as_js_string().expect("string");
                 if let Ok(idx) = key.parse::<usize>() {
                     s.encode_utf16()
                         .nth(idx)
@@ -679,7 +1142,9 @@ impl Value {
                 }
             }
             // JS functions are objects: read attached properties.
-            Value::Function(f) => f.get_property(key),
+            _ if self.as_function().is_some() => {
+                self.as_function().expect("function").get_property(key)
+            }
             _ => Value::Undefined,
         }
     }
@@ -706,7 +1171,7 @@ impl Value {
     /// Only own enumerable string properties are copied; the prototype and
     /// excluded bindings are not carried into the result.
     pub fn object_rest(&self, excluded: &[&str]) -> Value {
-        let Value::Object(object) = self else {
+        let Some(object) = self.as_object() else {
             return Value::object(HashMap::new());
         };
         let object = object.borrow();
@@ -729,36 +1194,40 @@ impl Value {
     /// function is reachable through the prototype chain, the setter is
     /// invoked with the object as receiver instead of storing directly.
     pub fn set_property(&self, key: &str, value: Value) {
+        if let Some(o) = self.as_object() {
+            let has_own = o.borrow().properties.contains_key(key);
+            if !has_own {
+                let setter = o
+                    .borrow()
+                    .get(&format!("__w3cos_setter_{key}"), self)
+                    .clone();
+                if !setter.is_undefined() {
+                    setter.call(self.clone(), vec![value]);
+                    return;
+                }
+            }
+            o.borrow_mut().set(key, value, &Value::Undefined);
+            return;
+        }
+        if let Some(arr) = self.as_array() {
+            if let Ok(idx) = key.parse::<usize>() {
+                if crate::binary::set_typed_array_index(self, idx, value.clone()) {
+                    return;
+                }
+                let mut a = arr.borrow_mut();
+                if idx >= a.len() {
+                    a.resize_with(idx + 1, array_hole);
+                }
+                a[idx] = value;
+            }
+            return;
+        }
         match self {
-            Value::Object(o) => {
-                let has_own = o.borrow().properties.contains_key(key);
-                if !has_own {
-                    let setter = o
-                        .borrow()
-                        .get(&format!("__w3cos_setter_{key}"), self)
-                        .clone();
-                    if !setter.is_undefined() {
-                        setter.call(self.clone(), vec![value]);
-                        return;
-                    }
-                }
-                o.borrow_mut().set(key, value, &Value::Undefined);
-            }
-            Value::Array(arr) => {
-                if let Ok(idx) = key.parse::<usize>() {
-                    if crate::binary::set_typed_array_index(self, idx, value.clone()) {
-                        return;
-                    }
-                    let mut a = arr.borrow_mut();
-                    if idx >= a.len() {
-                        a.resize_with(idx + 1, array_hole);
-                    }
-                    a[idx] = value;
-                }
-            }
             // JS functions are objects: properties attach to the function
             // value (decorator ids, constructor statics).
-            Value::Function(f) => f.set_property(key, value),
+            _ if self.as_function().is_some() => {
+                self.as_function().expect("function").set_property(key, value)
+            }
             _ => {}
         }
     }
@@ -766,8 +1235,11 @@ impl Value {
     /// Delete an own property and return the JavaScript-style success value.
     pub fn delete_property(&self, key: &str) -> Value {
         let deleted = match self {
-            Value::Object(object) => object.borrow_mut().delete(key),
-            Value::Array(array) => {
+            _ if self.as_object().is_some() => {
+                self.as_object().expect("object").borrow_mut().delete(key)
+            }
+            _ if self.as_array().is_some() => {
+                let array = self.as_array().expect("array");
                 if let Ok(index) = key.parse::<usize>() {
                     if let Some(slot) = array.borrow_mut().get_mut(index) {
                         *slot = array_hole();
@@ -775,7 +1247,8 @@ impl Value {
                 }
                 true
             }
-            Value::Function(function) => {
+            _ if self.as_function().is_some() => {
+                let function = self.as_function().expect("function");
                 let mut props = function.props.borrow_mut();
                 props.remove(key);
                 function.allocation.set_bytes(function_heap_bytes(&props));
@@ -797,21 +1270,25 @@ impl Value {
         Value::Bool(b)
     }
     pub fn string(s: &str) -> Self {
-        Value::String(JsString::intern(s))
+        Value::from_js_string(JsString::intern(s))
     }
 
     pub fn array(items: Vec<Value>) -> Self {
-        Value::Array(Rc::new(RefCell::new(ArrayStorage::new(items))))
+        let rc = Rc::new(RefCell::new(ArrayStorage::new(items)));
+        let handle = crate::page_arena::alloc_array(Rc::clone(&rc));
+        Value::Imm(Immediate::from_array_handle(handle))
     }
 
     pub fn object(props: HashMap<String, Value>) -> Self {
-        Value::Object(Rc::new(RefCell::new(crate::JsObject::from_map(props))))
+        let rc = Rc::new(RefCell::new(crate::JsObject::from_map(props)));
+        let handle = crate::page_arena::alloc_object(Rc::clone(&rc));
+        Value::Imm(Immediate::from_object_handle(handle))
     }
 
     pub fn object_from_parts(parts: Vec<Value>) -> Self {
         let mut properties = HashMap::new();
         for part in parts {
-            if let Value::Object(object) = part {
+            if let Some(object) = part.as_object() {
                 let object = object.borrow();
                 for key in object.keys() {
                     properties.insert(key.clone(), object.get_direct(&key));
@@ -822,7 +1299,9 @@ impl Value {
     }
 
     pub fn function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
-        Value::Function(JsFunction::new(f))
+        let js = JsFunction::new(f);
+        let handle = crate::page_arena::alloc_function(js);
+        Value::Imm(Immediate::from_function_handle(handle))
     }
 
     /// A plain object that is also callable (a JS class / constructor object).
@@ -840,7 +1319,11 @@ impl Value {
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         match self {
             Value::Function(function) => function.call(this, args),
-            Value::Object(object) => {
+            _ if self.as_function().is_some() => {
+                self.as_function().expect("function").call(this, args)
+            }
+            _ if self.as_object().is_some() => {
+                let object = self.as_object().expect("object");
                 let slot = object.borrow().call_slot().cloned();
                 match slot {
                     Some(function) => function.call(this, args),
@@ -975,8 +1458,14 @@ impl Value {
                 .unwrap_or(Value::Undefined)
                 .to_js_string();
             return Value::Bool(match self {
-                Value::Object(object) => object.borrow().properties.contains_key(property.as_str()),
-                Value::Array(values) => {
+                _ if self.as_object().is_some() => self
+                    .as_object()
+                    .expect("object")
+                    .borrow()
+                    .properties
+                    .contains_key(property.as_str()),
+                _ if self.as_array().is_some() => {
+                    let values = self.as_array().expect("array");
                     property == "length"
                         || property.parse::<usize>().is_ok_and(|index| {
                             values
@@ -985,7 +1474,10 @@ impl Value {
                                 .is_some_and(|value| !is_array_hole(value))
                         })
                 }
-                Value::Function(function) => function.has_own_property(&property),
+                _ if self.as_function().is_some() => self
+                    .as_function()
+                    .expect("function")
+                    .has_own_property(&property),
                 _ => false,
             });
         }
@@ -994,30 +1486,30 @@ impl Value {
         {
             return result;
         }
-        if let Value::Array(values) = self
-            && let Some(result) = array_call_method(values, key, args.clone(), self)
+        if let Some(values) = self.as_array()
+            && let Some(result) = array_call_method(&values, key, args.clone(), self)
         {
             return result;
         }
         match (self, key) {
-            (Value::Function(_), "call") => {
+            (this, "call") if this.is_function() => {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 return self.call(this_arg, args.into_iter().skip(1).collect());
             }
-            (Value::Function(_), "apply") => {
+            (this, "apply") if this.is_function() => {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-                let applied_args = match args.get(1) {
-                    Some(Value::Array(values)) => values
+                let applied_args = match args.get(1).and_then(Value::as_array) {
+                    Some(values) => values
                         .borrow()
                         .iter()
                         .cloned()
                         .map(array_slot_value)
                         .collect(),
-                    _ => Vec::new(),
+                    None => Vec::new(),
                 };
                 return self.call(this_arg, applied_args);
             }
-            (Value::Function(_), "bind") => {
+            (this, "bind") if this.is_function() => {
                 let target = self.clone();
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 let bound_args: Vec<Value> = args.into_iter().skip(1).collect();
@@ -1027,13 +1519,15 @@ impl Value {
                     target.call(this_arg.clone(), combined)
                 });
             }
-            (Value::String(value), "endsWith") => {
+            (this, "endsWith") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 return Value::Bool(
                     args.first()
                         .is_some_and(|suffix| value.ends_with(&suffix.to_js_string())),
                 );
             }
-            (Value::String(value), "slice") => {
+            (this, "slice") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let units = value.encode_utf16().collect::<Vec<_>>();
                 let length = units.len() as i64;
                 let normalize = |argument: Option<&Value>, fallback: i64| {
@@ -1052,7 +1546,8 @@ impl Value {
                 let end = normalize(args.get(1), length).max(start);
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
-            (Value::String(value), "substr") => {
+            (this, "substr") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let units = value.encode_utf16().collect::<Vec<_>>();
                 let length = units.len() as i64;
                 let raw_start = args
@@ -1075,22 +1570,25 @@ impl Value {
                 let end = start.saturating_add(count).min(units.len());
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
-            (Value::String(value), "startsWith") => {
+            (this, "startsWith") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
                 let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-                let start = string_index_to_byte(value, start);
+                let start = string_index_to_byte(&value, start);
                 return Value::Bool(value[start..].starts_with(&needle));
             }
-            (Value::String(value), "includes") => {
+            (this, "includes") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
                 let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-                let start = string_index_to_byte(value, start);
+                let start = string_index_to_byte(&value, start);
                 return Value::Bool(value[start..].contains(&needle));
             }
-            (Value::String(value), "indexOf") => {
+            (this, "indexOf") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
                 let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-                let start_byte = string_index_to_byte(value, start);
+                let start_byte = string_index_to_byte(&value, start);
                 let index = value
                     .get(start_byte..)
                     .and_then(|tail| tail.find(&needle).map(|offset| start_byte + offset))
@@ -1098,7 +1596,8 @@ impl Value {
                     .unwrap_or(-1.0);
                 return Value::Number(index);
             }
-            (Value::String(value), "charCodeAt") => {
+            (this, "charCodeAt") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
                 if !index.is_finite() || index < 0.0 {
                     return Value::Number(f64::NAN);
@@ -1111,7 +1610,8 @@ impl Value {
                         .unwrap_or(f64::NAN),
                 );
             }
-            (Value::String(value), "charAt") => {
+            (this, "charAt") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
                 if !index.is_finite() || index < 0.0 {
                     return Value::from(String::new());
@@ -1124,7 +1624,8 @@ impl Value {
                         .unwrap_or_default(),
                 );
             }
-            (Value::String(value), "substring") => {
+            (this, "substring") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let len = value.chars().count();
                 let mut start = args.first().map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
                 let mut end = args
@@ -1137,17 +1638,20 @@ impl Value {
                 if start > end {
                     std::mem::swap(&mut start, &mut end);
                 }
-                let start = string_index_to_byte(value, start);
-                let end = string_index_to_byte(value, end);
+                let start = string_index_to_byte(&value, start);
+                let end = string_index_to_byte(&value, end);
                 return Value::from(value[start..end].to_string());
             }
-            (Value::String(value), "toUpperCase") => {
+            (this, "toUpperCase") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 return Value::from(value.to_uppercase());
             }
-            (Value::String(value), "toLowerCase") => {
+            (this, "toLowerCase") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 return Value::from(value.to_lowercase());
             }
-            (Value::String(value), "localeCompare") => {
+            (this, "localeCompare") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let other = args.first().cloned().unwrap_or_default().to_js_string();
                 return Value::Number(match value.as_str().cmp(other.as_str()) {
                     std::cmp::Ordering::Less => -1.0,
@@ -1155,21 +1659,23 @@ impl Value {
                     std::cmp::Ordering::Greater => 1.0,
                 });
             }
-            (Value::String(value), "trim") => {
+            (this, "trim") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 return Value::from(value.trim().to_string());
             }
-            (Value::String(value), "split") => {
+            (this, "split") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let Some(separator) = args.first() else {
-                    return Value::array(vec![Value::String(value.clone())]);
+                    return Value::array(vec![Value::from(value.clone())]);
                 };
                 if separator.is_undefined() {
-                    return Value::array(vec![Value::String(value.clone())]);
+                    return Value::array(vec![Value::from(value.clone())]);
                 }
                 let limit = args
                     .get(1)
                     .map(|value| value.to_number().max(0.0) as usize)
                     .unwrap_or(usize::MAX);
-                if let Some(result) = crate::regexp::string_split(value, separator, limit) {
+                if let Some(result) = crate::regexp::string_split(&value, separator, limit) {
                     return result;
                 }
                 let separator = separator.to_js_string();
@@ -1188,24 +1694,27 @@ impl Value {
                 };
                 return Value::array(parts);
             }
-            (Value::String(value), "match") => {
+            (this, "match") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let pattern = args.first().cloned().unwrap_or(Value::Undefined);
-                if let Some(result) = crate::regexp::string_match(value, &pattern) {
+                if let Some(result) = crate::regexp::string_match(&value, &pattern) {
                     return result;
                 }
             }
-            (Value::String(value), "matchAll") => {
+            (this, "matchAll") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let pattern = args.first().cloned().unwrap_or(Value::Undefined);
-                if let Some(result) = crate::regexp::string_match_all(value, &pattern) {
+                if let Some(result) = crate::regexp::string_match_all(&value, &pattern) {
                     return result;
                 }
                 let global = crate::regexp::create(&pattern.to_js_string(), "g");
-                return crate::regexp::string_match_all(value, &global)
+                return crate::regexp::string_match_all(&value, &global)
                     .expect("fresh global regexp always produces an iterator");
             }
-            (Value::String(value), "search") => {
+            (this, "search") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let pattern = args.first().cloned().unwrap_or(Value::Undefined);
-                if let Some(result) = crate::regexp::string_search(value, &pattern) {
+                if let Some(result) = crate::regexp::string_search(&value, &pattern) {
                     return result;
                 }
                 return Value::Number(
@@ -1215,10 +1724,11 @@ impl Value {
                         .unwrap_or(-1.0),
                 );
             }
-            (Value::String(value), "replace") => {
+            (this, "replace") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
                 let pattern = args.first().cloned().unwrap_or(Value::Undefined);
                 let replacement = args.get(1).cloned().unwrap_or(Value::Undefined);
-                if let Some(result) = crate::regexp::string_replace(value, &pattern, &replacement) {
+                if let Some(result) = crate::regexp::string_replace(&value, &pattern, &replacement) {
                     return result;
                 }
                 if replacement.is_function()
@@ -1230,7 +1740,7 @@ impl Value {
                         vec![
                             pattern,
                             Value::Number(value[..byte].encode_utf16().count() as f64),
-                            Value::String(value.clone()),
+                            Value::from(value.clone()),
                         ],
                     );
                     return Value::from(format!(
@@ -1246,7 +1756,8 @@ impl Value {
                     1,
                 ));
             }
-            (Value::Array(values), "filter") => {
+            _ if self.as_array().is_some() && key == "filter" => {
+                let values = self.as_array().expect("array");
                 let predicate = args.first().cloned().unwrap_or(Value::Undefined);
                 let filtered = values
                     .borrow()
@@ -1267,12 +1778,14 @@ impl Value {
                     .collect();
                 return Value::array(filtered);
             }
-            (Value::Array(values), "push") => {
+            _ if self.as_array().is_some() && key == "push" => {
+                let values = self.as_array().expect("array");
                 let mut values = values.borrow_mut();
                 values.extend(args);
                 return Value::Number(values.len() as f64);
             }
-            (Value::Array(values), "set") => {
+            _ if self.as_array().is_some() && key == "set" => {
+                let values = self.as_array().expect("array");
                 let source: Vec<Value> = args
                     .first()
                     .cloned()
@@ -1294,7 +1807,8 @@ impl Value {
                 }
                 return Value::Undefined;
             }
-            (Value::Array(values), "forEach") => {
+            _ if self.as_array().is_some() && key == "forEach" => {
+                let values = self.as_array().expect("array");
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 for (index, value) in values.borrow().iter().cloned().enumerate() {
                     if is_array_hole(&value) {
@@ -1320,8 +1834,10 @@ impl Value {
             return true;
         }
         match self {
-            Value::Array(_) | Value::String(_) => true,
-            Value::Object(object) => {
+            _ if self.is_array() => true,
+            _ if self.is_string() => true,
+            _ if self.as_object().is_some() => {
+                let object = self.as_object().expect("object");
                 crate::collections::iter_collection(self).is_some()
                     || object
                         .borrow()
@@ -1332,10 +1848,10 @@ impl Value {
                         .borrow()
                         .get_direct("__w3cosMapValuesSnapshot")
                         .is_function()
-                    || matches!(
-                        object.borrow().get_direct("__w3cosMapValues"),
-                        Value::Array(_)
-                    )
+                    || object
+                        .borrow()
+                        .get_direct("__w3cosMapValues")
+                        .is_array()
             }
             _ => false,
         }
@@ -1352,27 +1868,31 @@ impl Value {
             return iterator;
         }
         match self {
-            Value::Array(values) => ValueIterator::new(LiveArrayIterator {
-                values: Rc::clone(values),
+            _ if self.as_array().is_some() => ValueIterator::new(LiveArrayIterator {
+                values: self.as_array().expect("array"),
                 index: 0,
             }),
-            Value::String(value) => ValueIterator::new(
-                value
-                    .chars()
-                    .map(|character| Value::from(character.to_string()))
-                    .collect::<Vec<_>>()
-                    .into_iter(),
-            ),
+            _ if self.is_string() => {
+                let value = self.as_js_string().expect("string");
+                ValueIterator::new(
+                    value
+                        .chars()
+                        .map(|character| Value::from(character.to_string()))
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                )
+            }
             // First use the standards-oriented Map/Set registry. Retain the
             // host runtime's snapshot hook as a fallback for its lightweight
             // built-in Map used by compiled application paths.
-            Value::Object(object) => {
+            _ if self.as_object().is_some() => {
+                let object = self.as_object().expect("object");
                 if let Some(iterator) = crate::collections::iter_collection(self) {
                     return ValueIterator::boxed(iterator);
                 }
                 let iterable_snapshot = object.borrow().get_direct("__w3cosIterableSnapshot");
                 if iterable_snapshot.is_function() {
-                    if let Value::Array(values) = iterable_snapshot.call(self.clone(), vec![]) {
+                    if let Some(values) = iterable_snapshot.call(self.clone(), vec![]).as_array() {
                         return ValueIterator::new(values.borrow().clone().into_iter());
                     }
                 }
@@ -1407,9 +1927,9 @@ impl Value {
                 } else {
                     object.borrow().get_direct("__w3cosMapValues")
                 };
-                match values {
-                    Value::Array(values) => ValueIterator::new(values.borrow().clone().into_iter()),
-                    _ => ValueIterator::new(Vec::new().into_iter()),
+                match values.as_array() {
+                    Some(values) => ValueIterator::new(values.borrow().clone().into_iter()),
+                    None => ValueIterator::new(Vec::new().into_iter()),
                 }
             }
             _ => ValueIterator::new(Vec::new().into_iter()),
@@ -1527,10 +2047,8 @@ fn close_async_iterator_chain(
 }
 
 fn is_iterator_object(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Object(_) | Value::Array(_) | Value::Function(_)
-    ) && crate::bigint::get(value).is_none()
+    (value.is_object() || value.is_array() || value.is_function())
+        && crate::bigint::get(value).is_none()
 }
 
 pub(crate) fn type_error(message: &str) -> Value {
@@ -1782,9 +2300,10 @@ fn array_call_method(
         "concat" => {
             let mut out = values.borrow().clone();
             for item in &args {
-                match item {
-                    Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
-                    other => out.push(other.clone()),
+                if let Some(inner) = item.as_array() {
+                    out.extend(inner.borrow().iter().cloned());
+                } else {
+                    out.push(item.clone());
                 }
             }
             Value::array(out)
@@ -1884,12 +2403,13 @@ fn array_call_method(
                     if is_array_hole(item) {
                         continue;
                     }
-                    match item {
-                        Value::Array(inner) if depth > 0 => {
-                            flatten(into, &inner.borrow(), depth - 1)
+                    if depth > 0 {
+                        if let Some(inner) = item.as_array() {
+                            flatten(into, &inner.borrow(), depth - 1);
+                            continue;
                         }
-                        other => into.push(other.clone()),
                     }
+                    into.push(item.clone());
                 }
             }
             let mut out = Vec::new();
@@ -1903,9 +2423,11 @@ fn array_call_method(
                 if is_array_hole(value) {
                     continue;
                 }
-                match f.call(Value::Undefined, callback_args(value, index)) {
-                    Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
-                    other => out.push(other),
+                let mapped = f.call(Value::Undefined, callback_args(value, index));
+                if let Some(inner) = mapped.as_array() {
+                    out.extend(inner.borrow().iter().cloned());
+                } else {
+                    out.push(mapped);
                 }
             }
             Value::array(out)
@@ -1925,19 +2447,19 @@ fn array_call_method(
 
 impl From<&str> for Value {
     fn from(value: &str) -> Self {
-        Value::String(JsString::intern(value))
+        Value::from_js_string(JsString::intern(value))
     }
 }
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
-        Value::String(JsString::from(value))
+        Value::from_js_string(JsString::from(value))
     }
 }
 
 impl From<JsString> for Value {
     fn from(value: JsString) -> Self {
-        Value::String(value)
+        Value::from_js_string(value)
     }
 }
 
@@ -2110,21 +2632,20 @@ impl Value {
             return equal;
         }
         match (self, other) {
-            (Value::Undefined, Value::Undefined) => true,
-            (Value::Null, Value::Null) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => {
-                if a.is_nan() || b.is_nan() {
-                    false
-                } else {
-                    a == b
+            (Value::Imm(a), Value::Imm(b)) => {
+                match (a.as_number(), b.as_number()) {
+                    (Some(x), Some(y)) => x == y, // NaN !== NaN
+                    (None, None) => a == b,
+                    _ => false,
                 }
             }
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
-            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
-            (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
-            _ => false,
+            (left, right) if Value::array_identity_eq(left, right) => true,
+            (left, right) if Value::object_identity_eq(left, right) => true,
+            (left, right) if Value::function_identity_eq(left, right) => true,
+            _ => match (self.as_js_string(), other.as_js_string()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            },
         }
     }
 
@@ -2137,34 +2658,42 @@ impl Value {
             return equal;
         }
         match (self, other) {
-            (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            // f64 `==` already identifies -0.0 with +0.0 (SameValueZero
-            // agrees); NaN needs the explicit special-case.
-            (Value::Number(a), Value::Number(b)) => a == b || (a.is_nan() && b.is_nan()),
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
-            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
-            (Value::Function(a), Value::Function(b)) => a.ptr_eq(b),
-            _ => false,
+            (Value::Imm(a), Value::Imm(b)) => match (a.as_number(), b.as_number()) {
+                (Some(x), Some(y)) => x == y || (x.is_nan() && y.is_nan()),
+                (None, None) => a == b,
+                _ => false,
+            },
+            (left, right) if Value::array_identity_eq(left, right) => true,
+            (left, right) if Value::object_identity_eq(left, right) => true,
+            (left, right) if Value::function_identity_eq(left, right) => true,
+            _ => match (self.as_js_string(), other.as_js_string()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            },
         }
     }
 
     /// ECMAScript `==` (abstract equality — simplified).
     pub fn abstract_eq(&self, other: &Value) -> bool {
-        if std::mem::discriminant(self) == std::mem::discriminant(other) {
-            return self.strict_eq(other);
-        }
-        match (self, other) {
-            (Value::Null, Value::Undefined) | (Value::Undefined, Value::Null) => true,
-            (Value::Number(_), Value::String(_)) => {
+        match (self.unpack(), other.unpack()) {
+            (ValueUnpack::Undefined, ValueUnpack::Undefined)
+            | (ValueUnpack::Null, ValueUnpack::Null)
+            | (ValueUnpack::Bool(_), ValueUnpack::Bool(_))
+            | (ValueUnpack::Number(_), ValueUnpack::Number(_))
+            | (ValueUnpack::String(_), ValueUnpack::String(_))
+            | (ValueUnpack::Array(_), ValueUnpack::Array(_))
+            | (ValueUnpack::Object(_), ValueUnpack::Object(_))
+            | (ValueUnpack::Function(_), ValueUnpack::Function(_)) => self.strict_eq(other),
+            (ValueUnpack::Null, ValueUnpack::Undefined)
+            | (ValueUnpack::Undefined, ValueUnpack::Null) => true,
+            (ValueUnpack::Number(_), ValueUnpack::String(_)) => {
                 self.strict_eq(&Value::Number(other.to_number()))
             }
-            (Value::String(_), Value::Number(_)) => {
+            (ValueUnpack::String(_), ValueUnpack::Number(_)) => {
                 Value::Number(self.to_number()).strict_eq(other)
             }
-            (Value::Bool(_), _) => Value::Number(self.to_number()).abstract_eq(other),
-            (_, Value::Bool(_)) => self.abstract_eq(&Value::Number(other.to_number())),
+            (ValueUnpack::Bool(_), _) => Value::Number(self.to_number()).abstract_eq(other),
+            (_, ValueUnpack::Bool(_)) => self.abstract_eq(&Value::Number(other.to_number())),
             _ => false,
         }
     }
@@ -2174,7 +2703,7 @@ impl Value {
             return ordering.is_lt();
         }
         match (self, other) {
-            (Value::String(left), Value::String(right)) => left < right,
+            (left, right) if left.is_string() && right.is_string() => left.as_js_string() < right.as_js_string(),
             _ => self.to_number() < other.to_number(),
         }
     }
@@ -2184,7 +2713,7 @@ impl Value {
             return ordering.is_gt();
         }
         match (self, other) {
-            (Value::String(left), Value::String(right)) => left > right,
+            (left, right) if left.is_string() && right.is_string() => left.as_js_string() > right.as_js_string(),
             _ => self.to_number() > other.to_number(),
         }
     }
@@ -2194,7 +2723,7 @@ impl Value {
             return !ordering.is_gt();
         }
         match (self, other) {
-            (Value::String(left), Value::String(right)) => left <= right,
+            (left, right) if left.is_string() && right.is_string() => left.as_js_string() <= right.as_js_string(),
             _ => self.to_number() <= other.to_number(),
         }
     }
@@ -2204,7 +2733,7 @@ impl Value {
             return !ordering.is_lt();
         }
         match (self, other) {
-            (Value::String(left), Value::String(right)) => left >= right,
+            (left, right) if left.is_string() && right.is_string() => left.as_js_string() >= right.as_js_string(),
             _ => self.to_number() >= other.to_number(),
         }
     }
@@ -2224,15 +2753,15 @@ impl fmt::Display for Value {
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Undefined => write!(f, "undefined"),
-            Value::Null => write!(f, "null"),
-            Value::Bool(b) => write!(f, "{b}"),
-            Value::Number(n) => write!(f, "{n}"),
-            Value::String(s) => write!(f, "{s:?}"),
-            Value::Array(arr) => write!(f, "{:?}", arr.borrow()),
-            Value::Object(_) => write!(f, "{{...}}"),
-            Value::Function(_) => write!(f, "[Function]"),
+        match self.unpack() {
+            ValueUnpack::Undefined => write!(f, "undefined"),
+            ValueUnpack::Null => write!(f, "null"),
+            ValueUnpack::Bool(b) => write!(f, "{b}"),
+            ValueUnpack::Number(n) => write!(f, "{n}"),
+            ValueUnpack::String(s) => write!(f, "{s:?}"),
+            ValueUnpack::Array(arr) => write!(f, "{:?}", arr.borrow()),
+            ValueUnpack::Object(_) => write!(f, "{{...}}"),
+            ValueUnpack::Function(_) => write!(f, "[Function]"),
         }
     }
 }
@@ -2288,9 +2817,125 @@ pub fn throw_value(value: Value) -> ! {
     std::panic::panic_any(PanicValue(value))
 }
 
+/// JS completion record used by AOT state machines: `Ok` is normal
+/// completion, `Err` is throw. Host/DOM seams may still panic via
+/// [`throw_value`].
+pub type Completion = Result<Value, Value>;
+
+fn panic_payload_to_throw(payload: Box<dyn std::any::Any + Send>) -> Value {
+    if let Some(value) = payload.downcast_ref::<PanicValue>() {
+        value.0.clone()
+    } else {
+        std::panic::resume_unwind(payload)
+    }
+}
+
+/// Catch a [`throw_value`] panic as a Throw completion. Non-JS panics resume.
+pub fn catch_js<F: FnOnce() -> Value>(f: F) -> Completion {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => Ok(value),
+        Err(payload) => Err(panic_payload_to_throw(payload)),
+    }
+}
+
+/// Like [`catch_js`], but the closure may itself return a completion.
+pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Value> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => Err(panic_payload_to_throw(payload)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_copy<T: Copy>(value: T) -> T {
+        value
+    }
+
+    /// Immediates are a Copy tagged word: clone is a register move, no `Rc`,
+    /// no allocation. Heap strings/arrays/objects/functions stay as pointers.
+    #[test]
+    fn immediates_are_copy_tagged_words_without_allocation() {
+        assert_eq!(std::mem::size_of::<Immediate>(), 8);
+        assert!(!std::mem::needs_drop::<Immediate>());
+        let undef = assert_copy(Immediate::UNDEFINED);
+        let null = assert_copy(Immediate::NULL);
+        let flag = assert_copy(Immediate::from_bool(true));
+        let num = assert_copy(Immediate::from_number(42.0));
+        let nan = assert_copy(Immediate::from_number(f64::NAN));
+        assert!(undef.is_undefined());
+        assert!(null.is_null());
+        assert_eq!(flag.as_bool(), Some(true));
+        assert_eq!(num.as_number(), Some(42.0));
+        assert!(nan.as_number().unwrap().is_nan());
+        // Payload NaNs collapse to the canonical quiet-NaN so tags stay unique.
+        assert_eq!(
+            nan.bits(),
+            Immediate::from_number(f64::from_bits(0x7FF8_0000_0000_0001)).bits()
+        );
+
+        let a = Value::Undefined;
+        let b = a.clone();
+        assert!(b.is_undefined());
+        // Clone of an immediate Value does not allocate: the Imm arm is Copy.
+        match a {
+            Value::Imm(word) => {
+                let copied = assert_copy(word);
+                assert!(copied.is_undefined());
+            }
+            _ => panic!("undefined must be the tagged immediate word"),
+        }
+        match Value::Bool(false) {
+            Value::Imm(word) => assert_eq!(assert_copy(word).as_bool(), Some(false)),
+            _ => panic!("bool must be the tagged immediate word"),
+        }
+        match Value::Number(-0.0) {
+            Value::Imm(word) => assert_eq!(
+                assert_copy(word).as_number().unwrap().to_bits(),
+                (-0.0_f64).to_bits()
+            ),
+            _ => panic!("number must be the tagged immediate word"),
+        }
+        // Direct String-arm construction stays a heap variant; interned
+        // short strings created via Value::string are packed below.
+        assert!(
+            Value::String(JsString::intern("heap-or-intern"))
+                .as_immediate()
+                .is_none()
+        );
+        match Value::string("imm-intern") {
+            Value::Imm(word) => {
+                let copied = assert_copy(word);
+                assert!(copied.is_interned_string());
+                assert_eq!(std::mem::size_of_val(&copied), 8);
+                assert!(!std::mem::needs_drop::<Immediate>());
+            }
+            _ => panic!("interned short string must be the tagged immediate word"),
+        }
+        match Value::array(vec![]) {
+            Value::Imm(word) => {
+                assert!(word.is_array_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+            }
+            _ => panic!("Value::array must pack a page-arena handle"),
+        }
+        match Value::object(HashMap::new()) {
+            Value::Imm(word) => {
+                assert!(word.is_object_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+            }
+            _ => panic!("Value::object must pack a page-arena handle"),
+        }
+        match Value::function(|_, _| Value::Undefined) {
+            Value::Imm(word) => {
+                assert!(word.is_function_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+            }
+            _ => panic!("Value::function must pack a page-arena handle"),
+        }
+    }
 
     #[test]
     fn type_coercion() {
@@ -3066,8 +3711,13 @@ mod tests {
         let a = Value::string("interned-clone-test");
         let b = a.clone();
         match (&a, &b) {
-            (Value::String(left), Value::String(right)) => assert!(left.ptr_eq(right)),
-            _ => panic!("expected strings"),
+            (Value::Imm(left), Value::Imm(right)) => {
+                assert_copy(*left);
+                assert_eq!(left.interned_handle(), right.interned_handle());
+                assert!(left.is_interned_string());
+                assert_eq!(left.as_js_string().unwrap().heap_strong_count(), None);
+            }
+            _ => panic!("interned short string clone must stay Imm, not Rc"),
         }
         assert_eq!(a, b);
         assert_eq!(a.to_js_string(), "interned-clone-test");
@@ -3078,8 +3728,170 @@ mod tests {
         let a = Value::string("length");
         let b = Value::string("length");
         match (&a, &b) {
-            (Value::String(left), Value::String(right)) => assert!(left.ptr_eq(right)),
-            _ => panic!("expected strings"),
+            (Value::Imm(left), Value::Imm(right)) => {
+                assert_eq!(left.interned_handle(), right.interned_handle());
+            }
+            _ => panic!("interned literals must pack into Immediate"),
         }
+    }
+
+    #[test]
+    fn interned_short_string_value_is_imm_copy_word() {
+        let s = Value::string("short-intern-imm");
+        assert!(s.is_string());
+        match s {
+            Value::Imm(word) => {
+                let copied = assert_copy(word);
+                assert_eq!(std::mem::size_of::<Immediate>(), 8);
+                assert_eq!(std::mem::size_of_val(&copied), 8);
+                assert!(!std::mem::needs_drop::<Immediate>());
+                assert!(copied.is_interned_string());
+                let js = copied.as_js_string().expect("handle");
+                assert_eq!(js.as_str(), "short-intern-imm");
+                assert!(js.page_handle().is_some());
+                assert_eq!(js.heap_strong_count(), None);
+                assert_eq!(copied.interned_handle(), js.page_handle());
+                // tag 5 in low 4 bits, handle in bits 4..36
+                assert_eq!(copied.bits() & 0xF, 5);
+                assert_eq!(
+                    ((copied.bits() >> 4) as u32),
+                    js.page_handle().unwrap()
+                );
+            }
+            _ => panic!("interned short string Value must be Imm"),
+        }
+        let cloned = s.clone();
+        match cloned {
+            Value::Imm(word) => {
+                assert_copy(word);
+                assert!(word.is_interned_string());
+                assert_eq!(word.as_js_string().unwrap().heap_strong_count(), None);
+            }
+            _ => panic!("clone of interned short string must not take the String arm"),
+        }
+    }
+
+    #[test]
+    fn long_string_value_stays_on_heap_arm() {
+        let raw = "L".repeat(257);
+        let s = Value::string(&raw);
+        assert!(s.is_string());
+        assert!(s.as_immediate().is_none());
+        match &s {
+            Value::String(js) => {
+                assert!(js.page_handle().is_none());
+                assert_eq!(js.heap_strong_count(), Some(1));
+            }
+            _ => panic!("long string must stay on the String arm"),
+        }
+        let cloned = s.clone();
+        match (&s, &cloned) {
+            (Value::String(left), Value::String(right)) => {
+                assert!(left.ptr_eq(right));
+                assert_eq!(left.heap_strong_count(), Some(2));
+            }
+            _ => panic!("long string clone must stay heap"),
+        }
+        assert_eq!(s.to_js_string(), raw);
+    }
+
+    #[test]
+    fn object_handle_clone_does_not_increase_rc_and_reset_empties_table() {
+        crate::page_arena::reset();
+        let obj = Value::object(HashMap::from([("k".into(), Value::Number(1.0))]));
+        match &obj {
+            Value::Imm(word) => {
+                assert!(word.is_object_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+                let handle = word.object_handle().unwrap();
+                let rc = crate::page_arena::get_object(handle);
+                let before = Rc::strong_count(&rc);
+                let cloned = obj.clone();
+                assert_eq!(Rc::strong_count(&rc), before);
+                match cloned {
+                    Value::Imm(copy) => {
+                        assert_eq!(copy.object_handle(), word.object_handle())
+                    }
+                    _ => panic!("clone must stay Imm handle"),
+                }
+                assert_eq!(obj.get_property("k").to_number(), 1.0);
+                assert_eq!(cloned.get_property("k").to_number(), 1.0);
+            }
+            _ => panic!("Value::object must pack a page-arena handle"),
+        }
+        assert!(crate::page_arena::live_objects() >= 1);
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_objects(), 0);
+    }
+
+    #[test]
+    fn array_handle_clone_does_not_increase_rc_and_reset_empties_table() {
+        crate::page_arena::reset();
+        let arr = Value::array(vec![Value::Number(1.0), Value::Number(2.0)]);
+        match &arr {
+            Value::Imm(word) => {
+                assert!(word.is_array_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+                let handle = word.array_handle().unwrap();
+                let rc = crate::page_arena::get_array(handle);
+                let before = Rc::strong_count(&rc);
+                let cloned = arr.clone();
+                assert_eq!(Rc::strong_count(&rc), before);
+                match cloned {
+                    Value::Imm(copy) => {
+                        assert_eq!(copy.array_handle(), word.array_handle())
+                    }
+                    _ => panic!("clone must stay Imm handle"),
+                }
+                assert_eq!(arr.get_property("0").to_number(), 1.0);
+                assert_eq!(cloned.get_property("1").to_number(), 2.0);
+                assert_eq!(arr.get_property("length").to_number(), 2.0);
+            }
+            _ => panic!("Value::array must pack a page-arena handle"),
+        }
+        assert!(crate::page_arena::live_arrays() >= 1);
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_arrays(), 0);
+    }
+
+    #[test]
+    fn function_handle_clone_does_not_increase_rc_and_reset_empties_table() {
+        crate::page_arena::reset();
+        let func = Value::function(|_, _| Value::Number(7.0));
+        match &func {
+            Value::Imm(word) => {
+                assert!(word.is_function_handle());
+                assert!(!std::mem::needs_drop::<Immediate>());
+                let handle = word.function_handle().unwrap();
+                let js = crate::page_arena::get_function(handle);
+                let before = js.strong_counts();
+                let cloned = func.clone();
+                assert_eq!(js.strong_counts(), before);
+                match cloned {
+                    Value::Imm(copy) => {
+                        assert_eq!(copy.function_handle(), word.function_handle())
+                    }
+                    _ => panic!("clone must stay Imm handle"),
+                }
+                assert_eq!(func.call(Value::Undefined, vec![]).to_number(), 7.0);
+                assert_eq!(cloned.call(Value::Undefined, vec![]).to_number(), 7.0);
+                // tag 8 in low 4 bits
+                assert_eq!(word.bits() & 0xF, 8);
+            }
+            _ => panic!("Value::function must pack a page-arena handle"),
+        }
+        assert!(crate::page_arena::live_functions() >= 1);
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_functions(), 0);
+    }
+
+    #[test]
+    fn interned_string_handles_drop_on_page_reset() {
+        crate::page_arena::reset();
+        let s = Value::string("reset-drops-imm-handle");
+        assert!(matches!(s, Value::Imm(word) if word.is_interned_string()));
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_handles(), 0);
+        assert_eq!(JsString::interned_table_bytes(), 0);
     }
 }

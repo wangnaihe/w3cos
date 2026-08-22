@@ -471,22 +471,12 @@ mod tests {
                 .to_bool()
         );
 
-        assert!(matches!(
-            old_storage.call_method("open", vec![Value::string("stale-assets")]),
-            Value::Undefined
-        ));
-        assert!(matches!(
-            old_cache.call_method("keys", vec![]),
-            Value::Undefined
-        ));
-        assert!(matches!(
-            old_storage_class.call(Value::Undefined, vec![]),
-            Value::Undefined
-        ));
-        assert!(matches!(
-            old_cache_class.call(Value::Undefined, vec![]),
-            Value::Undefined
-        ));
+        assert!(old_storage
+            .call_method("open", vec![Value::string("stale-assets")])
+            .is_undefined());
+        assert!(old_cache.call_method("keys", vec![]).is_undefined());
+        assert!(old_storage_class.call(Value::Undefined, vec![]).is_undefined());
+        assert!(old_cache_class.call(Value::Undefined, vec![]).is_undefined());
 
         let stale_exists =
             settled(new_storage.call_method("has", vec![Value::string("stale-assets")]));

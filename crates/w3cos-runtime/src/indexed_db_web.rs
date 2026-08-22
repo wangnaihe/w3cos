@@ -446,8 +446,10 @@ fn request_value() -> (Value, Rc<RefCell<RequestState>>, ListenerMap) {
 }
 
 fn same_callback(left: &Value, right: &Value) -> bool {
+    if left.is_function() || right.is_function() {
+        return left.strict_eq(right);
+    }
     match (left, right) {
-        (Value::Function(left), Value::Function(right)) => left.ptr_eq(right),
         (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
         _ => left == right,
     }
@@ -1249,7 +1251,7 @@ fn key_path_from_web(value: &Value, optional: bool) -> indexed_db::Result<String
             &path,
         ))));
     }
-    if let Value::Array(paths) = value {
+    if let Some(paths) = value.as_array() {
         let paths = paths
             .borrow()
             .iter()
@@ -1403,13 +1405,14 @@ fn database_web_value(
                 ));
             }
             let names_value = arg(&args, 0);
-            let names = match names_value {
-                Value::Array(values) => values
+            let names = if let Some(values) = names_value.as_array() {
+                values
                     .borrow()
                     .iter()
                     .map(Value::to_js_string)
-                    .collect::<Vec<_>>(),
-                value => vec![value.to_js_string()],
+                    .collect::<Vec<_>>()
+            } else {
+                vec![names_value.to_js_string()]
             };
             let mode_value = arg(&args, 1);
             let mode = match mode_value.to_js_string().as_str() {
@@ -2751,7 +2754,7 @@ pub(crate) fn value_to_json(value: &Value) -> indexed_db::Result<JsonValue> {
         // heap roots, preserving non-cyclic sharing as well as cycles. Keys use
         // `key_to_json` below so their sortable compact representation remains
         // available to the SQLite adapter.
-        Value::Array(_) | Value::Object(_) => graph_clone_to_json(value),
+        value if value.is_array() || value.is_object() => graph_clone_to_json(value),
         _ => value_to_json_inner(value, &mut std::collections::HashSet::new()),
     }
 }
@@ -2782,10 +2785,12 @@ impl GraphCloneEncoder {
     fn encode(&mut self, value: &Value) -> indexed_db::Result<JsonValue> {
         match value {
             _ if w3cos_core::binary::clone_descriptor(value).is_some() => {
-                let identity = match value {
-                    Value::Array(values) => (0, Rc::as_ptr(values) as usize),
-                    Value::Object(object) => (1, Rc::as_ptr(object) as usize),
-                    _ => unreachable!("binary descriptors are heap values"),
+                let identity = if let Some(values) = value.as_array() {
+                    (0, Rc::as_ptr(&values) as usize)
+                } else if let Some(object) = value.as_object() {
+                    (1, Rc::as_ptr(&object) as usize)
+                } else {
+                    unreachable!("binary descriptors are heap values")
                 };
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
@@ -2837,8 +2842,9 @@ impl GraphCloneEncoder {
                 };
                 Ok(graph_reference(id))
             }
-            Value::Array(values) if !w3cos_core::collections::is_typed_array(value) => {
-                let identity = (0, Rc::as_ptr(values) as usize);
+            _ if value.as_array().is_some() && !w3cos_core::collections::is_typed_array(value) => {
+                let values = value.as_array().expect("array");
+                let identity = (0, Rc::as_ptr(&values) as usize);
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
                 }
@@ -3050,17 +3056,19 @@ fn value_to_json_inner(
         )])));
     }
     match value {
-        Value::Undefined => Ok(JsonValue::Object(serde_json::Map::from_iter([(
+        value if value.is_undefined() => Ok(JsonValue::Object(serde_json::Map::from_iter([(
             CLONE_TAG.into(),
             JsonValue::String("undefined".into()),
         )]))),
-        Value::Function(_) => Err(IndexedDbError {
+        value if value.is_function() => Err(IndexedDbError {
             name: "DataCloneError".into(),
             message: "The value cannot be structured cloned.".into(),
         }),
-        Value::Null => Ok(JsonValue::Null),
-        Value::Bool(value) => Ok(JsonValue::Bool(*value)),
-        Value::Number(value) => serde_json::Number::from_f64(*value)
+        value if value.is_null() => Ok(JsonValue::Null),
+        value if value.as_bool().is_some() => Ok(JsonValue::Bool(value.as_bool().unwrap())),
+        value if value.as_number().is_some() => {
+            let number = value.as_number().unwrap();
+            serde_json::Number::from_f64(number)
             .map(JsonValue::Number)
             .map_or_else(
                 || {
@@ -3069,9 +3077,9 @@ fn value_to_json_inner(
                         (
                             "value".into(),
                             JsonValue::String(
-                                if value.is_nan() {
+                                if number.is_nan() {
                                     "NaN"
-                                } else if value.is_sign_positive() {
+                                } else if number.is_sign_positive() {
                                     "Infinity"
                                 } else {
                                     "-Infinity"
@@ -3082,10 +3090,13 @@ fn value_to_json_inner(
                     ])))
                 },
                 Ok,
-            ),
+            )
+        }
+        value if value.is_string() => Ok(JsonValue::String(value.to_js_string())),
         Value::String(value) => Ok(JsonValue::String(value.to_string())),
-        Value::Array(values) => {
-            let pointer = Rc::as_ptr(values) as usize;
+        value if value.as_array().is_some() => {
+            let values = value.as_array().expect("array");
+            let pointer = Rc::as_ptr(&values) as usize;
             if !active.insert(pointer) {
                 return Err(IndexedDbError {
                     name: "DataCloneError".into(),
@@ -3101,7 +3112,8 @@ fn value_to_json_inner(
             active.remove(&pointer);
             result
         }
-        Value::Object(object) => {
+        value if value.as_object().is_some() => {
+            let object = value.as_object().expect("object");
             if let Some(bigint) = w3cos_core::bigint::get(value) {
                 return Ok(JsonValue::Object(serde_json::Map::from_iter([(
                     BIGINT_TAG.into(),
@@ -3126,7 +3138,7 @@ fn value_to_json_inner(
                 )])));
             }
             if let Some(snapshot) = w3cos_core::collections::collection_snapshot(value) {
-                let pointer = Rc::as_ptr(object) as usize;
+                let pointer = Rc::as_ptr(&object) as usize;
                 if !active.insert(pointer) {
                     return Err(IndexedDbError {
                         name: "DataCloneError".into(),
@@ -3224,7 +3236,7 @@ fn value_to_json_inner(
                     ])),
                 )])));
             }
-            let pointer = Rc::as_ptr(object) as usize;
+            let pointer = Rc::as_ptr(&object) as usize;
             if !active.insert(pointer) {
                 return Err(IndexedDbError {
                     name: "DataCloneError".into(),
@@ -3257,6 +3269,10 @@ fn value_to_json_inner(
             }
             Ok(JsonValue::Object(cloned))
         }
+        _ => Err(IndexedDbError {
+            name: "DataCloneError".into(),
+            message: "The value cannot be structured cloned.".into(),
+        }),
     }
 }
 
@@ -3515,7 +3531,7 @@ fn json_graph_to_value(graph: &serde_json::Map<String, JsonValue>) -> Value {
                     .flatten()
                     .map(|value| json_graph_part_to_value(value, &placeholders))
                     .collect::<Vec<_>>();
-                if let Value::Array(storage) = &placeholders[index] {
+                if let Some(storage) = placeholders[index].as_array() {
                     storage.borrow_mut().replace_values(items);
                 }
             }

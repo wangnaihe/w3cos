@@ -1296,7 +1296,7 @@ pub fn intersection_observer_class() -> Value {
                 let threshold = options.get_property("threshold");
                 let mut thresholds = if threshold.is_undefined() {
                     vec![0.0]
-                } else if matches!(threshold, Value::Array(_)) {
+                } else if threshold.is_array() {
                     threshold.iter().map(|value| value.to_number()).collect()
                 } else {
                     vec![threshold.to_number()]

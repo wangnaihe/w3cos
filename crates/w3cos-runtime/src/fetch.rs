@@ -389,9 +389,12 @@ pub fn fetch_value(arguments: Vec<Value>) -> Value {
         body: multipart
             .as_ref()
             .map(|(body, _)| body.clone())
-            .or_else(|| match body {
-                Value::Undefined | Value::Null => None,
-                body => Some(body.to_js_string()),
+            .or_else(|| {
+                if body.is_nullish() {
+                    None
+                } else {
+                    Some(body.to_js_string())
+                }
             }),
         ..FetchOptions::default()
     };
@@ -1255,7 +1258,7 @@ fn collect_header_init(init: &Value) -> HeaderList {
         );
         return list;
     }
-    if let Value::Array(entries) = init {
+    if let Some(entries) = init.as_array() {
         for entry in entries.borrow().iter() {
             header_append(
                 &list,
@@ -1265,7 +1268,7 @@ fn collect_header_init(init: &Value) -> HeaderList {
         }
         return list;
     }
-    if let Value::Object(object) = init {
+    if let Some(object) = init.as_object() {
         let object = object.borrow();
         for name in object.keys() {
             header_append(&list, &name, &object.get_direct(&name).to_js_string());
@@ -1648,11 +1651,12 @@ fn fetch_error_value(url: &str, name: &str, message: &str) -> Value {
 /// recursively assimilating the facade's own `then` method.
 fn fetch_promise_facade(response: Value) -> Value {
     let properties = match &response {
-        Value::Object(object) => {
+        object if object.as_object().is_some() => {
+            let object = object.as_object().expect("object");
             let object = object.borrow();
-            let keys = match object.own_keys() {
-                Value::Array(keys) => keys.borrow().clone(),
-                _ => Vec::new(),
+            let keys = match object.own_keys().as_array() {
+                Some(keys) => keys.borrow().clone(),
+                None => Vec::new(),
             };
             keys.into_iter()
                 .map(|key| {
@@ -1683,7 +1687,8 @@ pub fn response_class() -> Value {
         }
         let constructor = realm_fetch_function(|_, args| {
             let body = match args.first() {
-                None | Some(Value::Undefined) | Some(Value::Null) => String::new(),
+                None => String::new(),
+                Some(body) if body.is_nullish() => String::new(),
                 Some(body) => body.to_js_string(),
             };
             let init = args.get(1).cloned().unwrap_or(Value::Undefined);
@@ -1692,9 +1697,13 @@ pub fn response_class() -> Value {
             } else {
                 200
             };
-            let status_text = match init.get_property("statusText") {
-                Value::Undefined => String::new(),
-                value => value.to_js_string(),
+            let status_text = {
+                let value = init.get_property("statusText");
+                if value.is_undefined() {
+                    String::new()
+                } else {
+                    value.to_js_string()
+                }
             };
             let headers =
                 headers_value_from_list(collect_header_init(&init.get_property("headers")));
@@ -1935,9 +1944,10 @@ fn request_value(input: Value, init: Value) -> Value {
             if let Some((body, _)) = crate::form_data::serialize(&text_body) {
                 return Value::string(&body);
             }
-            match &text_body {
-                Value::Undefined | Value::Null => Value::from(""),
-                value => Value::from(value.to_js_string()),
+            if text_body.is_nullish() {
+                Value::from("")
+            } else {
+                Value::from(text_body.to_js_string())
             }
         }),
     );
@@ -2207,7 +2217,7 @@ pub fn abort_signal_class() -> Value {
                 let state = new_abort_state();
                 let signal = abort_signal_value(Rc::clone(&state));
                 let sources = args.first().cloned().unwrap_or(Value::Undefined);
-                if let Value::Array(sources) = sources {
+                if let Some(sources) = sources.as_array() {
                     for source in sources.borrow().iter().cloned() {
                         if source.get_property("aborted").to_bool() {
                             abort_state(&state, &signal, source.get_property("reason"));

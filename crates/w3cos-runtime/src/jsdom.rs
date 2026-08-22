@@ -437,10 +437,10 @@ pub(crate) fn realm_function(
 pub(crate) type WeakRealmObject = Weak<RefCell<JsObject>>;
 
 pub(crate) fn weak_realm_object(value: &Value) -> WeakRealmObject {
-    match value {
-        Value::Object(object) => Rc::downgrade(object),
-        _ => unreachable!("Realm host objects must use object storage"),
-    }
+    value
+        .as_object()
+        .map(|object| Rc::downgrade(&object))
+        .expect("Realm host objects must use object storage")
 }
 
 pub(crate) fn upgrade_realm_object(object: &WeakRealmObject) -> Option<Value> {
@@ -3318,7 +3318,7 @@ fn scroll_element_into_view(node: u32, options: Value) {
         )
     } else {
         (
-            if matches!(&options, Value::Bool(false)) {
+            if options.as_bool() == Some(false) {
                 "end".to_string()
             } else {
                 "start".to_string()
@@ -5563,10 +5563,12 @@ fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Va
     if !handler.is_function() {
         return;
     }
-    let capture = match &options {
-        Value::Bool(b) => *b,
-        Value::Object(_) => options.get_property("capture").to_bool(),
-        _ => false,
+    let capture = if let Some(b) = options.as_bool() {
+        b
+    } else if options.is_object() {
+        options.get_property("capture").to_bool()
+    } else {
+        false
     };
     let et = event_type_for(type_name);
     LISTENERS.with(|l| {
@@ -12554,6 +12556,7 @@ pub fn reset_bridge() {
     SELECTION_VALUE.with(|value| {
         value.borrow_mut().take();
     });
+    w3cos_core::page_arena::reset();
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -12625,6 +12628,22 @@ mod tests {
             matches!((&el, &again), (Value::Object(a), Value::Object(b)) if Rc::ptr_eq(a, b)),
             "held detached wrapper must keep === identity"
         );
+    }
+
+    #[test]
+    fn page_arena_drops_interned_strings_on_reset_bridge() {
+        setup();
+        let unique = "page-arena-nav-key";
+        let interned = w3cos_core::JsString::intern(unique);
+        assert!(interned.page_handle().is_some());
+        assert_eq!(interned.heap_strong_count(), None);
+        let cloned = interned.clone();
+        assert!(interned.ptr_eq(&cloned));
+        assert!(w3cos_core::page_arena::live_handles() >= 1);
+        assert!(w3cos_core::page_arena::allocated_bytes() >= unique.len());
+        reset_bridge();
+        assert_eq!(w3cos_core::page_arena::live_handles(), 0);
+        assert_eq!(w3cos_core::page_arena::allocated_bytes(), 0);
     }
 
     #[test]

@@ -3325,7 +3325,7 @@ export function boot() { return <App />; }"#,
         assert!(
             code.contains("synchronous function App compiled from W3IR")
                 && code.contains("w3cos_core::Value::string(\"main\")")
-                && code.contains("w3cos_core::intrinsics::create_object"),
+                && code.contains("w3cos_core::Value::object"),
             "default function body must be lowered: {code}"
         );
         assert!(

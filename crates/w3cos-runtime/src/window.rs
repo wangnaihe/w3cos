@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::dom;
-use crate::paint_artifact::{PaintArtifact, PaintNode};
+use crate::paint_artifact::{PaintArtifact, PaintNode, reuse_or_clone_paint_nodes};
+use crate::retained_layers::{CompositorOverrides, LayerPaintAction, RetainedLayerTree};
 use crate::text_layout;
 use crate::tile_manager::{TileManager, TileRequest};
 
@@ -436,6 +437,8 @@ struct ScrollDamage {
 enum RepaintMode {
     Full,
     ScrollOnly(Vec<ScrollDamage>),
+    /// Opacity / transform only; GPU/Skia replay retained layer recordings.
+    CompositorOnly,
     ScrollContentChanged(Vec<ScrollDamage>),
     ExternalAfterScroll {
         scroll_indices: Vec<usize>,
@@ -455,7 +458,7 @@ impl RepaintMode {
                     damages.push(ScrollDamage { index, delta_y });
                 }
             }
-            RepaintMode::Clean => {
+            RepaintMode::Clean | RepaintMode::CompositorOnly => {
                 *self = RepaintMode::ScrollOnly(vec![ScrollDamage { index, delta_y }]);
             }
             RepaintMode::ExternalAfterScroll { .. } => {
@@ -481,6 +484,7 @@ fn repaint_after_host_tree_rebuild(current: RepaintMode) -> RepaintMode {
             damage_indices,
         },
         RepaintMode::Clean => RepaintMode::Clean,
+        RepaintMode::CompositorOnly => RepaintMode::CompositorOnly,
         RepaintMode::Full => RepaintMode::Full,
     }
 }
@@ -522,6 +526,7 @@ fn repaint_after_host_tree_content_change(
         },
         RepaintMode::Full
         | RepaintMode::Clean
+        | RepaintMode::CompositorOnly
         | RepaintMode::ScrollOnly(_)
         | RepaintMode::ScrollContentChanged(_) => RepaintMode::Full,
     }
@@ -1190,6 +1195,7 @@ struct FrameCacheScreenshot;
 #[cfg(feature = "ai-bridge")]
 impl w3cos_ai_bridge::server::ScreenshotProvider for FrameCacheScreenshot {
     fn capture_png(&self) -> Option<Vec<u8>> {
+        crate::frame_cache::request_screenshot();
         crate::frame_cache::encode_png()
     }
 }
@@ -1319,6 +1325,9 @@ struct App {
     scroll_ancestor: Vec<Option<usize>>,
     flat_parents: Vec<Option<usize>>,
     paint_artifact: PaintArtifact,
+    retained_layers: RetainedLayerTree,
+    #[cfg(feature = "gpu")]
+    retained_layer_scenes: Vec<Scene>,
     tile_manager: TileManager,
     // Performance: spatial grid for O(1) hit testing
     spatial_grid: SpatialGrid,
@@ -1470,6 +1479,9 @@ impl App {
             scroll_ancestor: Vec::new(),
             flat_parents: Vec::new(),
             paint_artifact: PaintArtifact::default(),
+            retained_layers: RetainedLayerTree::default(),
+            #[cfg(feature = "gpu")]
+            retained_layer_scenes: Vec::new(),
             tile_manager: TileManager::default(),
             spatial_grid: SpatialGrid::empty(),
             paint_generation: 0,
@@ -1806,7 +1818,7 @@ impl App {
         }
         let lookahead = (scrollport.height * 1.5 + damage.delta_y.abs() * 4.0)
             .clamp(scrollport.height, scrollport.height * 3.0);
-        let flat = layout::pre_flatten(&self.root);
+        let flat = self.paint_artifact.nodes.as_slice();
         let mut requests = Vec::new();
         for &(rect, index) in &self.layout_cache {
             if index == damage.index
@@ -2538,13 +2550,30 @@ impl App {
             self.needs_tree_rebuild = true;
         }
 
-        let flat = layout::pre_flatten(&self.root);
+        let dummy_action = EventAction::None;
+        let old_paint_nodes = std::mem::take(&mut self.paint_artifact.nodes);
+        let reuse_flatten =
+            !self.needs_tree_rebuild && !self.needs_style_refresh && !old_paint_nodes.is_empty();
+        let retained_flat = if reuse_flatten {
+            Some(paint_nodes_as_flat(&old_paint_nodes, &dummy_action))
+        } else {
+            None
+        };
+        let walked_flat = if !reuse_flatten {
+            Some(layout::pre_flatten(&self.root))
+        } else {
+            None
+        };
+        let flat: &[layout::FlatNodeInfo<'_>] = retained_flat
+            .as_deref()
+            .or(walked_flat.as_deref())
+            .expect("layout flatten");
         if self.needs_tree_rebuild {
             self.layout_engine.invalidate();
             self.needs_tree_rebuild = false;
             self.needs_style_refresh = false;
         } else if self.needs_style_refresh && self.layout_engine.tree_valid() {
-            let _ = self.layout_engine.patch_display_styles(&flat);
+            let _ = self.layout_engine.patch_display_styles(flat);
             self.needs_style_refresh = false;
         }
 
@@ -2630,38 +2659,52 @@ impl App {
             viewport,
         );
 
-        self.hit_nodes.clear();
-        self.focusable_indices.clear();
-        for &(rect, idx) in &self.layout_cache {
-            if let Some(node) = flat.get(idx) {
-                if !layout::is_node_visible(&flat, idx) {
-                    continue;
+        if reuse_flatten {
+            let rects: HashMap<usize, LayoutRect> = self
+                .layout_cache
+                .iter()
+                .map(|(rect, idx)| (*idx, *rect))
+                .collect();
+            for hit in &mut self.hit_nodes {
+                if let Some(rect) = rects.get(&hit.index) {
+                    hit.rect = *rect;
                 }
-                let disabled = dom_host_disabled(&node.on_click);
-                let is_interactive = (matches!(node.kind, ComponentKind::Button { .. })
-                    || matches!(node.kind, ComponentKind::TextInput { .. })
-                    || node.on_click.has_pointer_interaction())
-                    && !disabled;
-                let is_host_target =
-                    is_interactive || matches!(node.on_click, EventAction::NativeHost { .. });
-                let is_focusable = (matches!(node.kind, ComponentKind::Button { .. })
-                    || matches!(node.kind, ComponentKind::TextInput { .. }))
-                    && !disabled;
-                if is_focusable {
-                    self.focusable_indices.push(idx);
-                }
-                self.hit_nodes.push(HitNode {
-                    rect,
-                    index: idx,
-                    is_interactive,
-                    is_host_target,
-                    is_focusable,
-                    on_click: node.on_click.clone(),
-                });
             }
-        }
+            self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
+        } else {
+            self.hit_nodes.clear();
+            self.focusable_indices.clear();
+            for &(rect, idx) in &self.layout_cache {
+                if let Some(node) = flat.get(idx) {
+                    if !layout::is_node_visible(&flat, idx) {
+                        continue;
+                    }
+                    let disabled = dom_host_disabled(&node.on_click);
+                    let is_interactive = (matches!(node.kind, ComponentKind::Button { .. })
+                        || matches!(node.kind, ComponentKind::TextInput { .. })
+                        || node.on_click.has_pointer_interaction())
+                        && !disabled;
+                    let is_host_target =
+                        is_interactive || matches!(node.on_click, EventAction::NativeHost { .. });
+                    let is_focusable = (matches!(node.kind, ComponentKind::Button { .. })
+                        || matches!(node.kind, ComponentKind::TextInput { .. }))
+                        && !disabled;
+                    if is_focusable {
+                        self.focusable_indices.push(idx);
+                    }
+                    self.hit_nodes.push(HitNode {
+                        rect,
+                        index: idx,
+                        is_interactive,
+                        is_host_target,
+                        is_focusable,
+                        on_click: node.on_click.clone(),
+                    });
+                }
+            }
 
-        self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
+            self.spatial_grid = SpatialGrid::build(&self.hit_nodes, w, layout_h + layout_offset_y);
+        }
         crate::uitest::set_hit_targets(
             self.hit_nodes
                 .iter()
@@ -2795,7 +2838,9 @@ impl App {
             // Re-materialize spacers and recompute layout before presenting
             // this frame so a newly encountered tall/short row never exposes
             // the intermediate estimated geometry for one refresh interval.
-            drop(flat);
+            drop(retained_flat);
+            drop(walked_flat);
+            self.paint_artifact.nodes = old_paint_nodes;
             for (scroll_index, correction) in virtual_anchor_corrections {
                 self.queue_scroll_damage(scroll_index, correction);
             }
@@ -2804,15 +2849,28 @@ impl App {
             self.ensure_layout_pass(measurement_pass + 1);
             return;
         }
-        self.paint_artifact = PaintArtifact::build(
-            flat.iter().map(|node| PaintNode {
-                kind: node.kind.clone(),
-                style: node.style.clone(),
-                parent: node.parent,
-            }),
-            &self.layout_cache,
-            self.layout_generation + 1,
-        );
+        drop(retained_flat);
+        let (paint_nodes, _style_clones) = if reuse_flatten {
+            (old_paint_nodes, 0usize)
+        } else {
+            reuse_or_clone_paint_nodes(
+                old_paint_nodes,
+                walked_flat
+                    .as_ref()
+                    .expect("walked flatten")
+                    .iter()
+                    .map(|node| {
+                        (
+                            node.kind,
+                            node.style,
+                            node.parent,
+                            node.sticky_counter_signal,
+                        )
+                    }),
+            )
+        };
+        self.paint_artifact =
+            PaintArtifact::build(paint_nodes, &self.layout_cache, self.layout_generation + 1);
         for (scroll_index, correction) in virtual_anchor_corrections {
             self.queue_scroll_damage(scroll_index, correction);
         }
@@ -3232,8 +3290,22 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
-        let has_active_animations = !self.animations.is_empty();
-        let repaint_mode = take_repaint_for_present(&mut self.repaint_mode, has_active_animations);
+        let paint_anims = self.animations.iter().any(|animation| {
+            !matches!(
+                animation.property(),
+                AnimatedProperty::Opacity | AnimatedProperty::Transform
+            )
+        });
+        let compositor_anims = self.animations.iter().any(|animation| {
+            matches!(
+                animation.property(),
+                AnimatedProperty::Opacity | AnimatedProperty::Transform
+            )
+        });
+        let mut repaint_mode = take_repaint_for_present(&mut self.repaint_mode, paint_anims);
+        if matches!(repaint_mode, RepaintMode::Clean) && compositor_anims {
+            repaint_mode = RepaintMode::CompositorOnly;
+        }
         let Some((tile_requests, tile_clients)) =
             prepare_for_repaint(&repaint_mode, || self.prepare_compositor_tiles())
         else {
@@ -3301,43 +3373,30 @@ impl App {
             self.viewport.layout_w,
             self.viewport.layout_h,
         );
-        // Blink computes cull rects during PrePaint. Do the equivalent before
-        // building Vello display items so offscreen list nodes never enter the
-        // scene or its z-sort. Keep a small overscan for shadows/transforms.
-        let mut render_nodes: Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)> =
-            layout_cache
-                .iter()
-                .filter_map(|&(rect, idx)| {
-                    if !node_intersects_paint_cull(
-                        idx,
-                        rect,
-                        &scroll_info,
-                        self.viewport.layout_w,
-                        self.viewport.layout_h,
-                        64.0,
-                    ) {
-                        return None;
-                    }
-                    let node = flat.get(idx)?;
-                    let style = style_overrides.get(&idx).unwrap_or(&node.style);
-                    Some((idx, rect, &node.kind, style))
-                })
-                .collect();
-        let paint_z = &self.paint_artifact.z_order;
-        render_nodes.sort_by_key(|(idx, _, _, _)| paint_z[*idx]);
+        let compositor_overrides = CompositorOverrides::from_style_map(&style_overrides);
+        if self.hovered_index.is_some() || self.pressed_index.is_some() {
+            self.retained_layers.invalidate_recordings();
+        }
+        let layer_action = self.retained_layers.sync(
+            &self.paint_artifact,
+            &self.scroll_offsets,
+            &compositor_overrides,
+        );
+        let can_replay = matches!(layer_action, LayerPaintAction::Replay)
+            && self.retained_layers.recordings_valid()
+            && self.retained_layer_scenes.len() == self.retained_layers.layers.len();
 
         let scale = self.scale_factor as f32;
-        // Blink performs interest-rect prepaint before raster/submit. Do the
-        // same here so a virtual-window swap cannot make the first visible
-        // frame synchronously build every new text display chunk.
-        let display_chunks = self.collect_scroll_interest_display_chunks(&tile_clients);
-        if !display_chunks.is_empty() {
-            self.glyph_cache.prepaint_display_chunks(
-                &display_chunks,
-                &self.font_data,
-                &self.font,
-                Duration::from_micros(1_500),
-            );
+        if !can_replay {
+            let display_chunks = self.collect_scroll_interest_display_chunks(&tile_clients);
+            if !display_chunks.is_empty() {
+                self.glyph_cache.prepaint_display_chunks(
+                    &display_chunks,
+                    &self.font_data,
+                    &self.font,
+                    Duration::from_micros(1_500),
+                );
+            }
         }
 
         let device_handle = &self.render_cx.devices[dev_id];
@@ -3348,38 +3407,86 @@ impl App {
         }
 
         self.scene.reset();
-        {
-            let pipelines = self.gpu_filter_pipelines.as_mut().unwrap();
-            let layer_pool = &mut self.gpu_layer_textures;
-            let output_pool = &mut self.gpu_output_texture_pool;
-            let renderer = self
-                .renderers
-                .get_mut(dev_id)
-                .and_then(|r| r.as_mut())
-                .expect("gpu renderer");
-            let mut filter_ctx = crate::gpu_filter::GpuFilterCtx {
-                device: &device_handle.device,
-                queue: &device_handle.queue,
-                renderer,
-                antialiasing_method: gpu_aa_config(),
-                pipelines,
-                layer_pool,
-                output_pool,
-                scale_factor: scale,
-            };
-            render_gpu::render_frame(
+        if can_replay {
+            self.retained_layers.note_replay();
+            crate::perf::record_paint_path("retained-layer-replay");
+            render_gpu::composite_retained_layers(
                 &mut self.scene,
-                width,
-                height,
-                &render_nodes,
-                &self.font_data,
-                &self.font,
+                &self.retained_layer_scenes,
+                &self.retained_layers.layers,
+                &self.paint_artifact,
                 &scroll_info,
-                &self.text_input_values,
-                self.focused_index,
-                &mut self.glyph_cache,
+                &compositor_overrides,
                 scale,
-                Some(&mut filter_ctx),
+            );
+        } else {
+            let layer_nodes: Vec<
+                Vec<(usize, LayoutRect, &ComponentKind, &w3cos_std::style::Style)>,
+            > = self
+                .retained_layers
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .client_indices
+                        .iter()
+                        .filter_map(|&idx| {
+                            let node = self.paint_artifact.nodes.get(idx)?;
+                            let rect = self
+                                .paint_artifact
+                                .rect_by_index
+                                .get(idx)
+                                .copied()
+                                .flatten()?;
+                            let style = style_overrides.get(&idx).unwrap_or(&node.style);
+                            Some((idx, rect, &node.kind, style))
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut recordings = Vec::with_capacity(layer_nodes.len());
+            {
+                let pipelines = self.gpu_filter_pipelines.as_mut().unwrap();
+                let layer_pool = &mut self.gpu_layer_textures;
+                let output_pool = &mut self.gpu_output_texture_pool;
+                let renderer = self
+                    .renderers
+                    .get_mut(dev_id)
+                    .and_then(|r| r.as_mut())
+                    .expect("gpu renderer");
+                let mut filter_ctx = crate::gpu_filter::GpuFilterCtx {
+                    device: &device_handle.device,
+                    queue: &device_handle.queue,
+                    renderer,
+                    antialiasing_method: gpu_aa_config(),
+                    pipelines,
+                    layer_pool,
+                    output_pool,
+                    scale_factor: scale,
+                };
+                for nodes in &layer_nodes {
+                    recordings.push(render_gpu::record_layer_scene(
+                        nodes,
+                        &self.font_data,
+                        &self.font,
+                        &self.text_input_values,
+                        self.focused_index,
+                        &mut self.glyph_cache,
+                        Some(&mut filter_ctx),
+                    ));
+                }
+            }
+            self.retained_layer_scenes = recordings;
+            self.retained_layers.note_rebuild();
+            crate::perf::record_paint_path("full-scene-rebuild");
+            render_gpu::composite_retained_layers(
+                &mut self.scene,
+                &self.retained_layer_scenes,
+                &self.retained_layers.layers,
+                &self.paint_artifact,
+                &scroll_info,
+                &compositor_overrides,
+                scale,
             );
         }
 
@@ -3411,7 +3518,6 @@ impl App {
             }
         }
 
-        drop(render_nodes);
         drop(style_overrides);
 
         // Cleanup animations
@@ -3477,12 +3583,24 @@ impl App {
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default()),
             );
-            device_handle.queue.submit([encoder.finish()]);
-            surface_texture.present();
+            let screenshot_requested = crate::frame_cache::take_screenshot_request();
+            let plan = render_gpu::gpu_present_plan(screenshot_requested);
+            render_gpu::present_swapchain(&device_handle.queue, encoder, surface_texture);
             presented = true;
             if !self.first_frame_presented {
                 self.first_frame_presented = true;
                 eprintln!("[W3C OS] first frame presented");
+            }
+            if plan.copy_framebuffer_to_cpu {
+                if let Some(rgba) = render_gpu::copy_texture_view_to_cpu(
+                    &device_handle.device,
+                    &device_handle.queue,
+                    &surface.target_view,
+                    width,
+                    height,
+                ) {
+                    crate::frame_cache::store_from_slice(width, height, &rgba);
+                }
             }
             let _ = device_handle.device.poll(wgpu::PollType::Poll);
         }
@@ -3733,6 +3851,8 @@ impl App {
                 )
             })
             .collect();
+        #[cfg(feature = "skia")]
+        let compositor_overrides = CompositorOverrides::from_style_map(&style_overrides);
         #[cfg(all(feature = "skia", target_os = "ios"))]
         let painted_with_skia_metal = skia_backend_requested()
             && self
@@ -3750,6 +3870,8 @@ impl App {
                         self.focused_index,
                         canvas_background,
                         Some(&self.paint_artifact),
+                        Some(&compositor_overrides),
+                        scale,
                     )
                 });
         #[cfg(not(all(feature = "skia", target_os = "ios")))]
@@ -3773,6 +3895,9 @@ impl App {
                             focused_index: self.focused_index,
                             background: canvas_background,
                             artifact: Some(&self.paint_artifact),
+                            retained: None,
+                            compositor_overrides: Some(&compositor_overrides),
+                            scale_factor: scale,
                         },
                     )
                 });
@@ -3798,6 +3923,8 @@ impl App {
                         self.focused_index,
                         canvas_background,
                         Some(&self.paint_artifact),
+                        Some(&compositor_overrides),
+                        scale,
                     )
                 })
                 .is_some_and(|rgba| {
@@ -3916,6 +4043,18 @@ impl App {
                         crate::perf::record_paint_path("full-external-fallback");
                     }
                 }
+                RepaintMode::CompositorOnly => {
+                    render_cpu::render_frame(
+                        &mut pixmap,
+                        &render_nodes,
+                        &self.font,
+                        &scroll_info,
+                        &self.text_input_values,
+                        self.focused_index,
+                        &mut self.cpu.as_mut().unwrap().clip_masks,
+                    );
+                    crate::perf::record_paint_path("full-compositor-cpu");
+                }
                 RepaintMode::Full => {
                     render_cpu::render_frame(
                         &mut pixmap,
@@ -3971,7 +4110,7 @@ impl App {
 
         #[cfg(any(feature = "devtools", feature = "ai-bridge"))]
         {
-            if !direct_skia_present {
+            if !direct_skia_present && crate::frame_cache::take_screenshot_request() {
                 crate::frame_cache::store_from_slice(w, h, pixmap.data());
             }
         }
@@ -4198,7 +4337,7 @@ impl App {
     }
 
     fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
-        let flat = layout::pre_flatten(&self.root);
+        let flat = self.paint_artifact.nodes.as_slice();
         let mut visual_host_fallback = None;
         if flat
             .iter()
@@ -4375,7 +4514,7 @@ impl App {
     }
 
     fn hit_test_scroll(&self, x: f32, y: f32) -> Option<usize> {
-        let flat = layout::pre_flatten(&self.root);
+        let flat = self.paint_artifact.nodes.as_slice();
         let scroll_info = build_scroll_info_fast(
             &self.scroll_ancestor,
             &self.scrollable_nodes,
@@ -5575,6 +5714,9 @@ impl App {
                 handle.poll_and_respond(doc);
             });
         }
+        if crate::frame_cache::screenshot_request_pending() {
+            self.request_repaint();
+        }
     }
 
     #[cfg(feature = "devtools")]
@@ -5977,6 +6119,23 @@ fn replace_virtual_index(component: &mut Component, index: usize) {
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let t = t.clamp(0.0, 1.0);
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+fn paint_nodes_as_flat<'a>(
+    nodes: &'a [PaintNode],
+    dummy_action: &'a EventAction,
+) -> Vec<layout::FlatNodeInfo<'a>> {
+    nodes
+        .iter()
+        .map(|node| layout::FlatNodeInfo {
+            stable_id: 0,
+            kind: &node.kind,
+            style: &node.style,
+            on_click: dummy_action,
+            sticky_counter_signal: node.sticky_counter_signal,
+            parent: node.parent,
+        })
+        .collect()
 }
 
 trait PaintNodeView {

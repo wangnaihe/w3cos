@@ -22,10 +22,10 @@ thread_local! {
 }
 
 fn state_of(value: &Value) -> Option<Rc<RefCell<Vec<Entry>>>> {
-    let Value::Object(object) = value else {
+    let Some(object) = value.as_object() else {
         return None;
     };
-    let Value::Number(id) = object.borrow().get_direct(FORM_DATA_ID) else {
+    let Some(id) = object.borrow().get_direct(FORM_DATA_ID).as_number() else {
         return None;
     };
     STATES.with(|states| states.borrow().get(&(id as u64)).cloned())

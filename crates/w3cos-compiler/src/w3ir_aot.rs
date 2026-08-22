@@ -134,6 +134,49 @@ fn val_index(plan: &EscapePlan, ir: u32) -> u32 {
     val_slot(plan, ir).unwrap_or_else(|| panic!("missing value slot for IR register {ir}"))
 }
 
+fn emit_caught_stmt(
+    stmt: &str,
+    exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
+    plan: &EscapePlan,
+) -> String {
+    let Some((exception, target)) = exception_target else {
+        return stmt.to_string();
+    };
+    format!(
+        "if let Err(__w3cos_exception) = w3cos_core::catch_js(|| {{ {stmt} w3cos_core::Value::Undefined }}) {{ {}; self.block = {}; continue 'drive; }}",
+        store_boxed(plan, exception.0, "__w3cos_exception"),
+        target.0,
+    )
+}
+
+fn emit_caught_value(
+    expr: &str,
+    dst_store: &str,
+    exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
+    plan: &EscapePlan,
+) -> String {
+    match exception_target {
+        None => dst_store.replace("__w3cos_value", expr),
+        Some((exception, target)) => format!(
+            "match w3cos_core::catch_js(|| {expr}) {{ Ok(__w3cos_value) => {{ {dst_store} }} Err(__w3cos_exception) => {{ {}; self.block = {}; continue 'drive; }} }}",
+            store_boxed(plan, exception.0, "__w3cos_exception"),
+            target.0,
+        ),
+    }
+}
+
+fn is_call_like(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::Call { .. }
+            | Instruction::CallWithArguments { .. }
+            | Instruction::CallMethod { .. }
+            | Instruction::CallMethodWithArguments { .. }
+            | Instruction::Construct { .. }
+            | Instruction::ConstructWithArguments { .. }
+    )
+}
+
 fn store_boxed(plan: &EscapePlan, ir: u32, expr: &str) -> String {
     if let Some(slot) = num_slot(plan, ir) {
         format!("self.num_regs[{slot}] = ({expr}).to_number()")
@@ -315,6 +358,50 @@ fn emit_boxed_value(plan: &EscapePlan, register: u32) -> String {
         format!("w3cos_core::Value::Bool(self.bool_regs[{slot}])")
     } else {
         format!("self.registers[{}].clone()", val_index(plan, register))
+    }
+}
+
+fn emit_boxed_use(plan: &EscapePlan, register: u32, take: bool) -> String {
+    if take {
+        if let Some(slot) = val_slot(plan, register) {
+            return format!(
+                "std::mem::replace(&mut self.registers[{slot}], w3cos_core::Value::Undefined)"
+            );
+        }
+    }
+    emit_boxed_value(plan, register)
+}
+
+struct ValueUseEmitter<'a> {
+    plan: &'a EscapePlan,
+    remaining: HashMap<u32, usize>,
+}
+
+impl<'a> ValueUseEmitter<'a> {
+    fn new(
+        plan: &'a EscapePlan,
+        last_uses: &HashSet<u32>,
+        reads: impl IntoIterator<Item = u32>,
+    ) -> Self {
+        let mut remaining = HashMap::new();
+        for register in reads {
+            if last_uses.contains(&register) && val_slot(plan, register).is_some() {
+                *remaining.entry(register).or_insert(0) += 1;
+            }
+        }
+        Self { plan, remaining }
+    }
+
+    fn emit(&mut self, register: u32) -> String {
+        let take = self
+            .remaining
+            .get_mut(&register)
+            .map(|count| {
+                *count -= 1;
+                *count == 0
+            })
+            .unwrap_or(false);
+        emit_boxed_use(self.plan, register, take)
     }
 }
 
@@ -585,6 +672,269 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
     }
 }
 
+fn read_registers(instruction: &Instruction) -> Vec<u32> {
+    match instruction {
+        Instruction::LoadConstant { .. }
+        | Instruction::LoadBinding { .. }
+        | Instruction::RefreshBinding { .. }
+        | Instruction::ImportMeta { .. }
+        | Instruction::CreateClosure { .. }
+        | Instruction::Jump { .. } => Vec::new(),
+        Instruction::Move { src, .. } => vec![src.0],
+        Instruction::InitializeBinding { value, .. } | Instruction::StoreBinding { value, .. } => {
+            vec![value.0]
+        }
+        Instruction::Add { lhs, rhs, .. } | Instruction::Binary { lhs, rhs, .. } => {
+            vec![lhs.0, rhs.0]
+        }
+        Instruction::Unary { value, .. } => vec![value.0],
+        Instruction::GetProperty { object, key, .. }
+        | Instruction::DeleteProperty { object, key, .. } => vec![object.0, key.0],
+        Instruction::SetProperty {
+            object, key, value, ..
+        }
+        | Instruction::DefineField {
+            object, key, value, ..
+        } => vec![object.0, key.0, value.0],
+        Instruction::DefinePrivate {
+            object,
+            brand,
+            name,
+            value,
+            ..
+        } => vec![object.0, brand.0, name.0, value.0],
+        Instruction::GetPrivate {
+            object,
+            brand,
+            name,
+            ..
+        } => vec![object.0, brand.0, name.0],
+        Instruction::SetPrivate {
+            object,
+            brand,
+            name,
+            value,
+            ..
+        } => vec![object.0, brand.0, name.0, value.0],
+        Instruction::HasPrivate { object, brand, .. } => vec![object.0, brand.0],
+        Instruction::DefinePrivateMethod {
+            brand, name, value, ..
+        } => {
+            vec![brand.0, name.0, value.0]
+        }
+        Instruction::DefinePrivateAccessor {
+            brand,
+            name,
+            getter,
+            setter,
+            ..
+        } => {
+            let mut registers = vec![brand.0, name.0];
+            if let Some(getter) = getter {
+                registers.push(getter.0);
+            }
+            if let Some(setter) = setter {
+                registers.push(setter.0);
+            }
+            registers
+        }
+        Instruction::CreateArray { elements, .. } => {
+            elements.iter().map(|element| element.0).collect()
+        }
+        Instruction::AppendArrayElement { array, value, .. } => vec![array.0, value.0],
+        Instruction::AppendIterable {
+            array, iterable, ..
+        } => vec![array.0, iterable.0],
+        Instruction::ArrayRest { value, .. } => vec![value.0],
+        Instruction::ObjectRest {
+            value, excluded, ..
+        } => {
+            let mut registers = vec![value.0];
+            registers.extend(excluded.iter().map(|key| key.0));
+            registers
+        }
+        Instruction::CreateObject { properties, .. } => properties
+            .iter()
+            .flat_map(|(key, value)| [key.0, value.0])
+            .collect(),
+        Instruction::CopyDataProperties { target, source, .. } => vec![target.0, source.0],
+        Instruction::CreateClass {
+            constructor,
+            super_class,
+            initializer,
+            ..
+        } => {
+            let mut registers = vec![constructor.0];
+            if let Some(super_class) = super_class {
+                registers.push(super_class.0);
+            }
+            if let Some(initializer) = initializer {
+                registers.push(initializer.0);
+            }
+            registers
+        }
+        Instruction::Call {
+            callee,
+            this_value,
+            arguments,
+            ..
+        } => {
+            let mut registers = vec![callee.0, this_value.0];
+            registers.extend(arguments.iter().map(|argument| argument.0));
+            registers
+        }
+        Instruction::CallWithArguments {
+            callee,
+            this_value,
+            arguments,
+            ..
+        } => vec![callee.0, this_value.0, arguments.0],
+        Instruction::CallMethod {
+            object,
+            key,
+            arguments,
+            ..
+        } => {
+            let mut registers = vec![object.0, key.0];
+            registers.extend(arguments.iter().map(|argument| argument.0));
+            registers
+        }
+        Instruction::CallMethodWithArguments {
+            object,
+            key,
+            arguments,
+            ..
+        } => vec![object.0, key.0, arguments.0],
+        Instruction::Construct {
+            constructor,
+            arguments,
+            ..
+        } => {
+            let mut registers = vec![constructor.0];
+            registers.extend(arguments.iter().map(|argument| argument.0));
+            registers
+        }
+        Instruction::ConstructWithArguments {
+            constructor,
+            arguments,
+            ..
+        } => vec![constructor.0, arguments.0],
+        Instruction::DynamicImport { specifier, .. } => vec![specifier.0],
+        Instruction::Await { value, .. } | Instruction::Yield { value, .. } => vec![value.0],
+        Instruction::YieldDelegate { iterator, .. } => vec![iterator.0],
+        Instruction::Branch { condition, .. } => vec![condition.0],
+        Instruction::Return { value } | Instruction::Throw { value } => vec![value.0],
+    }
+}
+
+fn control_successors(instruction: &Instruction, function: &Function) -> Vec<BlockId> {
+    match instruction {
+        Instruction::Jump { target } => vec![*target],
+        Instruction::Branch {
+            then_block,
+            else_block,
+            ..
+        } => {
+            if then_block == else_block {
+                vec![*then_block]
+            } else {
+                vec![*then_block, *else_block]
+            }
+        }
+        Instruction::Await { suspension, .. } => function
+            .suspension_points
+            .iter()
+            .find(|point| point.id == *suspension)
+            .map(|point| vec![point.resume_block, point.reject_block])
+            .unwrap_or_default(),
+        Instruction::Yield { suspension, .. } => function
+            .generator_suspension_points
+            .iter()
+            .find(|point| point.id == *suspension)
+            .map(|point| vec![point.resume_block, point.return_block, point.throw_block])
+            .unwrap_or_default(),
+        Instruction::YieldDelegate { suspension, .. } => function
+            .generator_suspension_points
+            .iter()
+            .find(|point| point.id == *suspension)
+            .map(|point| vec![point.resume_block, point.return_block, point.throw_block])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn analyze_live_in(function: &Function) -> HashMap<BlockId, HashSet<u32>> {
+    let mut live_in: HashMap<BlockId, HashSet<u32>> = HashMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in function.blocks.iter().rev() {
+            let mut live = HashSet::new();
+            if let Some(last) = block.instructions.last() {
+                for successor in control_successors(last, function) {
+                    if let Some(incoming) = live_in.get(&successor) {
+                        live.extend(incoming.iter().copied());
+                    }
+                }
+            }
+            if let Some((_, catch)) = exception_target_for_block(function, block.id) {
+                if let Some(incoming) = live_in.get(&catch) {
+                    live.extend(incoming.iter().copied());
+                }
+            }
+            for instruction in block.instructions.iter().rev() {
+                if let Some(dst) = written_register(instruction) {
+                    live.remove(&dst.0);
+                }
+                live.extend(read_registers(instruction));
+            }
+            let slot = live_in.entry(block.id).or_default();
+            if slot != &live {
+                *slot = live;
+                changed = true;
+            }
+        }
+    }
+    live_in
+}
+
+fn last_uses_in_sequence(
+    instructions: &[Instruction],
+    function: &Function,
+    exception_target: Option<(Register, BlockId)>,
+    live_in: &HashMap<BlockId, HashSet<u32>>,
+) -> Vec<HashSet<u32>> {
+    let mut live = HashSet::new();
+    if let Some(last) = instructions.last() {
+        for successor in control_successors(last, function) {
+            if let Some(incoming) = live_in.get(&successor) {
+                live.extend(incoming.iter().copied());
+            }
+        }
+    }
+    if let Some((_, catch)) = exception_target {
+        if let Some(incoming) = live_in.get(&catch) {
+            live.extend(incoming.iter().copied());
+        }
+    }
+    let mut last_uses = vec![HashSet::new(); instructions.len()];
+    for (index, instruction) in instructions.iter().enumerate().rev() {
+        let after = live.clone();
+        if let Some(dst) = written_register(instruction) {
+            live.remove(&dst.0);
+        }
+        let mut dying = HashSet::new();
+        for register in read_registers(instruction) {
+            if !after.contains(&register) {
+                dying.insert(register);
+            }
+            live.insert(register);
+        }
+        last_uses[index] = dying;
+    }
+    last_uses
+}
+
 fn proven_string_keys(instructions: &[Instruction], index: usize) -> HashMap<u32, String> {
     let mut known = HashMap::new();
     for instruction in &instructions[..index] {
@@ -794,7 +1144,6 @@ fn generate_sync_function_with_factories(
             EmissionMode::Sync,
             module_specifier,
             &type_name,
-            false,
             storage,
             &plan,
             &back_edges,
@@ -815,71 +1164,17 @@ fn generate_sync_function_with_factories(
         blocks.push_str(&emitted);
         blocks.push_str("                }\n");
     }
-    let mut exception_handler_groups: Vec<(u32, u32, Vec<u32>)> = Vec::new();
-    for (block_id, _) in &sync_blocks {
-        let exception_target = exception_target_for_block(function, *block_id);
-        if let Some((exception, target)) = exception_target {
-            if let Some((_, _, blocks)) = exception_handler_groups
-                .iter_mut()
-                .find(|(register, handler, _)| *register == exception.0 && *handler == target.0)
-            {
-                blocks.push(block_id.0);
-            } else {
-                exception_handler_groups.push((exception.0, target.0, vec![block_id.0]));
-            }
-        }
-    }
-    let mut exception_handlers = String::new();
-    for (exception, target, mut protected_blocks) in exception_handler_groups {
-        protected_blocks.sort_unstable();
-        exception_handlers.push_str(&format!(
-            "                    {} => {{ {}; self.block = {}; }}\n",
-            compact_block_patterns(&protected_blocks),
-            store_boxed(&plan, exception, "__w3cos_exception"),
-            target,
-        ));
-    }
     let is_direct = direct_body.is_some();
     let run_body = if let Some(direct_body) = &direct_body {
         direct_body.clone()
-    } else if exception_handlers.is_empty() {
+    } else {
         format!(
             r#"
         'drive: loop {{
             match self.block {{
-{blocks}                _ => return w3cos_core::throw_value(
+{blocks}                _ => return Err(
                     w3cos_core::Value::string("invalid synchronous W3IR block")
                 ),
-            }}
-        }}"#
-        )
-    } else {
-        format!(
-            r#"
-        loop {{
-            let __w3cos_outcome = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| {{
-                    'drive: loop {{
-                        match self.block {{
-{blocks}                            _ => return w3cos_core::throw_value(
-                                w3cos_core::Value::string("invalid synchronous W3IR block")
-                            ),
-                        }}
-                    }}
-                }}),
-            );
-            let __w3cos_payload = match __w3cos_outcome {{
-                Ok(__w3cos_value) => return __w3cos_value,
-                Err(__w3cos_payload) => __w3cos_payload,
-            }};
-            let __w3cos_exception =
-                if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {{
-                    value.0.clone()
-                }} else {{
-                    std::panic::resume_unwind(__w3cos_payload);
-                }};
-            match self.block {{
-{exception_handlers}                _ => std::panic::resume_unwind(__w3cos_payload),
             }}
         }}"#
         )
@@ -948,7 +1243,7 @@ struct {type_name} {{
 }}
 
 impl {type_name} {{
-    fn run(&mut self) -> w3cos_core::Value {{
+    fn run(&mut self) -> Result<w3cos_core::Value, w3cos_core::Value> {{
 {run_body}
     }}
 }}
@@ -967,7 +1262,7 @@ pub fn {rust_name}(
         capture_getters,
         capture_setters,
 {block_initializer}
-    }}.run()
+    }}.run().unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))
 }}
 "#,
         registers = plan.n_val,
@@ -1013,7 +1308,6 @@ fn generate_async_function_with_factories(
             EmissionMode::Async,
             module_specifier,
             &type_name,
-            true,
             storage,
             &plan,
             &back_edges,
@@ -1106,10 +1400,10 @@ impl {type_name} {{
         }}
     }}
 
-    fn run(&mut self) -> {type_name}Outcome {{
+    fn run(&mut self) -> Result<{type_name}Outcome, w3cos_core::Value> {{
         'drive: loop {{
             match self.block {{
-{blocks}                _ => return w3cos_core::throw_value(
+{blocks}                _ => return Err(
                     w3cos_core::Value::string("invalid async W3IR block")
                 ),
             }}
@@ -1121,19 +1415,9 @@ impl {type_name} {{
         resolve: w3cos_core::Value,
         reject: w3cos_core::Value,
     ) {{
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
-            frame.borrow_mut().run()
-        }}));
-        let outcome = match outcome {{
+        let outcome = match w3cos_core::catch_js_result(|| frame.borrow_mut().run()) {{
             Ok(outcome) => outcome,
-            Err(payload) => {{
-                let reason = if let Some(value) =
-                    payload.downcast_ref::<w3cos_core::PanicValue>()
-                {{
-                    value.0.clone()
-                }} else {{
-                    std::panic::resume_unwind(payload);
-                }};
+            Err(reason) => {{
                 reject.call(w3cos_core::Value::Undefined, vec![reason]);
                 return;
             }}
@@ -1281,7 +1565,6 @@ fn generate_generator_with_factories(
             EmissionMode::Generator,
             module_specifier,
             &type_name,
-            true,
             storage,
             &plan,
             &back_edges,
@@ -1556,7 +1839,6 @@ fn generate_async_generator_with_factories(
             EmissionMode::AsyncGenerator,
             module_specifier,
             &type_name,
-            true,
             storage,
             &plan,
             &back_edges,
@@ -1776,17 +2058,9 @@ impl {type_name} {{
                 "TypeError: delegated iterator method is not callable"
             ));
         }}
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
-            method.call(iterator.clone(), arguments)
-        }})) {{
+        match w3cos_core::catch_js(|| method.call(iterator.clone(), arguments)) {{
             Ok(value) => Ok(Some(value)),
-            Err(payload) => {{
-                if let Some(value) = payload.downcast_ref::<w3cos_core::PanicValue>() {{
-                    Err(value.0.clone())
-                }} else {{
-                    std::panic::resume_unwind(payload);
-                }}
-            }}
+            Err(value) => Err(value),
         }}
     }}
 
@@ -2053,21 +2327,13 @@ impl {type_name} {{
     }}
 
     fn continue_active(frame: std::rc::Rc<std::cell::RefCell<Self>>) {{
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
+        match w3cos_core::catch_js(|| {{
             frame
                 .borrow_mut()
                 .resume(0, w3cos_core::Value::Undefined)
-        }}));
-        match outcome {{
+        }}) {{
             Ok(outcome) => Self::handle(frame, outcome),
-            Err(payload) => {{
-                let reason = if let Some(value) =
-                    payload.downcast_ref::<w3cos_core::PanicValue>()
-                {{
-                    value.0.clone()
-                }} else {{
-                    std::panic::resume_unwind(payload);
-                }};
+            Err(reason) => {{
                 frame.borrow_mut().state = {type_name}State::Completed;
                 Self::settle_active(frame, false, reason);
             }}
@@ -2088,19 +2354,11 @@ impl {type_name} {{
             frame.active = Some(request);
             (kind, input)
         }};
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
+        match w3cos_core::catch_js(|| {{
             frame.borrow_mut().resume(request.0, request.1)
-        }}));
-        match outcome {{
+        }}) {{
             Ok(outcome) => Self::handle(frame, outcome),
-            Err(payload) => {{
-                let reason = if let Some(value) =
-                    payload.downcast_ref::<w3cos_core::PanicValue>()
-                {{
-                    value.0.clone()
-                }} else {{
-                    std::panic::resume_unwind(payload);
-                }};
+            Err(reason) => {{
                 frame.borrow_mut().state = {type_name}State::Completed;
                 Self::settle_active(frame, false, reason);
             }}
@@ -2258,12 +2516,13 @@ fn emit_block_instructions(
     mode: EmissionMode,
     module_specifier: Option<&str>,
     type_name: &str,
-    wrap_exceptions: bool,
     storage: SlotStorage,
     plan: &EscapePlan,
     back_edges: &UniqueBackEdgePlan,
 ) -> Result<String> {
     let reaching = reaching_number_constants(instructions);
+    let live_in = analyze_live_in(function);
+    let last_uses = last_uses_in_sequence(instructions, function, exception_target, &live_in);
     let emitted = instructions
         .iter()
         .enumerate()
@@ -2281,6 +2540,7 @@ fn emit_block_instructions(
                 plan,
                 back_edges,
                 &reaching[index],
+                &last_uses[index],
             )
             .map(|emitted| match mode {
                 EmissionMode::Async => emitted.replace("__W3COS_ASYNC_FRAME__", type_name),
@@ -2292,64 +2552,21 @@ fn emit_block_instructions(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let protected_end = instructions
-        .iter()
-        .position(|instruction| is_direct_control_flow(instruction, mode))
-        .unwrap_or(instructions.len());
     let mut output = String::new();
-    if wrap_exceptions
-        && let Some((exception, target)) = exception_target
-        && protected_end > 0
-    {
-        output.push_str(
-            "                    let __w3cos_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
-        );
-        for instruction in &emitted[..protected_end] {
-            output.push_str("                        ");
-            output.push_str(instruction);
-            output.push('\n');
-        }
-        output.push_str(
-            "                    }));\n                    if let Err(__w3cos_payload) = __w3cos_outcome {\n                        let __w3cos_exception = if let Some(value) = __w3cos_payload.downcast_ref::<w3cos_core::PanicValue>() {\n                            value.0.clone()\n                        } else {\n                            std::panic::resume_unwind(__w3cos_payload);\n                        };\n",
-        );
-        output.push_str(&format!(
-            "                        {};\n                        self.block = {};\n                        continue 'drive;\n                    }}\n",
-            store_boxed(plan, exception.0, "__w3cos_exception"),
-            target.0,
-        ));
-    } else {
-        for instruction in &emitted[..protected_end] {
-            output.push_str("                    ");
-            output.push_str(instruction);
-            output.push('\n');
-        }
-    }
-    for instruction in &emitted[protected_end..] {
+    for (instruction, emitted) in instructions.iter().zip(&emitted) {
+        let line = if exception_target.is_some()
+            && !is_direct_control_flow(instruction, mode)
+            && !is_call_like(instruction)
+        {
+            emit_caught_stmt(emitted, exception_target, plan)
+        } else {
+            emitted.clone()
+        };
         output.push_str("                    ");
-        output.push_str(instruction);
+        output.push_str(&line);
         output.push('\n');
     }
     Ok(output)
-}
-
-fn compact_block_patterns(blocks: &[u32]) -> String {
-    let mut patterns = Vec::new();
-    let mut index = 0;
-    while index < blocks.len() {
-        let start = blocks[index];
-        let mut end = start;
-        index += 1;
-        while index < blocks.len() && blocks[index] == end + 1 {
-            end = blocks[index];
-            index += 1;
-        }
-        if start == end {
-            patterns.push(start.to_string());
-        } else {
-            patterns.push(format!("{start}..={end}"));
-        }
-    }
-    patterns.join(" | ")
 }
 
 fn is_direct_control_flow(instruction: &Instruction, mode: EmissionMode) -> bool {
@@ -2392,6 +2609,7 @@ fn emit_instruction(
     plan: &EscapePlan,
     back_edges: &UniqueBackEdgePlan,
     reaching_nums: &HashMap<u32, f64>,
+    last_uses: &HashSet<u32>,
 ) -> Result<String> {
     let register = |register: w3cos_ir::Register| val_index(plan, register.0);
     Ok(match instruction {
@@ -2449,17 +2667,17 @@ fn emit_instruction(
         Instruction::Move { dst, src } if num_slot(plan, dst.0).is_some() => format!(
             "self.num_regs[{}] = {}.to_number();",
             num_index(plan, dst.0),
-            emit_boxed_value(plan, src.0)
+            emit_boxed_use(plan, src.0, last_uses.contains(&src.0))
         ),
         Instruction::Move { dst, src } if known_bool(plan, dst.0) => format!(
             "self.bool_regs[{}] = {}.to_bool();",
             bool_index(plan, dst.0),
-            emit_boxed_value(plan, src.0)
+            emit_boxed_use(plan, src.0, last_uses.contains(&src.0))
         ),
         Instruction::Move { dst, src } => format!(
             "self.registers[{}] = {};",
             register(*dst),
-            emit_boxed_value(plan, src.0)
+            emit_boxed_use(plan, src.0, last_uses.contains(&src.0))
         ),
         Instruction::LoadBinding { dst, binding } => format!(
             "self.registers[{}] = if let Some(getter) = {} {{ getter.call(w3cos_core::Value::Undefined, Vec::new()) }} else {{ match {} {{ Some(cell) => {{ let binding = cell.borrow(); if binding.1 {{ binding.0.clone() }} else {{ w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }}, None => w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) }} }};",
@@ -2565,14 +2783,15 @@ fn emit_instruction(
                 format!(
                     "self.registers[{}] = {}.get_property({literal:?});",
                     register(*dst),
-                    emit_boxed_value(plan, object.0),
+                    emit_boxed_use(plan, object.0, last_uses.contains(&object.0)),
                 )
             } else {
+                let mut uses = ValueUseEmitter::new(plan, last_uses, [object.0, key.0]);
                 format!(
                     "self.registers[{}] = w3cos_core::intrinsics::get_property(&{}, &{});",
                     register(*dst),
-                    emit_boxed_value(plan, object.0),
-                    emit_boxed_value(plan, key.0)
+                    uses.emit(object.0),
+                    uses.emit(key.0)
                 )
             }
         }
@@ -2671,7 +2890,7 @@ fn emit_instruction(
             )
         }
         Instruction::CreateArray { dst, elements } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::create_array(vec![{}]);",
+            "self.registers[{}] = w3cos_core::Value::array(vec![{}]);",
             register(*dst),
             elements
                 .iter()
@@ -2709,19 +2928,25 @@ fn emit_instruction(
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Instruction::CreateObject { dst, properties } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::create_object(vec![{}]);",
-            register(*dst),
-            properties
-                .iter()
-                .map(|(key, value)| format!(
-                    "({}, {})",
-                    emit_boxed_value(plan, key.0),
-                    emit_boxed_value(plan, value.0)
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        Instruction::CreateObject { dst, properties } => {
+            let object = if properties.is_empty() {
+                "w3cos_core::Value::object(std::collections::HashMap::new())".into()
+            } else {
+                format!(
+                    "w3cos_core::Value::object(std::collections::HashMap::from([{}]))",
+                    properties
+                        .iter()
+                        .map(|(key, value)| format!(
+                            "({}.to_js_string(), {})",
+                            emit_boxed_value(plan, key.0),
+                            emit_boxed_value(plan, value.0)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            format!("self.registers[{}] = {object};", register(*dst))
+        }
         Instruction::CopyDataProperties { target, source } => format!(
             "w3cos_core::intrinsics::copy_data_properties(&{}, &{});",
             emit_boxed_value(plan, target.0),
@@ -2788,25 +3013,44 @@ fn emit_instruction(
             callee,
             this_value,
             arguments,
-        } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::call(&{}, {}, vec![{}]);",
-            register(*dst),
-            emit_boxed_value(plan, callee.0),
-            emit_boxed_value(plan, this_value.0),
-            emit_arguments(arguments, plan)
-        ),
+        } => {
+            let mut reads = vec![callee.0, this_value.0];
+            reads.extend(arguments.iter().map(|argument| argument.0));
+            let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
+            let expr = format!(
+                "w3cos_core::intrinsics::call(&{}, {}, vec![{}])",
+                uses.emit(callee.0),
+                uses.emit(this_value.0),
+                emit_arguments_from(&mut uses, arguments)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
+            )
+        }
         Instruction::CallWithArguments {
             dst,
             callee,
             this_value,
             arguments,
-        } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::call_with_arguments(&{}, {}, &{});",
-            register(*dst),
-            emit_boxed_value(plan, callee.0),
-            emit_boxed_value(plan, this_value.0),
-            emit_boxed_value(plan, arguments.0)
-        ),
+        } => {
+            let mut uses =
+                ValueUseEmitter::new(plan, last_uses, [callee.0, this_value.0, arguments.0]);
+            let expr = format!(
+                "w3cos_core::intrinsics::call_with_arguments(&{}, {}, &{})",
+                uses.emit(callee.0),
+                uses.emit(this_value.0),
+                uses.emit(arguments.0)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
+            )
+        }
         Instruction::CallMethod {
             dst,
             object,
@@ -2814,19 +3058,35 @@ fn emit_instruction(
             arguments,
         } => {
             if let Some(literal) = proven_strings.get(&key.0) {
-                format!(
-                    "self.registers[{}] = {}.call_method({literal:?}, vec![{}]);",
-                    register(*dst),
-                    emit_boxed_value(plan, object.0),
-                    emit_arguments(arguments, plan)
+                let mut reads = vec![object.0];
+                reads.extend(arguments.iter().map(|argument| argument.0));
+                let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
+                let expr = format!(
+                    "{}.call_method({literal:?}, vec![{}])",
+                    uses.emit(object.0),
+                    emit_arguments_from(&mut uses, arguments)
+                );
+                emit_caught_value(
+                    &expr,
+                    &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                    exception_target,
+                    plan,
                 )
             } else {
-                format!(
-                    "self.registers[{}] = w3cos_core::intrinsics::call_method(&{}, &{}, vec![{}]);",
-                    register(*dst),
-                    emit_boxed_value(plan, object.0),
-                    emit_boxed_value(plan, key.0),
-                    emit_arguments(arguments, plan)
+                let mut reads = vec![object.0, key.0];
+                reads.extend(arguments.iter().map(|argument| argument.0));
+                let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
+                let expr = format!(
+                    "w3cos_core::intrinsics::call_method(&{}, &{}, vec![{}])",
+                    uses.emit(object.0),
+                    uses.emit(key.0),
+                    emit_arguments_from(&mut uses, arguments)
+                );
+                emit_caught_value(
+                    &expr,
+                    &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                    exception_target,
+                    plan,
                 )
             }
         }
@@ -2835,33 +3095,59 @@ fn emit_instruction(
             object,
             key,
             arguments,
-        } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::call_method_with_arguments(&{}, &{}, &{});",
-            register(*dst),
-            emit_boxed_value(plan, object.0),
-            emit_boxed_value(plan, key.0),
-            emit_boxed_value(plan, arguments.0)
-        ),
+        } => {
+            let mut uses = ValueUseEmitter::new(plan, last_uses, [object.0, key.0, arguments.0]);
+            let expr = format!(
+                "w3cos_core::intrinsics::call_method_with_arguments(&{}, &{}, &{})",
+                uses.emit(object.0),
+                uses.emit(key.0),
+                uses.emit(arguments.0)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
+            )
+        }
         Instruction::Construct {
             dst,
             constructor,
             arguments,
-        } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::construct(&{}, vec![{}]);",
-            register(*dst),
-            emit_boxed_value(plan, constructor.0),
-            emit_arguments(arguments, plan)
-        ),
+        } => {
+            let mut reads = vec![constructor.0];
+            reads.extend(arguments.iter().map(|argument| argument.0));
+            let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
+            let expr = format!(
+                "w3cos_core::intrinsics::construct(&{}, vec![{}])",
+                uses.emit(constructor.0),
+                emit_arguments_from(&mut uses, arguments)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
+            )
+        }
         Instruction::ConstructWithArguments {
             dst,
             constructor,
             arguments,
-        } => format!(
-            "self.registers[{}] = w3cos_core::intrinsics::construct_with_arguments(&{}, &{});",
-            register(*dst),
-            emit_boxed_value(plan, constructor.0),
-            emit_boxed_value(plan, arguments.0)
-        ),
+        } => {
+            let mut uses = ValueUseEmitter::new(plan, last_uses, [constructor.0, arguments.0]);
+            let expr = format!(
+                "w3cos_core::intrinsics::construct_with_arguments(&{}, &{})",
+                uses.emit(constructor.0),
+                uses.emit(arguments.0)
+            );
+            emit_caught_value(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                plan,
+            )
+        }
         Instruction::DynamicImport { dst, specifier } => {
             let referrer = module_specifier
                 .ok_or_else(|| anyhow!("dynamic import AOT emission requires its W3IR module"))?;
@@ -2904,13 +3190,23 @@ fn emit_instruction(
                 .iter()
                 .find(|point| point.id == *suspension)
                 .ok_or_else(|| anyhow!("missing W3IR await suspension point"))?;
-            let awaited = format!(
-                "return Self::awaited({}, {}, {}, {});",
-                emit_boxed_value(plan, value.0),
-                register(*dst),
-                point.resume_block.0,
-                point.reject_block.0,
-            );
+            let awaited = if matches!(mode, EmissionMode::Async) {
+                format!(
+                    "return Ok(Self::awaited({}, {}, {}, {}));",
+                    emit_boxed_value(plan, value.0),
+                    register(*dst),
+                    point.resume_block.0,
+                    point.reject_block.0,
+                )
+            } else {
+                format!(
+                    "return Self::awaited({}, {}, {}, {});",
+                    emit_boxed_value(plan, value.0),
+                    register(*dst),
+                    point.resume_block.0,
+                    point.reject_block.0,
+                )
+            };
             if matches!(mode, EmissionMode::Async) {
                 awaited.replace("Self::", "__W3COS_ASYNC_FRAME__::")
             } else {
@@ -2987,9 +3283,9 @@ fn emit_instruction(
                 "self.state = __W3COS_STATE__::Completed; return Self::result({}, true);",
                 emit_boxed_value(plan, value.0)
             ),
-            EmissionMode::Sync => format!("return {};", emit_boxed_value(plan, value.0)),
+            EmissionMode::Sync => format!("return Ok({});", emit_boxed_value(plan, value.0)),
             EmissionMode::Async => format!(
-                "return __W3COS_ASYNC_FRAME__::completed({});",
+                "return Ok(__W3COS_ASYNC_FRAME__::completed({}));",
                 emit_boxed_value(plan, value.0)
             ),
         },
@@ -3006,10 +3302,9 @@ fn emit_instruction(
                         "self.state = __W3COS_STATE__::Completed; return w3cos_core::throw_value({});",
                         emit_boxed_value(plan, value.0)
                     ),
-                    EmissionMode::Sync | EmissionMode::Async => format!(
-                        "return w3cos_core::throw_value({});",
-                        emit_boxed_value(plan, value.0)
-                    ),
+                    EmissionMode::Sync | EmissionMode::Async => {
+                        format!("return Err({});", emit_boxed_value(plan, value.0))
+                    }
                 }
             }
         }
@@ -3164,10 +3459,10 @@ fn unary_intrinsic(operator: UnaryOperator) -> &'static str {
     }
 }
 
-fn emit_arguments(arguments: &[w3cos_ir::Register], plan: &EscapePlan) -> String {
+fn emit_arguments_from(uses: &mut ValueUseEmitter<'_>, arguments: &[w3cos_ir::Register]) -> String {
     arguments
         .iter()
-        .map(|argument| emit_boxed_value(plan, argument.0))
+        .map(|argument| uses.emit(argument.0))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -3826,14 +4121,126 @@ fn main() {{
         let generated = generate_sync_function_from_module(&module, function, "read_aot").unwrap();
 
         assert!(protected_instructions > 1);
-        assert_eq!(
-            generated
-                .matches("let __w3cos_outcome = std::panic::catch_unwind")
-                .count(),
-            1,
-            "one exception boundary should cover all protected blocks in a sync function: {generated}"
+        assert!(
+            !generated.contains("catch_unwind"),
+            "sync try/catch AOT must not emit catch_unwind: {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::catch_js"),
+            "protected calls should match a JS completion: {generated}"
         );
         assert!(generated.contains("match self.block"));
+    }
+
+    #[test]
+    fn emits_js_exceptions_as_result_without_catch_unwind() {
+        let throw_module = crate::w3ir_lowering::lower_script(
+            r#"
+                function boom() {
+                    throw "boom";
+                }
+                boom;
+            "#,
+            "app:///sync-aot-throw.js",
+        )
+        .unwrap();
+        let throw_function = throw_module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("boom"))
+            .unwrap();
+        let throw_generated =
+            generate_sync_function_from_module(&throw_module, throw_function, "boom_aot").unwrap();
+        assert!(
+            !throw_generated.contains("catch_unwind"),
+            "throwing AOT must not emit catch_unwind: {throw_generated}"
+        );
+        assert!(
+            throw_generated.contains("return Err("),
+            "uncaught JS throw should be a Result Err: {throw_generated}"
+        );
+
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function run() {
+                    try {
+                        throw "boom";
+                    } catch (error) {
+                        return error;
+                    }
+                }
+                run;
+            "#,
+            "app:///sync-aot-try-catch-throw.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("run"))
+            .unwrap()
+            .clone();
+        let generated = generate_sync_function_from_module(&module, &function, "run_aot").unwrap();
+        assert!(
+            !generated.contains("catch_unwind"),
+            "try/catch throw AOT must not emit catch_unwind: {generated}"
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("src")).unwrap();
+        let core_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../w3cos-core")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_aot_try_catch_throw_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {:?} }}\n",
+                core_path
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("src/main.rs"),
+            format!(
+                r#"
+{generated}
+fn main() {{
+    println!(
+        "{{}}",
+        run_aot(
+            w3cos_core::Value::Undefined,
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+        .to_js_string(),
+    );
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--manifest-path",
+                fixture.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .env(
+                "CARGO_TARGET_DIR",
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/w3ir-aot-fixtures"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated try/catch throw fixture failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "boom");
     }
 
     #[test]
@@ -3954,6 +4361,10 @@ fn main() {{
             .call(Value::Undefined, vec![Value::Null])
             .to_js_string();
         let generated = generate_sync_function_from_module(&module, &function, "read_aot").unwrap();
+        assert!(
+            !generated.contains("catch_unwind"),
+            "runtime exception try/catch must not emit catch_unwind: {generated}"
+        );
 
         let fixture = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(fixture.path().join("src")).unwrap();
@@ -4110,6 +4521,83 @@ fn main() {{
         assert!(generated.contains("w3cos_core::intrinsics::call_with_arguments"));
         assert!(generated.contains("w3cos_core::intrinsics::call_method_with_arguments"));
         assert!(generated.contains("w3cos_core::intrinsics::construct_with_arguments"));
+        assert!(!generated.contains("w3cos_vm"));
+        assert!(!generated.contains("w3cos_ir"));
+    }
+
+    #[test]
+    fn emits_object_and_array_literals_as_arena_handles() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function build() {
+                    const object = { a: 1 };
+                    const items = [1];
+                    return [object, items];
+                }
+                build;
+            "#,
+            "app:///literal-handles-aot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("build"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "build_aot").unwrap();
+
+        assert!(
+            generated.contains("w3cos_core::Value::object"),
+            "object literals must intern through Value::object: {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::Value::array"),
+            "array literals must intern through Value::array: {generated}"
+        );
+        assert!(
+            !generated.contains("Value::Object(") && !generated.contains("Value::Array("),
+            "object/array literals must not emit Value::Object/Array(Rc::new(...)): {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::Value::object(std::collections::HashMap::new())"),
+            "empty object literals must intern via Value::object(HashMap::new()): {generated}"
+        );
+        assert!(
+            generated.contains("w3cos_core::Value::array(vec!["),
+            "array literals must intern via Value::array(vec![...]): {generated}"
+        );
+        assert!(!generated.contains("w3cos_vm"));
+        assert!(!generated.contains("w3cos_ir"));
+    }
+
+    #[test]
+    fn emits_create_closure_through_value_function_intern() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function build() {
+                    const add = (value) => value + 1;
+                    return add;
+                }
+                build;
+            "#,
+            "app:///closure-handles-aot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("build"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "build_aot").unwrap();
+
+        assert!(
+            generated.contains("w3cos_core::Value::function"),
+            "CreateClosure must intern through Value::function: {generated}"
+        );
+        assert!(
+            !generated.contains("Value::Function("),
+            "CreateClosure must not emit Value::Function(Rc): {generated}"
+        );
         assert!(!generated.contains("w3cos_vm"));
         assert!(!generated.contains("w3cos_ir"));
     }
@@ -4414,6 +4902,238 @@ fn main() {{
                 "Value bank must be smaller than the IR register count: {generated}"
             );
         }
+    }
+
+    fn last_use_fixture(instructions: Vec<Instruction>, registers: u32) -> Function {
+        Function {
+            id: FunctionId(0),
+            name: Some("slice".into()),
+            parameters: Vec::new(),
+            rest_parameter: None,
+            arguments_binding: None,
+            bindings: Vec::new(),
+            captures: Vec::new(),
+            this_binding: None,
+            registers,
+            entry: BlockId(0),
+            blocks: vec![w3cos_ir::Block {
+                id: BlockId(0),
+                instructions,
+                source_span: None,
+            }],
+            exception_regions: Vec::new(),
+            suspension_points: Vec::new(),
+            generator_suspension_points: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            source_span: None,
+        }
+    }
+
+    fn emit_slice(function: &Function) -> String {
+        generate_sync_function_with_factories(function, "slice_aot", &HashMap::new(), None).unwrap()
+    }
+
+    #[test]
+    fn moves_last_use_value_register_instead_of_cloning() {
+        let function = last_use_fixture(
+            vec![
+                Instruction::LoadConstant {
+                    dst: Register(0),
+                    value: Constant::String("hello".into()),
+                },
+                Instruction::Move {
+                    dst: Register(1),
+                    src: Register(0),
+                },
+                Instruction::Return { value: Register(1) },
+            ],
+            2,
+        );
+        let generated = emit_slice(&function);
+        assert!(
+            generated.contains(
+                "std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined)"
+            ),
+            "last-use Move of a Value slot must take instead of clone: {generated}"
+        );
+        assert!(
+            !generated.contains("self.registers[0].clone()"),
+            "last-use Move source must not clone: {generated}"
+        );
+        assert!(
+            generated.contains("self.registers[1] = std::mem::replace"),
+            "Move destination should be assigned from the taken source: {generated}"
+        );
+    }
+
+    #[test]
+    fn takes_last_use_call_argument_instead_of_cloning() {
+        let function = last_use_fixture(
+            vec![
+                Instruction::LoadConstant {
+                    dst: Register(0),
+                    value: Constant::String("callee".into()),
+                },
+                Instruction::LoadConstant {
+                    dst: Register(1),
+                    value: Constant::Undefined,
+                },
+                Instruction::LoadConstant {
+                    dst: Register(2),
+                    value: Constant::String("arg".into()),
+                },
+                Instruction::Call {
+                    dst: Register(3),
+                    callee: Register(0),
+                    this_value: Register(1),
+                    arguments: vec![Register(2)],
+                },
+                Instruction::Return { value: Register(3) },
+            ],
+            4,
+        );
+        let generated = emit_slice(&function);
+        assert!(
+            generated.contains(
+                "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined)]"
+            ) || generated.contains(
+                "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined),"
+            ),
+            "last-use Call argument must be taken, not cloned: {generated}"
+        );
+        assert!(
+            !generated.contains("self.registers[2].clone()"),
+            "last-use Call argument must not clone: {generated}"
+        );
+        assert!(
+            generated.contains(
+                "std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined)"
+            ),
+            "last-use Call callee should also take: {generated}"
+        );
+    }
+
+    #[test]
+    fn takes_last_use_get_property_object_instead_of_cloning() {
+        let function = last_use_fixture(
+            vec![
+                Instruction::LoadConstant {
+                    dst: Register(0),
+                    value: Constant::String("object".into()),
+                },
+                Instruction::LoadConstant {
+                    dst: Register(1),
+                    value: Constant::String("name".into()),
+                },
+                Instruction::GetProperty {
+                    dst: Register(2),
+                    object: Register(0),
+                    key: Register(1),
+                },
+                Instruction::Return { value: Register(2) },
+            ],
+            3,
+        );
+        let generated = emit_slice(&function);
+        assert!(
+            generated.contains(".get_property(\"name\")"),
+            "constant GetProperty key should still peephole: {generated}"
+        );
+        assert!(
+            generated.contains(
+                "std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined).get_property(\"name\")"
+            ),
+            "last-use GetProperty object must take instead of clone: {generated}"
+        );
+        assert!(
+            !generated.contains(".clone().get_property("),
+            "last-use GetProperty object must not clone: {generated}"
+        );
+    }
+
+    #[test]
+    fn clones_value_register_that_is_live_after_use() {
+        let function = last_use_fixture(
+            vec![
+                Instruction::LoadConstant {
+                    dst: Register(0),
+                    value: Constant::String("object".into()),
+                },
+                Instruction::LoadConstant {
+                    dst: Register(1),
+                    value: Constant::String("name".into()),
+                },
+                Instruction::GetProperty {
+                    dst: Register(2),
+                    object: Register(0),
+                    key: Register(1),
+                },
+                Instruction::Move {
+                    dst: Register(3),
+                    src: Register(0),
+                },
+                Instruction::Return { value: Register(3) },
+            ],
+            4,
+        );
+        let generated = emit_slice(&function);
+        assert!(
+            generated.contains("self.registers[0].clone().get_property(\"name\")")
+                || generated.contains("get_property(&self.registers[0].clone()"),
+            "GetProperty object that is live after the use must still clone: {generated}"
+        );
+        assert!(
+            generated.contains("self.registers[3] = std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined)")
+                || generated.contains("self.registers[3] = self.registers[0].clone()"),
+            "later last use of the object may take or clone: {generated}"
+        );
+        assert!(
+            !generated.contains(
+                "std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined).get_property"
+            ),
+            "must not take the object at GetProperty while it is still live: {generated}"
+        );
+    }
+
+    #[test]
+    fn clones_call_callee_that_is_live_after_the_call() {
+        let function = last_use_fixture(
+            vec![
+                Instruction::LoadConstant {
+                    dst: Register(0),
+                    value: Constant::String("callee".into()),
+                },
+                Instruction::LoadConstant {
+                    dst: Register(1),
+                    value: Constant::Undefined,
+                },
+                Instruction::Call {
+                    dst: Register(2),
+                    callee: Register(0),
+                    this_value: Register(1),
+                    arguments: Vec::new(),
+                },
+                Instruction::Return { value: Register(0) },
+            ],
+            3,
+        );
+        let generated = emit_slice(&function);
+        assert!(
+            generated.contains("call(&self.registers[0].clone()")
+                || generated.contains("call(&self.registers[0]"),
+            "expected a Call of the live callee: {generated}"
+        );
+        assert!(
+            generated.contains("self.registers[0].clone()"),
+            "callee used after Call must be cloned at the Call (or kept): {generated}"
+        );
+        assert!(
+            !generated.contains(
+                "call(&std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined)"
+            ),
+            "must not take a callee that is returned later: {generated}"
+        );
     }
 
     fn parse_undefined_vec_len(generated: &str) -> Option<u32> {

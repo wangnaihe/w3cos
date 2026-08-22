@@ -81,7 +81,7 @@ fn create_with_prototype(source: &str, flags: &str, prototype: &Value) -> Value 
     let string_source = display_source(source);
     let string_flags = flags.clone();
     let value = Value::object(HashMap::from([
-        (SOURCE.into(), Value::String(source.into())),
+        (SOURCE.into(), Value::from(source)),
         (FLAGS.into(), Value::from(flags.clone())),
         ("source".into(), Value::from(display_source(source))),
         ("flags".into(), Value::from(flags.clone())),
@@ -177,7 +177,7 @@ pub fn string_match(input: &str, pattern: &Value) -> Option<Value> {
         let matches: Vec<Value> = regex
             .find_iter(input)
             .filter_map(Result::ok)
-            .map(|matched| Value::String(matched.as_str().into()))
+            .map(|matched| Value::from(matched.as_str()))
             .collect();
         return Some(if matches.is_empty() {
             Value::Null
@@ -224,7 +224,7 @@ pub fn string_split(input: &str, pattern: &Value, limit: usize) -> Option<Value>
         let full = captures
             .get(0)
             .expect("captures always include the full match");
-        output.push(Value::String(input[previous_end..full.start()].into()));
+        output.push(Value::from(&input[previous_end..full.start()]));
         if output.len() == limit {
             return Some(Value::array(output));
         }
@@ -232,7 +232,7 @@ pub fn string_split(input: &str, pattern: &Value, limit: usize) -> Option<Value>
             output.push(
                 captures
                     .get(index)
-                    .map(|capture| Value::String(capture.as_str().into()))
+                    .map(|capture| Value::from(capture.as_str()))
                     .unwrap_or(Value::Undefined),
             );
             if output.len() == limit {
@@ -242,7 +242,7 @@ pub fn string_split(input: &str, pattern: &Value, limit: usize) -> Option<Value>
         previous_end = full.end();
     }
     if output.len() < limit {
-        output.push(Value::String(input[previous_end..].into()));
+        output.push(Value::from(&input[previous_end..]));
     }
     Some(Value::array(output))
 }
@@ -345,14 +345,14 @@ pub fn string_replace(input: &str, pattern: &Value, replacement: &Value) -> Opti
                 .map(|index| {
                     captures
                         .get(index)
-                        .map(|capture| Value::String(capture.as_str().into()))
+                        .map(|capture| Value::from(capture.as_str()))
                         .unwrap_or(Value::Undefined)
                 })
                 .collect::<Vec<_>>();
             arguments.push(Value::Number(
                 input[..full.start()].encode_utf16().count() as f64
             ));
-            arguments.push(Value::String(input.into()));
+            arguments.push(Value::from(input));
             let groups = capture_groups(&regex, &captures);
             if !groups.is_undefined() {
                 arguments.push(groups);
@@ -372,7 +372,7 @@ pub fn string_replace(input: &str, pattern: &Value, replacement: &Value) -> Opti
         }
     }
     if !matched {
-        return Some(Value::String(input.into()));
+        return Some(Value::from(input));
     }
     output.push_str(&input[previous_end..]);
     Some(Value::from(output))
@@ -387,7 +387,7 @@ fn capture_groups(regex: &Regex, captures: &fancy_regex::Captures<'_>) -> Value 
                 name.to_string(),
                 captures
                     .name(name)
-                    .map(|matched| Value::String(matched.as_str().into()))
+                    .map(|matched| Value::from(matched.as_str()))
                     .unwrap_or(Value::Undefined),
             )
         })
@@ -624,7 +624,7 @@ fn captures_value(
                 index.to_string(),
                 captures
                     .get(index)
-                    .map(|matched| Value::String(matched.as_str().into()))
+                    .map(|matched| Value::from(matched.as_str()))
                     .unwrap_or(Value::Undefined),
             )
         })
@@ -634,7 +634,7 @@ fn captures_value(
         "index".into(),
         Value::Number(input[..full_match.start()].encode_utf16().count() as f64),
     );
-    properties.insert("input".into(), Value::String(input.into()));
+    properties.insert("input".into(), Value::from(input));
     properties.insert("groups".into(), capture_groups(regex, captures));
     if has_indices {
         properties.insert("indices".into(), capture_indices(regex, input, captures));

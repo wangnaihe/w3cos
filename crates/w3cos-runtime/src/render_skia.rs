@@ -4,27 +4,35 @@
 //! Vello and tiny-skia backends. It does not perform layout or invent native
 //! widget defaults: CSS-derived geometry and style remain the source of truth.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use skia_safe::canvas::SaveLayerRec;
 use skia_safe::{
-    AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, FontStyle,
-    ImageFilter, ImageInfo, MaskFilter, Paint, PathBuilder, RRect, Rect, Surface, TileMode,
-    Typeface, Vector, color_filters, gradient_shader, image_filters, images, paint,
+    AlphaType, BlurStyle, Canvas, Color, Color4f, ColorType, Data, Font, FontMgr, FontStyle, Image,
+    ImageFilter, ImageInfo, MaskFilter, Matrix, Paint, PathBuilder, Picture, PictureRecorder,
+    RRect, Rect, Surface, TileMode, Typeface, Vector, color_filters, gradient_shader,
+    image_filters, images, paint,
 };
 use w3cos_std::SvgPathCommand;
 use w3cos_std::component::ComponentKind;
-use w3cos_std::style::{JustifyContent, Style, TextAlign};
+use w3cos_std::style::{JustifyContent, Style, TextAlign, Transform2D};
 
 use crate::filter::{FilterChain, FilterOp, parse_css_filter};
 use crate::layout::LayoutRect;
 use crate::paint_artifact::PaintArtifact;
+use crate::retained_layers::{
+    CompositorOverrides, LayerPaintAction, RetainedLayerTree, layer_css_transform,
+    layer_opacity as compositor_layer_opacity, layer_scroll_translation,
+};
 use crate::text_layout;
 
 const FONT_FALLBACK_CACHE_CAPACITY: usize = 2048;
 
+const IMAGE_TEXTURE_CACHE_LIMIT: usize = 256;
+
 thread_local! {
+    static SKIA_IMAGES: RefCell<HashMap<usize, Image>> = RefCell::new(HashMap::new());
     /// System font matching is comparatively expensive on Apple platforms.
     /// Cache Skia typeface references for characters missing from the primary
     /// face; this does not copy the underlying system font into application memory.
@@ -41,6 +49,61 @@ thread_local! {
             host_typeface().expect("host Skia font")
         }
     };
+    static SKIA_IMAGE_UPLOADS: Cell<u64> = const { Cell::new(0) };
+    static SKIA_IMAGE_REUSES: Cell<u64> = const { Cell::new(0) };
+}
+
+pub(crate) fn skia_image_upload_count() -> u64 {
+    SKIA_IMAGE_UPLOADS.with(Cell::get)
+}
+
+pub(crate) fn skia_image_reuse_count() -> u64 {
+    SKIA_IMAGE_REUSES.with(Cell::get)
+}
+
+pub(crate) fn reset_image_texture_stats() {
+    SKIA_IMAGE_UPLOADS.with(|count| count.set(0));
+    SKIA_IMAGE_REUSES.with(|count| count.set(0));
+}
+
+pub(crate) fn clear_image_texture_cache() {
+    SKIA_IMAGES.with(|cache| cache.borrow_mut().clear());
+}
+
+pub(crate) fn invalidate_image_texture(pixels_id: usize) {
+    SKIA_IMAGES.with(|cache| {
+        cache.borrow_mut().remove(&pixels_id);
+    });
+}
+
+fn cached_skia_image(decoded: &crate::image_loader::DecodedImage) -> Option<Image> {
+    let pixels_id = decoded.pixels_id();
+    SKIA_IMAGES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(image) = cache.get(&pixels_id) {
+            SKIA_IMAGE_REUSES.with(|count| count.set(count.get().saturating_add(1)));
+            return Some(image.clone());
+        }
+        if cache.len() >= IMAGE_TEXTURE_CACHE_LIMIT {
+            cache.clear();
+        }
+        let pixels = decoded.data.as_slice();
+        let width = decoded.width;
+        let height = decoded.height;
+        if width == 0 || height == 0 || pixels.len() != width as usize * height as usize * 4 {
+            return None;
+        }
+        let info = ImageInfo::new(
+            (width as i32, height as i32),
+            ColorType::RGBA8888,
+            AlphaType::Unpremul,
+            None,
+        );
+        let image = images::raster_from_data(&info, Data::new_copy(pixels), width as usize * 4)?;
+        SKIA_IMAGE_UPLOADS.with(|count| count.set(count.get().saturating_add(1)));
+        cache.insert(pixels_id, image.clone());
+        Some(image)
+    })
 }
 
 fn primary_typeface(font_bytes: &[u8]) -> Option<Typeface> {
@@ -78,6 +141,31 @@ pub(crate) struct ReplayFrame<'a> {
     pub focused_index: Option<usize>,
     pub background: w3cos_std::color::Color,
     pub artifact: Option<&'a PaintArtifact>,
+    pub retained: Option<&'a mut RetainedSkiaCache>,
+    pub compositor_overrides: Option<&'a CompositorOverrides>,
+    pub scale_factor: f32,
+}
+
+#[derive(Default)]
+pub struct RetainedSkiaCache {
+    tree: RetainedLayerTree,
+    pictures: Vec<Picture>,
+}
+
+impl RetainedSkiaCache {
+    pub fn invalidate_recordings(&mut self) {
+        self.tree.invalidate_recordings();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_scene_rebuilds(&self) -> u64 {
+        self.tree.full_scene_rebuilds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compositor_replays(&self) -> u64 {
+        self.tree.compositor_replays
+    }
 }
 
 pub struct SkiaRasterizer {
@@ -85,6 +173,7 @@ pub struct SkiaRasterizer {
     size: (u32, u32),
     rgba: Vec<u8>,
     typeface: Typeface,
+    retained: RetainedSkiaCache,
 }
 
 impl SkiaRasterizer {
@@ -95,6 +184,7 @@ impl SkiaRasterizer {
             size: (0, 0),
             rgba: Vec::new(),
             typeface,
+            retained: RetainedSkiaCache::default(),
         })
     }
 
@@ -105,7 +195,22 @@ impl SkiaRasterizer {
             size: (0, 0),
             rgba: Vec::new(),
             typeface,
+            retained: RetainedSkiaCache::default(),
         })
+    }
+
+    pub fn invalidate_recordings(&mut self) {
+        self.retained.invalidate_recordings();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_rebuilds(&self) -> u64 {
+        self.retained.full_scene_rebuilds()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_replays(&self) -> u64 {
+        self.retained.compositor_replays()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -120,6 +225,8 @@ impl SkiaRasterizer {
         focused_index: Option<usize>,
         background: w3cos_std::color::Color,
         artifact: Option<&PaintArtifact>,
+        compositor_overrides: Option<&CompositorOverrides>,
+        scale_factor: f32,
     ) -> Option<&[u8]> {
         self.ensure_surface(width, height)?;
         let surface = self.surface.as_mut()?;
@@ -134,6 +241,9 @@ impl SkiaRasterizer {
                 focused_index,
                 background,
                 artifact,
+                retained: Some(&mut self.retained),
+                compositor_overrides,
+                scale_factor,
             },
         );
         let expected = width as usize * height as usize * 4;
@@ -161,12 +271,20 @@ impl SkiaRasterizer {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, frame: ReplayFrame<'_>) {
-    canvas.clear(to_skia_color(frame.background, 1.0));
+fn paint_display_list(
+    canvas: &Canvas,
+    typeface: &Typeface,
+    frame: ReplayFrame<'_>,
+    bake_compositor_props: bool,
+) {
+    // Layer recordings must not bake a background clear; composite applies
+    // the canvas background, then opacity / transform / scroll.
+    if bake_compositor_props {
+        canvas.clear(to_skia_color(frame.background, 1.0));
+    }
     let mut active_filters = Vec::new();
     for &(idx, rect, kind, style) in frame.nodes {
-        let filter_path = effect_path(frame.artifact, idx);
+        let filter_path = effect_path(frame.artifact, idx, bake_compositor_props);
         let common = active_filters
             .iter()
             .zip(&filter_path)
@@ -184,7 +302,9 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, frame: ReplayFr
                 continue;
             };
             let mut paint = Paint::default();
-            paint.set_alpha_f(effect.opacity.clamp(0.0, 1.0));
+            if bake_compositor_props {
+                paint.set_alpha_f(effect.opacity.clamp(0.0, 1.0));
+            }
             if let Some(filter) = effect
                 .filter
                 .as_deref()
@@ -248,6 +368,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, frame: ReplayFr
             frame.metrics_font,
             frame.text_input_values.get(&idx).map(String::as_str),
             frame.focused_index == Some(idx),
+            bake_compositor_props,
         );
         if matches!(local_filter, Some(Some(_))) {
             canvas.restore();
@@ -259,6 +380,154 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, frame: ReplayFr
     }
 }
 
+pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: ReplayFrame<'_>) {
+    let retained = frame.retained.take();
+    let overrides = frame.compositor_overrides;
+    let scale_factor = if frame.scale_factor > 0.0 {
+        frame.scale_factor
+    } else {
+        1.0
+    };
+    if let (Some(artifact), Some(cache)) = (frame.artifact, retained) {
+        let mut scrolls = HashMap::new();
+        for (idx, info) in frame.scroll_info.iter().enumerate() {
+            if let Some((sx, sy, _)) = info {
+                scrolls.insert(idx, (*sx, *sy));
+            }
+        }
+        let default_overrides = CompositorOverrides::default();
+        let overrides = overrides.unwrap_or(&default_overrides);
+        let action = cache.tree.sync(artifact, &scrolls, overrides);
+        let can_replay = matches!(action, LayerPaintAction::Replay)
+            && cache.tree.recordings_valid()
+            && cache.pictures.len() == cache.tree.layers.len();
+        if can_replay {
+            cache.tree.note_replay();
+            crate::perf::record_paint_path("retained-layer-replay");
+            composite_skia_layers(
+                canvas,
+                &cache.pictures,
+                &cache.tree.layers,
+                artifact,
+                frame.scroll_info,
+                overrides,
+                frame.background,
+                scale_factor,
+            );
+            return;
+        }
+        let mut pictures = Vec::with_capacity(cache.tree.layers.len());
+        for layer in &cache.tree.layers {
+            let layer_nodes: Vec<_> = frame
+                .nodes
+                .iter()
+                .copied()
+                .filter(|(idx, _, _, _)| layer.client_indices.contains(idx))
+                .collect();
+            let mut recorder = PictureRecorder::new();
+            let bounds = Rect::new(
+                layer.bounds.x * scale_factor - 64.0,
+                layer.bounds.y * scale_factor - 64.0,
+                (layer.bounds.x + layer.bounds.width) * scale_factor + 64.0,
+                (layer.bounds.y + layer.bounds.height) * scale_factor + 64.0,
+            );
+            let recording = recorder.begin_recording(bounds, false);
+            paint_display_list(
+                recording,
+                typeface,
+                ReplayFrame {
+                    nodes: &layer_nodes,
+                    metrics_font: frame.metrics_font,
+                    scroll_info: &[],
+                    text_input_values: frame.text_input_values,
+                    focused_index: frame.focused_index,
+                    background: w3cos_std::color::Color::TRANSPARENT,
+                    artifact: Some(artifact),
+                    retained: None,
+                    compositor_overrides: None,
+                    scale_factor,
+                },
+                false,
+            );
+            if let Some(picture) = recorder.finish_recording_as_picture(None) {
+                pictures.push(picture);
+            }
+        }
+        cache.pictures = pictures;
+        cache.tree.note_rebuild();
+        crate::perf::record_paint_path("full-scene-rebuild");
+        composite_skia_layers(
+            canvas,
+            &cache.pictures,
+            &cache.tree.layers,
+            artifact,
+            frame.scroll_info,
+            overrides,
+            frame.background,
+            scale_factor,
+        );
+        return;
+    }
+    paint_display_list(canvas, typeface, frame, true);
+}
+
+fn compositor_layer_matrix(
+    layer: &crate::retained_layers::CompositorLayer,
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    scale_factor: f32,
+) -> Matrix {
+    let (scroll_x, scroll_y, _) = layer_scroll_translation(layer, scroll_info);
+    let css = layer_css_transform(layer, artifact, overrides);
+    let mut matrix = Matrix::new_identity();
+    if !css.is_identity() {
+        let origin = (layer.bounds.x * scale_factor, layer.bounds.y * scale_factor);
+        matrix.post_translate((-origin.0, -origin.1));
+        if (css.scale_x - 1.0).abs() > f32::EPSILON || (css.scale_y - 1.0).abs() > f32::EPSILON {
+            matrix.post_scale((css.scale_x, css.scale_y), None);
+        }
+        if css.rotate_deg.abs() > f32::EPSILON {
+            matrix.post_rotate(css.rotate_deg, None);
+        }
+        matrix.post_translate((
+            origin.0 + css.translate_x * scale_factor,
+            origin.1 + css.translate_y * scale_factor,
+        ));
+    }
+    matrix.post_translate((scroll_x, scroll_y));
+    matrix
+}
+
+fn composite_skia_layers(
+    canvas: &Canvas,
+    pictures: &[Picture],
+    layers: &[crate::retained_layers::CompositorLayer],
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    background: w3cos_std::color::Color,
+    scale_factor: f32,
+) {
+    canvas.clear(to_skia_color(background, 1.0));
+    for (layer, picture) in layers.iter().zip(pictures) {
+        let (_, _, clip) = layer_scroll_translation(layer, scroll_info);
+        let matrix = compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale_factor);
+        let opacity = compositor_layer_opacity(layer, artifact, overrides);
+        let save = canvas.save();
+        if let Some(clip_rect) = clip {
+            canvas.clip_rect(to_rect(clip_rect), None, Some(false));
+        }
+        if opacity < 0.999 {
+            let mut paint = Paint::default();
+            paint.set_alpha_f(opacity);
+            canvas.save_layer(&SaveLayerRec::default().paint(&paint));
+        }
+        canvas.draw_picture(picture, Some(&matrix), None);
+        canvas.restore_to_count(save);
+    }
+}
+
 #[cfg(target_os = "ios")]
 pub struct SkiaMetalPresenter {
     layer: objc2_06::rc::Retained<objc2_quartz_core::CAMetalLayer>,
@@ -266,6 +535,7 @@ pub struct SkiaMetalPresenter {
         objc2_06::rc::Retained<objc2_06::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
     context: skia_safe::gpu::DirectContext,
     typeface: Typeface,
+    retained: RetainedSkiaCache,
 }
 
 #[cfg(target_os = "ios")]
@@ -316,7 +586,12 @@ impl SkiaMetalPresenter {
             command_queue,
             context,
             typeface,
+            retained: RetainedSkiaCache::default(),
         })
+    }
+
+    pub fn invalidate_recordings(&mut self) {
+        self.retained.invalidate_recordings();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -331,6 +606,8 @@ impl SkiaMetalPresenter {
         focused_index: Option<usize>,
         background: w3cos_std::color::Color,
         artifact: Option<&PaintArtifact>,
+        compositor_overrides: Option<&CompositorOverrides>,
+        scale_factor: f32,
     ) -> bool {
         use objc2_06::rc::Retained;
         use objc2_06::runtime::ProtocolObject;
@@ -371,6 +648,9 @@ impl SkiaMetalPresenter {
                     focused_index,
                     background,
                     artifact,
+                    retained: Some(&mut self.retained),
+                    compositor_overrides,
+                    scale_factor,
                 },
             );
             self.context.flush_and_submit();
@@ -399,8 +679,13 @@ fn render_node(
     metrics_font: &fontdue::Font,
     text_input_value: Option<&str>,
     focused: bool,
+    bake_compositor_props: bool,
 ) {
-    let transform = style.transform;
+    let transform = if bake_compositor_props {
+        style.transform
+    } else {
+        Transform2D::IDENTITY
+    };
     let rect = LayoutRect {
         x: rect.x + transform.translate_x,
         y: rect.y + transform.translate_y,
@@ -608,14 +893,7 @@ fn render_node(
             ..
         } => {
             if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
-                draw_rgba_pixels(
-                    canvas,
-                    rect,
-                    raster.width,
-                    raster.height,
-                    raster.data.as_slice(),
-                    style.opacity,
-                );
+                draw_decoded_image(canvas, rect, &raster, style.opacity);
             }
         }
         ComponentKind::Root
@@ -673,7 +951,11 @@ fn draw_svg_path(
     }
 }
 
-fn effect_path(artifact: Option<&PaintArtifact>, client_index: usize) -> Vec<usize> {
+fn effect_path(
+    artifact: Option<&PaintArtifact>,
+    client_index: usize,
+    bake_compositor_props: bool,
+) -> Vec<usize> {
     let Some(artifact) = artifact else {
         return Vec::new();
     };
@@ -687,7 +969,7 @@ fn effect_path(artifact: Option<&PaintArtifact>, client_index: usize) -> Vec<usi
         let Some(effect) = artifact.properties.effects.get(current) else {
             break;
         };
-        if effect.opacity < 0.999 || effect.filter.is_some() {
+        if effect.filter.is_some() || (bake_compositor_props && effect.opacity < 0.999) {
             path.push(current);
         }
         if effect.parent == current {
@@ -703,14 +985,22 @@ fn draw_image(canvas: &Canvas, rect: LayoutRect, src: &str, opacity: f32) {
     let Some(decoded) = crate::image_loader::get_or_load(src) else {
         return;
     };
-    draw_rgba_pixels(
-        canvas,
-        rect,
-        decoded.width,
-        decoded.height,
-        decoded.data.as_slice(),
-        opacity,
-    );
+    draw_decoded_image(canvas, rect, &decoded, opacity);
+}
+
+fn draw_decoded_image(
+    canvas: &Canvas,
+    rect: LayoutRect,
+    decoded: &crate::image_loader::DecodedImage,
+    opacity: f32,
+) {
+    let Some(image) = cached_skia_image(decoded) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_alpha_f(opacity.clamp(0.0, 1.0));
+    canvas.draw_image_rect(image, None, to_rect(rect), &paint);
 }
 
 fn draw_canvas(canvas: &Canvas, client_index: usize, rect: LayoutRect, opacity: f32) {
@@ -1725,6 +2015,8 @@ mod tests {
                 None,
                 w3cos_std::color::Color::WHITE,
                 None,
+                None,
+                1.0,
             )
             .unwrap();
         let center = (4 * 8 + 4) * 4;
@@ -1754,6 +2046,8 @@ mod tests {
                 None,
                 w3cos_std::color::Color::WHITE,
                 None,
+                None,
+                1.0,
             )
             .unwrap();
         let pixel = &pixels[center..center + 4];
@@ -1803,16 +2097,19 @@ mod tests {
                     kind: parent_kind.clone(),
                     style: parent_style.clone(),
                     parent: None,
+                    sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: red_kind.clone(),
                     style: red_style.clone(),
                     parent: Some(0),
+                    sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: blue_kind.clone(),
                     style: blue_style.clone(),
                     parent: Some(0),
+                    sticky_counter_signal: None,
                 },
             ],
             &[(rects[0], 0), (rects[1], 1), (rects[2], 2)],
@@ -1836,6 +2133,8 @@ mod tests {
                 None,
                 w3cos_std::color::Color::WHITE,
                 Some(&artifact),
+                None,
+                1.0,
             )
             .unwrap();
         let left = &pixels[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 4];
@@ -1880,11 +2179,33 @@ mod tests {
                 None,
                 w3cos_std::color::Color::WHITE,
                 None,
+                None,
+                1.0,
             )
             .unwrap();
         assert!((pixels[0] as i16 - 10).abs() <= 2);
         assert!((pixels[1] as i16 - 20).abs() <= 2);
         assert!(pixels[2] >= 238);
         assert_eq!(pixels[3], 255);
+    }
+
+    #[test]
+    fn skia_image_is_reused_for_unchanged_decoded_pixels() {
+        crate::image_loader::clear_cache();
+        crate::image_loader::reset_cache_stats();
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([12, 34, 56, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let decoded =
+            crate::image_loader::decode_and_install("skia-cache.png", &bytes.into_inner()).unwrap();
+        let first = super::cached_skia_image(&decoded).expect("skia image");
+        let second = super::cached_skia_image(&decoded).expect("skia image");
+        assert_eq!(first.unique_id(), second.unique_id());
+        assert_eq!(skia_image_upload_count(), 1);
+        assert_eq!(skia_image_reuse_count(), 1);
+        crate::image_loader::clear_cache();
+        assert!(super::SKIA_IMAGES.with(|cache| cache.borrow().is_empty()));
     }
 }

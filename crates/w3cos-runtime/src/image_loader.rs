@@ -1,5 +1,6 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::Read as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,9 +20,59 @@ pub struct DecodedImage {
     pub data: Arc<Vec<u8>>,
 }
 
+impl DecodedImage {
+    /// Identity of the decoded pixel buffer. GPU/Skia texture caches key off
+    /// this so a reused `Arc` keeps a stable Vello blob id / Skia image.
+    pub(crate) fn pixels_id(&self) -> usize {
+        Arc::as_ptr(&self.data) as usize
+    }
+}
+
 thread_local! {
     static CACHE: RefCell<HashMap<String, Option<DecodedImage>>> = RefCell::new(HashMap::new());
+    static FINGERPRINTS: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
     static ANIMATIONS: RefCell<HashMap<String, AnimatedImage>> = RefCell::new(HashMap::new());
+    static DECODE_COUNT: Cell<u64> = const { Cell::new(0) };
+    static CACHE_HITS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn record_decode() {
+    DECODE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+fn record_hit() {
+    CACHE_HITS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+pub(crate) fn decode_count() -> u64 {
+    DECODE_COUNT.with(Cell::get)
+}
+
+pub(crate) fn cache_hit_count() -> u64 {
+    CACHE_HITS.with(Cell::get)
+}
+
+pub(crate) fn reset_cache_stats() {
+    DECODE_COUNT.with(|count| count.set(0));
+    CACHE_HITS.with(|count| count.set(0));
+    #[cfg(feature = "gpu")]
+    crate::render_gpu::reset_image_texture_stats();
+    #[cfg(feature = "skia")]
+    crate::render_skia::reset_image_texture_stats();
+}
+
+fn source_fingerprint(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cached_decoded_if_fingerprint(src: &str, fingerprint: u64) -> Option<DecodedImage> {
+    let matches = FINGERPRINTS.with(|fps| fps.borrow().get(src).copied() == Some(fingerprint));
+    if !matches {
+        return None;
+    }
+    CACHE.with(|cache| cache.borrow().get(src).and_then(Option::clone))
 }
 
 #[derive(Clone)]
@@ -40,9 +91,13 @@ struct AnimatedImage {
 
 pub fn get_or_load(src: &str) -> Option<DecodedImage> {
     if let Some(frame) = current_animation_frame(src) {
+        record_hit();
         return Some(frame);
     }
     if let Some(entry) = CACHE.with(|cache| cache.borrow().get(src).cloned()) {
+        if entry.is_some() {
+            record_hit();
+        }
         return entry;
     }
     let result = load_from_source(src);
@@ -57,9 +112,15 @@ pub fn get_or_load(src: &str) -> Option<DecodedImage> {
 /// string, so relative image URLs do not trigger a second renderer-owned
 /// network request after the Browser loader has resolved them.
 pub(crate) fn decode_and_install(src: &str, bytes: &[u8]) -> Result<DecodedImage, String> {
+    let fingerprint = source_fingerprint(bytes);
+    if let Some(decoded) = cached_decoded_if_fingerprint(src, fingerprint) {
+        record_hit();
+        return Ok(decoded);
+    }
+    record_decode();
     if looks_like_svg(bytes) {
         let decoded = decode_svg(bytes)?;
-        install_decoded(src, decoded.clone());
+        install_decoded_bytes(src, decoded.clone(), fingerprint);
         return Ok(decoded);
     }
     if let Ok(frames) = decode_gif_frames(bytes)
@@ -97,7 +158,7 @@ pub(crate) fn decode_and_install(src: &str, bytes: &[u8]) -> Result<DecodedImage
                 },
             );
         });
-        install_decoded(src, decoded.clone());
+        install_decoded_bytes(src, decoded.clone(), fingerprint);
         return Ok(decoded);
     }
     let image = image::load_from_memory(bytes).map_err(|error| error.to_string())?;
@@ -112,13 +173,20 @@ pub(crate) fn decode_and_install(src: &str, bytes: &[u8]) -> Result<DecodedImage
         intrinsic_height: rgba.height(),
         data: Arc::new(rgba.into_raw()),
     };
-    install_decoded(src, decoded.clone());
+    install_decoded_bytes(src, decoded.clone(), fingerprint);
     Ok(decoded)
 }
 
 fn install_decoded(src: &str, decoded: DecodedImage) {
     CACHE.with(|cache| {
         cache.borrow_mut().insert(src.to_string(), Some(decoded));
+    });
+}
+
+fn install_decoded_bytes(src: &str, decoded: DecodedImage, fingerprint: u64) {
+    install_decoded(src, decoded);
+    FINGERPRINTS.with(|fps| {
+        fps.borrow_mut().insert(src.to_string(), fingerprint);
     });
 }
 
@@ -243,12 +311,50 @@ pub(crate) fn reserve_browser_source(src: &str) {
 }
 
 pub(crate) fn invalidate(src: &str) {
+    let pixels_ids = cached_pixels_ids(src);
     CACHE.with(|cache| {
         cache.borrow_mut().remove(src);
+    });
+    FINGERPRINTS.with(|fps| {
+        fps.borrow_mut().remove(src);
     });
     ANIMATIONS.with(|animations| {
         animations.borrow_mut().remove(src);
     });
+    for pixels_id in pixels_ids {
+        drop_renderer_texture(pixels_id);
+    }
+}
+
+fn cached_pixels_ids(src: &str) -> Vec<usize> {
+    let mut ids = Vec::new();
+    CACHE.with(|cache| {
+        if let Some(Some(image)) = cache.borrow().get(src) {
+            ids.push(image.pixels_id());
+        }
+    });
+    ANIMATIONS.with(|animations| {
+        if let Some(animation) = animations.borrow().get(src) {
+            for frame in &animation.frames {
+                ids.push(Arc::as_ptr(&frame.data) as usize);
+            }
+        }
+    });
+    ids
+}
+
+fn drop_renderer_texture(pixels_id: usize) {
+    #[cfg(feature = "gpu")]
+    crate::render_gpu::invalidate_image_texture(pixels_id);
+    #[cfg(feature = "skia")]
+    crate::render_skia::invalidate_image_texture(pixels_id);
+}
+
+fn drop_all_renderer_textures() {
+    #[cfg(feature = "gpu")]
+    crate::render_gpu::clear_image_texture_cache();
+    #[cfg(feature = "skia")]
+    crate::render_skia::clear_image_texture_cache();
 }
 
 /// Return the sources from CSS `url(...)` image layers in paint order.
@@ -368,7 +474,9 @@ pub(crate) fn absolutize_css_urls(source: &str, base: &url::Url) -> String {
 /// Drop decoded images that can be recreated from their source.
 pub fn clear_cache() {
     CACHE.with(|cache| cache.borrow_mut().clear());
+    FINGERPRINTS.with(|fps| fps.borrow_mut().clear());
     ANIMATIONS.with(|animations| animations.borrow_mut().clear());
+    drop_all_renderer_textures();
 }
 
 #[cfg(test)]
@@ -454,6 +562,39 @@ mod tests {
             ),
             ".hero { background-image: url('https://example.test/css/images/hero.png'); }"
         );
+    }
+
+    #[test]
+    fn decode_once_is_reused_across_paints_of_the_same_src() {
+        clear_cache();
+        reset_cache_stats();
+        let bytes = png_2x1();
+        decode_and_install("cache/pixel.png", &bytes).unwrap();
+        assert_eq!(decode_count(), 1);
+        assert_eq!(cache_hit_count(), 0);
+
+        let first = get_or_load("cache/pixel.png").expect("decoded");
+        let second = get_or_load("cache/pixel.png").expect("decoded");
+        assert_eq!(decode_count(), 1);
+        assert_eq!(cache_hit_count(), 2);
+        assert_eq!(first.pixels_id(), second.pixels_id());
+        assert!(std::sync::Arc::ptr_eq(&first.data, &second.data));
+
+        decode_and_install("cache/pixel.png", &bytes).unwrap();
+        assert_eq!(decode_count(), 1);
+        assert!(cache_hit_count() >= 3);
+
+        let other = {
+            let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+            let mut bytes = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        decode_and_install("cache/pixel.png", &other).unwrap();
+        assert_eq!(decode_count(), 2);
+        clear_cache();
     }
 }
 

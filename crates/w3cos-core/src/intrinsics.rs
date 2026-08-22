@@ -199,10 +199,11 @@ pub fn create_object(properties: Vec<(Value, Value)>) -> Value {
 /// without invoking inherited setters on the destination.
 pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
     let keys = match source {
-        Value::Undefined | Value::Null => Vec::new(),
-        Value::Object(object) => {
+        _ if source.is_nullish() => Vec::new(),
+        _ if source.as_object().is_some() => {
+            let object = source.as_object().expect("object");
             let own_keys = object.borrow().own_keys();
-            let Value::Array(keys) = own_keys else {
+            let Some(keys) = own_keys.as_array() else {
                 return target.clone();
             };
             keys.borrow()
@@ -210,22 +211,29 @@ pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
                 .map(Value::to_js_string)
                 .collect::<Vec<_>>()
         }
-        Value::Array(values) => values
+        _ if source.as_array().is_some() => source
+            .as_array()
+            .expect("array")
             .borrow()
             .iter()
             .enumerate()
             .filter(|(_, value)| !crate::value::is_array_hole(value))
             .map(|(index, _)| index.to_string())
             .collect(),
-        Value::String(value) => (0..value.encode_utf16().count())
-            .map(|index| index.to_string())
-            .collect(),
-        Value::Function(function) => function
+        _ if source.is_string() => {
+            let value = source.as_js_string().expect("string");
+            (0..value.encode_utf16().count())
+                .map(|index| index.to_string())
+                .collect()
+        }
+        _ if source.as_function().is_some() => source
+            .as_function()
+            .expect("function")
             .keys()
             .into_iter()
             .filter(|key| key != "prototype")
             .collect(),
-        Value::Bool(_) | Value::Number(_) => Vec::new(),
+        _ => Vec::new(),
     };
 
     let mut seen = HashSet::new();
@@ -238,7 +246,7 @@ pub fn copy_data_properties(target: &Value, source: &Value) -> Value {
         if !seen.insert(key.clone()) {
             continue;
         }
-        if let Value::Object(object) = source {
+        if let Some(object) = source.as_object() {
             let descriptor = object.borrow().get_own_property_descriptor(&key);
             if descriptor.is_undefined() || !descriptor.get_property("enumerable").to_bool() {
                 continue;
@@ -255,7 +263,7 @@ pub fn create_array(elements: Vec<Value>) -> Value {
 }
 
 pub fn append_array_element(array: &Value, value: Value) -> Value {
-    let Value::Array(elements) = array else {
+    let Some(elements) = array.as_array() else {
         crate::throw_value(Value::string(
             "TypeError: array construction target is not an array",
         ));
@@ -287,7 +295,7 @@ pub fn object_rest(value: &Value, excluded: &[Value]) -> Value {
 }
 
 pub fn for_in_keys(value: &Value) -> Value {
-    if let Value::Array(values) = value {
+    if let Some(values) = value.as_array() {
         return Value::array(
             values
                 .borrow()
@@ -302,7 +310,7 @@ pub fn for_in_keys(value: &Value) -> Value {
     let mut seen_keys = HashSet::new();
     let mut seen_objects = HashSet::new();
     let mut current = value.clone();
-    while let Value::Object(object) = current {
+    while let Some(object) = current.as_object() {
         if !seen_objects.insert(std::rc::Rc::as_ptr(&object) as usize) {
             break;
         }
@@ -337,7 +345,7 @@ pub fn call(callee: &Value, this_value: Value, arguments: Vec<Value>) -> Value {
 }
 
 fn materialized_arguments(arguments: &Value) -> Vec<Value> {
-    let Value::Array(arguments) = arguments else {
+    let Some(arguments) = arguments.as_array() else {
         crate::throw_value(crate::value::type_error(
             "materialized call arguments are not an array",
         ));
@@ -538,12 +546,13 @@ mod tests {
         );
 
         let awaited = await_value(&Value::Number(42.0));
-        assert!(matches!(
-            crate::promise::status(&awaited),
-            Some(crate::promise::PromiseStatus::Fulfilled(Value::Number(
-                42.0
-            )))
-        ));
+        assert_eq!(
+            crate::promise::status(&awaited).and_then(|status| match status {
+                crate::promise::PromiseStatus::Fulfilled(value) => value.as_number(),
+                _ => None,
+            }),
+            Some(42.0)
+        );
     }
 
     #[test]

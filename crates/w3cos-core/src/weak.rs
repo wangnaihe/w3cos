@@ -22,9 +22,19 @@ enum WeakValue {
 impl WeakValue {
     fn new(value: &Value) -> Option<Self> {
         match value {
-            Value::Array(value) => Some(Self::Array(Rc::downgrade(value))),
-            Value::Object(value) => Some(Self::Object(Rc::downgrade(value))),
-            Value::Function(value) => Some(Self::Function(value.downgrade())),
+            _ if value.as_array().is_some() => {
+                Some(Self::Array(Rc::downgrade(
+                    &value.as_array().expect("array"),
+                )))
+            }
+            _ if value.as_object().is_some() => {
+                Some(Self::Object(Rc::downgrade(
+                    &value.as_object().expect("object"),
+                )))
+            }
+            _ if value.as_function().is_some() => Some(Self::Function(
+                value.as_function().expect("function").downgrade(),
+            )),
             _ => None,
         }
     }
@@ -94,10 +104,10 @@ fn next_id() -> u64 {
 }
 
 fn state_id(value: &Value) -> Option<u64> {
-    match value.get_property(STATE_KEY) {
-        Value::Number(id) => Some(id as u64),
-        _ => None,
-    }
+    value
+        .get_property(STATE_KEY)
+        .as_number()
+        .map(|id| id as u64)
 }
 
 fn instance(proto: &Value) -> Value {
@@ -467,7 +477,8 @@ mod tests {
     fn weak_map_and_set_do_not_keep_object_keys_alive() {
         let map = construct(&weak_map_class(), vec![]);
         let set = construct(&weak_set_class(), vec![]);
-        let key = Value::object(HashMap::new());
+        // Host Rc object: page-local arena objects stay pinned until reset.
+        let key = Value::Object(Rc::new(RefCell::new(crate::JsObject::new())));
         let weak = match &key {
             Value::Object(value) => Rc::downgrade(value),
             _ => unreachable!(),
@@ -487,7 +498,10 @@ mod tests {
 
     #[test]
     fn weak_ref_deref_releases_target() {
-        let target = Value::array(vec![Value::Number(1.0)]);
+        // Host Rc array: page-local arena arrays stay pinned until reset.
+        let target = Value::Array(Rc::new(RefCell::new(ArrayStorage::new(vec![
+            Value::Number(1.0),
+        ]))));
         let reference = construct(&weak_ref_class(), vec![target.clone()]);
         assert_eq!(reference.call_method("deref", vec![]), target);
         drop(target);
@@ -505,7 +519,7 @@ mod tests {
                 Value::Undefined
             })],
         );
-        let target = Value::object(HashMap::new());
+        let target = Value::Object(Rc::new(RefCell::new(crate::JsObject::new())));
         registry.call_method("register", vec![target.clone(), Value::string("shipment")]);
         drop(target);
         registry.call_method("cleanupSome", vec![]);

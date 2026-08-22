@@ -22,7 +22,7 @@ use skia_safe::gpu::{
 use skia_safe::{ColorType, FontMgr, Typeface};
 use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
-use super::render_skia::{ReplayFrame, replay_frame};
+use super::render_skia::{ReplayFrame, RetainedSkiaCache, replay_frame};
 
 const FRAMES_IN_FLIGHT: usize = 2;
 const MOBILE_SKIA_RESOURCE_CACHE_BYTES: usize = 32 * 1024 * 1024;
@@ -53,6 +53,7 @@ pub struct SkiaVulkanPresenter {
     context: Option<gpu::DirectContext>,
     typeface: Typeface,
     swapchain_dirty: bool,
+    retained: RetainedSkiaCache,
 }
 
 impl SkiaVulkanPresenter {
@@ -215,6 +216,7 @@ impl SkiaVulkanPresenter {
             context: Some(context),
             typeface,
             swapchain_dirty: true,
+            retained: RetainedSkiaCache::default(),
         };
         presenter.create_frame_sync()?;
         let size = window.inner_size();
@@ -370,6 +372,10 @@ impl SkiaVulkanPresenter {
         skia_safe::graphics::purge_all_caches();
     }
 
+    pub fn invalidate_recordings(&mut self) {
+        self.retained.invalidate_recordings();
+    }
+
     pub fn render_frame(&mut self, width: u32, height: u32, frame: ReplayFrame<'_>) -> bool {
         let result = unsafe { self.render_frame_inner(width, height, frame) };
         match result {
@@ -478,7 +484,34 @@ impl SkiaVulkanPresenter {
             None,
         )
         .ok_or_else(|| "wrap Android swapchain image for Skia".to_string())?;
-        replay_frame(surface.canvas(), &self.typeface, frame);
+        let ReplayFrame {
+            nodes,
+            metrics_font,
+            scroll_info,
+            text_input_values,
+            focused_index,
+            background,
+            artifact,
+            compositor_overrides,
+            scale_factor,
+            retained: _,
+        } = frame;
+        replay_frame(
+            surface.canvas(),
+            &self.typeface,
+            ReplayFrame {
+                nodes,
+                metrics_font,
+                scroll_info,
+                text_input_values,
+                focused_index,
+                background,
+                artifact,
+                retained: Some(&mut self.retained),
+                compositor_overrides,
+                scale_factor,
+            },
+        );
         let present_state = skia_vk::mutable_texture_states::new_vulkan(
             skia_vk::ImageLayout::PRESENT_SRC_KHR,
             self.queue_family,

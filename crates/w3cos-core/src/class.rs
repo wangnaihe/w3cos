@@ -93,7 +93,7 @@ pub fn create_class_with_initializer(
     if let Some(parent) = super_class {
         set_prototype_of(&class, parent);
     }
-    if let Value::Object(object) = &class {
+    if let Some(object) = class.as_object() {
         let mut object = object.borrow_mut();
         object.class_brand = Some(brand_id);
         object.private_brands.insert(brand_id);
@@ -110,23 +110,22 @@ pub fn create_class_with_initializer(
 /// function itself returns an object. Anything else yields `Undefined`
 /// (JS would throw a TypeError; the runtime stays total).
 pub fn construct(class_value: &Value, args: Vec<Value>) -> Value {
-    match class_value {
-        Value::Object(_) => class_value.call(Value::Undefined, args),
-        Value::Function(function) => {
-            let instance = Value::object(HashMap::new());
-            let prototype = class_value.get_property("prototype");
-            if prototype.is_object() {
-                set_prototype_of(&instance, &prototype);
-            }
-            let result = function.call(instance.clone(), args);
-            if result.is_object() || result.is_array() || result.is_function() {
-                result
-            } else {
-                instance
-            }
-        }
-        _ => Value::Undefined,
+    if class_value.as_object().is_some() {
+        return class_value.call(Value::Undefined, args);
     }
+    if let Some(function) = class_value.as_function() {
+        let instance = Value::object(HashMap::new());
+        let prototype = class_value.get_property("prototype");
+        if prototype.is_object() {
+            set_prototype_of(&instance, &prototype);
+        }
+        let result = function.call(instance.clone(), args);
+        if result.is_object() || result.is_array() || result.is_function() {
+            return result;
+        }
+        return instance;
+    }
+    Value::Undefined
 }
 
 /// `obj instanceof X` — walk `obj`'s prototype chain looking for identity
@@ -135,24 +134,21 @@ pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
     if crate::binary::typed_array_instance_of(obj, class_value) {
         return true;
     }
-    let target = match class_value.get_property("prototype") {
-        Value::Object(target) => target,
-        _ => return false,
+    let Some(target) = class_value.get_property("prototype").as_object() else {
+        return false;
     };
-    let mut current = match obj {
-        Value::Object(object) => object.borrow().get_prototype_of(),
-        _ => return false,
+    let Some(object) = obj.as_object() else {
+        return false;
     };
+    let mut current = object.borrow().get_prototype_of();
     loop {
-        match current {
-            Value::Object(object) => {
-                if Rc::ptr_eq(&object, &target) {
-                    return true;
-                }
-                current = object.borrow().get_prototype_of();
-            }
-            _ => return false,
+        let Some(object) = current.as_object() else {
+            return false;
+        };
+        if Rc::ptr_eq(&object, &target) {
+            return true;
         }
+        current = object.borrow().get_prototype_of();
     }
 }
 
@@ -167,7 +163,7 @@ pub fn super_ctor(this: &Value, parent_class: &Value, args: Vec<Value>) -> Value
 }
 
 fn queue_class_initializer(this: &Value, brand: u64, class: Value, initializer: Value) {
-    if let Value::Object(object) = this {
+    if let Some(object) = this.as_object() {
         let mut object = object.borrow_mut();
         object
             .pending_class_initializers
@@ -177,10 +173,9 @@ fn queue_class_initializer(this: &Value, brand: u64, class: Value, initializer: 
 }
 
 fn run_pending_class_initializer(this: &Value) {
-    let pending = match this {
-        Value::Object(object) => object.borrow_mut().pending_class_initializers.pop(),
-        _ => None,
-    };
+    let pending = this.as_object().and_then(|object| {
+        object.borrow_mut().pending_class_initializers.pop()
+    });
     if let Some((brand, class, initializer)) = pending {
         install_private_brand(this, brand);
         if !initializer.is_undefined() {
@@ -190,7 +185,7 @@ fn run_pending_class_initializer(this: &Value) {
 }
 
 fn install_private_brand(receiver: &Value, brand: u64) {
-    if let Value::Object(object) = receiver {
+    if let Some(object) = receiver.as_object() {
         let mut object = object.borrow_mut();
         object.private_brands.insert(brand);
         object.refresh_heap_accounting();
@@ -198,20 +193,16 @@ fn install_private_brand(receiver: &Value, brand: u64) {
 }
 
 fn brand_id(brand: &Value) -> Option<u64> {
-    match brand {
-        Value::Object(object) => object.borrow().class_brand,
-        _ => None,
-    }
+    brand.as_object().and_then(|object| object.borrow().class_brand)
 }
 
 fn require_private_brand(receiver: &Value, brand: &Value, name: &str) -> u64 {
     let Some(brand_id) = brand_id(brand) else {
         private_brand_error(name)
     };
-    let has_brand = match receiver {
-        Value::Object(object) => object.borrow().private_brands.contains(&brand_id),
-        _ => false,
-    };
+    let has_brand = receiver
+        .as_object()
+        .is_some_and(|object| object.borrow().private_brands.contains(&brand_id));
     if !has_brand {
         private_brand_error(name);
     }
@@ -230,7 +221,7 @@ fn private_brand_error(name: &str) -> ! {
 /// Installs a private field in an object's unobservable internal slot table.
 pub fn define_private_field(receiver: &Value, brand: &Value, name: &str, value: Value) {
     let brand_id = require_private_brand(receiver, brand, name);
-    if let Value::Object(object) = receiver {
+    if let Some(object) = receiver.as_object() {
         let mut object = object.borrow_mut();
         object
             .private_elements
@@ -242,7 +233,7 @@ pub fn define_private_field(receiver: &Value, brand: &Value, name: &str, value: 
 /// Installs a shared private method on the class brand object.
 pub fn define_private_method(brand: &Value, name: &str, method: Value) {
     let brand_id = require_private_brand(brand, brand, name);
-    if let Value::Object(object) = brand {
+    if let Some(object) = brand.as_object() {
         let mut object = object.borrow_mut();
         object
             .private_elements
@@ -259,7 +250,7 @@ pub fn define_private_accessor(
     setter: Option<Value>,
 ) {
     let brand_id = require_private_brand(brand, brand, name);
-    if let Value::Object(object) = brand {
+    if let Some(object) = brand.as_object() {
         let mut object = object.borrow_mut();
         let key = (brand_id, name.to_string());
         let (old_getter, old_setter) = match object.private_elements.remove(&key) {
@@ -279,12 +270,12 @@ pub fn define_private_accessor(
 
 fn private_element(receiver: &Value, brand: &Value, brand_id: u64, name: &str) -> PrivateElement {
     let key = (brand_id, name.to_string());
-    if let Value::Object(object) = receiver {
+    if let Some(object) = receiver.as_object() {
         if let Some(element) = object.borrow().private_elements.get(&key) {
             return element.clone();
         }
     }
-    if let Value::Object(object) = brand {
+    if let Some(object) = brand.as_object() {
         if let Some(element) = object.borrow().private_elements.get(&key) {
             return element.clone();
         }
@@ -307,7 +298,7 @@ pub fn get_private(receiver: &Value, brand: &Value, name: &str) -> Value {
 pub fn set_private(receiver: &Value, brand: &Value, name: &str, value: Value) -> Value {
     let brand_id = require_private_brand(receiver, brand, name);
     let key = (brand_id, name.to_string());
-    if let Value::Object(object) = receiver {
+    if let Some(object) = receiver.as_object() {
         let is_field = matches!(
             object.borrow().private_elements.get(&key),
             Some(PrivateElement::Field(_))
@@ -337,10 +328,9 @@ pub fn has_private(receiver: &Value, brand: &Value) -> bool {
     let Some(brand_id) = brand_id(brand) else {
         return false;
     };
-    match receiver {
-        Value::Object(object) => object.borrow().private_brands.contains(&brand_id),
-        _ => false,
-    }
+    receiver
+        .as_object()
+        .is_some_and(|object| object.borrow().private_brands.contains(&brand_id))
 }
 
 /// `super.method(...)` in an instance method: look up `name` on the parent
@@ -398,23 +388,21 @@ pub fn static_super_set(this: &Value, parent_class: &Value, name: &str, value: V
 }
 
 fn get_with_receiver(target: &Value, receiver: &Value, name: &str) -> Value {
-    match target {
-        Value::Object(object) => {
-            let direct = object.borrow().get(name, receiver);
-            if !direct.is_undefined() {
-                return direct;
-            }
-            let getter = object
-                .borrow()
-                .get(&format!("__w3cos_getter_{name}"), receiver);
-            getter.call(receiver.clone(), vec![])
-        }
-        _ => Value::Undefined,
+    let Some(object) = target.as_object() else {
+        return Value::Undefined;
+    };
+    let direct = object.borrow().get(name, receiver);
+    if !direct.is_undefined() {
+        return direct;
     }
+    let getter = object
+        .borrow()
+        .get(&format!("__w3cos_getter_{name}"), receiver);
+    getter.call(receiver.clone(), vec![])
 }
 
 fn set_with_receiver(target: &Value, receiver: &Value, name: &str, value: Value) -> Value {
-    if let Value::Object(object) = target {
+    if let Some(object) = target.as_object() {
         let setter = object
             .borrow()
             .get(&format!("__w3cos_setter_{name}"), receiver);
@@ -431,14 +419,14 @@ fn set_with_receiver(target: &Value, receiver: &Value, name: &str, value: Value)
 /// Used for class field initializers and private-brand installation, which
 /// in JS semantics use `[[Define]]` rather than `[[Set]]`.
 pub fn define_field(this: &Value, key: &str, value: Value) {
-    if let Value::Object(object) = this {
+    if let Some(object) = this.as_object() {
         object.borrow_mut().set_direct(key, value);
     }
 }
 
 /// Set `obj`'s prototype link from generated code (`obj` must be an object).
 pub fn set_prototype_of(obj: &Value, proto: &Value) {
-    if let Value::Object(object) = obj {
+    if let Some(object) = obj.as_object() {
         object.borrow_mut().set_prototype_of(proto);
     }
 }
@@ -446,25 +434,23 @@ pub fn set_prototype_of(obj: &Value, proto: &Value) {
 /// `Object.getPrototypeOf(obj)`: the object's prototype link, or `Null`
 /// (matching JS for non-objects, which throw — kept total here).
 pub fn get_prototype_of(obj: &Value) -> Value {
-    match obj {
-        Value::Object(object) => object.borrow().get_prototype_of(),
-        _ => Value::Null,
-    }
+    obj.as_object()
+        .map(|object| object.borrow().get_prototype_of())
+        .unwrap_or(Value::Null)
 }
 
 /// `Object.getOwnPropertyDescriptor(obj, key)`: a descriptor object for an
 /// own property, or `Undefined` when absent (matching JS for data properties).
 pub fn get_own_property_descriptor(obj: &Value, key: &str) -> Value {
-    match obj {
-        Value::Object(object) => object.borrow().get_own_property_descriptor(key),
-        _ => Value::Undefined,
-    }
+    obj.as_object()
+        .map(|object| object.borrow().get_own_property_descriptor(key))
+        .unwrap_or(Value::Undefined)
 }
 
 /// `Object.defineProperty(obj, key, descriptor)`: define `key` from a
 /// `{value}`/`{get}`/`{set}` descriptor (best-effort), returning `obj`.
 pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
-    if let Value::Object(object) = obj {
+    if let Some(object) = obj.as_object() {
         object.borrow_mut().define_property(key, descriptor);
     }
     obj.clone()
@@ -822,7 +808,7 @@ mod tests {
         assert_eq!(get_private(&instance, &child, "child"), Value::Number(2.0));
         assert!(has_private(&instance, &base));
         assert!(has_private(&instance, &child));
-        let Value::Object(object) = &instance else {
+        let Some(object) = instance.as_object() else {
             panic!("constructed value should be an object");
         };
         assert_eq!(object.borrow().own_keys().to_js_string(), "");

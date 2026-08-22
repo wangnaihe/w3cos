@@ -65,7 +65,7 @@ pub(crate) fn layout_font() -> &'static fontdue::Font {
     LAYOUT_FONT.get_or_init(|| crate::font_face::host_ui_font().font.clone())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayoutRect {
     pub x: f32,
     pub y: f32,
@@ -609,6 +609,10 @@ pub struct LayoutEngine {
     root_node: Option<taffy::NodeId>,
     tree_valid: bool,
     viewport: Option<(f32, f32)>,
+    /// Taffy `compute_layout` calls issued by the most recent `compute()`.
+    /// 1 means text-leaf heights were already clean and the historic second
+    /// full pass was skipped.
+    pub last_compute_layout_passes: u8,
 }
 
 pub struct LayoutResults {
@@ -641,6 +645,7 @@ impl LayoutEngine {
             root_node: None,
             tree_valid: false,
             viewport: None,
+            last_compute_layout_passes: 0,
         }
     }
 
@@ -694,8 +699,11 @@ impl LayoutEngine {
             height: AvailableSpace::Definite(viewport_h),
         };
         self.tree.compute_layout(root_node, space)?;
-        update_text_leaf_heights(&mut self.tree, root_node, flat, None)?;
-        self.tree.compute_layout(root_node, space)?;
+        self.last_compute_layout_passes = 1;
+        if update_text_leaf_heights(&mut self.tree, root_node, flat, None)? {
+            self.tree.compute_layout(root_node, space)?;
+            self.last_compute_layout_passes = 2;
+        }
 
         let mut results = Vec::new();
         let mut fixed_results = Vec::new();
@@ -768,21 +776,14 @@ pub fn compute_with_scroll(
         viewport_w,
         viewport_h,
     )?;
-    tree.compute_layout(
-        root_node,
-        Size {
-            width: AvailableSpace::Definite(viewport_w),
-            height: AvailableSpace::Definite(viewport_h),
-        },
-    )?;
-    update_text_leaf_heights(&mut tree, root_node, &flat, None)?;
-    tree.compute_layout(
-        root_node,
-        Size {
-            width: AvailableSpace::Definite(viewport_w),
-            height: AvailableSpace::Definite(viewport_h),
-        },
-    )?;
+    let space = Size {
+        width: AvailableSpace::Definite(viewport_w),
+        height: AvailableSpace::Definite(viewport_h),
+    };
+    tree.compute_layout(root_node, space)?;
+    if update_text_leaf_heights(&mut tree, root_node, &flat, None)? {
+        tree.compute_layout(root_node, space)?;
+    }
 
     let mut results = Vec::new();
     let mut fixed_results = Vec::new();
@@ -1051,14 +1052,16 @@ fn patch_taffy_display(
 }
 
 /// After first layout pass, set Text leaf heights from wrapped line count at assigned width.
+/// Returns true when any leaf style changed and a second Taffy pass is required.
 fn update_text_leaf_heights(
     tree: &mut TaffyTree<usize>,
     node: NodeId,
     flat: &[FlatNodeInfo<'_>],
     parent_display: Option<WDisplay>,
-) -> Result<(), taffy::TaffyError> {
+) -> Result<bool, taffy::TaffyError> {
     let layout = tree.layout(node)?;
     let node_width = layout.size.width;
+    let mut dirty = false;
 
     if let Some(idx) = tree.get_node_context(node).copied() {
         if idx < flat.len() {
@@ -1079,6 +1082,7 @@ fn update_text_leaf_heights(
                         taffy_style.min_size.height = measured_height;
                         taffy_style.size.height = measured_height;
                         tree.set_style(node, taffy_style)?;
+                        dirty = true;
                     }
                 }
             }
@@ -1091,9 +1095,9 @@ fn update_text_leaf_heights(
         .and_then(|idx| flat.get(idx))
         .map(|info| info.style.display);
     for child in tree.children(node)? {
-        update_text_leaf_heights(tree, child, flat, current_display)?;
+        dirty |= update_text_leaf_heights(tree, child, flat, current_display)?;
     }
-    Ok(())
+    Ok(dirty)
 }
 
 fn to_taffy_display(d: WDisplay) -> taffy::Display {
@@ -3133,6 +3137,36 @@ mod tests {
 
         let r2 = engine.compute(&tree, &flat, 1200.0, 800.0).unwrap();
         assert_eq!(r2.layout_cache.len(), 2);
+    }
+
+    #[test]
+    fn second_full_layout_is_skipped_when_text_heights_are_clean() {
+        let tree = Component::column(
+            Style {
+                display: WDisp::Flex,
+                flex_direction: WDir::Column,
+                width: WDim::Px(80.0),
+                ..Style::default()
+            },
+            vec![Component::text(
+                "word word word word word word word word word",
+                s(),
+            )],
+        );
+        let flat = pre_flatten(&tree);
+        let mut engine = LayoutEngine::new();
+        let first = engine.compute(&tree, &flat, 80.0, 600.0).unwrap();
+        assert_eq!(first.layout_cache.len(), 2);
+        assert_eq!(
+            engine.last_compute_layout_passes, 2,
+            "first pass must still reflow wrapped Auto-height text"
+        );
+        let second = engine.compute(&tree, &flat, 80.0, 600.0).unwrap();
+        assert_eq!(second.layout_cache, first.layout_cache);
+        assert_eq!(
+            engine.last_compute_layout_passes, 1,
+            "clean text heights must skip the second full Taffy pass"
+        );
     }
 
     #[test]
