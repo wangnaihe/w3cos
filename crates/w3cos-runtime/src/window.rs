@@ -3887,18 +3887,15 @@ impl App {
                     skia.render_frame(
                         w,
                         h,
-                        crate::render_skia::ReplayFrame {
-                            nodes: &render_nodes,
-                            metrics_font: &self.font,
-                            scroll_info: &scroll_info,
-                            text_input_values: &self.text_input_values,
-                            focused_index: self.focused_index,
-                            background: canvas_background,
-                            artifact: Some(&self.paint_artifact),
-                            retained: None,
-                            compositor_overrides: Some(&compositor_overrides),
-                            scale_factor: scale,
-                        },
+                        &render_nodes,
+                        &self.font,
+                        &scroll_info,
+                        &self.text_input_values,
+                        self.focused_index,
+                        canvas_background,
+                        Some(&self.paint_artifact),
+                        Some(&compositor_overrides),
+                        scale,
                     )
                 });
         #[cfg(not(all(feature = "skia", target_os = "android")))]
