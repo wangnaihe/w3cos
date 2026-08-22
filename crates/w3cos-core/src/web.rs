@@ -22,7 +22,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::Once;
 
 use base64::Engine as _;
@@ -1350,12 +1350,8 @@ pub fn structured_clone(args: Vec<Value>) -> Value {
 
 fn heap_pointer(value: &Value) -> Option<usize> {
     match value {
-        _ if value.as_array().is_some() => {
-            Some(Rc::as_ptr(&value.as_array().expect("array")) as usize)
-        }
-        _ if value.as_object().is_some() => {
-            Some(Rc::as_ptr(&value.as_object().expect("object")) as usize)
-        }
+        _ if value.as_array().is_some() => Some(value.as_array().expect("array").identity()),
+        _ if value.as_object().is_some() => Some(value.as_object().expect("object").identity()),
         _ => None,
     }
 }
@@ -2190,9 +2186,9 @@ fn params_value(
 ) -> Value {
     let state: PairList = Rc::new(RefCell::new(pairs));
     let params = Value::object(HashMap::new());
-    let weak_self: Weak<RefCell<crate::JsObject>> = params
+    let weak_self = params
         .as_object()
-        .map(|object| Rc::downgrade(&object))
+        .map(|object| object.downgrade())
         .expect("URLSearchParams object");
 
     /// After-mutation hook: push the new serialization into the URL.
@@ -2353,10 +2349,7 @@ fn params_value(
             "forEach",
             Value::function(move |_, args| {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
-                let receiver = weak_self
-                    .upgrade()
-                    .map(Value::Object)
-                    .unwrap_or(Value::Undefined);
+                let receiver = weak_self.upgrade_value().unwrap_or(Value::Undefined);
                 // Snapshot so the callback may mutate the params without
                 // tripping the RefCell borrow.
                 let snapshot = state.borrow().clone();

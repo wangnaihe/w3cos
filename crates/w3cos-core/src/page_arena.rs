@@ -11,7 +11,9 @@
 //! on the `Value::Function(Rc<FunctionData>)` / object call-slot `Rc` path.
 //! Interned functions store one `Box<FunctionData>`; `as_function` /
 //! `get_function` / clone return a handle and do not clone inner Rcs.
-//! Size-class slabs wait for a later cut.
+//! Interned objects / arrays store one `Box<RefCell<_>>`; `as_object` /
+//! `as_array` / `get_object` / `get_array` / clone return a handle and
+//! do not clone the table slot. Size-class slabs wait for a later cut.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -56,9 +58,9 @@ struct PageArena {
     intern: HashMap<u64, Vec<u32>>,
     allocated: usize,
     /// 1-based object slots; index 0 is unused so handle `0` is never valid.
-    objects: Vec<Option<std::rc::Rc<std::cell::RefCell<crate::JsObject>>>>,
+    objects: Vec<Option<Box<RefCell<crate::JsObject>>>>,
     /// 1-based array slots; index 0 is unused so handle `0` is never valid.
-    arrays: Vec<Option<std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>>>>,
+    arrays: Vec<Option<Box<RefCell<crate::value::ArrayStorage>>>>,
     /// 1-based function slots; index 0 is unused so handle `0` is never valid.
     functions: Vec<Option<Box<crate::value::FunctionData>>>,
 }
@@ -163,42 +165,66 @@ impl PageArena {
         self.functions.shrink_to_fit();
     }
 
-    fn alloc_object(
-        &mut self,
-        object: std::rc::Rc<std::cell::RefCell<crate::JsObject>>,
-    ) -> u32 {
+    fn alloc_object(&mut self, object: crate::JsObject) -> u32 {
         let handle = self.objects.len() as u32;
-        self.objects.push(Some(object));
+        self.objects.push(Some(Box::new(RefCell::new(object))));
         handle
     }
 
-    fn get_object(
-        &self,
-        handle: u32,
-    ) -> std::rc::Rc<std::cell::RefCell<crate::JsObject>> {
+    fn get_object(&self, handle: u32) -> crate::value::JsObjectRef {
         let Some(Some(object)) = self.objects.get(handle as usize) else {
             panic!("page object handle used after reset_bridge");
         };
-        object.clone()
+        crate::value::JsObjectRef::from_interned(
+            handle,
+            self.epoch,
+            object.as_ref() as *const RefCell<crate::JsObject>,
+        )
     }
 
-    fn alloc_array(
-        &mut self,
-        array: std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>>,
-    ) -> u32 {
+    fn upgrade_object(&self, handle: u32, epoch: u32) -> Option<crate::value::JsObjectRef> {
+        if epoch != self.epoch {
+            return None;
+        }
+        let Some(Some(object)) = self.objects.get(handle as usize) else {
+            return None;
+        };
+        Some(crate::value::JsObjectRef::from_interned(
+            handle,
+            self.epoch,
+            object.as_ref() as *const RefCell<crate::JsObject>,
+        ))
+    }
+
+    fn alloc_array(&mut self, array: crate::value::ArrayStorage) -> u32 {
         let handle = self.arrays.len() as u32;
-        self.arrays.push(Some(array));
+        self.arrays.push(Some(Box::new(RefCell::new(array))));
         handle
     }
 
-    fn get_array(
-        &self,
-        handle: u32,
-    ) -> std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>> {
+    fn get_array(&self, handle: u32) -> crate::value::JsArrayRef {
         let Some(Some(array)) = self.arrays.get(handle as usize) else {
             panic!("page array handle used after reset_bridge");
         };
-        array.clone()
+        crate::value::JsArrayRef::from_interned(
+            handle,
+            self.epoch,
+            array.as_ref() as *const RefCell<crate::value::ArrayStorage>,
+        )
+    }
+
+    fn upgrade_array(&self, handle: u32, epoch: u32) -> Option<crate::value::JsArrayRef> {
+        if epoch != self.epoch {
+            return None;
+        }
+        let Some(Some(array)) = self.arrays.get(handle as usize) else {
+            return None;
+        };
+        Some(crate::value::JsArrayRef::from_interned(
+            handle,
+            self.epoch,
+            array.as_ref() as *const RefCell<crate::value::ArrayStorage>,
+        ))
     }
 
     fn alloc_function(&mut self, function: crate::value::FunctionData) -> u32 {
@@ -218,11 +244,7 @@ impl PageArena {
         )
     }
 
-    fn upgrade_function(
-        &self,
-        handle: u32,
-        epoch: u32,
-    ) -> Option<crate::value::JsFunction> {
+    fn upgrade_function(&self, handle: u32, epoch: u32) -> Option<crate::value::JsFunction> {
         if epoch != self.epoch {
             return None;
         }
@@ -303,23 +325,29 @@ pub fn live_handles() -> usize {
     ARENA.with(|arena| arena.borrow().slots.len().saturating_sub(1))
 }
 
-/// Store a page-local object. Clone of the returned handle does not
-/// `Rc::clone`.
-pub(crate) fn alloc_object(
-    object: std::rc::Rc<std::cell::RefCell<crate::JsObject>>,
-) -> u32 {
+/// Store a page-local object. The arena owns the payload once;
+/// returned handles are `Clone` (`u32` + cached slot pointer).
+pub(crate) fn alloc_object(object: crate::JsObject) -> u32 {
     ARENA.with(|arena| arena.borrow_mut().alloc_object(object))
 }
 
 /// Resolve a live object handle. Panics if the handle belongs to a
-/// previous page (same contract as interned strings).
-pub(crate) fn get_object(
-    handle: u32,
-) -> std::rc::Rc<std::cell::RefCell<crate::JsObject>> {
+/// previous page (same contract as interned strings). Does not clone
+/// the payload.
+pub(crate) fn get_object(handle: u32) -> crate::value::JsObjectRef {
     if handle == 0 {
         panic!("page object handle used after reset_bridge");
     }
     ARENA.with(|arena| arena.borrow().get_object(handle))
+}
+
+/// Upgrade an interned weak object. Fails after [`reset`] via epoch
+/// or empty slot — not `Weak::upgrade` of an inner Rc.
+pub(crate) fn upgrade_object(handle: u32, epoch: u32) -> Option<crate::value::JsObjectRef> {
+    if handle == 0 || epoch != current_epoch() {
+        return None;
+    }
+    ARENA.with(|arena| arena.borrow().upgrade_object(handle, epoch))
 }
 
 /// Live page-local objects (empty after [`reset`]).
@@ -327,23 +355,29 @@ pub fn live_objects() -> usize {
     ARENA.with(|arena| arena.borrow().objects.len().saturating_sub(1))
 }
 
-/// Store a page-local array. Clone of the returned handle does not
-/// `Rc::clone`.
-pub(crate) fn alloc_array(
-    array: std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>>,
-) -> u32 {
+/// Store a page-local array. The arena owns the payload once;
+/// returned handles are `Clone` (`u32` + cached slot pointer).
+pub(crate) fn alloc_array(array: crate::value::ArrayStorage) -> u32 {
     ARENA.with(|arena| arena.borrow_mut().alloc_array(array))
 }
 
 /// Resolve a live array handle. Panics if the handle belongs to a
-/// previous page (same contract as interned strings).
-pub(crate) fn get_array(
-    handle: u32,
-) -> std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>> {
+/// previous page (same contract as interned strings). Does not clone
+/// the payload.
+pub(crate) fn get_array(handle: u32) -> crate::value::JsArrayRef {
     if handle == 0 {
         panic!("page array handle used after reset_bridge");
     }
     ARENA.with(|arena| arena.borrow().get_array(handle))
+}
+
+/// Upgrade an interned weak array. Fails after [`reset`] via epoch
+/// or empty slot — not `Weak::upgrade` of an inner Rc.
+pub(crate) fn upgrade_array(handle: u32, epoch: u32) -> Option<crate::value::JsArrayRef> {
+    if handle == 0 || epoch != current_epoch() {
+        return None;
+    }
+    ARENA.with(|arena| arena.borrow().upgrade_array(handle, epoch))
 }
 
 /// Live page-local arrays (empty after [`reset`]).
@@ -369,10 +403,7 @@ pub(crate) fn get_function(handle: u32) -> crate::value::JsFunction {
 
 /// Upgrade an interned weak function. Fails after [`reset`] via epoch
 /// or empty slot — not `Weak::upgrade` of inner Rcs.
-pub(crate) fn upgrade_function(
-    handle: u32,
-    epoch: u32,
-) -> Option<crate::value::JsFunction> {
+pub(crate) fn upgrade_function(handle: u32, epoch: u32) -> Option<crate::value::JsFunction> {
     if handle == 0 || epoch != current_epoch() {
         return None;
     }
@@ -428,36 +459,38 @@ mod tests {
     fn object_table_alloc_and_reset_empties() {
         reset();
         assert_eq!(live_objects(), 0);
-        let rc = std::rc::Rc::new(std::cell::RefCell::new(crate::JsObject::new()));
-        let handle = alloc_object(rc.clone());
+        let handle = alloc_object(crate::JsObject::new());
         assert_eq!(handle, 1);
-        assert_eq!(std::rc::Rc::strong_count(&rc), 2);
         let resolved = get_object(handle);
-        assert!(std::rc::Rc::ptr_eq(&rc, &resolved));
+        let cloned = resolved.clone();
+        assert!(resolved.ptr_eq(&cloned));
+        assert_eq!(resolved.interned_handle(), Some(handle));
+        assert!(resolved.host_strong_count().is_none());
+        assert_eq!(live_objects(), 1);
         drop(resolved);
+        drop(cloned);
         assert_eq!(live_objects(), 1);
         reset();
         assert_eq!(live_objects(), 0);
-        assert_eq!(std::rc::Rc::strong_count(&rc), 1);
     }
 
     #[test]
     fn array_table_alloc_and_reset_empties() {
         reset();
         assert_eq!(live_arrays(), 0);
-        let rc = std::rc::Rc::new(std::cell::RefCell::new(
-            crate::value::ArrayStorage::new(Vec::new()),
-        ));
-        let handle = alloc_array(rc.clone());
+        let handle = alloc_array(crate::value::ArrayStorage::new(Vec::new()));
         assert_eq!(handle, 1);
-        assert_eq!(std::rc::Rc::strong_count(&rc), 2);
         let resolved = get_array(handle);
-        assert!(std::rc::Rc::ptr_eq(&rc, &resolved));
+        let cloned = resolved.clone();
+        assert!(resolved.ptr_eq(&cloned));
+        assert_eq!(resolved.interned_handle(), Some(handle));
+        assert!(resolved.host_strong_count().is_none());
+        assert_eq!(live_arrays(), 1);
         drop(resolved);
+        drop(cloned);
         assert_eq!(live_arrays(), 1);
         reset();
         assert_eq!(live_arrays(), 0);
-        assert_eq!(std::rc::Rc::strong_count(&rc), 1);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::heap::{HeapAllocation, HeapKind};
 use crate::js_string::JsString;
 use crate::proxy::ProxyHandler;
-use crate::value::{FunctionData, Value};
+use crate::value::{FunctionData, JsObjectRef, Value};
 
 #[derive(Clone)]
 pub(crate) enum PrivateElement {
@@ -30,7 +30,7 @@ pub(crate) enum PrivateElement {
 pub struct JsObject {
     pub(crate) properties: HashMap<JsString, Value>,
     property_order: Vec<JsString>,
-    pub(crate) prototype: Option<Rc<RefCell<JsObject>>>,
+    pub(crate) prototype: Option<JsObjectRef>,
     pub(crate) proxy_handler: Option<ProxyHandler>,
     has_getter_properties: bool,
     pub(crate) call_slot: Option<Rc<FunctionData>>,
@@ -369,7 +369,7 @@ impl JsObject {
             }
         }
         match &self.prototype {
-            Some(proto) => Value::Object(proto.clone()),
+            Some(proto) => proto.as_value(),
             None => Value::Null,
         }
     }
@@ -623,7 +623,7 @@ mod tests {
         let parent_rc = Rc::new(RefCell::new(parent));
 
         let mut child = JsObject::new();
-        child.prototype = Some(parent_rc);
+        child.prototype = Some(JsObjectRef::from_host(parent_rc));
         child.set_direct("own", Value::Number(1.0));
 
         assert_eq!(child.get_direct("own").to_number(), 1.0);

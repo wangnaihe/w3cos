@@ -311,7 +311,7 @@ pub fn for_in_keys(value: &Value) -> Value {
     let mut seen_objects = HashSet::new();
     let mut current = value.clone();
     while let Some(object) = current.as_object() {
-        if !seen_objects.insert(std::rc::Rc::as_ptr(&object) as usize) {
+        if !seen_objects.insert(object.identity()) {
             break;
         }
         let (own_keys, prototype) = {

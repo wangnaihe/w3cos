@@ -145,7 +145,7 @@ pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
         let Some(object) = current.as_object() else {
             return false;
         };
-        if Rc::ptr_eq(&object, &target) {
+        if object.ptr_eq(&target) {
             return true;
         }
         current = object.borrow().get_prototype_of();
@@ -173,9 +173,9 @@ fn queue_class_initializer(this: &Value, brand: u64, class: Value, initializer: 
 }
 
 fn run_pending_class_initializer(this: &Value) {
-    let pending = this.as_object().and_then(|object| {
-        object.borrow_mut().pending_class_initializers.pop()
-    });
+    let pending = this
+        .as_object()
+        .and_then(|object| object.borrow_mut().pending_class_initializers.pop());
     if let Some((brand, class, initializer)) = pending {
         install_private_brand(this, brand);
         if !initializer.is_undefined() {
@@ -193,7 +193,9 @@ fn install_private_brand(receiver: &Value, brand: u64) {
 }
 
 fn brand_id(brand: &Value) -> Option<u64> {
-    brand.as_object().and_then(|object| object.borrow().class_brand)
+    brand
+        .as_object()
+        .and_then(|object| object.borrow().class_brand)
 }
 
 fn require_private_brand(receiver: &Value, brand: &Value, name: &str) -> u64 {
