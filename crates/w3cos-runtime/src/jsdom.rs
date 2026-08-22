@@ -57,7 +57,7 @@ use objc2::runtime::{AnyClass, AnyObject};
 #[cfg(target_os = "ios")]
 use std::ffi::CStr;
 
-use w3cos_core::{JsObject, ProxyBuilder, Value};
+use w3cos_core::{JsObject, ProxyBuilder, Value, WeakJsObject};
 use w3cos_dom::Element;
 use w3cos_dom::events::{Event, EventData, EventType};
 use w3cos_dom::node::NodeId;
@@ -147,7 +147,7 @@ struct ShadowRootInfo {
 /// not pin them after the last JS handle drops.
 enum ElementMemo {
     Strong(Value),
-    Weak(Weak<RefCell<JsObject>>),
+    Weak(WeakJsObject),
 }
 
 thread_local! {
@@ -434,17 +434,17 @@ pub(crate) fn realm_function(
     })
 }
 
-pub(crate) type WeakRealmObject = Weak<RefCell<JsObject>>;
+pub(crate) type WeakRealmObject = WeakJsObject;
 
 pub(crate) fn weak_realm_object(value: &Value) -> WeakRealmObject {
     value
         .as_object()
-        .map(|object| Rc::downgrade(&object))
+        .map(|object| object.downgrade())
         .expect("Realm host objects must use object storage")
 }
 
 pub(crate) fn upgrade_realm_object(object: &WeakRealmObject) -> Option<Value> {
-    object.upgrade().map(Value::Object)
+    object.upgrade_value()
 }
 
 pub(crate) fn register_weak_realm_object(
@@ -12581,11 +12581,8 @@ mod tests {
         el
     }
 
-    fn wrapper_weak(value: &Value) -> std::rc::Weak<RefCell<JsObject>> {
-        match value {
-            Value::Object(object) => Rc::downgrade(object),
-            _ => panic!("expected object wrapper"),
-        }
+    fn wrapper_weak(value: &Value) -> WeakRealmObject {
+        weak_realm_object(value)
     }
 
     #[test]
@@ -12625,7 +12622,9 @@ mod tests {
         let id = node_id_of(&el).expect("node id");
         let again = element_value(id);
         assert!(
-            matches!((&el, &again), (Value::Object(a), Value::Object(b)) if Rc::ptr_eq(a, b)),
+            el.as_object()
+                .zip(again.as_object())
+                .is_some_and(|(a, b)| a.ptr_eq(&b)),
             "held detached wrapper must keep === identity"
         );
     }
@@ -14806,18 +14805,9 @@ mod tests {
             .get_property("body")
             .call_method("requestFullscreen", vec![]);
 
-        let document_weak = match &document {
-            Value::Object(object) => Rc::downgrade(object),
-            _ => unreachable!("document must be an object"),
-        };
-        let window_weak = match &window {
-            Value::Object(object) => Rc::downgrade(object),
-            _ => unreachable!("window must be an object"),
-        };
-        let selection_weak = match &selection {
-            Value::Object(object) => Rc::downgrade(object),
-            _ => unreachable!("selection must be an object"),
-        };
+        let document_weak = weak_realm_object(&document);
+        let window_weak = weak_realm_object(&window);
+        let selection_weak = weak_realm_object(&selection);
         drop(document);
         drop(window);
         drop(selection);

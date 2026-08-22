@@ -559,7 +559,8 @@ enum JsObjectRepr {
     Host(Rc<RefCell<crate::JsObject>>),
 }
 
-pub(crate) enum WeakJsObject {
+#[derive(Clone)]
+pub enum WeakJsObject {
     Interned { handle: u32, epoch: u32 },
     Host(Weak<RefCell<crate::JsObject>>),
 }
@@ -706,7 +707,7 @@ impl JsObjectRef {
         }
     }
 
-    pub(crate) fn downgrade(&self) -> WeakJsObject {
+    pub fn downgrade(&self) -> WeakJsObject {
         match self.repr {
             JsObjectRepr::Interned { handle, epoch, .. } => {
                 WeakJsObject::Interned { handle, epoch }
@@ -717,7 +718,7 @@ impl JsObjectRef {
 }
 
 impl WeakJsObject {
-    pub(crate) fn upgrade(&self) -> Option<JsObjectRef> {
+    pub fn upgrade(&self) -> Option<JsObjectRef> {
         match self {
             WeakJsObject::Interned { handle, epoch } => {
                 crate::page_arena::upgrade_object(*handle, *epoch)
@@ -726,8 +727,18 @@ impl WeakJsObject {
         }
     }
 
-    pub(crate) fn upgrade_value(&self) -> Option<Value> {
+    pub fn upgrade_value(&self) -> Option<Value> {
         self.upgrade().map(|object| object.as_value())
+    }
+
+    /// Host `Weak::strong_count`, or `1`/`0` for a live/dead interned slot.
+    pub fn strong_count(&self) -> usize {
+        match self {
+            WeakJsObject::Interned { handle, epoch } => {
+                usize::from(crate::page_arena::upgrade_object(*handle, *epoch).is_some())
+            }
+            WeakJsObject::Host(weak) => weak.strong_count(),
+        }
     }
 }
 

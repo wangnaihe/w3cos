@@ -2786,9 +2786,9 @@ impl GraphCloneEncoder {
         match value {
             _ if w3cos_core::binary::clone_descriptor(value).is_some() => {
                 let identity = if let Some(values) = value.as_array() {
-                    (0, Rc::as_ptr(&values) as usize)
+                    (0, values.identity())
                 } else if let Some(object) = value.as_object() {
-                    (1, Rc::as_ptr(&object) as usize)
+                    (1, object.identity())
                 } else {
                     unreachable!("binary descriptors are heap values")
                 };
@@ -2844,7 +2844,7 @@ impl GraphCloneEncoder {
             }
             _ if value.as_array().is_some() && !w3cos_core::collections::is_typed_array(value) => {
                 let values = value.as_array().expect("array");
-                let identity = (0, Rc::as_ptr(&values) as usize);
+                let identity = (0, values.identity());
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
                 }
@@ -3096,7 +3096,7 @@ fn value_to_json_inner(
         Value::String(value) => Ok(JsonValue::String(value.to_string())),
         value if value.as_array().is_some() => {
             let values = value.as_array().expect("array");
-            let pointer = Rc::as_ptr(&values) as usize;
+            let pointer = values.identity();
             if !active.insert(pointer) {
                 return Err(IndexedDbError {
                     name: "DataCloneError".into(),
@@ -3138,7 +3138,7 @@ fn value_to_json_inner(
                 )])));
             }
             if let Some(snapshot) = w3cos_core::collections::collection_snapshot(value) {
-                let pointer = Rc::as_ptr(&object) as usize;
+                let pointer = object.identity();
                 if !active.insert(pointer) {
                     return Err(IndexedDbError {
                         name: "DataCloneError".into(),
@@ -3236,7 +3236,7 @@ fn value_to_json_inner(
                     ])),
                 )])));
             }
-            let pointer = Rc::as_ptr(&object) as usize;
+            let pointer = object.identity();
             if !active.insert(pointer) {
                 return Err(IndexedDbError {
                     name: "DataCloneError".into(),

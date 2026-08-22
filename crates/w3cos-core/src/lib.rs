@@ -31,5 +31,5 @@ pub use proxy::{ProxyBuilder, ProxyHandler, proxy_class};
 pub use reactive::{Computed, Effect, Signal, batch, watch};
 pub use value::{
     ArrayStorage, Completion, FunctionData, Immediate, JsArrayRef, JsFunction, JsObjectRef,
-    PanicValue, Value, catch_js, catch_js_result, throw_value, type_of,
+    PanicValue, Value, WeakJsObject, catch_js, catch_js_result, throw_value, type_of,
 };
