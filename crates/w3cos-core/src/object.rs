@@ -20,6 +20,26 @@ pub(crate) enum PrivateElement {
     },
 }
 
+/// Rare class / private / enumerability state. Almost every ordinary object
+/// never touches these; they live behind [`JsObject::rare`] so empty objects
+/// stay slab-dense.
+#[derive(Clone, Default)]
+pub(crate) struct RareObjectData {
+    /// Derived-class instance initializers waiting for their corresponding
+    /// `super(...)` call to return. This is internal execution state, not an
+    /// observable JavaScript property.
+    pub(crate) pending_class_initializers: Vec<(u64, Value, Value)>,
+    /// Opaque class brands and private elements are intentionally kept out of
+    /// `properties`, so proxy traps and reflection cannot observe them.
+    pub(crate) class_brand: Option<u64>,
+    pub(crate) private_brands: HashSet<u64>,
+    pub(crate) private_elements: HashMap<(u64, String), PrivateElement>,
+    /// Own keys that are not enumerable. Ordinary data properties default to
+    /// enumerable; `Object.defineProperty` can clear the flag so `for-in` and
+    /// `CopyDataProperties` skip them, matching ECMAScript.
+    non_enumerable: HashSet<String>,
+}
+
 /// A JavaScript-like dynamic object with string-keyed properties,
 /// prototype chain, and optional Proxy handler for trap interception.
 ///
@@ -35,19 +55,9 @@ pub struct JsObject {
     pub(crate) proxy_handler: Option<ProxyHandler>,
     has_getter_properties: bool,
     pub(crate) call_slot: Option<Rc<FunctionData>>,
-    /// Derived-class instance initializers waiting for their corresponding
-    /// `super(...)` call to return. This is internal execution state, not an
-    /// observable JavaScript property.
-    pub(crate) pending_class_initializers: Vec<(u64, Value, Value)>,
-    /// Opaque class brands and private elements are intentionally kept out of
-    /// `properties`, so proxy traps and reflection cannot observe them.
-    pub(crate) class_brand: Option<u64>,
-    pub(crate) private_brands: HashSet<u64>,
-    pub(crate) private_elements: HashMap<(u64, String), PrivateElement>,
-    /// Own keys that are not enumerable. Ordinary data properties default to
-    /// enumerable; `Object.defineProperty` can clear the flag so `for-in` and
-    /// `CopyDataProperties` skip them, matching ECMAScript.
-    non_enumerable: HashSet<String>,
+    /// Lazily boxed rare class / private / enumerability fields. `None` on
+    /// ordinary empty objects.
+    pub(crate) rare: Option<Box<RareObjectData>>,
     heap_allocation: HeapAllocation,
 }
 
@@ -60,11 +70,7 @@ impl JsObject {
             proxy_handler: None,
             has_getter_properties: false,
             call_slot: None,
-            pending_class_initializers: Vec::new(),
-            class_brand: None,
-            private_brands: HashSet::new(),
-            private_elements: HashMap::new(),
-            non_enumerable: HashSet::new(),
+            rare: None,
             heap_allocation,
         }
     }
@@ -88,11 +94,7 @@ impl JsObject {
             proxy_handler: None,
             has_getter_properties,
             call_slot: None,
-            pending_class_initializers: Vec::new(),
-            class_brand: None,
-            private_brands: HashSet::new(),
-            private_elements: HashMap::new(),
-            non_enumerable: HashSet::new(),
+            rare: None,
             heap_allocation,
         };
         object.refresh_heap_accounting();
@@ -115,11 +117,7 @@ impl JsObject {
             proxy_handler: Some(handler),
             has_getter_properties,
             call_slot: None,
-            pending_class_initializers: Vec::new(),
-            class_brand: None,
-            private_brands: HashSet::new(),
-            private_elements: HashMap::new(),
-            non_enumerable: HashSet::new(),
+            rare: None,
             heap_allocation,
         };
         object.refresh_heap_accounting();
@@ -143,11 +141,7 @@ impl JsObject {
             proxy_handler: None,
             has_getter_properties,
             call_slot: Some(call),
-            pending_class_initializers: Vec::new(),
-            class_brand: None,
-            private_brands: HashSet::new(),
-            private_elements: HashMap::new(),
-            non_enumerable: HashSet::new(),
+            rare: None,
             heap_allocation,
         };
         object.refresh_heap_accounting();
@@ -157,6 +151,20 @@ impl JsObject {
     /// The call slot, if this object is callable.
     pub fn call_slot(&self) -> Option<&Rc<FunctionData>> {
         self.call_slot.as_ref()
+    }
+
+    /// Allocate rare class / private / enumerability state on first use.
+    pub(crate) fn ensure_rare(&mut self) -> &mut RareObjectData {
+        if self.rare.is_none() {
+            self.rare = Some(Box::new(RareObjectData::default()));
+        }
+        self.rare.as_mut().expect("rare just allocated")
+    }
+
+    fn own_key_enumerable(&self, key: &str) -> bool {
+        self.rare
+            .as_ref()
+            .map_or(true, |rare| !rare.non_enumerable.contains(key))
     }
 
     // ── Proxy-aware property access ────────────────────────────────────
@@ -248,7 +256,9 @@ impl JsObject {
         }
         let removed = self.properties.remove(key).is_some();
         if removed {
-            self.non_enumerable.remove(key);
+            if let Some(rare) = self.rare.as_mut() {
+                rare.non_enumerable.remove(key);
+            }
         }
         if removed && key.starts_with("__w3cos_getter_") {
             self.has_getter_properties = self
@@ -291,7 +301,7 @@ impl JsObject {
             desc.insert("writable".into(), Value::Bool(true));
             desc.insert(
                 "enumerable".into(),
-                Value::Bool(!self.non_enumerable.contains(key)),
+                Value::Bool(self.own_key_enumerable(key)),
             );
             desc.insert("configurable".into(), Value::Bool(true));
             Value::object(desc)
@@ -317,7 +327,7 @@ impl JsObject {
             }
             desc.insert(
                 "enumerable".into(),
-                Value::Bool(!self.non_enumerable.contains(key)),
+                Value::Bool(self.own_key_enumerable(key)),
             );
             desc.insert("configurable".into(), Value::Bool(true));
             Value::object(desc)
@@ -340,9 +350,11 @@ impl JsObject {
             }
             if let Some(enumerable) = desc.properties.get("enumerable") {
                 if enumerable.to_bool() {
-                    self.non_enumerable.remove(key);
+                    if let Some(rare) = self.rare.as_mut() {
+                        rare.non_enumerable.remove(key);
+                    }
                 } else {
-                    self.non_enumerable.insert(key.to_string());
+                    self.ensure_rare().non_enumerable.insert(key.to_string());
                 }
             }
         }
@@ -429,47 +441,63 @@ impl JsObject {
 
     pub(crate) fn refresh_heap_accounting(&self) {
         let property_bytes = self.properties.heap_bytes();
-        let pending_bytes = self
-            .pending_class_initializers
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(u64, Value, Value)>());
-        let private_brand_bytes = self
-            .private_brands
-            .capacity()
-            .saturating_mul(std::mem::size_of::<u64>());
-        let private_element_bytes = self
-            .private_elements
-            .capacity()
-            .saturating_mul(std::mem::size_of::<((u64, String), PrivateElement)>())
-            .saturating_add(
-                self.private_elements
-                    .keys()
-                    .map(|(_, name)| name.capacity())
-                    .fold(0usize, usize::saturating_add),
-            );
+        let mut rare_bytes = 0usize;
+        if let Some(rare) = self.rare.as_ref() {
+            let pending_bytes = rare
+                .pending_class_initializers
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u64, Value, Value)>());
+            let private_brand_bytes = rare
+                .private_brands
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u64>());
+            let private_element_bytes = rare
+                .private_elements
+                .capacity()
+                .saturating_mul(std::mem::size_of::<((u64, String), PrivateElement)>())
+                .saturating_add(
+                    rare.private_elements
+                        .keys()
+                        .map(|(_, name)| name.capacity())
+                        .fold(0usize, usize::saturating_add),
+                );
+            let non_enumerable_bytes = rare
+                .non_enumerable
+                .iter()
+                .map(|key| key.capacity())
+                .fold(0usize, usize::saturating_add);
+            rare_bytes = std::mem::size_of::<RareObjectData>()
+                .saturating_add(pending_bytes)
+                .saturating_add(private_brand_bytes)
+                .saturating_add(private_element_bytes)
+                .saturating_add(non_enumerable_bytes);
+        }
         self.heap_allocation.set_bytes(
             std::mem::size_of::<Self>()
                 .saturating_add(property_bytes)
-                .saturating_add(pending_bytes)
-                .saturating_add(private_brand_bytes)
-                .saturating_add(private_element_bytes),
+                .saturating_add(rare_bytes),
         );
     }
 
     /// Snapshot the raw properties as a `Value::Object` (used as `target` arg for traps).
     fn target_value(&self) -> Value {
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
+        let rare = self.rare.as_ref().map(|rare| {
+            Box::new(RareObjectData {
+                pending_class_initializers: Vec::new(),
+                class_brand: rare.class_brand,
+                private_brands: HashSet::new(),
+                private_elements: HashMap::new(),
+                non_enumerable: rare.non_enumerable.clone(),
+            })
+        });
         let clone = Self {
             properties: self.properties.clone(),
             prototype: self.prototype.clone(),
             proxy_handler: None,
             has_getter_properties: self.has_getter_properties,
             call_slot: self.call_slot.clone(),
-            pending_class_initializers: Vec::new(),
-            class_brand: self.class_brand,
-            private_brands: HashSet::new(),
-            private_elements: HashMap::new(),
-            non_enumerable: self.non_enumerable.clone(),
+            rare,
             heap_allocation,
         };
         clone.refresh_heap_accounting();
@@ -608,12 +636,45 @@ mod tests {
         assert_eq!(small.get_direct("a").to_number(), 1.0);
         assert_eq!(small.get_direct("e").to_number(), 5.0);
 
-        // Empty interned objects must shrink vs prior HashMap+Vec control words (536).
+        // Rare class/private/enumerability state is lazy-boxed so ordinary empty
+        // objects shrink vs the prior inline HashSet/HashMap/Vec layout (472 /
+        // RefCell 480). PropertyMap stays as-is.
         assert_eq!(
             std::mem::size_of::<JsObject>(),
-            472,
-            "empty PropertyMap should keep JsObject at 472B (was 536 with HashMap+Vec)"
+            296,
+            "lazy-boxed rare fields should keep JsObject at 296B (was 472)"
         );
+        assert_eq!(
+            std::mem::size_of::<RefCell<JsObject>>(),
+            304,
+            "RefCell<JsObject> should be 304B for denser page-arena slabs (was 480)"
+        );
+        assert!(
+            empty.rare.is_none(),
+            "ordinary empty objects must not allocate RareObjectData"
+        );
+    }
+
+    #[test]
+    fn define_property_non_enumerable_allocates_rare_once() {
+        let mut obj = JsObject::new();
+        assert!(obj.rare.is_none());
+        obj.define_property(
+            "hidden",
+            &Value::object(HashMap::from([
+                ("value".into(), Value::Number(1.0)),
+                ("enumerable".into(), Value::Bool(false)),
+            ])),
+        );
+        assert!(obj.rare.is_some());
+        assert!(
+            !obj.get_own_property_descriptor("hidden")
+                .get_property("enumerable")
+                .to_bool()
+        );
+        obj.delete("hidden");
+        // rare box may remain; enumerability set should no longer list the key
+        assert!(obj.own_key_enumerable("hidden"));
     }
 
     #[test]

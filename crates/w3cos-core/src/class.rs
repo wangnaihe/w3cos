@@ -95,8 +95,9 @@ pub fn create_class_with_initializer(
     }
     if let Some(object) = class.as_object() {
         let mut object = object.borrow_mut();
-        object.class_brand = Some(brand_id);
-        object.private_brands.insert(brand_id);
+        let rare = object.ensure_rare();
+        rare.class_brand = Some(brand_id);
+        rare.private_brands.insert(brand_id);
         object.refresh_heap_accounting();
     }
     *class_cell.borrow_mut() = class.clone();
@@ -166,6 +167,7 @@ fn queue_class_initializer(this: &Value, brand: u64, class: Value, initializer: 
     if let Some(object) = this.as_object() {
         let mut object = object.borrow_mut();
         object
+            .ensure_rare()
             .pending_class_initializers
             .push((brand, class, initializer));
         object.refresh_heap_accounting();
@@ -173,9 +175,13 @@ fn queue_class_initializer(this: &Value, brand: u64, class: Value, initializer: 
 }
 
 fn run_pending_class_initializer(this: &Value) {
-    let pending = this
-        .as_object()
-        .and_then(|object| object.borrow_mut().pending_class_initializers.pop());
+    let pending = this.as_object().and_then(|object| {
+        object
+            .borrow_mut()
+            .rare
+            .as_mut()
+            .and_then(|rare| rare.pending_class_initializers.pop())
+    });
     if let Some((brand, class, initializer)) = pending {
         install_private_brand(this, brand);
         if !initializer.is_undefined() {
@@ -187,24 +193,32 @@ fn run_pending_class_initializer(this: &Value) {
 fn install_private_brand(receiver: &Value, brand: u64) {
     if let Some(object) = receiver.as_object() {
         let mut object = object.borrow_mut();
-        object.private_brands.insert(brand);
+        object.ensure_rare().private_brands.insert(brand);
         object.refresh_heap_accounting();
     }
 }
 
 fn brand_id(brand: &Value) -> Option<u64> {
-    brand
-        .as_object()
-        .and_then(|object| object.borrow().class_brand)
+    brand.as_object().and_then(|object| {
+        object
+            .borrow()
+            .rare
+            .as_ref()
+            .and_then(|rare| rare.class_brand)
+    })
 }
 
 fn require_private_brand(receiver: &Value, brand: &Value, name: &str) -> u64 {
     let Some(brand_id) = brand_id(brand) else {
         private_brand_error(name)
     };
-    let has_brand = receiver
-        .as_object()
-        .is_some_and(|object| object.borrow().private_brands.contains(&brand_id));
+    let has_brand = receiver.as_object().is_some_and(|object| {
+        object
+            .borrow()
+            .rare
+            .as_ref()
+            .is_some_and(|rare| rare.private_brands.contains(&brand_id))
+    });
     if !has_brand {
         private_brand_error(name);
     }
@@ -225,9 +239,10 @@ pub fn define_private_field(receiver: &Value, brand: &Value, name: &str, value: 
     let brand_id = require_private_brand(receiver, brand, name);
     if let Some(object) = receiver.as_object() {
         let mut object = object.borrow_mut();
-        object
-            .private_elements
-            .insert((brand_id, name.to_string()), PrivateElement::Field(value));
+        object.ensure_rare().private_elements.insert(
+            (brand_id, name.to_string()),
+            PrivateElement::Field(value),
+        );
         object.refresh_heap_accounting();
     }
 }
@@ -237,9 +252,10 @@ pub fn define_private_method(brand: &Value, name: &str, method: Value) {
     let brand_id = require_private_brand(brand, brand, name);
     if let Some(object) = brand.as_object() {
         let mut object = object.borrow_mut();
-        object
-            .private_elements
-            .insert((brand_id, name.to_string()), PrivateElement::Method(method));
+        object.ensure_rare().private_elements.insert(
+            (brand_id, name.to_string()),
+            PrivateElement::Method(method),
+        );
         object.refresh_heap_accounting();
     }
 }
@@ -254,12 +270,13 @@ pub fn define_private_accessor(
     let brand_id = require_private_brand(brand, brand, name);
     if let Some(object) = brand.as_object() {
         let mut object = object.borrow_mut();
+        let rare = object.ensure_rare();
         let key = (brand_id, name.to_string());
-        let (old_getter, old_setter) = match object.private_elements.remove(&key) {
+        let (old_getter, old_setter) = match rare.private_elements.remove(&key) {
             Some(PrivateElement::Accessor { getter, setter }) => (getter, setter),
             _ => (None, None),
         };
-        object.private_elements.insert(
+        rare.private_elements.insert(
             key,
             PrivateElement::Accessor {
                 getter: getter.or(old_getter),
@@ -273,12 +290,22 @@ pub fn define_private_accessor(
 fn private_element(receiver: &Value, brand: &Value, brand_id: u64, name: &str) -> PrivateElement {
     let key = (brand_id, name.to_string());
     if let Some(object) = receiver.as_object() {
-        if let Some(element) = object.borrow().private_elements.get(&key) {
+        if let Some(element) = object
+            .borrow()
+            .rare
+            .as_ref()
+            .and_then(|rare| rare.private_elements.get(&key))
+        {
             return element.clone();
         }
     }
     if let Some(object) = brand.as_object() {
-        if let Some(element) = object.borrow().private_elements.get(&key) {
+        if let Some(element) = object
+            .borrow()
+            .rare
+            .as_ref()
+            .and_then(|rare| rare.private_elements.get(&key))
+        {
             return element.clone();
         }
     }
@@ -302,12 +329,17 @@ pub fn set_private(receiver: &Value, brand: &Value, name: &str, value: Value) ->
     let key = (brand_id, name.to_string());
     if let Some(object) = receiver.as_object() {
         let is_field = matches!(
-            object.borrow().private_elements.get(&key),
+            object
+                .borrow()
+                .rare
+                .as_ref()
+                .and_then(|rare| rare.private_elements.get(&key)),
             Some(PrivateElement::Field(_))
         );
         if is_field {
             let mut object = object.borrow_mut();
             object
+                .ensure_rare()
                 .private_elements
                 .insert(key, PrivateElement::Field(value.clone()));
             object.refresh_heap_accounting();
@@ -330,9 +362,13 @@ pub fn has_private(receiver: &Value, brand: &Value) -> bool {
     let Some(brand_id) = brand_id(brand) else {
         return false;
     };
-    receiver
-        .as_object()
-        .is_some_and(|object| object.borrow().private_brands.contains(&brand_id))
+    receiver.as_object().is_some_and(|object| {
+        object
+            .borrow()
+            .rare
+            .as_ref()
+            .is_some_and(|rare| rare.private_brands.contains(&brand_id))
+    })
 }
 
 /// `super.method(...)` in an instance method: look up `name` on the parent
