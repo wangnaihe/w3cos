@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::heap::{HeapAllocation, HeapKind};
 use crate::js_string::JsString;
 use crate::proxy::ProxyHandler;
-use crate::value::{JsFunction, Value};
+use crate::value::{FunctionData, Value};
 
 #[derive(Clone)]
 pub(crate) enum PrivateElement {
@@ -33,7 +33,7 @@ pub struct JsObject {
     pub(crate) prototype: Option<Rc<RefCell<JsObject>>>,
     pub(crate) proxy_handler: Option<ProxyHandler>,
     has_getter_properties: bool,
-    pub(crate) call_slot: Option<JsFunction>,
+    pub(crate) call_slot: Option<Rc<FunctionData>>,
     /// Derived-class instance initializers waiting for their corresponding
     /// `super(...)` call to return. This is internal execution state, not an
     /// observable JavaScript property.
@@ -134,7 +134,7 @@ impl JsObject {
 
     /// Create a callable object (a JS class / constructor): plain properties
     /// plus a call slot invoked by `Value::call` / `class::construct`.
-    pub fn with_call_slot(properties: HashMap<String, Value>, call: JsFunction) -> Self {
+    pub fn with_call_slot(properties: HashMap<String, Value>, call: Rc<FunctionData>) -> Self {
         let properties: HashMap<JsString, Value> = properties
             .into_iter()
             .map(|(key, value)| (JsString::intern(&key), value))
@@ -164,7 +164,7 @@ impl JsObject {
     }
 
     /// The call slot, if this object is callable.
-    pub fn call_slot(&self) -> Option<&JsFunction> {
+    pub fn call_slot(&self) -> Option<&Rc<FunctionData>> {
         self.call_slot.as_ref()
     }
 

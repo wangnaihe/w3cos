@@ -8,8 +8,10 @@
 //! can drop unreferenced wrappers without a page reset. `array_hole` and host
 //! arrays keep `Value::Array(Rc)` when they must be collectable without a
 //! page reset. Host/DOM callables (`Value::callable`, jsdom call slots) stay
-//! on the `Value::Function(Rc)` / object call-slot path. Size-class slabs
-//! wait for a later cut.
+//! on the `Value::Function(Rc<FunctionData>)` / object call-slot `Rc` path.
+//! Interned functions store one `Box<FunctionData>`; `as_function` /
+//! `get_function` / clone return a handle and do not clone inner Rcs.
+//! Size-class slabs wait for a later cut.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -58,7 +60,7 @@ struct PageArena {
     /// 1-based array slots; index 0 is unused so handle `0` is never valid.
     arrays: Vec<Option<std::rc::Rc<std::cell::RefCell<crate::value::ArrayStorage>>>>,
     /// 1-based function slots; index 0 is unused so handle `0` is never valid.
-    functions: Vec<Option<crate::value::JsFunction>>,
+    functions: Vec<Option<Box<crate::value::FunctionData>>>,
 }
 
 impl PageArena {
@@ -199,9 +201,9 @@ impl PageArena {
         array.clone()
     }
 
-    fn alloc_function(&mut self, function: crate::value::JsFunction) -> u32 {
+    fn alloc_function(&mut self, function: crate::value::FunctionData) -> u32 {
         let handle = self.functions.len() as u32;
-        self.functions.push(Some(function));
+        self.functions.push(Some(Box::new(function)));
         handle
     }
 
@@ -209,7 +211,29 @@ impl PageArena {
         let Some(Some(function)) = self.functions.get(handle as usize) else {
             panic!("page function handle used after reset_bridge");
         };
-        function.clone()
+        crate::value::JsFunction::from_interned(
+            handle,
+            self.epoch,
+            function.as_ref() as *const crate::value::FunctionData,
+        )
+    }
+
+    fn upgrade_function(
+        &self,
+        handle: u32,
+        epoch: u32,
+    ) -> Option<crate::value::JsFunction> {
+        if epoch != self.epoch {
+            return None;
+        }
+        let Some(Some(function)) = self.functions.get(handle as usize) else {
+            return None;
+        };
+        Some(crate::value::JsFunction::from_interned(
+            handle,
+            self.epoch,
+            function.as_ref() as *const crate::value::FunctionData,
+        ))
     }
 }
 
@@ -224,7 +248,7 @@ thread_local! {
     static GEN: Cell<u32> = const { Cell::new(1) };
 }
 
-fn current_epoch() -> u32 {
+pub(crate) fn current_epoch() -> u32 {
     GEN.get()
 }
 
@@ -327,19 +351,32 @@ pub fn live_arrays() -> usize {
     ARENA.with(|arena| arena.borrow().arrays.len().saturating_sub(1))
 }
 
-/// Store a page-local JS function. Clone of the returned handle does not
-/// `Rc::clone` the closure / props / allocation.
-pub(crate) fn alloc_function(function: crate::value::JsFunction) -> u32 {
+/// Store a page-local JS function. The arena owns the payload once;
+/// returned handles are `Copy` (`u32` + cached slot pointer).
+pub(crate) fn alloc_function(function: crate::value::FunctionData) -> u32 {
     ARENA.with(|arena| arena.borrow_mut().alloc_function(function))
 }
 
 /// Resolve a live function handle. Panics if the handle belongs to a
-/// previous page (same contract as interned strings).
+/// previous page (same contract as interned strings). Does not clone
+/// the payload.
 pub(crate) fn get_function(handle: u32) -> crate::value::JsFunction {
     if handle == 0 {
         panic!("page function handle used after reset_bridge");
     }
     ARENA.with(|arena| arena.borrow().get_function(handle))
+}
+
+/// Upgrade an interned weak function. Fails after [`reset`] via epoch
+/// or empty slot — not `Weak::upgrade` of inner Rcs.
+pub(crate) fn upgrade_function(
+    handle: u32,
+    epoch: u32,
+) -> Option<crate::value::JsFunction> {
+    if handle == 0 || epoch != current_epoch() {
+        return None;
+    }
+    ARENA.with(|arena| arena.borrow().upgrade_function(handle, epoch))
 }
 
 /// Live page-local functions (empty after [`reset`]).
@@ -427,21 +464,20 @@ mod tests {
     fn function_table_alloc_and_reset_empties() {
         reset();
         assert_eq!(live_functions(), 0);
-        let js = crate::value::JsFunction::new(|_, _| crate::Value::Undefined);
-        let before = js.strong_counts();
-        let handle = alloc_function(js.clone());
+        let handle = alloc_function(crate::value::FunctionData::new(|_, _| {
+            crate::Value::Undefined
+        }));
         assert_eq!(handle, 1);
-        let after_alloc = js.strong_counts();
-        assert_eq!(after_alloc.0, before.0 + 1);
-        assert_eq!(after_alloc.1, before.1 + 1);
-        assert_eq!(after_alloc.2, before.2 + 1);
         let resolved = get_function(handle);
-        assert!(resolved.ptr_eq(&js));
+        let cloned = resolved.clone();
+        assert!(resolved.ptr_eq(&cloned));
+        assert_eq!(resolved.interned_handle(), Some(handle));
+        assert!(resolved.host_strong_count().is_none());
+        assert_eq!(live_functions(), 1);
         drop(resolved);
+        drop(cloned);
         assert_eq!(live_functions(), 1);
         reset();
         assert_eq!(live_functions(), 0);
-        let after_reset = js.strong_counts();
-        assert_eq!(after_reset, before);
     }
 }

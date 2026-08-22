@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 use std::ops::{Deref, Index, IndexMut};
 use std::rc::{Rc, Weak};
 use std::slice::SliceIndex;
@@ -43,7 +44,7 @@ pub enum Value {
     String(JsString),
     Array(Rc<RefCell<ArrayStorage>>),
     Object(Rc<RefCell<crate::JsObject>>),
-    Function(JsFunction),
+    Function(Rc<FunctionData>),
 }
 
 impl Default for Value {
@@ -405,7 +406,7 @@ impl Value {
             Value::Imm(imm) => imm
                 .function_handle()
                 .map(crate::page_arena::get_function),
-            Value::Function(function) => Some(function.clone()),
+            Value::Function(function) => Some(JsFunction::from_host(Rc::clone(function))),
             _ => None,
         }
     }
@@ -586,7 +587,7 @@ impl Value {
             Value::String(s) => ValueUnpack::String(s.clone()),
             Value::Array(a) => ValueUnpack::Array(Rc::clone(a)),
             Value::Object(o) => ValueUnpack::Object(Rc::clone(o)),
-            Value::Function(f) => ValueUnpack::Function(f.clone()),
+            Value::Function(f) => ValueUnpack::Function(JsFunction::from_host(Rc::clone(f))),
         }
     }
 }
@@ -618,7 +619,7 @@ pub(crate) fn array_slot_value(value: Value) -> Value {
 }
 
 fn function_heap_bytes(props: &HashMap<JsString, Value>) -> usize {
-    std::mem::size_of::<JsFunction>()
+    std::mem::size_of::<FunctionData>()
         .saturating_add(
             props
                 .capacity()
@@ -719,28 +720,45 @@ impl PartialEq for Value {
     }
 }
 
-/// A callable JS function stored as a reference-counted closure.
-#[derive(Clone)]
+/// Payload of a JS function object.
+///
+/// Page-local interned functions store one [`Box`] of this in the page
+/// arena. Host / DOM callables share [`Rc<FunctionData>`] on
+/// [`Value::Function`] and object call-slots.
+pub struct FunctionData {
+    inner: Box<dyn Fn(Value, Vec<Value>) -> Value>,
+    props: RefCell<HashMap<JsString, Value>>,
+    allocation: HeapAllocation,
+}
+
+/// A callable JS function: interned page-local handle, or host `Rc`.
+///
+/// Interned `Clone` copies a `u32` handle (plus a cached payload pointer).
+/// It does not `Rc::clone` the closure / props / allocation. Host clones
+/// clone one `Rc<FunctionData>`.
 pub struct JsFunction {
-    inner: Rc<dyn Fn(Value, Vec<Value>) -> Value>,
-    /// Properties assigned on the function value. JS functions are objects:
-    /// `id.toString = () => name` (monaco's service decorators), static
-    /// methods installed on constructor functions, etc.
-    props: Rc<RefCell<std::collections::HashMap<JsString, Value>>>,
-    allocation: Rc<HeapAllocation>,
+    repr: JsFunctionRepr,
 }
 
-pub(crate) struct WeakJsFunction {
-    inner: Weak<dyn Fn(Value, Vec<Value>) -> Value>,
-    props: Weak<RefCell<std::collections::HashMap<JsString, Value>>>,
-    allocation: Weak<HeapAllocation>,
+enum JsFunctionRepr {
+    Interned {
+        handle: u32,
+        epoch: u32,
+        ptr: *const FunctionData,
+        _thread: PhantomData<Rc<()>>,
+    },
+    Host(Rc<FunctionData>),
 }
 
-impl JsFunction {
+pub(crate) enum WeakJsFunction {
+    Interned { handle: u32, epoch: u32 },
+    Host(Weak<FunctionData>),
+}
+
+impl FunctionData {
     #[inline]
     pub fn new(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
-        let inner: Rc<dyn Fn(Value, Vec<Value>) -> Value> = Rc::new(f);
-        Self::from_erased(inner)
+        Self::from_erased(Box::new(f))
     }
 
     /// Construct the common JS function object after erasing the concrete
@@ -748,20 +766,17 @@ impl JsFunction {
     /// keeping prototype/allocation setup in the generic constructor causes
     /// that body to be monomorphized once per closure before LTO can merge it.
     #[inline(never)]
-    fn from_erased(inner: Rc<dyn Fn(Value, Vec<Value>) -> Value>) -> Self {
-        let mut props = std::collections::HashMap::new();
+    fn from_erased(inner: Box<dyn Fn(Value, Vec<Value>) -> Value>) -> Self {
+        let mut props = HashMap::new();
         // Ordinary JavaScript function objects own a prototype object. The
         // compiler uses these Values for function declarations/constructors;
         // Libraries install methods on constructor prototypes before
         // constructing instances.
         props.insert(JsString::intern("prototype"), Value::object(HashMap::new()));
-        let allocation = Rc::new(HeapAllocation::new(
-            HeapKind::Function,
-            function_heap_bytes(&props),
-        ));
+        let allocation = HeapAllocation::new(HeapKind::Function, function_heap_bytes(&props));
         Self {
             inner,
-            props: Rc::new(RefCell::new(props)),
+            props: RefCell::new(props),
             allocation,
         }
     }
@@ -770,7 +785,6 @@ impl JsFunction {
         (self.inner)(this, args)
     }
 
-    /// Read a property of the function object (Undefined when absent).
     pub fn get_property(&self, key: &str) -> Value {
         self.props
             .borrow()
@@ -783,7 +797,6 @@ impl JsFunction {
         self.props.borrow().contains_key(key)
     }
 
-    /// Own property names installed on this function object.
     pub fn keys(&self) -> Vec<String> {
         self.props
             .borrow()
@@ -792,55 +805,188 @@ impl JsFunction {
             .collect()
     }
 
-    /// Assign a property on the function object.
     pub fn set_property(&self, key: &str, value: Value) {
         let mut props = self.props.borrow_mut();
         props.insert(JsString::intern(key), value);
         self.allocation.set_bytes(function_heap_bytes(&props));
     }
 
+    pub fn delete_property(&self, key: &str) {
+        let mut props = self.props.borrow_mut();
+        props.remove(key);
+        self.allocation.set_bytes(function_heap_bytes(&props));
+    }
+
+    pub fn identity(&self) -> usize {
+        self as *const FunctionData as usize
+    }
+}
+
+impl Clone for JsFunction {
+    fn clone(&self) -> Self {
+        match self.repr {
+            JsFunctionRepr::Interned {
+                handle,
+                epoch,
+                ptr,
+                _thread,
+            } => Self {
+                repr: JsFunctionRepr::Interned {
+                    handle,
+                    epoch,
+                    ptr,
+                    _thread,
+                },
+            },
+            JsFunctionRepr::Host(ref rc) => Self {
+                repr: JsFunctionRepr::Host(Rc::clone(rc)),
+            },
+        }
+    }
+}
+
+impl JsFunction {
+    #[inline]
+    pub fn new(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
+        Self::from_host(Rc::new(FunctionData::new(f)))
+    }
+
+    pub(crate) fn from_interned(handle: u32, epoch: u32, ptr: *const FunctionData) -> Self {
+        Self {
+            repr: JsFunctionRepr::Interned {
+                handle,
+                epoch,
+                ptr,
+                _thread: PhantomData,
+            },
+        }
+    }
+
+    pub(crate) fn from_host(data: Rc<FunctionData>) -> Self {
+        Self {
+            repr: JsFunctionRepr::Host(data),
+        }
+    }
+
+    /// Resolve payload without holding the page-arena `RefCell`. Interned
+    /// handles use the cached slot pointer (epoch-checked). Nested
+    /// `Value::function` allocation would otherwise `BorrowMutError`.
+    fn data(&self) -> &FunctionData {
+        match self.repr {
+            JsFunctionRepr::Interned { epoch, ptr, .. } => {
+                if epoch != crate::page_arena::current_epoch() || ptr.is_null() {
+                    panic!("page function handle used after reset_bridge");
+                }
+                // Safety: `ptr` names a `FunctionData` box in the current
+                // page function table. `reset` bumps the epoch before
+                // dropping those boxes. Callers must not hold the reference
+                // across a page reset.
+                unsafe { &*ptr }
+            }
+            JsFunctionRepr::Host(ref rc) => rc,
+        }
+    }
+
+    pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
+        self.data().call(this, args)
+    }
+
+    /// Read a property of the function object (Undefined when absent).
+    pub fn get_property(&self, key: &str) -> Value {
+        self.data().get_property(key)
+    }
+
+    pub fn has_own_property(&self, key: &str) -> bool {
+        self.data().has_own_property(key)
+    }
+
+    /// Own property names installed on this function object.
+    pub fn keys(&self) -> Vec<String> {
+        self.data().keys()
+    }
+
+    /// Assign a property on the function object.
+    pub fn set_property(&self, key: &str, value: Value) {
+        self.data().set_property(key, value)
+    }
+
+    pub fn delete_property(&self, key: &str) {
+        self.data().delete_property(key)
+    }
+
     /// A stable identity address for this function value (clones of the same
     /// `JsFunction` share it) — used for identity-keyed collections (JS Map).
     pub fn identity(&self) -> usize {
-        Rc::as_ptr(&self.inner) as *const u8 as usize
+        self.data().identity()
     }
 
-    /// Function identity: two `JsFunction`s are the same function when they
-    /// share the inner closure allocation (clones of one value do).
+    /// Function identity: two interned handles name the same slot, or two
+    /// host functions share the same `FunctionData` allocation.
     pub fn ptr_eq(&self, other: &JsFunction) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
+        match (&self.repr, &other.repr) {
+            (
+                JsFunctionRepr::Interned {
+                    handle: a,
+                    epoch: ea,
+                    ..
+                },
+                JsFunctionRepr::Interned {
+                    handle: b,
+                    epoch: eb,
+                    ..
+                },
+            ) => a == b && ea == eb,
+            (JsFunctionRepr::Host(a), JsFunctionRepr::Host(b)) => Rc::ptr_eq(a, b),
+            _ => std::ptr::eq(self.data(), other.data()),
+        }
     }
 
-    /// Strong counts of the three inner `Rc`s (closure, props, allocation).
     #[cfg(test)]
-    pub(crate) fn strong_counts(&self) -> (usize, usize, usize) {
-        (
-            Rc::strong_count(&self.inner),
-            Rc::strong_count(&self.props),
-            Rc::strong_count(&self.allocation),
-        )
+    pub(crate) fn interned_handle(&self) -> Option<u32> {
+        match self.repr {
+            JsFunctionRepr::Interned { handle, .. } => Some(handle),
+            JsFunctionRepr::Host(_) => None,
+        }
+    }
+
+    /// Strong count of the host `Rc<FunctionData>`, when this is not interned.
+    #[cfg(test)]
+    pub(crate) fn host_strong_count(&self) -> Option<usize> {
+        match &self.repr {
+            JsFunctionRepr::Host(rc) => Some(Rc::strong_count(rc)),
+            JsFunctionRepr::Interned { .. } => None,
+        }
     }
 
     pub(crate) fn downgrade(&self) -> WeakJsFunction {
-        WeakJsFunction {
-            inner: Rc::downgrade(&self.inner),
-            props: Rc::downgrade(&self.props),
-            allocation: Rc::downgrade(&self.allocation),
+        match self.repr {
+            JsFunctionRepr::Interned { handle, epoch, .. } => {
+                WeakJsFunction::Interned { handle, epoch }
+            }
+            JsFunctionRepr::Host(ref rc) => WeakJsFunction::Host(Rc::downgrade(rc)),
         }
     }
 }
 
 impl WeakJsFunction {
-    pub(crate) fn upgrade(&self) -> Option<JsFunction> {
-        Some(JsFunction {
-            inner: self.inner.upgrade()?,
-            props: self.props.upgrade()?,
-            allocation: self.allocation.upgrade()?,
-        })
+    pub(crate) fn upgrade_value(&self) -> Option<Value> {
+        match self {
+            WeakJsFunction::Interned { handle, epoch } => crate::page_arena::upgrade_function(
+                *handle, *epoch,
+            )
+            .map(|_| Value::Imm(Immediate::from_function_handle(*handle))),
+            WeakJsFunction::Host(weak) => weak.upgrade().map(Value::Function),
+        }
     }
 }
 
 impl fmt::Debug for JsFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[Function]")
+    }
+}
+
+impl fmt::Debug for FunctionData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[Function]")
     }
@@ -1248,10 +1394,7 @@ impl Value {
                 true
             }
             _ if self.as_function().is_some() => {
-                let function = self.as_function().expect("function");
-                let mut props = function.props.borrow_mut();
-                props.remove(key);
-                function.allocation.set_bytes(function_heap_bytes(&props));
+                self.as_function().expect("function").delete_property(key);
                 true
             }
             _ => true,
@@ -1299,8 +1442,7 @@ impl Value {
     }
 
     pub fn function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
-        let js = JsFunction::new(f);
-        let handle = crate::page_arena::alloc_function(js);
+        let handle = crate::page_arena::alloc_function(FunctionData::new(f));
         Value::Imm(Immediate::from_function_handle(handle))
     }
 
@@ -1311,7 +1453,7 @@ impl Value {
     ) -> Self {
         Value::Object(Rc::new(RefCell::new(crate::JsObject::with_call_slot(
             props,
-            JsFunction::new(f),
+            Rc::new(FunctionData::new(f)),
         ))))
     }
 
@@ -3864,9 +4006,12 @@ mod tests {
                 assert!(!std::mem::needs_drop::<Immediate>());
                 let handle = word.function_handle().unwrap();
                 let js = crate::page_arena::get_function(handle);
-                let before = js.strong_counts();
+                assert_eq!(js.interned_handle(), Some(handle));
+                assert!(js.host_strong_count().is_none());
                 let cloned = func.clone();
-                assert_eq!(js.strong_counts(), before);
+                let again = func.as_function().expect("function");
+                assert!(js.ptr_eq(&again));
+                assert!(js.ptr_eq(&again.clone()));
                 match cloned {
                     Value::Imm(copy) => {
                         assert_eq!(copy.function_handle(), word.function_handle())
@@ -3880,9 +4025,54 @@ mod tests {
             }
             _ => panic!("Value::function must pack a page-arena handle"),
         }
-        assert!(crate::page_arena::live_functions() >= 1);
+        assert_eq!(crate::page_arena::live_functions(), 1);
         crate::page_arena::reset();
         assert_eq!(crate::page_arena::live_functions(), 0);
+    }
+
+    #[test]
+    fn interned_function_as_function_clone_is_handle_eq_and_live_table_stays_one() {
+        crate::page_arena::reset();
+        let func = Value::function(|_, _| Value::Number(3.0));
+        assert_eq!(crate::page_arena::live_functions(), 1);
+        let a = func.as_function().expect("function");
+        let b = a.clone();
+        let c = func.as_function().expect("function");
+        assert!(a.ptr_eq(&b));
+        assert!(a.ptr_eq(&c));
+        assert_eq!(a.interned_handle(), func.function_handle());
+        assert!(a.host_strong_count().is_none());
+        assert!(b.host_strong_count().is_none());
+        assert_eq!(crate::page_arena::live_functions(), 1);
+        // Nested Value::function during call must not hold the arena RefCell.
+        let maker = Value::function(|_, _| Value::function(|_, _| Value::Number(9.0)));
+        assert_eq!(crate::page_arena::live_functions(), 2);
+        let inner = maker.call(Value::Undefined, vec![]);
+        assert!(inner.is_function());
+        assert_eq!(inner.call(Value::Undefined, vec![]).to_number(), 9.0);
+        assert_eq!(crate::page_arena::live_functions(), 3);
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_functions(), 0);
+        let stale = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            a.call(Value::Undefined, vec![])
+        }));
+        assert!(
+            stale.is_err(),
+            "stale interned function handle must panic after reset"
+        );
+    }
+
+    #[test]
+    fn interned_function_weak_fails_after_reset() {
+        crate::page_arena::reset();
+        let func = Value::function(|_, _| Value::Number(1.0));
+        let weak = func.as_function().expect("function").downgrade();
+        let upgraded = weak.upgrade_value().expect("live interned function");
+        assert!(upgraded.function_handle() == func.function_handle());
+        assert_eq!(upgraded.call(Value::Undefined, vec![]).to_number(), 1.0);
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_functions(), 0);
+        assert!(weak.upgrade_value().is_none());
     }
 
     #[test]

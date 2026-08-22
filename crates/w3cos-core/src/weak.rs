@@ -43,7 +43,7 @@ impl WeakValue {
         match self {
             Self::Array(value) => value.upgrade().map(Value::Array),
             Self::Object(value) => value.upgrade().map(Value::Object),
-            Self::Function(value) => value.upgrade().map(Value::Function),
+            Self::Function(value) => value.upgrade_value(),
         }
     }
 
