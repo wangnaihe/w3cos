@@ -66,7 +66,7 @@ impl PageString {
 /// Measured 64-bit classes:
 /// - `RefCell<JsObject>` = 480 → 8 slots / 4K chunk (compact PropertyMap)
 /// - `RefCell<ArrayStorage>` = 56 → 73 slots / 4K chunk
-/// - `FunctionData` = 96 → 42 slots / 4K chunk
+/// - `FunctionData` = 64 → 64 slots / 4K chunk (compact PropertyMap)
 struct SizeClassSlab<T> {
     chunks: Vec<Box<[MaybeUninit<T>]>>,
     len: usize,
@@ -622,8 +622,9 @@ mod tests {
             crate::Value::Undefined
         }));
 
-        // FunctionData::new also interns the "prototype" property key.
-        assert_eq!(live_handles(), 2);
+        // FunctionData::new interns "prototype"; PropertyMap Inline placeholders
+        // also intern "" (shared across empty slots).
+        assert_eq!(live_handles(), 3);
         assert_eq!(live_objects(), 2); // explicit + function prototype
         assert_eq!(live_arrays(), 1);
         assert_eq!(live_functions(), 1);

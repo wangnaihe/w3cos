@@ -10,6 +10,7 @@ use std::slice::SliceIndex;
 
 use crate::heap::{HeapAllocation, HeapKind};
 use crate::js_string::JsString;
+use crate::property_map::PropertyMap;
 
 /// JavaScript-compatible dynamic value type.
 ///
@@ -1002,16 +1003,10 @@ pub(crate) fn array_slot_value(value: Value) -> Value {
 }
 
 fn function_heap_bytes(
-    props: &HashMap<JsString, Value>,
+    props: &PropertyMap,
     captures: Option<&AotCaptureMap>,
 ) -> usize {
-    let mut bytes = std::mem::size_of::<FunctionData>()
-        .saturating_add(
-            props
-                .capacity()
-                .saturating_mul(std::mem::size_of::<(JsString, Value)>()),
-        )
-        .saturating_add(props.len().saturating_mul(std::mem::size_of::<JsString>()));
+    let mut bytes = std::mem::size_of::<FunctionData>().saturating_add(props.heap_bytes());
     if let Some(captures) = captures {
         // Box<AotCaptureMap> payload (the Box word itself sits in FunctionData).
         bytes = bytes
@@ -1147,7 +1142,9 @@ enum FunctionBody {
 /// call-slots.
 pub struct FunctionData {
     body: FunctionBody,
-    props: RefCell<HashMap<JsString, Value>>,
+    /// Own string-keyed data properties. Ordinary functions keep ≤4 inline
+    /// (prototype, and often length/name) without a HashMap spill.
+    props: RefCell<PropertyMap>,
     allocation: HeapAllocation,
 }
 
@@ -1207,7 +1204,7 @@ impl FunctionData {
             FunctionBody::Dyn(_) => None,
             FunctionBody::Aot { captures, .. } => Some(captures.as_ref()),
         };
-        let mut props = HashMap::new();
+        let mut props = PropertyMap::new();
         // Ordinary JavaScript function objects own a prototype object. The
         // compiler uses these Values for function declarations/constructors;
         // Libraries install methods on constructor prototypes before
@@ -1247,6 +1244,12 @@ impl FunctionData {
             .keys()
             .map(|key| key.as_str().to_string())
             .collect()
+    }
+
+    /// True when props have not spilled to HashMap (empty or ≤INLINE_CAP inline).
+    #[cfg(test)]
+    pub(crate) fn props_is_compact(&self) -> bool {
+        self.props.borrow().is_compact()
     }
 
     pub fn set_property(&self, key: &str, value: Value) {
@@ -1410,6 +1413,11 @@ impl JsFunction {
             JsFunctionRepr::Host(rc) => Some(Rc::strong_count(rc)),
             JsFunctionRepr::Interned { .. } => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn props_is_compact(&self) -> bool {
+        self.data().props_is_compact()
     }
 
     pub(crate) fn downgrade(&self) -> WeakJsFunction {
@@ -4493,6 +4501,31 @@ mod tests {
         assert_eq!(crate::page_arena::live_functions(), 1);
         crate::page_arena::reset();
         assert_eq!(crate::page_arena::live_functions(), 0);
+    }
+
+    #[test]
+    fn fresh_function_props_stay_inline_for_prototype_only() {
+        crate::page_arena::reset();
+        let func = Value::function(|_, _| Value::Undefined);
+        let js = func.as_function().expect("function");
+        assert!(js.has_own_property("prototype"));
+        assert!(
+            js.props_is_compact(),
+            "prototype-only FunctionData props must stay Inline (no HashMap spill)"
+        );
+        assert_eq!(js.keys(), vec!["prototype".to_string()]);
+        // length/name still fit in INLINE_CAP (4) with prototype.
+        js.set_property("length", Value::Number(0.0));
+        js.set_property("name", Value::string("f"));
+        assert!(js.props_is_compact(), "prototype+length+name still inline");
+        js.set_property("extra", Value::Number(1.0));
+        assert!(js.props_is_compact(), "4th own prop still inline");
+        js.set_property("spill", Value::Number(2.0));
+        assert!(
+            !js.props_is_compact(),
+            "5th own prop spills FunctionData props to HashMap"
+        );
+        crate::page_arena::reset();
     }
 
     #[test]
