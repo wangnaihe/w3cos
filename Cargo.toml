@@ -42,7 +42,6 @@ png = "0.17"
 # Chromium-facing raster formats. Avoid linking scientific/authoring codecs
 # (DDS/EXR/HDR/PNM/QOI/TGA/TIFF) into every standalone application.
 image = { version = "0.25", default-features = false, features = [
-    "avif",
     "bmp",
     "gif",
     "ico",

@@ -2830,6 +2830,9 @@ W3COS.
 - [ ] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
 - [ ] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
 - [ ] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+  - [x] Remove the unused AVIF encoder (`ravif`/`rav1e`) from the ordinary
+    raster closure and retain it as explicit `image-avif-encode` capability.
+    AVIF decoding is a separate native-decoder boundary.
 - [x] Keep compiler/SWC/W3VM out of ordinary AOT applications; include parser + W3VM only for Browser or explicitly dynamic targets
   - `scripts/check-aot-dependency-boundary.sh` enforces the default runtime boundary in CI
   - `dynamic-js` is an explicit opt-in runtime feature

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 dependency_tree="$(cargo tree -p w3cos-runtime --no-default-features -e normal)"
-for forbidden in w3cos-compiler w3cos-vm w3cos-ir swc_; do
+for forbidden in w3cos-compiler w3cos-vm w3cos-ir swc_ ravif rav1e; do
     if grep -q "$forbidden" <<<"$dependency_tree"; then
         echo "ordinary AOT runtime unexpectedly contains $forbidden" >&2
         exit 1
@@ -50,4 +50,4 @@ if ! grep -q 'W3IR native class emission' "$compiler_codegen"; then
     exit 1
 fi
 
-echo "ordinary AOT excludes compiler/W3VM/W3IR/SWC linkage; module init, functions and class callables have one W3IR semantic path"
+echo "ordinary AOT excludes compiler/W3VM/W3IR/SWC and AVIF encoder linkage; module init, functions and class callables have one W3IR semantic path"
