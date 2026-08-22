@@ -15,7 +15,7 @@ use crate::value::Value;
 
 /// Inline entries before spilling to `HashMap`. Four covers common object
 /// literals / instances without growing the spilled path's cold size much;
-/// `(JsString, Value)` is 64B so the inline box is ~260B.
+/// `(JsString, Value)` is 32B (thin string + two-word Value) so the inline box is ~128B.
 pub(crate) const INLINE_CAP: usize = 4;
 
 #[derive(Clone)]

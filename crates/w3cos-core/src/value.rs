@@ -14,20 +14,27 @@ use crate::property_map::PropertyMap;
 
 /// JavaScript-compatible dynamic value type.
 ///
-/// First-cut ABI: Undefined / Null / Bool / Number and page-interned
-/// strings (any length) are a Copy tagged word ([`Immediate`], NaN-box).
-/// Clone of those immediates is a register move of the 8-byte word and
-/// does not touch `Rc`.
+/// Page-local ABI: Undefined / Null / Bool / Number, page-interned strings
+/// (any length), and page-arena object / array / function handles are a
+/// Copy tagged word ([`Immediate`], NaN-box). Clone of those immediates is
+/// a register move of the 8-byte word and does not touch `Rc`.
 ///
-/// Host/outliving `Rc<str>` strings ([`JsString::heap`]), host/DOM objects, host arrays, and host/DOM
-/// callables stay as a remaining enum of pointers / `Rc`. Page-local objects
-/// created via [`Value::object`] / literals, constructor / literal arrays
-/// created via [`Value::array`], and ordinary JS closures created via
-/// [`Value::function`] / [`Value::aot_function`] (AOT `CreateClosure`) are `u32` handles packed in
-/// [`Immediate`] (clone is a register move). `array_hole` stays a host `Rc`
-/// object. Host/DOM callables (`Value::callable`, jsdom call slots) stay
-/// `Value::Object(Rc)` / `Value::Function(Rc)`. Symbols remain interned
-/// strings (`__w3cos_symbol_…`).
+/// Host/outliving strings ([`JsString::heap`], thin `Rc<String>`), host/DOM
+/// objects, host arrays, and host/DOM callables stay as the remaining
+/// enum of thin `Rc` arms. On 64-bit, [`Value`] is two words (16 bytes):
+/// packing host `Rc` pointers into the NaN payload would need a non-`Copy`
+/// single-word wrapper (Immediate stays `Copy` for page locals) and would
+/// break the `String` / `Array` / `Object` / `Function` variant names used
+/// across AOT asserts and jsdom — deferred. WeakRef identity for host/DOM
+/// wrappers remains `Rc` (or Weak) on those arms.
+///
+/// Page-local objects created via [`Value::object`] / literals, constructor
+/// / literal arrays created via [`Value::array`], and ordinary JS closures
+/// created via [`Value::function`] / [`Value::aot_function`] (AOT
+/// `CreateClosure`) are `u32` handles packed in [`Immediate`]. `array_hole`
+/// stays a host `Rc` object. Host/DOM callables (`Value::callable`, jsdom
+/// call slots) stay `Value::Object(Rc)` / `Value::Function(Rc)`. Symbols
+/// remain interned strings (`__w3cos_symbol_…`).
 ///
 /// Constructors `Value::Undefined`, `Value::Null`, `Value::Bool`, and
 /// `Value::Number` are unchanged so AOT emission (`num_regs` / `bool_regs`
@@ -72,8 +79,9 @@ impl Default for Value {
 ///   - `7` page-arena array (`u32` handle payload)
 ///   - `8` page-arena function (`u32` handle payload)
 ///
-/// Host `Rc<str>` and heap pointers are **not** in this word (remaining
-/// `Value` enum). Tagged payloads use a 4-bit tag (`HANDLE_SHIFT = 4`).
+/// Host `Rc` strings / objects / arrays / functions are **not** in this
+/// word (remaining `Value` enum arms). Tagged payloads use a 4-bit tag
+/// (`HANDLE_SHIFT = 4`).
 #[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct Immediate(u64);
@@ -347,7 +355,7 @@ impl Value {
     }
 
     /// Pack page-interned strings into [`Immediate`]; [`JsString::heap`]
-    /// `Rc<str>` stay on the `String` arm.
+    /// thin `Rc<String>` stay on the `String` arm.
     #[inline]
     pub fn from_js_string(s: JsString) -> Self {
         if let Some(handle) = s.page_handle() {
@@ -3499,6 +3507,9 @@ mod tests {
     #[test]
     fn immediates_are_copy_tagged_words_without_allocation() {
         assert_eq!(std::mem::size_of::<Immediate>(), 8);
+        assert_eq!(std::mem::size_of::<Value>(), 16);
+        assert_eq!(std::mem::size_of::<JsString>(), 16);
+        assert_eq!(std::mem::size_of::<Option<Value>>(), 16);
         assert!(!std::mem::needs_drop::<Immediate>());
         let undef = assert_copy(Immediate::UNDEFINED);
         let null = assert_copy(Immediate::NULL);

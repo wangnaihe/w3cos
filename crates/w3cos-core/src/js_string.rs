@@ -4,13 +4,19 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::rc::Rc;
 
-use crate::page_arena::{self, PageString};
+use crate::page_arena;
 
 /// Interned / shared JavaScript string.
 ///
 /// Page-local strings from [`Self::intern`] live in the page bump arena and
-/// clone as a `u32` handle (any length). Host / outliving strings use
-/// [`Self::heap`] (`Rc<str>`) so they survive `page_arena::reset`.
+/// clone as a `(handle, epoch)` word (any length). Host / outliving strings
+/// use [`Self::heap`] (`Rc<String>`, thin pointer) so they survive
+/// `page_arena::reset`.
+///
+/// Both arms are pointer-sized so [`JsString`] is 16 bytes on 64-bit. That
+/// keeps [`crate::Value::String`] from inflating [`crate::Value`] past two
+/// words (host `Rc` arms + NaN-box [`crate::Immediate`] already fit in 16).
+/// Fat `PageString` (cached bump ptr/len) stays inside the arena slots only.
 ///
 /// Core heap values are thread-confined (`Rc<RefCell<JsObject>>`, thread-local
 /// heap counters), so the intern table is thread-local as well. The page bump
@@ -23,9 +29,20 @@ use crate::page_arena::{self, PageString};
 /// second AOT-only string type.
 pub struct JsString(Repr);
 
+/// Page-local handle word. Bump bytes are resolved through the arena on
+/// [`JsString::as_str`]; we deliberately do not cache `ptr`/`len` here so
+/// the `Value::String` arm stays one word of payload.
+#[derive(Clone, Copy)]
+struct InternedHandle {
+    handle: u32,
+    epoch: u32,
+}
+
 enum Repr {
-    Interned(PageString),
-    Heap(Rc<str>),
+    Interned(InternedHandle),
+    /// Thin `Rc` (sized `String`) — `Rc<str>` would be a fat pointer and
+    /// blow [`JsString`] / [`crate::Value`] back to 24–32 bytes.
+    Heap(Rc<String>),
 }
 
 impl Clone for JsString {
@@ -42,30 +59,36 @@ impl JsString {
     /// on `page_arena::reset`. Prefer [`Self::heap`] for host strings that
     /// must outlive the page.
     pub fn intern(s: &str) -> Self {
-        // `PageString::len` is `u32`; absurd sizes fall back to heap Rc.
+        // Arena slot `len` is `u32`; absurd sizes fall back to heap Rc.
         if s.len() > u32::MAX as usize {
             return Self::heap(s);
         }
-        Self(Repr::Interned(page_arena::intern(s)))
+        let page = page_arena::intern(s);
+        Self(Repr::Interned(InternedHandle {
+            handle: page.handle,
+            epoch: page.epoch,
+        }))
     }
 
-    /// Host / outliving string: `Rc<str>` clone, not page-local. Survives
+    /// Host / outliving string: thin `Rc<String>`, not page-local. Survives
     /// `page_arena::reset` (unlike [`Self::intern`]).
     pub fn heap(s: impl AsRef<str>) -> Self {
-        Self(Repr::Heap(Rc::from(s.as_ref())))
+        Self(Repr::Heap(Rc::new(s.as_ref().to_string())))
     }
 
     pub fn as_str(&self) -> &str {
         match &self.0 {
-            Repr::Interned(interned) => interned.as_str(),
-            Repr::Heap(rc) => rc,
+            Repr::Interned(interned) => page_arena::str_at(interned.handle, interned.epoch),
+            Repr::Heap(rc) => rc.as_str(),
         }
     }
 
     /// True when both handles share the same intern slot or `Rc` allocation.
     pub fn ptr_eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
-            (Repr::Interned(a), Repr::Interned(b)) => a.handle == b.handle && a.epoch == b.epoch,
+            (Repr::Interned(a), Repr::Interned(b)) => {
+                a.handle == b.handle && a.epoch == b.epoch
+            }
             (Repr::Heap(a), Repr::Heap(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
@@ -85,7 +108,11 @@ impl JsString {
 
     /// Rebuild a page-interned `JsString` from a NaN-box handle.
     pub(crate) fn from_page_handle(handle: u32) -> Option<Self> {
-        page_arena::get(handle).map(|interned| Self(Repr::Interned(interned)))
+        let page = page_arena::get(handle)?;
+        Some(Self(Repr::Interned(InternedHandle {
+            handle: page.handle,
+            epoch: page.epoch,
+        })))
     }
 
     /// `Rc` strong-count for [`Self::heap`] strings. `None` for page-interned
@@ -297,5 +324,11 @@ mod tests {
         assert_eq!(page_arena::live_handles(), 0);
         assert_eq!(page_arena::allocated_bytes(), 0);
         assert_eq!(JsString::interned_table_bytes(), 0);
+    }
+
+    #[test]
+    fn js_string_is_two_words_on_64bit() {
+        assert_eq!(std::mem::size_of::<JsString>(), 16);
+        assert_eq!(std::mem::align_of::<JsString>(), 8);
     }
 }

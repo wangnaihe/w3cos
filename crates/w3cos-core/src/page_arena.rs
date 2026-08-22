@@ -4,7 +4,7 @@
 //! / literal arrays, and ordinary JS closures created via [`crate::Value::function`]
 //! live here so clones copy a `u32` handle instead of `Rc::clone`. The bump
 //! and slabs are dropped on [`reset`] (`reset_bridge` / document navigation).
-//! Host/outliving strings keep [`crate::JsString::heap`] (`Rc<str>`).
+//! Host/outliving strings keep [`crate::JsString::heap`] (thin `Rc<String>`).
 //! Host / DOM wrappers keep the `Value::Object(Rc)` path so WeakRef intern
 //! can drop unreferenced wrappers without a page reset. `array_hole` and host
 //! arrays keep `Value::Array(Rc)` when they must be collectable without a
@@ -377,6 +377,24 @@ pub(crate) fn get(handle: u32) -> Option<PageString> {
         }
         Some(slot)
     })
+}
+
+/// UTF-8 for a page-intern handle. Stale epoch / missing slot yields `""`
+/// (no panic), matching leftover Values after [`reset`].
+///
+/// The slice is valid until the next [`reset`] — same contract as
+/// [`PageString::as_str`]. `'static` is a type-system lie for that window.
+pub(crate) fn str_at(handle: u32, epoch: u32) -> &'static str {
+    match get(handle) {
+        Some(slot) if slot.epoch == epoch => {
+            let s = slot.as_str();
+            // Safety: bump bytes live until `reset`; see `PageString::as_str`.
+            unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(s.as_ptr(), s.len()))
+            }
+        }
+        _ => "",
+    }
 }
 
 /// Drop interned page strings and payload slabs. Called from `reset_bridge`
