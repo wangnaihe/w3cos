@@ -33,5 +33,5 @@ pub use reactive::{Computed, Effect, Signal, batch, watch};
 pub use value::{
     AotCaptureMap, AotFactory, ArrayStorage, Completion, FunctionData, Immediate, JsArrayRef,
     JsFunction, JsObjectRef, PanicValue, Value, WeakJsObject, catch_js, catch_js_result,
-    throw_value, type_of,
+    throw_value, type_of, unwrap_or_throw,
 };

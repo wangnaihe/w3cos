@@ -3428,9 +3428,20 @@ pub fn throw_value(value: Value) -> ! {
 }
 
 /// JS completion record used by AOT state machines: `Ok` is normal
-/// completion, `Err` is throw. Host/DOM seams may still panic via
-/// [`throw_value`].
+/// completion, `Err` is throw.
+///
+/// Prefer returning [`Completion`] from host/TDZ helpers when the caller can
+/// propagate `Err` (AOT `run`, VM ops). [`throw_value`] remains the ABI for
+/// `Value`-returning host callbacks that cannot change signature yet.
 pub type Completion = Result<Value, Value>;
+
+/// Re-raise a Throw completion through the legacy panic ABI.
+pub fn unwrap_or_throw(completion: Completion) -> Value {
+    match completion {
+        Ok(value) => value,
+        Err(exception) => throw_value(exception),
+    }
+}
 
 fn panic_payload_to_throw(payload: Box<dyn std::any::Any + Send>) -> Value {
     if let Some(value) = payload.downcast_ref::<PanicValue>() {
@@ -3466,6 +3477,25 @@ mod tests {
 
     /// Immediates are a Copy tagged word: clone is a register move, no `Rc`,
     /// no allocation. Heap strings/arrays/objects/functions stay as pointers.
+    #[test]
+    fn catch_js_and_unwrap_or_throw_round_trip_js_exceptions() {
+        let thrown = catch_js(|| throw_value(Value::string("boom")));
+        assert_eq!(thrown, Err(Value::string("boom")));
+        let ok = catch_js(|| Value::Number(1.0));
+        assert_eq!(ok, Ok(Value::Number(1.0)));
+        assert_eq!(unwrap_or_throw(Ok(Value::Number(2.0))), Value::Number(2.0));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unwrap_or_throw(Err(Value::string("again")))
+        }));
+        let payload = panicked.expect_err("unwrap_or_throw must use throw_value ABI");
+        let value = payload
+            .downcast_ref::<PanicValue>()
+            .expect("PanicValue")
+            .0
+            .clone();
+        assert_eq!(value, Value::string("again"));
+    }
+
     #[test]
     fn immediates_are_copy_tagged_words_without_allocation() {
         assert_eq!(std::mem::size_of::<Immediate>(), 8);

@@ -6177,14 +6177,18 @@ fn dispatch_native_touch(
     dispatch_event_value_to_js(&native_event, event)
 }
 
-fn pointer_capture_error(pointer_id: i64) -> ! {
-    w3cos_core::throw_value(Value::object(HashMap::from([
+fn pointer_capture_error_value(pointer_id: i64) -> Value {
+    Value::object(HashMap::from([
         ("name".to_string(), Value::string("NotFoundError")),
         (
             "message".to_string(),
             Value::string(&format!("Pointer {pointer_id} is not active")),
         ),
-    ])))
+    ]))
+}
+
+fn pointer_capture_error(pointer_id: i64) -> ! {
+    w3cos_core::throw_value(pointer_capture_error_value(pointer_id))
 }
 
 fn dispatch_pointer_capture_event(target: u32, event_type: &str, pointer_id: i64) {
@@ -8027,8 +8031,12 @@ pub(crate) fn comment_value(args: Vec<Value>) -> Value {
     element_value(dom::create_comment(&data))
 }
 
+fn dom_exception_value(message: &str, name: &str) -> Value {
+    w3cos_core::web::dom_exception_instance(message, name)
+}
+
 fn dom_exception(message: &str, name: &str) -> ! {
-    w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(message, name))
+    w3cos_core::throw_value(dom_exception_value(message, name))
 }
 
 fn valid_xml_name(name: &str) -> bool {
