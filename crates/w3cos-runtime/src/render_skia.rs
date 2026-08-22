@@ -1007,42 +1007,18 @@ fn draw_canvas(canvas: &Canvas, client_index: usize, rect: LayoutRect, opacity: 
     let Some(snapshot) = crate::canvas2d::surface_snapshot(client_index) else {
         return;
     };
-    draw_rgba_pixels(
-        canvas,
-        rect,
-        snapshot.width,
-        snapshot.height,
-        snapshot.pixels.as_slice(),
-        opacity,
-    );
+    // Reuse the Skia image while the published Arc identity is unchanged.
+    // Mutating 2D APIs force a fresh Arc on the next publish.
+    let decoded = crate::image_loader::DecodedImage {
+        width: snapshot.width,
+        height: snapshot.height,
+        intrinsic_width: snapshot.width,
+        intrinsic_height: snapshot.height,
+        data: snapshot.pixels,
+    };
+    draw_decoded_image(canvas, rect, &decoded, opacity);
 }
 
-fn draw_rgba_pixels(
-    canvas: &Canvas,
-    rect: LayoutRect,
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-    opacity: f32,
-) {
-    if width == 0 || height == 0 || pixels.len() != width as usize * height as usize * 4 {
-        return;
-    }
-    let info = ImageInfo::new(
-        (width as i32, height as i32),
-        ColorType::RGBA8888,
-        AlphaType::Unpremul,
-        None,
-    );
-    let Some(image) = images::raster_from_data(&info, Data::new_copy(pixels), width as usize * 4)
-    else {
-        return;
-    };
-    let mut paint = Paint::default();
-    paint.set_anti_alias(true);
-    paint.set_alpha_f(opacity.clamp(0.0, 1.0));
-    canvas.draw_image_rect(image, None, to_rect(rect), &paint);
-}
 
 fn skia_filter_chain(chain: &FilterChain) -> Option<ImageFilter> {
     let mut input = None;
@@ -2207,5 +2183,97 @@ mod tests {
         assert_eq!(skia_image_reuse_count(), 1);
         crate::image_loader::clear_cache();
         assert!(super::SKIA_IMAGES.with(|cache| cache.borrow().is_empty()));
+    }
+
+    #[test]
+    fn canvas_snapshot_skia_image_reused_until_dirtied() {
+        crate::image_loader::reset_cache_stats();
+        super::clear_image_texture_cache();
+        crate::canvas2d::remove_surface(11);
+
+        let mut context = crate::canvas2d::CanvasRenderingContext2D::new(4, 4);
+        context.set_fill_style("#00ff00");
+        context.fill_rect(0.0, 0.0, 4.0, 4.0);
+        context.publish_to_surface(11);
+
+        let kind = ComponentKind::Canvas {
+            width: 4,
+            height: 4,
+        };
+        let style = Style::default();
+        let nodes = [(
+            11,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 4.0,
+                height: 4.0,
+            },
+            &kind,
+            &style,
+        )];
+        let font = test_font();
+        let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+
+        let _ = rasterizer
+            .render_frame(
+                4,
+                4,
+                &nodes,
+                &font,
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::color::Color::WHITE,
+                None,
+                None,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(skia_image_upload_count(), 1);
+        assert_eq!(skia_image_reuse_count(), 0);
+
+        // Unchanged canvas: republish must keep Arc identity and skip upload.
+        context.publish_to_surface(11);
+        let _ = rasterizer
+            .render_frame(
+                4,
+                4,
+                &nodes,
+                &font,
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::color::Color::WHITE,
+                None,
+                None,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(skia_image_upload_count(), 1);
+        assert_eq!(skia_image_reuse_count(), 1);
+
+        context.fill_rect(0.0, 0.0, 1.0, 1.0);
+        context.publish_to_surface(11);
+        let _ = rasterizer
+            .render_frame(
+                4,
+                4,
+                &nodes,
+                &font,
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::color::Color::WHITE,
+                None,
+                None,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(skia_image_upload_count(), 2);
+        assert_eq!(skia_image_reuse_count(), 1);
+
+        crate::canvas2d::remove_surface(11);
+        super::clear_image_texture_cache();
     }
 }
