@@ -90,6 +90,11 @@ impl Immediate {
     const TAG_FN: u64 = 8;
     const TAG_MASK: u64 = 0xF;
     const HANDLE_SHIFT: u64 = 4;
+    /// Bits 36..50 of a tagged handle word: page-arena epoch (15 bits).
+    /// Leftover Immediates after `reset_bridge` fail the epoch check so a
+    /// reused slot index cannot alias a new page object/array/function.
+    const EPOCH_SHIFT: u64 = 36;
+    const EPOCH_MASK: u64 = 0x7FFF;
 
     pub const UNDEFINED: Self = Self(Self::QNAN | Self::TAG_UNDEF);
     pub const NULL: Self = Self(Self::QNAN | Self::TAG_NULL);
@@ -114,26 +119,40 @@ impl Immediate {
 
     /// Pack a page-arena intern handle into the tagged word.
     #[inline]
-    pub const fn from_interned_string(handle: u32) -> Self {
-        Self(Self::QNAN | Self::TAG_STR | ((handle as u64) << Self::HANDLE_SHIFT))
+    pub fn from_interned_string(handle: u32) -> Self {
+        Self(Self::pack_handle(Self::TAG_STR, handle))
+    }
+
+    fn pack_handle(tag: u64, handle: u32) -> u64 {
+        let epoch = (crate::page_arena::current_epoch() as u64) & Self::EPOCH_MASK;
+        Self::QNAN | tag | ((handle as u64) << Self::HANDLE_SHIFT) | (epoch << Self::EPOCH_SHIFT)
+    }
+
+    fn live_slot(self) -> Option<u32> {
+        let packed = (self.0 >> Self::EPOCH_SHIFT) & Self::EPOCH_MASK;
+        let live = (crate::page_arena::current_epoch() as u64) & Self::EPOCH_MASK;
+        if packed != live {
+            return None;
+        }
+        Some((self.0 >> Self::HANDLE_SHIFT) as u32)
     }
 
     /// Pack a page-arena object handle into the tagged word.
     #[inline]
-    pub const fn from_object_handle(handle: u32) -> Self {
-        Self(Self::QNAN | Self::TAG_OBJ | ((handle as u64) << Self::HANDLE_SHIFT))
+    pub fn from_object_handle(handle: u32) -> Self {
+        Self(Self::pack_handle(Self::TAG_OBJ, handle))
     }
 
     /// Pack a page-arena array handle into the tagged word.
     #[inline]
-    pub const fn from_array_handle(handle: u32) -> Self {
-        Self(Self::QNAN | Self::TAG_ARR | ((handle as u64) << Self::HANDLE_SHIFT))
+    pub fn from_array_handle(handle: u32) -> Self {
+        Self(Self::pack_handle(Self::TAG_ARR, handle))
     }
 
     /// Pack a page-arena function handle into the tagged word.
     #[inline]
-    pub const fn from_function_handle(handle: u32) -> Self {
-        Self(Self::QNAN | Self::TAG_FN | ((handle as u64) << Self::HANDLE_SHIFT))
+    pub fn from_function_handle(handle: u32) -> Self {
+        Self(Self::pack_handle(Self::TAG_FN, handle))
     }
 
     /// Raw tagged bits. Documented transmute target.
@@ -204,9 +223,9 @@ impl Immediate {
     }
 
     #[inline]
-    pub const fn interned_handle(self) -> Option<u32> {
+    pub fn interned_handle(self) -> Option<u32> {
         if self.is_interned_string() {
-            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+            self.live_slot()
         } else {
             None
         }
@@ -223,9 +242,9 @@ impl Immediate {
     }
 
     #[inline]
-    pub const fn object_handle(self) -> Option<u32> {
+    pub fn object_handle(self) -> Option<u32> {
         if self.is_object_handle() {
-            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+            self.live_slot()
         } else {
             None
         }
@@ -237,9 +256,9 @@ impl Immediate {
     }
 
     #[inline]
-    pub const fn array_handle(self) -> Option<u32> {
+    pub fn array_handle(self) -> Option<u32> {
         if self.is_array_handle() {
-            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+            self.live_slot()
         } else {
             None
         }
@@ -251,9 +270,9 @@ impl Immediate {
     }
 
     #[inline]
-    pub const fn function_handle(self) -> Option<u32> {
+    pub fn function_handle(self) -> Option<u32> {
         if self.is_function_handle() {
-            Some((self.0 >> Self::HANDLE_SHIFT) as u32)
+            self.live_slot()
         } else {
             None
         }
@@ -341,7 +360,7 @@ impl Value {
     #[inline]
     pub fn as_object(&self) -> Option<JsObjectRef> {
         match self {
-            Value::Imm(imm) => imm.object_handle().map(crate::page_arena::get_object),
+            Value::Imm(imm) => imm.object_handle().and_then(crate::page_arena::get_object),
             Value::Object(object) => Some(JsObjectRef::from_host(Rc::clone(object))),
             _ => None,
         }
@@ -370,7 +389,7 @@ impl Value {
     #[inline]
     pub fn as_array(&self) -> Option<JsArrayRef> {
         match self {
-            Value::Imm(imm) => imm.array_handle().map(crate::page_arena::get_array),
+            Value::Imm(imm) => imm.array_handle().and_then(crate::page_arena::get_array),
             Value::Array(array) => Some(JsArrayRef::from_host(Rc::clone(array))),
             _ => None,
         }
@@ -399,7 +418,7 @@ impl Value {
     #[inline]
     pub fn as_function(&self) -> Option<JsFunction> {
         match self {
-            Value::Imm(imm) => imm.function_handle().map(crate::page_arena::get_function),
+            Value::Imm(imm) => imm.function_handle().and_then(crate::page_arena::get_function),
             Value::Function(function) => Some(JsFunction::from_host(Rc::clone(function))),
             _ => None,
         }
@@ -634,6 +653,15 @@ impl JsObjectRef {
         }
     }
 
+    pub(crate) fn is_live(&self) -> bool {
+        match self.repr {
+            JsObjectRepr::Interned { epoch, ptr, .. } => {
+                epoch == crate::page_arena::current_epoch() && !ptr.is_null()
+            }
+            JsObjectRepr::Host(_) => true,
+        }
+    }
+
     /// Resolve payload without holding the page-arena `RefCell`.
     fn cell(&self) -> &RefCell<crate::JsObject> {
         match self.repr {
@@ -656,7 +684,7 @@ impl JsObjectRef {
         match self.repr {
             JsObjectRepr::Interned { handle, epoch, .. } => {
                 if epoch != crate::page_arena::current_epoch() {
-                    panic!("page object handle used after reset_bridge");
+                    return Value::Undefined;
                 }
                 Value::Imm(Immediate::from_object_handle(handle))
             }
@@ -817,7 +845,7 @@ impl JsArrayRef {
         match self.repr {
             JsArrayRepr::Interned { handle, epoch, .. } => {
                 if epoch != crate::page_arena::current_epoch() {
-                    panic!("page array handle used after reset_bridge");
+                    return Value::Undefined;
                 }
                 Value::Imm(Immediate::from_array_handle(handle))
             }
@@ -919,18 +947,25 @@ impl Value {
             Value::Imm(imm) if imm.is_undefined() => ValueUnpack::Undefined,
             Value::Imm(imm) if imm.is_null() => ValueUnpack::Null,
             Value::Imm(imm) if imm.is_bool() => ValueUnpack::Bool(imm.as_bool().unwrap_or(false)),
-            Value::Imm(imm) if imm.is_interned_string() => {
-                ValueUnpack::String(imm.as_js_string().expect("interned string handle"))
-            }
-            Value::Imm(imm) if imm.is_object_handle() => ValueUnpack::Object(
-                crate::page_arena::get_object(imm.object_handle().expect("object handle")),
-            ),
-            Value::Imm(imm) if imm.is_array_handle() => ValueUnpack::Array(
-                crate::page_arena::get_array(imm.array_handle().expect("array handle")),
-            ),
-            Value::Imm(imm) if imm.is_function_handle() => ValueUnpack::Function(
-                crate::page_arena::get_function(imm.function_handle().expect("function handle")),
-            ),
+            Value::Imm(imm) if imm.is_interned_string() => imm
+                .as_js_string()
+                .map(ValueUnpack::String)
+                .unwrap_or(ValueUnpack::Undefined),
+            Value::Imm(imm) if imm.is_object_handle() => imm
+                .object_handle()
+                .and_then(crate::page_arena::get_object)
+                .map(ValueUnpack::Object)
+                .unwrap_or(ValueUnpack::Undefined),
+            Value::Imm(imm) if imm.is_array_handle() => imm
+                .array_handle()
+                .and_then(crate::page_arena::get_array)
+                .map(ValueUnpack::Array)
+                .unwrap_or(ValueUnpack::Undefined),
+            Value::Imm(imm) if imm.is_function_handle() => imm
+                .function_handle()
+                .and_then(crate::page_arena::get_function)
+                .map(ValueUnpack::Function)
+                .unwrap_or(ValueUnpack::Undefined),
             Value::Imm(imm) => ValueUnpack::Number(imm.as_number().unwrap_or(f64::NAN)),
             Value::String(s) => ValueUnpack::String(s.clone()),
             Value::Array(a) => ValueUnpack::Array(JsArrayRef::from_host(Rc::clone(a))),
@@ -1539,20 +1574,13 @@ impl Value {
         self.as_array().is_some()
     }
     pub fn is_function(&self) -> bool {
-        match self {
-            Value::Function(_) => true,
-            Value::Imm(imm) => imm.is_function_handle(),
-            _ => false,
-        }
+        self.as_function().is_some()
     }
     pub fn is_callable(&self) -> bool {
-        match self {
-            Value::Function(_) => true,
-            Value::Imm(imm) if imm.is_function_handle() => true,
-            _ => self
+        self.as_function().is_some()
+            || self
                 .as_object()
-                .is_some_and(|object| object.borrow().call_slot().is_some()),
-        }
+                .is_some_and(|object| object.borrow().call_slot().is_some())
     }
 
     /// ECMAScript `ToInt32`.
@@ -4296,7 +4324,7 @@ mod tests {
                 assert!(word.is_object_handle());
                 assert!(!std::mem::needs_drop::<Immediate>());
                 let handle = word.object_handle().unwrap();
-                let js = crate::page_arena::get_object(handle);
+                let js = crate::page_arena::get_object(handle).expect("live object");
                 assert_eq!(js.interned_handle(), Some(handle));
                 assert!(js.host_strong_count().is_none());
                 let cloned = obj.clone();
@@ -4329,7 +4357,7 @@ mod tests {
                 assert!(word.is_array_handle());
                 assert!(!std::mem::needs_drop::<Immediate>());
                 let handle = word.array_handle().unwrap();
-                let js = crate::page_arena::get_array(handle);
+                let js = crate::page_arena::get_array(handle).expect("live array");
                 assert_eq!(js.interned_handle(), Some(handle));
                 assert!(js.host_strong_count().is_none());
                 let cloned = arr.clone();
@@ -4363,7 +4391,7 @@ mod tests {
                 assert!(word.is_function_handle());
                 assert!(!std::mem::needs_drop::<Immediate>());
                 let handle = word.function_handle().unwrap();
-                let js = crate::page_arena::get_function(handle);
+                let js = crate::page_arena::get_function(handle).expect("live function");
                 assert_eq!(js.interned_handle(), Some(handle));
                 assert!(js.host_strong_count().is_none());
                 let cloned = func.clone();
@@ -4520,6 +4548,42 @@ mod tests {
         crate::page_arena::reset();
         assert_eq!(crate::page_arena::live_functions(), 0);
         assert!(weak.upgrade_value().is_none());
+    }
+
+    #[test]
+    fn leftover_interned_immediate_is_dead_after_reset_and_does_not_alias() {
+        crate::page_arena::reset();
+        let old_obj = Value::object(HashMap::from([("k".into(), Value::Number(1.0))]));
+        let old_arr = Value::array(vec![Value::Number(2.0)]);
+        let old_fn = Value::function(|_, _| Value::Number(3.0));
+        assert!(old_obj.as_object().is_some());
+        assert!(old_arr.as_array().is_some());
+        assert!(old_fn.as_function().is_some());
+
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_objects(), 0);
+        assert_eq!(crate::page_arena::live_arrays(), 0);
+        assert_eq!(crate::page_arena::live_functions(), 0);
+        assert!(old_obj.as_object().is_none());
+        assert!(old_arr.as_array().is_none());
+        assert!(old_fn.as_function().is_none());
+        assert!(old_obj.get_property("k").is_undefined());
+        assert!(old_arr.get_property("0").is_undefined());
+        assert!(old_fn.call(Value::Undefined, vec![]).is_undefined());
+
+        let new_obj = Value::object(HashMap::from([("k".into(), Value::Number(9.0))]));
+        let new_arr = Value::array(vec![Value::Number(8.0)]);
+        let new_fn = Value::function(|_, _| Value::Number(7.0));
+        assert!(new_obj.as_object().is_some());
+        assert!(old_obj.as_object().is_none());
+        assert!(!old_obj.strict_eq(&new_obj));
+        assert!(!old_arr.strict_eq(&new_arr));
+        assert!(!old_fn.strict_eq(&new_fn));
+        assert_eq!(new_obj.get_property("k").to_number(), 9.0);
+        assert_eq!(new_arr.get_property("0").to_number(), 8.0);
+        assert_eq!(new_fn.call(Value::Undefined, vec![]).to_number(), 7.0);
+        assert!(old_obj.get_property("k").is_undefined());
+        assert!(old_fn.call(Value::Undefined, vec![]).is_undefined());
     }
 
     #[test]

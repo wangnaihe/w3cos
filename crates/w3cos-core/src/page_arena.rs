@@ -38,7 +38,9 @@ pub(crate) struct PageString {
 impl PageString {
     pub(crate) fn as_str(&self) -> &str {
         if self.epoch != current_epoch() {
-            panic!("page-interned string used after reset_bridge");
+            // Leftover keys/values after reset_bridge: treat as dead, like
+            // a failed Weak upgrade. Do not follow the retired bump pointer.
+            return "";
         }
         // Safety: `ptr`/`len` name UTF-8 bytes in a bump chunk that lives
         // until `reset` bumps the epoch. Callers must not hold the `&str` across
@@ -171,15 +173,15 @@ impl PageArena {
         handle
     }
 
-    fn get_object(&self, handle: u32) -> crate::value::JsObjectRef {
+    fn get_object(&self, handle: u32) -> Option<crate::value::JsObjectRef> {
         let Some(Some(object)) = self.objects.get(handle as usize) else {
-            panic!("page object handle used after reset_bridge");
+            return None;
         };
-        crate::value::JsObjectRef::from_interned(
+        Some(crate::value::JsObjectRef::from_interned(
             handle,
             self.epoch,
             object.as_ref() as *const RefCell<crate::JsObject>,
-        )
+        ))
     }
 
     fn upgrade_object(&self, handle: u32, epoch: u32) -> Option<crate::value::JsObjectRef> {
@@ -202,15 +204,15 @@ impl PageArena {
         handle
     }
 
-    fn get_array(&self, handle: u32) -> crate::value::JsArrayRef {
+    fn get_array(&self, handle: u32) -> Option<crate::value::JsArrayRef> {
         let Some(Some(array)) = self.arrays.get(handle as usize) else {
-            panic!("page array handle used after reset_bridge");
+            return None;
         };
-        crate::value::JsArrayRef::from_interned(
+        Some(crate::value::JsArrayRef::from_interned(
             handle,
             self.epoch,
             array.as_ref() as *const RefCell<crate::value::ArrayStorage>,
-        )
+        ))
     }
 
     fn upgrade_array(&self, handle: u32, epoch: u32) -> Option<crate::value::JsArrayRef> {
@@ -233,15 +235,15 @@ impl PageArena {
         handle
     }
 
-    fn get_function(&self, handle: u32) -> crate::value::JsFunction {
+    fn get_function(&self, handle: u32) -> Option<crate::value::JsFunction> {
         let Some(Some(function)) = self.functions.get(handle as usize) else {
-            panic!("page function handle used after reset_bridge");
+            return None;
         };
-        crate::value::JsFunction::from_interned(
+        Some(crate::value::JsFunction::from_interned(
             handle,
             self.epoch,
             function.as_ref() as *const crate::value::FunctionData,
-        )
+        ))
     }
 
     fn upgrade_function(&self, handle: u32, epoch: u32) -> Option<crate::value::JsFunction> {
@@ -288,19 +290,17 @@ pub(crate) fn intern(s: &str) -> PageString {
     })
 }
 
-/// Resolve a live intern handle. Panics if the handle belongs to a
-/// previous page (same contract as [`PageString::as_str`]).
+/// Resolve a live intern handle. Returns `None` if the handle belongs
+/// to a previous page (same dead-handle contract as interned objects).
 pub(crate) fn get(handle: u32) -> Option<PageString> {
     if handle == 0 {
         return None;
     }
     ARENA.with(|arena| {
         let arena = arena.borrow();
-        let Some(slot) = arena.slots.get(handle as usize).copied() else {
-            panic!("page-interned string used after reset_bridge");
-        };
+        let slot = arena.slots.get(handle as usize).copied()?;
         if slot.handle != handle || slot.epoch != arena.epoch {
-            panic!("page-interned string used after reset_bridge");
+            return None;
         }
         Some(slot)
     })
@@ -331,12 +331,12 @@ pub(crate) fn alloc_object(object: crate::JsObject) -> u32 {
     ARENA.with(|arena| arena.borrow_mut().alloc_object(object))
 }
 
-/// Resolve a live object handle. Panics if the handle belongs to a
-/// previous page (same contract as interned strings). Does not clone
-/// the payload.
-pub(crate) fn get_object(handle: u32) -> crate::value::JsObjectRef {
+/// Resolve a live object handle. Returns `None` if the slot is empty
+/// (previous-page leftover after [`reset`]). Does not clone the payload.
+/// Already-resolved `JsObjectRef` values still epoch-check on deref.
+pub(crate) fn get_object(handle: u32) -> Option<crate::value::JsObjectRef> {
     if handle == 0 {
-        panic!("page object handle used after reset_bridge");
+        return None;
     }
     ARENA.with(|arena| arena.borrow().get_object(handle))
 }
@@ -361,12 +361,12 @@ pub(crate) fn alloc_array(array: crate::value::ArrayStorage) -> u32 {
     ARENA.with(|arena| arena.borrow_mut().alloc_array(array))
 }
 
-/// Resolve a live array handle. Panics if the handle belongs to a
-/// previous page (same contract as interned strings). Does not clone
-/// the payload.
-pub(crate) fn get_array(handle: u32) -> crate::value::JsArrayRef {
+/// Resolve a live array handle. Returns `None` if the slot is empty
+/// (previous-page leftover after [`reset`]). Does not clone the payload.
+/// Already-resolved `JsArrayRef` values still epoch-check on deref.
+pub(crate) fn get_array(handle: u32) -> Option<crate::value::JsArrayRef> {
     if handle == 0 {
-        panic!("page array handle used after reset_bridge");
+        return None;
     }
     ARENA.with(|arena| arena.borrow().get_array(handle))
 }
@@ -391,12 +391,12 @@ pub(crate) fn alloc_function(function: crate::value::FunctionData) -> u32 {
     ARENA.with(|arena| arena.borrow_mut().alloc_function(function))
 }
 
-/// Resolve a live function handle. Panics if the handle belongs to a
-/// previous page (same contract as interned strings). Does not clone
-/// the payload.
-pub(crate) fn get_function(handle: u32) -> crate::value::JsFunction {
+/// Resolve a live function handle. Returns `None` if the slot is empty
+/// (previous-page leftover after [`reset`]). Does not clone the payload.
+/// Already-resolved `JsFunction` values still epoch-check on deref.
+pub(crate) fn get_function(handle: u32) -> Option<crate::value::JsFunction> {
     if handle == 0 {
-        panic!("page function handle used after reset_bridge");
+        return None;
     }
     ARENA.with(|arena| arena.borrow().get_function(handle))
 }
@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(live_objects(), 0);
         let handle = alloc_object(crate::JsObject::new());
         assert_eq!(handle, 1);
-        let resolved = get_object(handle);
+        let resolved = get_object(handle).expect("live object");
         let cloned = resolved.clone();
         assert!(resolved.ptr_eq(&cloned));
         assert_eq!(resolved.interned_handle(), Some(handle));
@@ -480,7 +480,7 @@ mod tests {
         assert_eq!(live_arrays(), 0);
         let handle = alloc_array(crate::value::ArrayStorage::new(Vec::new()));
         assert_eq!(handle, 1);
-        let resolved = get_array(handle);
+        let resolved = get_array(handle).expect("live array");
         let cloned = resolved.clone();
         assert!(resolved.ptr_eq(&cloned));
         assert_eq!(resolved.interned_handle(), Some(handle));
@@ -501,7 +501,7 @@ mod tests {
             crate::Value::Undefined
         }));
         assert_eq!(handle, 1);
-        let resolved = get_function(handle);
+        let resolved = get_function(handle).expect("live function");
         let cloned = resolved.clone();
         assert!(resolved.ptr_eq(&cloned));
         assert_eq!(resolved.interned_handle(), Some(handle));

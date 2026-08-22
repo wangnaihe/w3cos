@@ -187,7 +187,9 @@ impl JsObject {
             return val.clone();
         }
         if let Some(ref proto) = self.prototype {
-            return proto.borrow().get_direct(key);
+            if proto.is_live() {
+                return proto.borrow().get_direct(key);
+            }
         }
         Value::Undefined
     }
@@ -220,7 +222,9 @@ impl JsObject {
             || self
                 .prototype
                 .as_ref()
-                .is_some_and(|prototype| prototype.borrow().may_have_getter_properties())
+                .is_some_and(|prototype| {
+                    prototype.is_live() && prototype.borrow().may_have_getter_properties()
+                })
     }
 
     /// `[[Has]]` — the `in` operator.
@@ -239,7 +243,9 @@ impl JsObject {
             return true;
         }
         if let Some(ref proto) = self.prototype {
-            return proto.borrow().has_direct(key);
+            if proto.is_live() {
+                return proto.borrow().has_direct(key);
+            }
         }
         false
     }
@@ -369,8 +375,8 @@ impl JsObject {
             }
         }
         match &self.prototype {
-            Some(proto) => proto.as_value(),
-            None => Value::Null,
+            Some(proto) if proto.is_live() => proto.as_value(),
+            _ => Value::Null,
         }
     }
 

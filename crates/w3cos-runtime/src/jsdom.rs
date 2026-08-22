@@ -2026,7 +2026,7 @@ fn legacy_unescape(value: &str) -> String {
 fn eval_compat_value() -> Value {
     func(|_, args| {
         let input = arg(&args, 0);
-        if !matches!(input, Value::String(_)) {
+        if !input.is_string() {
             return input;
         }
         EVAL_WARNING_EMITTED.with(|warned| {
