@@ -8,13 +8,15 @@ use crate::page_arena::{self, PageString};
 
 /// Interned / shared JavaScript string.
 ///
-/// Short strings (`<=` [`INTERN_LIMIT`]) live in the page bump arena and
-/// clone as a `u32` handle. Longer strings still share via `Rc<str>` so a
-/// unique large payload cannot pin the intern map for the rest of the page.
+/// Page-local strings from [`Self::intern`] live in the page bump arena and
+/// clone as a `u32` handle (any length). Host / outliving strings use
+/// [`Self::heap`] (`Rc<str>`) so they survive `page_arena::reset`.
 ///
 /// Core heap values are thread-confined (`Rc<RefCell<JsObject>>`, thread-local
 /// heap counters), so the intern table is thread-local as well. The page bump
-/// is dropped on `page_arena::reset` (`reset_bridge` / navigation).
+/// is dropped on `page_arena::reset` (`reset_bridge` / navigation). Stale
+/// page handles yield empty `as_str` (no panic), matching short-string
+/// leftover Values after navigation.
 ///
 /// This is a Core type. `w3cos-dom`'s `Atom` stays in DOM; Core must not
 /// depend on that crate. VM and AOT share this representation — there is no
@@ -26,10 +28,6 @@ enum Repr {
     Heap(Rc<str>),
 }
 
-/// Property-key / short-literal intern cutoff. Longer strings still share
-/// via `Rc` on `Value` clone, but skip the page intern table.
-const INTERN_LIMIT: usize = 256;
-
 impl Clone for JsString {
     fn clone(&self) -> Self {
         match &self.0 {
@@ -40,11 +38,21 @@ impl Clone for JsString {
 }
 
 impl JsString {
+    /// Page-arena intern (any length). Clone is a handle copy; bytes drop
+    /// on `page_arena::reset`. Prefer [`Self::heap`] for host strings that
+    /// must outlive the page.
     pub fn intern(s: &str) -> Self {
-        if s.len() > INTERN_LIMIT {
-            return Self(Repr::Heap(Rc::from(s)));
+        // `PageString::len` is `u32`; absurd sizes fall back to heap Rc.
+        if s.len() > u32::MAX as usize {
+            return Self::heap(s);
         }
         Self(Repr::Interned(page_arena::intern(s)))
+    }
+
+    /// Host / outliving string: `Rc<str>` clone, not page-local. Survives
+    /// `page_arena::reset` (unlike [`Self::intern`]).
+    pub fn heap(s: impl AsRef<str>) -> Self {
+        Self(Repr::Heap(Rc::from(s.as_ref())))
     }
 
     pub fn as_str(&self) -> &str {
@@ -67,7 +75,7 @@ impl JsString {
         page_arena::allocated_bytes()
     }
 
-    /// Page intern handle when this string is page-local (not a long `Rc`).
+    /// Page intern handle when this string is page-local (not a heap `Rc`).
     pub fn page_handle(&self) -> Option<u32> {
         match self.0 {
             Repr::Interned(interned) => Some(interned.handle),
@@ -80,7 +88,7 @@ impl JsString {
         page_arena::get(handle).map(|interned| Self(Repr::Interned(interned)))
     }
 
-    /// `Rc` strong-count for long heap strings. `None` for page-interned
+    /// `Rc` strong-count for [`Self::heap`] strings. `None` for page-interned
     /// handles, which do not clone through `Rc`.
     pub fn heap_strong_count(&self) -> Option<usize> {
         match &self.0 {
@@ -229,15 +237,45 @@ mod tests {
     }
 
     #[test]
-    fn long_strings_still_clone_without_copying_via_rc() {
-        let raw = "x".repeat(INTERN_LIMIT + 8);
+    fn long_page_strings_intern_as_handle_not_rc() {
+        let raw = "x".repeat(512);
         let a = JsString::intern(&raw);
+        assert!(a.page_handle().is_some());
+        assert_eq!(a.heap_strong_count(), None);
+        let b = a.clone();
+        assert!(a.ptr_eq(&b));
+        assert_eq!(a.as_str(), raw);
+        assert_eq!(a.page_handle(), b.page_handle());
+        assert_eq!(a.heap_strong_count(), None);
+    }
+
+    #[test]
+    fn heap_strings_stay_rc_and_survive_page_reset() {
+        page_arena::reset();
+        let raw = "heap-outlives-page-".to_string() + &"y".repeat(300);
+        let a = JsString::heap(&raw);
         assert!(a.page_handle().is_none());
         assert_eq!(a.heap_strong_count(), Some(1));
         let b = a.clone();
         assert!(a.ptr_eq(&b));
-        assert_eq!(a.as_str(), raw);
         assert_eq!(a.heap_strong_count(), Some(2));
+        page_arena::reset();
+        assert_eq!(a.as_str(), raw);
+        assert_eq!(b.as_str(), raw);
+        assert_eq!(a.heap_strong_count(), Some(2));
+    }
+
+    #[test]
+    fn long_interned_string_as_str_empty_after_reset() {
+        page_arena::reset();
+        let raw = "L".repeat(400);
+        let a = JsString::intern(&raw);
+        assert_eq!(a.as_str(), raw);
+        let handle = a.page_handle().expect("page handle");
+        page_arena::reset();
+        assert_eq!(page_arena::live_handles(), 0);
+        assert_eq!(a.as_str(), "");
+        assert!(JsString::from_page_handle(handle).is_none());
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Page-scoped bump arena, interned string handles, and JS object/array/function slots.
 //!
-//! Short interned JS strings, page-local [`crate::JsObject`]s, constructor
+//! Page-interned JS strings (any length), page-local [`crate::JsObject`]s, constructor
 //! / literal arrays, and ordinary JS closures created via [`crate::Value::function`]
 //! live here so clones copy a `u32` handle instead of `Rc::clone`. The bump
 //! and slabs are dropped on [`reset`] (`reset_bridge` / document navigation).
+//! Host/outliving strings keep [`crate::JsString::heap`] (`Rc<str>`).
 //! Host / DOM wrappers keep the `Value::Object(Rc)` path so WeakRef intern
 //! can drop unreferenced wrappers without a page reset. `array_hole` and host
 //! arrays keep `Value::Array(Rc)` when they must be collectable without a
@@ -18,7 +19,7 @@
 //! Immediate handles are `Copy` and do not refcount, so dead interned
 //! payloads cannot be reclaimed mid-page. Slabs only speed the alloc path:
 //! many same-size `FunctionData` / `JsObject` / `ArrayStorage` payloads
-//! share a chunk instead of one `Box` malloc each. Short strings stay on
+//! share a chunk instead of one `Box` malloc each. Strings stay on
 //! the packed bump — intern never aborts after the copy, so size-class
 //! padding would not reclaim holes.
 

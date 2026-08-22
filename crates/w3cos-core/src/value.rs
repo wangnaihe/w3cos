@@ -14,12 +14,12 @@ use crate::property_map::PropertyMap;
 
 /// JavaScript-compatible dynamic value type.
 ///
-/// First-cut ABI: Undefined / Null / Bool / Number and interned short
-/// strings are a Copy tagged word ([`Immediate`], NaN-box). Clone of
-/// those immediates is a register move of the 8-byte word and does not
-/// touch `Rc`.
+/// First-cut ABI: Undefined / Null / Bool / Number and page-interned
+/// strings (any length) are a Copy tagged word ([`Immediate`], NaN-box).
+/// Clone of those immediates is a register move of the 8-byte word and
+/// does not touch `Rc`.
 ///
-/// Long `Rc<str>` strings, host/DOM objects, host arrays, and host/DOM
+/// Host/outliving `Rc<str>` strings ([`JsString::heap`]), host/DOM objects, host arrays, and host/DOM
 /// callables stay as a remaining enum of pointers / `Rc`. Page-local objects
 /// created via [`Value::object`] / literals, constructor / literal arrays
 /// created via [`Value::array`], and ordinary JS closures created via
@@ -38,7 +38,7 @@ use crate::property_map::PropertyMap;
 /// counters), so string intern is thread-local as well.
 #[derive(Clone)]
 pub enum Value {
-    /// NaN-boxed undefined / null / bool / number / interned short string.
+    /// NaN-boxed undefined / null / bool / number / page-interned string.
     /// Prefer `Value::Undefined` / `Value::Bool` / `Value::Number` /
     /// `Value::string` constructors over matching this arm.
     Imm(Immediate),
@@ -67,12 +67,12 @@ impl Default for Value {
 ///   - `2` null
 ///   - `3` false
 ///   - `4` true
-///   - `5` interned page-arena string (`u32` handle payload)
+///   - `5` page-arena string handle (`u32` payload; any interned length)
 ///   - `6` page-arena object (`u32` handle payload)
 ///   - `7` page-arena array (`u32` handle payload)
 ///   - `8` page-arena function (`u32` handle payload)
 ///
-/// Long `Rc<str>` and heap pointers are **not** in this word (remaining
+/// Host `Rc<str>` and heap pointers are **not** in this word (remaining
 /// `Value` enum). Tagged payloads use a 4-bit tag (`HANDLE_SHIFT = 4`).
 #[derive(Copy, Clone)]
 #[repr(transparent)]
@@ -336,7 +336,7 @@ impl Value {
         }
     }
 
-    /// Interned page-arena handle or long heap `JsString`.
+    /// Page-arena handle or host heap `JsString`.
     #[inline]
     pub fn as_js_string(&self) -> Option<JsString> {
         match self {
@@ -346,8 +346,8 @@ impl Value {
         }
     }
 
-    /// Pack interned short strings into [`Immediate`]; long `Rc<str>` stay
-    /// on the `String` arm.
+    /// Pack page-interned strings into [`Immediate`]; [`JsString::heap`]
+    /// `Rc<str>` stay on the `String` arm.
     #[inline]
     pub fn from_js_string(s: JsString) -> Self {
         if let Some(handle) = s.page_handle() {
@@ -3508,8 +3508,8 @@ mod tests {
             ),
             _ => panic!("number must be the tagged immediate word"),
         }
-        // Direct String-arm construction stays a heap variant; interned
-        // short strings created via Value::string are packed below.
+        // Direct String-arm construction stays an enum variant; page-
+        // interned strings created via Value::string are packed below.
         assert!(
             Value::String(JsString::intern("heap-or-intern"))
                 .as_immediate()
@@ -3522,7 +3522,7 @@ mod tests {
                 assert_eq!(std::mem::size_of_val(&copied), 8);
                 assert!(!std::mem::needs_drop::<Immediate>());
             }
-            _ => panic!("interned short string must be the tagged immediate word"),
+            _ => panic!("page-interned string must be the tagged immediate word"),
         }
         match Value::array(vec![]) {
             Value::Imm(word) => {
@@ -4327,7 +4327,7 @@ mod tests {
                 assert!(left.is_interned_string());
                 assert_eq!(left.as_js_string().unwrap().heap_strong_count(), None);
             }
-            _ => panic!("interned short string clone must stay Imm, not Rc"),
+            _ => panic!("page-interned string clone must stay Imm, not Rc"),
         }
         assert_eq!(a, b);
         assert_eq!(a.to_js_string(), "interned-clone-test");
@@ -4365,7 +4365,7 @@ mod tests {
                 assert_eq!(copied.bits() & 0xF, 5);
                 assert_eq!(((copied.bits() >> 4) as u32), js.page_handle().unwrap());
             }
-            _ => panic!("interned short string Value must be Imm"),
+            _ => panic!("page-interned string Value must be Imm"),
         }
         let cloned = s.clone();
         match cloned {
@@ -4374,14 +4374,42 @@ mod tests {
                 assert!(word.is_interned_string());
                 assert_eq!(word.as_js_string().unwrap().heap_strong_count(), None);
             }
-            _ => panic!("clone of interned short string must not take the String arm"),
+            _ => panic!("clone of page-interned string must not take the String arm"),
         }
     }
 
     #[test]
-    fn long_string_value_stays_on_heap_arm() {
-        let raw = "L".repeat(257);
+    fn long_page_string_value_is_imm_handle_not_rc() {
+        let raw = "L".repeat(400);
         let s = Value::string(&raw);
+        assert!(s.is_string());
+        match &s {
+            Value::Imm(word) => {
+                assert_copy(*word);
+                assert!(word.is_interned_string());
+                let js = word.as_js_string().expect("handle");
+                assert_eq!(js.as_str(), raw);
+                assert!(js.page_handle().is_some());
+                assert_eq!(js.heap_strong_count(), None);
+                assert_eq!(word.bits() & 0xF, 5);
+            }
+            _ => panic!("long page-interned string must pack into Immediate"),
+        }
+        let cloned = s.clone();
+        match (&s, &cloned) {
+            (Value::Imm(left), Value::Imm(right)) => {
+                assert_eq!(left.interned_handle(), right.interned_handle());
+                assert_eq!(left.as_js_string().unwrap().heap_strong_count(), None);
+            }
+            _ => panic!("long page string clone must stay Imm, not Rc"),
+        }
+        assert_eq!(s.to_js_string(), raw);
+    }
+
+    #[test]
+    fn heap_string_value_stays_on_string_arm() {
+        let raw = "H".repeat(400);
+        let s = Value::from_js_string(JsString::heap(&raw));
         assert!(s.is_string());
         assert!(s.as_immediate().is_none());
         match &s {
@@ -4389,7 +4417,7 @@ mod tests {
                 assert!(js.page_handle().is_none());
                 assert_eq!(js.heap_strong_count(), Some(1));
             }
-            _ => panic!("long string must stay on the String arm"),
+            _ => panic!("heap string must stay on the String arm"),
         }
         let cloned = s.clone();
         match (&s, &cloned) {
@@ -4397,9 +4425,31 @@ mod tests {
                 assert!(left.ptr_eq(right));
                 assert_eq!(left.heap_strong_count(), Some(2));
             }
-            _ => panic!("long string clone must stay heap"),
+            _ => panic!("heap string clone must stay Rc"),
         }
         assert_eq!(s.to_js_string(), raw);
+    }
+
+    #[test]
+    fn long_interned_string_handle_dead_after_reset() {
+        crate::page_arena::reset();
+        let raw = "R".repeat(512);
+        let s = Value::string(&raw);
+        let word = match &s {
+            Value::Imm(w) => {
+                assert!(w.is_interned_string());
+                assert_eq!(w.as_js_string().unwrap().as_str(), raw);
+                *w
+            }
+            _ => panic!("long interned string must be Imm"),
+        };
+        crate::page_arena::reset();
+        assert_eq!(crate::page_arena::live_handles(), 0);
+        assert!(word.interned_handle().is_none());
+        assert!(word.as_js_string().is_none());
+        assert!(s.as_js_string().is_none());
+        // Leftover Imm string unpacks as Undefined (no panic).
+        assert_eq!(s.to_js_string(), "undefined");
     }
 
     #[test]
