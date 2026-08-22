@@ -64,7 +64,7 @@ impl PageString {
 /// `reset` / `Drop` drop every initialized slot, then the chunks.
 ///
 /// Measured 64-bit classes:
-/// - `RefCell<JsObject>` = 544 → 8 slots / 4K chunk
+/// - `RefCell<JsObject>` = 480 → 8 slots / 4K chunk (compact PropertyMap)
 /// - `RefCell<ArrayStorage>` = 56 → 73 slots / 4K chunk
 /// - `FunctionData` = 96 → 42 slots / 4K chunk
 struct SizeClassSlab<T> {

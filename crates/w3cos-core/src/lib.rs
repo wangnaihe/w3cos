@@ -11,6 +11,7 @@ pub mod js_string;
 pub mod json;
 pub mod module_registry;
 mod object;
+mod property_map;
 pub mod page_arena;
 pub mod promise;
 mod proxy;
