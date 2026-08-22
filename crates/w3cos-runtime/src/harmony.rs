@@ -15,7 +15,7 @@ use skia_safe::{ColorType, FontMgr, Typeface};
 use w3cos_std::component::{Component, EventAction};
 
 use crate::layout;
-use crate::render_skia::{ReplayFrame, replay_frame};
+use crate::render_skia::{ReplayFrame, RetainedSkiaCache, replay_frame};
 
 type EglBoolean = c_uint;
 type EglDisplay = *mut c_void;
@@ -95,6 +95,10 @@ struct HarmonyRuntime {
     root: Component,
     direct_context: skia_safe::gpu::DirectContext,
     typeface: Typeface,
+    /// Owned Skia layer recordings. Injected into replay_frame the same way
+    /// SkiaVulkanPresenter / SkiaRasterizer do — callers cannot pass &mut cache
+    /// while also holding &mut self for the EGL/Skia surface.
+    retained: RetainedSkiaCache,
     pressed_target: Option<u32>,
 }
 
@@ -152,6 +156,7 @@ impl HarmonyRuntime {
             root,
             direct_context,
             typeface,
+            retained: RetainedSkiaCache::default(),
             pressed_target: None,
         };
         runtime.render()?;
@@ -223,6 +228,12 @@ impl HarmonyRuntime {
             None,
         )
         .ok_or_else(|| "Skia could not wrap the OHOS EGL framebuffer".to_string())?;
+        // Inject the runtime's retained cache here (same pattern as Android
+        // SkiaVulkanPresenter::render_frame_inner). Recording still nests with
+        // retained: None inside replay_frame — pictures must not nest the cache.
+        // artifact stays None until Harmony grows a PaintArtifact pipeline;
+        // when that lands, pass Some(artifact) and scroll/opacity/transform
+        // will replay without a full-scene rebuild.
         replay_frame(
             surface.canvas(),
             &self.typeface,
@@ -234,6 +245,9 @@ impl HarmonyRuntime {
                 focused_index: None,
                 background: self.root.style.background,
                 artifact: None,
+                retained: Some(&mut self.retained),
+                compositor_overrides: None,
+                scale_factor: 1.0,
             },
         );
         self.direct_context.flush_and_submit();

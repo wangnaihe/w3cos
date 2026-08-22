@@ -296,6 +296,10 @@ pub fn render_scroll_content_change(
 /// Virtual rows already repaint through retained scroll damage. Restricting
 /// the gesture-completion pass to exact changed-node rectangles keeps a sticky
 /// counter update from rasterizing the rest of the fixed chrome.
+///
+/// Returns `Some(damaged_rects)` when the retained path handled the update
+/// (possibly with an empty rect list). Returns `None` when the caller must
+/// fall back to a full-frame paint.
 pub fn render_damage_nodes(
     pixmap: &mut Pixmap,
     nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
@@ -305,9 +309,9 @@ pub fn render_damage_nodes(
     focused_index: Option<usize>,
     damage_indices: &[usize],
     clip_masks: &mut ClipMaskCache,
-) -> bool {
+) -> Option<Vec<LayoutRect>> {
     if damage_indices.is_empty() {
-        return false;
+        return None;
     }
     let full = LayoutRect {
         x: 0.0,
@@ -337,10 +341,10 @@ pub fn render_damage_nodes(
         // commit. Its scrollport pixels were already reconciled by
         // `render_scroll_content_change`, so there is no external work left
         // and a full-frame fallback would only introduce a stop hitch.
-        return true;
+        return Some(Vec::new());
     }
-    for damage in damages {
-        clear_rect_with_sk_color(pixmap, damage, page_bg());
+    for damage in &damages {
+        clear_rect_with_sk_color(pixmap, *damage, page_bg());
         paint_nodes(
             pixmap,
             nodes,
@@ -350,11 +354,11 @@ pub fn render_damage_nodes(
             focused_index,
             None,
             None,
-            Some(damage),
+            Some(*damage),
             clip_masks,
         );
     }
-    true
+    Some(damages)
 }
 
 fn is_within_scroll_container(

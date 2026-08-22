@@ -656,8 +656,8 @@ fn map_key(value: &Value) -> String {
             }
         }
         crate::value::ValueUnpack::String(s) => format!("s:{s}"),
-        crate::value::ValueUnpack::Array(rc) => format!("a:{:p}", std::rc::Rc::as_ptr(&rc)),
-        crate::value::ValueUnpack::Object(rc) => format!("o:{:p}", std::rc::Rc::as_ptr(&rc)),
+        crate::value::ValueUnpack::Array(a) => format!("a:{:#x}", a.identity()),
+        crate::value::ValueUnpack::Object(o) => format!("o:{:#x}", o.identity()),
         crate::value::ValueUnpack::Function(f) => format!("f:{:#x}", f.identity()),
     }
 }
@@ -1119,11 +1119,11 @@ mod monaco_tests {
             panic!("Map constructor did not return an object");
         };
 
-        assert_eq!(
-            std::rc::Rc::strong_count(&object),
-            2,
-            "a method stored on the Map must use its call receiver instead of creating an Rc cycle"
+        assert!(
+            object.host_strong_count().is_none(),
+            "interned Map must not wrap as host Rc; methods use the call receiver"
         );
+        assert_eq!(object.interned_handle(), map.object_handle());
     }
 
     #[test]

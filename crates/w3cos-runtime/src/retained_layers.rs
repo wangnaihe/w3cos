@@ -773,4 +773,81 @@ mod tests {
         assert_eq!(rasterizer.retained_rebuilds(), 1);
         assert_eq!(rasterizer.retained_replays(), 1);
     }
+
+    #[cfg(feature = "skia")]
+    #[test]
+    fn presenter_cache_injection_replays_opacity() {
+        let artifact = red_layer_tree();
+        let nodes = skia_nodes(&artifact);
+        let font = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf").as_slice(),
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+        let typeface = skia_safe::FontMgr::default()
+            .new_from_data(include_bytes!("../assets/Inter-Regular.ttf"), None)
+            .expect("test typeface");
+        let mut cache = crate::render_skia::RetainedSkiaCache::default();
+        let mut surface = skia_safe::Surface::new_raster_n32_premul((8, 8)).unwrap();
+        let empty = std::collections::HashMap::new();
+        crate::render_skia::replay_frame(
+            surface.canvas(),
+            &typeface,
+            crate::render_skia::ReplayFrame {
+                nodes: &nodes,
+                metrics_font: &font,
+                scroll_info: &[],
+                text_input_values: &empty,
+                focused_index: None,
+                background: w3cos_std::color::Color::WHITE,
+                artifact: Some(&artifact),
+                retained: Some(&mut cache),
+                compositor_overrides: None,
+                scale_factor: 1.0,
+            },
+        );
+        assert_eq!(cache.full_scene_rebuilds(), 1);
+        assert_eq!(cache.compositor_replays(), 0);
+
+        let mut overrides = CompositorOverrides::default();
+        overrides.opacity.insert(1, 0.2);
+        crate::render_skia::replay_frame(
+            surface.canvas(),
+            &typeface,
+            crate::render_skia::ReplayFrame {
+                nodes: &nodes,
+                metrics_font: &font,
+                scroll_info: &[],
+                text_input_values: &empty,
+                focused_index: None,
+                background: w3cos_std::color::Color::WHITE,
+                artifact: Some(&artifact),
+                retained: Some(&mut cache),
+                compositor_overrides: Some(&overrides),
+                scale_factor: 1.0,
+            },
+        );
+        assert_eq!(cache.full_scene_rebuilds(), 1);
+        assert_eq!(cache.compositor_replays(), 1);
+
+        let unused = crate::render_skia::RetainedSkiaCache::default();
+        crate::render_skia::replay_frame(
+            surface.canvas(),
+            &typeface,
+            crate::render_skia::ReplayFrame {
+                nodes: &nodes,
+                metrics_font: &font,
+                scroll_info: &[],
+                text_input_values: &empty,
+                focused_index: None,
+                background: w3cos_std::color::Color::WHITE,
+                artifact: Some(&artifact),
+                retained: None,
+                compositor_overrides: Some(&overrides),
+                scale_factor: 1.0,
+            },
+        );
+        assert_eq!(unused.full_scene_rebuilds(), 0);
+        assert_eq!(unused.compositor_replays(), 0);
+    }
 }

@@ -32,6 +32,14 @@ pub struct CanvasSnapshot {
     pub revision: u64,
 }
 
+impl CanvasSnapshot {
+    /// Identity of the published pixel buffer. Skia/Vello texture caches key off
+    /// this so an unchanged canvas reuses the last uploaded image across frames.
+    pub(crate) fn pixels_id(&self) -> usize {
+        Arc::as_ptr(&self.pixels) as usize
+    }
+}
+
 thread_local! {
     static SURFACES: RefCell<HashMap<usize, CanvasSnapshot>> = RefCell::new(HashMap::new());
 }
@@ -53,13 +61,28 @@ pub fn surface_snapshot(client_id: usize) -> Option<CanvasSnapshot> {
 
 pub fn remove_surface(client_id: usize) {
     SURFACES.with(|surfaces| {
-        surfaces.borrow_mut().remove(&client_id);
+        if let Some(snapshot) = surfaces.borrow_mut().remove(&client_id) {
+            drop_renderer_texture(snapshot.pixels_id());
+        }
     });
 }
 
 /// Drop retained canvas snapshots under OS memory pressure.
 pub fn clear_surfaces() {
-    SURFACES.with(|surfaces| surfaces.borrow_mut().clear());
+    SURFACES.with(|surfaces| {
+        let mut surfaces = surfaces.borrow_mut();
+        for snapshot in surfaces.values() {
+            drop_renderer_texture(snapshot.pixels_id());
+        }
+        surfaces.clear();
+    });
+}
+
+fn drop_renderer_texture(pixels_id: usize) {
+    #[cfg(feature = "gpu")]
+    crate::render_gpu::invalidate_image_texture(pixels_id);
+    #[cfg(feature = "skia")]
+    crate::render_skia::invalidate_image_texture(pixels_id);
 }
 
 // ── Color / Style ──────────────────────────────────────────────────────────
@@ -401,6 +424,10 @@ pub struct CanvasRenderingContext2D {
     pub state: ContextState,
     state_stack: VecDeque<ContextState>,
     revision: u64,
+    /// Set by any pixel-mutating 2D API (draw/clear/put/resize). Cleared on publish.
+    dirty: bool,
+    /// Last Arc handed to the surface registry; reused until `dirty`.
+    published_pixels: Option<Arc<Vec<u8>>>,
 }
 
 impl CanvasRenderingContext2D {
@@ -414,21 +441,71 @@ impl CanvasRenderingContext2D {
             state: ContextState::default(),
             state_stack: VecDeque::new(),
             revision: 0,
+            // Blank buffer still needs an initial snapshot when first published.
+            dirty: true,
+            published_pixels: None,
         }
     }
 
     /// Snapshot this context into the retained canvas resource registry.
+    ///
+    /// Unchanged canvases reuse the previous `Arc` / revision so paint backends
+    /// can keep the last uploaded Skia image / Vello brush by identity.
     pub fn publish_to_surface(&mut self, client_id: usize) {
+        if !self.dirty {
+            if let Some(existing) = surface_snapshot(client_id) {
+                if existing.revision == self.revision
+                    && existing.width == self.width
+                    && existing.height == self.height
+                    && self
+                        .published_pixels
+                        .as_ref()
+                        .is_some_and(|pixels| Arc::ptr_eq(&existing.pixels, pixels))
+                {
+                    return;
+                }
+            }
+            if let Some(pixels) = self.published_pixels.clone() {
+                publish_surface(
+                    client_id,
+                    CanvasSnapshot {
+                        width: self.width,
+                        height: self.height,
+                        pixels,
+                        revision: self.revision,
+                    },
+                );
+                return;
+            }
+        }
+
         self.revision = self.revision.wrapping_add(1);
+        let pixels = Arc::new(self.pixels.clone());
+        self.published_pixels = Some(pixels.clone());
+        self.dirty = false;
         publish_surface(
             client_id,
             CanvasSnapshot {
                 width: self.width,
                 height: self.height,
-                pixels: Arc::new(self.pixels.clone()),
+                pixels,
                 revision: self.revision,
             },
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_pixels_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn mark_pixels_dirty(&mut self) {
+        self.dirty = true;
     }
 
     // ── State ──────────────────────────────────────────────────────────────
@@ -601,6 +678,7 @@ impl CanvasRenderingContext2D {
 
     /// `ctx.clearRect(x, y, w, h)` — set pixels to transparent black.
     pub fn clear_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.mark_pixels_dirty();
         let [_ta, _tb, _tc, _td, tx, ty] = self.state.transform;
         let x0 = (x + tx) as i32;
         let y0 = (y + ty) as i32;
@@ -770,6 +848,7 @@ impl CanvasRenderingContext2D {
 
     /// `ctx.putImageData(imageData, dx, dy)` — write pixels to the canvas.
     pub fn put_image_data(&mut self, image_data: &ImageData, dx: i32, dy: i32) {
+        self.mark_pixels_dirty();
         for row in 0..image_data.height {
             for col in 0..image_data.width {
                 let dst_x = dx + col as i32;
@@ -808,6 +887,7 @@ impl CanvasRenderingContext2D {
         mut dw: f32,
         mut dh: f32,
     ) {
+        self.mark_pixels_dirty();
         if source_width == 0
             || source_height == 0
             || source.len() < (source_width * source_height * 4) as usize
@@ -886,6 +966,8 @@ impl CanvasRenderingContext2D {
         self.width = width;
         self.height = height;
         self.pixels = vec![0u8; (width * height * 4) as usize];
+        self.published_pixels = None;
+        self.mark_pixels_dirty();
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -901,6 +983,7 @@ impl CanvasRenderingContext2D {
         b: u8,
         alpha: f32,
     ) {
+        self.mark_pixels_dirty();
         let w = self.width as i32;
         let h = self.height as i32;
         for py in y0.max(0)..y1.min(h) {
@@ -1063,6 +1146,48 @@ mod tests {
         assert_eq!(g, 0);
         assert_eq!(b, 128);
         assert!((a as f32 - 127.5).abs() < 2.0);
+    }
+
+    #[test]
+    fn publish_reuses_snapshot_arc_until_pixels_dirtied() {
+        let mut ctx = CanvasRenderingContext2D::new(4, 4);
+        ctx.set_fill_style("#ff0000");
+        ctx.fill_rect(0.0, 0.0, 4.0, 4.0);
+        assert!(ctx.is_pixels_dirty());
+
+        ctx.publish_to_surface(42);
+        let first = surface_snapshot(42).expect("published");
+        assert!(!ctx.is_pixels_dirty());
+        assert_eq!(ctx.snapshot_revision(), first.revision);
+        let first_id = first.pixels_id();
+
+        // Style-only / path-only mutations must not force a new snapshot.
+        ctx.set_fill_style("#00ff00");
+        ctx.begin_path();
+        ctx.rect(0.0, 0.0, 1.0, 1.0);
+        assert!(!ctx.is_pixels_dirty());
+        ctx.publish_to_surface(42);
+        let second = surface_snapshot(42).expect("republished");
+        assert_eq!(second.revision, first.revision);
+        assert_eq!(second.pixels_id(), first_id);
+        assert!(Arc::ptr_eq(&first.pixels, &second.pixels));
+
+        ctx.fill_rect(0.0, 0.0, 1.0, 1.0);
+        assert!(ctx.is_pixels_dirty());
+        ctx.publish_to_surface(42);
+        let third = surface_snapshot(42).expect("dirty publish");
+        assert_ne!(third.revision, first.revision);
+        assert_ne!(third.pixels_id(), first_id);
+
+        ctx.resize(8, 8);
+        assert!(ctx.is_pixels_dirty());
+        ctx.publish_to_surface(42);
+        let resized = surface_snapshot(42).expect("resize publish");
+        assert_eq!(resized.width, 8);
+        assert_eq!(resized.height, 8);
+        assert_ne!(resized.pixels_id(), third.pixels_id());
+
+        remove_surface(42);
     }
 
     #[test]

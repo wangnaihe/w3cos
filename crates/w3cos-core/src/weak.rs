@@ -6,16 +6,16 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
-use crate::value::{ArrayStorage, WeakJsFunction};
-use crate::{JsObject, Value};
+use crate::Value;
+use crate::value::{WeakJsArray, WeakJsFunction, WeakJsObject};
 
 const STATE_KEY: &str = "__w3cos_weak_id";
 
 enum WeakValue {
-    Array(Weak<RefCell<ArrayStorage>>),
-    Object(Weak<RefCell<JsObject>>),
+    Array(WeakJsArray),
+    Object(WeakJsObject),
     Function(WeakJsFunction),
 }
 
@@ -23,14 +23,10 @@ impl WeakValue {
     fn new(value: &Value) -> Option<Self> {
         match value {
             _ if value.as_array().is_some() => {
-                Some(Self::Array(Rc::downgrade(
-                    &value.as_array().expect("array"),
-                )))
+                Some(Self::Array(value.as_array().expect("array").downgrade()))
             }
             _ if value.as_object().is_some() => {
-                Some(Self::Object(Rc::downgrade(
-                    &value.as_object().expect("object"),
-                )))
+                Some(Self::Object(value.as_object().expect("object").downgrade()))
             }
             _ if value.as_function().is_some() => Some(Self::Function(
                 value.as_function().expect("function").downgrade(),
@@ -41,9 +37,9 @@ impl WeakValue {
 
     fn upgrade(&self) -> Option<Value> {
         match self {
-            Self::Array(value) => value.upgrade().map(Value::Array),
-            Self::Object(value) => value.upgrade().map(Value::Object),
-            Self::Function(value) => value.upgrade().map(Value::Function),
+            Self::Array(value) => value.upgrade_value(),
+            Self::Object(value) => value.upgrade_value(),
+            Self::Function(value) => value.upgrade_value(),
         }
     }
 
@@ -472,6 +468,7 @@ mod tests {
     use super::*;
     use crate::PanicValue;
     use crate::class::{construct, instance_of};
+    use crate::value::ArrayStorage;
 
     #[test]
     fn weak_map_and_set_do_not_keep_object_keys_alive() {

@@ -311,7 +311,7 @@ pub fn for_in_keys(value: &Value) -> Value {
     let mut seen_objects = HashSet::new();
     let mut current = value.clone();
     while let Some(object) = current.as_object() {
-        if !seen_objects.insert(std::rc::Rc::as_ptr(&object) as usize) {
+        if !seen_objects.insert(object.identity()) {
             break;
         }
         let (own_keys, prototype) = {
@@ -344,38 +344,95 @@ pub fn call(callee: &Value, this_value: Value, arguments: Vec<Value>) -> Value {
     callee.call(this_value, arguments)
 }
 
-fn materialized_arguments(arguments: &Value) -> Vec<Value> {
+/// Invoke a callable and surface host/TDZ [`throw_value`] panics as a completion.
+pub fn call_completion(
+    callee: &Value,
+    this_value: Value,
+    arguments: Vec<Value>,
+) -> crate::Completion {
+    crate::catch_js(|| call(callee, this_value, arguments))
+}
+
+fn try_materialized_arguments(arguments: &Value) -> Result<Vec<Value>, Value> {
     let Some(arguments) = arguments.as_array() else {
-        crate::throw_value(crate::value::type_error(
+        return Err(crate::value::type_error(
             "materialized call arguments are not an array",
         ));
     };
-    arguments
+    Ok(arguments
         .borrow()
         .iter()
         .cloned()
         .map(crate::value::array_slot_value)
-        .collect()
+        .collect())
+}
+
+fn materialized_arguments(arguments: &Value) -> Vec<Value> {
+    match try_materialized_arguments(arguments) {
+        Ok(arguments) => arguments,
+        Err(exception) => crate::throw_value(exception),
+    }
 }
 
 pub fn call_with_arguments(callee: &Value, this_value: Value, arguments: &Value) -> Value {
     call(callee, this_value, materialized_arguments(arguments))
 }
 
+pub fn call_with_arguments_completion(
+    callee: &Value,
+    this_value: Value,
+    arguments: &Value,
+) -> crate::Completion {
+    let arguments = try_materialized_arguments(arguments)?;
+    call_completion(callee, this_value, arguments)
+}
+
 pub fn call_method(object: &Value, key: &Value, arguments: Vec<Value>) -> Value {
     object.call_method(&key.to_js_string(), arguments)
+}
+
+pub fn call_method_completion(
+    object: &Value,
+    key: &Value,
+    arguments: Vec<Value>,
+) -> crate::Completion {
+    crate::catch_js(|| call_method(object, key, arguments))
 }
 
 pub fn call_method_with_arguments(object: &Value, key: &Value, arguments: &Value) -> Value {
     call_method(object, key, materialized_arguments(arguments))
 }
 
+pub fn call_method_with_arguments_completion(
+    object: &Value,
+    key: &Value,
+    arguments: &Value,
+) -> crate::Completion {
+    let arguments = try_materialized_arguments(arguments)?;
+    call_method_completion(object, key, arguments)
+}
+
 pub fn construct(constructor: &Value, arguments: Vec<Value>) -> Value {
     crate::class::construct(constructor, arguments)
 }
 
+pub fn construct_completion(
+    constructor: &Value,
+    arguments: Vec<Value>,
+) -> crate::Completion {
+    crate::catch_js(|| construct(constructor, arguments))
+}
+
 pub fn construct_with_arguments(constructor: &Value, arguments: &Value) -> Value {
     construct(constructor, materialized_arguments(arguments))
+}
+
+pub fn construct_with_arguments_completion(
+    constructor: &Value,
+    arguments: &Value,
+) -> crate::Completion {
+    let arguments = try_materialized_arguments(arguments)?;
+    construct_completion(constructor, arguments)
 }
 
 pub fn super_construct(this_value: &Value, super_class: &Value, arguments: Vec<Value>) -> Value {
@@ -744,5 +801,28 @@ mod tests {
             .map(|value| value.to_js_string())
             .collect::<Vec<_>>();
         assert_eq!(keys, vec!["only"]);
+    }
+}
+
+
+#[cfg(test)]
+mod call_completion_tests {
+    use super::*;
+    use crate::Value;
+
+    #[test]
+    fn call_completion_surfaces_host_throw_without_escaping_panic() {
+        let boom = Value::function(|_, _| crate::throw_value(Value::string("host boom")));
+        let outcome = call_completion(&boom, Value::Undefined, Vec::new());
+        assert_eq!(outcome, Err(Value::string("host boom")));
+    }
+
+    #[test]
+    fn call_with_arguments_completion_rejects_non_array_without_unwind() {
+        let noop = Value::function(|_, _| Value::Undefined);
+        let outcome =
+            call_with_arguments_completion(&noop, Value::Undefined, &Value::Number(1.0));
+        let err = outcome.expect_err("non-array args");
+        assert_eq!(err.get_property("name").to_js_string(), "TypeError");
     }
 }

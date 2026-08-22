@@ -9,6 +9,7 @@
 // block around every ash call inside it.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::ptr;
 use std::time::Duration;
@@ -20,9 +21,14 @@ use skia_safe::gpu::{
     vk as skia_vk,
 };
 use skia_safe::{ColorType, FontMgr, Typeface};
+use w3cos_std::component::ComponentKind;
+use w3cos_std::style::Style;
 use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
+use super::layout::LayoutRect;
+use super::paint_artifact::PaintArtifact;
 use super::render_skia::{ReplayFrame, RetainedSkiaCache, replay_frame};
+use super::retained_layers::CompositorOverrides;
 
 const FRAMES_IN_FLIGHT: usize = 2;
 const MOBILE_SKIA_RESOURCE_CACHE_BYTES: usize = 32 * 1024 * 1024;
@@ -376,8 +382,36 @@ impl SkiaVulkanPresenter {
         self.retained.invalidate_recordings();
     }
 
-    pub fn render_frame(&mut self, width: u32, height: u32, frame: ReplayFrame<'_>) -> bool {
-        let result = unsafe { self.render_frame_inner(width, height, frame) };
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
+        metrics_font: &fontdue::Font,
+        scroll_info: &[Option<(f32, f32, LayoutRect)>],
+        text_input_values: &HashMap<usize, String>,
+        focused_index: Option<usize>,
+        background: w3cos_std::color::Color,
+        artifact: Option<&PaintArtifact>,
+        compositor_overrides: Option<&CompositorOverrides>,
+        scale_factor: f32,
+    ) -> bool {
+        let result = unsafe {
+            self.render_frame_inner(
+                width,
+                height,
+                nodes,
+                metrics_font,
+                scroll_info,
+                text_input_values,
+                focused_index,
+                background,
+                artifact,
+                compositor_overrides,
+                scale_factor,
+            )
+        };
         match result {
             Ok(rendered) => rendered,
             Err(error) => {
@@ -405,11 +439,20 @@ impl SkiaVulkanPresenter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn render_frame_inner(
         &mut self,
         width: u32,
         height: u32,
-        frame: ReplayFrame<'_>,
+        nodes: &[(usize, LayoutRect, &ComponentKind, &Style)],
+        metrics_font: &fontdue::Font,
+        scroll_info: &[Option<(f32, f32, LayoutRect)>],
+        text_input_values: &HashMap<usize, String>,
+        focused_index: Option<usize>,
+        background: w3cos_std::color::Color,
+        artifact: Option<&PaintArtifact>,
+        compositor_overrides: Option<&CompositorOverrides>,
+        scale_factor: f32,
     ) -> Result<bool, String> {
         if self.swapchain_dirty || self.extent.width != width || self.extent.height != height {
             self.recreate_swapchain(width, height)?;
@@ -484,18 +527,8 @@ impl SkiaVulkanPresenter {
             None,
         )
         .ok_or_else(|| "wrap Android swapchain image for Skia".to_string())?;
-        let ReplayFrame {
-            nodes,
-            metrics_font,
-            scroll_info,
-            text_input_values,
-            focused_index,
-            background,
-            artifact,
-            compositor_overrides,
-            scale_factor,
-            retained: _,
-        } = frame;
+        // Window cannot pass &mut self.retained into this &mut self method.
+        // Inject the presenter's cache here so scroll/opacity/transform replay.
         replay_frame(
             surface.canvas(),
             &self.typeface,

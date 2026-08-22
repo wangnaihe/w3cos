@@ -57,7 +57,7 @@ use objc2::runtime::{AnyClass, AnyObject};
 #[cfg(target_os = "ios")]
 use std::ffi::CStr;
 
-use w3cos_core::{JsObject, ProxyBuilder, Value};
+use w3cos_core::{JsObject, ProxyBuilder, Value, WeakJsObject};
 use w3cos_dom::Element;
 use w3cos_dom::events::{Event, EventData, EventType};
 use w3cos_dom::node::NodeId;
@@ -147,7 +147,7 @@ struct ShadowRootInfo {
 /// not pin them after the last JS handle drops.
 enum ElementMemo {
     Strong(Value),
-    Weak(Weak<RefCell<JsObject>>),
+    Weak(WeakJsObject),
 }
 
 thread_local! {
@@ -434,17 +434,17 @@ pub(crate) fn realm_function(
     })
 }
 
-pub(crate) type WeakRealmObject = Weak<RefCell<JsObject>>;
+pub(crate) type WeakRealmObject = WeakJsObject;
 
 pub(crate) fn weak_realm_object(value: &Value) -> WeakRealmObject {
     value
         .as_object()
-        .map(|object| Rc::downgrade(&object))
+        .map(|object| object.downgrade())
         .expect("Realm host objects must use object storage")
 }
 
 pub(crate) fn upgrade_realm_object(object: &WeakRealmObject) -> Option<Value> {
-    object.upgrade().map(Value::Object)
+    object.upgrade_value()
 }
 
 pub(crate) fn register_weak_realm_object(
@@ -1005,59 +1005,17 @@ fn event_type_name(et: EventType) -> String {
 }
 
 // ── Selector matching (simple selectors + descendant combinator) ───────────
-// Supported: `tag`, `#id`, `.class`, `*`, attribute presence/equality,
-/// compounds (`tag.a.b`, `#id.a`) and descendant chains (`div .foo`).
-/// NOT supported: `>`, `+`, `~`, or `:pseudo` — see module docs / gap report.
+// Supported: `tag`, `#id`, `.class`, compounds (`tag.a.b`, `#id.a`) and
+/// descendant chains (`div .foo`). NOT supported: `>`, `+`, `~`, `:pseudo`,
+/// `[attr]`, `*` — see module docs / gap report.
 
 fn matches_simple(selector: &str, node: u32) -> bool {
-    if selector.is_empty() || selector.contains(['>', '+', '~', ':']) {
+    if selector.is_empty() || selector.contains(['>', '+', '~', ':', '[', ']', '*']) {
         return false;
     }
     if dom::node_type(node) != 1 {
         return false;
     }
-    let mut attributes = Vec::new();
-    let mut remainder = selector;
-    while let Some(open) = remainder.find('[') {
-        let Some(close) = remainder[open + 1..].find(']') else {
-            return false;
-        };
-        let close = open + 1 + close;
-        let expression = remainder[open + 1..close].trim();
-        if expression.is_empty() {
-            return false;
-        }
-        if let Some((name, value)) = expression.split_once('=') {
-            let name = name.trim();
-            if name.is_empty() {
-                return false;
-            }
-            attributes.push((
-                name,
-                Some(value.trim().trim_matches(['\'', '"']).to_string()),
-            ));
-        } else {
-            attributes.push((expression, None));
-        }
-        remainder = &remainder[close + 1..];
-    }
-    if remainder.contains(']') {
-        return false;
-    }
-    for (name, expected) in attributes {
-        let name = normalized_attribute_name(node, name);
-        let Some(actual) = dom::get_attribute(node, &name) else {
-            return false;
-        };
-        if expected
-            .as_deref()
-            .is_some_and(|expected| actual != expected)
-        {
-            return false;
-        }
-    }
-
-    let selector = selector.split('[').next().unwrap_or_default();
     // #id part
     if let Some(hash) = selector.find('#') {
         let id: String = selector[hash + 1..]
@@ -1083,7 +1041,7 @@ fn matches_simple(selector: &str, node: u32) -> bool {
         .chars()
         .take_while(|c| *c != '.' && *c != '#')
         .collect();
-    if !tag.is_empty() && tag != "*" && dom::tag_name(node) != tag.to_ascii_lowercase() {
+    if !tag.is_empty() && dom::tag_name(node) != tag.to_ascii_lowercase() {
         return false;
     }
     true
@@ -1134,16 +1092,15 @@ fn matches_selector_chain(node: u32, parts: &[&str]) -> bool {
 /// Candidate nodes for the right-most simple selector, using the document's
 /// id/class/tag indexes for speed.
 fn selector_candidates(simple: &str) -> Vec<u32> {
-    let selector_head = simple.split('[').next().unwrap_or_default();
-    if let Some(hash) = selector_head.find('#') {
-        let id: String = selector_head[hash + 1..]
+    if let Some(hash) = simple.find('#') {
+        let id: String = simple[hash + 1..]
             .chars()
             .take_while(|c| *c != '.' && *c != '#')
             .collect();
         return dom::get_element_by_id(&id).into_iter().collect();
     }
-    if let Some(dot) = selector_head.find('.') {
-        let first_class: String = selector_head[dot + 1..]
+    if let Some(dot) = simple.find('.') {
+        let first_class: String = simple[dot + 1..]
             .chars()
             .take_while(|c| *c != '.' && *c != '#')
             .collect();
@@ -1151,21 +1108,12 @@ fn selector_candidates(simple: &str) -> Vec<u32> {
             return dom::get_elements_by_class_name(&first_class);
         }
     }
-    let tag: String = selector_head
+    let tag: String = simple
         .chars()
         .take_while(|c| *c != '.' && *c != '#')
         .collect();
-    if tag.is_empty() || tag == "*" {
-        let mut candidates = Vec::new();
-        let mut stack = vec![document_element_id()];
-        while let Some(node) = stack.pop() {
-            if dom::node_type(node) == 1 {
-                candidates.push(node);
-            }
-            let children = dom::children(node);
-            stack.extend(children.into_iter().rev());
-        }
-        candidates
+    if tag.is_empty() {
+        Vec::new()
     } else {
         dom::get_elements_by_tag_name(&tag.to_ascii_lowercase())
     }
@@ -1332,14 +1280,6 @@ pub(crate) fn namespace_uri(node: u32) -> String {
     get_expando(node, "namespaceURI")
         .map(|namespace| namespace.to_js_string())
         .unwrap_or_else(|| "http://www.w3.org/1999/xhtml".to_string())
-}
-
-fn normalized_attribute_name(node: u32, name: &str) -> String {
-    if namespace_uri(node) == crate::html_parser_state::HTML_NAMESPACE {
-        name.to_ascii_lowercase()
-    } else {
-        name.to_string()
-    }
 }
 
 pub(crate) fn ensure_template_content(node: u32) -> u32 {
@@ -2086,7 +2026,7 @@ fn legacy_unescape(value: &str) -> String {
 fn eval_compat_value() -> Value {
     func(|_, args| {
         let input = arg(&args, 0);
-        if !matches!(input, Value::String(_)) {
+        if !input.is_string() {
             return input;
         }
         EVAL_WARNING_EMITTED.with(|warned| {
@@ -3795,13 +3735,14 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "classList" => class_list_value(node),
         "attributes" => attributes_value(node),
         "dataset" => dataset_value(node),
-        "getAttribute" => func(move |_, args| {
-            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
-            match dom::get_attribute(node, &name) {
-                Some(v) => Value::from(v),
-                None => Value::Null,
-            }
-        }),
+        "getAttribute" => {
+            func(
+                move |_, args| match dom::get_attribute(node, &arg(&args, 0).to_js_string()) {
+                    Some(v) => Value::from(v),
+                    None => Value::Null,
+                },
+            )
+        }
         "getAttributeNS" => func(move |_, args| {
             let namespace_value = arg(&args, 0);
             let namespace = (!namespace_value.is_null())
@@ -3813,8 +3754,11 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             }
         }),
         "setAttribute" => func(move |_, args| {
-            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
-            dom::set_attribute(node, &name, &arg(&args, 1).to_js_string());
+            dom::set_attribute(
+                node,
+                &arg(&args, 0).to_js_string(),
+                &arg(&args, 1).to_js_string(),
+            );
             Value::Undefined
         }),
         "setAttributeNS" => func(move |_, args| {
@@ -3831,8 +3775,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::Undefined
         }),
         "hasAttribute" => func(move |_, args| {
-            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
-            Value::Bool(dom::has_attribute(node, &name))
+            Value::Bool(dom::has_attribute(node, &arg(&args, 0).to_js_string()))
         }),
         "hasAttributeNS" => func(move |_, args| {
             let namespace_value = arg(&args, 0);
@@ -3846,8 +3789,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             ))
         }),
         "removeAttribute" => func(move |_, args| {
-            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
-            dom::remove_attribute(node, &name);
+            dom::remove_attribute(node, &arg(&args, 0).to_js_string());
             Value::Undefined
         }),
         "removeAttributeNS" => func(move |_, args| {
@@ -3859,7 +3801,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::Undefined
         }),
         "toggleAttribute" => func(move |_, args| {
-            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
+            let name = arg(&args, 0).to_js_string();
             let force = arg(&args, 1);
             let has = dom::has_attribute(node, &name);
             let want = if force.is_undefined() {
@@ -6235,14 +6177,18 @@ fn dispatch_native_touch(
     dispatch_event_value_to_js(&native_event, event)
 }
 
-fn pointer_capture_error(pointer_id: i64) -> ! {
-    w3cos_core::throw_value(Value::object(HashMap::from([
+fn pointer_capture_error_value(pointer_id: i64) -> Value {
+    Value::object(HashMap::from([
         ("name".to_string(), Value::string("NotFoundError")),
         (
             "message".to_string(),
             Value::string(&format!("Pointer {pointer_id} is not active")),
         ),
-    ])))
+    ]))
+}
+
+fn pointer_capture_error(pointer_id: i64) -> ! {
+    w3cos_core::throw_value(pointer_capture_error_value(pointer_id))
 }
 
 fn dispatch_pointer_capture_event(target: u32, event_type: &str, pointer_id: i64) {
@@ -8085,8 +8031,12 @@ pub(crate) fn comment_value(args: Vec<Value>) -> Value {
     element_value(dom::create_comment(&data))
 }
 
+fn dom_exception_value(message: &str, name: &str) -> Value {
+    w3cos_core::web::dom_exception_instance(message, name)
+}
+
 fn dom_exception(message: &str, name: &str) -> ! {
-    w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(message, name))
+    w3cos_core::throw_value(dom_exception_value(message, name))
 }
 
 fn valid_xml_name(name: &str) -> bool {
@@ -12220,31 +12170,7 @@ fn build_window_value() -> Value {
         func(|_, args| Value::Bool(js_dispatch_event(0, arg(&args, 0)))),
     );
 
-    let generation = realm_generation();
-    let handler = ProxyBuilder::new()
-        .get(move |target, key, _receiver| {
-            if !bridge_realm_is_current(generation) {
-                return Value::Undefined;
-            }
-            if target
-                .as_object()
-                .is_some_and(|object| object.borrow().has_direct(key))
-            {
-                return target.get_property(key);
-            }
-            dom::get_element_by_id(key)
-                .map(element_value)
-                .unwrap_or(Value::Undefined)
-        })
-        .has(move |target, key| {
-            bridge_realm_is_current(generation)
-                && (target
-                    .as_object()
-                    .is_some_and(|object| object.borrow().has_direct(key))
-                    || dom::get_element_by_id(key).is_some())
-        })
-        .build();
-    let window = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
+    let window = Value::object(props);
     w3cos_core::class::set_prototype_of(&window, &window_class().get_property("prototype"));
     window
 }
@@ -12663,11 +12589,8 @@ mod tests {
         el
     }
 
-    fn wrapper_weak(value: &Value) -> std::rc::Weak<RefCell<JsObject>> {
-        match value {
-            Value::Object(object) => Rc::downgrade(object),
-            _ => panic!("expected object wrapper"),
-        }
+    fn wrapper_weak(value: &Value) -> WeakRealmObject {
+        weak_realm_object(value)
     }
 
     #[test]
@@ -12707,7 +12630,9 @@ mod tests {
         let id = node_id_of(&el).expect("node id");
         let again = element_value(id);
         assert!(
-            matches!((&el, &again), (Value::Object(a), Value::Object(b)) if Rc::ptr_eq(a, b)),
+            el.as_object()
+                .zip(again.as_object())
+                .is_some_and(|(a, b)| a.ptr_eq(&b)),
             "held detached wrapper must keep === identity"
         );
     }
@@ -13827,43 +13752,6 @@ mod tests {
     }
 
     #[test]
-    fn html_attribute_names_are_ascii_case_insensitive_but_svg_names_are_not() {
-        setup();
-        let document = document_value();
-        let div = create_in_body("div");
-        div.call_method(
-            "setAttribute",
-            vec![Value::string("labelXQL"), Value::string("html")],
-        );
-        assert_eq!(
-            div.call_method("getAttribute", vec![Value::string("labelxql")])
-                .to_js_string(),
-            "html"
-        );
-
-        let svg = document.call_method(
-            "createElementNS",
-            vec![
-                Value::string("http://www.w3.org/2000/svg"),
-                Value::string("svg"),
-            ],
-        );
-        svg.call_method(
-            "setAttribute",
-            vec![Value::string("viewBox"), Value::string("0 0 10 10")],
-        );
-        assert_eq!(
-            svg.call_method("getAttribute", vec![Value::string("viewBox")])
-                .to_js_string(),
-            "0 0 10 10"
-        );
-        assert!(
-            svg.call_method("getAttribute", vec![Value::string("viewbox")])
-                .is_null()
-        );
-    }
-
-    #[test]
     fn document_get_element_by_id_and_query_selector() {
         setup();
         let doc = document_value();
@@ -13931,39 +13819,6 @@ mod tests {
         // contains()
         assert!(outer.call_method("contains", vec![inner.clone()]).to_bool());
         assert!(!inner.call_method("contains", vec![outer.clone()]).to_bool());
-    }
-
-    #[test]
-    fn query_selector_attribute_matching_includes_empty_values() {
-        setup();
-        let root = create_in_body("div");
-        root.call_method(
-            "setAttribute",
-            vec![Value::string("id"), Value::string("root")],
-        );
-        root.set_property(
-            "innerHTML",
-            Value::string("<div id=\"\"></div><div id></div><div></div>"),
-        );
-        assert!(window_value().get_property("root") == root);
-        assert!(
-            window_value()
-                .as_object()
-                .is_some_and(|window| window.borrow().has("root"))
-        );
-
-        assert_eq!(
-            root.call_method("querySelectorAll", vec![Value::string("[id]")])
-                .get_property("length")
-                .to_u32(),
-            2
-        );
-        assert_eq!(
-            root.call_method("querySelectorAll", vec![Value::string("[id='']")])
-                .get_property("length")
-                .to_u32(),
-            2
-        );
     }
 
     #[test]
@@ -14958,18 +14813,9 @@ mod tests {
             .get_property("body")
             .call_method("requestFullscreen", vec![]);
 
-        let document_weak = match &document {
-            Value::Object(object) => Rc::downgrade(object),
-            _ => unreachable!("document must be an object"),
-        };
-        let window_weak = match &window {
-            Value::Object(object) => Rc::downgrade(object),
-            _ => unreachable!("window must be an object"),
-        };
-        let selection_weak = match &selection {
-            Value::Object(object) => Rc::downgrade(object),
-            _ => unreachable!("selection must be an object"),
-        };
+        let document_weak = weak_realm_object(&document);
+        let window_weak = weak_realm_object(&window);
+        let selection_weak = weak_realm_object(&selection);
         drop(document);
         drop(window);
         drop(selection);

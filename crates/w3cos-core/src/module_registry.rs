@@ -40,15 +40,25 @@ impl BindingCell {
     }
 
     pub fn read(&self) -> Value {
-        self.read_named("module binding")
+        crate::unwrap_or_throw(self.try_read())
     }
 
     pub fn read_named(&self, name: &str) -> Value {
-        self.state.borrow().clone().unwrap_or_else(|| {
-            crate::throw_value(crate::intrinsics::reference_error(&format!(
+        crate::unwrap_or_throw(self.try_read_named(name))
+    }
+
+    /// TDZ-aware read that returns a Throw completion instead of unwinding.
+    pub fn try_read(&self) -> Result<Value, Value> {
+        self.try_read_named("module binding")
+    }
+
+    pub fn try_read_named(&self, name: &str) -> Result<Value, Value> {
+        match self.state.borrow().clone() {
+            Some(value) => Ok(value),
+            None => Err(crate::intrinsics::reference_error(&format!(
                 "{name} is not initialized"
-            )))
-        })
+            ))),
+        }
     }
 
     /// Complete declaration initialization, or update an already initialized
@@ -72,16 +82,24 @@ impl ExportBinding {
     }
 
     pub fn read(&self) -> Value {
-        self.getter.call(Value::Undefined, Vec::new())
+        crate::unwrap_or_throw(self.try_read())
     }
 
     pub fn write(&self, value: Value) -> Value {
+        crate::unwrap_or_throw(self.try_write(value))
+    }
+
+    pub fn try_read(&self) -> Result<Value, Value> {
+        crate::catch_js(|| self.getter.call(Value::Undefined, Vec::new()))
+    }
+
+    pub fn try_write(&self, value: Value) -> Result<Value, Value> {
         if !self.setter.is_callable() {
-            crate::throw_value(Value::string(
+            return Err(Value::string(
                 "TypeError: imported module binding is immutable",
             ));
         }
-        self.setter.call(Value::Undefined, vec![value])
+        crate::catch_js(|| self.setter.call(Value::Undefined, vec![value]))
     }
 
     pub fn getter(&self) -> Value {
@@ -406,6 +424,19 @@ mod tests {
         let cell = BindingCell::uninitialized();
         let binding = ExportBinding::from_cell(cell.clone(), true);
 
+        let completion = cell
+            .try_read_named("alpha")
+            .expect_err("TDZ try_read must be Err without unwinding");
+        assert_eq!(completion.get_property("name").to_js_string(), "ReferenceError");
+        assert!(
+            completion
+                .get_property("message")
+                .to_js_string()
+                .contains("alpha is not initialized"),
+            "{}",
+            completion.get_property("message").to_js_string()
+        );
+
         let thrown = catch_unwind(AssertUnwindSafe(|| binding.read()))
             .expect_err("an uninitialized module binding must throw");
         let error = thrown
@@ -418,8 +449,10 @@ mod tests {
 
         assert_eq!(binding.write(Value::Number(1.0)), Value::Number(1.0));
         assert_eq!(binding.read(), Value::Number(1.0));
+        assert_eq!(binding.try_read().expect("initialized"), Value::Number(1.0));
         assert_eq!(binding.write(Value::Number(2.0)), Value::Number(2.0));
         assert_eq!(cell.read(), Value::Number(2.0));
+        assert_eq!(cell.try_read().expect("initialized"), Value::Number(2.0));
     }
 
     #[test]

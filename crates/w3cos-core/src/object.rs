@@ -7,7 +7,8 @@ use std::rc::Rc;
 use crate::heap::{HeapAllocation, HeapKind};
 use crate::js_string::JsString;
 use crate::proxy::ProxyHandler;
-use crate::value::{JsFunction, Value};
+use crate::property_map::PropertyMap;
+use crate::value::{FunctionData, JsObjectRef, Value};
 
 #[derive(Clone)]
 pub(crate) enum PrivateElement {
@@ -19,21 +20,11 @@ pub(crate) enum PrivateElement {
     },
 }
 
-/// A JavaScript-like dynamic object with string-keyed properties,
-/// prototype chain, and optional Proxy handler for trap interception.
-///
-/// When `proxy_handler` is `Some`, property operations are routed through
-/// the corresponding trap. When `None`, direct HashMap access is used.
-///
-/// `call_slot` makes the object callable (like a JS class or function
-/// object): `Value::call` on an object with a call slot invokes it.
-pub struct JsObject {
-    pub(crate) properties: HashMap<JsString, Value>,
-    property_order: Vec<JsString>,
-    pub(crate) prototype: Option<Rc<RefCell<JsObject>>>,
-    pub(crate) proxy_handler: Option<ProxyHandler>,
-    has_getter_properties: bool,
-    pub(crate) call_slot: Option<JsFunction>,
+/// Rare class / private / enumerability state. Almost every ordinary object
+/// never touches these; they live behind [`JsObject::rare`] so empty objects
+/// stay slab-dense.
+#[derive(Clone, Default)]
+pub(crate) struct RareObjectData {
     /// Derived-class instance initializers waiting for their corresponding
     /// `super(...)` call to return. This is internal execution state, not an
     /// observable JavaScript property.
@@ -47,6 +38,26 @@ pub struct JsObject {
     /// enumerable; `Object.defineProperty` can clear the flag so `for-in` and
     /// `CopyDataProperties` skip them, matching ECMAScript.
     non_enumerable: HashSet<String>,
+}
+
+/// A JavaScript-like dynamic object with string-keyed properties,
+/// prototype chain, and optional Proxy handler for trap interception.
+///
+/// When `proxy_handler` is `Some`, property operations are routed through
+/// the corresponding trap. When `None`, direct property-map access is used.
+///
+/// `call_slot` makes the object callable (like a JS class or function
+/// object): `Value::call` on an object with a call slot invokes it.
+pub struct JsObject {
+    /// Own string-keyed data properties. Empty is heap-free; ≤4 stay inline.
+    pub(crate) properties: PropertyMap,
+    pub(crate) prototype: Option<JsObjectRef>,
+    pub(crate) proxy_handler: Option<ProxyHandler>,
+    has_getter_properties: bool,
+    pub(crate) call_slot: Option<Rc<FunctionData>>,
+    /// Lazily boxed rare class / private / enumerability fields. `None` on
+    /// ordinary empty objects.
+    pub(crate) rare: Option<Box<RareObjectData>>,
     heap_allocation: HeapAllocation,
 }
 
@@ -54,17 +65,12 @@ impl JsObject {
     pub fn new() -> Self {
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         Self {
-            properties: HashMap::new(),
-            property_order: Vec::new(),
+            properties: PropertyMap::new(),
             prototype: None,
             proxy_handler: None,
             has_getter_properties: false,
             call_slot: None,
-            pending_class_initializers: Vec::new(),
-            class_brand: None,
-            private_brands: HashSet::new(),
-            private_elements: HashMap::new(),
-            non_enumerable: HashSet::new(),
+            rare: None,
             heap_allocation,
         }
     }
@@ -78,24 +84,17 @@ impl JsObject {
     }
 
     fn from_interned_map(properties: HashMap<JsString, Value>) -> Self {
-        let mut property_order = properties.keys().cloned().collect::<Vec<_>>();
-        property_order.sort();
-        let has_getter_properties = property_order
-            .iter()
-            .any(|key| key.as_str().starts_with("__w3cos_getter_"));
+        let properties = PropertyMap::from_interned_hashmap(properties);
+        let has_getter_properties = properties
+            .any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
-            property_order,
             prototype: None,
             proxy_handler: None,
             has_getter_properties,
             call_slot: None,
-            pending_class_initializers: Vec::new(),
-            class_brand: None,
-            private_brands: HashSet::new(),
-            private_elements: HashMap::new(),
-            non_enumerable: HashSet::new(),
+            rare: None,
             heap_allocation,
         };
         object.refresh_heap_accounting();
@@ -108,24 +107,17 @@ impl JsObject {
             .into_iter()
             .map(|(key, value)| (JsString::intern(&key), value))
             .collect();
-        let mut property_order = properties.keys().cloned().collect::<Vec<_>>();
-        property_order.sort();
-        let has_getter_properties = property_order
-            .iter()
-            .any(|key| key.as_str().starts_with("__w3cos_getter_"));
+        let properties = PropertyMap::from_interned_hashmap(properties);
+        let has_getter_properties = properties
+            .any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
-            property_order,
             prototype: None,
             proxy_handler: Some(handler),
             has_getter_properties,
             call_slot: None,
-            pending_class_initializers: Vec::new(),
-            class_brand: None,
-            private_brands: HashSet::new(),
-            private_elements: HashMap::new(),
-            non_enumerable: HashSet::new(),
+            rare: None,
             heap_allocation,
         };
         object.refresh_heap_accounting();
@@ -134,29 +126,22 @@ impl JsObject {
 
     /// Create a callable object (a JS class / constructor): plain properties
     /// plus a call slot invoked by `Value::call` / `class::construct`.
-    pub fn with_call_slot(properties: HashMap<String, Value>, call: JsFunction) -> Self {
+    pub fn with_call_slot(properties: HashMap<String, Value>, call: Rc<FunctionData>) -> Self {
         let properties: HashMap<JsString, Value> = properties
             .into_iter()
             .map(|(key, value)| (JsString::intern(&key), value))
             .collect();
-        let mut property_order = properties.keys().cloned().collect::<Vec<_>>();
-        property_order.sort();
-        let has_getter_properties = property_order
-            .iter()
-            .any(|key| key.as_str().starts_with("__w3cos_getter_"));
+        let properties = PropertyMap::from_interned_hashmap(properties);
+        let has_getter_properties = properties
+            .any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
-            property_order,
             prototype: None,
             proxy_handler: None,
             has_getter_properties,
             call_slot: Some(call),
-            pending_class_initializers: Vec::new(),
-            class_brand: None,
-            private_brands: HashSet::new(),
-            private_elements: HashMap::new(),
-            non_enumerable: HashSet::new(),
+            rare: None,
             heap_allocation,
         };
         object.refresh_heap_accounting();
@@ -164,8 +149,22 @@ impl JsObject {
     }
 
     /// The call slot, if this object is callable.
-    pub fn call_slot(&self) -> Option<&JsFunction> {
+    pub fn call_slot(&self) -> Option<&Rc<FunctionData>> {
         self.call_slot.as_ref()
+    }
+
+    /// Allocate rare class / private / enumerability state on first use.
+    pub(crate) fn ensure_rare(&mut self) -> &mut RareObjectData {
+        if self.rare.is_none() {
+            self.rare = Some(Box::new(RareObjectData::default()));
+        }
+        self.rare.as_mut().expect("rare just allocated")
+    }
+
+    fn own_key_enumerable(&self, key: &str) -> bool {
+        self.rare
+            .as_ref()
+            .map_or(true, |rare| !rare.non_enumerable.contains(key))
     }
 
     // ── Proxy-aware property access ────────────────────────────────────
@@ -187,7 +186,9 @@ impl JsObject {
             return val.clone();
         }
         if let Some(ref proto) = self.prototype {
-            return proto.borrow().get_direct(key);
+            if proto.is_live() {
+                return proto.borrow().get_direct(key);
+            }
         }
         Value::Undefined
     }
@@ -208,9 +209,6 @@ impl JsObject {
         if key.starts_with("__w3cos_getter_") {
             self.has_getter_properties = true;
         }
-        if !self.properties.contains_key(key) {
-            self.property_order.push(JsString::intern(key));
-        }
         self.properties.insert(JsString::intern(key), value);
         self.refresh_heap_accounting();
     }
@@ -220,7 +218,9 @@ impl JsObject {
             || self
                 .prototype
                 .as_ref()
-                .is_some_and(|prototype| prototype.borrow().may_have_getter_properties())
+                .is_some_and(|prototype| {
+                    prototype.is_live() && prototype.borrow().may_have_getter_properties()
+                })
     }
 
     /// `[[Has]]` — the `in` operator.
@@ -239,7 +239,9 @@ impl JsObject {
             return true;
         }
         if let Some(ref proto) = self.prototype {
-            return proto.borrow().has_direct(key);
+            if proto.is_live() {
+                return proto.borrow().has_direct(key);
+            }
         }
         false
     }
@@ -254,14 +256,14 @@ impl JsObject {
         }
         let removed = self.properties.remove(key).is_some();
         if removed {
-            self.property_order.retain(|candidate| candidate != key);
-            self.non_enumerable.remove(key);
+            if let Some(rare) = self.rare.as_mut() {
+                rare.non_enumerable.remove(key);
+            }
         }
         if removed && key.starts_with("__w3cos_getter_") {
             self.has_getter_properties = self
                 .properties
-                .keys()
-                .any(|key| key.as_str().starts_with("__w3cos_getter_"));
+                .any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
         }
         if removed {
             self.refresh_heap_accounting();
@@ -278,8 +280,8 @@ impl JsObject {
             }
         }
         let keys: Vec<Value> = self
-            .property_order
-            .iter()
+            .properties
+            .keys()
             .map(|k| Value::from(k.clone()))
             .collect();
         Value::array(keys)
@@ -293,13 +295,13 @@ impl JsObject {
                 return trap(&target, key);
             }
         }
-        if self.properties.contains_key(key) {
+        if let Some(value) = self.properties.get(key) {
             let mut desc = HashMap::new();
-            desc.insert("value".into(), self.properties[key].clone());
+            desc.insert("value".into(), value.clone());
             desc.insert("writable".into(), Value::Bool(true));
             desc.insert(
                 "enumerable".into(),
-                Value::Bool(!self.non_enumerable.contains(key)),
+                Value::Bool(self.own_key_enumerable(key)),
             );
             desc.insert("configurable".into(), Value::Bool(true));
             Value::object(desc)
@@ -325,7 +327,7 @@ impl JsObject {
             }
             desc.insert(
                 "enumerable".into(),
-                Value::Bool(!self.non_enumerable.contains(key)),
+                Value::Bool(self.own_key_enumerable(key)),
             );
             desc.insert("configurable".into(), Value::Bool(true));
             Value::object(desc)
@@ -343,17 +345,16 @@ impl JsObject {
         if let Some(desc) = descriptor.as_object() {
             let desc = desc.borrow();
             if let Some(val) = desc.properties.get("value") {
-                if !self.properties.contains_key(key) {
-                    self.property_order.push(JsString::intern(key));
-                }
                 self.properties.insert(JsString::intern(key), val.clone());
                 self.refresh_heap_accounting();
             }
             if let Some(enumerable) = desc.properties.get("enumerable") {
                 if enumerable.to_bool() {
-                    self.non_enumerable.remove(key);
+                    if let Some(rare) = self.rare.as_mut() {
+                        rare.non_enumerable.remove(key);
+                    }
                 } else {
-                    self.non_enumerable.insert(key.to_string());
+                    self.ensure_rare().non_enumerable.insert(key.to_string());
                 }
             }
         }
@@ -369,8 +370,8 @@ impl JsObject {
             }
         }
         match &self.prototype {
-            Some(proto) => Value::Object(proto.clone()),
-            None => Value::Null,
+            Some(proto) if proto.is_live() => proto.as_value(),
+            _ => Value::Null,
         }
     }
 
@@ -420,8 +421,8 @@ impl JsObject {
     // ── Helpers ────────────────────────────────────────────────────────
 
     pub fn keys(&self) -> Vec<String> {
-        self.property_order
-            .iter()
+        self.properties
+            .keys()
             .map(|key| key.as_str().to_string())
             .collect()
     }
@@ -439,49 +440,67 @@ impl JsObject {
     }
 
     pub(crate) fn refresh_heap_accounting(&self) {
-        let property_bytes = self
-            .properties
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(JsString, Value)>())
-            .saturating_add(
-                self.properties
-                    .len()
-                    .saturating_mul(std::mem::size_of::<JsString>()),
-            );
-        let pending_bytes = self
-            .pending_class_initializers
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(u64, Value, Value)>());
-        let private_brand_bytes = self
-            .private_brands
-            .capacity()
-            .saturating_mul(std::mem::size_of::<u64>());
-        let private_element_bytes = self
-            .private_elements
-            .capacity()
-            .saturating_mul(std::mem::size_of::<((u64, String), PrivateElement)>())
-            .saturating_add(
-                self.private_elements
-                    .keys()
-                    .map(|(_, name)| name.capacity())
-                    .fold(0usize, usize::saturating_add),
-            );
+        let property_bytes = self.properties.heap_bytes();
+        let mut rare_bytes = 0usize;
+        if let Some(rare) = self.rare.as_ref() {
+            let pending_bytes = rare
+                .pending_class_initializers
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u64, Value, Value)>());
+            let private_brand_bytes = rare
+                .private_brands
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u64>());
+            let private_element_bytes = rare
+                .private_elements
+                .capacity()
+                .saturating_mul(std::mem::size_of::<((u64, String), PrivateElement)>())
+                .saturating_add(
+                    rare.private_elements
+                        .keys()
+                        .map(|(_, name)| name.capacity())
+                        .fold(0usize, usize::saturating_add),
+                );
+            let non_enumerable_bytes = rare
+                .non_enumerable
+                .iter()
+                .map(|key| key.capacity())
+                .fold(0usize, usize::saturating_add);
+            rare_bytes = std::mem::size_of::<RareObjectData>()
+                .saturating_add(pending_bytes)
+                .saturating_add(private_brand_bytes)
+                .saturating_add(private_element_bytes)
+                .saturating_add(non_enumerable_bytes);
+        }
         self.heap_allocation.set_bytes(
             std::mem::size_of::<Self>()
                 .saturating_add(property_bytes)
-                .saturating_add(pending_bytes)
-                .saturating_add(private_brand_bytes)
-                .saturating_add(private_element_bytes),
+                .saturating_add(rare_bytes),
         );
     }
 
     /// Snapshot the raw properties as a `Value::Object` (used as `target` arg for traps).
     fn target_value(&self) -> Value {
-        let mut clone = JsObject::from_interned_map(self.properties.clone());
-        clone.prototype = self.prototype.clone();
-        clone.has_getter_properties = self.has_getter_properties;
-        clone.call_slot = self.call_slot.clone();
-        clone.non_enumerable = self.non_enumerable.clone();
+        let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
+        let rare = self.rare.as_ref().map(|rare| {
+            Box::new(RareObjectData {
+                pending_class_initializers: Vec::new(),
+                class_brand: rare.class_brand,
+                private_brands: HashSet::new(),
+                private_elements: HashMap::new(),
+                non_enumerable: rare.non_enumerable.clone(),
+            })
+        });
+        let clone = Self {
+            properties: self.properties.clone(),
+            prototype: self.prototype.clone(),
+            proxy_handler: None,
+            has_getter_properties: self.has_getter_properties,
+            call_slot: self.call_slot.clone(),
+            rare,
+            heap_allocation,
+        };
+        clone.refresh_heap_accounting();
         Value::Object(Rc::new(RefCell::new(clone)))
     }
 }
@@ -592,6 +611,73 @@ mod tests {
     }
 
     #[test]
+    fn empty_and_small_objects_keep_compact_property_map() {
+        let empty = JsObject::new();
+        assert!(empty.properties.is_compact());
+        assert!(empty.properties.is_empty());
+        assert_eq!(empty.properties.heap_bytes(), 0);
+
+        let mut small = JsObject::new();
+        small.set_direct("a", Value::Number(1.0));
+        small.set_direct("b", Value::Number(2.0));
+        small.set_direct("c", Value::Number(3.0));
+        small.set_direct("d", Value::Number(4.0));
+        assert!(
+            small.properties.is_compact(),
+            "<=4 own properties must stay off HashMap"
+        );
+        assert_eq!(small.keys(), vec!["a", "b", "c", "d"]);
+
+        small.set_direct("e", Value::Number(5.0));
+        assert!(
+            !small.properties.is_compact(),
+            "5th property spills to HashMap"
+        );
+        assert_eq!(small.get_direct("a").to_number(), 1.0);
+        assert_eq!(small.get_direct("e").to_number(), 5.0);
+
+        // Rare class/private/enumerability state is lazy-boxed so ordinary empty
+        // objects shrink vs the prior inline HashSet/HashMap/Vec layout (472 /
+        // RefCell 480). PropertyMap stays as-is.
+        assert_eq!(
+            std::mem::size_of::<JsObject>(),
+            296,
+            "lazy-boxed rare fields should keep JsObject at 296B (was 472)"
+        );
+        assert_eq!(
+            std::mem::size_of::<RefCell<JsObject>>(),
+            304,
+            "RefCell<JsObject> should be 304B for denser page-arena slabs (was 480)"
+        );
+        assert!(
+            empty.rare.is_none(),
+            "ordinary empty objects must not allocate RareObjectData"
+        );
+    }
+
+    #[test]
+    fn define_property_non_enumerable_allocates_rare_once() {
+        let mut obj = JsObject::new();
+        assert!(obj.rare.is_none());
+        obj.define_property(
+            "hidden",
+            &Value::object(HashMap::from([
+                ("value".into(), Value::Number(1.0)),
+                ("enumerable".into(), Value::Bool(false)),
+            ])),
+        );
+        assert!(obj.rare.is_some());
+        assert!(
+            !obj.get_own_property_descriptor("hidden")
+                .get_property("enumerable")
+                .to_bool()
+        );
+        obj.delete("hidden");
+        // rare box may remain; enumerability set should no longer list the key
+        assert!(obj.own_key_enumerable("hidden"));
+    }
+
+    #[test]
     fn property_keys_are_interned_across_objects() {
         let mut left = JsObject::new();
         let mut right = JsObject::new();
@@ -623,7 +709,7 @@ mod tests {
         let parent_rc = Rc::new(RefCell::new(parent));
 
         let mut child = JsObject::new();
-        child.prototype = Some(parent_rc);
+        child.prototype = Some(JsObjectRef::from_host(parent_rc));
         child.set_direct("own", Value::Number(1.0));
 
         assert_eq!(child.get_direct("own").to_number(), 1.0);

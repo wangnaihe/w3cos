@@ -2,10 +2,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 use crate::Value;
-use crate::value::ValueIterator;
+use crate::value::{ValueIterator, WeakJsArray};
 
 const BUFFER_STATE_KEY: &str = "__w3cos_array_buffer_id";
 const SHARED_BUFFER_KEY: &str = "__w3cos_shared_array_buffer";
@@ -242,7 +242,7 @@ impl Kind {
 }
 
 struct View {
-    storage: Weak<RefCell<crate::value::ArrayStorage>>,
+    storage: WeakJsArray,
     buffer: Value,
     bytes: Rc<RefCell<Vec<u8>>>,
     offset: usize,
@@ -812,10 +812,10 @@ fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, 
     };
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|view| view.storage.strong_count() > 0);
+        views.retain(|view| view.storage.upgrade().is_some());
         views.iter().find_map(|view| {
             let storage = view.storage.upgrade()?;
-            Rc::ptr_eq(&storage, &candidate).then(|| {
+            storage.ptr_eq(&candidate).then(|| {
                 (
                     view.bytes.clone(),
                     view.offset,
@@ -831,7 +831,7 @@ fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, 
 fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|view| view.storage.strong_count() > 0);
+        views.retain(|view| view.storage.upgrade().is_some());
         let bytes = changed.borrow();
         for view in views.iter() {
             if !Rc::ptr_eq(&view.bytes, changed) {
@@ -868,7 +868,7 @@ fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
     let storage = value.as_array().expect("typed array storage");
     VIEWS.with(|views| {
         views.borrow_mut().push(View {
-            storage: Rc::downgrade(&storage),
+            storage: storage.downgrade(),
             buffer,
             bytes,
             offset,

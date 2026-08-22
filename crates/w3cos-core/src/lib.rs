@@ -11,6 +11,7 @@ pub mod js_string;
 pub mod json;
 pub mod module_registry;
 mod object;
+mod property_map;
 pub mod page_arena;
 pub mod promise;
 mod proxy;
@@ -30,6 +31,7 @@ pub use object::JsObject;
 pub use proxy::{ProxyBuilder, ProxyHandler, proxy_class};
 pub use reactive::{Computed, Effect, Signal, batch, watch};
 pub use value::{
-    ArrayStorage, Completion, Immediate, JsFunction, PanicValue, Value, catch_js, catch_js_result,
-    throw_value, type_of,
+    AotCaptureMap, AotFactory, ArrayStorage, Completion, FunctionData, Immediate, JsArrayRef,
+    JsFunction, JsObjectRef, PanicValue, Value, WeakJsObject, catch_js, catch_js_result,
+    throw_value, type_of, unwrap_or_throw,
 };

@@ -11,7 +11,6 @@
 //! forms, and non-finite numbers serialize as `null`.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
 use crate::Value;
 use crate::value::js_error;
@@ -166,7 +165,7 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
         crate::value::ValueUnpack::Number(n) => Some(serialize_number(n)),
         crate::value::ValueUnpack::String(s) => Some(serialize_string(s.as_str())),
         crate::value::ValueUnpack::Array(items) => {
-            let pointer = Rc::as_ptr(&items) as usize;
+            let pointer = items.identity();
             context.enter(pointer);
             // Children serialize with the deeper indent already applied so
             // nested containers line up.
@@ -186,7 +185,7 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
             Some(render_container('[', ']', &parts, &inner, &outer))
         }
         crate::value::ValueUnpack::Object(object) => {
-            let pointer = Rc::as_ptr(&object) as usize;
+            let pointer = object.identity();
             context.enter(pointer);
             let whitelist: Option<Vec<String>> = match &context.replacer {
                 keys if keys.as_array().is_some() => Some(
