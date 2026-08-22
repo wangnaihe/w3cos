@@ -102,4 +102,31 @@ mod tests {
             "the document box must change at least one white background pixel"
         );
     }
+
+    #[test]
+    fn block_in_inline_collapsible_whitespace_matches_the_direct_block() {
+        crate::dom::reset_document();
+        let span = crate::dom::create_element("span");
+        crate::dom::set_style_property(span, "opacity", "0.5");
+        crate::dom::append_child(span, crate::dom::create_text_node("\n  "));
+        let nested = crate::dom::create_element("div");
+        crate::dom::set_style_property(nested, "width", "100px");
+        crate::dom::set_style_property(nested, "height", "100px");
+        crate::dom::set_style_property(nested, "background", "green");
+        crate::dom::append_child(span, nested);
+        crate::dom::append_child(span, crate::dom::create_text_node("\n"));
+        crate::dom::append_child(crate::dom::body_id(), span);
+        let actual = render_document_rgba(160, 120).expect("render block in inline");
+
+        crate::dom::reset_document();
+        let direct = crate::dom::create_element("div");
+        crate::dom::set_style_property(direct, "width", "100px");
+        crate::dom::set_style_property(direct, "height", "100px");
+        crate::dom::set_style_property(direct, "background", "green");
+        crate::dom::set_style_property(direct, "opacity", "0.5");
+        crate::dom::append_child(crate::dom::body_id(), direct);
+        let expected = render_document_rgba(160, 120).expect("render direct block");
+
+        assert_eq!(actual, expected);
+    }
 }

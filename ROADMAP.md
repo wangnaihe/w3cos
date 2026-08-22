@@ -85,10 +85,13 @@ suite is red.
   `testharness.js`, isolated per-document workers, deterministic offscreen
   Skia reftests, WPT fuzzy comparison, JSON results, and PNG diff artifacts.
 - [x] Establish a fail-closed two-case raw-WPT smoke gate and a broader
-  failure-preserving baseline: 2 pass and 3 fail on 2026-08-22. The three
-  failures remain DOM attribute/selector and CSS opacity work, not exemptions.
-- [ ] Close the three recorded raw-WPT failures, expand the selected DOM/CSS
-  suites, and add the WPT server/metadata features required by those suites.
+  five-case baseline. The initial 2-pass/3-fail snapshot on 2026-08-22 was
+  closed to 5 pass and 0 fail without expected-result exemptions.
+- [x] Close the three recorded raw-WPT failures: HTML attribute-name
+  normalization, empty-value attribute selectors plus Window named access,
+  and block-in-inline opacity positioning.
+- [ ] Expand the selected DOM/CSS suites and add the WPT server/metadata
+  features required by those suites.
 - [ ] Add an independently pinned Test262 runner for ECMAScript language
   semantics; do not infer Test262 coverage from WPT or direct Rust tests.
 - [x] Fix `w3cos-runtime --test w3c_feature_matrix`

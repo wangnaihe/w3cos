@@ -1005,17 +1005,59 @@ fn event_type_name(et: EventType) -> String {
 }
 
 // ── Selector matching (simple selectors + descendant combinator) ───────────
-// Supported: `tag`, `#id`, `.class`, compounds (`tag.a.b`, `#id.a`) and
-/// descendant chains (`div .foo`). NOT supported: `>`, `+`, `~`, `:pseudo`,
-/// `[attr]`, `*` — see module docs / gap report.
+// Supported: `tag`, `#id`, `.class`, `*`, attribute presence/equality,
+/// compounds (`tag.a.b`, `#id.a`) and descendant chains (`div .foo`).
+/// NOT supported: `>`, `+`, `~`, or `:pseudo` — see module docs / gap report.
 
 fn matches_simple(selector: &str, node: u32) -> bool {
-    if selector.is_empty() || selector.contains(['>', '+', '~', ':', '[', ']', '*']) {
+    if selector.is_empty() || selector.contains(['>', '+', '~', ':']) {
         return false;
     }
     if dom::node_type(node) != 1 {
         return false;
     }
+    let mut attributes = Vec::new();
+    let mut remainder = selector;
+    while let Some(open) = remainder.find('[') {
+        let Some(close) = remainder[open + 1..].find(']') else {
+            return false;
+        };
+        let close = open + 1 + close;
+        let expression = remainder[open + 1..close].trim();
+        if expression.is_empty() {
+            return false;
+        }
+        if let Some((name, value)) = expression.split_once('=') {
+            let name = name.trim();
+            if name.is_empty() {
+                return false;
+            }
+            attributes.push((
+                name,
+                Some(value.trim().trim_matches(['\'', '"']).to_string()),
+            ));
+        } else {
+            attributes.push((expression, None));
+        }
+        remainder = &remainder[close + 1..];
+    }
+    if remainder.contains(']') {
+        return false;
+    }
+    for (name, expected) in attributes {
+        let name = normalized_attribute_name(node, name);
+        let Some(actual) = dom::get_attribute(node, &name) else {
+            return false;
+        };
+        if expected
+            .as_deref()
+            .is_some_and(|expected| actual != expected)
+        {
+            return false;
+        }
+    }
+
+    let selector = selector.split('[').next().unwrap_or_default();
     // #id part
     if let Some(hash) = selector.find('#') {
         let id: String = selector[hash + 1..]
@@ -1041,7 +1083,7 @@ fn matches_simple(selector: &str, node: u32) -> bool {
         .chars()
         .take_while(|c| *c != '.' && *c != '#')
         .collect();
-    if !tag.is_empty() && dom::tag_name(node) != tag.to_ascii_lowercase() {
+    if !tag.is_empty() && tag != "*" && dom::tag_name(node) != tag.to_ascii_lowercase() {
         return false;
     }
     true
@@ -1092,15 +1134,16 @@ fn matches_selector_chain(node: u32, parts: &[&str]) -> bool {
 /// Candidate nodes for the right-most simple selector, using the document's
 /// id/class/tag indexes for speed.
 fn selector_candidates(simple: &str) -> Vec<u32> {
-    if let Some(hash) = simple.find('#') {
-        let id: String = simple[hash + 1..]
+    let selector_head = simple.split('[').next().unwrap_or_default();
+    if let Some(hash) = selector_head.find('#') {
+        let id: String = selector_head[hash + 1..]
             .chars()
             .take_while(|c| *c != '.' && *c != '#')
             .collect();
         return dom::get_element_by_id(&id).into_iter().collect();
     }
-    if let Some(dot) = simple.find('.') {
-        let first_class: String = simple[dot + 1..]
+    if let Some(dot) = selector_head.find('.') {
+        let first_class: String = selector_head[dot + 1..]
             .chars()
             .take_while(|c| *c != '.' && *c != '#')
             .collect();
@@ -1108,12 +1151,21 @@ fn selector_candidates(simple: &str) -> Vec<u32> {
             return dom::get_elements_by_class_name(&first_class);
         }
     }
-    let tag: String = simple
+    let tag: String = selector_head
         .chars()
         .take_while(|c| *c != '.' && *c != '#')
         .collect();
-    if tag.is_empty() {
-        Vec::new()
+    if tag.is_empty() || tag == "*" {
+        let mut candidates = Vec::new();
+        let mut stack = vec![document_element_id()];
+        while let Some(node) = stack.pop() {
+            if dom::node_type(node) == 1 {
+                candidates.push(node);
+            }
+            let children = dom::children(node);
+            stack.extend(children.into_iter().rev());
+        }
+        candidates
     } else {
         dom::get_elements_by_tag_name(&tag.to_ascii_lowercase())
     }
@@ -1280,6 +1332,14 @@ pub(crate) fn namespace_uri(node: u32) -> String {
     get_expando(node, "namespaceURI")
         .map(|namespace| namespace.to_js_string())
         .unwrap_or_else(|| "http://www.w3.org/1999/xhtml".to_string())
+}
+
+fn normalized_attribute_name(node: u32, name: &str) -> String {
+    if namespace_uri(node) == crate::html_parser_state::HTML_NAMESPACE {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    }
 }
 
 pub(crate) fn ensure_template_content(node: u32) -> u32 {
@@ -3735,14 +3795,13 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "classList" => class_list_value(node),
         "attributes" => attributes_value(node),
         "dataset" => dataset_value(node),
-        "getAttribute" => {
-            func(
-                move |_, args| match dom::get_attribute(node, &arg(&args, 0).to_js_string()) {
-                    Some(v) => Value::from(v),
-                    None => Value::Null,
-                },
-            )
-        }
+        "getAttribute" => func(move |_, args| {
+            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
+            match dom::get_attribute(node, &name) {
+                Some(v) => Value::from(v),
+                None => Value::Null,
+            }
+        }),
         "getAttributeNS" => func(move |_, args| {
             let namespace_value = arg(&args, 0);
             let namespace = (!namespace_value.is_null())
@@ -3754,11 +3813,8 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             }
         }),
         "setAttribute" => func(move |_, args| {
-            dom::set_attribute(
-                node,
-                &arg(&args, 0).to_js_string(),
-                &arg(&args, 1).to_js_string(),
-            );
+            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
+            dom::set_attribute(node, &name, &arg(&args, 1).to_js_string());
             Value::Undefined
         }),
         "setAttributeNS" => func(move |_, args| {
@@ -3775,7 +3831,8 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::Undefined
         }),
         "hasAttribute" => func(move |_, args| {
-            Value::Bool(dom::has_attribute(node, &arg(&args, 0).to_js_string()))
+            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
+            Value::Bool(dom::has_attribute(node, &name))
         }),
         "hasAttributeNS" => func(move |_, args| {
             let namespace_value = arg(&args, 0);
@@ -3789,7 +3846,8 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             ))
         }),
         "removeAttribute" => func(move |_, args| {
-            dom::remove_attribute(node, &arg(&args, 0).to_js_string());
+            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
+            dom::remove_attribute(node, &name);
             Value::Undefined
         }),
         "removeAttributeNS" => func(move |_, args| {
@@ -3801,7 +3859,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::Undefined
         }),
         "toggleAttribute" => func(move |_, args| {
-            let name = arg(&args, 0).to_js_string();
+            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
             let force = arg(&args, 1);
             let has = dom::has_attribute(node, &name);
             let want = if force.is_undefined() {
@@ -12162,7 +12220,31 @@ fn build_window_value() -> Value {
         func(|_, args| Value::Bool(js_dispatch_event(0, arg(&args, 0)))),
     );
 
-    let window = Value::object(props);
+    let generation = realm_generation();
+    let handler = ProxyBuilder::new()
+        .get(move |target, key, _receiver| {
+            if !bridge_realm_is_current(generation) {
+                return Value::Undefined;
+            }
+            if target
+                .as_object()
+                .is_some_and(|object| object.borrow().has_direct(key))
+            {
+                return target.get_property(key);
+            }
+            dom::get_element_by_id(key)
+                .map(element_value)
+                .unwrap_or(Value::Undefined)
+        })
+        .has(move |target, key| {
+            bridge_realm_is_current(generation)
+                && (target
+                    .as_object()
+                    .is_some_and(|object| object.borrow().has_direct(key))
+                    || dom::get_element_by_id(key).is_some())
+        })
+        .build();
+    let window = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
     w3cos_core::class::set_prototype_of(&window, &window_class().get_property("prototype"));
     window
 }
@@ -13745,6 +13827,43 @@ mod tests {
     }
 
     #[test]
+    fn html_attribute_names_are_ascii_case_insensitive_but_svg_names_are_not() {
+        setup();
+        let document = document_value();
+        let div = create_in_body("div");
+        div.call_method(
+            "setAttribute",
+            vec![Value::string("labelXQL"), Value::string("html")],
+        );
+        assert_eq!(
+            div.call_method("getAttribute", vec![Value::string("labelxql")])
+                .to_js_string(),
+            "html"
+        );
+
+        let svg = document.call_method(
+            "createElementNS",
+            vec![
+                Value::string("http://www.w3.org/2000/svg"),
+                Value::string("svg"),
+            ],
+        );
+        svg.call_method(
+            "setAttribute",
+            vec![Value::string("viewBox"), Value::string("0 0 10 10")],
+        );
+        assert_eq!(
+            svg.call_method("getAttribute", vec![Value::string("viewBox")])
+                .to_js_string(),
+            "0 0 10 10"
+        );
+        assert!(
+            svg.call_method("getAttribute", vec![Value::string("viewbox")])
+                .is_null()
+        );
+    }
+
+    #[test]
     fn document_get_element_by_id_and_query_selector() {
         setup();
         let doc = document_value();
@@ -13812,6 +13931,39 @@ mod tests {
         // contains()
         assert!(outer.call_method("contains", vec![inner.clone()]).to_bool());
         assert!(!inner.call_method("contains", vec![outer.clone()]).to_bool());
+    }
+
+    #[test]
+    fn query_selector_attribute_matching_includes_empty_values() {
+        setup();
+        let root = create_in_body("div");
+        root.call_method(
+            "setAttribute",
+            vec![Value::string("id"), Value::string("root")],
+        );
+        root.set_property(
+            "innerHTML",
+            Value::string("<div id=\"\"></div><div id></div><div></div>"),
+        );
+        assert!(window_value().get_property("root") == root);
+        assert!(
+            window_value()
+                .as_object()
+                .is_some_and(|window| window.borrow().has("root"))
+        );
+
+        assert_eq!(
+            root.call_method("querySelectorAll", vec![Value::string("[id]")])
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+        assert_eq!(
+            root.call_method("querySelectorAll", vec![Value::string("[id='']")])
+                .get_property("length")
+                .to_u32(),
+            2
+        );
     }
 
     #[test]

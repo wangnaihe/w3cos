@@ -42,24 +42,25 @@ cargo run -p w3cos-wpt-runner -- \
   --artifacts target/wpt-smoke
 ```
 
-The broader baseline intentionally retains known failures. `--report-only`
-keeps the command successful while still recording every result:
+The broader five-case baseline is also fail-closed:
 
 ```bash
 cargo run -p w3cos-wpt-runner -- \
   --wpt-root ../wpt \
   --suite tests/wpt/w3cos-baseline.json \
-  --artifacts target/wpt-baseline \
-  --report-only
+  --artifacts target/wpt-baseline
 ```
 
-At the 2026-08-22 baseline, the broader manifest records 2 passing and 3
-failing cases. The failures are evidence, not expected-result exemptions:
+The first 2026-08-22 run recorded 2 passing and 3 failing cases. Those failures
+were retained as evidence and then closed without expected-result exemptions:
 
-- mixed-ASCII-case HTML attributes fail the DOM assertion;
-- empty `id` attribute selectors fail the DOM assertion;
-- block-in-inline opacity differs from its reference by 2200 pixels, with a
-  maximum channel difference of 129.
+- mixed-ASCII-case HTML attributes now use HTML-namespace ASCII normalization;
+- empty `id` presence/equality selectors and Window named access now match;
+- block-in-inline collapsible whitespace no longer shifts the opacity group.
+
+The recorded baseline is now 5 passing and 0 failing cases. `--report-only`
+remains available for intentionally red discovery manifests, but it is not
+used by either current gate.
 
 `results.json` contains suite, case, subtest, and pixel-difference data.
 Reftests additionally emit `actual`, `expected`, and red-highlighted `diff`

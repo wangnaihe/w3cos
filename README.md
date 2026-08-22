@@ -225,8 +225,8 @@ cargo run -p w3cos-wpt-runner -- \
   --suite tests/wpt/w3cos-smoke.json
 ```
 
-Checkout preparation, the broader failure-preserving baseline, artifacts, and
-current runner boundaries are documented in
+Checkout preparation, the broader fail-closed baseline, artifacts, and current
+runner boundaries are documented in
 [Raw Web Platform Tests](docs/wpt-conformance.md).
 
 ### Technology Stack
