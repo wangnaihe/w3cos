@@ -3933,6 +3933,9 @@ impl App {
         let painted_with_skia =
             painted_with_skia_metal || painted_with_skia_vulkan || painted_with_skia_raster;
 
+        // Default to a full softbuffer blit. Retained paint paths below narrow
+        // this to scrollports / node rects when the pixmap only changed there.
+        let mut softbuffer_damage = SoftbufferDamage::Full;
         if painted_with_skia {
             crate::perf::record_paint_path("skia-full");
         } else {
@@ -3980,11 +3983,24 @@ impl App {
                             &self.scroll_ancestor,
                             &mut self.cpu.as_mut().unwrap().clip_masks,
                         );
-                        crate::perf::record_paint_path(if retained {
-                            "retained-scroll"
+                        if retained {
+                            // Softbuffer was not strip-shifted — blit the whole
+                            // scrollport(s), which is still << full-window when
+                            // chrome surrounds the scroller.
+                            softbuffer_damage = SoftbufferDamage::from_layout_rects(
+                                damages.iter().filter_map(|damage| {
+                                    scaled_scrollable
+                                        .iter()
+                                        .find(|(idx, _, _)| *idx == damage.index)
+                                        .map(|(_, rect, _)| *rect)
+                                }),
+                                w,
+                                h,
+                            );
+                            crate::perf::record_paint_path("retained-scroll");
                         } else {
-                            "full-scroll-fallback"
-                        });
+                            crate::perf::record_paint_path("full-scroll-fallback");
+                        }
                     }
                 }
                 RepaintMode::ScrollContentChanged(damages) => {
@@ -4004,18 +4020,28 @@ impl App {
                         &self.scroll_ancestor,
                         &mut self.cpu.as_mut().unwrap().clip_masks,
                     );
-                    crate::perf::record_paint_path(if retained {
-                        "retained-content-change"
+                    if retained {
+                        softbuffer_damage = SoftbufferDamage::from_layout_rects(
+                            damages.iter().filter_map(|damage| {
+                                scaled_scrollable
+                                    .iter()
+                                    .find(|(idx, _, _)| *idx == damage.index)
+                                    .map(|(_, rect, _)| *rect)
+                            }),
+                            w,
+                            h,
+                        );
+                        crate::perf::record_paint_path("retained-content-change");
                     } else {
-                        "full-content-fallback"
-                    });
+                        crate::perf::record_paint_path("full-content-fallback");
+                    }
                 }
                 RepaintMode::ExternalAfterScroll {
                     scroll_indices,
                     damage_indices,
                 } => {
-                    let retained = scroll_indices.len() == 1
-                        && render_cpu::render_damage_nodes(
+                    let damaged = if scroll_indices.len() == 1 {
+                        render_cpu::render_damage_nodes(
                             &mut pixmap,
                             &render_nodes,
                             &self.font,
@@ -4024,8 +4050,13 @@ impl App {
                             self.focused_index,
                             &damage_indices,
                             &mut self.cpu.as_mut().unwrap().clip_masks,
-                        );
-                    if retained {
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(rects) = damaged {
+                        softbuffer_damage =
+                            SoftbufferDamage::from_layout_rects(rects, w, h);
                         crate::perf::record_paint_path("external-after-scroll");
                     } else {
                         render_cpu::render_frame(
@@ -4078,6 +4109,7 @@ impl App {
                 .find(|h| h.index == hover_idx && h.is_interactive)
             {
                 draw_hover_outline_cpu(&mut pixmap, hit.rect);
+                softbuffer_damage.union_layout_rect(hit.rect, w, h);
             }
         }
         if !direct_skia_present && let Some(focus_idx) = self.focused_index {
@@ -4090,6 +4122,7 @@ impl App {
                             .find(|h| h.index == focus_idx && h.is_focusable)
                         {
                             draw_focus_ring_cpu(&mut pixmap, hit.rect);
+                            softbuffer_damage.union_layout_rect(hit.rect, w, h);
                         }
                     }
                 }
@@ -4114,7 +4147,7 @@ impl App {
 
         if let Some(cpu) = self.cpu.as_mut() {
             if !painted_with_skia_metal && !painted_with_skia_vulkan {
-                cpu.present(&pixmap, w, h);
+                cpu.present(&pixmap, w, h, softbuffer_damage);
             }
             cpu.framebuffer = (!direct_skia_present).then_some(pixmap);
             if !self.first_frame_presented {
@@ -6713,9 +6746,66 @@ fn sticky_scroll_offset(
 // CPU-only drawing helpers
 // ---------------------------------------------------------------------------
 
+/// Physical-pixel damage for the softbuffer present blit.
+///
+/// The retained RGBA pixmap can update only dirty regions (scroll strips,
+/// changed nodes). softbuffer still needs those pixels as `0x00RRGGBB`.
+/// Backends that report `Buffer::age() >= 1` keep the previous frame, so we
+/// can swizzle only the dirty rects. Age-0 backends (AppKit) allocate a fresh
+/// zeroed buffer every frame and must take the full-frame path.
+#[cfg(feature = "cpu-render")]
+#[derive(Clone, Debug)]
+enum SoftbufferDamage {
+    Full,
+    /// `(x, y, width, height)` in physical pixmap pixels.
+    Rects(Vec<[u32; 4]>),
+}
+
+#[cfg(feature = "cpu-render")]
+impl SoftbufferDamage {
+    fn from_layout_rects(rects: impl IntoIterator<Item = LayoutRect>, w: u32, h: u32) -> Self {
+        let mut out = Vec::new();
+        for rect in rects {
+            if let Some(px) = layout_rect_to_pixel_damage(rect, w, h) {
+                out.push(px);
+            }
+        }
+        if out.is_empty() {
+            SoftbufferDamage::Rects(Vec::new())
+        } else {
+            SoftbufferDamage::Rects(out)
+        }
+    }
+
+    fn union_layout_rect(&mut self, rect: LayoutRect, w: u32, h: u32) {
+        let SoftbufferDamage::Rects(rects) = self else {
+            return;
+        };
+        let Some(px) = layout_rect_to_pixel_damage(rect, w, h) else {
+            return;
+        };
+        rects.push(px);
+    }
+}
+
+#[cfg(feature = "cpu-render")]
+fn layout_rect_to_pixel_damage(rect: LayoutRect, fb_w: u32, fb_h: u32) -> Option<[u32; 4]> {
+    if fb_w == 0 || fb_h == 0 {
+        return None;
+    }
+    let x0 = (rect.x.floor() as i32).clamp(0, fb_w as i32);
+    let y0 = (rect.y.floor() as i32).clamp(0, fb_h as i32);
+    let x1 = ((rect.x + rect.width).ceil() as i32).clamp(0, fb_w as i32);
+    let y1 = ((rect.y + rect.height).ceil() as i32).clamp(0, fb_h as i32);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some([x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32])
+}
+
 #[cfg(feature = "cpu-render")]
 impl CpuPresenter {
-    fn present(&mut self, pixmap: &Pixmap, w: u32, h: u32) {
+    fn present(&mut self, pixmap: &Pixmap, w: u32, h: u32, damage: SoftbufferDamage) {
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
@@ -6732,8 +6822,37 @@ impl CpuPresenter {
         // tiny-skia pixmap is RGBA and is retained for scroll-damage copies.
         // Swizzle into the softbuffer in place (0x00RRGGBB); do not mutate
         // the pixmap and do not allocate a third framebuffer.
-        rgba8_to_softbuffer_xrgb(pixmap.data(), &mut buffer);
-        let _ = buffer.present();
+        //
+        // Age >= 1 means this buffer still holds the previous present, so
+        // dirty-rect swizzle is correct. Age 0 (fresh/unspecified) requires a
+        // full-frame write — AppKit always takes this path.
+        let use_damage = buffer.age() >= 1;
+        match (use_damage, damage) {
+            (true, SoftbufferDamage::Rects(rects)) if rects.is_empty() => {
+                // Pixmap unchanged vs last present; skip the blit.
+            }
+            (true, SoftbufferDamage::Rects(rects)) => {
+                let fb_w = pixmap.width();
+                rgba8_to_softbuffer_xrgb_rects(pixmap.data(), fb_w, &mut buffer, &rects);
+                let damage_rects: Vec<softbuffer::Rect> = rects
+                    .iter()
+                    .filter_map(|&[x, y, rw, rh]| {
+                        let width = NonZeroU32::new(rw)?;
+                        let height = NonZeroU32::new(rh)?;
+                        Some(softbuffer::Rect { x, y, width, height })
+                    })
+                    .collect();
+                if damage_rects.is_empty() {
+                    let _ = buffer.present();
+                } else {
+                    let _ = buffer.present_with_damage(&damage_rects);
+                }
+            }
+            (_, SoftbufferDamage::Full) | (false, SoftbufferDamage::Rects(_)) => {
+                rgba8_to_softbuffer_xrgb(pixmap.data(), &mut buffer);
+                let _ = buffer.present();
+            }
+        }
     }
 }
 
@@ -6744,6 +6863,50 @@ impl CpuPresenter {
 /// which reads the RGBA pixmap on the next frame.
 #[cfg(feature = "cpu-render")]
 fn rgba8_to_softbuffer_xrgb(src: &[u8], dst: &mut [u32]) {
+    let n = dst.len().min(src.len() / 4);
+    if n == 0 {
+        return;
+    }
+    let src = &src[..n * 4];
+    let dst = &mut dst[..n];
+    swizzle_rgba8_to_xrgb(src, dst);
+}
+
+/// Swizzle only the damaged physical-pixel rectangles into softbuffer.
+#[cfg(feature = "cpu-render")]
+fn rgba8_to_softbuffer_xrgb_rects(
+    src: &[u8],
+    src_width: u32,
+    dst: &mut [u32],
+    rects: &[[u32; 4]],
+) {
+    let src_width = src_width as usize;
+    if src_width == 0 {
+        return;
+    }
+    let dst_height = dst.len() / src_width;
+    for &[x, y, w, h] in rects {
+        let x = x as usize;
+        let y = y as usize;
+        let w = w as usize;
+        let h = h as usize;
+        if w == 0 || h == 0 || x >= src_width || y >= dst_height {
+            continue;
+        }
+        let w = w.min(src_width - x);
+        let h = h.min(dst_height - y);
+        for row in 0..h {
+            let src_off = ((y + row) * src_width + x) * 4;
+            let dst_off = (y + row) * src_width + x;
+            let src_row = &src[src_off..src_off + w * 4];
+            let dst_row = &mut dst[dst_off..dst_off + w];
+            swizzle_rgba8_to_xrgb(src_row, dst_row);
+        }
+    }
+}
+
+#[cfg(feature = "cpu-render")]
+fn swizzle_rgba8_to_xrgb(src: &[u8], dst: &mut [u32]) {
     let n = dst.len().min(src.len() / 4);
     if n == 0 {
         return;
@@ -6793,7 +6956,10 @@ fn cpu_paint_style_needs_scale(kind: &ComponentKind, style: &w3cos_std::style::S
 
 #[cfg(all(test, feature = "cpu-render"))]
 mod cpu_present_swizzle_tests {
-    use super::rgba8_to_softbuffer_xrgb;
+    use super::{
+        layout_rect_to_pixel_damage, rgba8_to_softbuffer_xrgb, rgba8_to_softbuffer_xrgb_rects,
+    };
+    use crate::layout::LayoutRect;
 
     #[test]
     fn packs_rgba_bytes_as_xrgb() {
@@ -6811,6 +6977,37 @@ mod cpu_present_swizzle_tests {
         assert_eq!(dst[0], 0xFFFF);
         let mut empty: [u32; 0] = [];
         rgba8_to_softbuffer_xrgb(&[1, 2, 3, 4], &mut empty);
+    }
+
+    #[test]
+    fn rect_swizzle_updates_only_damaged_pixels() {
+        // 2x2 pixmap, damage only the bottom-right pixel.
+        let src = [
+            0x11, 0x22, 0x33, 0xFF, 0x44, 0x55, 0x66, 0xFF, 0x77, 0x88, 0x99, 0xFF, 0xAA, 0xBB,
+            0xCC, 0xFF,
+        ];
+        let mut dst = [0u32; 4];
+        rgba8_to_softbuffer_xrgb_rects(&src, 2, &mut dst, &[[1, 1, 1, 1]]);
+        assert_eq!(dst[0], 0);
+        assert_eq!(dst[1], 0);
+        assert_eq!(dst[2], 0);
+        assert_eq!(dst[3], 0x00AA_BBCC);
+    }
+
+    #[test]
+    fn layout_rect_clamps_to_framebuffer() {
+        let px = layout_rect_to_pixel_damage(
+            LayoutRect {
+                x: -4.0,
+                y: 10.5,
+                width: 20.0,
+                height: 5.0,
+            },
+            16,
+            20,
+        )
+        .unwrap();
+        assert_eq!(px, [0, 10, 16, 6]);
     }
 }
 
