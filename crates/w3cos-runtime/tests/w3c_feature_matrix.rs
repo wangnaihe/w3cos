@@ -298,7 +298,7 @@ fn ecma_proxy_get_trap() {
     let mut props = HashMap::new();
     props.insert("x".into(), Value::Number(1.0));
     let handler = ProxyBuilder::new()
-        .get(|_target, key, _receiver| Value::String(format!("proxy:{key}")))
+        .get(|_target, key, _receiver| Value::String(format!("proxy:{key}").into()))
         .build();
     let obj = JsObject::with_proxy(props, handler);
     let receiver = Value::Undefined;

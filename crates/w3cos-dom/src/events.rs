@@ -569,6 +569,12 @@ impl EventRegistry {
         self.listeners.retain(|(id, _)| *id != node);
     }
 
+    pub(crate) fn has_listeners(&self, node: NodeId) -> bool {
+        self.listeners
+            .iter()
+            .any(|(listener_node, _)| *listener_node == node)
+    }
+
     /// Dispatch event to listeners on the target node only (no bubbling).
     pub fn dispatch(&mut self, event: &mut Event) {
         self.dispatch_at_node(event.target, event);

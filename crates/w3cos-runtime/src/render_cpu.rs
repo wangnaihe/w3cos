@@ -1471,7 +1471,8 @@ fn draw_text_line(
 
     GLYPH_RASTER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        for ch in text.chars() {
+        let render_text = text_layout::font_render_text(text);
+        for ch in render_text.chars() {
             let registered = crate::font_face::FontRegistry::global()
                 .resolve_style_for_character(style, ch)
                 .and_then(|font| font.parsed());

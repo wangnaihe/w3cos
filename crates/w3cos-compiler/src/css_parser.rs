@@ -1039,10 +1039,26 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "row-gap" => style.row_gap = css_parse_px(value),
         "column-gap" => style.column_gap = css_parse_px(value),
         "padding" => apply_padding_shorthand(style, value),
-        "padding-top" => style.padding_top = css_parse_spacing(value),
-        "padding-right" => style.padding_right = css_parse_spacing(value),
-        "padding-bottom" => style.padding_bottom = css_parse_spacing(value),
-        "padding-left" => style.padding_left = css_parse_spacing(value),
+        "padding-top" => {
+            if let Some(value) = css_parse_padding_spacing(value) {
+                style.padding_top = Some(value);
+            }
+        }
+        "padding-right" => {
+            if let Some(value) = css_parse_padding_spacing(value) {
+                style.padding_right = Some(value);
+            }
+        }
+        "padding-bottom" => {
+            if let Some(value) = css_parse_padding_spacing(value) {
+                style.padding_bottom = Some(value);
+            }
+        }
+        "padding-left" => {
+            if let Some(value) = css_parse_padding_spacing(value) {
+                style.padding_left = Some(value);
+            }
+        }
         "margin" => apply_margin_shorthand(style, value),
         "margin-top" => style.margin_top = css_parse_spacing(value),
         "margin-right" => style.margin_right = css_parse_spacing(value),
@@ -1121,6 +1137,17 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "border-left" => parse_border_side_shorthand(style, value, BorderSide::Left),
         "align-items" => style.align_items = Some(value.to_string()),
         "align-self" => style.align_self = Some(value.to_string()),
+        "vertical-align" => {
+            style.align_self = Some(
+                match value.trim() {
+                    "top" | "text-top" => "flex-start",
+                    "bottom" | "text-bottom" => "flex-end",
+                    "middle" => "center",
+                    _ => "baseline",
+                }
+                .to_string(),
+            )
+        }
         "align-content" => style.align_content = Some(value.to_string()),
         "justify-self" => style.justify_self = Some(value.to_string()),
         "justify-items" => style.justify_items = Some(value.to_string()),
@@ -1148,6 +1175,7 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "flex" => parse_flex_shorthand(style, value),
         "order" => style.order = value.parse().ok(),
         "position" => style.position = Some(value.to_string()),
+        "float" => style.float = Some(value.to_string()),
         "inset" => {
             let parts: Vec<&str> = value.split_whitespace().collect();
             let values = match parts.as_slice() {
@@ -1322,6 +1350,21 @@ fn css_parse_spacing(value: &str) -> Option<Spacing> {
     crate::css_values::css_parse_spacing_value(value)
 }
 
+fn css_parse_padding_spacing(value: &str) -> Option<Spacing> {
+    let spacing = css_parse_spacing(value)?;
+    match spacing {
+        Spacing::Px(value)
+        | Spacing::Percent(value)
+        | Spacing::Rem(value)
+        | Spacing::Em(value)
+        | Spacing::Vw(value)
+        | Spacing::Vh(value)
+            if value < 0.0 => None,
+        Spacing::Auto => None,
+        _ => Some(spacing),
+    }
+}
+
 fn css_parse_px(value: &str) -> Option<f32> {
     crate::css_values::parse_plain_px(value)
 }
@@ -1358,6 +1401,20 @@ fn css_parse_spacing_shorthand(value: &str) -> Option<(Spacing, Spacing, Spacing
     }
 }
 
+fn css_parse_padding_shorthand(value: &str) -> Option<(Spacing, Spacing, Spacing, Spacing)> {
+    let parts: Vec<Spacing> = value
+        .split_whitespace()
+        .map(css_parse_padding_spacing)
+        .collect::<Option<_>>()?;
+    match parts.as_slice() {
+        [all] => Some((*all, *all, *all, *all)),
+        [vertical, horizontal] => Some((*vertical, *horizontal, *vertical, *horizontal)),
+        [top, horizontal, bottom] => Some((*top, *horizontal, *bottom, *horizontal)),
+        [top, right, bottom, left] => Some((*top, *right, *bottom, *left)),
+        _ => None,
+    }
+}
+
 /// CSS box-edge shorthand: 1–4 values (top [right [bottom [left]]]).
 fn css_parse_edge_shorthand(value: &str) -> Option<(f32, f32, f32, f32)> {
     let parts: Vec<f32> = value.split_whitespace().filter_map(css_parse_px).collect();
@@ -1374,7 +1431,7 @@ fn css_parse_edge_shorthand(value: &str) -> Option<(f32, f32, f32, f32)> {
 }
 
 fn apply_padding_shorthand(style: &mut StyleDecl, value: &str) {
-    let Some((t, r, b, l)) = css_parse_spacing_shorthand(value) else {
+    let Some((t, r, b, l)) = css_parse_padding_shorthand(value) else {
         return;
     };
     style.padding_top = Some(t);
@@ -1480,6 +1537,36 @@ mod tests {
         assert_eq!(sheet.rules[0].style.color.as_deref(), Some("#e94560"));
         assert_eq!(sheet.rules[0].style.font_size, Some(24.0));
         assert!(sheet.rules[0].layer.is_none());
+    }
+
+    #[test]
+    fn negative_padding_does_not_replace_a_valid_declaration() {
+        let sheet = parse_css(
+            ".target { padding: 4px; padding-top: -1%; padding-bottom: -2px; padding: 1px -3px; }",
+        );
+        let style = &sheet.rules[0].style;
+        assert_eq!(style.padding, Some(Spacing::Px(4.0)));
+        assert_eq!(style.padding_top, Some(Spacing::Px(4.0)));
+        assert_eq!(style.padding_bottom, Some(Spacing::Px(4.0)));
+    }
+
+    #[test]
+    fn float_is_retained_in_the_typed_style_declaration() {
+        let sheet = parse_css(".target { float: right; }");
+        assert_eq!(sheet.rules[0].style.float.as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn vertical_align_is_lowered_to_portable_cross_axis_alignment() {
+        let sheet = parse_css(
+            ".top { vertical-align: top; } .middle { vertical-align: middle; } .bottom { vertical-align: bottom; }",
+        );
+        assert_eq!(
+            sheet.rules[0].style.align_self.as_deref(),
+            Some("flex-start")
+        );
+        assert_eq!(sheet.rules[1].style.align_self.as_deref(), Some("center"));
+        assert_eq!(sheet.rules[2].style.align_self.as_deref(), Some("flex-end"));
     }
 
     #[test]

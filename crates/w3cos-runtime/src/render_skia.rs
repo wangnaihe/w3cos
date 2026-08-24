@@ -984,7 +984,11 @@ fn effect_path(
 }
 
 fn draw_image(canvas: &Canvas, rect: LayoutRect, src: &str, opacity: f32) {
-    draw_image_with_edge_antialiasing(canvas, rect, src, opacity, true);
+    // Untransformed replaced images own their pixel coverage just like a
+    // zero-radius CSS background. Browser rasterizers snap those outer edges
+    // instead of blending the image with the page at fractional layout
+    // coordinates; interpolation remains inside the destination rectangle.
+    draw_image_with_edge_antialiasing(canvas, rect, src, opacity, false);
 }
 
 fn draw_image_with_edge_antialiasing(
@@ -1031,7 +1035,6 @@ fn draw_canvas(canvas: &Canvas, client_index: usize, rect: LayoutRect, opacity: 
     };
     draw_decoded_image(canvas, rect, &decoded, opacity, true);
 }
-
 
 fn skia_filter_chain(chain: &FilterChain) -> Option<ImageFilter> {
     let mut input = None;
@@ -1212,7 +1215,7 @@ fn draw_text_in_rect(
     text: &str,
     style: &Style,
     typeface: &Typeface,
-    metrics_font: &fontdue::Font,
+    _metrics_font: &fontdue::Font,
 ) {
     let content = text_paint_box(rect, style);
     // An overflow clip belongs to the element itself as well as its
@@ -1237,13 +1240,13 @@ fn draw_text_in_rect(
         save
     });
     let registry = crate::font_face::FontRegistry::global();
-    let layout = text_layout::retained_text_paint_layout_with(
+    let layout = text_layout::retained_text_paint_layout_with_run_width(
         text,
         content.width,
         style.font_size,
         style.white_space,
         registry.cascade_cache_key(style, text) ^ 0x534b_4941_5445_5801,
-        |character| registry.style_char_advance(style, character, style.font_size, metrics_font),
+        |line| measure_skia_text_advance(line, typeface, style),
         |line| {
             measure_skia_text_ink_bounds(
                 line,
@@ -1262,7 +1265,20 @@ fn draw_text_in_rect(
             style.font_weight,
             Some(style),
         );
-        draw_text_ink_in_box(canvas, content, &layout.lines[0], ink, style, typeface);
+        let line_height = style.font_size * style.line_height;
+        let x = aligned_text_x(content, effective_text_align(style), ink.left, ink.width);
+        let top = content.y + (content.height - line_height).max(0.0) * 0.5;
+        draw_text_line(
+            canvas,
+            x,
+            top,
+            &layout.lines[0],
+            style.font_size,
+            style.color,
+            style.opacity,
+            typeface,
+            style,
+        );
         if let Some(save) = clip_save {
             canvas.restore_to_count(save);
         }
@@ -1327,29 +1343,6 @@ fn draw_centered_text(
     );
 }
 
-fn draw_text_ink_in_box(
-    canvas: &Canvas,
-    rect: LayoutRect,
-    text: &str,
-    ink: text_layout::InkBounds,
-    style: &Style,
-    typeface: &Typeface,
-) {
-    let x = aligned_text_x(rect, effective_text_align(style), ink.left, ink.width);
-    let y = rect.y + (rect.height - ink.height) * 0.5 - ink.top;
-    draw_text_line(
-        canvas,
-        x,
-        y,
-        text,
-        style.font_size,
-        style.color,
-        style.opacity,
-        typeface,
-        style,
-    );
-}
-
 fn effective_text_align(style: &Style) -> TextAlign {
     // DOM text content is lowered into the host Text component instead of an
     // anonymous flex child. Preserve the browser behavior of centering that
@@ -1382,7 +1375,8 @@ fn draw_text_line(
 ) -> f32 {
     let paint = color_paint(color, opacity);
     let mut cursor_x = x;
-    for run in css_font_runs(text, typeface, style) {
+    let font_text = text_layout::font_render_text(text);
+    for run in css_font_runs(font_text.as_ref(), typeface, style) {
         let font = Font::new(run.typeface, font_size);
         canvas.draw_str(run.text, (cursor_x, top + font_size), &font, &paint);
         cursor_x += font.measure_str(run.text, Some(&paint)).0;
@@ -1404,9 +1398,10 @@ fn measure_skia_text_ink_bounds(
     let mut bottom = f32::MIN;
     let mut saw_ink = false;
 
+    let font_text = text_layout::font_render_text(text);
     let runs = style.map_or_else(
-        || fallback_font_runs(text, typeface, font_weight),
-        |style| css_font_runs(text, typeface, style),
+        || fallback_font_runs(font_text.as_ref(), typeface, font_weight),
+        |style| css_font_runs(font_text.as_ref(), typeface, style),
     );
     for run in runs {
         let font = Font::new(run.typeface, font_size);
@@ -1433,6 +1428,18 @@ fn measure_skia_text_ink_bounds(
     }
 }
 
+fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> f32 {
+    let font_text = text_layout::font_render_text(text);
+    css_font_runs(font_text.as_ref(), typeface, style)
+        .into_iter()
+        .map(|run| {
+            Font::new(run.typeface, style.font_size)
+                .measure_str(run.text, None)
+                .0
+        })
+        .sum()
+}
+
 pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f32, f32) {
     let registered = registered_typeface(style);
     INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
@@ -1440,28 +1447,52 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
             .as_ref()
             .map(|(_, typeface)| typeface)
             .unwrap_or(intrinsic);
-        let mut width = 0.0_f32;
-        let mut line_spacing = 0.0_f32;
-        for run in css_font_runs(text, primary, style) {
-            let font = Font::new(run.typeface, style.font_size);
-            width += font.measure_str(run.text, None).0;
-            let (spacing, metrics) = font.metrics();
-            // CSS `normal` uses the font's full em line box, not only Skia's
-            // baseline spacing. `BOUNDS_INVALID` only describes the aggregate
-            // glyph bounds; top/bottom line metrics are still populated.
-            let normal_line_height = (metrics.bottom - metrics.top).max(spacing);
-            line_spacing = line_spacing.max(normal_line_height);
-        }
-        if text.is_empty() {
-            let font = Font::new(primary.clone(), style.font_size);
-            let (spacing, metrics) = font.metrics();
-            line_spacing = (metrics.bottom - metrics.top).max(spacing);
-        }
+        let lines = text_layout::wrap_text_with_run_width(
+            text,
+            f32::MAX / 4.0,
+            style.white_space,
+            |line| measure_skia_text_advance(line, primary, style),
+        );
+        let width = lines
+            .iter()
+            .map(|line| measure_skia_text_advance(line, primary, style))
+            .fold(0.0_f32, f32::max);
         let padding = style.padding_lengths();
+        // Skia's macOS fallback typeface exposes a 32.55px top-to-bottom
+        // metric at 16px, but that is a glyph coverage bound, not the used
+        // CSS line box. Browser block/inline layout advances by the computed
+        // line-height; fallback-specific CJK expansion is applied centrally
+        // by `browser_normal_cjk_height` in layout.rs.
+        let content_height = text_layout::used_text_line_count(text, style, &lines) as f32
+            * style.font_size
+            * style.line_height;
         (
             width + padding.left + padding.right,
-            line_spacing.max(style.font_size * style.line_height) + padding.top + padding.bottom,
+            content_height + padding.top + padding.bottom,
         )
+    })
+}
+
+pub(crate) fn measure_skia_wrapped_text_height(text: &str, width: f32, style: &Style) -> f32 {
+    let registered = registered_typeface(style);
+    INTRINSIC_PRIMARY_TYPEFACE.with(|intrinsic| {
+        let primary = registered
+            .as_ref()
+            .map(|(_, typeface)| typeface)
+            .unwrap_or(intrinsic);
+        let padding = style.padding_lengths();
+        let inner_width = (width - padding.left - padding.right).max(1.0);
+        let lines =
+            text_layout::wrap_text_with_run_width(text, inner_width, style.white_space, |line| {
+                measure_skia_text_advance(line, primary, style)
+            });
+        let used_line_count = text_layout::used_text_line_count(text, style, &lines);
+        let content_height = if used_line_count == 1 {
+            measure_skia_text_intrinsic_size(&lines[0], style).1 - padding.top - padding.bottom
+        } else {
+            used_line_count as f32 * style.font_size * style.line_height
+        };
+        content_height + padding.top + padding.bottom
     })
 }
 
@@ -1614,13 +1645,7 @@ fn draw_background_image(
                     // The background painting area owns edge coverage. Keeping
                     // tile edges non-AA avoids double-blended outer edges and
                     // seams between repeated tiles.
-                    draw_image_with_edge_antialiasing(
-                        canvas,
-                        *tile,
-                        &layer.source,
-                        opacity,
-                        false,
-                    );
+                    draw_image_with_edge_antialiasing(canvas, *tile, &layer.source, opacity, false);
                 }
             }
             crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
@@ -1706,10 +1731,22 @@ fn gradient_shader_for_layer(
 }
 
 fn draw_round_rect(canvas: &Canvas, rect: LayoutRect, radius: f32, paint: &Paint) {
-    canvas.draw_round_rect(to_rect(rect), radius.max(0.0), radius.max(0.0), paint);
+    if radius <= 0.0 {
+        let mut crisp = paint.clone();
+        crisp.set_anti_alias(false);
+        canvas.draw_rect(to_rect(rect), &crisp);
+    } else {
+        canvas.draw_round_rect(to_rect(rect), radius, radius, paint);
+    }
 }
 
 fn draw_rounded_rect(canvas: &Canvas, rect: LayoutRect, radii: [f32; 4], paint: &Paint) {
+    if radii.iter().all(|radius| *radius <= 0.0) {
+        let mut crisp = paint.clone();
+        crisp.set_anti_alias(false);
+        canvas.draw_rect(to_rect(rect), &crisp);
+        return;
+    }
     let radii = radii.map(|radius| {
         let radius = radius.max(0.0);
         Vector::new(radius, radius)
@@ -1828,6 +1865,73 @@ mod tests {
     }
 
     #[test]
+    fn zero_radius_css_box_fill_uses_crisp_edge_coverage() {
+        let mut surface = Surface::new_raster_n32_premul((8, 8)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        draw_rounded_rect(
+            surface.canvas(),
+            LayoutRect {
+                x: 0.5,
+                y: 0.5,
+                width: 4.0,
+                height: 4.0,
+            },
+            [0.0; 4],
+            &color_paint(w3cos_std::color::Color::rgb(0, 128, 0), 1.0),
+        );
+
+        let info = ImageInfo::new((8, 8), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 8 * 8 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 8 * 4, (0, 0)));
+        assert_eq!(&pixels[..4], &[255, 255, 255, 255]);
+        assert_eq!(
+            &pixels[(1 * 8 + 1) * 4..(1 * 8 + 1) * 4 + 4],
+            &[0, 128, 0, 255]
+        );
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .all(|pixel| { pixel == [255, 255, 255, 255] || pixel == [0, 128, 0, 255] })
+        );
+    }
+
+    #[test]
+    fn replaced_image_uses_crisp_edge_coverage_at_fractional_layout_coordinates() {
+        crate::image_loader::clear_cache();
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 128, 0, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::image_loader::decode_and_install("fractional-image.png", &bytes.into_inner())
+            .unwrap();
+
+        let mut surface = Surface::new_raster_n32_premul((8, 8)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        draw_image(
+            surface.canvas(),
+            LayoutRect {
+                x: 0.5,
+                y: 0.5,
+                width: 4.0,
+                height: 4.0,
+            },
+            "fractional-image.png",
+            1.0,
+        );
+
+        let info = ImageInfo::new((8, 8), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 8 * 8 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 8 * 4, (0, 0)));
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .all(|pixel| { pixel == [255, 255, 255, 255] || pixel == [0, 128, 0, 255] })
+        );
+        crate::image_loader::clear_cache();
+    }
+
+    #[test]
     fn text_leaf_clips_its_own_hidden_overflow() {
         let mut surface = Surface::new_raster_n32_premul((96, 32)).unwrap();
         surface.canvas().clear(Color::TRANSPARENT);
@@ -1879,6 +1983,60 @@ mod tests {
     }
 
     #[test]
+    fn single_line_and_first_explicit_multiline_run_share_the_same_baseline() {
+        let mut single = Surface::new_raster_n32_premul((64, 40)).unwrap();
+        let mut multiline = Surface::new_raster_n32_premul((64, 40)).unwrap();
+        single.canvas().clear(Color::TRANSPARENT);
+        multiline.canvas().clear(Color::TRANSPARENT);
+        let typeface = FontMgr::default()
+            .new_from_data(TEST_FONT, None)
+            .expect("Skia test typeface");
+        let metrics_font = test_font();
+        let style = Style {
+            color: w3cos_std::color::Color::BLACK,
+            font_size: 16.0,
+            line_height: 1.2,
+            ..Style::default()
+        };
+        draw_text_in_rect(
+            single.canvas(),
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 64.0,
+                height: 19.2,
+            },
+            "i",
+            &style,
+            &typeface,
+            &metrics_font,
+        );
+        draw_text_in_rect(
+            multiline.canvas(),
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 64.0,
+                height: 38.4,
+            },
+            "i\u{2028}i",
+            &style,
+            &typeface,
+            &metrics_font,
+        );
+
+        let info = ImageInfo::new((64, 40), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut single_pixels = vec![0_u8; 64 * 40 * 4];
+        let mut multiline_pixels = vec![0_u8; 64 * 40 * 4];
+        assert!(single.read_pixels(&info, &mut single_pixels, 64 * 4, (0, 0)));
+        assert!(multiline.read_pixels(&info, &mut multiline_pixels, 64 * 4, (0, 0)));
+        assert_eq!(
+            &single_pixels[..64 * 19 * 4],
+            &multiline_pixels[..64 * 19 * 4]
+        );
+    }
+
+    #[test]
     fn registered_css_font_supplies_skia_typeface_and_releases_with_owner() {
         const OWNER: u64 = 0x534b_4941_464f_4e54;
         const FAMILY: &str = "W3COS Skia Font Test";
@@ -1905,6 +2063,15 @@ mod tests {
         drop(typeface);
         crate::font_face::FontRegistry::global().clear_owner(OWNER);
         assert!(registered_typeface(&style).is_none());
+    }
+
+    #[test]
+    fn skia_uses_regular_space_metrics_for_non_breaking_space() {
+        let primary = FontMgr::default().new_from_data(TEST_FONT, None).unwrap();
+        let style = Style::default();
+        let space = measure_skia_text_advance(" ", &primary, &style);
+        let non_breaking_space = measure_skia_text_advance("\u{00a0}", &primary, &style);
+        assert!((space - non_breaking_space).abs() < 0.01);
     }
 
     #[test]

@@ -4055,8 +4055,7 @@ impl App {
                         None
                     };
                     if let Some(rects) = damaged {
-                        softbuffer_damage =
-                            SoftbufferDamage::from_layout_rects(rects, w, h);
+                        softbuffer_damage = SoftbufferDamage::from_layout_rects(rects, w, h);
                         crate::perf::record_paint_path("external-after-scroll");
                     } else {
                         render_cpu::render_frame(
@@ -4578,10 +4577,26 @@ impl App {
                 .then_some((idx, rect))
             })
             .collect();
+        let input_scrollable = self
+            .scrollable_nodes
+            .iter()
+            .copied()
+            .filter(|(idx, _, _)| {
+                flat.get(*idx).is_some_and(|node| {
+                    matches!(
+                        node.style.resolved_overflow_x(),
+                        w3cos_std::style::Overflow::Auto | w3cos_std::style::Overflow::Scroll
+                    ) || matches!(
+                        node.style.resolved_overflow_y(),
+                        w3cos_std::style::Overflow::Auto | w3cos_std::style::Overflow::Scroll
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         topmost_scroll_node_at(
             x,
             y,
-            &self.scrollable_nodes,
+            &input_scrollable,
             &scroll_info,
             &paint_z,
             &overlay_blockers,
@@ -6839,7 +6854,12 @@ impl CpuPresenter {
                     .filter_map(|&[x, y, rw, rh]| {
                         let width = NonZeroU32::new(rw)?;
                         let height = NonZeroU32::new(rh)?;
-                        Some(softbuffer::Rect { x, y, width, height })
+                        Some(softbuffer::Rect {
+                            x,
+                            y,
+                            width,
+                            height,
+                        })
                     })
                     .collect();
                 if damage_rects.is_empty() {
@@ -6874,12 +6894,7 @@ fn rgba8_to_softbuffer_xrgb(src: &[u8], dst: &mut [u32]) {
 
 /// Swizzle only the damaged physical-pixel rectangles into softbuffer.
 #[cfg(feature = "cpu-render")]
-fn rgba8_to_softbuffer_xrgb_rects(
-    src: &[u8],
-    src_width: u32,
-    dst: &mut [u32],
-    rects: &[[u32; 4]],
-) {
+fn rgba8_to_softbuffer_xrgb_rects(src: &[u8], src_width: u32, dst: &mut [u32], rects: &[[u32; 4]]) {
     let src_width = src_width as usize;
     if src_width == 0 {
         return;

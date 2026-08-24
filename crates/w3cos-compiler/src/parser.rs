@@ -135,6 +135,7 @@ pub struct StyleDecl {
     pub height: Option<String>,
     pub flex_grow: Option<f32>,
     pub position: Option<String>,
+    pub float: Option<String>,
     pub top: Option<String>,
     pub right: Option<String>,
     pub bottom: Option<String>,

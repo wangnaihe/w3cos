@@ -1252,7 +1252,17 @@ impl StreamingDocumentParser {
                     .unwrap_or(instruction.len());
                 let target = &instruction[..split];
                 let data = instruction[split..].trim_start_matches(char::is_whitespace);
-                let node = crate::dom::create_processing_instruction(target, data);
+                // Declarative processing-instruction attributes are only
+                // recognized from attribute-shaped data. Preserve the legacy
+                // HTML bogus-comment data for unstructured `<?...?>` markup;
+                // existing MutationObserver content relies on those question
+                // mark delimiters being observable through CharacterData.
+                let parser_data = if data.contains('=') {
+                    data.to_string()
+                } else {
+                    format!("?{instruction}?")
+                };
+                let node = crate::dom::create_processing_instruction(target, &parser_data);
                 if self.fragment_root.is_none() && !self.doctype_seen {
                     crate::dom::insert_before(0, node, self.html);
                 } else {
@@ -1665,7 +1675,10 @@ mod tests {
             instruction.get_property("target").to_js_string(),
             "processing"
         );
-        assert_eq!(instruction.get_property("data").to_js_string(), "data");
+        assert_eq!(
+            instruction.get_property("data").to_js_string(),
+            "?processing data?"
+        );
         assert_eq!(parser.parse_error_count(), 0);
     }
 

@@ -43,6 +43,7 @@ psl = { workspace = true }
 w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
 parley = { workspace = true }
+unicode-bidi = { workspace = true }
 fontdue = { workspace = true }
 fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 anyhow = { workspace = true }

@@ -301,6 +301,14 @@ pub(crate) fn dimensions(src: &str) -> Option<(u32, u32)> {
     })
 }
 
+/// Whether the Browser loader owns this source but has no decoded intrinsic
+/// dimensions yet. This covers both an in-flight request and a terminally
+/// broken image, neither of which should fall back to the legacy 200x200
+/// renderer placeholder.
+pub(crate) fn is_reserved_browser_source(src: &str) -> bool {
+    CACHE.with(|cache| matches!(cache.borrow().get(src), Some(None)))
+}
+
 /// Reserve a Browser-owned source while its asynchronous fetch is pending (or
 /// after it has failed), preventing paint from falling back to the legacy
 /// synchronous source loader and issuing a duplicate network request.

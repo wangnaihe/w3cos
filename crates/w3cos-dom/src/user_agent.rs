@@ -23,14 +23,24 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
     style.display = match local_name {
         "base" | "head" | "link" | "meta" | "noembed" | "noframes" | "param" | "script"
         | "style" | "template" | "title" => Display::None,
-        "a" | "abbr" | "b" | "code" | "em" | "i" | "label" | "small" | "span" | "strong" => {
+        "a" | "abbr" | "b" | "br" | "code" | "em" | "i" | "label" | "small" | "span" | "strong" => {
             Display::Inline
         }
         "button" | "img" | "input" | "select" | "textarea" => Display::InlineBlock,
+        "table" => Display::Table,
+        "caption" => Display::TableCaption,
+        "colgroup" => Display::TableColumnGroup,
+        "col" => Display::TableColumn,
+        "thead" => Display::TableHeaderGroup,
+        "tbody" => Display::TableRowGroup,
+        "tfoot" => Display::TableFooterGroup,
+        "tr" => Display::TableRow,
+        "td" | "th" => Display::TableCell,
         _ => Display::Block,
     };
 
     match local_name {
+        "body" => style.margin = Edges::all(8.0),
         "button" => {
             style.box_sizing = BoxSizing::BorderBox;
             style.background = Color::rgb(239, 239, 239);
@@ -101,8 +111,22 @@ mod tests {
 
         assert_eq!(html_default_style("div").display, Display::Block);
         assert_eq!(html_default_style("div").flex_direction, FlexDirection::Row);
+        assert_eq!(html_default_style("body").margin, Edges::all(8.0));
         assert_eq!(html_default_style("span").display, Display::Inline);
+        assert_eq!(html_default_style("br").display, Display::Inline);
         assert_eq!(html_default_style("img").display, Display::InlineBlock);
+        assert_eq!(html_default_style("table").display, Display::Table);
+        assert_eq!(
+            html_default_style("thead").display,
+            Display::TableHeaderGroup
+        );
+        assert_eq!(html_default_style("tbody").display, Display::TableRowGroup);
+        assert_eq!(
+            html_default_style("tfoot").display,
+            Display::TableFooterGroup
+        );
+        assert_eq!(html_default_style("tr").display, Display::TableRow);
+        assert_eq!(html_default_style("td").display, Display::TableCell);
         assert_eq!(html_default_style("script").display, Display::None);
         assert_eq!(html_default_style("style").display, Display::None);
         assert_eq!(html_default_style("head").display, Display::None);

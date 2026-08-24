@@ -1,13 +1,15 @@
 //! Text measurement and wrapping (layout estimates + font-accurate paint).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
-use w3cos_std::style::{Style, WhiteSpace};
+use w3cos_std::style::{Display, Style, WhiteSpace};
 
 const TEXT_PAINT_CACHE_CAPACITY: usize = 4096;
+const FORCED_LINE_BREAK: char = '\u{2028}';
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TextPaintKey {
@@ -50,6 +52,109 @@ fn white_space_key(value: WhiteSpace) -> u8 {
         WhiteSpace::Pre => 2,
         WhiteSpace::PreWrap => 3,
         WhiteSpace::PreLine => 4,
+    }
+}
+
+fn normalized_segment_breaks(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                output.push('\n');
+            }
+            '\u{000c}' => output.push('\n'),
+            _ => output.push(character),
+        }
+    }
+    output
+}
+
+fn collapse_css_whitespace_sequences(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for character in text.chars() {
+        if matches!(character, ' ' | '\t' | '\n' | '\u{000c}') {
+            pending_space = true;
+        } else {
+            if pending_space {
+                output.push(' ');
+                pending_space = false;
+            }
+            output.push(character);
+        }
+    }
+    if pending_space {
+        output.push(' ');
+    }
+    output
+}
+
+fn collapse_pre_line_whitespace(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            collapse_css_whitespace_sequences(line)
+                .trim_matches(' ')
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn expand_tabs(text: &str) -> String {
+    const TAB_SIZE: usize = 8;
+
+    let mut output = String::with_capacity(text.len());
+    let mut column = 0usize;
+    for character in text.chars() {
+        match character {
+            '\n' | FORCED_LINE_BREAK => {
+                output.push('\n');
+                column = 0;
+            }
+            '\t' => {
+                let spaces = TAB_SIZE - column % TAB_SIZE;
+                output.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+            }
+            _ => {
+                output.push(character);
+                column += 1;
+            }
+        }
+    }
+    output
+}
+
+pub fn prepare_text_for_white_space(text: &str, white_space: WhiteSpace) -> String {
+    let text = normalized_segment_breaks(text);
+    match white_space {
+        WhiteSpace::Normal | WhiteSpace::NoWrap => collapse_css_whitespace_sequences(&text),
+        WhiteSpace::PreLine => collapse_pre_line_whitespace(&text),
+        WhiteSpace::Pre | WhiteSpace::PreWrap => expand_tabs(&text),
+    }
+}
+
+/// The break at the end of an inline text fragment terminates its current
+/// line, but there is no following fragment with paintable area. Keep the
+/// break in shaping/flow while excluding that synthetic empty fragment from
+/// the inline box's used block size. Block/pre boxes still retain their final
+/// empty line.
+pub fn used_text_line_count(text: &str, style: &Style, lines: &[String]) -> usize {
+    let terminal_preserved_break = text
+        .chars()
+        .next_back()
+        .is_some_and(|character| matches!(character, '\n' | FORCED_LINE_BREAK));
+    if style.display == Display::Inline
+        && terminal_preserved_break
+        && lines.last().is_some_and(String::is_empty)
+    {
+        lines.len().saturating_sub(1).max(1)
+    } else {
+        lines.len().max(1)
     }
 }
 
@@ -127,8 +232,9 @@ where
     };
 
     for ch in text.chars() {
-        if ch == '\n' {
-            flush(&mut lines, &mut current, &mut current_w);
+        if matches!(ch, '\n' | FORCED_LINE_BREAK) {
+            lines.push(std::mem::take(&mut current));
+            current_w = 0.0;
             continue;
         }
         let cw = char_width(ch);
@@ -156,7 +262,69 @@ where
         current.push(ch);
         current_w += cw;
     }
-    flush(&mut lines, &mut current, &mut current_w);
+    if !current.is_empty() || text.ends_with('\n') {
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    merge_orphan_punctuation_lines(&mut lines);
+    lines
+}
+
+/// Greedy wrapping backed by shaped-run measurement.
+///
+/// Summing isolated glyph advances loses kerning and shaping adjustments. That
+/// is observable when a shrink-to-fit inline box is exactly its max-content
+/// width: layout measures the shaped word, while paint used to wrap its final
+/// glyph because the isolated advances were wider. Measure each candidate run
+/// with the paint backend so line breaking and intrinsic sizing share one
+/// metric space.
+fn wrap_greedy_with_run_width<F>(text: &str, max_width: f32, mut run_width: F) -> Vec<String>
+where
+    F: FnMut(&str) -> f32,
+{
+    if max_width <= 1.0 {
+        return vec![text.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let flush = |lines: &mut Vec<String>, current: &mut String| {
+        if !current.is_empty() {
+            lines.push(std::mem::take(current));
+        }
+    };
+
+    for ch in text.chars() {
+        if matches!(ch, '\n' | FORCED_LINE_BREAK) {
+            lines.push(std::mem::take(&mut current));
+            continue;
+        }
+
+        let had_content = !current.is_empty();
+        current.push(ch);
+        if had_content && run_width(&current) > max_width {
+            current.pop();
+            if may_not_start_line(ch) {
+                if let Some(last) = current.pop() {
+                    flush(&mut lines, &mut current);
+                    current.push(last);
+                }
+            } else if current.chars().last().is_some_and(may_not_end_line) {
+                let last = current.pop().unwrap();
+                flush(&mut lines, &mut current);
+                current.push(last);
+            } else {
+                flush(&mut lines, &mut current);
+            }
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() || text.ends_with('\n') {
+        lines.push(current);
+    }
 
     if lines.is_empty() {
         lines.push(String::new());
@@ -166,6 +334,10 @@ where
 }
 
 pub fn estimated_char_width(ch: char, font_size: f32) -> f32 {
+    if is_bidi_format_control(ch) {
+        return 0.0;
+    }
+    let ch = font_glyph_character(ch);
     if ch == ' ' {
         font_size * 0.33
     } else if ch.is_ascii() {
@@ -176,6 +348,10 @@ pub fn estimated_char_width(ch: char, font_size: f32) -> f32 {
 }
 
 pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
+    if is_bidi_format_control(ch) {
+        return 0.0;
+    }
+    let ch = font_glyph_character(ch);
     if !font.chars().contains_key(&ch) {
         return estimated_char_width(ch, font_size);
     }
@@ -185,6 +361,54 @@ pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
     } else {
         estimated_char_width(ch, font_size)
     }
+}
+
+pub(crate) fn font_glyph_character(character: char) -> char {
+    if character == '\u{00a0}' {
+        ' '
+    } else {
+        character
+    }
+}
+
+pub(crate) fn font_render_text(text: &str) -> Cow<'_, str> {
+    if text.is_ascii() {
+        return Cow::Borrowed(text);
+    }
+
+    let bidi = unicode_bidi::BidiInfo::new(text, None);
+    let visual = bidi.paragraphs.first().map_or_else(
+        || Cow::Borrowed(text),
+        |paragraph| bidi.reorder_line(paragraph, paragraph.range.clone()),
+    );
+    let rendered = visual
+        .chars()
+        .filter(|character| !is_bidi_format_control(*character))
+        .map(font_glyph_character)
+        .collect::<String>();
+    if rendered == text {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(rendered)
+    }
+}
+
+pub(crate) fn is_bidi_format_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'
+            | '\u{202b}'
+            | '\u{202c}'
+            | '\u{202d}'
+            | '\u{202e}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
+    )
 }
 
 pub fn measure_text_width_estimate(text: &str, font_size: f32) -> f32 {
@@ -202,49 +426,39 @@ pub fn wrap_text_estimate(
     white_space: WhiteSpace,
 ) -> (Vec<String>, f32) {
     let line_h = font_size * line_height;
-    if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
-        return (vec![text.to_string()], line_h);
-    }
-    if max_width <= 1.0 {
-        return (vec![text.to_string()], line_h);
-    }
-
-    let lines = wrap_greedy(text, max_width, |ch| estimated_char_width(ch, font_size));
+    let lines = wrap_text_with_char_width(text, max_width, white_space, |ch| {
+        estimated_char_width(ch, font_size)
+    });
     let height = lines.len() as f32 * line_h;
     (lines, height)
 }
 
 pub fn wrapped_block_height_estimate(content: &str, width: f32, style: &Style) -> f32 {
     let inner_w = (width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
-    let (_, h) = wrap_text_estimate(
+    let (lines, _) = wrap_text_estimate(
         content,
         inner_w,
         style.font_size,
         style.line_height,
         style.white_space,
     );
+    let h =
+        used_text_line_count(content, style, &lines) as f32 * style.font_size * style.line_height;
     h + style.padding_lengths().top + style.padding_lengths().bottom
 }
 
 pub fn text_intrinsic_size_estimate(content: &str, style: &Style, wrap_width: f32) -> (f32, f32) {
-    if matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
-        let w = measure_text_width_estimate(content, style.font_size)
-            + style.padding_lengths().left
-            + style.padding_lengths().right;
-        let h = style.font_size * style.line_height
-            + style.padding_lengths().top
-            + style.padding_lengths().bottom;
-        return (w, h);
-    }
     let inner_w =
         (wrap_width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
-    let (lines, h) = wrap_text_estimate(
+    let (lines, _) = wrap_text_estimate(
         content,
         inner_w,
         style.font_size,
         style.line_height,
         style.white_space,
     );
+    let h =
+        used_text_line_count(content, style, &lines) as f32 * style.font_size * style.line_height;
     let max_line_w = lines
         .iter()
         .map(|line| measure_text_width_estimate(line, style.font_size))
@@ -262,33 +476,26 @@ pub fn text_intrinsic_size_font(
     wrap_width: f32,
     font: &fontdue::Font,
 ) -> (f32, f32) {
-    if matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
-        let mut w = measure_text_width_font(content, style.font_size, font)
-            + style.padding_lengths().left
-            + style.padding_lengths().right;
-        if let w3cos_std::style::Dimension::Px(mw) = style.min_width {
-            w = w.max(mw);
-        }
-        let h = single_line_content_height(content, style.font_size, style.line_height, font)
-            + style.padding_lengths().top
-            + style.padding_lengths().bottom;
-        return (w, h);
-    }
     let inner_w =
         (wrap_width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
     let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
     let line_h = style.font_size * style.line_height;
-    let h = if lines.len() == 1 {
+    let used_line_count = used_text_line_count(content, style, &lines);
+    let h = if used_line_count == 1 {
         single_line_content_height(&lines[0], style.font_size, style.line_height, font)
     } else {
-        lines.len() as f32 * line_h
+        used_line_count as f32 * line_h
     };
     let max_line_w = lines
         .iter()
         .map(|line| measure_text_width_font(line, style.font_size, font))
         .fold(0.0f32, f32::max);
+    let mut width = max_line_w + style.padding_lengths().left + style.padding_lengths().right;
+    if let w3cos_std::style::Dimension::Px(min_width) = style.min_width {
+        width = width.max(min_width);
+    }
     (
-        max_line_w + style.padding_lengths().left + style.padding_lengths().right,
+        width,
         h + style.padding_lengths().top + style.padding_lengths().bottom,
     )
 }
@@ -302,10 +509,11 @@ pub fn wrapped_block_height_font(
     let inner_w = (width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
     let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
     let line_h = style.font_size * style.line_height;
-    let block_h = if lines.len() == 1 {
+    let used_line_count = used_text_line_count(content, style, &lines);
+    let block_h = if used_line_count == 1 {
         single_line_content_height(&lines[0], style.font_size, style.line_height, font)
     } else {
-        lines.len() as f32 * line_h
+        used_line_count as f32 * line_h
     };
     block_h + style.padding_lengths().top + style.padding_lengths().bottom
 }
@@ -318,7 +526,11 @@ pub fn single_line_vertical_metrics(
 ) -> (f32, f32) {
     let mut top = f32::MAX;
     let mut bottom = f32::MIN;
-    for ch in text.chars() {
+    for character in text.chars() {
+        if is_bidi_format_control(character) {
+            continue;
+        }
+        let ch = font_glyph_character(character);
         if !font.chars().contains_key(&ch) {
             top = top.min(-font_size * 0.88);
             bottom = bottom.max(font_size * 0.12);
@@ -414,7 +626,11 @@ pub fn measure_text_ink_bounds(
     let mut bottom = f32::MIN;
     let mut saw_ink = false;
 
-    for ch in text.chars() {
+    for character in text.chars() {
+        if is_bidi_format_control(character) {
+            continue;
+        }
+        let ch = font_glyph_character(character);
         if !font.chars().contains_key(&ch) {
             let advance = estimated_char_width(ch, font_size);
             saw_ink = true;
@@ -466,15 +682,9 @@ pub fn wrap_text_font(
     font: &fontdue::Font,
     white_space: WhiteSpace,
 ) -> Vec<String> {
-    if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
-        return vec![text.to_string()];
-    }
-    if max_width <= 1.0 {
-        return vec![text.to_string()];
-    }
-
-    let lines = wrap_greedy(text, max_width, |ch| char_advance(ch, font_size, font));
-    lines
+    wrap_text_with_char_width(text, max_width, white_space, |ch| {
+        char_advance(ch, font_size, font)
+    })
 }
 
 pub fn wrap_text_with_char_width(
@@ -483,13 +693,48 @@ pub fn wrap_text_with_char_width(
     white_space: WhiteSpace,
     char_width: impl FnMut(char) -> f32,
 ) -> Vec<String> {
-    if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
-        return vec![text.to_string()];
+    let text = prepare_text_for_white_space(text, white_space);
+    if white_space == WhiteSpace::NoWrap {
+        return text.split(FORCED_LINE_BREAK).map(str::to_string).collect();
+    }
+    if white_space == WhiteSpace::Pre {
+        return text
+            .split(['\n', FORCED_LINE_BREAK])
+            .map(str::to_string)
+            .collect();
     }
     if max_width <= 1.0 {
-        return vec![text.to_string()];
+        return text
+            .split(['\n', FORCED_LINE_BREAK])
+            .map(str::to_string)
+            .collect();
     }
-    wrap_greedy(text, max_width, char_width)
+    wrap_greedy(&text, max_width, char_width)
+}
+
+pub fn wrap_text_with_run_width(
+    text: &str,
+    max_width: f32,
+    white_space: WhiteSpace,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
+    let text = prepare_text_for_white_space(text, white_space);
+    if white_space == WhiteSpace::NoWrap {
+        return text.split(FORCED_LINE_BREAK).map(str::to_string).collect();
+    }
+    if white_space == WhiteSpace::Pre {
+        return text
+            .split(['\n', FORCED_LINE_BREAK])
+            .map(str::to_string)
+            .collect();
+    }
+    if max_width <= 1.0 {
+        return text
+            .split(['\n', FORCED_LINE_BREAK])
+            .map(str::to_string)
+            .collect();
+    }
+    wrap_greedy_with_run_width(&text, max_width, run_width)
 }
 
 pub fn retained_text_paint_layout(
@@ -533,6 +778,39 @@ pub fn retained_text_paint_layout_with(
     }
 
     let lines = wrap_text_with_char_width(text, max_width, white_space, char_width);
+    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
+    TEXT_PAINT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
+            cache.entries.clear();
+        }
+        cache.entries.insert(key, layout.clone());
+    });
+    layout
+}
+
+pub fn retained_text_paint_layout_with_run_width(
+    text: &str,
+    max_width: f32,
+    font_size: f32,
+    white_space: WhiteSpace,
+    font_identity: u64,
+    run_width: impl FnMut(&str) -> f32,
+    mut measure_ink: impl FnMut(&str) -> InkBounds,
+) -> Rc<TextPaintLayout> {
+    let key = TextPaintKey {
+        text: text.to_owned(),
+        max_width: max_width.to_bits(),
+        font: font_identity,
+        font_size: font_size.to_bits(),
+        white_space: white_space_key(white_space),
+    };
+    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
+        return cached;
+    }
+
+    let lines = wrap_text_with_run_width(text, max_width, white_space, run_width);
     let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
     let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
     TEXT_PAINT_CACHE.with(|cache| {
@@ -623,6 +901,112 @@ mod tests {
                 .iter()
                 .all(|line| line.chars().count() as f32 <= max_width)
         );
+    }
+
+    #[test]
+    fn shaped_run_width_keeps_kerning_pair_inside_its_intrinsic_box() {
+        let isolated = wrap_text_with_char_width("PASS", 3.5, WhiteSpace::Normal, |_| 1.0);
+        assert_eq!(isolated, vec!["PAS", "S"]);
+
+        let shaped = wrap_text_with_run_width("PASS", 3.5, WhiteSpace::Normal, |text| {
+            text.chars().count() as f32 - text.chars().count().saturating_sub(1) as f32 * 0.2
+        });
+        assert_eq!(shaped, vec!["PASS"]);
+    }
+
+    #[test]
+    fn css_white_space_modes_prepare_generated_text_before_shaping() {
+        let source = "This text\n\tshould   be";
+        assert_eq!(
+            prepare_text_for_white_space(source, WhiteSpace::Normal),
+            "This text should be"
+        );
+        assert_eq!(
+            prepare_text_for_white_space(source, WhiteSpace::NoWrap),
+            "This text should be"
+        );
+        assert_eq!(
+            prepare_text_for_white_space(source, WhiteSpace::PreLine),
+            "This text\nshould be"
+        );
+        assert_eq!(
+            prepare_text_for_white_space(source, WhiteSpace::Pre),
+            "This text\n        should   be"
+        );
+    }
+
+    #[test]
+    fn non_breaking_space_uses_the_regular_space_glyph_advance() {
+        let font = fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepare_text_for_white_space("left\u{00a0}right", WhiteSpace::Normal),
+            "left\u{00a0}right",
+            "NBSP must retain its no-break identity during line breaking"
+        );
+        assert!(
+            (char_advance('\u{00a0}', 16.0, &font) - char_advance(' ', 16.0, &font)).abs() < 0.01,
+            "NBSP must paint with the regular space glyph advance"
+        );
+    }
+
+    #[test]
+    fn explicit_bidi_overrides_are_reordered_before_font_rendering() {
+        assert_eq!(font_render_text("\u{202e}elbadaer"), "readable");
+        assert_eq!(font_render_text("\u{202e}d c \u{202d}ab\u{202c}"), "ab c d");
+    }
+
+    #[test]
+    fn pre_preserves_explicit_and_empty_lines_without_soft_wrapping() {
+        let lines = wrap_text_with_run_width("first\n\nsecond", 1.0, WhiteSpace::Pre, |_| 100.0);
+        assert_eq!(lines, vec!["first", "", "second"]);
+    }
+
+    #[test]
+    fn terminal_break_does_not_create_a_painted_empty_inline_fragment() {
+        let content = "  \n";
+        let lines = wrap_text_with_run_width(content, 100.0, WhiteSpace::Pre, |_| 8.0);
+        assert_eq!(lines, vec!["  ", ""]);
+        assert_eq!(
+            used_text_line_count(
+                content,
+                &Style {
+                    display: Display::Inline,
+                    white_space: WhiteSpace::Pre,
+                    ..Style::default()
+                },
+                &lines,
+            ),
+            1
+        );
+        assert_eq!(
+            used_text_line_count(
+                content,
+                &Style {
+                    display: Display::Block,
+                    white_space: WhiteSpace::Pre,
+                    ..Style::default()
+                },
+                &lines,
+            ),
+            2,
+            "block preformatted content retains its terminal empty line"
+        );
+    }
+
+    #[test]
+    fn forced_break_survives_normal_and_nowrap_whitespace_modes() {
+        for white_space in [WhiteSpace::Normal, WhiteSpace::NoWrap] {
+            let lines =
+                wrap_text_with_run_width("first\u{2028}second", 1000.0, white_space, |text| {
+                    text.len() as f32
+                });
+            assert_eq!(lines, vec!["first", "second"]);
+        }
     }
 
     #[test]

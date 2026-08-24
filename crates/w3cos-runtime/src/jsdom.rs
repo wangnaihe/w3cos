@@ -734,9 +734,7 @@ fn nodes_have_same_shadow_including_root(left: u32, right: u32) -> bool {
             && right_connected
             && get_expando(left, "ownerDocument")
                 .unwrap_or_else(document_value)
-                .strict_eq(
-                    &get_expando(right, "ownerDocument").unwrap_or_else(document_value),
-                );
+                .strict_eq(&get_expando(right, "ownerDocument").unwrap_or_else(document_value));
     }
     shadow_including_tree_root(left) == shadow_including_tree_root(right)
 }
@@ -1127,15 +1125,12 @@ fn collection_value(
             key == "length"
                 || matches!(key, "item" | "entries" | "forEach" | "keys" | "values")
                 || (class_name == "HTMLCollection" && key == "namedItem")
-                || key
-                    .parse::<usize>()
-                    .ok()
-                    .is_some_and(|index| {
-                        index
-                            < has_static_items
-                                .as_ref()
-                                .map_or_else(|| has_provider().len(), |items| items.len())
-                    })
+                || key.parse::<usize>().ok().is_some_and(|index| {
+                    index
+                        < has_static_items
+                            .as_ref()
+                            .map_or_else(|| has_provider().len(), |items| items.len())
+                })
                 || (class_name == "HTMLCollection"
                     && html_collection_supported_names(&has_provider())
                         .iter()
@@ -1656,7 +1651,7 @@ fn matches_simple(selector: &str, node: u32, scope: Option<u32>) -> bool {
                 node_is_connected(node)
                     && hash.strip_prefix('#').is_some_and(|target| {
                         !target.is_empty()
-                        && dom::get_attribute(node, "id").as_deref() == Some(target)
+                            && dom::get_attribute(node, "id").as_deref() == Some(target)
                     })
             }
             ":popover-open" => popover_is_open(node),
@@ -1930,9 +1925,9 @@ fn selector_has_no_namespace_type(selector: &str) -> bool {
                 ' ' | '\t' | '\n' | '\r' | '\u{000c}' | '>' | '+' | '~' | ',' | '('
             );
         boundary_before
-            && chars
-                .get(index + 1)
-                .is_some_and(|next| *next == '*' || *next == '-' || *next == '_' || next.is_alphabetic())
+            && chars.get(index + 1).is_some_and(|next| {
+                *next == '*' || *next == '-' || *next == '_' || next.is_alphabetic()
+            })
     })
 }
 
@@ -1946,9 +1941,9 @@ fn selector_for_static_validation(selector: &str) -> String {
                     chars[index - 1],
                     ' ' | '\t' | '\n' | '\r' | '\u{000c}' | '>' | '+' | '~' | ',' | '('
                 ))
-            && chars
-                .get(index + 1)
-                .is_some_and(|next| *next == '*' || *next == '-' || *next == '_' || next.is_alphabetic())
+            && chars.get(index + 1).is_some_and(|next| {
+                *next == '*' || *next == '-' || *next == '_' || next.is_alphabetic()
+            })
         {
             normalized.push('*');
         }
@@ -2607,7 +2602,10 @@ fn processing_instruction_attributes(node: u32) -> Vec<(String, String)> {
             return Vec::new();
         }
         index += 1;
-        let Some(quote) = bytes.get(index).copied().filter(|quote| matches!(quote, b'\'' | b'"'))
+        let Some(quote) = bytes
+            .get(index)
+            .copied()
+            .filter(|quote| matches!(quote, b'\'' | b'"'))
         else {
             return Vec::new();
         };
@@ -2629,9 +2627,7 @@ fn processing_instruction_attributes(node: u32) -> Vec<(String, String)> {
         }
     }
     PROCESSING_INSTRUCTION_ATTRIBUTES.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(node, (data, attributes.clone()));
+        cache.borrow_mut().insert(node, (data, attributes.clone()));
     });
     attributes
 }
@@ -2700,10 +2696,12 @@ pub(crate) fn sync_global_document_child_relationships() {
     let root = document_element_id();
     if namespace_uri(root) == crate::html_parser_state::HTML_NAMESPACE
         && dom::tag_name(root) == "html"
-        && let Some(body) = inclusive_descendant_elements(root).into_iter().find(|node| {
-            namespace_uri(*node) == crate::html_parser_state::HTML_NAMESPACE
-                && dom::tag_name(*node) == "body"
-        })
+        && let Some(body) = inclusive_descendant_elements(root)
+            .into_iter()
+            .find(|node| {
+                namespace_uri(*node) == crate::html_parser_state::HTML_NAMESPACE
+                    && dom::tag_name(*node) == "body"
+            })
     {
         // XML navigation replaces the bootstrap HTML shell. The JS-facing
         // document getter already follows the parsed tree; keep the native
@@ -3267,7 +3265,6 @@ pub(crate) fn parse_html_attributes(mut input: &str) -> Vec<(String, String)> {
 
 pub(crate) fn apply_html_attribute(node: u32, name: &str, value: &str) {
     match name {
-        "class" => dom::set_class_name(node, value),
         "style" => {
             dom::set_attribute(node, name, value);
             parse_css_text(node, value);
@@ -3285,7 +3282,14 @@ pub(crate) fn apply_html_attribute_ns(
     value: &str,
 ) {
     if namespace.is_none() {
-        apply_html_attribute(node, qualified_name, value);
+        // `setAttributeNS(null, ...)` identifies an Attr by namespace and
+        // local name. It must create a distinct null-namespace Attr when a
+        // same-qualified-name Attr already exists in another namespace;
+        // `setAttribute(...)` instead updates the first qualified-name match.
+        dom::set_attribute_ns_parts(node, None, qualified_name, prefix, local_name, value);
+        if qualified_name == "style" {
+            parse_css_text(node, value);
+        }
     } else {
         dom::set_attribute_ns_parts(node, namespace, qualified_name, prefix, local_name, value);
     }
@@ -4162,9 +4166,8 @@ pub(crate) fn graft_shadow_component_subtrees(component: &mut w3cos_std::Compone
         _ => None,
     };
     if let Some(root) = host.and_then(shadow_root_id_for_host) {
-        let mut shadow = dom::with_document(|document| {
-            document.to_component_subtree(NodeId::from_u32(root))
-        });
+        let mut shadow =
+            dom::with_document(|document| document.to_component_subtree(NodeId::from_u32(root)));
         compose_shadow_slots(&mut shadow);
         component.children = shadow.children;
     }
@@ -4561,10 +4564,7 @@ pub(crate) fn node_prototype_contains(receiver: Value, args: Vec<Value>) -> Valu
     )
 }
 
-pub(crate) fn node_prototype_compare_document_position(
-    receiver: Value,
-    args: Vec<Value>,
-) -> Value {
+pub(crate) fn node_prototype_compare_document_position(receiver: Value, args: Vec<Value>) -> Value {
     const DISCONNECTED: u16 = 0x01;
     const PRECEDING: u16 = 0x02;
     const FOLLOWING: u16 = 0x04;
@@ -4588,13 +4588,12 @@ pub(crate) fn node_prototype_compare_document_position(
     let receiver_root = receiver_path.last().expect("a node path has a root");
     let other_root = other_path.last().expect("a node path has a root");
     if !receiver_root.strict_eq(other_root) {
-        let direction = if disconnected_node_order(receiver_root)
-            < disconnected_node_order(other_root)
-        {
-            FOLLOWING
-        } else {
-            PRECEDING
-        };
+        let direction =
+            if disconnected_node_order(receiver_root) < disconnected_node_order(other_root) {
+                FOLLOWING
+            } else {
+                PRECEDING
+            };
         return Value::Number((DISCONNECTED | IMPLEMENTATION_SPECIFIC | direction) as f64);
     }
 
@@ -4630,7 +4629,10 @@ pub(crate) fn node_prototype_compare_document_position(
     let other_index = children
         .iter()
         .position(|child| child.strict_eq(other_branch));
-    let direction = if receiver_index.zip(other_index).is_some_and(|(left, right)| left < right) {
+    let direction = if receiver_index
+        .zip(other_index)
+        .is_some_and(|(left, right)| left < right)
+    {
         FOLLOWING
     } else {
         PRECEDING
@@ -4650,11 +4652,7 @@ pub(crate) fn node_prototype_has_child_nodes(receiver: Value, _args: Vec<Value>)
         };
         return Value::Bool(!children.is_empty());
     }
-    Value::Bool(
-        node_id_of(&receiver)
-            .and_then(dom::first_child)
-            .is_some(),
-    )
+    Value::Bool(node_id_of(&receiver).and_then(dom::first_child).is_some())
 }
 
 fn validate_document_parent_node_insertion(document: &Value, args: &[Value], prepend: bool) {
@@ -4792,8 +4790,7 @@ fn set_virtual_document_children(document: &Value, children: Vec<Value>) {
 }
 
 fn is_dom_node_value(value: &Value) -> bool {
-    node_id_of(value).is_some()
-        || matches!(value.get_property("nodeType").to_u32(), 2 | 9)
+    node_id_of(value).is_some() || matches!(value.get_property("nodeType").to_u32(), 2 | 9)
 }
 
 fn validate_virtual_document_child_sequence(children: &[Value]) {
@@ -4885,11 +4882,7 @@ fn virtual_document_insert_before(document: Value, args: Vec<Value>) -> Value {
     };
 
     let mut candidate = children;
-    candidate.retain(|existing| {
-        !inserted
-            .iter()
-            .any(|inserted| inserted.strict_eq(existing))
-    });
+    candidate.retain(|existing| !inserted.iter().any(|inserted| inserted.strict_eq(existing)));
     let insertion_index = reference
         .as_ref()
         .and_then(|reference| {
@@ -4943,11 +4936,7 @@ fn virtual_document_replace_child(document: Value, args: Vec<Value>) -> Value {
     };
 
     let mut candidate = children;
-    candidate.retain(|existing| {
-        !inserted
-            .iter()
-            .any(|inserted| inserted.strict_eq(existing))
-    });
+    candidate.retain(|existing| !inserted.iter().any(|inserted| inserted.strict_eq(existing)));
     let old_index = candidate
         .iter()
         .position(|existing| existing.strict_eq(&old_child))
@@ -5657,9 +5646,7 @@ fn frame_function_compat_class(global: Value, document: Value) -> Value {
         #[cfg(feature = "dynamic-js")]
         {
             return crate::dynamic_script::construct_global_function_in_realm(
-                &args,
-                &global,
-                &document,
+                &args, &global, &document,
             )
             .unwrap_or_else(|error| {
                 w3cos_core::throw_value(w3cos_core::error_instance(
@@ -6506,19 +6493,102 @@ fn window_class() -> Value {
     })
 }
 
-fn deepest_node_at_point(node: u32, x: f32, y: f32) -> Option<u32> {
+fn live_deepest_node_at_point(node: u32, x: f32, y: f32) -> Option<u32> {
     let mut found = None;
     for child in dom::children(node) {
-        if let Some(descendant) = deepest_node_at_point(child, x, y) {
+        if let Some(descendant) = live_deepest_node_at_point(child, x, y) {
             found = Some(descendant);
             continue;
         }
         let rect = dom::bounding_rect(child);
-        if x >= rect.left() && x <= rect.right() && y >= rect.top() && y <= rect.bottom() {
+        if rect.width > 0.0
+            && rect.height > 0.0
+            && x >= rect.left()
+            && x < rect.right()
+            && y >= rect.top()
+            && y < rect.bottom()
+        {
             found = Some(child);
         }
     }
     found
+}
+
+/// Return the painted element stack at a viewport coordinate, front to back.
+///
+/// CSSOM hit testing is a synchronous layout API. The native render loop may
+/// not have consumed parser/style mutations yet, so reading `DOMRect`s cached
+/// on the live DOM can observe an older frame (or all-zero boxes before the
+/// first frame). Build one transient layout snapshot for the whole query and
+/// use the same flattened indices and z-order as painting.
+fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
+    let (viewport_width, viewport_height, _) = viewport();
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || f64::from(x) >= viewport_width
+        || f64::from(y) >= viewport_height
+    {
+        return Vec::new();
+    }
+
+    let root = dom::to_component_tree();
+    let flat = crate::layout::pre_flatten(&root);
+    let Ok(layouts) = crate::layout::compute(&root, viewport_width as f32, viewport_height as f32)
+    else {
+        return live_deepest_node_at_point(document_element_id(), x, y)
+            .into_iter()
+            .collect();
+    };
+    let artifact = crate::paint_artifact::PaintArtifact::build(
+        flat.iter().map(|entry| crate::paint_artifact::PaintNode {
+            kind: entry.kind.clone(),
+            style: entry.style.clone(),
+            parent: entry.parent,
+            sticky_counter_signal: entry.sticky_counter_signal,
+        }),
+        &layouts,
+        1,
+    );
+
+    let mut hits = layouts
+        .into_iter()
+        .filter_map(|(rect, index)| {
+            if rect.width <= 0.0
+                || rect.height <= 0.0
+                || x < rect.x
+                || x >= rect.x + rect.width
+                || y < rect.y
+                || y >= rect.y + rect.height
+            {
+                return None;
+            }
+            let entry = flat.get(index)?;
+            if matches!(
+                entry.style.pointer_events,
+                w3cos_std::style::PointerEvents::None
+            ) {
+                return None;
+            }
+            let node = match entry.on_click {
+                w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok()?,
+                _ => return None,
+            };
+            (dom::node_type(node) == 1).then_some((artifact.z_order[index], index, node))
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by_key(|(z_order, index, _)| (*z_order, *index));
+
+    let mut seen = HashSet::new();
+    hits.into_iter()
+        .rev()
+        .filter_map(|(_, _, node)| seen.insert(node).then_some(node))
+        .collect()
+}
+
+fn deepest_node_at_point(x: f32, y: f32) -> Option<u32> {
+    elements_at_point(x, y).into_iter().next()
 }
 
 fn first_text_descendant(node: u32) -> Option<u32> {
@@ -6531,7 +6601,7 @@ fn first_text_descendant(node: u32) -> Option<u32> {
 }
 
 fn caret_position_from_point(x: f32, y: f32) -> Value {
-    let Some(hit) = deepest_node_at_point(document_element_id(), x, y) else {
+    let Some(hit) = deepest_node_at_point(x, y) else {
         return Value::Null;
     };
     let offset_node = first_text_descendant(hit).unwrap_or(hit);
@@ -7256,12 +7326,90 @@ fn forced_scroll_size(node: u32) -> (f64, f64) {
     )
 }
 
+fn set_element_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
+    let (scroll_width, scroll_height) = forced_scroll_size(node);
+    let client = forced_bounding_rect(node);
+    let max_left = (scroll_width as f32 - client.width).max(0.0);
+    let max_top = (scroll_height as f32 - client.height).max(0.0);
+    let clamp = |value: f32, maximum: f32| {
+        if value.is_finite() {
+            value.clamp(0.0, maximum)
+        } else {
+            0.0
+        }
+    };
+    dom::set_scroll_offset(
+        node,
+        left.map(|value| clamp(value, max_left)),
+        top.map(|value| clamp(value, max_top)),
+    );
+}
+
+fn block_in_inline_fragment_bounds(
+    node: u32,
+    mut child_rect: impl FnMut(u32) -> Option<w3cos_dom::DOMRect>,
+) -> Option<w3cos_dom::DOMRect> {
+    let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
+    if !matches!(style.display, w3cos_std::style::Display::Inline)
+        || style.padding != w3cos_std::style::Edges::ZERO
+        || style.border_width != 0.0
+        || style.border_top_width.is_some_and(|value| value != 0.0)
+        || style.border_right_width.is_some_and(|value| value != 0.0)
+        || style.border_bottom_width.is_some_and(|value| value != 0.0)
+        || style.border_left_width.is_some_and(|value| value != 0.0)
+    {
+        return None;
+    }
+    let children = dom::children(node);
+    let has_in_flow_block = children.iter().copied().any(|child| {
+        dom::node_type(child) == 1
+            && dom::with_document(|document| {
+                let child_style = document.computed_style_for(NodeId::from_u32(child));
+                !matches!(
+                    child_style.position,
+                    w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+                ) && matches!(
+                    child_style.display,
+                    w3cos_std::style::Display::Block
+                        | w3cos_std::style::Display::Flex
+                        | w3cos_std::style::Display::Grid
+                )
+            })
+    });
+    if !has_in_flow_block {
+        return None;
+    }
+
+    let mut bounds: Option<w3cos_dom::DOMRect> = None;
+    for child in children {
+        if dom::node_type(child) != 1 {
+            continue;
+        }
+        let Some(rect) = child_rect(child) else {
+            continue;
+        };
+        if rect.width == 0.0 || rect.height == 0.0 {
+            continue;
+        }
+        bounds = Some(bounds.map_or(rect, |bounds| {
+            let left = bounds.x.min(rect.x);
+            let top = bounds.y.min(rect.y);
+            let right = (bounds.x + bounds.width).max(rect.x + rect.width);
+            let bottom = (bounds.y + bounds.height).max(rect.y + rect.height);
+            w3cos_dom::DOMRect::new(left, top, right - left, bottom - top)
+        }));
+    }
+    bounds
+}
+
 fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     let live = dom::bounding_rect(node);
     if !dom::is_document_dirty()
         && (live.width != 0.0 || live.height != 0.0 || live.x != 0.0 || live.y != 0.0)
     {
-        return apply_css_motion_to_rect(node, live);
+        let rect = block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
+            .unwrap_or(live);
+        return apply_css_motion_to_rect(node, rect);
     }
 
     // Geometry APIs synchronously flush pending style and layout in browsers.
@@ -7278,20 +7426,81 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
         return live;
     };
     let (viewport_width, viewport_height, _) = viewport();
-    let Ok(layouts) = crate::layout::compute(
-        &root,
-        viewport_width as f32,
-        viewport_height as f32,
-    ) else {
+    let Ok(layouts) = crate::layout::compute(&root, viewport_width as f32, viewport_height as f32)
+    else {
         return live;
     };
-    let rect = layouts
-        .into_iter()
-        .find(|(_, index)| *index == target_index)
-        .map_or(live, |(rect, _)| {
-            w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height)
-        });
+    let rect_for_node = |candidate: u32| {
+        let index = flat.iter().position(|info| {
+            matches!(
+                info.on_click,
+                w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(candidate)
+            )
+        })?;
+        layouts
+            .iter()
+            .find(|(_, layout_index)| *layout_index == index)
+            .map(|(rect, _)| w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height))
+    };
+    let rect = block_in_inline_fragment_bounds(node, rect_for_node).unwrap_or_else(|| {
+        layouts
+            .iter()
+            .find(|(_, index)| *index == target_index)
+            .map_or(live, |(rect, _)| {
+                w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height)
+            })
+    });
     apply_css_motion_to_rect(node, rect)
+}
+
+fn offset_parent_node(node: u32) -> Option<u32> {
+    let position =
+        dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)).position);
+    if matches!(position, w3cos_std::style::Position::Fixed)
+        || matches!(dom::tag_name(node).as_str(), "html" | "body")
+    {
+        return None;
+    }
+
+    let mut ancestor = dom::parent_node(node);
+    while let Some(candidate) = ancestor {
+        if dom::node_type(candidate) == 1 {
+            let tag = dom::tag_name(candidate);
+            let positioned = dom::with_document(|document| {
+                !matches!(
+                    document
+                        .computed_style_for(NodeId::from_u32(candidate))
+                        .position,
+                    w3cos_std::style::Position::Static
+                )
+            });
+            if positioned || matches!(tag.as_str(), "body" | "table" | "td" | "th") {
+                return Some(candidate);
+            }
+        }
+        ancestor = dom::parent_node(candidate);
+    }
+    None
+}
+
+fn offset_position(node: u32) -> (f32, f32) {
+    let rect = forced_bounding_rect(node);
+    let Some(parent) = offset_parent_node(node) else {
+        return (rect.x, rect.y);
+    };
+    let parent_rect = forced_bounding_rect(parent);
+    let parent_style =
+        dom::with_document(|document| document.computed_style_for(NodeId::from_u32(parent)));
+    let border_left = parent_style
+        .border_left_width
+        .unwrap_or(parent_style.border_width);
+    let border_top = parent_style
+        .border_top_width
+        .unwrap_or(parent_style.border_width);
+    (
+        rect.x - parent_rect.x - border_left,
+        rect.y - parent_rect.y - border_top,
+    )
 }
 
 fn apply_css_motion_to_rect(node: u32, mut rect: w3cos_dom::DOMRect) -> w3cos_dom::DOMRect {
@@ -7302,9 +7511,7 @@ fn apply_css_motion_to_rect(node: u32, mut rect: w3cos_dom::DOMRect) -> w3cos_do
                 .iter()
                 .rev()
                 .find(|motion| {
-                    motion.node == node
-                        && motion.pseudo.is_none()
-                        && motion.property == "left"
+                    motion.node == node && motion.pseudo.is_none() && motion.property == "left"
                 })
                 .and_then(|motion| match motion.to {
                     CssMotionValue::Length(value) => Some(value),
@@ -7372,8 +7579,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "isConnected" => Value::Bool(node_is_connected(node)),
         "contentDocument" | "contentWindow" if dom::tag_name(node) == "iframe" => {
             #[cfg(feature = "dynamic-js")]
-            let can_create_context =
-                !crate::dynamic_script::frame_post_insertion_pending(node);
+            let can_create_context = !crate::dynamic_script::frame_post_insertion_pending(node);
             #[cfg(not(feature = "dynamic-js"))]
             let can_create_context = true;
             if can_create_context {
@@ -7501,9 +7707,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             set_popover_open(node, open);
             Value::Bool(open)
         }),
-        "open" if dom::tag_name(node) == "dialog" => {
-            Value::Bool(dom::has_attribute(node, "open"))
-        }
+        "open" if dom::tag_name(node) == "dialog" => Value::Bool(dom::has_attribute(node, "open")),
         "returnValue" if dom::tag_name(node) == "dialog" => {
             get_expando(node, DIALOG_RETURN_VALUE_EXPANDO).unwrap_or_else(|| Value::string(""))
         }
@@ -7619,12 +7823,10 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "isDefaultNamespace" => {
             func(move |_, args| is_default_namespace_result(&element_value(node), &arg(&args, 0)))
         }
-        "isSameNode" => {
-            func(move |_, args| Value::Bool(node_id_of(&arg(&args, 0)) == Some(node)))
+        "isSameNode" => func(move |_, args| Value::Bool(node_id_of(&arg(&args, 0)) == Some(node))),
+        "isEqualNode" => {
+            func(move |_, args| Value::Bool(nodes_are_equal(&element_value(node), &arg(&args, 0))))
         }
-        "isEqualNode" => func(move |_, args| {
-            Value::Bool(nodes_are_equal(&element_value(node), &arg(&args, 0)))
-        }),
 
         // ── Text content ──
         "textContent" => node_text_content(node),
@@ -7827,9 +8029,9 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                     .any(|(current, _)| current == &name),
             )
         }),
-        "hasAttributes" if dom::node_type(node) == 7 => func(move |_, _| {
-            Value::Bool(!processing_instruction_attributes(node).is_empty())
-        }),
+        "hasAttributes" if dom::node_type(node) == 7 => {
+            func(move |_, _| Value::Bool(!processing_instruction_attributes(node).is_empty()))
+        }
         "setAttribute" if dom::node_type(node) == 7 => func(move |_, args| {
             set_processing_instruction_attribute(
                 node,
@@ -7942,12 +8144,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 detach_attribute_value(node, &previous);
             }
             attribute.set_property("ownerElement", element_value(node));
-            cache_attribute_value(
-                node,
-                namespace.as_deref(),
-                &local_name,
-                attribute.clone(),
-            );
+            cache_attribute_value(node, namespace.as_deref(), &local_name, attribute.clone());
             previous
         }),
         "setAttribute" => func(move |_, args| {
@@ -7957,7 +8154,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             }
             let name = normalized_attribute_name(node, &requested_name);
             let value = arg(&args, 1).to_js_string();
-            dom::set_attribute(node, &name, &value);
+            apply_html_attribute(node, &name, &value);
             #[cfg(feature = "dynamic-js")]
             if let Some(event_type) = name.strip_prefix("on").filter(|event| !event.is_empty()) {
                 crate::dynamic_script::update_inline_event_handler(node, event_type, &value);
@@ -7969,7 +8166,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             let qualified_name = arg(&args, 1).to_js_string();
             let (prefix, local_name) =
                 validate_and_extract_qualified_name(namespace.as_deref(), &qualified_name);
-            dom::set_attribute_ns_parts(
+            apply_html_attribute_ns(
                 node,
                 namespace.as_deref(),
                 &qualified_name,
@@ -8011,8 +8208,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "removeAttributeNS" => func(move |_, args| {
             let namespace = normalized_namespace_argument(&arg(&args, 0));
             let local_name = arg(&args, 1).to_js_string();
-            let previous =
-                attribute_node_by_namespace(node, namespace.as_deref(), &local_name);
+            let previous = attribute_node_by_namespace(node, namespace.as_deref(), &local_name);
             dom::remove_attribute_ns(node, namespace.as_deref(), &local_name);
             if !previous.is_null() {
                 detach_attribute_value(node, &previous);
@@ -8025,7 +8221,10 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 type_error("removeAttributeNode requires an Attr node");
             }
             if node_id_of(&attribute.get_property("ownerElement")) != Some(node) {
-                dom_exception("The attribute is not owned by this element", "NotFoundError");
+                dom_exception(
+                    "The attribute is not owned by this element",
+                    "NotFoundError",
+                );
             }
             let namespace = normalized_namespace_argument(&attribute.get_property("namespaceURI"));
             let local_name = attribute.get_property("localName").to_js_string();
@@ -8038,7 +8237,10 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 )
             };
             if current.is_null() || !current.strict_eq(&attribute) {
-                dom_exception("The attribute is not owned by this element", "NotFoundError");
+                dom_exception(
+                    "The attribute is not owned by this element",
+                    "NotFoundError",
+                );
             }
             if namespace.is_some() {
                 dom::remove_attribute_ns(node, namespace.as_deref(), &local_name);
@@ -8236,14 +8438,13 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                             .iter()
                             .position(|child| *child == reference)
                     })
-                    .unwrap_or(destination_children.len()) as u32;
+                    .unwrap_or(destination_children.len())
+                    as u32;
                 adjust_live_ranges_for_removal(moving_id);
                 adjust_live_ranges_for_insertion(node, insertion_index);
-                with_deferred_dom_post_insertion_steps(|| {
-                    match reference_id {
-                        Some(reference_id) => dom::insert_before(node, moving_id, reference_id),
-                        None => dom::append_child(node, moving_id),
-                    }
+                with_deferred_dom_post_insertion_steps(|| match reference_id {
+                    Some(reference_id) => dom::insert_before(node, moving_id, reference_id),
+                    None => dom::append_child(node, moving_id),
                 });
                 pin_element_subtree(moving_id);
                 affected_slots.extend(affected_slots_for_node_position(moving_id));
@@ -8253,6 +8454,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 if was_connected && node_is_connected(moving_id) {
                     crate::custom_elements_web::moved_subtree(&moving);
                 }
+                #[cfg(feature = "dynamic-js")]
                 crate::dynamic_script::notify_picture_relevant_move(moving_id, old_parent, node);
                 schedule_focus_revalidation_after_move(moving_id);
                 if let Some(before) = transition_before {
@@ -8547,19 +8749,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 .get_property("hash")
                 .to_js_string();
             let target_id = hash.strip_prefix('#').filter(|target| !target.is_empty());
-            if sel.contains(":popover-open")
-                || sel.contains(":modal")
-                || sel.contains(":focus")
-            {
+            if sel.contains(":popover-open") || sel.contains(":modal") || sel.contains(":focus") {
                 let parts = selector_chain_parts(&sel);
                 if parts.is_empty() {
                     dom_exception("Invalid selector", "SyntaxError");
                 }
-                return Value::Bool(matches_selector_chain_in_scope(
-                    node,
-                    &parts,
-                    Some(node),
-                ));
+                return Value::Bool(matches_selector_chain_in_scope(node, &parts, Some(node)));
             }
             match dom::matches_selector_with_target(node, &sel, target_id) {
                 Ok(true) => Value::Bool(true),
@@ -8669,9 +8864,9 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "offsetHeight" | "clientHeight" => Value::Number(forced_bounding_rect(node).height as f64),
         "scrollWidth" => Value::Number(forced_scroll_size(node).0),
         "scrollHeight" => Value::Number(forced_scroll_size(node).1),
-        "offsetTop" => Value::Number(forced_bounding_rect(node).y as f64),
-        "offsetLeft" => Value::Number(forced_bounding_rect(node).x as f64),
-        "offsetParent" => Value::Null,
+        "offsetTop" => Value::Number(offset_position(node).1 as f64),
+        "offsetLeft" => Value::Number(offset_position(node).0 as f64),
+        "offsetParent" => element_or_null(offset_parent_node(node)),
         "clientTop" | "clientLeft" => Value::Number(0.0),
         "scrollTop" => Value::Number(dom::get_scroll_offset(node).1 as f64),
         "scrollLeft" => Value::Number(dom::get_scroll_offset(node).0 as f64),
@@ -8696,7 +8891,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 left = first.to_number() as f32;
                 top = arg(&args, 1).to_number() as f32;
             }
-            dom::set_scroll_offset(node, Some(left), Some(top));
+            set_element_scroll_offset(node, Some(left), Some(top));
             Value::Undefined
         }),
 
@@ -8922,9 +9117,9 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "content" | "name" | "media" | "scheme" if dom::tag_name(node) == "meta" => {
             Value::string(&dom::get_attribute(node, key).unwrap_or_default())
         }
-        "httpEquiv" if dom::tag_name(node) == "meta" => Value::string(
-            &dom::get_attribute(node, "http-equiv").unwrap_or_default(),
-        ),
+        "httpEquiv" if dom::tag_name(node) == "meta" => {
+            Value::string(&dom::get_attribute(node, "http-equiv").unwrap_or_default())
+        }
         "disabled" if matches!(dom::tag_name(node).as_str(), "link" | "style") => {
             Value::Bool(dom::has_attribute(node, "disabled"))
         }
@@ -9348,8 +9543,8 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
             }
         }
         "tabIndex" => dom::set_attribute(node, "tabindex", &value.to_js_string()),
-        "scrollTop" => dom::set_scroll_offset(node, None, Some(value.to_number() as f32)),
-        "scrollLeft" => dom::set_scroll_offset(node, Some(value.to_number() as f32), None),
+        "scrollTop" => set_element_scroll_offset(node, None, Some(value.to_number() as f32)),
+        "scrollLeft" => set_element_scroll_offset(node, Some(value.to_number() as f32), None),
         "width" | "height" if dom::tag_name(node) == "canvas" => {
             dom::set_attribute(node, key, &value.to_js_string());
             let w = dom::get_attribute(node, "width")
@@ -9452,9 +9647,9 @@ fn attributes_value(node: u32) -> Value {
             &value,
         );
         attr_values.push(attr.clone());
-        attrs_by_name.insert(name.clone(), attr.clone());
+        attrs_by_name.entry(name.clone()).or_insert(attr.clone());
         props.insert(i.to_string(), attr.clone());
-        if !named_node_map_reserved_property(&name) {
+        if !named_node_map_reserved_property(&name) && !props.contains_key(&name) {
             props.insert(name, attr);
         }
     }
@@ -9777,8 +9972,7 @@ fn attribute_value(
     value: &str,
 ) -> Value {
     let cache_key = attribute_cache_key(owner, namespace, local_name);
-    if let Some(attribute) =
-        ATTRIBUTE_VALUES.with(|cache| cache.borrow().get(&cache_key).cloned())
+    if let Some(attribute) = ATTRIBUTE_VALUES.with(|cache| cache.borrow().get(&cache_key).cloned())
     {
         return attribute;
     }
@@ -9821,18 +10015,14 @@ fn attribute_value(
         ),
     ]);
     for property in ["value", "nodeValue", "textContent"] {
-        let getter_qualified_name = qualified_name.clone();
         let getter_local_name = local_name.clone();
         let getter_namespace = namespace.clone();
         let getter_stored_value = Rc::clone(&stored_value);
         props.insert(
             format!("__w3cos_getter_{property}"),
             func(move |_, _| {
-                let current = if let Some(namespace) = getter_namespace.as_deref() {
-                    dom::get_attribute_ns(owner, Some(namespace), &getter_local_name)
-                } else {
-                    dom::get_attribute(owner, &getter_qualified_name)
-                };
+                let current =
+                    dom::get_attribute_ns(owner, getter_namespace.as_deref(), &getter_local_name);
                 if let Some(current) = current {
                     *getter_stored_value.borrow_mut() = current;
                 }
@@ -9848,11 +10038,9 @@ fn attribute_value(
             format!("__w3cos_setter_{property}"),
             func(move |_, args| {
                 let value = arg(&args, 0).to_js_string();
-                let attached = if let Some(namespace) = setter_namespace.as_deref() {
-                    dom::get_attribute_ns(owner, Some(namespace), &setter_local_name).is_some()
-                } else {
-                    dom::get_attribute(owner, &setter_qualified_name).is_some()
-                };
+                let attached =
+                    dom::get_attribute_ns(owner, setter_namespace.as_deref(), &setter_local_name)
+                        .is_some();
                 if attached {
                     dom::set_attribute_ns_parts(
                         owner,
@@ -9893,24 +10081,14 @@ fn attribute_cache_key(
     namespace: Option<&str>,
     local_name: &str,
 ) -> (u32, Option<String>, String) {
-    (
-        owner,
-        namespace.map(str::to_string),
-        local_name.to_string(),
-    )
+    (owner, namespace.map(str::to_string), local_name.to_string())
 }
 
-fn cache_attribute_value(
-    owner: u32,
-    namespace: Option<&str>,
-    local_name: &str,
-    attribute: Value,
-) {
+fn cache_attribute_value(owner: u32, namespace: Option<&str>, local_name: &str, attribute: Value) {
     ATTRIBUTE_VALUES.with(|cache| {
-        cache.borrow_mut().insert(
-            attribute_cache_key(owner, namespace, local_name),
-            attribute,
-        );
+        cache
+            .borrow_mut()
+            .insert(attribute_cache_key(owner, namespace, local_name), attribute);
     });
 }
 
@@ -9918,9 +10096,11 @@ fn detach_attribute_value(owner: u32, attribute: &Value) {
     let namespace = normalized_namespace_argument(&attribute.get_property("namespaceURI"));
     let local_name = attribute.get_property("localName").to_js_string();
     ATTRIBUTE_VALUES.with(|cache| {
-        cache
-            .borrow_mut()
-            .remove(&attribute_cache_key(owner, namespace.as_deref(), &local_name));
+        cache.borrow_mut().remove(&attribute_cache_key(
+            owner,
+            namespace.as_deref(),
+            &local_name,
+        ));
     });
     attribute.set_property("ownerElement", Value::Null);
 }
@@ -10490,9 +10670,7 @@ fn transition_applies(transition: &w3cos_std::style::Transition, property: &str)
 
 fn motion_style(node: u32, pseudo: Option<&str>) -> w3cos_std::style::Style {
     dom::with_document(|document| match pseudo {
-        Some(pseudo) => {
-            document.computed_pseudo_style_for(NodeId::from_u32(node), pseudo)
-        }
+        Some(pseudo) => document.computed_pseudo_style_for(NodeId::from_u32(node), pseudo),
         None => document.computed_style_for(NodeId::from_u32(node)),
     })
 }
@@ -10524,11 +10702,7 @@ fn capture_transition_snapshots(node: u32) -> Vec<TransitionSnapshot> {
     snapshots
 }
 
-fn start_css_transition(
-    node: u32,
-    from: &TransitionSnapshot,
-    to: &TransitionSnapshot,
-) {
+fn start_css_transition(node: u32, from: &TransitionSnapshot, to: &TransitionSnapshot) {
     if from.value == to.value {
         return;
     }
@@ -10573,9 +10747,10 @@ fn start_changed_transitions(
     after: &[TransitionSnapshot],
 ) {
     for to in after {
-        if let Some(from) = before.iter().find(|from| {
-            from.pseudo == to.pseudo && from.property == to.property
-        }) {
+        if let Some(from) = before
+            .iter()
+            .find(|from| from.pseudo == to.pseudo && from.property == to.property)
+        {
             start_css_transition(node, from, to);
         }
     }
@@ -10603,16 +10778,20 @@ fn scan_css_animations() {
         if already_started {
             continue;
         }
+        #[cfg(feature = "dynamic-js")]
         let keyframes = ["transform", "left"].into_iter().find_map(|property| {
-            crate::dynamic_script::active_keyframe_property(&animation.name, property)
-                .and_then(|(from, to)| {
+            crate::dynamic_script::active_keyframe_property(&animation.name, property).and_then(
+                |(from, to)| {
                     Some((
                         property,
                         css_motion_value(property, &from)?,
                         css_motion_value(property, &to)?,
                     ))
-                })
+                },
+            )
         });
+        #[cfg(not(feature = "dynamic-js"))]
+        let keyframes: Option<(&str, CssMotionValue, CssMotionValue)> = None;
         let Some((property, from, to)) = keyframes else {
             continue;
         };
@@ -10662,7 +10841,9 @@ fn tick_css_motions() {
             .borrow_mut()
             .iter_mut()
             .filter_map(|motion| {
-                if motion.event_pending && now.saturating_duration_since(motion.started_at) >= motion.delay {
+                if motion.event_pending
+                    && now.saturating_duration_since(motion.started_at) >= motion.delay
+                {
                     motion.event_pending = false;
                     Some((
                         motion.node,
@@ -10683,11 +10864,7 @@ fn tick_css_motions() {
     }
 }
 
-pub(crate) fn commit_css_motion_style(
-    node: u32,
-    pseudo: Option<&str>,
-    property: &str,
-) {
+pub(crate) fn commit_css_motion_style(node: u32, pseudo: Option<&str>, property: &str) {
     if pseudo.is_some() {
         return;
     }
@@ -10731,7 +10908,8 @@ fn style_apply(node: u32, kebab: &str, value: &str) {
     // values. Avoid six full computed-style cascades around unrelated inline
     // writes (CSS parsing tests perform thousands of color assignments).
     let tracks_discrete_motion = is_discrete_css2_property(kebab);
-    let discrete_before = tracks_discrete_motion.then(|| inline_computed_style_fallback(node, kebab));
+    let discrete_before =
+        tracks_discrete_motion.then(|| inline_computed_style_fallback(node, kebab));
     let tracks_motion = matches!(kebab, "left" | "transform");
     let before = tracks_motion.then(|| capture_transition_snapshots(node));
     STYLE_CACHE.with(|c| {
@@ -10742,7 +10920,12 @@ fn style_apply(node: u32, kebab: &str, value: &str) {
     // are dropped there but stay in the bridge cache).
     dom::set_style_property(node, kebab, &value);
     if let Some(before) = discrete_before {
-        start_discrete_css_transition(node, kebab, before, inline_computed_style_fallback(node, kebab));
+        start_discrete_css_transition(
+            node,
+            kebab,
+            before,
+            inline_computed_style_fallback(node, kebab),
+        );
     }
     if let Some(before) = before {
         let after = capture_transition_snapshots(node);
@@ -10803,8 +10986,7 @@ fn start_discrete_css_transition(node: u32, property: &str, from: String, to: St
             .retain(|motion| motion.node != node || motion.property != property);
     });
     if from == to
-        || !cached_style_value(node, "transition-behavior")
-            .eq_ignore_ascii_case("allow-discrete")
+        || !cached_style_value(node, "transition-behavior").eq_ignore_ascii_case("allow-discrete")
     {
         return;
     }
@@ -10817,8 +10999,8 @@ fn start_discrete_css_transition(node: u32, property: &str, from: String, to: St
     else {
         return;
     };
-    let delay_ms = signed_css_time_ms(&cached_style_value(node, "transition-delay"))
-        .unwrap_or_default();
+    let delay_ms =
+        signed_css_time_ms(&cached_style_value(node, "transition-delay")).unwrap_or_default();
     let easing = css_easing(&cached_style_value(node, "transition-timing-function"));
     DISCRETE_CSS_TRANSITIONS.with(|motions| {
         motions.borrow_mut().push(DiscreteCssTransition {
@@ -10843,7 +11025,8 @@ fn sampled_discrete_css_transition(node: u32, property: &str) -> Option<String> 
             .find(|motion| motion.node == node && motion.property == property)
             .map(|motion| {
                 let elapsed_ms = motion.started_at.elapsed().as_secs_f64() * 1_000.0;
-                let progress = ((elapsed_ms - motion.delay_ms) / motion.duration_ms).clamp(0.0, 1.0);
+                let progress =
+                    ((elapsed_ms - motion.delay_ms) / motion.duration_ms).clamp(0.0, 1.0);
                 if motion.easing.interpolate(progress as f32) < 0.5 {
                     motion.from.clone()
                 } else {
@@ -10855,8 +11038,12 @@ fn sampled_discrete_css_transition(node: u32, property: &str) -> Option<String> 
 
 fn discrete_css_initial_value(property: &str) -> Option<&'static str> {
     match property {
-        "border-bottom-style" | "border-left-style" | "border-right-style"
-        | "border-top-style" | "clear" | "float" => Some("none"),
+        "border-bottom-style"
+        | "border-left-style"
+        | "border-right-style"
+        | "border-top-style"
+        | "clear"
+        | "float" => Some("none"),
         "border-collapse" => Some("separate"),
         "empty-cells" => Some("show"),
         _ => None,
@@ -10896,8 +11083,8 @@ fn sampled_discrete_css_animation(node: u32, property: &str) -> Option<String> {
     let name = cached_style_value(node, "animation-name");
     let duration_ms = signed_css_time_ms(&cached_style_value(node, "animation-duration"))
         .filter(|duration| *duration > 0.0)?;
-    let delay_ms = signed_css_time_ms(&cached_style_value(node, "animation-delay"))
-        .unwrap_or_default();
+    let delay_ms =
+        signed_css_time_ms(&cached_style_value(node, "animation-delay")).unwrap_or_default();
     let (from, to) = crate::dynamic_script::active_keyframe_property(&name, property)?;
     Some(select_discrete_css_value(
         node,
@@ -11234,11 +11421,8 @@ fn style_value(node: u32) -> Value {
             }
             let property = camel_to_kebab(key);
             css_property_supported(&property, "initial")
-                || STYLE_CACHE.with(|cache| {
-                    cache
-                        .borrow()
-                        .contains_key(&(node, property.to_string()))
-                })
+                || STYLE_CACHE
+                    .with(|cache| cache.borrow().contains_key(&(node, property.to_string())))
         })
         .set(move |_target, key, value, _receiver| {
             if bridge_realm_is_current(generation) {
@@ -11297,9 +11481,7 @@ fn computed_style_property_value(node: u32, pseudo: Option<&str>, property: &str
         if let Some((from, to, progress, easing)) =
             crate::animations_web::discrete_property_sample(node, property)
         {
-            return select_discrete_css_value(
-                node, property, &from, &to, progress, &easing,
-            );
+            return select_discrete_css_value(node, property, &from, &to, progress, &easing);
         }
         #[cfg(feature = "dynamic-js")]
         if let Some(value) = sampled_discrete_css_animation(node, property) {
@@ -11309,6 +11491,12 @@ fn computed_style_property_value(node: u32, pseudo: Option<&str>, property: &str
     if let Some(value) = sampled_css_motion_value(node, pseudo, property) {
         return css_motion_value_to_css(value);
     }
+    if pseudo.is_none()
+        && matches!(property, "margin-left" | "margin-right")
+        && let Some(value) = resolved_horizontal_margin(node, property)
+    {
+        return value;
+    }
     let mut value = match pseudo {
         Some(pseudo) => dom::computed_pseudo_style_property(node, pseudo, property),
         None => dom::computed_style_property(node, property),
@@ -11317,6 +11505,65 @@ fn computed_style_property_value(node: u32, pseudo: Option<&str>, property: &str
         value = inline_computed_style_fallback(node, property);
     }
     serialize_computed_style_property(property, &value)
+}
+
+fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
+    use w3cos_std::style::Spacing;
+
+    let parent = dom::parent_node(node)?;
+    if dom::node_type(parent) != 1 {
+        return None;
+    }
+    let (style, parent_style) = dom::with_document(|document| {
+        (
+            document.computed_style_for(NodeId::from_u32(node)),
+            document.computed_style_for(NodeId::from_u32(parent)),
+        )
+    });
+    let spacing = if property == "margin-left" {
+        style.margin.left
+    } else {
+        style.margin.right
+    };
+    let (viewport_width, viewport_height, _) = viewport();
+    let parent_rect = forced_bounding_rect(parent);
+    let percentage_basis = parent_rect.width;
+    let resolve = |spacing: Spacing, font_size: f32| match spacing {
+        Spacing::Px(value) => value,
+        Spacing::Percent(value) => percentage_basis * value / 100.0,
+        Spacing::Rem(value) => value * 16.0,
+        Spacing::Em(value) => value * font_size,
+        Spacing::Vw(value) => viewport_width as f32 * value / 100.0,
+        Spacing::Vh(value) => viewport_height as f32 * value / 100.0,
+        Spacing::Auto => 0.0,
+        other => other.resolve(&w3cos_std::safe_area::current()),
+    };
+    if !matches!(spacing, Spacing::Auto) {
+        return Some(format!("{}px", resolve(spacing, style.font_size)));
+    }
+
+    let rect = forced_bounding_rect(node);
+    let content_width = parent_rect.width
+        - parent_style
+            .border_left_width
+            .unwrap_or(parent_style.border_width)
+        - parent_style
+            .border_right_width
+            .unwrap_or(parent_style.border_width)
+        - resolve(parent_style.padding.left, parent_style.font_size)
+        - resolve(parent_style.padding.right, parent_style.font_size);
+    let left_auto = matches!(style.margin.left, Spacing::Auto);
+    let right_auto = matches!(style.margin.right, Spacing::Auto);
+    let fixed_left = resolve(style.margin.left, style.font_size);
+    let fixed_right = resolve(style.margin.right, style.font_size);
+    let remaining = content_width - rect.width - fixed_left - fixed_right;
+    let used = match (property, left_auto, right_auto) {
+        ("margin-left", true, true) | ("margin-right", true, true) => remaining / 2.0,
+        ("margin-left", true, false) | ("margin-right", false, true) => remaining,
+        _ => resolve(spacing, style.font_size),
+    };
+    let used = if used.abs() < 0.000_1 { 0.0 } else { used };
+    Some(format!("{used}px"))
 }
 
 fn inline_computed_style_fallback(node: u32, property: &str) -> String {
@@ -11909,9 +12156,9 @@ fn focus_is_suppressed(node: u32) -> bool {
 
 fn schedule_focus_revalidation_after_move(moved: u32) {
     let focused = ACTIVE_ELEMENT.with(|active| *active.borrow());
-    let Some(focused) = focused.filter(|focused| {
-        *focused == moved || is_ancestor_of(moved, *focused)
-    }) else {
+    let Some(focused) =
+        focused.filter(|focused| *focused == moved || is_ancestor_of(moved, *focused))
+    else {
         return;
     };
     queue_microtask_value(func(move |_, _| {
@@ -12301,9 +12548,7 @@ pub(crate) fn dispatch_native_pointer(
 }
 
 fn hit_tested_touch_target(x: f32, y: f32) -> Option<u32> {
-    let node = deepest_node_at_point(document_element_id(), x, y)?;
-    let rect = dom::bounding_rect(node);
-    (rect.width > 0.0 && rect.height > 0.0).then_some(node)
+    deepest_node_at_point(x, y)
 }
 
 fn active_touch_target(pointer_id: i64) -> Option<u32> {
@@ -13449,9 +13694,7 @@ fn compare_boundary_points(
         if let Some(left_child) = left_ancestors.get(&parent) {
             let children = dom::children(parent);
             let left_index = children.iter().position(|child| child == left_child)?;
-            let right_index = children
-                .iter()
-                .position(|child| *child == right_branch)?;
+            let right_index = children.iter().position(|child| *child == right_branch)?;
             return Some(left_index.cmp(&right_index));
         }
         right_branch = parent;
@@ -13472,15 +13715,15 @@ fn range_intersects_node(range: &Value, node: u32) -> bool {
     };
     let start_container = range_hidden(range, "__sc");
     let end_container = range_hidden(range, "__ec");
-    compare_boundary_points(start_container, range_hidden(range, "__so"), parent, index + 1)
-        .is_some_and(|ordering| ordering == Ordering::Less)
-        && compare_boundary_points(
-            end_container,
-            range_hidden(range, "__eo"),
-            parent,
-            index,
-        )
-        .is_some_and(|ordering| ordering == Ordering::Greater)
+    compare_boundary_points(
+        start_container,
+        range_hidden(range, "__so"),
+        parent,
+        index + 1,
+    )
+    .is_some_and(|ordering| ordering == Ordering::Less)
+        && compare_boundary_points(end_container, range_hidden(range, "__eo"), parent, index)
+            .is_some_and(|ordering| ordering == Ordering::Greater)
 }
 
 fn adjust_live_ranges_for_removal(node: u32) {
@@ -13954,8 +14197,7 @@ pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
             let v = value.clone();
             move |_, args| {
                 Value::Bool(
-                    node_id_of(&arg(&args, 0))
-                        .is_some_and(|node| range_intersects_node(&v, node)),
+                    node_id_of(&arg(&args, 0)).is_some_and(|node| range_intersects_node(&v, node)),
                 )
             }
         }),
@@ -14555,8 +14797,7 @@ fn global_document_children() -> Vec<Value> {
 
 fn is_global_document_child(node: u32) -> bool {
     dom::parent_node(node) == Some(0)
-        || get_expando(node, "parentNode")
-            .is_some_and(|parent| parent.strict_eq(&document_value()))
+        || get_expando(node, "parentNode").is_some_and(|parent| parent.strict_eq(&document_value()))
 }
 
 fn global_document_sibling(node: u32, next: bool) -> Value {
@@ -15265,19 +15506,13 @@ fn build_document_value() -> Value {
     );
     props.insert(
         "elementFromPoint".to_string(),
-        func(|_, args| {
-            element_or_null(deepest_node_at_point(
-                document_element_id(),
-                farg(&args, 0),
-                farg(&args, 1),
-            ))
-        }),
+        func(|_, args| element_or_null(deepest_node_at_point(farg(&args, 0), farg(&args, 1)))),
     );
     props.insert(
         "elementsFromPoint".to_string(),
         func(|_, args| {
             Value::array(
-                deepest_node_at_point(document_element_id(), farg(&args, 0), farg(&args, 1))
+                elements_at_point(farg(&args, 0), farg(&args, 1))
                     .into_iter()
                     .map(element_value)
                     .collect(),
@@ -17804,6 +18039,8 @@ fn build_window_value() -> Value {
     }
     props.insert("BigInt".to_string(), w3cos_core::bigint::bigint_class());
     props.insert("RegExp".to_string(), w3cos_core::regexp::regexp_class());
+    props.insert("Map".to_string(), w3cos_core::collections::map_class());
+    props.insert("Set".to_string(), w3cos_core::collections::set_class());
     props.insert(
         "WeakMap".to_string(),
         w3cos_core::collections::weak_map_class(),
@@ -19569,9 +19806,7 @@ mod tests {
             "setAttribute",
             vec![Value::string("data-route"), Value::string("inbox")],
         );
-        let adopted_attribute = adopted
-            .get_property("attributes")
-            .get_property("0");
+        let adopted_attribute = adopted.get_property("attributes").get_property("0");
         assert!(adopted.get_property("ownerDocument") == document);
         assert!(adopted_attribute.get_property("ownerDocument") == document);
 
@@ -19620,11 +19855,7 @@ mod tests {
         let document = document_value();
         let doctype = document.get_property("implementation").call_method(
             "createDocumentType",
-            vec![
-                Value::string("html"),
-                Value::string(""),
-                Value::string(""),
-            ],
+            vec![Value::string("html"), Value::string(""), Value::string("")],
         );
         let text = document.call_method("createTextNode", vec![Value::string("invalid")]);
         let error = w3cos_core::catch_js(|| doctype.call_method("appendChild", vec![text]))
@@ -19647,18 +19878,16 @@ mod tests {
         assert_eq!(type_error.get_property("name").to_js_string(), "TypeError");
 
         let child = document.call_method("createTextNode", vec![Value::string("child")]);
-        let hierarchy_error = w3cos_core::catch_js(|| {
-            leaf.call_method("insertBefore", vec![child, Value::Null])
-        })
-        .expect_err("character data cannot contain children");
+        let hierarchy_error =
+            w3cos_core::catch_js(|| leaf.call_method("insertBefore", vec![child, Value::Null]))
+                .expect_err("character data cannot contain children");
         assert_eq!(
             hierarchy_error.get_property("name").to_js_string(),
             "HierarchyRequestError"
         );
 
         let parent = document.call_method("createElement", vec![Value::string("div")]);
-        let foreign_reference =
-            document.call_method("createElement", vec![Value::string("span")]);
+        let foreign_reference = document.call_method("createElement", vec![Value::string("span")]);
         let doctype = document.get_property("implementation").call_method(
             "createDocumentType",
             vec![Value::string("html"), Value::string(""), Value::string("")],
@@ -19667,10 +19896,12 @@ mod tests {
             parent.call_method("insertBefore", vec![doctype, foreign_reference])
         })
         .expect_err("reference membership precedes inserted child position checks");
-        assert_eq!(not_found.get_property("name").to_js_string(), "NotFoundError");
+        assert_eq!(
+            not_found.get_property("name").to_js_string(),
+            "NotFoundError"
+        );
 
-        let insert_before = crate::dom_constructors::prototype("Node")
-            .get_property("insertBefore");
+        let insert_before = crate::dom_constructors::prototype("Node").get_property("insertBefore");
         assert_eq!(insert_before.get_property("length"), Value::Number(2.0));
         let prototype_not_found = w3cos_core::catch_js(|| {
             insert_before.call(
@@ -19701,26 +19932,20 @@ mod tests {
             insert_before.call(
                 created_document.clone(),
                 vec![
-                    created_document.call_method(
-                        "createTextNode",
-                        vec![Value::string("invalid")],
-                    ),
+                    created_document.call_method("createTextNode", vec![Value::string("invalid")]),
                     Value::Null,
                 ],
             )
         })
         .expect_err("Node.prototype.insertBefore must dispatch virtual documents");
         assert_eq!(
-            document_hierarchy_error
-                .get_property("name")
-                .to_js_string(),
+            document_hierarchy_error.get_property("name").to_js_string(),
             "HierarchyRequestError"
         );
 
-        let foreign_document = document.get_property("implementation").call_method(
-            "createHTMLDocument",
-            vec![Value::string("foreign")],
-        );
+        let foreign_document = document
+            .get_property("implementation")
+            .call_method("createHTMLDocument", vec![Value::string("foreign")]);
         let document_reference_error = w3cos_core::catch_js(|| {
             insert_before.call(
                 parent,
@@ -20573,9 +20798,11 @@ mod tests {
             2.0
         );
         #[cfg(not(feature = "dynamic-js"))]
-        assert!(window
-            .call_method("eval", vec![Value::string("1 + 1")])
-            .is_undefined());
+        assert!(
+            window
+                .call_method("eval", vec![Value::string("1 + 1")])
+                .is_undefined()
+        );
         let dynamic = w3cos_core::class::construct(
             &window.get_property("Function"),
             vec![Value::string("return 1")],
@@ -20913,10 +21140,8 @@ mod tests {
         let document = document_value();
         let root = create_in_body("div");
         let html_child = document.call_method("createElement", vec![Value::string("div")]);
-        let no_namespace_child = document.call_method(
-            "createElementNS",
-            vec![Value::Null, Value::string("div")],
-        );
+        let no_namespace_child =
+            document.call_method("createElementNS", vec![Value::Null, Value::string("div")]);
         root.call_method("appendChild", vec![html_child]);
         root.call_method("appendChild", vec![no_namespace_child.clone()]);
 
@@ -21057,9 +21282,21 @@ mod tests {
             document.get_property("inputEncoding"),
             Value::string("UTF-8")
         );
-        assert!(document.call_method("contains", vec![parent.clone()]).to_bool());
-        assert!(parent.call_method("contains", vec![first.clone()]).to_bool());
-        assert!(!first.call_method("contains", vec![parent.clone()]).to_bool());
+        assert!(
+            document
+                .call_method("contains", vec![parent.clone()])
+                .to_bool()
+        );
+        assert!(
+            parent
+                .call_method("contains", vec![first.clone()])
+                .to_bool()
+        );
+        assert!(
+            !first
+                .call_method("contains", vec![parent.clone()])
+                .to_bool()
+        );
         assert_eq!(
             parent
                 .call_method("compareDocumentPosition", vec![first.clone()])
@@ -21463,7 +21700,10 @@ mod tests {
         ));
         assert!(!clone.strict_eq(&attribute));
         assert_eq!(clone.get_property("nodeType"), Value::Number(2.0));
-        assert_eq!(clone.get_property("namespaceURI"), Value::string("urn:test"));
+        assert_eq!(
+            clone.get_property("namespaceURI"),
+            Value::string("urn:test")
+        );
         assert_eq!(clone.get_property("prefix"), Value::string("prefix"));
         assert_eq!(clone.get_property("localName"), Value::string("name"));
         assert_eq!(clone.get_property("value"), Value::string("value"));
@@ -21552,9 +21792,14 @@ mod tests {
         );
         let root = document.call_method("getElementById", vec![Value::string("root")]);
         assert_eq!(root.get_property("nodeType"), Value::Number(1.0));
-        assert_eq!(document.get_property("body").get_property("nodeName"), Value::string("body"));
-        assert!(document.call_method("querySelector", vec![Value::string(":root")])
-            == document.get_property("documentElement"));
+        assert_eq!(
+            document.get_property("body").get_property("nodeName"),
+            Value::string("body")
+        );
+        assert!(
+            document.call_method("querySelector", vec![Value::string(":root")])
+                == document.get_property("documentElement")
+        );
         assert_eq!(
             document
                 .call_method("querySelectorAll", vec![Value::string(":target")])
@@ -21565,9 +21810,11 @@ mod tests {
         let clone = root.call_method("cloneNode", vec![Value::Bool(true)]);
         assert_eq!(clone.get_property("nodeType"), Value::Number(1.0));
         assert_eq!(clone.get_property("childElementCount"), Value::Number(1.0));
-        assert!(clone
-            .call_method("querySelector", vec![Value::string(":target")])
-            .is_null());
+        assert!(
+            clone
+                .call_method("querySelector", vec![Value::string(":target")])
+                .is_null()
+        );
         let fragment = document.call_method("createDocumentFragment", vec![]);
         assert!(fragment.call_method("appendChild", vec![clone.clone()]) == clone);
     }
@@ -21623,11 +21870,13 @@ mod tests {
             );
             element.call_method(
                 "appendChild",
-                vec![document_value()
-                    .call_method("createComment", vec![Value::string("child")])],
+                vec![document_value().call_method("createComment", vec![Value::string("child")])],
             );
         }
-        assert!(left.call_method("isEqualNode", vec![right.clone()]).to_bool());
+        assert!(
+            left.call_method("isEqualNode", vec![right.clone()])
+                .to_bool()
+        );
         right
             .get_property("firstChild")
             .set_property("data", Value::string("different"));
@@ -21640,12 +21889,10 @@ mod tests {
                 .call_method("isEqualNode", vec![right_document.clone()])
                 .to_bool()
         );
-        right_document
-            .get_property("body")
-            .call_method("appendChild", vec![right_document.call_method(
-                "createElement",
-                vec![Value::string("div")],
-            )]);
+        right_document.get_property("body").call_method(
+            "appendChild",
+            vec![right_document.call_method("createElement", vec![Value::string("div")])],
+        );
         assert!(
             !left_document
                 .call_method("isEqualNode", vec![right_document])
@@ -21994,14 +22241,12 @@ mod tests {
 
         popover.call_method("showPopover", vec![]);
         assert!(
-            document.call_method("querySelector", vec![Value::string(":popover-open")])
-                == popover
+            document.call_method("querySelector", vec![Value::string(":popover-open")]) == popover
         );
 
         new_parent.call_method("moveBefore", vec![popover.clone(), Value::Null]);
         assert!(
-            document.call_method("querySelector", vec![Value::string(":popover-open")])
-                == popover
+            document.call_method("querySelector", vec![Value::string(":popover-open")]) == popover
         );
     }
 
@@ -22046,15 +22291,12 @@ mod tests {
         );
         let disconnected_origin =
             document.call_method("createElement", vec![Value::string("section")]);
-        let disconnected_child =
-            document.call_method("createElement", vec![Value::string("p")]);
+        let disconnected_child = document.call_method("createElement", vec![Value::string("p")]);
         disconnected_origin.call_method("appendChild", vec![disconnected_child.clone()]);
 
         let error = w3cos_core::catch_js(|| {
-            connected_destination.call_method(
-                "moveBefore",
-                vec![disconnected_child.clone(), Value::Null],
-            )
+            connected_destination
+                .call_method("moveBefore", vec![disconnected_child.clone(), Value::Null])
         })
         .expect_err("moving between connected and disconnected roots must throw");
         assert_eq!(
@@ -22065,10 +22307,8 @@ mod tests {
         let disconnected_destination =
             document.call_method("createElement", vec![Value::string("aside")]);
         let error = w3cos_core::catch_js(|| {
-            disconnected_destination.call_method(
-                "moveBefore",
-                vec![disconnected_child.clone(), Value::Null],
-            )
+            disconnected_destination
+                .call_method("moveBefore", vec![disconnected_child.clone(), Value::Null])
         })
         .expect_err("moving between unrelated disconnected roots must throw");
         assert_eq!(
@@ -22077,10 +22317,8 @@ mod tests {
         );
 
         disconnected_origin.call_method("appendChild", vec![disconnected_destination.clone()]);
-        disconnected_destination.call_method(
-            "moveBefore",
-            vec![disconnected_child.clone(), Value::Null],
-        );
+        disconnected_destination
+            .call_method("moveBefore", vec![disconnected_child.clone(), Value::Null]);
         assert!(disconnected_child.get_property("parentNode") == disconnected_destination);
     }
 
@@ -22088,8 +22326,7 @@ mod tests {
     fn virtual_document_move_before_accepts_comments_but_rejects_elements() {
         setup();
         let implementation = document_value().get_property("implementation");
-        let document =
-            implementation.call_method("createHTMLDocument", vec![Value::Undefined]);
+        let document = implementation.call_method("createHTMLDocument", vec![Value::Undefined]);
         assert!(document.get_property("isConnected").to_bool());
         let body = document.get_property("body");
         let comment = document.call_method("createComment", vec![Value::string("comment")]);
@@ -22109,6 +22346,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "dynamic-js")]
     #[test]
     fn compiled_move_before_enforces_required_and_node_arguments() {
         setup();
@@ -22293,6 +22531,67 @@ try {
                 .get_property("attributes")
                 .get_property("toString")
                 .is_function()
+        );
+    }
+
+    #[test]
+    fn null_namespace_attribute_does_not_replace_a_same_named_namespaced_attribute() {
+        setup();
+        let document = document_value();
+        let element = document.call_method("createElement", vec![Value::string("div")]);
+        element.call_method(
+            "setAttributeNS",
+            vec![
+                Value::string("urn:test"),
+                Value::string("align"),
+                Value::string("right"),
+            ],
+        );
+        element.call_method(
+            "setAttributeNS",
+            vec![
+                Value::string(""),
+                Value::string("align"),
+                Value::string("left"),
+            ],
+        );
+
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![Value::string("align")])
+                .to_js_string(),
+            "right"
+        );
+        assert_eq!(
+            element
+                .call_method(
+                    "getAttributeNS",
+                    vec![Value::string("urn:test"), Value::string("align")],
+                )
+                .to_js_string(),
+            "right"
+        );
+        assert_eq!(
+            element
+                .call_method("getAttributeNS", vec![Value::Null, Value::string("align")],)
+                .to_js_string(),
+            "left"
+        );
+        let attributes = element.get_property("attributes");
+        assert_eq!(attributes.get_property("length").to_u32(), 2);
+        assert_eq!(
+            attributes
+                .call_method("item", vec![Value::Number(0.0)])
+                .get_property("value")
+                .to_js_string(),
+            "right"
+        );
+        assert_eq!(
+            attributes
+                .call_method("item", vec![Value::Number(1.0)])
+                .get_property("value")
+                .to_js_string(),
+            "left"
         );
     }
 
@@ -22568,15 +22867,11 @@ try {
     fn hit_tested_touch_uses_layout_boxes_and_retargets_active_contacts() {
         setup();
         let target = create_in_body("div");
-        let target_id = node_id_of(&target).unwrap();
         let miss_log = Rc::new(RefCell::new(Vec::<String>::new()));
         let hit_log = Rc::new(RefCell::new(Vec::<String>::new()));
-        dom::with_document_mut(|tree| {
-            tree.set_layout_rect(
-                NodeId::from_u32(target_id),
-                w3cos_dom::DOMRect::new(10.0, 10.0, 40.0, 40.0),
-            );
-        });
+        let style = target.get_property("style");
+        style.set_property("width", Value::string("40px"));
+        style.set_property("height", Value::string("40px"));
         let log = Rc::clone(&hit_log);
         target.call_method(
             "addEventListener",
@@ -22617,13 +22912,75 @@ try {
             ],
         );
 
-        assert!(!dispatch_hit_tested_touch("down", 0.0, 0.0, 21, 0.5));
         assert!(!dispatch_hit_tested_touch("down", 1000.0, 1000.0, 21, 0.5));
         assert!(miss_log.borrow().is_empty());
         assert!(!dispatch_hit_tested_touch("down", 20.0, 20.0, 21, 0.5));
         assert!(!dispatch_hit_tested_touch("move", 0.0, 0.0, 21, 0.5));
         assert!(!dispatch_hit_tested_touch("up", 0.0, 0.0, 21, 0.0));
         assert_eq!(hit_log.borrow().as_slice(), &["touchstart", "touchend"]);
+    }
+
+    #[test]
+    fn document_hit_testing_flushes_layout_and_returns_the_element_stack() {
+        setup();
+        set_viewport(320.0, 240.0);
+        let document = document_value();
+        let outer = create_in_body("div");
+        let target = document.call_method("createElement", vec![Value::string("div")]);
+        outer.call_method("appendChild", vec![target.clone()]);
+        let outer_style = outer.get_property("style");
+        outer_style.set_property("width", Value::string("200px"));
+        outer_style.set_property("height", Value::string("100px"));
+        let target_style = target.get_property("style");
+        target_style.set_property("width", Value::string("80px"));
+        target_style.set_property("height", Value::string("40px"));
+
+        let bounds = target.call_method("getBoundingClientRect", Vec::new());
+        let x = bounds.get_property("x").to_number() + 20.0;
+        let y = bounds.get_property("y").to_number() + 20.0;
+        let hit =
+            document.call_method("elementFromPoint", vec![Value::Number(x), Value::Number(y)]);
+        assert!(hit.strict_eq(&target));
+
+        let stack = document.call_method(
+            "elementsFromPoint",
+            vec![Value::Number(x), Value::Number(y)],
+        );
+        assert!(stack.get_property("0").strict_eq(&target));
+        assert!(stack.get_property("1").strict_eq(&outer));
+        assert!(stack.get_property("length").to_u32() >= 2);
+    }
+
+    #[test]
+    fn offset_coordinates_are_relative_to_the_positioned_offset_parent() {
+        setup();
+        set_viewport(320.0, 240.0);
+        let document = document_value();
+        let outer = create_in_body("div");
+        let outer_style = outer.get_property("style");
+        outer_style.set_property("position", Value::string("relative"));
+        outer_style.set_property("width", Value::string("100px"));
+        outer_style.set_property("height", Value::string("100px"));
+        outer_style.set_property("marginLeft", Value::string("8px"));
+        let target = document.call_method("createElement", vec![Value::string("div")]);
+        let target_style = target.get_property("style");
+        target_style.set_property("position", Value::string("absolute"));
+        target_style.set_property("width", Value::string("100%"));
+        target_style.set_property("height", Value::string("100%"));
+        outer.call_method("appendChild", vec![target.clone()]);
+
+        assert!(target.get_property("offsetParent").strict_eq(&outer));
+        assert_eq!(target.get_property("offsetLeft").to_number(), 0.0);
+        assert_eq!(target.get_property("offsetTop").to_number(), 0.0);
+        assert_eq!(target.get_property("offsetWidth").to_number(), 100.0);
+        assert_eq!(target.get_property("offsetHeight").to_number(), 100.0);
+        assert_eq!(
+            target
+                .call_method("getBoundingClientRect", Vec::new())
+                .get_property("x")
+                .to_number(),
+            8.0
+        );
     }
 
     #[test]
@@ -22759,8 +23116,7 @@ try {
         form.call_method("appendChild", vec![nested_button.clone()]);
         assert!(nested_button.get_property("form").strict_eq(&form));
 
-        let external_button =
-            document.call_method("createElement", vec![Value::string("button")]);
+        let external_button = document.call_method("createElement", vec![Value::string("button")]);
         external_button.call_method(
             "setAttribute",
             vec![Value::string("form"), Value::string("owner")],
@@ -22829,6 +23185,7 @@ try {
         assert_eq!(select.get_property("selectedIndex"), Value::Number(0.0));
     }
 
+    #[cfg(feature = "dynamic-js")]
     #[test]
     fn moved_display_contents_child_becomes_a_sized_flex_item() {
         setup();
@@ -23786,6 +24143,44 @@ try {
                 .to_js_string(),
             "characterData"
         );
+    }
+
+    #[test]
+    fn mutation_observer_records_same_value_set_attribute_for_class() {
+        setup();
+        let window = window_value();
+        let host = create_in_body("p");
+        host.call_method(
+            "setAttribute",
+            vec![Value::string("class"), Value::string("same")],
+        );
+        let observer = w3cos_core::class::construct(
+            &window.get_property("MutationObserver"),
+            vec![func(|_, _| Value::Undefined)],
+        );
+        observer.call_method(
+            "observe",
+            vec![
+                host.clone(),
+                Value::object(HashMap::from([
+                    ("attributes".to_string(), Value::Bool(true)),
+                    ("attributeOldValue".to_string(), Value::Bool(true)),
+                    ("childList".to_string(), Value::Bool(true)),
+                ])),
+            ],
+        );
+
+        host.call_method(
+            "setAttribute",
+            vec![Value::string("class"), Value::string("same")],
+        );
+
+        let records = observer.call_method("takeRecords", vec![]);
+        assert_eq!(records.get_property("length").to_u32(), 1);
+        let record = records.get_property("0");
+        assert_eq!(record.get_property("type").to_js_string(), "attributes");
+        assert_eq!(record.get_property("attributeName").to_js_string(), "class");
+        assert_eq!(record.get_property("oldValue").to_js_string(), "same");
     }
 
     #[test]
@@ -25080,6 +25475,38 @@ try {
     }
 
     #[test]
+    fn block_in_inline_bounds_ignore_zero_sized_fragments() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("500px"));
+        let target = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![target.clone()]);
+        for (width, height, display) in [
+            (100.0, 1.0, "inline-block"),
+            (0.0, 0.0, "block"),
+            (200.0, 1.0, "inline-block"),
+        ] {
+            let child = document.call_method("createElement", vec![Value::string("div")]);
+            let style = child.get_property("style");
+            if width != 0.0 {
+                style.set_property("width", Value::string(&format!("{width}px")));
+            }
+            if height != 0.0 {
+                style.set_property("height", Value::string(&format!("{height}px")));
+            }
+            style.set_property("display", Value::string(display));
+            target.call_method("appendChild", vec![child]);
+        }
+
+        let rect = target.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(rect.get_property("width").to_number(), 200.0);
+    }
+
+    #[test]
     fn focus_and_active_element() {
         setup();
         let doc = document_value();
@@ -25294,6 +25721,83 @@ try {
     }
 
     #[test]
+    fn computed_style_reports_used_horizontal_auto_margins() {
+        setup();
+        set_viewport(800.0, 600.0);
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            ".used-margin-container",
+            &[
+                ("display", "flow-root"),
+                ("width", "100px"),
+                ("padding", "5px"),
+                ("box-sizing", "border-box"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".used-margin-child",
+            &[("display", "flow-root"), ("width", "40px")],
+        );
+        let document = document_value();
+        let container = create_in_body("div");
+        container.set_property("className", Value::string("used-margin-container"));
+        let child = |margin_property: &str| {
+            let child = document.call_method("createElement", vec![Value::string("div")]);
+            child.set_property("className", Value::string("used-margin-child"));
+            child
+                .get_property("style")
+                .set_property(margin_property, Value::string("auto"));
+            container.call_method("appendChild", vec![child.clone()]);
+            child
+        };
+        let both = child("margin");
+        let left = child("marginLeft");
+        let right = child("marginRight");
+
+        assert_eq!(
+            forced_bounding_rect(node_id_of(&container).unwrap()).width,
+            100.0
+        );
+        assert_eq!(forced_bounding_rect(node_id_of(&both).unwrap()).width, 40.0);
+        let computed = |child| window_value().call_method("getComputedStyle", vec![child]);
+        let both = computed(both);
+        assert_eq!(both.get_property("marginLeft"), Value::string("25px"));
+        assert_eq!(both.get_property("marginRight"), Value::string("25px"));
+        let left = computed(left);
+        assert_eq!(left.get_property("marginLeft"), Value::string("50px"));
+        assert_eq!(left.get_property("marginRight"), Value::string("0px"));
+        let right = computed(right);
+        assert_eq!(right.get_property("marginLeft"), Value::string("0px"));
+        assert_eq!(right.get_property("marginRight"), Value::string("50px"));
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn set_attribute_style_updates_the_inline_style_declaration() {
+        setup();
+        let div = create_in_body("div");
+
+        div.call_method(
+            "setAttribute",
+            vec![
+                Value::string("style"),
+                Value::string("border: 2px solid green; display: block"),
+            ],
+        );
+
+        let computed = window_value().call_method("getComputedStyle", vec![div.clone()]);
+        assert_eq!(computed.get_property("display"), Value::string("block"));
+        let node = node_id_of(&div).expect("element has a DOM node");
+        let border_width = dom::with_document(|document| {
+            Element::new(NodeId::from_u32(node))
+                .style(document)
+                .to_style()
+                .border_width
+        });
+        assert_eq!(border_width, 2.0);
+    }
+
+    #[test]
     fn inline_style_canonicalizes_and_rejects_color_values() {
         setup();
         let div = create_in_body("div");
@@ -25384,10 +25888,7 @@ try {
                     "cssFloat".into(),
                     Value::string("initial"),
                 )])),
-                Value::object(HashMap::from([(
-                    "cssFloat".into(),
-                    Value::string("right"),
-                )])),
+                Value::object(HashMap::from([("cssFloat".into(), Value::string("right"))])),
             ]),
             Value::object(HashMap::from([
                 ("duration".into(), Value::Number(100_000.0)),
@@ -25409,11 +25910,27 @@ try {
     #[test]
     fn scroll_offsets() {
         setup();
+        set_viewport(500.0, 500.0);
         let div = create_in_body("div");
+        let style = div.get_property("style");
+        style.set_property("width", Value::string("100px"));
+        style.set_property("height", Value::string("100px"));
+        style.set_property("overflow", Value::string("auto"));
+        let child = document_value().call_method("createElement", vec![Value::string("div")]);
+        let child_style = child.get_property("style");
+        child_style.set_property("width", Value::string("300px"));
+        child_style.set_property("height", Value::string("400px"));
+        div.call_method("appendChild", vec![child]);
+
         div.set_property("scrollTop", Value::Number(33.0));
         div.set_property("scrollLeft", Value::Number(7.0));
         assert_eq!(div.get_property("scrollTop").to_number(), 33.0);
         assert_eq!(div.get_property("scrollLeft").to_number(), 7.0);
+
+        div.set_property("scrollTop", Value::Number(123_456.0));
+        div.set_property("scrollLeft", Value::Number(123_456.0));
+        assert_eq!(div.get_property("scrollTop").to_number(), 300.0);
+        assert_eq!(div.get_property("scrollLeft").to_number(), 200.0);
     }
 
     #[test]

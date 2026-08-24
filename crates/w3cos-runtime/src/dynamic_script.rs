@@ -22,9 +22,11 @@ use w3cos_vm::{
 pub use crate::html_compat::DocumentCompatibilityMode;
 use crate::html_parser_host::ParserScriptHost;
 pub use crate::html_parser_state::{DocumentParseProgress, StreamingDocumentParser};
+use crate::html_parser_state::{
+    HTML_NAMESPACE, parser_insertion_active, reset_parser_insertion_state,
+};
 #[cfg(test)]
-use crate::html_parser_state::{HTML_NAMESPACE, MATHML_NAMESPACE, SVG_NAMESPACE};
-use crate::html_parser_state::{parser_insertion_active, reset_parser_insertion_state};
+use crate::html_parser_state::{MATHML_NAMESPACE, SVG_NAMESPACE};
 use crate::xml_tree_builder::StreamingXmlDocumentParser;
 
 thread_local! {
@@ -595,6 +597,7 @@ impl Drop for ScriptLoaderInner {
         }
         for fetch in self.pending_stylesheet_fetches.get_mut().values() {
             fetch.task.cancel();
+            crate::font_loading_web::finish_font_readiness();
         }
         for fetch in self.pending_stylesheet_font_fetches.get_mut().values() {
             fetch.task.cancel();
@@ -1529,9 +1532,8 @@ impl ScriptLoader {
                 )
             },
         );
-        let wrapped = format!(
-            "globalThis[\"{result_key}\"] = function({parameters}) {{\n{body}\n}};"
-        );
+        let wrapped =
+            format!("globalThis[\"{result_key}\"] = function({parameters}) {{\n{body}\n}};");
         self.execute_classic_source_without_microtask_drain(
             &wrapped,
             &format!("inline:dynamic-function-{evaluation}"),
@@ -1563,9 +1565,8 @@ impl ScriptLoader {
                 )
             },
         );
-        let wrapped = format!(
-            "globalThis[\"{result_key}\"] = function({parameters}) {{\n{body}\n}};"
-        );
+        let wrapped =
+            format!("globalThis[\"{result_key}\"] = function({parameters}) {{\n{body}\n}};");
         self.execute_classic_source_in_realm(
             &wrapped,
             &format!("inline:dynamic-realm-function-{evaluation}"),
@@ -1668,11 +1669,7 @@ impl ScriptLoader {
             .unwrap_or_else(|| resolve_global_binding(name))
     }
 
-    fn realm_classic_lexical_declaration_binding(
-        &self,
-        global: &Value,
-        name: &str,
-    ) -> BindingCell {
+    fn realm_classic_lexical_declaration_binding(&self, global: &Value, name: &str) -> BindingCell {
         let mut realms = self.inner.realm_classic_lexical_bindings.borrow_mut();
         let index = realms
             .iter()
@@ -1741,7 +1738,9 @@ impl ScriptLoader {
         if !self.inner.policy.allow_scripts {
             return;
         }
-        let routes_to_window = node == crate::dom::body_id()
+        let is_html_body = crate::dom::tag_name(node).eq_ignore_ascii_case("body")
+            && crate::jsdom::namespace_uri(node) == HTML_NAMESPACE;
+        let routes_to_window = (node == crate::dom::body_id() || is_html_body)
             && matches!(
                 event_type,
                 "afterprint"
@@ -1774,11 +1773,7 @@ impl ScriptLoader {
         };
         if source.trim().is_empty() {
             if !routes_to_window {
-                crate::jsdom::js_set_inline_event_listener(
-                    node,
-                    event_type,
-                    Value::Undefined,
-                );
+                crate::jsdom::js_set_inline_event_listener(node, event_type, Value::Undefined);
             }
             return;
         }
@@ -3169,6 +3164,7 @@ impl ScriptLoader {
             .clear();
         for fetch in self.inner.pending_stylesheet_fetches.borrow().values() {
             fetch.task.cancel();
+            crate::font_loading_web::finish_font_readiness();
         }
         for fetch in self.inner.pending_stylesheet_font_fetches.borrow().values() {
             fetch.task.cancel();
@@ -3268,6 +3264,11 @@ impl ScriptLoader {
             self.prepare_pending_stylesheets(&document_url);
             self.prepare_pending_images(&document_url);
             self.prepare_pending_frames(&document_url);
+            // Inline styles may appear before the elements they target. The
+            // style-close scan cannot discover pseudo/background images for
+            // hosts that have not entered the DOM yet, so rescan once the
+            // parser has produced the complete document tree.
+            self.prepare_background_images(&document_url);
         }
         crate::jsdom::set_document_ready_state("interactive");
         self.drain_deferred_classic_scripts();
@@ -3316,6 +3317,7 @@ impl ScriptLoader {
         }
         for fetch in self.inner.pending_stylesheet_fetches.borrow().values() {
             fetch.task.cancel();
+            crate::font_loading_web::finish_font_readiness();
         }
         for fetch in self.inner.pending_stylesheet_font_fetches.borrow().values() {
             fetch.task.cancel();
@@ -3627,6 +3629,7 @@ impl ScriptLoader {
             .collect::<Vec<_>>();
         for (node, fetch) in removed {
             fetch.task.cancel();
+            crate::font_loading_web::finish_font_readiness();
             self.inner.ready_stylesheets.borrow_mut().insert(
                 fetch.graph.order,
                 ReadyStylesheet {
@@ -3855,27 +3858,25 @@ impl ScriptLoader {
                 Ok(url) if matches!(url.scheme(), "http" | "https") => {
                     self.start_stylesheet_fetch(element, node, url.as_str());
                 }
-                Ok(url) if url.scheme() == "data" => {
-                    match decode_frame_data_url(url.as_str()) {
-                        Ok((content_type, source))
-                            if content_type == "text/css" || content_type == "text/plain" =>
-                        {
-                            self.queue_stylesheet_result(
-                                element,
-                                node,
-                                Ok(Some((Some(url.to_string()), source))),
-                            );
-                        }
-                        Ok((content_type, _)) => self.queue_stylesheet_result(
+                Ok(url) if url.scheme() == "data" => match decode_frame_data_url(url.as_str()) {
+                    Ok((content_type, source))
+                        if content_type == "text/css" || content_type == "text/plain" =>
+                    {
+                        self.queue_stylesheet_result(
                             element,
                             node,
-                            Err(format!(
-                                "data stylesheet has unsupported media type {content_type:?}"
-                            )),
-                        ),
-                        Err(error) => self.queue_stylesheet_result(element, node, Err(error)),
+                            Ok(Some((Some(url.to_string()), source))),
+                        );
                     }
-                }
+                    Ok((content_type, _)) => self.queue_stylesheet_result(
+                        element,
+                        node,
+                        Err(format!(
+                            "data stylesheet has unsupported media type {content_type:?}"
+                        )),
+                    ),
+                    Err(error) => self.queue_stylesheet_result(element, node, Err(error)),
+                },
                 Ok(url) => self.queue_stylesheet_result(
                     element,
                     node,
@@ -3996,17 +3997,9 @@ impl ScriptLoader {
                             &content_type,
                             &document_url,
                         );
-                        crate::jsdom::install_frame_document(
-                            node,
-                            document.clone(),
-                            &document_url,
-                        );
+                        crate::jsdom::install_frame_document(node, document.clone(), &document_url);
                         let frame_window = element.get_property("contentWindow");
-                        self.execute_frame_inline_scripts(
-                            &document,
-                            &frame_window,
-                            &document_url,
-                        );
+                        self.execute_frame_inline_scripts(&document, &frame_window, &document_url);
                         crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
                         Ok(())
                     },
@@ -4025,16 +4018,9 @@ impl ScriptLoader {
                 let document = {
                     let current = element.get_property("contentDocument");
                     if current.is_nullish() {
-                        let document = crate::jsdom::parse_frame_document(
-                            "",
-                            "text/html",
-                            "about:blank",
-                        );
-                        crate::jsdom::install_frame_document(
-                            node,
-                            document.clone(),
-                            "about:blank",
-                        );
+                        let document =
+                            crate::jsdom::parse_frame_document("", "text/html", "about:blank");
+                        crate::jsdom::install_frame_document(node, document.clone(), "about:blank");
                         document
                     } else {
                         current
@@ -4065,11 +4051,7 @@ impl ScriptLoader {
                                 "text/html",
                                 "about:blank",
                             );
-                            crate::jsdom::install_frame_document(
-                                node,
-                                replacement,
-                                "about:blank",
-                            );
+                            crate::jsdom::install_frame_document(node, replacement, "about:blank");
                         }
                         crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
                         crate::jsdom::dispatch_element_lifecycle_event(node, "load");
@@ -4105,8 +4087,8 @@ impl ScriptLoader {
                 "text/html,application/xhtml+xml,application/xml,text/xml,*/*;q=0.1".to_string(),
             );
             let referrer_policy = {
-                let value = element
-                    .call_method("getAttribute", vec![Value::string("referrerpolicy")]);
+                let value =
+                    element.call_method("getAttribute", vec![Value::string("referrerpolicy")]);
                 crate::fetch::ScriptReferrerPolicy::parse(
                     (!value.is_null()).then(|| value.to_js_string()).as_deref(),
                 )
@@ -4141,6 +4123,25 @@ impl ScriptLoader {
             let value = crate::dom::computed_style_property(node, "background-image");
             for source in crate::image_loader::css_image_urls(&value) {
                 active_sources.insert(source);
+            }
+            let generated_content = crate::dom::with_document(|document| {
+                ["::before", "::after"]
+                    .into_iter()
+                    .flat_map(|pseudo_element| {
+                        w3cos_dom::stylesheet::matching_pseudo_declarations_for_node(
+                            document,
+                            w3cos_dom::node::NodeId::from_u32(node),
+                            pseudo_element,
+                        )
+                    })
+                    .filter(|(property, _, _)| property.eq_ignore_ascii_case("content"))
+                    .map(|(_, value, _)| value)
+                    .collect::<Vec<_>>()
+            });
+            for value in generated_content {
+                for source in crate::image_loader::css_image_urls(&value) {
+                    active_sources.insert(source);
+                }
             }
         }
         self.inner
@@ -4183,6 +4184,7 @@ impl ScriptLoader {
                 }
             }
         }
+        self.advance_document_lifecycle();
     }
 
     fn start_background_image_fetch(&self, source: String, request_url: &str) {
@@ -4562,6 +4564,7 @@ impl ScriptLoader {
                 integrity: String::new(),
             }));
         }
+        crate::font_loading_web::begin_font_readiness();
         self.advance_stylesheet_graph(StylesheetGraphLoad {
             element,
             node,
@@ -4643,6 +4646,7 @@ impl ScriptLoader {
                 .then_some(integrity)
                 .unwrap_or_default(),
         }));
+        crate::font_loading_web::begin_font_readiness();
         self.advance_stylesheet_graph(StylesheetGraphLoad {
             element,
             node,
@@ -4709,7 +4713,7 @@ impl ScriptLoader {
                         }
                     }
                 }
-                if graph.font_loading_started {
+                let mark_ready_if_idle = if graph.font_loading_started {
                     crate::font_face::FontFaceSet::global().mark_ready();
                     let (loaded, failed): (Vec<_>, Vec<_>) =
                         graph.font_event_faces.iter().cloned().partition(|face| {
@@ -4723,11 +4727,15 @@ impl ScriptLoader {
                             Vec::new()
                         },
                     );
+                    false
                 } else {
-                    crate::font_face::FontFaceSet::global().mark_ready_if_idle();
-                }
+                    true
+                };
                 if graph.font_only {
                     self.activate_deferred_stylesheet_fonts();
+                    if mark_ready_if_idle {
+                        crate::font_face::FontFaceSet::global().mark_ready_if_idle();
+                    }
                     return;
                 }
                 self.inner.ready_stylesheets.borrow_mut().insert(
@@ -4739,7 +4747,12 @@ impl ScriptLoader {
                     },
                 );
                 self.drain_ready_stylesheets();
+                self.demand_document_stylesheet_fonts();
                 self.activate_deferred_stylesheet_fonts();
+                if mark_ready_if_idle {
+                    crate::font_face::FontFaceSet::global().mark_ready_if_idle();
+                }
+                crate::font_loading_web::finish_font_readiness();
                 return;
             };
             match action {
@@ -4892,6 +4905,35 @@ impl ScriptLoader {
             self.activate_deferred_stylesheet_fonts();
         }
         matched
+    }
+
+    fn demand_document_stylesheet_fonts(&self) -> usize {
+        let Some(root) = active_document_root() else {
+            return 0;
+        };
+        let mut nodes = Vec::new();
+        collect_dom_nodes_in_tree_order(root, &mut nodes);
+        let text_runs = nodes
+            .into_iter()
+            .filter(|node| crate::dom::node_type(*node) == 3)
+            .filter_map(|node| {
+                let text = crate::dom::get_text_content(node)?;
+                if text.is_empty() {
+                    return None;
+                }
+                let parent = crate::dom::parent_node(node)?;
+                (crate::dom::node_type(parent) == 1).then(|| {
+                    let style = crate::dom::with_document(|document| {
+                        document.computed_style_for(w3cos_dom::node::NodeId::from_u32(parent))
+                    });
+                    (style, text)
+                })
+            })
+            .collect::<Vec<_>>();
+        text_runs
+            .iter()
+            .map(|(style, text)| self.demand_stylesheet_fonts_for_text(style, text))
+            .sum()
     }
 
     fn stylesheet_font_loading_score(
@@ -5375,6 +5417,7 @@ impl ScriptLoader {
                             source: Err(error),
                         },
                     );
+                    crate::font_loading_web::finish_font_readiness();
                     continue;
                 }
                 Err(error) => {
@@ -6162,6 +6205,11 @@ impl ScriptLoader {
         if self.inner.dom_content_loaded_fired.get()
             && !self.inner.document_load_fired.get()
             && self.inner.document_load_blockers.borrow().is_empty()
+            && self
+                .inner
+                .pending_background_image_fetches
+                .borrow()
+                .is_empty()
             && !self.inner.document_load_queued.replace(true)
         {
             let weak_loader = Rc::downgrade(&self.inner);
@@ -6177,6 +6225,7 @@ impl ScriptLoader {
                 if !inner.document_load_fired.get()
                     && inner.dom_content_loaded_fired.get()
                     && inner.document_load_blockers.borrow().is_empty()
+                    && inner.pending_background_image_fetches.borrow().is_empty()
                 {
                     inner.document_load_fired.set(true);
                     crate::jsdom::set_document_ready_state("complete");
@@ -7230,6 +7279,9 @@ impl ScriptLoader {
                 crate::dom::mark_dom_dirty();
             }
         }
+        if completed_count > 0 {
+            self.advance_document_lifecycle();
+        }
         completed_count
     }
 
@@ -7369,11 +7421,7 @@ impl ScriptLoader {
                 crate::jsdom::set_document_encoding(&document, encoding_name);
                 crate::jsdom::install_frame_document(node, document.clone(), &document_url);
                 let frame_window = crate::jsdom::element_value(node).get_property("contentWindow");
-                self.execute_frame_inline_scripts(
-                    &document,
-                    &frame_window,
-                    &document_url,
-                );
+                self.execute_frame_inline_scripts(&document, &frame_window, &document_url);
                 crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
                 Ok(())
             });
@@ -7971,6 +8019,7 @@ pub fn has_pending_script_fetches() -> bool {
                     || !inner.pending_stylesheet_font_fetches.borrow().is_empty()
                     || !inner.pending_image_fetches.borrow().is_empty()
                     || !inner.pending_frame_fetches.borrow().is_empty()
+                    || !inner.pending_background_image_fetches.borrow().is_empty()
             })
     })
 }
@@ -7995,6 +8044,13 @@ pub(crate) fn request_stylesheet_fonts_for_text(
         loader.map_or(0, |loader| {
             loader.demand_stylesheet_fonts_for_text(style, text)
         })
+    })
+}
+
+pub(crate) fn request_document_stylesheet_fonts() -> usize {
+    ACTIVE_DOCUMENT_LOADER.with(|active| {
+        let loader = active.borrow().as_ref().map(|(loader, _)| loader.clone());
+        loader.map_or(0, |loader| loader.demand_document_stylesheet_fonts())
     })
 }
 
@@ -8782,10 +8838,8 @@ pub(crate) fn notify_node_inserted(node: u32) {
                 // Dynamically inserted classic scripts prepare synchronously.
                 // Inline sources run before the DOM insertion method returns;
                 // external sources only start their fetch here.
-                let _ = loader.execute_pending_document_scripts_for_node(
-                    &document_url,
-                    Some(inserted_node),
-                );
+                let _ = loader
+                    .execute_pending_document_scripts_for_node(&document_url, Some(inserted_node));
             }
         }
     }
@@ -8814,8 +8868,7 @@ pub(crate) fn prepare_inserted_stylesheets(nodes: &[u32]) {
     DYNAMIC_STYLESHEET_NODES.with(|nodes| {
         nodes.borrow_mut().extend(stylesheets);
     });
-    if let Some((loader, document_url)) =
-        ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
+    if let Some((loader, document_url)) = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
     {
         // All insertion steps for an atomic batch precede every node's
         // post-insertion steps. This makes a later style/link visible to an
@@ -8910,11 +8963,7 @@ pub(crate) fn notify_script_mutated(node: u32) {
 /// `moveBefore()` deliberately suppresses ordinary removal/insertion steps, so
 /// this relevant-mutation step must be queued explicitly without invalidating
 /// the preserved subtree itself.
-pub(crate) fn notify_picture_relevant_move(
-    moving: u32,
-    old_parent: Option<u32>,
-    new_parent: u32,
-) {
+pub(crate) fn notify_picture_relevant_move(moving: u32, old_parent: Option<u32>, new_parent: u32) {
     let tag = crate::dom::tag_name(moving);
     let mut images = HashSet::new();
     if tag.eq_ignore_ascii_case("img") {
@@ -9655,9 +9704,7 @@ fn resolve_realm_global_binding(name: &str, global: &Value, document: &Value) ->
     )
 }
 
-fn decode_frame_data_url(
-    url: &str,
-) -> std::result::Result<(String, String), String> {
+fn decode_frame_data_url(url: &str) -> std::result::Result<(String, String), String> {
     let payload = url
         .get(url.find(':').map_or(0, |index| index + 1)..)
         .unwrap_or_default();
@@ -9684,10 +9731,7 @@ fn decode_frame_data_url(
     } else {
         percent_decode_url_bytes(data)
     };
-    Ok((
-        content_type,
-        String::from_utf8_lossy(&bytes).into_owned(),
-    ))
+    Ok((content_type, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn percent_decode_url_bytes(value: &str) -> Vec<u8> {
@@ -9697,7 +9741,8 @@ fn percent_decode_url_bytes(value: &str) -> Vec<u8> {
     while index < bytes.len() {
         if bytes[index] == b'%'
             && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+            && let (Some(high), Some(low)) =
+                (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
         {
             decoded.push((high << 4) | low);
             index += 3;
@@ -9928,6 +9973,32 @@ window.__regexpNameMatches = validName.test("div") && validName.test("smallEmoji
     }
 
     #[test]
+    fn classic_script_uses_page_map_and_set_globals() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+const validData = new Set(["data-offset-x"]);
+const measured = new Map([["width", 24]]);
+window.__setHasDataAttribute = validData.has("data-offset-x");
+window.__mapReadsMeasuredWidth = measured.get("width");
+"#,
+                "inline:page-map-set-globals",
+            )
+            .unwrap();
+        let window = crate::jsdom::window_value();
+        assert_eq!(
+            window.get_property("__setHasDataAttribute"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            window.get_property("__mapReadsMeasuredWidth"),
+            Value::Number(24.0)
+        );
+    }
+
+    #[test]
     fn classic_script_resolves_live_window_named_elements_by_id() {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
@@ -10040,9 +10111,7 @@ window.__elementRemoveIsUnscopable = Element.prototype[Symbol.unscopables].remov
         let frame1 = frames.get_property("1");
         let callback = w3cos_core::class::construct(
             &frame1.get_property("Function"),
-            vec![Value::string(
-                "throw new parent.frames[2].Error('PASS');",
-            )],
+            vec![Value::string("throw new parent.frames[2].Error('PASS');")],
         );
         assert!(callback.is_callable());
         assert!(
@@ -10068,10 +10137,8 @@ window.__elementRemoveIsUnscopable = Element.prototype[Symbol.unscopables].remov
                 .get_property("1")
                 .strict_eq(&frame1)
         );
-        let observer = w3cos_core::class::construct(
-            &frame0.get_property("MutationObserver"),
-            vec![callback],
-        );
+        let observer =
+            w3cos_core::class::construct(&frame0.get_property("MutationObserver"), vec![callback]);
         let target = frame0.get_property("document").get_property("body");
         observer.call_method(
             "observe",
@@ -10178,10 +10245,7 @@ document.body.appendChild(afterHost);
         let style = document.call_method("createElement", vec![Value::string("style")]);
         style.call_method(
             "appendChild",
-            vec![document.call_method(
-                "createTextNode",
-                vec![Value::string("body {}")],
-            )],
+            vec![document.call_method("createTextNode", vec![Value::string("body {}")])],
         );
         crate::jsdom::window_value().set_property("__insertedStyle", style.clone());
         let script = document.call_method("createElement", vec![Value::string("script")]);
@@ -10207,10 +10271,7 @@ document.body.appendChild(afterHost);
         let previous_sheet = style.get_property("sheet");
         style.call_method(
             "appendChild",
-            vec![document.call_method(
-                "createTextNode",
-                vec![Value::string("main {}")],
-            )],
+            vec![document.call_method("createTextNode", vec![Value::string("main {}")])],
         );
         assert_eq!(
             style
@@ -10250,10 +10311,8 @@ document.body.appendChild(afterHost);
         assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
 
         let document = crate::jsdom::document_value();
-        let target = document.call_method(
-            "getElementById",
-            vec![Value::string("alternate-target")],
-        );
+        let target =
+            document.call_method("getElementById", vec![Value::string("alternate-target")]);
         let computed_display = || {
             crate::jsdom::window_value()
                 .call_method("getComputedStyle", vec![target.clone()])
@@ -10326,7 +10385,9 @@ window.__defaultStylePost = defaultStylePost;
 
         let window = crate::jsdom::window_value();
         assert_eq!(
-            window.get_property("__parserAlternateBefore").to_js_string(),
+            window
+                .get_property("__parserAlternateBefore")
+                .to_js_string(),
             "block"
         );
         assert_eq!(
@@ -12345,12 +12406,16 @@ worker.postMessage(40);
             .get_property("head")
             .call_method("appendChild", vec![fragment]);
 
-        assert!(window
-            .get_property("laterFragmentChildWasConnected")
-            .to_bool());
-        assert!(window
-            .get_property("laterFragmentChildParent")
-            .strict_eq(&document.get_property("head")));
+        assert!(
+            window
+                .get_property("laterFragmentChildWasConnected")
+                .to_bool()
+        );
+        assert!(
+            window
+                .get_property("laterFragmentChildParent")
+                .strict_eq(&document.get_property("head"))
+        );
     }
 
     #[test]
@@ -12417,10 +12482,16 @@ window.__lexicalClosureLaterParent = lexicalLaterElement.parentNode;
 
         let window = crate::jsdom::window_value();
         let head = crate::jsdom::document_value().get_property("head");
-        assert!(window.get_property("__lexicalClosureLaterParent").strict_eq(&head));
-        assert!(window
-            .get_property("__lexicalClosureObservedParent")
-            .strict_eq(&head));
+        assert!(
+            window
+                .get_property("__lexicalClosureLaterParent")
+                .strict_eq(&head)
+        );
+        assert!(
+            window
+                .get_property("__lexicalClosureObservedParent")
+                .strict_eq(&head)
+        );
     }
 
     #[test]
@@ -12475,15 +12546,15 @@ window.__lexicalClosureLaterParent = lexicalLaterElement.parentNode;
             "fragmentTextEvents.push('t1');",
             "fragmentTextEvents.push('t2');",
         ] {
-            let text = document.call_method(
-                "createTextNode",
-                vec![Value::string(source)],
-            );
+            let text = document.call_method("createTextNode", vec![Value::string(source)]);
             fragment.call_method("appendChild", vec![text]);
         }
 
         script.call_method("appendChild", vec![fragment]);
-        assert_eq!(window.get_property("fragmentTextEvents").to_js_string(), "t1,t2");
+        assert_eq!(
+            window.get_property("fragmentTextEvents").to_js_string(),
+            "t1,t2"
+        );
         window.set_property("fragmentTextScript", script);
         loader
             .execute_source(
@@ -12495,7 +12566,10 @@ fragmentTextScript.text = "fragmentTextEvents.push('t5');";
                 "inline:already-started-script-mutations",
             )
             .unwrap();
-        assert_eq!(window.get_property("fragmentTextEvents").to_js_string(), "t1,t2");
+        assert_eq!(
+            window.get_property("fragmentTextEvents").to_js_string(),
+            "t1,t2"
+        );
     }
 
     #[test]
@@ -13661,7 +13735,10 @@ fragmentTextScript.text = "fragmentTextEvents.push('t5');";
             document.get_property("characterSet").to_js_string(),
             "windows-1252"
         );
-        assert_eq!(document.get_property("charset").to_js_string(), "windows-1252");
+        assert_eq!(
+            document.get_property("charset").to_js_string(),
+            "windows-1252"
+        );
         assert_eq!(
             document.get_property("inputEncoding").to_js_string(),
             "windows-1252"
@@ -14615,7 +14692,9 @@ parserMutationObserver.disconnect();
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind inline handler fixture");
-        let address = listener.local_addr().expect("inline handler fixture address");
+        let address = listener
+            .local_addr()
+            .expect("inline handler fixture address");
         let server = thread::spawn(move || {
             let (mut document, _) = listener.accept().expect("accept inline handler document");
             let request = read_http_request(&mut document);
@@ -14730,6 +14809,123 @@ window.__dynamicInlineHandler = dynamicInlineResult;
             computed.get_property("backgroundImage").to_js_string(),
             format!("url('{source}')")
         );
+    }
+
+    #[test]
+    fn generated_content_image_uses_the_css_subresource_cache() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::image_loader::clear_cache();
+        w3cos_dom::stylesheet::clear_rules();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind generated image fixture");
+        let address = listener
+            .local_addr()
+            .expect("generated image fixture address");
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            100,
+            100,
+            image::Rgba([0, 128, 0, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode generated-content PNG");
+        let png = png.into_inner();
+        let (image_requested_tx, image_requested_rx) = std::sync::mpsc::channel();
+        let (release_image_tx, release_image_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let responses = [
+                (
+                    "/css/generated/content.xhtml",
+                    "application/xhtml+xml",
+                    b"<html xmlns='http://www.w3.org/1999/xhtml'><head><style type='text/css'><![CDATA[div:before { content: url('../support/green.png'); }]]></style></head><body><div/></body></html>".as_slice(),
+                ),
+                ("/css/support/green.png", "image/png", png.as_slice()),
+            ];
+            for (path, content_type, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept generated image resource");
+                let request = read_http_request(&mut stream);
+                assert!(request.starts_with(&format!("GET {path} ")), "{request}");
+                if path.ends_with("green.png") {
+                    image_requested_tx
+                        .send(())
+                        .expect("report pending generated image request");
+                    let _ = release_image_rx.recv();
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write generated image response headers");
+                stream
+                    .write_all(body)
+                    .expect("write generated image response body");
+            }
+        });
+
+        let mut loader =
+            DocumentLoader::new(ScriptPolicy::default(), DocumentLoaderOptions::default());
+        loader
+            .navigate(&format!("http://{address}/css/generated/content.xhtml"))
+            .unwrap();
+        let source = "../support/green.png".to_string();
+        for _ in 0..10_000 {
+            let progress = loader.poll();
+            assert_ne!(
+                progress,
+                DocumentLoadProgress::Complete,
+                "document load must wait for generated-content images"
+            );
+            if image_requested_rx.try_recv().is_ok() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        release_image_tx
+            .send(())
+            .expect("release pending generated image response");
+        for _ in 0..10_000 {
+            if loader.poll() == DocumentLoadProgress::Complete {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(loader.progress(), &DocumentLoadProgress::Complete);
+        let declarations = crate::dom::with_document(|document| {
+            let item = document
+                .query_selector("div")
+                .expect("generated image host");
+            w3cos_dom::stylesheet::matching_pseudo_declarations_for_node(
+                document, item.id, "::before",
+            )
+        });
+        assert!(
+            declarations.iter().any(|(property, value, _)| {
+                property == "content"
+                    && crate::image_loader::css_image_urls(value) == [source.clone()]
+            }),
+            "generated image declaration must be active and absolute: {declarations:#?}"
+        );
+        assert_eq!(crate::image_loader::dimensions(&source), Some((100, 100)));
+        server.join().expect("generated image fixture completed");
+        let tree = crate::dom::with_document(|document| document.to_component_tree());
+        let image_index = crate::layout::pre_flatten(&tree)
+            .iter()
+            .enumerate()
+            .find_map(|(index, component)| {
+                matches!(
+                    &component.kind,
+                    w3cos_std::ComponentKind::Image { src } if src == &source
+                )
+                .then_some(index)
+            })
+            .expect("generated image component");
+        let image_rect = crate::layout::compute(&tree, 800.0, 600.0)
+            .unwrap()
+            .into_iter()
+            .find_map(|(rect, index)| (index == image_index).then_some(rect))
+            .expect("generated image layout rect");
+        assert_eq!((image_rect.width, image_rect.height), (100.0, 100.0));
     }
 
     #[test]
@@ -15193,6 +15389,132 @@ window.__dynamicInlineHandler = dynamicInlineResult;
             loader.script_loader.http_source_cache_stats().writes >= 1,
             "image response must enter the shared persistent HTTP cache"
         );
+    }
+
+    #[test]
+    fn xhtml_authored_image_uses_the_browser_image_pipeline() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::image_loader::clear_cache();
+        let pixels = image::RgbaImage::from_pixel(3, 2, image::Rgba([20, 40, 60, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind XHTML image fixture");
+        let address = listener.local_addr().expect("XHTML image fixture address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut document, _) = listener.accept().expect("accept XHTML document");
+            let request = read_http_request(&mut document);
+            assert!(
+                request.starts_with("GET /css/reference.xhtml "),
+                "{request}"
+            );
+            let body = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><span>Before<img src="support/square.png" />After</span></body></html>"#;
+            write!(
+                document,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xhtml+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .expect("write XHTML document");
+
+            listener
+                .set_nonblocking(true)
+                .expect("make XHTML image fixture nonblocking");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((mut image, _)) => {
+                        image
+                            .set_nonblocking(false)
+                            .expect("restore blocking XHTML image stream");
+                        let request = read_http_request(&mut image);
+                        request_tx
+                            .send(Some(request))
+                            .expect("report image request");
+                        release_rx.recv().expect("release XHTML image response");
+                        write!(
+                            image,
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            png.len(),
+                        )
+                        .expect("write XHTML image response headers");
+                        image.write_all(&png).expect("write XHTML image body");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            request_tx.send(None).expect("report missing image request");
+                            return;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept XHTML image: {error}"),
+                }
+            }
+        });
+
+        let mut loader =
+            DocumentLoader::new(ScriptPolicy::default(), DocumentLoaderOptions::default());
+        loader
+            .navigate(&format!("http://{address}/css/reference.xhtml"))
+            .unwrap();
+        let mut request = None;
+        for _ in 0..5_000 {
+            let progress = loader.poll();
+            assert_ne!(
+                progress,
+                DocumentLoadProgress::Complete,
+                "document load must wait for authored XHTML images"
+            );
+            if let Ok(result) = request_rx.try_recv() {
+                request = result;
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let request = request.expect("XHTML authored image must start a request");
+        release_tx.send(()).expect("release XHTML image response");
+        for _ in 0..5_000 {
+            match loader.poll() {
+                DocumentLoadProgress::Complete => break,
+                DocumentLoadProgress::Failed(error) => {
+                    panic!("XHTML image navigation failed: {error}")
+                }
+                _ => thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        server.join().expect("XHTML image fixture completed");
+        assert!(
+            request.starts_with("GET /css/support/square.png "),
+            "{request}"
+        );
+        assert_eq!(loader.progress(), &DocumentLoadProgress::Complete);
+        assert_eq!(
+            crate::image_loader::dimensions("support/square.png"),
+            Some((3, 2))
+        );
+        let tree = crate::dom::with_document(w3cos_dom::Document::to_component_tree);
+        let image_index = crate::layout::pre_flatten(&tree)
+            .iter()
+            .enumerate()
+            .find_map(|(index, component)| {
+                matches!(
+                    &component.kind,
+                    w3cos_std::ComponentKind::Image { src } if src == "support/square.png"
+                )
+                .then_some(index)
+            })
+            .expect("authored XHTML image component");
+        let image_rect = crate::layout::compute(&tree, 800.0, 600.0)
+            .unwrap()
+            .into_iter()
+            .find_map(|(rect, index)| (index == image_index).then_some(rect))
+            .expect("authored XHTML image layout");
+        assert_eq!((image_rect.width, image_rect.height), (3.0, 2.0));
     }
 
     #[test]
@@ -15922,6 +16244,89 @@ window.__dynamicInlineHandler = dynamicInlineResult;
                 .is_none(),
             "removing the stylesheet must clean up an activated deferred font"
         );
+    }
+
+    #[test]
+    fn document_fonts_ready_demands_faces_selected_after_stylesheet_parse() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind font ready fixture");
+        let address = listener.local_addr().expect("font ready fixture address");
+        let font_bytes = include_bytes!("../assets/Inter-Regular.ttf").to_vec();
+        let server = thread::spawn(move || {
+            let (mut document, _) = listener.accept().expect("accept font ready document");
+            let request = read_http_request(&mut document);
+            assert!(request.starts_with("GET /index.html "));
+            let body = r#"<html><head><style>
+                @font-face {
+                    font-family: "W3COS Font Ready Test";
+                    src: url("/ready.ttf") format("truetype");
+                    unicode-range: U+0041;
+                }
+                .target { font-family: "W3COS Font Ready Test"; }
+                </style></head><body><span class="target">A</span></body></html>"#;
+            write!(
+                document,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .expect("write font ready document");
+
+            let (mut font, _) = listener.accept().expect("accept ready-demanded font");
+            let request = read_http_request(&mut font);
+            assert!(request.starts_with("GET /ready.ttf "));
+            write!(
+                font,
+                "HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                font_bytes.len(),
+            )
+            .expect("write ready-demanded font headers");
+            font.write_all(&font_bytes)
+                .expect("write ready-demanded font body");
+        });
+
+        let mut loader =
+            DocumentLoader::new(ScriptPolicy::default(), DocumentLoaderOptions::default());
+        loader
+            .navigate(&format!("http://{address}/index.html"))
+            .unwrap();
+        for _ in 0..5_000 {
+            match loader.poll() {
+                DocumentLoadProgress::Complete => break,
+                DocumentLoadProgress::Failed(error) => {
+                    panic!("font ready navigation failed: {error}")
+                }
+                _ => thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(loader.progress(), &DocumentLoadProgress::Complete);
+        let fonts = crate::jsdom::document_value().get_property("fonts");
+        let face = fonts.call_method("values", vec![]).get_property("0");
+        assert_eq!(face.get_property("status").to_js_string(), "unloaded");
+
+        let ready = fonts.get_property("ready");
+        assert!(matches!(
+            w3cos_core::promise::status(&ready),
+            Some(w3cos_core::promise::PromiseStatus::Pending)
+        ));
+        for _ in 0..5_000 {
+            poll_script_fetches();
+            crate::jsdom::drain_microtasks();
+            if !matches!(
+                w3cos_core::promise::status(&ready),
+                Some(w3cos_core::promise::PromiseStatus::Pending)
+            ) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(matches!(
+            w3cos_core::promise::status(&ready),
+            Some(w3cos_core::promise::PromiseStatus::Fulfilled(_))
+        ));
+        assert_eq!(face.get_property("status").to_js_string(), "loaded");
+        server.join().expect("font ready fixture completed");
     }
 
     #[test]

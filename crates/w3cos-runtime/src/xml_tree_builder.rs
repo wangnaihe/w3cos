@@ -184,26 +184,12 @@ fn parse_xml_document_into(
 }
 
 fn decoded_general_reference(name: &str, entities: &HashMap<String, String>) -> Option<String> {
-    let character = match name {
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "amp" => Some('&'),
-        "apos" => Some('\''),
-        "quot" => Some('"'),
-        _ => name
-            .strip_prefix("#x")
-            .or_else(|| name.strip_prefix("#X"))
-            .and_then(|digits| u32::from_str_radix(digits, 16).ok())
-            .and_then(char::from_u32)
-            .or_else(|| {
-                name.strip_prefix('#')
-                    .and_then(|digits| digits.parse::<u32>().ok())
-                    .and_then(char::from_u32)
-            }),
-    };
-    character
-        .map(|character| character.to_string())
-        .or_else(|| entities.get(name).cloned())
+    let reference = format!("&{name};");
+    let decoded = crate::jsdom::decode_html_entities(&reference);
+    if decoded != reference {
+        return Some(decoded);
+    }
+    entities.get(name).cloned()
 }
 
 fn create_element(
@@ -384,6 +370,7 @@ mod tests {
         assert_eq!(flavor.get_property("prefix"), Value::string("p"));
     }
 
+    #[cfg(feature = "dynamic-js")]
     #[test]
     fn xhtml_parser_executes_inline_scripts_in_the_document_realm() {
         crate::dom::reset_document();
@@ -420,10 +407,7 @@ mod tests {
         assert_eq!(
             crate::jsdom::document_value()
                 .get_property("documentElement")
-                .call_method(
-                    "getAttribute",
-                    vec![Value::string("data-frame-loaded")],
-                ),
+                .call_method("getAttribute", vec![Value::string("data-frame-loaded")],),
             Value::string("yes")
         );
         let doctype = crate::jsdom::document_value().get_property("doctype");
@@ -445,10 +429,298 @@ mod tests {
         );
         assert_eq!(
             crate::dom::body_id(),
-            crate::jsdom::node_id_of(
-                &crate::jsdom::document_value().get_property("body")
-            )
-            .expect("XHTML body")
+            crate::jsdom::node_id_of(&crate::jsdom::document_value().get_property("body"))
+                .expect("XHTML body")
         );
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
+    fn xhtml_body_onload_routes_to_the_window_after_shell_replacement() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let loader = crate::dynamic_script::ScriptLoader::new(
+            crate::dynamic_script::ScriptPolicy::default(),
+        );
+        loader
+            .begin_document_parse("https://example.test/onload.xhtml")
+            .unwrap();
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(
+            Rc::new(loader),
+            "https://example.test/onload.xhtml",
+        );
+        parser
+            .write(
+                "<html xmlns='http://www.w3.org/1999/xhtml'><head><script>function fixupDOM() { document.body.setAttribute('data-loaded', 'yes'); }</script></head><body onload='fixupDOM()'/></html>",
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        crate::jsdom::drain_microtasks();
+
+        assert_eq!(
+            crate::jsdom::document_value()
+                .get_property("body")
+                .call_method("getAttribute", vec![Value::string("data-loaded")]),
+            Value::string("yes")
+        );
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
+    fn xhtml_generated_and_authored_inline_text_share_one_principal_text_box() {
+        w3cos_dom::stylesheet::clear_rules();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let loader = Rc::new(crate::dynamic_script::ScriptLoader::new(
+            crate::dynamic_script::ScriptPolicy::default(),
+        ));
+        loader
+            .begin_document_parse("https://example.test/generated.xhtml")
+            .unwrap();
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(
+            loader.clone(),
+            "https://example.test/generated.xhtml",
+        );
+        parser
+            .write(
+                "<html xmlns='http://www.w3.org/1999/xhtml'><head>\
+                 <style type='text/css'><![CDATA[div { position: relative; color: red; } span { position: absolute; top: 0; left: 0; } .test:before { content: 'TEST &#x46;&#x41;&#x49;&#x4c;'; }]]></style>\
+                 </head><body><div><span class='test'>ED</span></div></body></html>",
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        let stylesheet = w3cos_compiler::esm_css::parse_css_source(
+            "div { position: relative; color: red; } span { position: absolute; top: 0; left: 0; } .test:before { content: 'TEST &#x46;&#x41;&#x49;&#x4c;'; }",
+            "inline <style>",
+        );
+        assert!(
+            stylesheet.rules.iter().any(|rule| {
+                rule.selector == ".test:before"
+                    && rule.declarations.iter().any(|(property, value)| {
+                        property == "content" && value == "'TEST &#x46;&#x41;&#x49;&#x4c;'"
+                    })
+            }),
+            "compiled CSS must retain the XHTML entity spelling: {:#?}",
+            stylesheet.rules
+        );
+        for rule in stylesheet.rules {
+            let declarations = rule
+                .declarations
+                .iter()
+                .map(|(property, value): &(String, String)| {
+                    (property.as_str(), value.as_str())
+                })
+                .collect::<Vec<_>>();
+            w3cos_dom::stylesheet::register_rule(&rule.selector, &declarations);
+        }
+
+        let tree = crate::dom::with_document(|document| document.to_component_tree());
+        fn find_generated_run(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if matches!(
+                &component.kind,
+                w3cos_std::ComponentKind::Text { content }
+                    if content == "TEST &#x46;&#x41;&#x49;&#x4c;ED"
+            ) {
+                return Some(component);
+            }
+            component.children.iter().find_map(find_generated_run)
+        }
+        let principal = find_generated_run(&tree).unwrap_or_else(|| {
+            fn collect_text(component: &w3cos_std::Component, output: &mut Vec<String>) {
+                if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                    output.push(format!(
+                        "{content:?} display={:?} position={:?} color={:?}",
+                        component.style.display, component.style.position, component.style.color
+                    ));
+                }
+                for child in &component.children {
+                    collect_text(child, output);
+                }
+            }
+            let mut text = Vec::new();
+            collect_text(&tree, &mut text);
+            panic!("XHTML generated and authored text must shape as one run: {text:#?}")
+        });
+        assert!(principal.children.is_empty());
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[cfg(feature = "dynamic-js")]
+    #[test]
+    fn xhtml_inline_text_keeps_one_collapsed_space_before_preformatted_after_content() {
+        w3cos_dom::stylesheet::clear_rules();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let loader = Rc::new(crate::dynamic_script::ScriptLoader::new(
+            crate::dynamic_script::ScriptPolicy::default(),
+        ));
+        loader
+            .begin_document_parse("https://example.test/inline-content.xhtml")
+            .unwrap();
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(
+            loader,
+            "https://example.test/inline-content.xhtml",
+        );
+        parser
+            .write(
+                "<html xmlns='http://www.w3.org/1999/xhtml'><head/>\
+                 <body><div class='test'><div>\n   This test has failed.\n  </div></div></body></html>",
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        let stylesheet = w3cos_compiler::esm_css::parse_css_source(
+            ".test div { display: inline; padding: 0 1em 0 0; background: navy; color: navy; }\
+             .test div:after { content: '  \\A'; white-space: pre; }",
+            "inline <style>",
+        );
+        for rule in stylesheet.rules {
+            let declarations = rule
+                .declarations
+                .iter()
+                .map(|(property, value): &(String, String)| {
+                    (property.as_str(), value.as_str())
+                })
+                .collect::<Vec<_>>();
+            w3cos_dom::stylesheet::register_rule(&rule.selector, &declarations);
+        }
+
+        let tree = crate::dom::with_document(|document| document.to_component_tree());
+        fn navy_inline(component: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if component.style.background == w3cos_std::color::Color::rgb(0, 0, 128) {
+                return Some(component);
+            }
+            component.children.iter().find_map(navy_inline)
+        }
+        let inline = navy_inline(&tree).expect("navy inline component");
+        let text = inline
+            .children
+            .iter()
+            .filter_map(|child| match &child.kind {
+                w3cos_std::ComponentKind::Text { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text, ["This test has failed. ", "  \n"]);
+        let split_width = inline
+            .children
+            .iter()
+            .map(|child| match &child.kind {
+                w3cos_std::ComponentKind::Text { content } => {
+                    crate::layout::text_intrinsic_size(content, &child.style).0
+                }
+                _ => 0.0,
+            })
+            .sum::<f32>();
+        let mut reference_style = inline.style.clone();
+        reference_style.padding = w3cos_std::style::Edges::ZERO;
+        let reference_width = crate::layout::text_intrinsic_size(
+            "This test has failed.\u{00a0}\u{00a0}\u{00a0}",
+            &reference_style,
+        )
+        .0;
+        assert!(
+            (split_width - reference_width).abs() < 0.01,
+            "split generated inline width {split_width} must match the single reference run {reference_width}"
+        );
+        let flat = crate::layout::pre_flatten(&tree);
+        let inline_index = flat
+            .iter()
+            .position(|node| node.style.background == w3cos_std::color::Color::rgb(0, 0, 128))
+            .expect("navy inline layout node");
+        let inline_rect = crate::layout::compute(&tree, 800.0, 600.0)
+            .unwrap()
+            .into_iter()
+            .find_map(|(rect, index)| (index == inline_index).then_some(rect))
+            .expect("navy inline layout rect");
+        let padding = inline.style.padding_lengths();
+        assert!(
+            (inline_rect.width - split_width - padding.left - padding.right).abs() < 0.01,
+            "inline layout width {} must equal content {split_width} plus horizontal padding {}",
+            inline_rect.width,
+            padding.left + padding.right
+        );
+        w3cos_dom::stylesheet::clear_rules();
+
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let loader = Rc::new(crate::dynamic_script::ScriptLoader::new(
+            crate::dynamic_script::ScriptPolicy::default(),
+        ));
+        loader
+            .begin_document_parse("https://example.test/inline-reference.xhtml")
+            .unwrap();
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(
+            loader,
+            "https://example.test/inline-reference.xhtml",
+        );
+        parser
+            .write(
+                "<!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.0 Strict//EN' \
+                 'http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd'>\
+                 <html xmlns='http://www.w3.org/1999/xhtml'><head/>\
+                 <body><div>This test has failed.&nbsp;&nbsp;&nbsp;</div></body></html>",
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        let stylesheet = w3cos_compiler::esm_css::parse_css_source(
+            "div { display: inline; padding-right: 1em; background: navy; color: navy; }",
+            "inline reference <style>",
+        );
+        for rule in stylesheet.rules {
+            let declarations = rule
+                .declarations
+                .iter()
+                .map(|(property, value): &(String, String)| {
+                    (property.as_str(), value.as_str())
+                })
+                .collect::<Vec<_>>();
+            w3cos_dom::stylesheet::register_rule(&rule.selector, &declarations);
+        }
+        let reference_tree = crate::dom::with_document(|document| document.to_component_tree());
+        fn collect_text(component: &w3cos_std::Component, output: &mut String) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                output.push_str(content);
+            }
+            for child in &component.children {
+                collect_text(child, output);
+            }
+        }
+        let mut reference_text = String::new();
+        collect_text(&reference_tree, &mut reference_text);
+        assert!(
+            reference_text.contains("This test has failed.\u{00a0}\u{00a0}\u{00a0}"),
+            "reference NBSP text must survive XHTML lowering: {reference_text:?}"
+        );
+        let reference_flat = crate::layout::pre_flatten(&reference_tree);
+        let reference_index = reference_flat
+            .iter()
+            .position(|node| node.style.background == w3cos_std::color::Color::rgb(0, 0, 128))
+            .expect("navy reference layout node");
+        let reference_rect = crate::layout::compute(&reference_tree, 800.0, 600.0)
+            .unwrap()
+            .into_iter()
+            .find_map(|(rect, index)| (index == reference_index).then_some(rect))
+            .expect("navy reference layout rect");
+        assert!(
+            (inline_rect.width - reference_rect.width).abs() < 0.01,
+            "generated inline width {} must match reference width {}",
+            inline_rect.width,
+            reference_rect.width
+        );
+        assert!(
+            (inline_rect.height - reference_rect.height).abs() < 0.01,
+            "a terminal generated line break must not add an empty painted inline fragment: generated height {}, reference height {}",
+            inline_rect.height,
+            reference_rect.height
+        );
+        w3cos_dom::stylesheet::clear_rules();
     }
 }

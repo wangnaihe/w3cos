@@ -641,6 +641,7 @@ impl FontRegistry {
         style: &w3cos_std::style::Style,
         character: char,
     ) -> Option<LoadedFont> {
+        let character = crate::text_layout::font_glyph_character(character);
         let family = style.font_family.as_deref()?;
         let face_style = match style.font_style {
             w3cos_std::style::FontStyle::Normal => FontFaceStyle::Normal,
@@ -678,7 +679,8 @@ impl FontRegistry {
         let weight = FontWeight(style.font_weight);
         let mut runs: Vec<ResolvedFontRun> = Vec::new();
         for (offset, character) in text.char_indices() {
-            let font = self.resolve_stack_for_character(stack, weight, face_style, character);
+            let glyph_character = crate::text_layout::font_glyph_character(character);
+            let font = self.resolve_stack_for_character(stack, weight, face_style, glyph_character);
             let same_font = runs.last().is_some_and(|run| {
                 run.font.as_ref().map(LoadedFont::cache_key)
                     == font.as_ref().map(LoadedFont::cache_key)
@@ -744,7 +746,9 @@ impl FontRegistry {
         let mut bottom = f32::MIN;
         let mut saw_ink = false;
 
-        for character in text.chars() {
+        let render_text = crate::text_layout::font_render_text(text);
+        for character in render_text.chars() {
+            let character = crate::text_layout::font_glyph_character(character);
             let selected = self
                 .resolve_style_for_character(style, character)
                 .and_then(|font| font.parsed());

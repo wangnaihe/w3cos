@@ -114,7 +114,13 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
         ComponentKind::Image { src } => {
             let (natural_width, natural_height) = crate::image_loader::dimensions(src)
                 .map(|(width, height)| (width as f32, height as f32))
-                .unwrap_or((200.0, 200.0));
+                .unwrap_or_else(|| {
+                    if crate::image_loader::is_reserved_browser_source(src) {
+                        (0.0, 0.0)
+                    } else {
+                        (200.0, 200.0)
+                    }
+                });
             let width = dim_to_px(style.width);
             let height = dim_to_px(style.height);
             match (width, height) {
@@ -142,6 +148,101 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
     }
 }
 
+fn component_max_content_width(component: &Component) -> f32 {
+    let child_width = |child: &Component| component_max_content_width(child);
+    let intrinsic_width = if component.children.is_empty() {
+        leaf_intrinsic_size(&component.kind, &component.style).0
+    } else {
+        match component.style.display {
+            WDisplay::Table
+            | WDisplay::TableRowGroup
+            | WDisplay::TableHeaderGroup
+            | WDisplay::TableFooterGroup => component
+                .children
+                .iter()
+                .map(child_width)
+                .fold(0.0_f32, f32::max),
+            WDisplay::InlineTable
+                if component.children.iter().any(|child| {
+                    matches!(
+                        child.style.display,
+                        WDisplay::TableRow
+                            | WDisplay::TableRowGroup
+                            | WDisplay::TableHeaderGroup
+                            | WDisplay::TableFooterGroup
+                    )
+                }) =>
+            {
+                component
+                    .children
+                    .iter()
+                    .map(child_width)
+                    .fold(0.0_f32, f32::max)
+            }
+            WDisplay::TableRow => {
+                let children = component.children.iter().map(child_width).sum::<f32>();
+                children + component.style.gap * component.children.len().saturating_sub(1) as f32
+            }
+            _ => match component.style.flex_direction {
+                WDir::Row | WDir::RowReverse => {
+                    let children = component.children.iter().map(child_width).sum::<f32>();
+                    children
+                        + component.style.gap * component.children.len().saturating_sub(1) as f32
+                }
+                WDir::Column | WDir::ColumnReverse => component
+                    .children
+                    .iter()
+                    .map(child_width)
+                    .fold(0.0_f32, f32::max),
+            },
+        }
+    };
+    let specified_width = match component.style.width {
+        WDim::Px(width) => Some(width),
+        WDim::Em(width) => Some(width * component.style.font_size),
+        WDim::Rem(width) => Some(width * ROOT_FONT_SIZE),
+        _ => None,
+    };
+    let padding = component.style.padding_lengths();
+    let border_width = component
+        .style
+        .border_left_width
+        .unwrap_or(component.style.border_width)
+        + component
+            .style
+            .border_right_width
+            .unwrap_or(component.style.border_width);
+    let horizontal_inner_edges = padding.left + padding.right + border_width;
+    let border_box_width = match (specified_width, component.style.box_sizing) {
+        (Some(width), WBoxSizing::BorderBox) => width,
+        (Some(width), WBoxSizing::ContentBox) => width + horizontal_inner_edges,
+        (None, _) => intrinsic_width + horizontal_inner_edges,
+    };
+    let margin = component.style.margin_lengths();
+    let horizontal_margin = if component.style.display == WDisplay::TableCell {
+        0.0
+    } else {
+        margin.left + margin.right
+    };
+    border_box_width + horizontal_margin
+}
+
+fn shrink_to_fit_used_width(component: &Component) -> f32 {
+    let outer_width = component_max_content_width(component);
+    if matches!(
+        component.style.display,
+        WDisplay::Inline | WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
+    ) {
+        // Taffy applies an inline-level box's margins separately. Its assigned
+        // width is the border box, so do not make the painted background span
+        // the margin. Table max-content aggregation still needs outer widths.
+        let margin = component.style.margin_lengths();
+        (outer_width - margin.left - margin.right).max(0.0)
+    } else {
+        outer_width
+    }
+}
+
 fn dim_to_px(dim: WDim) -> Option<f32> {
     match dim {
         WDim::Px(v) => Some(v),
@@ -152,7 +253,9 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
 
 pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
     let registry = crate::font_face::FontRegistry::global();
+    #[cfg(not(feature = "skia"))]
     let font_runs = registry.resolve_style_runs(style, content);
+    #[cfg(not(feature = "skia"))]
     let has_registered_runs = font_runs.iter().any(|run| run.font.is_some());
     let key = text_measure_key(
         DEFAULT_TEXT_WRAP_WIDTH,
@@ -170,29 +273,28 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
         return measured;
     }
 
-    let measured = if has_registered_runs {
-        cascade_text_intrinsic_size(content, style, DEFAULT_TEXT_WRAP_WIDTH)
-    } else if matches!(style.display, WDisplay::InlineBlock | WDisplay::InlineFlex) {
+    let measured = {
         #[cfg(feature = "skia")]
         {
+            // Layout and paint must use the same shaping backend. Splitting
+            // one browser inline run across several generated/span boxes
+            // otherwise accumulates Fontdue-vs-Skia advance differences and
+            // visibly removes whitespace by the end of the line.
             crate::render_skia::measure_skia_text_intrinsic_size(content, style)
         }
         #[cfg(not(feature = "skia"))]
         {
-            text_layout::text_intrinsic_size_font(
-                content,
-                style,
-                DEFAULT_TEXT_WRAP_WIDTH,
-                layout_font(),
-            )
+            if has_registered_runs {
+                cascade_text_intrinsic_size(content, style, DEFAULT_TEXT_WRAP_WIDTH)
+            } else {
+                text_layout::text_intrinsic_size_font(
+                    content,
+                    style,
+                    DEFAULT_TEXT_WRAP_WIDTH,
+                    layout_font(),
+                )
+            }
         }
-    } else {
-        text_layout::text_intrinsic_size_font(
-            content,
-            style,
-            DEFAULT_TEXT_WRAP_WIDTH,
-            layout_font(),
-        )
     };
     TEXT_MEASURE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -205,6 +307,18 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
         cache.entries += 1;
     });
     measured
+}
+
+fn text_intrinsic_size_for_taffy(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
+    let (width, height) = text_intrinsic_size(content, style);
+    if style.box_sizing == WBoxSizing::BorderBox {
+        return (width, height);
+    }
+    let padding = style.padding_lengths();
+    (
+        (width - padding.left - padding.right).max(0.0),
+        (height - padding.top - padding.bottom).max(0.0),
+    )
 }
 
 fn cascade_char_advance(character: char, style: &w3cos_std::style::Style) -> f32 {
@@ -281,10 +395,11 @@ fn cascade_text_intrinsic_size(
         .iter()
         .map(|line| cascade_measure_width(line, style))
         .fold(0.0_f32, f32::max);
-    let height = if lines.len() == 1 {
+    let used_line_count = text_layout::used_text_line_count(content, style, &lines);
+    let height = if used_line_count == 1 {
         cascade_line_height(&lines[0], style)
     } else {
-        lines.len() as f32 * style.font_size * style.line_height
+        used_line_count as f32 * style.font_size * style.line_height
     };
     (
         width + padding.left + padding.right,
@@ -302,6 +417,22 @@ fn text_intrinsic_size_in_parent(
         height = height.max(browser_height);
     }
     (width, height)
+}
+
+fn text_intrinsic_size_in_parent_for_taffy(
+    content: &str,
+    style: &w3cos_std::style::Style,
+    parent_display: Option<WDisplay>,
+) -> (f32, f32) {
+    let (width, height) = text_intrinsic_size_in_parent(content, style, parent_display);
+    if style.box_sizing == WBoxSizing::BorderBox {
+        return (width, height);
+    }
+    let padding = style.padding_lengths();
+    (
+        (width - padding.left - padding.right).max(0.0),
+        (height - padding.top - padding.bottom).max(0.0),
+    )
 }
 
 fn browser_normal_cjk_height(
@@ -339,6 +470,7 @@ fn is_cjk(ch: char) -> bool {
 
 fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::style::Style) -> f32 {
     let registry = crate::font_face::FontRegistry::global();
+    #[cfg(not(feature = "skia"))]
     let font_runs = registry.resolve_style_runs(style, content);
     let key = text_measure_key(width, style, registry.cascade_cache_key(style, content));
     if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
@@ -352,10 +484,19 @@ fn wrapped_text_height(content: &str, width: f32, style: &w3cos_std::style::Styl
         return measured;
     }
 
-    let measured = if font_runs.iter().any(|run| run.font.is_some()) {
-        cascade_text_intrinsic_size(content, style, width).1
-    } else {
-        text_layout::wrapped_block_height_font(content, width, style, layout_font())
+    let measured = {
+        #[cfg(feature = "skia")]
+        {
+            crate::render_skia::measure_skia_wrapped_text_height(content, width, style)
+        }
+        #[cfg(not(feature = "skia"))]
+        {
+            if font_runs.iter().any(|run| run.font.is_some()) {
+                cascade_text_intrinsic_size(content, style, width).1
+            } else {
+                text_layout::wrapped_block_height_font(content, width, style, layout_font())
+            }
+        }
     };
     TEXT_MEASURE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -444,7 +585,7 @@ fn leaf_taffy_size(
     } else if matches!(style.height, WDim::Auto) {
         let h = match kind {
             ComponentKind::Text { content } => {
-                text_intrinsic_size_in_parent(content, style, parent_display).1
+                text_intrinsic_size_in_parent_for_taffy(content, style, parent_display).1
             }
             ComponentKind::Button { label } => button_intrinsic_size(label, style).1,
             _ => leaf_intrinsic_size(kind, style).1,
@@ -689,6 +830,7 @@ impl LayoutEngine {
                 None,
                 viewport_w,
                 viewport_h,
+                viewport_w,
             )?);
             self.tree_valid = true;
         }
@@ -710,15 +852,32 @@ impl LayoutEngine {
         let mut scrollable = Vec::new();
         let mut clip_only = Vec::new();
         let mut scroll_ancestor = vec![None; flat.len()];
+        let initial_containing_block = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: viewport_w,
+            height: viewport_h,
+        };
+        let root_x = root_auto_margin_offset(
+            flat.first().map(|entry| entry.style),
+            self.tree
+                .layout(root_node)
+                .map_or(viewport_w, |layout| layout.size.width),
+            viewport_w,
+            viewport_h,
+        );
 
         collect_layouts_fast(
             flat,
             &self.tree,
             root_node,
-            0.0,
+            root_x,
             0.0,
             viewport_w,
             viewport_h,
+            initial_containing_block,
+            initial_containing_block,
+            true,
             None,
             &mut results,
             &mut fixed_results,
@@ -726,6 +885,8 @@ impl LayoutEngine {
             &mut clip_only,
             &mut scroll_ancestor,
         );
+
+        extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
 
         results.extend(fixed_results);
 
@@ -775,6 +936,7 @@ pub fn compute_with_scroll(
         None,
         viewport_w,
         viewport_h,
+        viewport_w,
     )?;
     let space = Size {
         width: AvailableSpace::Definite(viewport_w),
@@ -790,15 +952,31 @@ pub fn compute_with_scroll(
     let mut scrollable = Vec::new();
     let mut clip_only = Vec::new();
     let mut scroll_ancestor = vec![None; flat.len()];
+    let initial_containing_block = LayoutRect {
+        x: 0.0,
+        y: 0.0,
+        width: viewport_w,
+        height: viewport_h,
+    };
+    let root_x = root_auto_margin_offset(
+        flat.first().map(|entry| entry.style),
+        tree.layout(root_node)
+            .map_or(viewport_w, |layout| layout.size.width),
+        viewport_w,
+        viewport_h,
+    );
 
     collect_layouts_fast(
         &flat,
         &tree,
         root_node,
-        0.0,
+        root_x,
         0.0,
         viewport_w,
         viewport_h,
+        initial_containing_block,
+        initial_containing_block,
+        true,
         None,
         &mut results,
         &mut fixed_results,
@@ -807,13 +985,116 @@ pub fn compute_with_scroll(
         &mut scroll_ancestor,
     );
 
+    extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
+
     results.extend(fixed_results);
     Ok((results, scrollable, clip_only))
+}
+
+fn extend_scroll_extents_from_descendants(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    scroll_ancestor: &[Option<usize>],
+    scrollable: &mut [(usize, LayoutRect, ScrollExtent)],
+) {
+    let scrollport_positions = scrollable
+        .iter()
+        .enumerate()
+        .map(|(position, (index, _, _))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    for (child, child_index) in layouts {
+        if matches!(
+            flat.get(*child_index).map(|entry| entry.style.position),
+            Some(WPos::Fixed)
+        ) {
+            continue;
+        }
+        let Some(scroll_index) = scroll_ancestor.get(*child_index).copied().flatten() else {
+            continue;
+        };
+        let Some(position) = scrollport_positions.get(&scroll_index).copied() else {
+            continue;
+        };
+        let (_, scrollport, extent) = &mut scrollable[position];
+        extent.max_x = extent
+            .max_x
+            .max(child.x + child.width - (scrollport.x + scrollport.width));
+        extent.max_y = extent
+            .max_y
+            .max(child.y + child.height - (scrollport.y + scrollport.height));
+    }
+}
+
+fn root_auto_margin_offset(
+    style: Option<&w3cos_std::style::Style>,
+    root_width: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> f32 {
+    let Some(style) = style else {
+        return 0.0;
+    };
+    let WSpacing::Auto = style.margin.left else {
+        return 0.0;
+    };
+    let right_auto = matches!(style.margin.right, WSpacing::Auto);
+    let right = if right_auto {
+        0.0
+    } else {
+        match style.margin.right {
+            WSpacing::Px(value) => value,
+            WSpacing::Percent(value) => viewport_w * value / 100.0,
+            WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
+            WSpacing::Em(value) => value * style.font_size,
+            WSpacing::Vw(value) => value * viewport_w / 100.0,
+            WSpacing::Vh(value) => value * viewport_h / 100.0,
+            WSpacing::Auto => 0.0,
+            other => other.resolve(&w3cos_std::safe_area::current()),
+        }
+    };
+    let remaining = (viewport_w - root_width - right).max(0.0);
+    if right_auto {
+        remaining / 2.0
+    } else {
+        remaining
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Internal: Taffy tree construction
 // ---------------------------------------------------------------------------
+
+fn component_content_width(
+    style: &w3cos_std::style::Style,
+    containing_width: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> f32 {
+    let specified = style.width.resolve(
+        containing_width,
+        ROOT_FONT_SIZE,
+        style.font_size,
+        viewport_w,
+        viewport_h,
+    );
+    let mut width = specified.unwrap_or(containing_width);
+    if style.box_sizing == WBoxSizing::BorderBox {
+        let resolve_edge = |spacing: WSpacing| match spacing {
+            WSpacing::Percent(value) => containing_width * value / 100.0,
+            WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
+            WSpacing::Em(value) => value * style.font_size,
+            WSpacing::Vw(value) => value * viewport_w / 100.0,
+            WSpacing::Vh(value) => value * viewport_h / 100.0,
+            WSpacing::Auto => 0.0,
+            other => other.resolve(&w3cos_std::safe_area::current()),
+        };
+        width -= resolve_edge(style.padding.left)
+            + resolve_edge(style.padding.right)
+            + style.border_left_width.unwrap_or(style.border_width)
+            + style.border_right_width.unwrap_or(style.border_width);
+    }
+    width.max(0.0)
+}
 
 fn build_taffy_tree(
     tree: &mut TaffyTree<usize>,
@@ -824,11 +1105,23 @@ fn build_taffy_tree(
     parent_align_items: Option<WAlign>,
     viewport_w: f32,
     viewport_h: f32,
+    containing_width: f32,
 ) -> Result<NodeId, taffy::TaffyError> {
     let my_idx = *idx;
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    // CSS resolves every percentage padding side against the containing
+    // block's width. Taffy leaves vertical percentages unresolved when that
+    // block has an indefinite height, so provide their pixel basis here.
+    if let WSpacing::Percent(value) = comp.style.padding.top {
+        style.padding.top = LengthPercentage::length(containing_width * value / 100.0);
+    }
+    if let WSpacing::Percent(value) = comp.style.padding.bottom {
+        style.padding.bottom = LengthPercentage::length(containing_width * value / 100.0);
+    }
+    let child_containing_width =
+        component_content_width(&comp.style, containing_width, viewport_w, viewport_h);
     if comp.style.display == WDisplay::Inline
         && matches!(
             parent_display,
@@ -876,10 +1169,13 @@ fn build_taffy_tree(
                     // Likewise, `overflow:hidden` removes the automatic
                     // min-content size of a flex item in browsers, allowing a
                     // nowrap title to contract and be clipped by its own box.
-                    let shrink_to_fit = matches!(
-                        comp.style.display,
-                        WDisplay::InlineBlock | WDisplay::InlineFlex
-                    );
+                    let inline_text_in_block = comp.style.display == WDisplay::Inline
+                        && matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid));
+                    let shrink_to_fit = inline_text_in_block
+                        || matches!(
+                            comp.style.display,
+                            WDisplay::InlineBlock | WDisplay::InlineFlex
+                        );
                     let clips_overflow = matches!(
                         comp.style.resolved_overflow_x(),
                         WOverflow::Hidden | WOverflow::Scroll | WOverflow::Auto
@@ -887,20 +1183,38 @@ fn build_taffy_tree(
                         comp.style.resolved_overflow_y(),
                         WOverflow::Hidden | WOverflow::Scroll | WOverflow::Auto
                     );
-                    if shrink_to_fit || (nowrap && !clips_overflow) {
-                        let mut w = text_intrinsic_size(content, &comp.style).0;
+                    if shrink_to_fit
+                        || (nowrap
+                            && !clips_overflow
+                            && !matches!(
+                                comp.style.display,
+                                WDisplay::Block
+                                    | WDisplay::Table
+                                    | WDisplay::TableRowGroup
+                                    | WDisplay::TableHeaderGroup
+                                    | WDisplay::TableFooterGroup
+                                    | WDisplay::TableCell
+                                    | WDisplay::TableCaption
+                                    | WDisplay::ListItem
+                            ))
+                    {
+                        let mut w = text_intrinsic_size_for_taffy(content, &comp.style).0;
                         if let WDim::Px(mw) = comp.style.min_width {
                             w = w.max(mw);
                         }
                         let dim = Dimension::length(w);
-                        (dim, dim)
+                        if inline_text_in_block && !nowrap {
+                            (Dimension::length(0.0), dim)
+                        } else {
+                            (dim, dim)
+                        }
                     } else if text_uses_intrinsic_cross_size(
                         &comp.style,
                         parent_direction,
                         parent_display,
                         parent_align_items,
                     ) {
-                        let mut w = text_intrinsic_size(content, &comp.style).0;
+                        let mut w = text_intrinsic_size_for_taffy(content, &comp.style).0;
                         if let WDim::Px(mw) = comp.style.min_width {
                             w = w.max(mw);
                         }
@@ -909,7 +1223,12 @@ fn build_taffy_tree(
                             WWordBreak::BreakAll | WWordBreak::BreakWord
                         ) {
                             let padding = comp.style.padding_lengths();
-                            comp.style.font_size + padding.left + padding.right
+                            comp.style.font_size
+                                + if comp.style.box_sizing == WBoxSizing::BorderBox {
+                                    padding.left + padding.right
+                                } else {
+                                    0.0
+                                }
                         } else {
                             w
                         };
@@ -923,7 +1242,7 @@ fn build_taffy_tree(
                         };
                         (min_width, Dimension::auto())
                     } else {
-                        let mut w = text_intrinsic_size(content, &comp.style).0;
+                        let mut w = text_intrinsic_size_for_taffy(content, &comp.style).0;
                         if let WDim::Px(mw) = comp.style.min_width {
                             w = w.max(mw);
                         }
@@ -955,7 +1274,7 @@ fn build_taffy_tree(
         let intrinsic_min_h = if matches!(comp.style.height, WDim::Auto) {
             match &comp.kind {
                 ComponentKind::Text { content } => Dimension::length(
-                    text_intrinsic_size_in_parent(content, &comp.style, parent_display).1,
+                    text_intrinsic_size_in_parent_for_taffy(content, &comp.style, parent_display).1,
                 ),
                 ComponentKind::Button { label } => {
                     Dimension::length(button_intrinsic_size(label, &comp.style).1)
@@ -1024,12 +1343,121 @@ fn build_taffy_tree(
                     Some(comp.style.align_items),
                     viewport_w,
                     viewport_h,
+                    child_containing_width,
                 )?;
                 Ok((c.style.order, source_index, node))
             })
             .collect::<Result<_, _>>()?;
         child_nodes.sort_by_key(|(order, source_index, _)| (*order, *source_index));
-        let child_nodes: Vec<NodeId> = child_nodes.into_iter().map(|(_, _, node)| node).collect();
+        let rescue_overwide_first_pair = if comp.style.flex_wrap == WWrap::Wrap
+            && child_nodes.len() >= 2
+        {
+            let first = &comp.children[child_nodes[0].1];
+            let second = &comp.children[child_nodes[1].1];
+            let anonymous_line_item = |component: &Component| {
+                matches!(component.kind, ComponentKind::Box)
+                    && component.children.len() == 1
+                    && component.style.display == WDisplay::InlineFlex
+                    && matches!(component.style.min_height, WDim::Px(_))
+            };
+            let first_width = component_max_content_width(first);
+            let second_width = component_max_content_width(second);
+            let second_strictly_reduces_line = second.children.first().is_some_and(|inner| {
+                if inner
+                    .style
+                    .font_family
+                    .as_deref()
+                    .is_some_and(|family| family.eq_ignore_ascii_case("ahem"))
+                    && let ComponentKind::Text { content } = &inner.kind
+                    && let WSpacing::Em(left) = inner.style.margin.left
+                {
+                    // Ahem defines every character cell as exactly 1ch. Keep
+                    // the zero-outer-width boundary distinct from a strictly
+                    // negative following box; only the latter can rescue an
+                    // overwide first item without a line break.
+                    -left > content.chars().count() as f32
+                } else {
+                    second_width < -0.01
+                }
+            });
+            let line_width = if matches!(comp.style.width, WDim::Auto) {
+                shrink_to_fit_used_width(comp)
+            } else {
+                component_content_width(
+                    &comp.style,
+                    containing_width,
+                    viewport_w,
+                    viewport_h,
+                )
+            };
+            (anonymous_line_item(first)
+                && anonymous_line_item(second)
+                && second_strictly_reduces_line
+                && first_width > line_width + 0.01
+                && first_width + second_width <= line_width + 0.01)
+                .then_some((first_width + second_width).max(0.0))
+        } else {
+            None
+        };
+        let mut child_nodes: Vec<NodeId> =
+            child_nodes.into_iter().map(|(_, _, node)| node).collect();
+        if let Some(group_width) = rescue_overwide_first_pair {
+            // Inline layout does not break before the first box on an empty
+            // line. A following negative-margin box can therefore pull that
+            // overwide first box back within the available line. Flexbox's
+            // greedy wrapping closes the line too early, so keep precisely
+            // that first pair together in an anonymous, context-free row.
+            // Later overflow opportunities remain independent, matching CSS
+            // inline line breaking (a third negative box cannot rescue an
+            // overflow that already occurred between the first two boxes).
+            let grouped = [child_nodes[0], child_nodes[1]];
+            let group_style = Style {
+                display: taffy::Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: Some(AlignItems::FlexStart),
+                flex_shrink: 0.0,
+                size: Size {
+                    width: Dimension::length(group_width),
+                    height: Dimension::auto(),
+                },
+                min_size: Size {
+                    width: Dimension::length(group_width),
+                    height: Dimension::auto(),
+                },
+                max_size: Size {
+                    width: Dimension::length(group_width),
+                    height: Dimension::auto(),
+                },
+                ..Style::default()
+            };
+            let group = tree.new_with_children(group_style, &grouped)?;
+            child_nodes.splice(0..2, [group]);
+        }
+        if matches!(comp.style.width, WDim::Auto)
+            && matches!(
+                comp.style.display,
+                WDisplay::Inline
+                    | WDisplay::InlineBlock
+                    | WDisplay::InlineFlex
+                    | WDisplay::InlineTable
+                    | WDisplay::Table
+            )
+            && (matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid))
+                || (matches!(parent_display, Some(WDisplay::Flex))
+                    && matches!(
+                        comp.style.display,
+                        WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
+                    )))
+        {
+            style.size.width = Dimension::length(shrink_to_fit_used_width(comp));
+            if comp.style.display == WDisplay::Table {
+                // CSS auto table layout shrink-wraps up to the available
+                // containing-block width. An unconstrained max-content width
+                // makes a wide table escape a viewport-sized block instead
+                // of distributing its columns inside that block.
+                style.max_size.width = Dimension::percent(1.0);
+            }
+        }
         let node = tree.new_with_children(style, &child_nodes)?;
         tree.set_node_context(node, Some(my_idx))?;
         Ok(node)
@@ -1133,11 +1561,20 @@ fn to_taffy_display(d: WDisplay) -> taffy::Display {
         | WDisplay::Inline
         | WDisplay::InlineBlock
         | WDisplay::InlineFlex
-        | WDisplay::Contents => {
-            taffy::Display::Flex
-        }
+        | WDisplay::InlineTable
+        | WDisplay::TableRow
+        | WDisplay::Contents => taffy::Display::Flex,
         WDisplay::Grid => taffy::Display::Grid,
-        WDisplay::Block => taffy::Display::Block,
+        WDisplay::Block
+        | WDisplay::Table
+        | WDisplay::TableRowGroup
+        | WDisplay::TableHeaderGroup
+        | WDisplay::TableFooterGroup
+        | WDisplay::TableColumnGroup
+        | WDisplay::TableColumn
+        | WDisplay::TableCell
+        | WDisplay::TableCaption
+        | WDisplay::ListItem => taffy::Display::Block,
         WDisplay::None => taffy::Display::None,
     }
 }
@@ -1156,6 +1593,9 @@ fn collect_layouts_fast(
     parent_y: f32,
     viewport_w: f32,
     viewport_h: f32,
+    absolute_containing_block: LayoutRect,
+    relative_containing_block: LayoutRect,
+    relative_containing_block_height_definite: bool,
     current_scroll_container: Option<usize>,
     out: &mut Vec<(LayoutRect, usize)>,
     fixed_out: &mut Vec<(LayoutRect, usize)>,
@@ -1174,6 +1614,7 @@ fn collect_layouts_fast(
     };
 
     let mut new_scroll_container = current_scroll_container;
+    let mut descendant_containing_block = absolute_containing_block;
 
     if let Some(&ctx) = tree.get_node_context(node) {
         if ctx < flat.len() {
@@ -1189,20 +1630,50 @@ fn collect_layouts_fast(
                     compute_fixed_rect(info.style, viewport_w, viewport_h, rect.width, rect.height);
                 fixed_out.push((rect, ctx));
             } else {
+                if matches!(info.style.position, WPos::Absolute) {
+                    let fallback = inline_absolute_static_rect(
+                        flat,
+                        tree,
+                        node,
+                        relative_containing_block,
+                        rect,
+                    )
+                    .unwrap_or(rect);
+                    rect = compute_absolute_rect(
+                        info.style,
+                        absolute_containing_block,
+                        fallback,
+                        viewport_w,
+                        viewport_h,
+                    );
+                } else if matches!(info.style.position, WPos::Relative) {
+                    rect = compute_relative_percentage_rect(
+                        info.style,
+                        relative_containing_block,
+                        relative_containing_block_height_definite,
+                        rect,
+                    );
+                }
                 out.push((rect, ctx));
+            }
+
+            if !matches!(info.style.position, WPos::Static) {
+                descendant_containing_block = rect;
             }
 
             let overflow_x = info.style.resolved_overflow_x();
             let overflow_y = info.style.resolved_overflow_y();
             let scrolls_x = matches!(overflow_x, WOverflow::Scroll | WOverflow::Auto);
             let scrolls_y = matches!(overflow_y, WOverflow::Scroll | WOverflow::Auto);
-            if scrolls_x || scrolls_y {
-                let max_x = if scrolls_x {
+            let clips_x = matches!(overflow_x, WOverflow::Hidden);
+            let clips_y = matches!(overflow_y, WOverflow::Hidden);
+            if scrolls_x || scrolls_y || clips_x || clips_y {
+                let max_x = if scrolls_x || clips_x {
                     layout.scroll_width().max(0.0)
                 } else {
                     0.0
                 };
-                let max_y = if scrolls_y {
+                let max_y = if scrolls_y || clips_y {
                     match info.kind {
                         ComponentKind::VirtualList { total_extent, .. } => {
                             (*total_extent - rect.height).max(0.0)
@@ -1212,30 +1683,49 @@ fn collect_layouts_fast(
                 } else {
                     0.0
                 };
-                if max_x > 0.0 || max_y > 0.0 {
+                if max_x > 0.0 || max_y > 0.0 || clips_x || clips_y {
                     scrollable.push((ctx, rect, ScrollExtent { max_x, max_y }));
                 } else {
                     clip_only.push((ctx, rect));
                 }
                 new_scroll_container = Some(ctx);
-            } else if matches!(overflow_x, WOverflow::Hidden)
-                || matches!(overflow_y, WOverflow::Hidden)
-            {
-                clip_only.push((ctx, rect));
-                new_scroll_container = Some(ctx);
             }
         }
     }
+
+    let child_relative_containing_block = LayoutRect {
+        x: rect.x + layout.border.left + layout.padding.left,
+        y: rect.y + layout.border.top + layout.padding.top,
+        width: layout.content_box_width(),
+        height: layout.content_box_height(),
+    };
+    let child_relative_containing_block_height_definite = tree
+        .get_node_context(node)
+        .and_then(|index| flat.get(*index))
+        .is_some_and(|info| match info.style.height {
+            WDim::Auto => {
+                matches!(info.style.position, WPos::Absolute | WPos::Fixed)
+                    && !matches!(info.style.top, WDim::Auto)
+                    && !matches!(info.style.bottom, WDim::Auto)
+                    && (matches!(info.style.position, WPos::Fixed)
+                        || relative_containing_block_height_definite)
+            }
+            WDim::Percent(_) => relative_containing_block_height_definite,
+            WDim::Px(_) | WDim::Rem(_) | WDim::Em(_) | WDim::Vw(_) | WDim::Vh(_) => true,
+        });
 
     for &child in tree.children(node).unwrap().iter() {
         collect_layouts_fast(
             flat,
             tree,
             child,
-            x,
-            y,
+            rect.x,
+            rect.y,
             viewport_w,
             viewport_h,
+            descendant_containing_block,
+            child_relative_containing_block,
+            child_relative_containing_block_height_definite,
             new_scroll_container,
             out,
             fixed_out,
@@ -1243,6 +1733,151 @@ fn collect_layouts_fast(
             clip_only,
             scroll_ancestor,
         );
+    }
+}
+
+fn inline_absolute_static_rect(
+    flat: &[FlatNodeInfo<'_>],
+    tree: &TaffyTree<usize>,
+    node: NodeId,
+    containing_block: LayoutRect,
+    mut rect: LayoutRect,
+) -> Option<LayoutRect> {
+    let index = tree.get_node_context(node).copied()?;
+    let style = flat.get(index)?.style;
+    if !matches!(style.position, WPos::Absolute)
+        || !matches!(style.left, WDim::Auto)
+        || !matches!(style.right, WDim::Auto)
+        || !matches!(style.top, WDim::Auto)
+        || !matches!(style.bottom, WDim::Auto)
+    {
+        return None;
+    }
+    let parent = tree.parent(node)?;
+    let siblings = tree.children(parent).ok()?;
+    let mut cursor_x = 0.0_f32;
+    let mut cursor_y = 0.0_f32;
+    let mut line_height = 0.0_f32;
+    let mut has_meaningful_inline_predecessor = false;
+    for sibling in siblings {
+        if sibling == node {
+            break;
+        }
+        let sibling_index = tree.get_node_context(sibling).copied()?;
+        let sibling_info = flat.get(sibling_index)?;
+        if matches!(sibling_info.style.position, WPos::Absolute | WPos::Fixed) {
+            continue;
+        }
+        if !matches!(
+            sibling_info.style.display,
+            WDisplay::Inline | WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
+        ) {
+            return None;
+        }
+        let layout = tree.layout(sibling).ok()?;
+        let (width, height, meaningful) = match sibling_info.kind {
+            ComponentKind::Text { content } => {
+                let (width, height) = text_intrinsic_size(content, sibling_info.style);
+                (
+                    width,
+                    height,
+                    content.chars().any(|character| !character.is_whitespace()),
+                )
+            }
+            _ => (layout.size.width, layout.size.height, true),
+        };
+        if cursor_x > 0.0 && cursor_x + width > containing_block.width {
+            cursor_x = 0.0;
+            cursor_y += line_height;
+            line_height = 0.0;
+        }
+        cursor_x += width;
+        line_height = line_height.max(height);
+        has_meaningful_inline_predecessor |= meaningful;
+    }
+    if !has_meaningful_inline_predecessor {
+        return None;
+    }
+    rect.x = containing_block.x + cursor_x;
+    rect.y = containing_block.y + cursor_y;
+    Some(rect)
+}
+
+fn compute_relative_percentage_rect(
+    style: &w3cos_std::style::Style,
+    containing_block: LayoutRect,
+    containing_block_height_definite: bool,
+    mut rect: LayoutRect,
+) -> LayoutRect {
+    match (style.left, style.right) {
+        (WDim::Percent(value), _) => rect.x += containing_block.width * value / 100.0,
+        (WDim::Auto, WDim::Percent(value)) => {
+            rect.x -= containing_block.width * value / 100.0;
+        }
+        _ => {}
+    }
+    if containing_block_height_definite {
+        match (style.top, style.bottom) {
+            (WDim::Percent(value), _) => rect.y += containing_block.height * value / 100.0,
+            (WDim::Auto, WDim::Percent(value)) => {
+                rect.y -= containing_block.height * value / 100.0;
+            }
+            _ => {}
+        }
+    }
+    rect
+}
+
+fn compute_absolute_rect(
+    style: &w3cos_std::style::Style,
+    containing_block: LayoutRect,
+    fallback: LayoutRect,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> LayoutRect {
+    let resolve_h = |d: WDim| {
+        d.resolve(
+            containing_block.width,
+            ROOT_FONT_SIZE,
+            style.font_size,
+            viewport_w,
+            viewport_h,
+        )
+    };
+    let resolve_v = |d: WDim| {
+        d.resolve(
+            containing_block.height,
+            ROOT_FONT_SIZE,
+            style.font_size,
+            viewport_w,
+            viewport_h,
+        )
+    };
+    let width = match style.width {
+        WDim::Percent(_) => resolve_h(style.width).unwrap_or(fallback.width),
+        _ => fallback.width,
+    };
+    let height = match style.height {
+        WDim::Percent(_) => resolve_v(style.height).unwrap_or(fallback.height),
+        _ => fallback.height,
+    };
+
+    let x = match (resolve_h(style.left), resolve_h(style.right)) {
+        (Some(left), _) => containing_block.x + left,
+        (None, Some(right)) => containing_block.x + containing_block.width - right - width,
+        (None, None) => fallback.x,
+    };
+    let y = match (resolve_v(style.top), resolve_v(style.bottom)) {
+        (Some(top), _) => containing_block.y + top,
+        (None, Some(bottom)) => containing_block.y + containing_block.height - bottom - height,
+        (None, None) => fallback.y,
+    };
+
+    LayoutRect {
+        x,
+        y,
+        width,
+        height,
     }
 }
 
@@ -1276,6 +1911,14 @@ fn compute_fixed_rect(
     let right = resolve_h(style.right);
     let top = resolve_v(style.top);
     let bottom = resolve_v(style.bottom);
+    let width = match style.width {
+        WDim::Percent(_) => resolve_h(style.width).unwrap_or(width),
+        _ => width,
+    };
+    let height = match style.height {
+        WDim::Percent(_) => resolve_v(style.height).unwrap_or(height),
+        _ => height,
+    };
 
     let x = match (left, right) {
         (Some(l), _) => l,
@@ -1356,6 +1999,32 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
                 height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
             },
         ),
+        WDisplay::InlineTable | WDisplay::TableRow => (
+            taffy::Display::Flex,
+            s.flex_grow,
+            s.flex_shrink,
+            Size {
+                width: to_taffy_dim(s.width, s.font_size, viewport_w, viewport_h),
+                height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
+            },
+        ),
+        WDisplay::Table
+        | WDisplay::TableRowGroup
+        | WDisplay::TableHeaderGroup
+        | WDisplay::TableFooterGroup
+        | WDisplay::TableColumnGroup
+        | WDisplay::TableColumn
+        | WDisplay::TableCell
+        | WDisplay::TableCaption
+        | WDisplay::ListItem => (
+            taffy::Display::Block,
+            s.flex_grow,
+            s.flex_shrink,
+            Size {
+                width: to_taffy_dim(s.width, s.font_size, viewport_w, viewport_h),
+                height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
+            },
+        ),
         // DOM lowering normally removes the generated box for `contents`.
         // Synthetic Component trees can still reach this conversion path.
         WDisplay::Contents => (
@@ -1377,6 +2046,23 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             },
         ),
     };
+    let margin = if s.display == WDisplay::TableCell {
+        // CSS table-cell boxes do not accept margins. Taffy's flex fallback
+        // would otherwise add those margins to column and row sizing.
+        Rect {
+            top: LengthPercentageAuto::length(0.0),
+            right: LengthPercentageAuto::length(0.0),
+            bottom: LengthPercentageAuto::length(0.0),
+            left: LengthPercentageAuto::length(0.0),
+        }
+    } else {
+        Rect {
+            top: to_taffy_margin(s.margin.top, s.font_size, viewport_w, viewport_h),
+            right: to_taffy_margin(s.margin.right, s.font_size, viewport_w, viewport_h),
+            bottom: to_taffy_margin(s.margin.bottom, s.font_size, viewport_w, viewport_h),
+            left: to_taffy_margin(s.margin.left, s.font_size, viewport_w, viewport_h),
+        }
+    };
 
     Style {
         display,
@@ -1388,11 +2074,11 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             WPos::Static | WPos::Relative | WPos::Sticky => taffy::Position::Relative,
             WPos::Absolute | WPos::Fixed => taffy::Position::Absolute,
         },
-        flex_direction: match s.flex_direction {
-            WDir::Row => FlexDirection::Row,
-            WDir::Column => FlexDirection::Column,
-            WDir::RowReverse => FlexDirection::RowReverse,
-            WDir::ColumnReverse => FlexDirection::ColumnReverse,
+        flex_direction: match (s.display, s.flex_direction) {
+            (WDisplay::TableRow, _) | (_, WDir::Row) => FlexDirection::Row,
+            (_, WDir::Column) => FlexDirection::Column,
+            (_, WDir::RowReverse) => FlexDirection::RowReverse,
+            (_, WDir::ColumnReverse) => FlexDirection::ColumnReverse,
         },
         justify_content: Some(match s.justify_content {
             WJustify::FlexStart => JustifyContent::FlexStart,
@@ -1427,10 +2113,10 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
         flex_shrink,
         flex_basis: to_taffy_dim(s.flex_basis, s.font_size, viewport_w, viewport_h),
         inset: Rect {
-            top: to_taffy_auto(s.top, s.font_size, viewport_w, viewport_h),
-            right: to_taffy_auto(s.right, s.font_size, viewport_w, viewport_h),
-            bottom: to_taffy_auto(s.bottom, s.font_size, viewport_w, viewport_h),
-            left: to_taffy_auto(s.left, s.font_size, viewport_w, viewport_h),
+            top: to_taffy_inset(s.top, s.position, s.font_size, viewport_w, viewport_h),
+            right: to_taffy_inset(s.right, s.position, s.font_size, viewport_w, viewport_h),
+            bottom: to_taffy_inset(s.bottom, s.position, s.font_size, viewport_w, viewport_h),
+            left: to_taffy_inset(s.left, s.position, s.font_size, viewport_w, viewport_h),
         },
         gap: Size {
             width: LengthPercentage::length(s.column_gap.unwrap_or(s.gap)),
@@ -1448,12 +2134,7 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             bottom: LengthPercentage::length(s.border_bottom_width.unwrap_or(s.border_width)),
             left: LengthPercentage::length(s.border_left_width.unwrap_or(s.border_width)),
         },
-        margin: Rect {
-            top: to_taffy_margin(s.margin.top, s.font_size, viewport_w, viewport_h),
-            right: to_taffy_margin(s.margin.right, s.font_size, viewport_w, viewport_h),
-            bottom: to_taffy_margin(s.margin.bottom, s.font_size, viewport_w, viewport_h),
-            left: to_taffy_margin(s.margin.left, s.font_size, viewport_w, viewport_h),
-        },
+        margin,
         overflow: taffy::Point {
             x: to_taffy_overflow(s.resolved_overflow_x()),
             y: to_taffy_overflow(s.resolved_overflow_y()),
@@ -1730,6 +2411,20 @@ fn to_taffy_auto(
         WDim::Em(v) => LengthPercentageAuto::length(v * local_font_size),
         WDim::Vw(v) => LengthPercentageAuto::length(v * viewport_w / 100.0),
         WDim::Vh(v) => LengthPercentageAuto::length(v * viewport_h / 100.0),
+    }
+}
+
+fn to_taffy_inset(
+    dimension: WDim,
+    position: WPos,
+    local_font_size: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> LengthPercentageAuto {
+    if matches!(position, WPos::Relative) && matches!(dimension, WDim::Percent(_)) {
+        LengthPercentageAuto::auto()
+    } else {
+        to_taffy_auto(dimension, local_font_size, viewport_w, viewport_h)
     }
 }
 
@@ -2021,6 +2716,299 @@ mod tests {
         let l = compute(&Component::text("R", s()), 800.0, 600.0).unwrap();
         assert_eq!(l[0].0.x, 0.0);
         assert_eq!(l[0].0.y, 0.0);
+    }
+
+    #[test]
+    fn root_left_auto_margin_uses_the_initial_containing_block() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                margin: w3cos_std::style::Edges {
+                    left: WSpacing::Auto,
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..Style::default()
+            },
+            vec![Component::text("root", s())],
+        );
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[0].0.x, 700.0);
+        assert_eq!(layout[1].0.x, 700.0);
+    }
+
+    #[test]
+    fn positioned_percentage_sizes_use_their_css_containing_blocks() {
+        let style = Style {
+            position: WPos::Absolute,
+            left: WDim::Px(0.0),
+            top: WDim::Px(0.0),
+            width: WDim::Percent(100.0),
+            height: WDim::Percent(100.0),
+            ..Style::default()
+        };
+        let containing_block = LayoutRect {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 80.0,
+        };
+        let absolute = compute_absolute_rect(
+            &style,
+            containing_block,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
+            800.0,
+            600.0,
+        );
+        assert_eq!(absolute, containing_block);
+
+        let fixed = compute_fixed_rect(&style, 800.0, 600.0, 0.0, 0.0);
+        assert_eq!((fixed.width, fixed.height), (800.0, 600.0));
+    }
+
+    #[test]
+    fn auto_inset_absolute_inline_uses_the_preceding_inline_static_position() {
+        let text_style = Style {
+            display: WDisp::Inline,
+            font_size: 10.0,
+            line_height: 10.0,
+            ..Style::default()
+        };
+        let expected_x = text_intrinsic_size("12345", &text_style).0;
+        let absolute = Component::text(
+            "span",
+            Style {
+                display: WDisp::Inline,
+                position: WPos::Absolute,
+                font_size: 10.0,
+                line_height: 10.0,
+                ..Style::default()
+            },
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                width: WDim::Px(100.0),
+                border_width: 1.0,
+                ..Style::default()
+            },
+            vec![Component::text("12345", text_style), absolute],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[2].0.x - layout[0].0.x - 1.0, expected_x);
+        assert_eq!(layout[2].0.y - layout[0].0.y - 1.0, 0.0);
+    }
+
+    #[test]
+    fn vertical_percentage_padding_uses_the_containing_block_width() {
+        let child = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                height: WDim::Px(50.0),
+                padding: w3cos_std::style::Edges {
+                    top: WSpacing::Percent(10.0),
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(500.0),
+                ..Style::default()
+            },
+            vec![child],
+        );
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!((layout[1].0.width, layout[1].0.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn relative_positioned_descendant_contributes_to_scroll_extent() {
+        let child = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                top: WDim::Percent(100.0),
+                width: WDim::Px(100.0),
+                height: WDim::Px(100.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                overflow: WOverflow::Hidden,
+                width: WDim::Px(200.0),
+                height: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![child],
+        );
+
+        let (layouts, scrollable, _) = compute_with_scroll(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layouts[1].0.y, 200.0);
+        assert_eq!(scrollable.len(), 1);
+        assert_eq!(scrollable[0].2.max_y, 100.0);
+    }
+
+    #[test]
+    fn relative_percentage_top_is_auto_for_an_auto_height_containing_block() {
+        let child = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                top: WDim::Percent(50.0),
+                width: WDim::Px(100.0),
+                height: WDim::Px(100.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                ..Style::default()
+            },
+            vec![child],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[1].0.y, layout[0].0.y);
+    }
+
+    #[test]
+    fn absolute_auto_height_with_opposing_insets_is_definite_for_relative_percentages() {
+        let child = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                top: WDim::Percent(100.0),
+                width: WDim::Px(100.0),
+                height: WDim::Px(100.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let scroller = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Absolute,
+                top: WDim::Px(0.0),
+                right: WDim::Px(0.0),
+                bottom: WDim::Px(0.0),
+                left: WDim::Px(0.0),
+                overflow: WOverflow::Hidden,
+                ..Style::default()
+            },
+            vec![child],
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                width: WDim::Px(200.0),
+                height: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![scroller],
+        );
+
+        let (layouts, scrollable, _) = compute_with_scroll(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layouts[2].0.y, 200.0);
+        assert_eq!(scrollable.len(), 1);
+        assert_eq!(scrollable[0].2.max_y, 100.0);
+    }
+
+    #[test]
+    fn anonymous_inline_line_items_preserve_negative_margin_wrapping() {
+        use w3cos_dom::{Document, stylesheet};
+
+        fn image(document: &mut Document, width_class: &str, margin_class: Option<&str>) -> w3cos_dom::Element {
+            let image = document.create_element("img");
+            image.class_list_add(document, width_class);
+            if let Some(margin_class) = margin_class {
+                image.class_list_add(document, margin_class);
+            }
+            image
+        }
+
+        fn host_height(
+            flat: &[FlatNodeInfo<'_>],
+            layout: &[(LayoutRect, usize)],
+            host_id: u64,
+        ) -> f32 {
+            let index = flat
+                .iter()
+                .position(|node| {
+                    matches!(node.on_click, EventAction::NativeHost { id, .. } if *id == host_id)
+                })
+                .expect("native host component");
+            layout
+                .iter()
+                .find_map(|(rect, candidate)| (*candidate == index).then_some(rect.height))
+                .expect("native host layout")
+        }
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule(
+            ".line",
+            &[
+                ("width", "40px"),
+                ("font-size", "10px"),
+                ("line-height", "1"),
+            ],
+        );
+        stylesheet::register_rule("img", &[("height", "6px")]);
+        stylesheet::register_rule(".w1", &[("width", "1ch")]);
+        stylesheet::register_rule(".w2", &[("width", "2ch")]);
+        stylesheet::register_rule(".w4", &[("width", "4ch")]);
+        stylesheet::register_rule(".neg1", &[("margin-left", "-1ch")]);
+
+        let mut document = Document::new();
+        let one_line = document.create_element("div");
+        one_line.class_list_add(&mut document, "line");
+        let first = image(&mut document, "w4", None);
+        let second = image(&mut document, "w1", Some("neg1"));
+        one_line.append_child(&mut document, first);
+        one_line.append_child(&mut document, second);
+
+        let two_lines = document.create_element("div");
+        two_lines.class_list_add(&mut document, "line");
+        let first = image(&mut document, "w4", None);
+        let second = image(&mut document, "w2", Some("neg1"));
+        two_lines.append_child(&mut document, first);
+        two_lines.append_child(&mut document, second);
+
+        document.body().append_child(&mut document, one_line);
+        document.body().append_child(&mut document, two_lines);
+
+        let component = document.to_component_tree();
+        let flat = pre_flatten(&component);
+        let layout = compute(&component, 800.0, 600.0).unwrap();
+        assert_eq!(
+            host_height(&flat, &layout, one_line.id.as_u32() as u64),
+            10.0,
+            "40px + (10px - 10px) stays on one 10px line: {component:#?}"
+        );
+        assert_eq!(
+            host_height(&flat, &layout, two_lines.id.as_u32() as u64),
+            20.0,
+            "40px + (20px - 10px) wraps to two 10px lines: {component:#?}"
+        );
+        stylesheet::clear_rules();
     }
 
     #[test]
@@ -2327,6 +3315,18 @@ mod tests {
         .unwrap();
         let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!((image.width, image.height), (4.0, 2.0));
+        crate::image_loader::invalidate(source);
+    }
+
+    #[test]
+    fn broken_browser_image_does_not_use_the_legacy_placeholder_size() {
+        let source = "missing-generated-image.png";
+        crate::image_loader::reserve_browser_source(source);
+        let kind = ComponentKind::Image {
+            src: source.to_string(),
+        };
+
+        assert_eq!(leaf_intrinsic_size(&kind, &Style::default()), (0.0, 0.0));
         crate::image_loader::invalidate(source);
     }
 
@@ -2762,6 +3762,88 @@ mod tests {
     }
 
     #[test]
+    fn inline_content_box_text_counts_padding_once() {
+        let style = Style {
+            display: WDisp::Inline,
+            box_sizing: WBoxSizing::ContentBox,
+            padding: w3cos_std::style::Edges::xy(16.0, 0.0),
+            white_space: WWhiteSpace::NoWrap,
+            ..Style::default()
+        };
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(300.0),
+                    ..Style::default()
+                },
+                vec![Component::text("This test has failed.", style.clone())],
+            ),
+            300.0,
+            200.0,
+        )
+        .unwrap();
+        let box_width = layout[1].0.width;
+        let content_width = text_intrinsic_size(
+            "This test has failed.",
+            &Style {
+                padding: w3cos_std::style::Edges::ZERO,
+                ..style.clone()
+            },
+        )
+        .0;
+        let horizontal_padding = style.padding_lengths().left + style.padding_lengths().right;
+
+        assert!(
+            (box_width - content_width - horizontal_padding).abs() < 1.0,
+            "content-box inline width should include its padding exactly once, got {box_width} for content {content_width}"
+        );
+    }
+
+    #[test]
+    fn normal_inline_content_box_text_counts_padding_once() {
+        let base = Style {
+            display: WDisp::Inline,
+            box_sizing: WBoxSizing::ContentBox,
+            white_space: WWhiteSpace::Normal,
+            ..Style::default()
+        };
+        let padded = Style {
+            padding: w3cos_std::style::Edges {
+                top: w3cos_std::style::Spacing::Px(0.0),
+                right: w3cos_std::style::Spacing::Px(16.0),
+                bottom: w3cos_std::style::Spacing::Px(0.0),
+                left: w3cos_std::style::Spacing::Px(0.0),
+            },
+            ..base.clone()
+        };
+        let width = |style: Style| {
+            compute(
+                &Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        width: WDim::Px(300.0),
+                        ..Style::default()
+                    },
+                    vec![Component::text("This test has failed.", style)],
+                ),
+                300.0,
+                200.0,
+            )
+            .unwrap()[1]
+                .0
+                .width
+        };
+
+        let content_width = width(base);
+        let padded_width = width(padded);
+        assert!(
+            (padded_width - content_width - 16.0).abs() < 1.0,
+            "normal inline padding should contribute once, got {content_width} -> {padded_width}"
+        );
+    }
+
+    #[test]
     fn inline_flex_badge_shrink_wraps_like_browser_css() {
         let style = Style {
             display: WDisp::InlineFlex,
@@ -2915,6 +3997,627 @@ mod tests {
             text_rect.height > 22.0,
             "inline CJK text should wrap inside the containing block"
         );
+    }
+
+    #[test]
+    fn preformatted_block_text_fills_its_containing_block_width() {
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(240.0),
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    "Line 1\nLine 2",
+                    Style {
+                        display: WDisp::Block,
+                        white_space: WWhiteSpace::Pre,
+                        ..Style::default()
+                    },
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        let text_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(text_rect.width, 240.0);
+    }
+
+    #[test]
+    fn inline_flex_text_wrapper_shrink_fits_inside_a_block() {
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(300.0),
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::InlineFlex,
+                        padding: w3cos_std::style::Edges::xy(16.0, 0.0),
+                        ..Style::default()
+                    },
+                    vec![
+                        Component::text("This test has failed.", Style::default()),
+                        Component::text("\u{00a0}\u{00a0}", Style::default()),
+                    ],
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        let wrapper = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert!(
+            wrapper.width < 300.0,
+            "inline flex wrapper must shrink-fit, got {wrapper:?}"
+        );
+        assert!(
+            wrapper.width > 150.0,
+            "wrapper lost its text width: {wrapper:?}"
+        );
+    }
+
+    #[test]
+    fn block_flow_places_a_generated_inline_line_directly_before_a_block_text_leaf() {
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisplay::Block,
+                    flex_direction: WDir::Row,
+                    margin: w3cos_std::style::Edges::all(8.0),
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisplay::Block,
+                        flex_direction: WDir::Row,
+                        border_width: 2.0,
+                        ..Style::default()
+                    },
+                    vec![
+                        Component::text(
+                            "0",
+                            Style {
+                                display: WDisplay::Inline,
+                                flex_direction: WDir::Row,
+                                ..Style::default()
+                            },
+                        ),
+                        Component::text(
+                            "0.0",
+                            Style {
+                                display: WDisplay::Block,
+                                flex_direction: WDir::Row,
+                                ..Style::default()
+                            },
+                        ),
+                    ],
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        let first = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let second = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        let expected_line_height = 16.0 * 1.2;
+        assert!(
+            (first.height - expected_line_height).abs() < 0.01
+                && (second.height - expected_line_height).abs() < 0.01,
+            "generated Latin line boxes should use CSS line-height {expected_line_height}: first={first:?}, second={second:?}"
+        );
+        assert!(
+            (second.y - (first.y + first.height)).abs() < 0.01,
+            "block child should follow the anonymous generated line without a gap: first={first:?}, second={second:?}"
+        );
+    }
+
+    #[test]
+    fn coalesced_generated_nowrap_line_contributes_to_following_block_flow() {
+        use w3cos_dom::{Document, stylesheet};
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule("body", &[("white-space", "nowrap")]);
+        stylesheet::register_rule("#test", &[("counter-reset", "item")]);
+        stylesheet::register_rule("#test span", &[("counter-increment", "item")]);
+        stylesheet::register_rule("#test span::before", &[("content", "counter(item)")]);
+
+        let mut document = Document::new();
+        let generated_line = document.create_element("div");
+        generated_line.set_attribute(&mut document, "id", "test");
+        for _ in 0..3 {
+            let span = document.create_element("span");
+            generated_line.append_child(&mut document, span);
+        }
+        let reference_line = document.create_element("div");
+        let reference_text = document.create_text_node("1 2 3");
+        reference_line.append_child(&mut document, reference_text);
+        document.body().append_child(&mut document, generated_line);
+        document.body().append_child(&mut document, reference_line);
+
+        let component = document.to_component_tree();
+        let layout = compute(&component, 800.0, 600.0).unwrap();
+        let first = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let second = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert!(
+            second.y >= first.y + first.height - 0.01,
+            "generated line must advance the next block: first={first:?}, second={second:?}, component={component:#?}"
+        );
+        stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn anonymous_inline_text_fragments_keep_their_intrinsic_row_widths() {
+        use w3cos_dom::{Document, stylesheet};
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule("span", &[("color", "green")]);
+
+        let mut document = Document::new();
+        let table = document.create_element("table");
+        let row = document.create_element("tr");
+        let cell = document.create_element("td");
+        let label = document.create_text_node("(Control: ");
+        let span = document.create_element("span");
+        let result = document.create_text_node("PASSED)");
+        span.append_child(&mut document, result);
+        cell.append_child(&mut document, label);
+        cell.append_child(&mut document, span);
+        row.append_child(&mut document, cell);
+        table.append_child(&mut document, row);
+        document.body().append_child(&mut document, table);
+
+        let component = document.to_component_tree();
+        let layout = compute(&component, 800.0, 600.0).unwrap();
+        let flat = pre_flatten(&component);
+        let text_index = |expected: &str| {
+            flat.iter()
+                .position(|node| {
+                    matches!(node.kind, ComponentKind::Text { content } if content == expected)
+                })
+                .expect("text component")
+        };
+        let label_index = text_index("(Control: ");
+        let result_index = text_index("PASSED)");
+        let label = layout
+            .iter()
+            .find(|(_, index)| *index == label_index)
+            .unwrap()
+            .0;
+        let result = layout
+            .iter()
+            .find(|(_, index)| *index == result_index)
+            .unwrap()
+            .0;
+        let expected_label_width = text_intrinsic_size("(Control: ", &Style::default()).0;
+        assert!(
+            label.width >= expected_label_width - 0.01,
+            "the first inline fragment must not be shrunk by its sibling: label={label:?}, result={result:?}, expected_label_width={expected_label_width}, component={component:#?}"
+        );
+        assert!(
+            result.x >= label.x + label.width - 0.01,
+            "inline fragments must remain adjacent without overlap: label={label:?}, result={result:?}"
+        );
+        stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn auto_width_css_table_shrink_wraps_its_rows() {
+        let cell = |label: &str| {
+            Component::text(
+                label,
+                Style {
+                    display: WDisp::TableCell,
+                    background: Color::WHITE,
+                    border_width: 3.0,
+                    border_color: Color::WHITE,
+                    ..Style::default()
+                },
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                background: Color::rgb(255, 0, 0),
+                ..Style::default()
+            },
+            vec![
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![cell("P"), cell("A"), cell("S"), cell("S")],
+                ),
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![cell("P"), cell("A"), cell("S"), cell("S")],
+                ),
+            ],
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(800.0),
+                ..Style::default()
+            },
+            vec![table],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let table = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let final_cell = layout.iter().find(|(_, index)| *index == 6).unwrap().0;
+        assert!(
+            table.width < 100.0,
+            "auto table should shrink-wrap instead of stretching: {table:?}"
+        );
+        assert!(
+            final_cell.x + final_cell.width <= table.x + table.width + 0.01,
+            "the table max-content width must include cell borders: table={table:?}, final_cell={final_cell:?}"
+        );
+    }
+
+    #[test]
+    fn inline_table_with_direct_inline_content_uses_the_full_row_width() {
+        let inline_table = Component::row(
+            Style {
+                display: WDisp::InlineTable,
+                ..Style::default()
+            },
+            vec![
+                Component::text("1", Style::default()),
+                Component::text("Before inline-table", Style::default()),
+            ],
+        );
+        let expected = inline_table
+            .children
+            .iter()
+            .map(component_max_content_width)
+            .sum::<f32>();
+
+        assert!(
+            (shrink_to_fit_used_width(&inline_table) - expected).abs() < 0.01,
+            "direct generated inline-table content must aggregate as one row"
+        );
+    }
+
+    #[test]
+    fn auto_width_css_table_caps_max_content_at_its_containing_block() {
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    "A table cell whose max-content width is wider than its containing block",
+                    Style {
+                        display: WDisp::TableCell,
+                        ..Style::default()
+                    },
+                )],
+            )],
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(120.0),
+                ..Style::default()
+            },
+            vec![table],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let table = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert!(
+            table.width <= 120.01,
+            "auto table must not exceed its containing block: {table:?}"
+        );
+    }
+
+    #[test]
+    fn table_cell_margins_do_not_participate_in_row_layout() {
+        let plain_cell = Component::text(
+            "left",
+            Style {
+                display: WDisp::TableCell,
+                ..Style::default()
+            },
+        );
+        let margined_cell = Component::text(
+            "left",
+            Style {
+                display: WDisp::TableCell,
+                margin: w3cos_std::style::Edges::all(5.0),
+                ..Style::default()
+            },
+        );
+        assert_eq!(
+            component_max_content_width(&plain_cell),
+            component_max_content_width(&margined_cell),
+            "table-cell margins must not affect max-content column sizing"
+        );
+
+        let cell = |label: &str| {
+            Component::text(
+                label,
+                Style {
+                    display: WDisp::TableCell,
+                    margin: w3cos_std::style::Edges::all(5.0),
+                    ..Style::default()
+                },
+            )
+        };
+        let row = Component::row(
+            Style {
+                display: WDisp::TableRow,
+                width: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![cell("left"), cell("right")],
+        );
+
+        let layout = compute(&row, 200.0, 100.0).unwrap();
+        let first = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!(first.x, 0.0);
+        assert!(
+            (second.x - first.x - first.width).abs() < 0.01,
+            "table-cell margins must not create a gap: first={first:?}, second={second:?}"
+        );
+    }
+
+    #[test]
+    fn shrink_to_fit_width_excludes_inline_margins() {
+        let plain = Component::boxed(
+            Style {
+                display: WDisp::Inline,
+                ..Style::default()
+            },
+            vec![Component::text("inline", Style::default())],
+        );
+        let margined = Component::boxed(
+            Style {
+                display: WDisp::Inline,
+                margin: w3cos_std::style::Edges::all(10.0),
+                ..Style::default()
+            },
+            vec![Component::text("inline", Style::default())],
+        );
+        assert_eq!(
+            shrink_to_fit_used_width(&plain),
+            shrink_to_fit_used_width(&margined),
+            "margins sit outside an auto shrink-to-fit box"
+        );
+    }
+
+    #[test]
+    fn generated_css_table_cells_cover_the_shrink_wrapped_table() {
+        use w3cos_dom::{Document, stylesheet};
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule(".table", &[("display", "table"), ("background", "red")]);
+        stylesheet::register_rule(".row", &[("display", "table-row")]);
+        stylesheet::register_rule(
+            ".cell",
+            &[
+                ("display", "table-cell"),
+                ("background", "white"),
+                ("border", "solid white"),
+            ],
+        );
+        stylesheet::register_rule(
+            ".row.test::before",
+            &[
+                ("content", "'P'"),
+                ("display", "table-cell"),
+                ("background", "white"),
+                ("border", "solid white"),
+            ],
+        );
+        stylesheet::register_rule(
+            ".row.test::after",
+            &[
+                ("content", "'S'"),
+                ("display", "table-cell"),
+                ("background", "white"),
+                ("border", "solid white"),
+            ],
+        );
+
+        let mut document = Document::new();
+        let table = document.create_element("div");
+        table.class_list_add(&mut document, "table");
+        let first_row = document.create_element("div");
+        first_row.class_list_add(&mut document, "row");
+        for label in ["P", "A", "S", "S"] {
+            let whitespace = document.create_text_node("\n  ");
+            first_row.append_child(&mut document, whitespace);
+            let cell = document.create_element("div");
+            cell.class_list_add(&mut document, "cell");
+            let text = document.create_text_node(label);
+            cell.append_child(&mut document, text);
+            first_row.append_child(&mut document, cell);
+        }
+        let whitespace = document.create_text_node("\n  ");
+        first_row.append_child(&mut document, whitespace);
+        let second_row = document.create_element("div");
+        second_row.class_list_add(&mut document, "row");
+        second_row.class_list_add(&mut document, "test");
+        for label in ["A", "S"] {
+            let whitespace = document.create_text_node("\n  ");
+            second_row.append_child(&mut document, whitespace);
+            let cell = document.create_element("div");
+            cell.class_list_add(&mut document, "cell");
+            let text = document.create_text_node(label);
+            cell.append_child(&mut document, text);
+            second_row.append_child(&mut document, cell);
+        }
+        let whitespace = document.create_text_node("\n  ");
+        second_row.append_child(&mut document, whitespace);
+        table.append_child(&mut document, first_row);
+        table.append_child(&mut document, second_row);
+        document.body().append_child(&mut document, table);
+
+        let component = document.to_component_tree();
+        let flat = pre_flatten(&component);
+        let layout = compute(&component, 800.0, 600.0).unwrap();
+        let table_index = flat
+            .iter()
+            .position(|node| node.style.background == Color::rgb(255, 0, 0))
+            .expect("red table component");
+        let table = layout
+            .iter()
+            .find_map(|(rect, index)| (*index == table_index).then_some(*rect))
+            .expect("red table layout");
+        let cell_right = layout
+            .iter()
+            .filter(|(_, index)| {
+                flat[*index].style.display == WDisp::TableCell
+                    && flat[*index].style.background == Color::WHITE
+            })
+            .map(|(rect, _)| rect.x + rect.width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (table.x + table.width - cell_right).abs() < 0.01,
+            "table background must end at the last cell edge: table={table:?}, cell_right={cell_right}, component={component:#?}"
+        );
+        stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn absolute_generated_children_skip_static_hosts_for_their_containing_block() {
+        use w3cos_dom::{Document, stylesheet};
+
+        fn document_body(document: &mut Document) -> w3cos_dom::Element {
+            let html = document.create_element("html");
+            let head = document.create_element("head");
+            let body = document.create_element("body");
+            html.append_child(document, head);
+            html.append_child(document, body);
+            document.body().append_child(document, html);
+            document.set_render_body(body.id);
+            body
+        }
+
+        fn absolute_bounds(component: &Component) -> LayoutRect {
+            let absolute_indices = pre_flatten(component)
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    (node.style.position == WPos::Absolute).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let layout = compute(component, 800.0, 600.0).unwrap();
+            let rects = layout
+                .iter()
+                .filter_map(|(rect, index)| absolute_indices.contains(index).then_some(*rect))
+                .collect::<Vec<_>>();
+            LayoutRect {
+                x: rects
+                    .iter()
+                    .map(|rect| rect.x)
+                    .fold(f32::INFINITY, f32::min),
+                y: rects
+                    .iter()
+                    .map(|rect| rect.y)
+                    .fold(f32::INFINITY, f32::min),
+                width: rects
+                    .iter()
+                    .map(|rect| rect.x + rect.width)
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    - rects
+                        .iter()
+                        .map(|rect| rect.x)
+                        .fold(f32::INFINITY, f32::min),
+                height: rects
+                    .iter()
+                    .map(|rect| rect.y + rect.height)
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    - rects
+                        .iter()
+                        .map(|rect| rect.y)
+                        .fold(f32::INFINITY, f32::min),
+            }
+        }
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule(
+            "#test::before",
+            &[
+                ("content", "''"),
+                ("position", "absolute"),
+                ("right", "50px"),
+                ("bottom", "0"),
+                ("width", "50px"),
+                ("height", "100px"),
+                ("background", "blue"),
+            ],
+        );
+        stylesheet::register_rule(
+            "#test::after",
+            &[
+                ("content", "''"),
+                ("position", "absolute"),
+                ("right", "0"),
+                ("bottom", "0"),
+                ("width", "50px"),
+                ("height", "100px"),
+                ("background", "blue"),
+            ],
+        );
+        let mut actual_document = Document::new();
+        let actual_body = document_body(&mut actual_document);
+        let paragraph = actual_document.create_element("p");
+        let paragraph_text = actual_document.create_text_node("positioned");
+        paragraph.append_child(&mut actual_document, paragraph_text);
+        actual_body.append_child(&mut actual_document, paragraph);
+        let host = actual_document.create_element("div");
+        host.set_attribute(&mut actual_document, "id", "test");
+        actual_body.append_child(&mut actual_document, host);
+        let actual = actual_document.to_component_tree();
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule(
+            "#reference",
+            &[
+                ("position", "absolute"),
+                ("right", "0"),
+                ("bottom", "0"),
+                ("width", "100px"),
+                ("height", "100px"),
+                ("background", "blue"),
+            ],
+        );
+        let mut reference_document = Document::new();
+        let reference_body = document_body(&mut reference_document);
+        let paragraph = reference_document.create_element("p");
+        let paragraph_text = reference_document.create_text_node("positioned");
+        paragraph.append_child(&mut reference_document, paragraph_text);
+        reference_body.append_child(&mut reference_document, paragraph);
+        let reference_box = reference_document.create_element("div");
+        reference_box.set_attribute(&mut reference_document, "id", "reference");
+        reference_body.append_child(&mut reference_document, reference_box);
+        let reference = reference_document.to_component_tree();
+
+        let actual_bounds = absolute_bounds(&actual);
+        let reference_bounds = absolute_bounds(&reference);
+        assert_eq!(
+            actual_bounds, reference_bounds,
+            "static hosts must not become absolute containing blocks"
+        );
+        stylesheet::clear_rules();
     }
 
     #[test]
@@ -3430,6 +5133,18 @@ mod tests {
         let _ = wrapped_text_height("上海 → 杭州运输节点已更新", 280.0, &style);
         let entries = TEXT_MEASURE_CACHE.with(|cache| cache.borrow().entries);
         assert_eq!(entries, 3, "assigned width is part of the cache key");
+    }
+
+    #[cfg(feature = "skia")]
+    #[test]
+    fn shaped_intrinsic_width_does_not_create_a_second_paint_line() {
+        let style = Style {
+            font_size: 16.0,
+            line_height: 1.2,
+            ..Style::default()
+        };
+        let (width, height) = text_intrinsic_size("PASS", &style);
+        assert_eq!(wrapped_text_height("PASS", width, &style), height);
     }
 
     #[test]

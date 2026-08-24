@@ -67,9 +67,8 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use w3cos_core::Value;
-    use w3cos_dom::node::NodeId;
     use w3cos_runtime::dom;
-    use w3cos_runtime::jsdom::{document_value, node_id_of, reset_bridge};
+    use w3cos_runtime::jsdom::{document_value, reset_bridge};
 
     fn setup() {
         dom::reset_document();
@@ -84,17 +83,24 @@ mod tests {
         el
     }
 
+    fn set_layout_box(element: &Value, left: f32, top: f32, width: f32, height: f32) {
+        let style = element.get_property("style");
+        for (property, value) in [
+            ("position", "absolute".to_string()),
+            ("left", format!("{left}px")),
+            ("top", format!("{top}px")),
+            ("width", format!("{width}px")),
+            ("height", format!("{height}px")),
+        ] {
+            style.set_property(property, Value::string(&value));
+        }
+    }
+
     #[test]
     fn dispatch_hit_tests_layout_and_delivers_touch_lifecycle() {
         setup();
         let target = create_in_body("button");
-        let target_id = node_id_of(&target).unwrap();
-        dom::with_document_mut(|tree| {
-            tree.set_layout_rect(
-                NodeId::from_u32(target_id),
-                w3cos_dom::DOMRect::new(8.0, 16.0, 32.0, 24.0),
-            );
-        });
+        set_layout_box(&target, 8.0, 16.0, 32.0, 24.0);
         let log = Rc::new(RefCell::new(Vec::<String>::new()));
         for event_type in ["pointerdown", "touchstart", "pointerup", "touchend"] {
             let log = Rc::clone(&log);
@@ -153,13 +159,7 @@ mod tests {
     fn prevent_default_on_touchmove_is_reported() {
         setup();
         let target = create_in_body("div");
-        let target_id = node_id_of(&target).unwrap();
-        dom::with_document_mut(|tree| {
-            tree.set_layout_rect(
-                NodeId::from_u32(target_id),
-                w3cos_dom::DOMRect::new(0.0, 0.0, 50.0, 50.0),
-            );
-        });
+        set_layout_box(&target, 0.0, 0.0, 50.0, 50.0);
         target.call_method(
             "addEventListener",
             vec![

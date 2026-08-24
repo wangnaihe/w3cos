@@ -533,10 +533,8 @@ fn parse_at_rule(
                 block_str, path, warnings, rules, imports, font_faces, media, false,
             );
             for rule in &mut rules[first_nested_rule..] {
-                rule.declarations.push((
-                    "__w3cos_container_query".to_string(),
-                    prelude.clone(),
-                ));
+                rule.declarations
+                    .push(("__w3cos_container_query".to_string(), prelude.clone()));
             }
         }
         "font-face" => {
@@ -746,13 +744,34 @@ fn split_top_level(s: &str, sep: u8) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
     for ch in s.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            current.push(ch);
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
+            '\'' | '"' => quote = Some(ch),
+            '\\' => escaped = true,
             '(' => depth += 1,
             ')' => depth -= 1,
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth -= 1,
             _ => {}
         }
-        if ch == sep as char && depth == 0 {
+        if ch == sep as char && depth == 0 && bracket_depth == 0 {
             parts.push(std::mem::take(&mut current));
         } else {
             current.push(ch);
@@ -922,6 +941,26 @@ mod tests {
         );
         assert_eq!(sheet.rules.len(), 2);
     }
+
+    #[test]
+    fn quoted_semicolons_do_not_split_authored_declarations() {
+        let sheet = parse_css_source(
+            ".test::before { content: 'TEST &#x46;&#x41;&#x49;&#x4c;'; color: red; }",
+            "quoted-semicolon.css",
+        );
+
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![
+                (
+                    "content".to_string(),
+                    "'TEST &#x46;&#x41;&#x49;&#x4c;'".to_string(),
+                ),
+                ("color".to_string(), "red".to_string()),
+            ]
+        );
+    }
+
     use crate::esm_resolver::EsmResolver;
 
     fn write_fixture(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {

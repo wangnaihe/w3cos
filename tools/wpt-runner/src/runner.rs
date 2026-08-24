@@ -273,7 +273,9 @@ fn declares_long_timeout(source: &str) -> bool {
     source.split('>').any(|tag| {
         let normalized = tag
             .chars()
-            .filter(|character| !character.is_ascii_whitespace() && !matches!(character, '\'' | '"'))
+            .filter(|character| {
+                !character.is_ascii_whitespace() && !matches!(character, '\'' | '"')
+            })
             .flat_map(char::to_lowercase)
             .collect::<String>();
         normalized.contains("<meta")
@@ -361,7 +363,13 @@ fn load_document(url: &str, timeout: Duration, width: u32, height: u32) -> Resul
     // defaults here makes assertion-heavy WPT files fail before the harness
     // or isolated outer worker deadline.
     script_policy.limits.max_wall_time = Some(timeout);
-    script_policy.limits.max_instructions = 100_000_000;
+    // Some upstream `timeout=long` tests deliberately execute hundreds of
+    // millions of simple operations to exercise optimized collection paths.
+    // The isolated worker and VM wall-clock deadlines already provide the
+    // authoritative safety bound, so the instruction ceiling must stay above
+    // those valid workloads instead of turning them into false conformance
+    // failures.
+    script_policy.limits.max_instructions = u64::MAX;
     let max_heap_mib = std::env::var("W3COS_WPT_MAX_HEAP_MIB")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())

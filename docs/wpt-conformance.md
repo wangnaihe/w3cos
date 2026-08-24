@@ -134,6 +134,12 @@ revision, or viewport mismatches.
   offscreen output deterministic instead of depending on a host font.
 - Both fuzzy dimensions are enforced: maximum per-channel difference and
   total differing pixels.
+- The legacy CSS2 `content-177` overlay reftest receives a path-scoped
+  `55 / 5,000` allowance during discovery. Its test paints the same
+  antialiased glyph red and then green while the reference paints green once;
+  Chrome at the pinned 800x600 corpus revision also differs by 55 / 4,712.
+  All other discovered cases remain strict unless upstream fuzzy metadata is
+  explicitly represented by the suite manifest.
 
 ## Current boundary
 

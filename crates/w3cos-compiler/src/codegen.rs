@@ -783,6 +783,17 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
             "inline" => "Display::Inline",
             "inline-block" => "Display::InlineBlock",
             "inline-flex" => "Display::InlineFlex",
+            "table" => "Display::Table",
+            "inline-table" => "Display::InlineTable",
+            "table-row-group" => "Display::TableRowGroup",
+            "table-header-group" => "Display::TableHeaderGroup",
+            "table-footer-group" => "Display::TableFooterGroup",
+            "table-row" => "Display::TableRow",
+            "table-column-group" => "Display::TableColumnGroup",
+            "table-column" => "Display::TableColumn",
+            "table-cell" => "Display::TableCell",
+            "table-caption" => "Display::TableCaption",
+            "list-item" => "Display::ListItem",
             "none" => "Display::None",
             _ => "Display::Flex",
         };
@@ -812,6 +823,14 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
             _ => "Position::Static",
         };
         fields.push(format!("position: {variant}"));
+    }
+    if let Some(ref value) = s.float {
+        let variant = match value.as_str() {
+            "left" => "Float::Left",
+            "right" => "Float::Right",
+            _ => "Float::None",
+        };
+        fields.push(format!("float: {variant}"));
     }
     if let Some(ref ov) = s.overflow {
         fields.push(format!("overflow: {}", gen_overflow(ov)));
@@ -1503,6 +1522,9 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     if let Some(ref p) = style.position {
         out.push_str(&sp("position", p));
     }
+    if let Some(ref value) = style.float {
+        out.push_str(&sp("float", value));
+    }
     if let Some(ref ov) = style.overflow {
         out.push_str(&sp("overflow", ov));
     }
@@ -1684,6 +1706,18 @@ mod tests {
         assert!(rust.contains("Component::text(\"hello\""));
         assert!(rust.contains("fn build_ui()"));
         assert!(rust.contains("w3cos_runtime::run_app"));
+    }
+
+    #[test]
+    fn codegen_emits_typed_float_style() {
+        let style = StyleDecl {
+            float: Some("right".into()),
+            ..StyleDecl::default()
+        };
+        let mut node = test_node(NodeKind::Text("float".into()), style);
+        node.text = Some("float".into());
+        let rust = generate(&test_tree(node), &empty_sheet()).unwrap();
+        assert!(rust.contains("float: Float::Right"), "{rust}");
     }
 
     #[test]

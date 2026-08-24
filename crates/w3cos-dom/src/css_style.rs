@@ -1,7 +1,7 @@
 use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
-    AlignItems, BoxSizing, Contain, Dimension, Display, Edges, FlexDirection, FlexWrap,
+    AlignItems, BoxSizing, Contain, Dimension, Display, Edges, FlexDirection, FlexWrap, Float,
     JustifyContent, Overflow, Position, Spacing, Style, WillChange,
 };
 
@@ -44,6 +44,7 @@ impl CSSStyleDeclaration {
         match name {
             "display" => self.inner.display = parse_display(value),
             "position" => self.inner.position = parse_position(value),
+            "float" | "cssFloat" => self.inner.float = parse_float(value),
 
             "flex-direction" | "flexDirection" => {
                 self.inner.flex_direction = parse_flex_direction(value)
@@ -77,64 +78,64 @@ impl CSSStyleDeclaration {
             "row-gap" | "rowGap" => self.inner.row_gap = parse_px(value),
             "column-gap" | "columnGap" => self.inner.column_gap = parse_px(value),
             "padding" => {
-                if let Some(edges) = parse_edge_shorthand(value) {
+                if let Some(edges) = parse_padding_shorthand(value) {
                     self.inner.padding = edges
                 }
             }
             "padding-top" | "paddingTop" => {
-                if let Some(v) = parse_edge_spacing(value) {
+                if let Some(v) = parse_padding_spacing(value) {
                     self.inner.padding.top = v
                 }
             }
             "padding-right" | "paddingRight" => {
-                if let Some(v) = parse_edge_spacing(value) {
+                if let Some(v) = parse_padding_spacing(value) {
                     self.inner.padding.right = v
                 }
             }
             "padding-bottom" | "paddingBottom" => {
-                if let Some(v) = parse_edge_spacing(value) {
+                if let Some(v) = parse_padding_spacing(value) {
                     self.inner.padding.bottom = v
                 }
             }
             "padding-left" | "paddingLeft" => {
-                if let Some(v) = parse_edge_spacing(value) {
+                if let Some(v) = parse_padding_spacing(value) {
                     self.inner.padding.left = v
                 }
             }
             "padding-inline" | "paddingInline" => {
                 let values = split_css_whitespace(value);
-                if let Some(start) = values.first().and_then(|value| parse_edge_spacing(value)) {
+                if let Some(start) = values.first().and_then(|value| parse_padding_spacing(value)) {
                     let end = values
                         .get(1)
-                        .and_then(|value| parse_edge_spacing(value))
+                        .and_then(|value| parse_padding_spacing(value))
                         .unwrap_or(start);
                     self.inner.padding.left = start;
                     self.inner.padding.right = end;
                 }
             }
             "padding-inline-start" | "paddingInlineStart" => {
-                if let Some(v) = parse_edge_spacing(value) {
+                if let Some(v) = parse_padding_spacing(value) {
                     self.inner.padding.left = v
                 }
             }
             "padding-inline-end" | "paddingInlineEnd" => {
-                if let Some(v) = parse_edge_spacing(value) {
+                if let Some(v) = parse_padding_spacing(value) {
                     self.inner.padding.right = v
                 }
             }
             "padding-block" | "paddingBlock" => {
                 let values = split_css_whitespace(value);
-                if let Some(start) = values.first().and_then(|value| parse_edge_spacing(value)) {
+                if let Some(start) = values.first().and_then(|value| parse_padding_spacing(value)) {
                     let end = values
                         .get(1)
-                        .and_then(|value| parse_edge_spacing(value))
+                        .and_then(|value| parse_padding_spacing(value))
                         .unwrap_or(start);
                     self.inner.padding.top = start;
                     self.inner.padding.bottom = end;
                 }
             }
             "margin" => {
-                if let Some(edges) = parse_edge_shorthand(value) {
+                if let Some(edges) = parse_margin_shorthand(value) {
                     self.inner.margin = edges
                 }
             }
@@ -335,6 +336,15 @@ impl CSSStyleDeclaration {
             "border-left-width" | "borderLeftWidth" => {
                 self.inner.border_left_width = parse_px(value)
             }
+            "border-style" | "borderStyle" => {
+                if let Some(visible) = parse_border_style_visibility(value) {
+                    self.inner.border_width = if visible {
+                        self.declared_uniform_border_width().unwrap_or(3.0)
+                    } else {
+                        0.0
+                    };
+                }
+            }
             "border-inline-width" | "borderInlineWidth" => {
                 let values = split_css_whitespace(value);
                 if let Some(start) = values.first().and_then(|value| parse_px(value)) {
@@ -494,6 +504,14 @@ impl CSSStyleDeclaration {
                 }
             }
             "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
+            "vertical-align" | "verticalAlign" => {
+                self.inner.align_self = match value.trim() {
+                    "top" | "text-top" => w3cos_std::style::AlignSelf::FlexStart,
+                    "bottom" | "text-bottom" => w3cos_std::style::AlignSelf::FlexEnd,
+                    "middle" => w3cos_std::style::AlignSelf::Center,
+                    _ => w3cos_std::style::AlignSelf::Baseline,
+                }
+            }
             "align-content" | "alignContent" => {
                 self.inner.align_content = parse_align_content(value)
             }
@@ -539,10 +557,32 @@ impl CSSStyleDeclaration {
                 Display::Inline => "inline".to_string(),
                 Display::InlineBlock => "inline-block".to_string(),
                 Display::InlineFlex => "inline-flex".to_string(),
+                Display::Table => "table".to_string(),
+                Display::InlineTable => "inline-table".to_string(),
+                Display::TableRowGroup => "table-row-group".to_string(),
+                Display::TableHeaderGroup => "table-header-group".to_string(),
+                Display::TableFooterGroup => "table-footer-group".to_string(),
+                Display::TableRow => "table-row".to_string(),
+                Display::TableColumnGroup => "table-column-group".to_string(),
+                Display::TableColumn => "table-column".to_string(),
+                Display::TableCell => "table-cell".to_string(),
+                Display::TableCaption => "table-caption".to_string(),
+                Display::ListItem => "list-item".to_string(),
                 Display::Contents => "contents".to_string(),
                 Display::None => "none".to_string(),
             },
             "position" => format!("{:?}", self.inner.position).to_lowercase(),
+            "float" | "cssFloat" => match self.inner.float {
+                Float::None => "none".to_string(),
+                Float::Left => "left".to_string(),
+                Float::Right => "right".to_string(),
+            },
+            "vertical-align" | "verticalAlign" => match self.inner.align_self {
+                w3cos_std::style::AlignSelf::FlexStart => "top".to_string(),
+                w3cos_std::style::AlignSelf::FlexEnd => "bottom".to_string(),
+                w3cos_std::style::AlignSelf::Center => "middle".to_string(),
+                _ => "baseline".to_string(),
+            },
             "font-size" | "fontSize" => format!("{}px", self.inner.font_size),
             "color" => format!(
                 "#{:02x}{:02x}{:02x}",
@@ -650,6 +690,25 @@ impl CSSStyleDeclaration {
     pub fn to_style(&self) -> Style {
         self.inner.clone()
     }
+
+    fn declared_uniform_border_width(&self) -> Option<f32> {
+        self.inline_declarations
+            .iter()
+            .rev()
+            .find_map(|(name, value)| {
+                if matches!(name.as_str(), "border-width" | "borderWidth") {
+                    split_css_whitespace(value)
+                        .first()
+                        .and_then(|part| parse_px(part))
+                } else if name == "border" {
+                    split_css_whitespace(value)
+                        .iter()
+                        .find_map(|part| parse_px(part))
+                } else {
+                    None
+                }
+            })
+    }
 }
 
 fn css_background_value(value: &str, initial: &str) -> Option<String> {
@@ -675,7 +734,7 @@ fn apply_background_shorthand(style: &mut Style, value: &str) {
     style.background_blend_mode = None;
 }
 
-fn parse_edge_spacing(value: &str) -> Option<Spacing> {
+fn parse_padding_spacing(value: &str) -> Option<Spacing> {
     let value = value.trim();
     let environments = [
         ("env(safe-area-inset-top)", SafeAreaEdge::Top),
@@ -729,7 +788,18 @@ fn parse_edge_spacing(value: &str) -> Option<Spacing> {
             }
         }
     }
-    parse_spacing(value)
+    let spacing = parse_spacing(value)?;
+    match spacing {
+        Spacing::Px(value)
+        | Spacing::Percent(value)
+        | Spacing::Rem(value)
+        | Spacing::Em(value)
+        | Spacing::Vw(value)
+        | Spacing::Vh(value)
+            if value < 0.0 => None,
+        Spacing::Auto => None,
+        _ => Some(spacing),
+    }
 }
 
 fn split_top_level_once(value: &str, separator: char) -> Option<(&str, &str)> {
@@ -747,12 +817,24 @@ fn split_top_level_once(value: &str, separator: char) -> Option<(&str, &str)> {
     None
 }
 
-fn parse_edge_shorthand(value: &str) -> Option<Edges> {
+fn parse_padding_shorthand(value: &str) -> Option<Edges> {
     let parts: Vec<Spacing> = split_css_whitespace(value)
         .iter()
-        .map(|part| parse_edge_spacing(part))
+        .map(|part| parse_padding_spacing(part))
         .collect::<Option<_>>()?;
-    let (top, right, bottom, left) = match parts.as_slice() {
+    expand_edge_spacing(&parts)
+}
+
+fn parse_margin_shorthand(value: &str) -> Option<Edges> {
+    let parts: Vec<Spacing> = split_css_whitespace(value)
+        .iter()
+        .map(|part| parse_spacing(part))
+        .collect::<Option<_>>()?;
+    expand_edge_spacing(&parts)
+}
+
+fn expand_edge_spacing(parts: &[Spacing]) -> Option<Edges> {
+    let (top, right, bottom, left) = match parts {
         [all] => (*all, *all, *all, *all),
         [vertical, horizontal] => (*vertical, *horizontal, *vertical, *horizontal),
         [top, horizontal, bottom] => (*top, *horizontal, *bottom, *horizontal),
@@ -774,6 +856,11 @@ fn parse_spacing(value: &str) -> Option<Spacing> {
     }
     for (suffix, constructor) in [
         ("rem", Spacing::Rem as fn(f32) -> Spacing),
+        // `ch` is the advance of the zero glyph. The portable style IR does
+        // not yet carry per-font character-relative units, so retain it as
+        // the existing local-font-relative dimension. This is exact for
+        // monospace/Ahem and preserves responsive scaling on every target.
+        ("ch", Spacing::Em),
         ("em", Spacing::Em),
         ("vw", Spacing::Vw),
         ("dvh", Spacing::Vh),
@@ -907,6 +994,21 @@ fn parse_display(value: &str) -> Display {
         "inline" => Display::Inline,
         "inline-block" => Display::InlineBlock,
         "inline-flex" => Display::InlineFlex,
+        // `flow-root` creates a block formatting context. The internal
+        // display model does not need a second block layout algorithm; map it
+        // to Block rather than falling through to the legacy Flex default.
+        "flow-root" => Display::Block,
+        "table" => Display::Table,
+        "inline-table" => Display::InlineTable,
+        "table-row-group" => Display::TableRowGroup,
+        "table-header-group" => Display::TableHeaderGroup,
+        "table-footer-group" => Display::TableFooterGroup,
+        "table-row" => Display::TableRow,
+        "table-column-group" => Display::TableColumnGroup,
+        "table-column" => Display::TableColumn,
+        "table-cell" => Display::TableCell,
+        "table-caption" => Display::TableCaption,
+        "list-item" => Display::ListItem,
         "contents" => Display::Contents,
         "none" => Display::None,
         _ => Display::Flex,
@@ -921,6 +1023,14 @@ fn parse_position(value: &str) -> Position {
         "fixed" => Position::Fixed,
         "sticky" => Position::Sticky,
         _ => Position::Static,
+    }
+}
+
+fn parse_float(value: &str) -> Float {
+    match value.trim() {
+        "left" => Float::Left,
+        "right" => Float::Right,
+        _ => Float::None,
     }
 }
 
@@ -985,6 +1095,11 @@ fn parse_dimension(value: &str) -> Dimension {
         && let Ok(n) = n.trim().parse()
     {
         return Dimension::Rem(n);
+    }
+    if let Some(n) = v.strip_suffix("ch")
+        && let Ok(n) = n.trim().parse()
+    {
+        return Dimension::Em(n);
     }
     if let Some(n) = v.strip_suffix("em")
         && let Ok(n) = n.trim().parse()
@@ -1083,6 +1198,24 @@ fn split_css_whitespace(value: &str) -> Vec<String> {
     parts
 }
 
+fn parse_border_style_visibility(value: &str) -> Option<bool> {
+    let styles = split_css_whitespace(value);
+    if styles.is_empty() || styles.len() > 4 {
+        return None;
+    }
+    let mut visible = false;
+    for style in styles {
+        match style.to_ascii_lowercase().as_str() {
+            "none" | "hidden" => {}
+            "dotted" | "dashed" | "solid" | "double" | "groove" | "ridge" | "inset" | "outset" => {
+                visible = true
+            }
+            _ => return None,
+        }
+    }
+    Some(visible)
+}
+
 fn expand_border_radius(values: &[f32]) -> Option<[f32; 4]> {
     match values {
         [all] => Some([*all; 4]),
@@ -1098,12 +1231,27 @@ fn expand_border_radius(values: &[f32]) -> Option<[f32; 4]> {
 }
 
 fn apply_border_shorthand(style: &mut Style, value: &str) {
+    let mut width = None;
+    let mut visible = None;
     for part in split_css_whitespace(value) {
-        if let Some(width) = parse_px(&part) {
-            style.border_width = width;
+        if let Some(parsed) = parse_px(&part) {
+            width = Some(parsed);
         } else if let Some(color) = Color::from_css(&part) {
             style.border_color = color;
+        } else if let Some(parsed) = parse_border_style_visibility(&part) {
+            visible = Some(parsed);
         }
+    }
+    if let Some(width) = match visible {
+        Some(false) => Some(0.0),
+        Some(true) => Some(width.unwrap_or(3.0)),
+        None => width,
+    } {
+        style.border_width = width;
+        style.border_top_width = Some(width);
+        style.border_right_width = Some(width);
+        style.border_bottom_width = Some(width);
+        style.border_left_width = Some(width);
     }
 }
 
@@ -1118,13 +1266,21 @@ enum BorderSide {
 fn apply_border_side_shorthand(style: &mut Style, value: &str, side: BorderSide) {
     let mut width = None;
     let mut color = None;
+    let mut visible = None;
     for part in split_css_whitespace(value) {
         if let Some(parsed) = parse_px(&part) {
             width = Some(parsed);
         } else if let Some(parsed) = Color::from_css(&part) {
             color = Some(parsed);
+        } else if let Some(parsed) = parse_border_style_visibility(&part) {
+            visible = Some(parsed);
         }
     }
+    let width = match visible {
+        Some(false) => Some(0.0),
+        Some(true) => Some(width.unwrap_or(3.0)),
+        None => width,
+    };
     match side {
         BorderSide::Top => {
             style.border_top_width = width;
@@ -1622,6 +1778,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn float_and_css_float_share_the_typed_property() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("float", "right");
+        assert_eq!(declaration.inner.float, Float::Right);
+        assert_eq!(declaration.get_property("cssFloat"), "right");
+
+        declaration.set_property("cssFloat", "left");
+        assert_eq!(declaration.inner.float, Float::Left);
+        assert_eq!(declaration.get_property("float"), "left");
+
+        declaration.set_property("float", "none");
+        assert_eq!(declaration.inner.float, Float::None);
+    }
+
+    #[test]
+    fn vertical_align_maps_to_portable_cross_axis_alignment() {
+        let mut declaration = CSSStyleDeclaration::new();
+
+        for (value, expected) in [
+            ("top", w3cos_std::style::AlignSelf::FlexStart),
+            ("middle", w3cos_std::style::AlignSelf::Center),
+            ("bottom", w3cos_std::style::AlignSelf::FlexEnd),
+            ("baseline", w3cos_std::style::AlignSelf::Baseline),
+        ] {
+            declaration.set_property("vertical-align", value);
+            assert_eq!(declaration.inner.align_self, expected);
+            assert_eq!(declaration.get_property("vertical-align"), value);
+        }
+    }
+
+    #[test]
     fn css_motion_shorthands_preserve_timing_and_longhand_delay() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("transition", "left 60s steps(1, jump-both)");
@@ -1629,10 +1816,7 @@ mod tests {
         assert_eq!(transition.duration_ms, 60_000);
         assert_eq!(
             transition.easing,
-            w3cos_std::style::Easing::Steps(
-                1,
-                w3cos_std::style::StepPosition::JumpBoth
-            )
+            w3cos_std::style::Easing::Steps(1, w3cos_std::style::StepPosition::JumpBoth)
         );
 
         declaration.set_property("animation", "1s linear infinite alternate slide");
@@ -1652,7 +1836,11 @@ mod tests {
 
         declaration.set_property("transition", "all 1s cubic-bezier(0, -0.5, 1, -0.5)");
         assert_eq!(
-            declaration.inner.transition.expect("bezier transition").easing,
+            declaration
+                .inner
+                .transition
+                .expect("bezier transition")
+                .easing,
             w3cos_std::style::Easing::CubicBezier(0.0, -0.5, 1.0, -0.5)
         );
     }
@@ -1676,6 +1864,43 @@ mod tests {
             declaration.inner.border_color,
             Color::rgba(215, 224, 238, 235)
         );
+    }
+
+    #[test]
+    fn border_none_resets_an_earlier_shorthand_width_on_every_side() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border", "1px solid cyan");
+        declaration.set_property("border", "none");
+
+        assert_eq!(declaration.inner.border_width, 0.0);
+        assert_eq!(declaration.inner.border_top_width, Some(0.0));
+        assert_eq!(declaration.inner.border_right_width, Some(0.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(0.0));
+        assert_eq!(declaration.inner.border_left_width, Some(0.0));
+    }
+
+    #[test]
+    fn border_side_none_resets_only_that_side_width() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border", "2px solid cyan");
+        declaration.set_property("border-left", "none");
+
+        assert_eq!(declaration.inner.border_top_width, Some(2.0));
+        assert_eq!(declaration.inner.border_right_width, Some(2.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(2.0));
+        assert_eq!(declaration.inner.border_left_width, Some(0.0));
+    }
+
+    #[test]
+    fn visible_border_style_uses_initial_medium_width() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-color", "orange");
+        declaration.set_property("border-style", "solid");
+        assert_eq!(declaration.inner.border_width, 3.0);
+        assert_eq!(declaration.inner.border_color, Color::rgb(255, 165, 0));
+
+        declaration.set_property("border-style", "none");
+        assert_eq!(declaration.inner.border_width, 0.0);
     }
 
     #[test]
@@ -1787,6 +2012,34 @@ mod tests {
                 right: Spacing::Px(2.0),
                 bottom: Spacing::Px(3.0),
                 left: Spacing::Px(4.0),
+            }
+        );
+    }
+
+    #[test]
+    fn negative_padding_declarations_are_ignored() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("padding", "4px");
+        declaration.set_property("padding-top", "-1%");
+        declaration.set_property("padding-bottom", "-2px");
+        declaration.set_property("padding", "1px -3px");
+        assert_eq!(declaration.inner.padding, Edges::all(4.0));
+    }
+
+    #[test]
+    fn negative_margin_and_character_relative_lengths_remain_valid() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "10px");
+        declaration.set_property("width", "4ch");
+        declaration.set_property("margin", "0 -1ch");
+        assert_eq!(declaration.inner.width, Dimension::Em(4.0));
+        assert_eq!(
+            declaration.inner.margin,
+            Edges {
+                top: Spacing::Px(0.0),
+                right: Spacing::Em(-1.0),
+                bottom: Spacing::Px(0.0),
+                left: Spacing::Em(-1.0),
             }
         );
     }
@@ -1918,4 +2171,28 @@ fn inline_flex_round_trips_without_falling_back_to_block_flex() {
     declaration.set_property("display", "inline-flex");
     assert_eq!(declaration.inner.display, Display::InlineFlex);
     assert_eq!(declaration.get_property("display"), "inline-flex");
+}
+
+#[test]
+fn flow_root_uses_block_layout_instead_of_flex_fallback() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("display", "flow-root");
+    assert_eq!(declaration.inner.display, Display::Block);
+}
+
+#[test]
+fn table_display_values_round_trip_without_falling_back_to_flex() {
+    for (value, expected) in [
+        ("table", Display::Table),
+        ("inline-table", Display::InlineTable),
+        ("table-row-group", Display::TableRowGroup),
+        ("table-row", Display::TableRow),
+        ("table-cell", Display::TableCell),
+        ("table-caption", Display::TableCaption),
+    ] {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("display", value);
+        assert_eq!(declaration.inner.display, expected);
+        assert_eq!(declaration.get_property("display"), value);
+    }
 }

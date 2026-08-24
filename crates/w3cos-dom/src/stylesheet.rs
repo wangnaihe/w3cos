@@ -13,8 +13,9 @@
 //! - structural `:first-child` and `:root`
 //! - comma groups (split into separate rules at registration)
 //!
-//! Dynamic pseudo-classes (`:hover`, `:focus`, ...) and pseudo-elements
-//! (`::before`) remain inert until their required runtime state is represented.
+//! Dynamic pseudo-classes (`:hover`, `:focus`, ...) remain inert until their
+//! required runtime state is represented. Generated `::before`/`::after`
+//! declarations are exposed separately for the component-tree bridge.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -387,9 +388,8 @@ fn register_rule_with_owner(owner: Option<u64>, selector: &str, declarations: &[
         .into_iter()
         .map(|single| {
             let (single, pseudo_element) = strip_terminal_pseudo_element(&single);
-            parse_selector_chain(&single).map(|(chain, combinators)| {
-                (chain, combinators, pseudo_element)
-            })
+            parse_selector_chain(&single)
+                .map(|(chain, combinators)| (chain, combinators, pseudo_element))
         })
         .collect::<Option<Vec<_>>>();
     let Some(parsed) = parsed else {
@@ -418,9 +418,16 @@ fn register_rule_with_owner(owner: Option<u64>, selector: &str, declarations: &[
 
 fn strip_terminal_pseudo_element(selector: &str) -> (String, Option<String>) {
     let selector = selector.trim_end();
-    for pseudo in ["::before", "::after"] {
-        if let Some(subject) = selector.strip_suffix(pseudo) {
-            return (subject.trim_end().to_string(), Some(pseudo.to_string()));
+    let lower = selector.to_ascii_lowercase();
+    for (authored, canonical) in [
+        ("::before", "::before"),
+        ("::after", "::after"),
+        (":before", "::before"),
+        (":after", "::after"),
+    ] {
+        if lower.ends_with(authored) {
+            let subject = &selector[..selector.len() - authored.len()];
+            return (subject.trim_end().to_string(), Some(canonical.to_string()));
         }
     }
     (selector.to_string(), None)
@@ -584,18 +591,14 @@ fn container_condition_matches(prelude: &str, width: f32, height: f32) -> bool {
     })
 }
 
-fn container_query_matches(
-    rules: &[Rule],
-    document: &Document,
-    node: NodeId,
-    query: &str,
-) -> bool {
+fn container_query_matches(rules: &[Rule], document: &Document, node: NodeId, query: &str) -> bool {
     let mut ancestor = document.get_node(node).parent;
     while let Some(candidate) = ancestor {
         let container_type = matched_property_value(rules, document, candidate, "container-type");
-        if container_type.as_deref().is_some_and(|value| {
-            matches!(value.trim(), "size" | "inline-size")
-        }) {
+        if container_type
+            .as_deref()
+            .is_some_and(|value| matches!(value.trim(), "size" | "inline-size"))
+        {
             let width = matched_property_value(rules, document, candidate, "width")
                 .as_deref()
                 .and_then(css_length_px)
@@ -625,14 +628,14 @@ pub fn matching_declarations_for_node(
             .filter(|rule| {
                 rule.pseudo_element.is_none()
                     && matches_chain_node(
-                    document,
-                    node,
-                    &rule.chain,
-                    &rule.combinators,
-                    rule.chain.len() - 1,
-                    None,
-                    None,
-                )
+                        document,
+                        node,
+                        &rule.chain,
+                        &rule.combinators,
+                        rule.chain.len() - 1,
+                        None,
+                        None,
+                    )
                     && rule
                         .declarations
                         .iter()
@@ -1067,7 +1070,9 @@ fn relative_selector_matches(
 }
 
 fn next_element_sibling(document: &Document, node: NodeId) -> Option<NodeId> {
-    following_element_siblings(document, node).into_iter().next()
+    following_element_siblings(document, node)
+        .into_iter()
+        .next()
 }
 
 fn following_element_siblings(document: &Document, node: NodeId) -> Vec<NodeId> {
@@ -1440,12 +1445,24 @@ pub fn parse_simple_id_selector(selector: &str) -> Option<String> {
     parse_complete_css_identifier(selector.strip_prefix('#')?)
 }
 
-fn css_unescape(value: &str) -> Option<String> {
+pub(crate) fn css_unescape(value: &str) -> Option<String> {
     let chars = value.chars().collect::<Vec<_>>();
     let mut output = String::new();
     let mut pos = 0usize;
     while pos < chars.len() {
         if chars[pos] == '\\' {
+            // A newline escaped inside a CSS string is a continuation, not a
+            // character escape. CSS Syntax removes the pair entirely; CRLF
+            // is one newline and therefore consumes all three characters.
+            if let Some(next) = chars.get(pos + 1).copied()
+                && matches!(next, '\n' | '\r' | '\u{000c}')
+            {
+                pos += 2;
+                if next == '\r' && chars.get(pos) == Some(&'\n') {
+                    pos += 1;
+                }
+                continue;
+            }
             let (escaped, next) = consume_css_escape(&chars, pos)?;
             output.push(escaped);
             pos = next;
@@ -1554,9 +1571,7 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
 
     // Optional leading element name or universal `*`.
     if pos < chars.len() {
-        if chars[pos] == '*'
-            && chars.get(pos + 1) == Some(&'|')
-            && chars.get(pos + 2) == Some(&'*')
+        if chars[pos] == '*' && chars.get(pos + 1) == Some(&'|') && chars.get(pos + 2) == Some(&'*')
         {
             compound.any_namespace = true;
             compound.universal = true;
@@ -1701,34 +1716,19 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                     (
                         false,
                         false,
-                        "active"
-                        | "focus"
-                        | "focus-visible"
-                        | "focus-within"
-                        | "hover"
-                        | "indeterminate"
-                        | "placeholder-shown",
+                        "active" | "focus" | "focus-visible" | "focus-within" | "hover"
+                        | "indeterminate" | "placeholder-shown",
                     ) => compound.unsupported = true,
                     (
                         true,
                         false,
-                        "after"
-                        | "backdrop"
-                        | "before"
-                        | "first-letter"
-                        | "first-line"
-                        | "marker"
-                        | "placeholder"
-                        | "selection",
+                        "after" | "backdrop" | "before" | "first-letter" | "first-line" | "marker"
+                        | "placeholder" | "selection",
                     ) => compound.unsupported = true,
-                    (
-                        false,
-                        false,
-                        "after" | "before" | "first-letter" | "first-line",
-                    ) => compound.unsupported = true,
-                    (true, true, "slotted") if !argument.is_empty() => {
+                    (false, false, "after" | "before" | "first-letter" | "first-line") => {
                         compound.unsupported = true
                     }
+                    (true, true, "slotted") if !argument.is_empty() => compound.unsupported = true,
                     (false, true, "dir") => {
                         let direction = trim_css_whitespace(&argument).to_ascii_lowercase();
                         if !matches!(direction.as_str(), "ltr" | "rtl") {
@@ -2137,6 +2137,20 @@ mod tests {
     }
 
     #[test]
+    fn css_string_unescape_removes_escaped_line_continuations() {
+        assert_eq!(css_unescape("left\\\nright"), Some("leftright".to_string()));
+        assert_eq!(css_unescape("left\\\rright"), Some("leftright".to_string()));
+        assert_eq!(
+            css_unescape("left\\\r\nright"),
+            Some("leftright".to_string())
+        );
+        assert_eq!(
+            css_unescape("left\\\u{000c}right"),
+            Some("leftright".to_string())
+        );
+    }
+
+    #[test]
     fn html_lang_attribute_values_are_ascii_case_insensitive_only_in_html() {
         setup();
         register_rule("[lang|=es]", &[("color", "green")]);
@@ -2177,7 +2191,10 @@ mod tests {
         let button = document.create_element("button");
         register_rule("#parent:has(button)", &[("display", "none")]);
 
-        assert_eq!(document.matches_selector(parent.id, ":has(button)"), Ok(false));
+        assert_eq!(
+            document.matches_selector(parent.id, ":has(button)"),
+            Ok(false)
+        );
         assert_ne!(
             document.computed_style_for(parent.id).display,
             w3cos_std::style::Display::None
@@ -2185,7 +2202,10 @@ mod tests {
 
         document.append_child(parent.id, button.id);
 
-        assert_eq!(document.matches_selector(parent.id, ":has(button)"), Ok(true));
+        assert_eq!(
+            document.matches_selector(parent.id, ":has(button)"),
+            Ok(true)
+        );
         assert_eq!(
             document.computed_style_for(parent.id).display,
             w3cos_std::style::Display::None
@@ -2204,12 +2224,20 @@ mod tests {
             "#item::before",
             &[("left", "20px"), ("transition", "left 1s")],
         );
+        register_rule("#item:after", &[("left", "30px")]);
         register_rule("#item.big::before", &[("left", "40px")]);
 
-        assert_eq!(document.computed_style_for(item.id).left, w3cos_std::style::Dimension::Px(10.0));
+        assert_eq!(
+            document.computed_style_for(item.id).left,
+            w3cos_std::style::Dimension::Px(10.0)
+        );
         assert_eq!(
             document.computed_pseudo_style_for(item.id, "::before").left,
             w3cos_std::style::Dimension::Px(20.0)
+        );
+        assert_eq!(
+            document.computed_pseudo_style_for(item.id, "::after").left,
+            w3cos_std::style::Dimension::Px(30.0)
         );
         item.set_attribute(&mut document, "class", "big");
         assert_eq!(

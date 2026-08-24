@@ -25,6 +25,16 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
     let root = crate::dom::to_component_tree();
     let flat = layout::pre_flatten(&root);
     let layout_cache = layout::compute(&root, width as f32, height as f32)?;
+    if std::env::var_os("W3COS_DUMP_HEADLESS_LAYOUT").is_some() {
+        for (rect, index) in &layout_cache {
+            if let Some(node) = flat.get(*index) {
+                eprintln!(
+                    "W3COS_HEADLESS_LAYOUT index={index} parent={:?} display={:?} kind={:?} width={:?} height={:?} rect={rect:?}",
+                    node.parent, node.style.display, node.kind, node.style.width, node.style.height,
+                );
+            }
+        }
+    }
     let artifact = PaintArtifact::build(
         flat.iter().map(|node| PaintNode {
             kind: node.kind.clone(),

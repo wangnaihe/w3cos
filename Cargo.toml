@@ -59,6 +59,7 @@ taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout",
 
 # Text layout: Parley — line-breaking, shaping, bidi, inline boxes
 parley = "0.7"
+unicode-bidi = "0.3.18"
 fontdue = "0.9"
 
 # Rendering: Skia (Blink-aligned primary) + Vello/tiny-skia compatibility backends

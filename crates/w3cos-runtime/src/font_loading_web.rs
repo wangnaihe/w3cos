@@ -20,6 +20,7 @@ thread_local! {
         RefCell::new(HashMap::new());
     static JS_FAMILIES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     static ACTIVE_FONT_LOADS: Cell<usize> = const { Cell::new(0) };
+    static READY_BLOCKERS: Cell<usize> = const { Cell::new(0) };
     static READY_CYCLE: RefCell<Option<ReadyCycle>> = const { RefCell::new(None) };
     static CYCLE_LOADED_FACES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
     static CYCLE_FAILED_FACES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
@@ -64,7 +65,7 @@ fn ready_promise(set: &Value) -> Value {
     READY_CYCLE.with(|cycle| {
         let mut cycle = cycle.borrow_mut();
         if cycle.is_none() {
-            *cycle = Some(if ACTIVE_FONT_LOADS.with(Cell::get) == 0 {
+            *cycle = Some(if ready_is_idle() {
                 ReadyCycle {
                     promise: resolved(set.clone()),
                     resolve: None,
@@ -81,6 +82,39 @@ fn ready_promise(set: &Value) -> Value {
     })
 }
 
+fn ready_is_idle() -> bool {
+    ACTIVE_FONT_LOADS.with(Cell::get) == 0 && READY_BLOCKERS.with(Cell::get) == 0
+}
+
+fn settle_ready_cycle_if_idle() {
+    if !ready_is_idle() {
+        return;
+    }
+    let set = FONT_FACE_SET_VALUE.with(|slot| slot.borrow().clone());
+    READY_CYCLE.with(|cycle| {
+        let resolve = cycle
+            .borrow_mut()
+            .as_mut()
+            .and_then(|cycle| cycle.resolve.take());
+        if let (Some(resolve), Some(set)) = (resolve, set) {
+            resolve.call(Value::Undefined, vec![set]);
+        }
+    });
+}
+
+pub(crate) fn begin_font_readiness() {
+    let was_idle = ready_is_idle();
+    READY_BLOCKERS.with(|blockers| blockers.set(blockers.get().saturating_add(1)));
+    if was_idle {
+        READY_CYCLE.with(|cycle| *cycle.borrow_mut() = Some(pending_ready_cycle()));
+    }
+}
+
+pub(crate) fn finish_font_readiness() {
+    READY_BLOCKERS.with(|blockers| blockers.set(blockers.get().saturating_sub(1)));
+    settle_ready_cycle_if_idle();
+}
+
 fn dispatch_loading_event(set: &Value, event_type: &str, faces: Vec<Value>) {
     let event = w3cos_core::class::construct(
         &crate::web_events::event_class(),
@@ -91,6 +125,7 @@ fn dispatch_loading_event(set: &Value, event_type: &str, faces: Vec<Value>) {
 }
 
 pub(crate) fn begin_font_loading(faces: Vec<Value>) {
+    let was_idle = ready_is_idle();
     let first = ACTIVE_FONT_LOADS.with(|active| {
         let previous = active.get();
         active.set(previous.saturating_add(1));
@@ -101,7 +136,9 @@ pub(crate) fn begin_font_loading(faces: Vec<Value>) {
     }
     CYCLE_LOADED_FACES.with(|loaded| loaded.borrow_mut().clear());
     CYCLE_FAILED_FACES.with(|failed| failed.borrow_mut().clear());
-    READY_CYCLE.with(|cycle| *cycle.borrow_mut() = Some(pending_ready_cycle()));
+    if was_idle {
+        READY_CYCLE.with(|cycle| *cycle.borrow_mut() = Some(pending_ready_cycle()));
+    }
     if let Some(set) = FONT_FACE_SET_VALUE.with(|slot| slot.borrow().clone()) {
         set.set_property("status", Value::string("loading"));
         dispatch_loading_event(&set, "loading", faces);
@@ -142,15 +179,7 @@ pub(crate) fn finish_font_loading(loaded_faces: Vec<Value>, failed_faces: Vec<Va
     if let Some(set) = &set {
         set.set_property("status", Value::string("loaded"));
     }
-    READY_CYCLE.with(|cycle| {
-        let resolve = cycle
-            .borrow_mut()
-            .as_mut()
-            .and_then(|cycle| cycle.resolve.take());
-        if let (Some(resolve), Some(set)) = (resolve, set.clone()) {
-            resolve.call(Value::Undefined, vec![set]);
-        }
-    });
+    settle_ready_cycle_if_idle();
     if let Some(set) = set {
         dispatch_loading_event(&set, "loadingdone", loaded_faces);
         if !failed_faces.is_empty() {
@@ -831,7 +860,17 @@ pub fn font_face_set_value() -> Value {
         let set_for_ready = set.clone();
         set.set_property(
             "__w3cos_getter_ready",
-            Value::function(move |_, _| ready_promise(&set_for_ready)),
+            Value::function(move |_, _| {
+                // A stylesheet may finish before the streaming parser has
+                // appended the text that selects one of its lazy @font-face
+                // rules. Browser `document.fonts.ready` observes the complete
+                // current document, so discover that demand before choosing
+                // the ready cycle rather than returning an already-resolved
+                // promise backed by fallback metrics.
+                #[cfg(feature = "dynamic-js")]
+                crate::dynamic_script::request_document_stylesheet_fonts();
+                ready_promise(&set_for_ready)
+            }),
         );
         for name in ["onloading", "onloadingdone", "onloadingerror"] {
             set.set_property(name, Value::Null);
@@ -847,11 +886,44 @@ pub fn reset() {
     STYLESHEET_FONT_FACES.with(|faces| faces.borrow_mut().clear());
     JS_FAMILIES.with(|families| families.borrow_mut().clear());
     ACTIVE_FONT_LOADS.with(|active| active.set(0));
+    READY_BLOCKERS.with(|blockers| blockers.set(0));
     READY_CYCLE.with(|cycle| cycle.borrow_mut().take());
     CYCLE_LOADED_FACES.with(|faces| faces.borrow_mut().clear());
     CYCLE_FAILED_FACES.with(|faces| faces.borrow_mut().clear());
     if let Some(set) = FONT_FACE_SET_VALUE.with(|slot| slot.borrow().clone()) {
         set.set_property("status", Value::string("loaded"));
         update_size(&set);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stylesheet_readiness_waits_for_the_font_load_it_discovers() {
+        reset();
+        let fonts = font_face_set_value();
+        begin_font_readiness();
+        let ready = fonts.get_property("ready");
+        assert!(matches!(
+            w3cos_core::promise::status(&ready),
+            Some(w3cos_core::promise::PromiseStatus::Pending)
+        ));
+
+        begin_font_loading(Vec::new());
+        finish_font_readiness();
+        assert!(matches!(
+            w3cos_core::promise::status(&ready),
+            Some(w3cos_core::promise::PromiseStatus::Pending)
+        ));
+
+        finish_font_loading(Vec::new(), Vec::new());
+        crate::jsdom::drain_microtasks();
+        assert!(matches!(
+            w3cos_core::promise::status(&ready),
+            Some(w3cos_core::promise::PromiseStatus::Fulfilled(_))
+        ));
+        reset();
     }
 }

@@ -32,6 +32,8 @@ pub struct Style {
     // Layout mode
     pub display: Display,
     pub position: Position,
+    #[serde(default)]
+    pub float: Float,
 
     // Flexbox
     pub flex_direction: FlexDirection,
@@ -202,6 +204,7 @@ impl Default for Style {
         Self {
             display: Display::Flex,
             position: Position::Static,
+            float: Float::None,
             flex_direction: FlexDirection::Column,
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
@@ -313,6 +316,7 @@ impl Style {
         let Style {
             display: _,
             position,
+            float,
             flex_direction,
             justify_content,
             align_items,
@@ -406,6 +410,7 @@ impl Style {
         let Style {
             display: _,
             position: position_b,
+            float: float_b,
             flex_direction: flex_direction_b,
             justify_content: justify_content_b,
             align_items: align_items_b,
@@ -497,6 +502,7 @@ impl Style {
             outline_style: outline_style_b,
         } = other;
         position == position_b
+            && float == float_b
             && flex_direction == flex_direction_b
             && justify_content == justify_content_b
             && align_items == align_items_b
@@ -602,6 +608,17 @@ pub enum Display {
     Inline,
     InlineBlock,
     InlineFlex,
+    Table,
+    InlineTable,
+    TableRowGroup,
+    TableHeaderGroup,
+    TableFooterGroup,
+    TableRow,
+    TableColumnGroup,
+    TableColumn,
+    TableCell,
+    TableCaption,
+    ListItem,
     Contents,
     None,
 }
@@ -614,6 +631,14 @@ pub enum Position {
     Absolute,
     Fixed,
     Sticky,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Float {
+    #[default]
+    None,
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]

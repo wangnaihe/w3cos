@@ -195,6 +195,7 @@ pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
         flex_wrap,
         order,
         position,
+        float,
         top,
         right,
         bottom,
