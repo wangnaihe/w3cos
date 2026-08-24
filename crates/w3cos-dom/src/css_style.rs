@@ -1517,6 +1517,23 @@ fn parse_easing(value: &str) -> Option<w3cos_std::style::Easing> {
         "ease-in" => Some(Easing::EaseIn),
         "ease-out" => Some(Easing::EaseOut),
         "ease-in-out" => Some(Easing::EaseInOut),
+        value if value.starts_with("cubic-bezier(") && value.ends_with(')') => {
+            let values = value[13..value.len() - 1]
+                .split(',')
+                .map(str::trim)
+                .map(str::parse::<f32>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            let [x1, y1, x2, y2] = values.as_slice() else {
+                return None;
+            };
+            // The x control points define time and must remain in [0, 1].
+            // CSS permits y values outside that interval for overshoot curves.
+            if !(0.0..=1.0).contains(x1) || !(0.0..=1.0).contains(x2) {
+                return None;
+            }
+            Some(Easing::CubicBezier(*x1, *y1, *x2, *y2))
+        }
         value if value.starts_with("steps(") && value.ends_with(')') => {
             let inner = &value[6..value.len() - 1];
             let mut parts = inner.split(',').map(str::trim);
@@ -1631,6 +1648,12 @@ mod tests {
         assert_eq!(
             animation.direction,
             w3cos_std::style::AnimationDirection::Alternate
+        );
+
+        declaration.set_property("transition", "all 1s cubic-bezier(0, -0.5, 1, -0.5)");
+        assert_eq!(
+            declaration.inner.transition.expect("bezier transition").easing,
+            w3cos_std::style::Easing::CubicBezier(0.0, -0.5, 1.0, -0.5)
         );
     }
 

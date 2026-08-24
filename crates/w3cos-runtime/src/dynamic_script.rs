@@ -9460,11 +9460,17 @@ pub(crate) fn active_keyframe_property(
                 .stops
                 .into_iter()
                 .filter_map(|stop| {
-                    let value = match property {
-                        "left" => stop.style.left,
-                        "transform" => stop.style.transform,
-                        _ => None,
-                    }?;
+                    let value = stop
+                        .declarations
+                        .iter()
+                        .rev()
+                        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(property))
+                        .map(|(_, value)| value.clone())
+                        .or_else(|| match property {
+                            "left" => stop.style.left,
+                            "transform" => stop.style.transform,
+                            _ => None,
+                        })?;
                     Some((stop.offset, value))
                 })
                 .collect::<Vec<_>>();

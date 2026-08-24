@@ -7,6 +7,9 @@ use w3cos_std::style::Spacing;
 pub struct KeyframeStop {
     pub offset: f32,
     pub style: StyleDecl,
+    /// Authored declarations retained for CSSOM/animation properties that do
+    /// not participate in the typed layout style yet.
+    pub declarations: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -551,16 +554,31 @@ fn parse_keyframe_block(source: &str) -> Vec<KeyframeStop> {
 
         let offsets = parse_keyframe_selectors(selector);
         let style = parse_declarations(block_str);
+        let declarations = parse_authored_declarations(block_str);
 
         for offset in offsets {
             stops.push(KeyframeStop {
                 offset,
                 style: style.clone(),
+                declarations: declarations.clone(),
             });
         }
     }
 
     stops
+}
+
+fn parse_authored_declarations(block: &str) -> Vec<(String, String)> {
+    block
+        .split(';')
+        .filter_map(|declaration| {
+            let (property, value) = declaration.split_once(':')?;
+            let property = property.trim().to_ascii_lowercase();
+            let value = value.trim().trim_end_matches("!important").trim();
+            (!property.is_empty() && !value.is_empty())
+                .then(|| (property, value.to_string()))
+        })
+        .collect()
 }
 
 fn parse_keyframe_selectors(s: &str) -> Vec<f32> {
@@ -1462,6 +1480,23 @@ mod tests {
         assert_eq!(sheet.rules[0].style.color.as_deref(), Some("#e94560"));
         assert_eq!(sheet.rules[0].style.font_size, Some(24.0));
         assert!(sheet.rules[0].layer.is_none());
+    }
+
+    #[test]
+    fn keyframes_retain_untyped_authored_declarations() {
+        let sheet = parse_css(
+            "@keyframes discrete { from { float: left; } to { float: right !important; } }",
+        );
+        let animation = sheet.keyframes.first().expect("keyframes");
+        assert_eq!(animation.stops.len(), 2);
+        assert_eq!(
+            animation.stops[0].declarations,
+            vec![("float".to_string(), "left".to_string())]
+        );
+        assert_eq!(
+            animation.stops[1].declarations,
+            vec![("float".to_string(), "right".to_string())]
+        );
     }
 
     #[test]
