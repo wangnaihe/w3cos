@@ -195,6 +195,10 @@ thread_local! {
     static CONSTRUCTORS: RefCell<Option<HashMap<String, Value>>> = const { RefCell::new(None) };
 }
 
+fn forward_receiver_method(name: &'static str) -> Value {
+    Value::function(move |receiver, args| receiver.get_property(name).call(receiver, args))
+}
+
 /// Release constructor/prototype identities owned by the discarded Realm.
 ///
 /// Besides matching browser identity semantics, rebuilding the graph prevents
@@ -366,6 +370,10 @@ fn build_constructors() -> HashMap<String, Value> {
         let constructor = match *name {
             "Range" => Value::function(|_, _| crate::jsdom::range_value(0, 0, 0, 0)),
             "StaticRange" => Value::function(|_, args| crate::jsdom::static_range_value(args)),
+            "Document" => Value::function(|_, _| {
+                crate::jsdom::empty_document_value("application/xml", "Document")
+            }),
+            "DocumentFragment" => Value::function(|_, _| crate::jsdom::document_fragment_value()),
             "Text" => Value::function(|_, args| crate::jsdom::text_value(args)),
             "Comment" => Value::function(|_, args| crate::jsdom::comment_value(args)),
             "AbstractRange"
@@ -411,12 +419,13 @@ fn build_constructors() -> HashMap<String, Value> {
         constructors.insert((*name).to_string(), constructor);
     }
 
+    let object_prototype = w3cos_core::object_value().get_property("prototype");
     for name in DOM_CONSTRUCTOR_NAMES {
-        let Some(parent) = parent_name(name) else {
-            continue;
-        };
         let prototype = constructors[*name].get_property("prototype");
-        let parent_prototype = constructors[parent].get_property("prototype");
+        let parent_prototype = parent_name(name).map_or_else(
+            || object_prototype.clone(),
+            |parent| constructors[parent].get_property("prototype"),
+        );
         w3cos_core::class::set_prototype_of(&prototype, &parent_prototype);
     }
 
@@ -511,6 +520,46 @@ fn build_constructors() -> HashMap<String, Value> {
     ] {
         node.set_property(property, Value::Undefined);
     }
+    node.set_property(
+        "cloneNode",
+        Value::function(|receiver, args| crate::jsdom::node_prototype_clone_node(receiver, args)),
+    );
+    let insert_before = Value::function(|receiver, args| {
+        crate::jsdom::node_prototype_insert_before(receiver, args)
+    });
+    insert_before.set_property("length", Value::Number(2.0));
+    node.set_property("insertBefore", insert_before);
+    let replace_child = Value::function(|receiver, args| {
+        crate::jsdom::node_prototype_replace_child(receiver, args)
+    });
+    replace_child.set_property("length", Value::Number(2.0));
+    node.set_property("replaceChild", replace_child);
+    let contains = Value::function(|receiver, args| {
+        crate::jsdom::node_prototype_contains(receiver, args)
+    });
+    contains.set_property("length", Value::Number(1.0));
+    node.set_property("contains", contains);
+    let compare_document_position = Value::function(|receiver, args| {
+        crate::jsdom::node_prototype_compare_document_position(receiver, args)
+    });
+    compare_document_position.set_property("length", Value::Number(1.0));
+    node.set_property("compareDocumentPosition", compare_document_position);
+    let has_child_nodes = Value::function(|receiver, args| {
+        crate::jsdom::node_prototype_has_child_nodes(receiver, args)
+    });
+    has_child_nodes.set_property("length", Value::Number(0.0));
+    node.set_property("hasChildNodes", has_child_nodes);
+    constructors["Element"].get_property("prototype").set_property(
+        "__w3cos_symbol_unscopables",
+        Value::object(HashMap::from([
+            ("after".to_string(), Value::Bool(true)),
+            ("append".to_string(), Value::Bool(true)),
+            ("before".to_string(), Value::Bool(true)),
+            ("prepend".to_string(), Value::Bool(true)),
+            ("remove".to_string(), Value::Bool(true)),
+            ("replaceWith".to_string(), Value::Bool(true)),
+        ])),
+    );
     let common_element_events = "onabort onanimationcancel onanimationend \
         onanimationiteration onanimationstart onauxclick onbeforeinput onbeforematch \
         onbeforetoggle onbeforexrselect onblur oncancel oncanplay oncanplaythrough onchange \
@@ -525,7 +574,8 @@ fn build_constructors() -> HashMap<String, Value> {
         onprogress onratechange onreset onresize onscroll onscrollend onscrollsnapchange \
         onscrollsnapchanging onsecuritypolicyviolation onseeked onseeking onselect \
         onselectionchange onselectstart onslotchange onstalled onsubmit onsuspend ontimeupdate \
-        ontoggle ontransitioncancel ontransitionend ontransitionrun ontransitionstart \
+        ontoggle ontouchcancel ontouchend ontouchmove ontouchstart ontransitioncancel \
+        ontransitionend ontransitionrun ontransitionstart \
         onvolumechange onwaiting onwebkitanimationend onwebkitanimationiteration \
         onwebkitanimationstart onwebkittransitionend onwheel";
     for name in ["HTMLElement", "SVGElement", "Document"] {
@@ -847,6 +897,20 @@ fn build_constructors() -> HashMap<String, Value> {
     {
         document.set_property(property, Value::Undefined);
     }
+    for method in [
+        "createAttribute",
+        "createAttributeNS",
+        "createCDATASection",
+        "createComment",
+        "createDocumentFragment",
+        "createElement",
+        "createElementNS",
+        "createProcessingInstruction",
+        "createTextNode",
+        "importNode",
+    ] {
+        document.set_property(method, forward_receiver_method(method));
+    }
     for (name, members) in [
         ("HTMLAllCollection", "item length namedItem"),
         (
@@ -1125,6 +1189,9 @@ fn build_constructors() -> HashMap<String, Value> {
         "hasFeature",
     ] {
         implementation.set_property(property, Value::Undefined);
+    }
+    for method in ["createDocument", "createDocumentType", "createHTMLDocument"] {
+        implementation.set_property(method, forward_receiver_method(method));
     }
     let token_list = constructors["DOMTokenList"].get_property("prototype");
     for property in [
@@ -1797,6 +1864,46 @@ fn build_constructors() -> HashMap<String, Value> {
             prototype.set_property(property, Value::Undefined);
         }
     }
+    constructors["Element"]
+        .get_property("prototype")
+        .set_property(
+            "attachShadow",
+            Value::function(|receiver, args| {
+                crate::jsdom::element_prototype_attach_shadow(receiver, args)
+            }),
+        );
+    constructors["Range"]
+        .get_property("prototype")
+        .set_property("cloneContents", forward_receiver_method("cloneContents"));
+    let shadow_root = constructors["ShadowRoot"].get_property("prototype");
+    w3cos_core::class::define_property(
+        &shadow_root,
+        "innerHTML",
+        &Value::object(HashMap::from([
+            (
+                "get".to_string(),
+                Value::function(|receiver, _| {
+                    crate::jsdom::shadow_root_prototype_inner_html_get(receiver)
+                }),
+            ),
+            (
+                "set".to_string(),
+                Value::function(|receiver, args| {
+                    crate::jsdom::shadow_root_prototype_inner_html_set(receiver, args)
+                }),
+            ),
+            ("enumerable".to_string(), Value::Bool(true)),
+            ("configurable".to_string(), Value::Bool(true)),
+        ])),
+    );
+    constructors["DocumentFragment"]
+        .get_property("prototype")
+        .set_property(
+            "getElementById",
+            Value::function(|fragment, args| {
+                crate::jsdom::document_fragment_get_element_by_id(fragment, args)
+            }),
+        );
     constructors
 }
 
@@ -1894,7 +2001,17 @@ fn html_constructor_for_tag(tag: &str) -> &'static str {
         "track" => "HTMLTrackElement",
         "ul" => "HTMLUListElement",
         "canvas" => "HTMLCanvasElement",
-        _ => "HTMLElement",
+        "abbr" | "acronym" | "address" | "article" | "aside" | "b" | "bdi" | "bdo"
+        | "bgsound" | "big" | "center" | "cite" | "code" | "dd" | "dfn" | "dt"
+        | "em" | "figcaption" | "figure" | "footer" | "header" | "hgroup" | "i"
+        | "isindex" | "kbd" | "main" | "mark" | "nav" | "nobr" | "noembed"
+        | "noframes" | "noscript" | "plaintext" | "rb" | "rp" | "rt" | "rtc" | "ruby"
+        | "s" | "samp" | "search" | "section" | "small" | "spacer" | "strike"
+        | "strong" | "sub" | "summary" | "sup" | "tt" | "u" | "var" | "wbr" => {
+            "HTMLElement"
+        }
+        _ if tag.contains('-') => "HTMLElement",
+        _ => "HTMLUnknownElement",
     }
 }
 
@@ -2002,9 +2119,44 @@ mod tests {
             &constructor("Element")
         ));
         assert!(w3cos_core::class::instance_of(&div, &constructor("Node")));
+        assert!(
+            Value::string("hasOwnProperty").js_in(&div).to_bool(),
+            "DOM prototype roots inherit Object.prototype"
+        );
+        assert_eq!(
+            div.call_method("hasOwnProperty", vec![Value::string("matches")]),
+            Value::Bool(false)
+        );
         assert!(!w3cos_core::class::instance_of(
             &div,
             &constructor("HTMLSpanElement")
+        ));
+    }
+
+    #[test]
+    fn unknown_html_tags_use_the_unknown_element_prototype() {
+        let unknown = Value::object(HashMap::new());
+        w3cos_core::class::set_prototype_of(
+            &unknown,
+            &prototype_for_node(1, "unknown", false),
+        );
+        assert!(w3cos_core::class::instance_of(
+            &unknown,
+            &constructor("HTMLUnknownElement")
+        ));
+
+        let custom = Value::object(HashMap::new());
+        w3cos_core::class::set_prototype_of(
+            &custom,
+            &prototype_for_node(1, "custom-element", false),
+        );
+        assert!(w3cos_core::class::instance_of(
+            &custom,
+            &constructor("HTMLElement")
+        ));
+        assert!(!w3cos_core::class::instance_of(
+            &custom,
+            &constructor("HTMLUnknownElement")
         ));
     }
 }

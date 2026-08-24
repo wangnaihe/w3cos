@@ -581,6 +581,34 @@ pub fn disconnected_subtree(root: &Value) {
     lifecycle_subtree(root, false);
 }
 
+pub fn moved_subtree(root: &Value) {
+    let root_id = root.get_property("__node_id");
+    if root_id.is_undefined() {
+        return;
+    }
+    let mut pending = vec![root_id.to_u32()];
+    while let Some(node) = pending.pop() {
+        let element = crate::jsdom::element_value(node);
+        if element
+            .get_property("__w3cos_custom_element_upgraded")
+            .to_bool()
+        {
+            if element.get_property("connectedMoveCallback").is_function() {
+                invoke_callback(&element, "connectedMoveCallback", vec![]);
+            } else {
+                invoke_callback(&element, "disconnectedCallback", vec![]);
+                invoke_callback(&element, "connectedCallback", vec![]);
+            }
+        }
+
+        let mut children = crate::dom::children(node);
+        if let Some(shadow_root) = crate::jsdom::shadow_root_id_for_host(node) {
+            children.extend(crate::dom::children(shadow_root));
+        }
+        pending.extend(children.into_iter().rev());
+    }
+}
+
 fn lifecycle_subtree(root: &Value, is_connected: bool) {
     let root_id = root.get_property("__node_id");
     if root_id.is_undefined() {
@@ -598,7 +626,7 @@ fn lifecycle_subtree(root: &Value, is_connected: bool) {
     }
 }
 
-fn upgrade_subtree(root: &Value) {
+pub(crate) fn upgrade_subtree(root: &Value) {
     let Some(root_id) = root
         .get_property("__node_id")
         .to_number()
@@ -707,6 +735,9 @@ pub fn custom_elements_value() -> Value {
                             .borrow_mut()
                             .insert(name.clone(), constructor.clone());
                     });
+                    let document_element =
+                        crate::jsdom::document_value().get_property("documentElement");
+                    upgrade_subtree(&document_element);
                     for resolve in WAITERS
                         .with(|waiters| waiters.borrow_mut().remove(&name))
                         .unwrap_or_default()
@@ -966,6 +997,41 @@ mod tests {
             .get_property("body")
             .call_method("appendChild", vec![element.clone()]);
         assert!(element.get_property("connected").to_bool());
+    }
+
+    #[test]
+    fn defining_a_custom_element_synchronously_upgrades_connected_candidates() {
+        reset();
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let element = crate::jsdom::document_value()
+            .call_method("createElement", vec![Value::string("x-connected")]);
+        crate::jsdom::document_value()
+            .get_property("body")
+            .call_method("appendChild", vec![element.clone()]);
+
+        let constructor = Value::function(|this, _| {
+            this.set_property("upgraded", Value::Bool(true));
+            Value::Undefined
+        });
+        let prototype = Value::object(HashMap::from([(
+            "connectedCallback".into(),
+            Value::function(|this, _| {
+                this.set_property("connected", Value::Bool(true));
+                Value::Undefined
+            }),
+        )]));
+        constructor.set_property("prototype", prototype);
+
+        custom_elements_value().call_method(
+            "define",
+            vec![Value::string("x-connected"), constructor.clone()],
+        );
+
+        assert!(element.get_property("upgraded").to_bool());
+        assert!(element.get_property("connected").to_bool());
+        assert!(w3cos_core::class::instance_of(&element, &constructor));
     }
 
     #[test]

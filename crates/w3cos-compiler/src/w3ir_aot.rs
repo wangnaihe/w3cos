@@ -2852,8 +2852,28 @@ fn emit_instruction(
             emit_boxed_value(plan, object.0),
             emit_boxed_value(plan, key.0)
         ),
-        Instruction::SetProperty { object, key, value } => {
-            if let Some(literal) = proven_strings.get(&key.0) {
+        Instruction::SetProperty {
+            object,
+            key,
+            value,
+            strict,
+        } => {
+            if *strict
+                && let Some(literal) = proven_strings.get(&key.0)
+            {
+                format!(
+                    "w3cos_core::intrinsics::set_property_strict(&{}, &w3cos_core::Value::from({literal:?}), {});",
+                    emit_boxed_value(plan, object.0),
+                    emit_boxed_value(plan, value.0)
+                )
+            } else if *strict {
+                format!(
+                    "w3cos_core::intrinsics::set_property_strict(&{}, &{}, {});",
+                    emit_boxed_value(plan, object.0),
+                    emit_boxed_value(plan, key.0),
+                    emit_boxed_value(plan, value.0)
+                )
+            } else if let Some(literal) = proven_strings.get(&key.0) {
                 format!(
                     "{}.set_property({literal:?}, {});",
                     emit_boxed_value(plan, object.0),

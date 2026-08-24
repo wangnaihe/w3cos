@@ -426,6 +426,24 @@ impl CSSStyleDeclaration {
                 self.inner.transition = parse_transition(value);
             }
 
+            "transition-delay" | "transitionDelay" => {
+                if let Some(transition) = self.inner.transition.as_mut()
+                    && let Some(delay_ms) = parse_time_ms(value)
+                {
+                    transition.delay_ms = delay_ms;
+                }
+            }
+
+            // Animation shorthand and the longhand used by browser pages.
+            "animation" => self.inner.animation = parse_animation(value),
+            "animation-delay" | "animationDelay" => {
+                if let Some(animation) = self.inner.animation.as_mut()
+                    && let Some(delay_ms) = parse_time_ms(value)
+                {
+                    animation.delay_ms = delay_ms;
+                }
+            }
+
             // Text properties
             "text-align" | "textAlign" => self.inner.text_align = parse_text_align(value),
             "white-space" | "whiteSpace" => self.inner.white_space = parse_white_space(value),
@@ -521,6 +539,7 @@ impl CSSStyleDeclaration {
                 Display::Inline => "inline".to_string(),
                 Display::InlineBlock => "inline-block".to_string(),
                 Display::InlineFlex => "inline-flex".to_string(),
+                Display::Contents => "contents".to_string(),
                 Display::None => "none".to_string(),
             },
             "position" => format!("{:?}", self.inner.position).to_lowercase(),
@@ -528,6 +547,10 @@ impl CSSStyleDeclaration {
             "color" => format!(
                 "#{:02x}{:02x}{:02x}",
                 self.inner.color.r, self.inner.color.g, self.inner.color.b
+            ),
+            "background-color" | "backgroundColor" => format!(
+                "#{:02x}{:02x}{:02x}",
+                self.inner.background.r, self.inner.background.g, self.inner.background.b
             ),
             "background-image" | "backgroundImage" => self
                 .inner
@@ -570,6 +593,23 @@ impl CSSStyleDeclaration {
                 .clone()
                 .unwrap_or_else(|| "normal".to_string()),
             "opacity" => format!("{}", self.inner.opacity),
+            "top" => dimension_to_css(&self.inner.top),
+            "right" => dimension_to_css(&self.inner.right),
+            "bottom" => dimension_to_css(&self.inner.bottom),
+            "left" => dimension_to_css(&self.inner.left),
+            "transform" => transform_to_css(self.inner.transform),
+            "transition" => self
+                .inner
+                .transition
+                .as_ref()
+                .map(transition_to_css)
+                .unwrap_or_else(|| "none".to_string()),
+            "animation" => self
+                .inner
+                .animation
+                .as_ref()
+                .map(animation_to_css)
+                .unwrap_or_else(|| "none".to_string()),
             "width" => dimension_to_css(&self.inner.width),
             "height" => dimension_to_css(&self.inner.height),
             "min-width" | "minWidth" => dimension_to_css(&self.inner.min_width),
@@ -825,8 +865,7 @@ fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
 }
 
 fn parse_px(value: &str) -> Option<f32> {
-    let v = value.trim().trim_end_matches("px");
-    v.parse().ok()
+    w3cos_std::style::parse_absolute_length_px(value)
 }
 
 fn will_change_to_css(wc: &WillChange) -> String {
@@ -868,6 +907,7 @@ fn parse_display(value: &str) -> Display {
         "inline" => Display::Inline,
         "inline-block" => Display::InlineBlock,
         "inline-flex" => Display::InlineFlex,
+        "contents" => Display::Contents,
         "none" => Display::None,
         _ => Display::Flex,
     }
@@ -1349,12 +1389,12 @@ fn parse_outline_style(value: &str) -> w3cos_std::style::OutlineStyle {
 
 fn parse_transition(value: &str) -> Option<w3cos_std::style::Transition> {
     use w3cos_std::style::{Easing, Transition, TransitionProperty};
-    let parts: Vec<&str> = value.split_whitespace().collect();
-    if parts.is_empty() {
+    let parts = split_css_whitespace(value);
+    if parts.is_empty() || value.trim().eq_ignore_ascii_case("none") {
         return None;
     }
 
-    let property = match parts[0] {
+    let property = match parts[0].as_str() {
         "all" => TransitionProperty::All,
         "opacity" => TransitionProperty::Opacity,
         "transform" => TransitionProperty::Transform,
@@ -1362,44 +1402,14 @@ fn parse_transition(value: &str) -> Option<w3cos_std::style::Transition> {
         "color" => TransitionProperty::Color,
         p => TransitionProperty::Custom(p.to_string()),
     };
-
-    let duration_ms = parts
-        .get(1)
-        .and_then(|s| {
-            if let Some(ms) = s.strip_suffix("ms") {
-                ms.parse().ok()
-            } else if let Some(sec) = s.strip_suffix('s') {
-                sec.parse::<f32>().ok().map(|v| (v * 1000.0) as u32)
-            } else {
-                s.parse().ok()
-            }
-        })
-        .unwrap_or(300);
-
+    let mut times = parts.iter().skip(1).filter_map(|part| parse_time_ms(part));
+    let duration_ms = times.next().unwrap_or(0);
+    let delay_ms = times.next().unwrap_or(0);
     let easing = parts
-        .get(2)
-        .map(|s| match *s {
-            "linear" => Easing::Linear,
-            "ease" => Easing::Ease,
-            "ease-in" => Easing::EaseIn,
-            "ease-out" => Easing::EaseOut,
-            "ease-in-out" => Easing::EaseInOut,
-            _ => Easing::Ease,
-        })
+        .iter()
+        .skip(1)
+        .find_map(|part| parse_easing(part))
         .unwrap_or(Easing::Ease);
-
-    let delay_ms = parts
-        .get(3)
-        .and_then(|s| {
-            if let Some(ms) = s.strip_suffix("ms") {
-                ms.parse().ok()
-            } else if let Some(sec) = s.strip_suffix('s') {
-                sec.parse::<f32>().ok().map(|v| (v * 1000.0) as u32)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
 
     Some(Transition {
         property,
@@ -1409,9 +1419,220 @@ fn parse_transition(value: &str) -> Option<w3cos_std::style::Transition> {
     })
 }
 
+fn parse_animation(value: &str) -> Option<w3cos_std::style::Animation> {
+    use w3cos_std::style::{
+        Animation, AnimationDirection, AnimationFillMode, AnimationIterationCount, Easing,
+    };
+    let parts = split_css_whitespace(value);
+    if parts.is_empty() || value.trim().eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut times = parts.iter().filter_map(|part| parse_time_ms(part));
+    let duration_ms = times.next().unwrap_or(0);
+    let delay_ms = times.next().unwrap_or(0);
+    let easing = parts
+        .iter()
+        .find_map(|part| parse_easing(part))
+        .unwrap_or(Easing::Ease);
+    let iteration_count = if parts.iter().any(|part| part == "infinite") {
+        AnimationIterationCount::Infinite
+    } else {
+        parts
+            .iter()
+            .find_map(|part| part.parse::<u32>().ok())
+            .map(AnimationIterationCount::Count)
+            .unwrap_or(AnimationIterationCount::Once)
+    };
+    let direction = if parts.iter().any(|part| part == "alternate-reverse") {
+        AnimationDirection::AlternateReverse
+    } else if parts.iter().any(|part| part == "alternate") {
+        AnimationDirection::Alternate
+    } else if parts.iter().any(|part| part == "reverse") {
+        AnimationDirection::Reverse
+    } else {
+        AnimationDirection::Normal
+    };
+    let fill_mode = if parts.iter().any(|part| part == "forwards") {
+        AnimationFillMode::Forwards
+    } else if parts.iter().any(|part| part == "backwards") {
+        AnimationFillMode::Backwards
+    } else if parts.iter().any(|part| part == "both") {
+        AnimationFillMode::Both
+    } else {
+        AnimationFillMode::None
+    };
+    let name = parts
+        .iter()
+        .rev()
+        .find(|part| {
+            parse_time_ms(part).is_none()
+                && parse_easing(part).is_none()
+                && !matches!(
+                    part.as_str(),
+                    "infinite"
+                        | "normal"
+                        | "reverse"
+                        | "alternate"
+                        | "alternate-reverse"
+                        | "none"
+                        | "forwards"
+                        | "backwards"
+                        | "both"
+                        | "running"
+                        | "paused"
+                )
+                && part.parse::<f32>().is_err()
+        })?
+        .to_string();
+    Some(Animation {
+        name,
+        duration_ms,
+        easing,
+        delay_ms,
+        iteration_count,
+        direction,
+        fill_mode,
+    })
+}
+
+fn parse_time_ms(value: &str) -> Option<u32> {
+    let value = value.trim();
+    if let Some(ms) = value.strip_suffix("ms") {
+        ms.parse::<f32>().ok().map(|value| value.max(0.0) as u32)
+    } else if let Some(seconds) = value.strip_suffix('s') {
+        seconds
+            .parse::<f32>()
+            .ok()
+            .map(|value| (value.max(0.0) * 1000.0) as u32)
+    } else {
+        None
+    }
+}
+
+fn parse_easing(value: &str) -> Option<w3cos_std::style::Easing> {
+    use w3cos_std::style::{Easing, StepPosition};
+    match value.trim() {
+        "linear" => Some(Easing::Linear),
+        "ease" => Some(Easing::Ease),
+        "ease-in" => Some(Easing::EaseIn),
+        "ease-out" => Some(Easing::EaseOut),
+        "ease-in-out" => Some(Easing::EaseInOut),
+        value if value.starts_with("steps(") && value.ends_with(')') => {
+            let inner = &value[6..value.len() - 1];
+            let mut parts = inner.split(',').map(str::trim);
+            let count = parts.next()?.parse::<u32>().ok()?.max(1);
+            let position = match parts.next().unwrap_or("jump-end") {
+                "start" | "jump-start" => StepPosition::JumpStart,
+                "jump-none" => StepPosition::JumpNone,
+                "jump-both" => StepPosition::JumpBoth,
+                _ => StepPosition::JumpEnd,
+            };
+            Some(Easing::Steps(count, position))
+        }
+        _ => None,
+    }
+}
+
+fn easing_to_css(easing: w3cos_std::style::Easing) -> String {
+    use w3cos_std::style::{Easing, StepPosition};
+    match easing {
+        Easing::Ease => "ease".to_string(),
+        Easing::Linear => "linear".to_string(),
+        Easing::EaseIn => "ease-in".to_string(),
+        Easing::EaseOut => "ease-out".to_string(),
+        Easing::EaseInOut => "ease-in-out".to_string(),
+        Easing::CubicBezier(x1, y1, x2, y2) => {
+            format!("cubic-bezier({x1}, {y1}, {x2}, {y2})")
+        }
+        Easing::Steps(count, position) => {
+            let position = match position {
+                StepPosition::JumpStart => "jump-start",
+                StepPosition::JumpEnd => "jump-end",
+                StepPosition::JumpNone => "jump-none",
+                StepPosition::JumpBoth => "jump-both",
+            };
+            format!("steps({count}, {position})")
+        }
+    }
+}
+
+fn transition_to_css(transition: &w3cos_std::style::Transition) -> String {
+    use w3cos_std::style::TransitionProperty;
+    let property = match &transition.property {
+        TransitionProperty::All => "all",
+        TransitionProperty::Opacity => "opacity",
+        TransitionProperty::Transform => "transform",
+        TransitionProperty::Background => "background",
+        TransitionProperty::Color => "color",
+        TransitionProperty::Custom(property) => property,
+    };
+    format!(
+        "{property} {}ms {} {}ms",
+        transition.duration_ms,
+        easing_to_css(transition.easing),
+        transition.delay_ms
+    )
+}
+
+fn animation_to_css(animation: &w3cos_std::style::Animation) -> String {
+    format!(
+        "{} {}ms {} {}ms",
+        animation.name,
+        animation.duration_ms,
+        easing_to_css(animation.easing),
+        animation.delay_ms
+    )
+}
+
+fn transform_to_css(transform: w3cos_std::style::Transform2D) -> String {
+    if transform.is_identity() {
+        "none".to_string()
+    } else {
+        format!(
+            "matrix({}, {}, {}, {}, {}, {})",
+            transform.scale_x,
+            0.0,
+            0.0,
+            transform.scale_y,
+            transform.translate_x,
+            transform.translate_y
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn css_motion_shorthands_preserve_timing_and_longhand_delay() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("transition", "left 60s steps(1, jump-both)");
+        let transition = declaration.inner.transition.as_ref().expect("transition");
+        assert_eq!(transition.duration_ms, 60_000);
+        assert_eq!(
+            transition.easing,
+            w3cos_std::style::Easing::Steps(
+                1,
+                w3cos_std::style::StepPosition::JumpBoth
+            )
+        );
+
+        declaration.set_property("animation", "1s linear infinite alternate slide");
+        declaration.set_property("animation-delay", "100ms");
+        let animation = declaration.inner.animation.as_ref().expect("animation");
+        assert_eq!(animation.name, "slide");
+        assert_eq!(animation.duration_ms, 1_000);
+        assert_eq!(animation.delay_ms, 100);
+        assert_eq!(
+            animation.iteration_count,
+            w3cos_std::style::AnimationIterationCount::Infinite
+        );
+        assert_eq!(
+            animation.direction,
+            w3cos_std::style::AnimationDirection::Alternate
+        );
+    }
 
     #[test]
     fn responsive_min_width_becomes_percent_size_with_fixed_cap() {

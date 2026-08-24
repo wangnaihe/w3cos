@@ -3,6 +3,7 @@
 use crate::html_compat::DocumentCompatibilityMode;
 use crate::html_parser_host::ParserScriptHost;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 thread_local! {
@@ -65,6 +66,7 @@ pub struct StreamingDocumentParser {
     pub(crate) section: DocumentInsertionSection,
     pub(crate) active_formatting: Vec<Option<ActiveFormattingElement>>,
     pub(crate) template_modes: Vec<TemplateInsertionMode>,
+    pub(crate) custom_entities: HashMap<String, String>,
     pub(crate) doctype_seen: bool,
     pub(crate) document_mode_locked: bool,
     pub(crate) compatibility_mode: DocumentCompatibilityMode,

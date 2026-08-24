@@ -112,6 +112,16 @@ mod tests {
         assert_eq!(blue.g, 0);
         assert_eq!(blue.b, 255);
 
+        assert_eq!(
+            Color::from_named("fuchsia"),
+            Some(Color::rgb(255, 0, 255))
+        );
+        assert_eq!(Color::from_named("navy"), Some(Color::rgb(0, 0, 128)));
+        assert_eq!(
+            Color::from_named("silver"),
+            Some(Color::rgb(192, 192, 192))
+        );
+
         assert!(Color::from_named("unknown").is_none());
     }
 
@@ -162,6 +172,18 @@ mod tests {
     }
 
     // --- Style tests ---
+
+    #[test]
+    fn css_absolute_lengths_resolve_to_96dpi_pixels() {
+        use crate::style::parse_absolute_length_px;
+
+        assert_eq!(parse_absolute_length_px("1in"), Some(96.0));
+        assert_eq!(parse_absolute_length_px("72pt"), Some(96.0));
+        assert_eq!(parse_absolute_length_px("6pc"), Some(96.0));
+        assert!((parse_absolute_length_px("2.54cm").unwrap() - 96.0).abs() < 0.001);
+        assert!((parse_absolute_length_px("25.4mm").unwrap() - 96.0).abs() < 0.001);
+        assert!((parse_absolute_length_px("101.6q").unwrap() - 96.0).abs() < 0.001);
+    }
 
     #[test]
     fn style_default() {

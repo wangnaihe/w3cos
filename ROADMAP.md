@@ -85,13 +85,27 @@ suite is red.
   `testharness.js`, isolated per-document workers, deterministic offscreen
   Skia reftests, WPT fuzzy comparison, JSON results, and PNG diff artifacts.
 - [x] Establish a fail-closed two-case raw-WPT smoke gate and a broader
-  five-case baseline. The initial 2-pass/3-fail snapshot on 2026-08-22 was
+  ten-case baseline. The initial 2-pass/3-fail snapshot on 2026-08-22 was
   closed to 5 pass and 0 fail without expected-result exemptions.
 - [x] Close the three recorded raw-WPT failures: HTML attribute-name
   normalization, empty-value attribute selectors plus Window named access,
   and block-in-inline opacity positioning.
-- [ ] Expand the selected DOM/CSS suites and add the WPT server/metadata
-  features required by those suites.
+- [x] Complete the first raw-WPT expansion from 5 to 10 cases. The 8-pass /
+  2-fail discovery snapshot was closed without exemptions by fixing same-name
+  namespaced attributes, quoted attribute-value selector parsing, and indexed
+  NodeList own-property descriptors; both added CSS reftests are pixel-exact.
+- [x] Inventory the full pinned `dom/nodes` and `css/CSS2` document range and
+  execute all 6,548 cases supported by the static runner in isolated,
+  resumable release batches. Keep the 2,368 pass / 4,180 red result as
+  structured discovery evidence rather than weakening the ten-case gate.
+- [x] Prevent stale page-arena handles from aliasing newly allocated values
+  after a Realm reset. The serialized full `w3cos-runtime --lib` run moved
+  from 730 pass / 79 fail / 1 ignored to 773 pass / 36 fail / 1 ignored; the
+  remaining Realm-lifetime assertions and IndexedDB cascade stay visible as
+  blocking runtime debt rather than being hidden by the WPT runner.
+- [ ] Add the 112 classified WPT server/metadata capabilities required by the
+  remaining entries: print, multi-reference graphs, `.headers`, generated JS
+  wrappers, fuzzy metadata, testdriver, server handlers, and `.sub` expansion.
 - [ ] Add an independently pinned Test262 runner for ECMAScript language
   semantics; do not infer Test262 coverage from WPT or direct Rust tests.
 - [x] Fix `w3cos-runtime --test w3c_feature_matrix`

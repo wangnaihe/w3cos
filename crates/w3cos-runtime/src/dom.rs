@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use w3cos_dom::Document;
 use w3cos_dom::node::NodeId;
@@ -7,6 +7,7 @@ use w3cos_std::EventAction;
 thread_local! {
     static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
     static DOM_DIRTY: RefCell<bool> = RefCell::new(false);
+    static DOM_MUTATION_GENERATION: Cell<u64> = const { Cell::new(0) };
     static SCROLL_REQUESTS: RefCell<Vec<(u32, Option<f32>, Option<f32>)>> = const {
         RefCell::new(Vec::new())
     };
@@ -22,6 +23,13 @@ pub fn with_document_mut<R>(f: impl FnOnce(&mut Document) -> R) -> R {
 
 pub(crate) fn mark_dom_dirty() {
     DOM_DIRTY.with(|d| *d.borrow_mut() = true);
+    DOM_MUTATION_GENERATION.with(|generation| {
+        generation.set(generation.get().wrapping_add(1));
+    });
+}
+
+pub(crate) fn mutation_generation() -> u64 {
+    DOM_MUTATION_GENERATION.with(Cell::get)
 }
 
 pub(crate) fn set_image_render_source(node: u32, source: Option<&str>) {
@@ -41,6 +49,7 @@ pub fn clear_document_dirty() {
 
 pub fn reset_document() {
     DOCUMENT.with(|d| *d.borrow_mut() = Document::new());
+    DOM_MUTATION_GENERATION.with(|generation| generation.set(0));
     SCROLL_REQUESTS.with(|requests| requests.borrow_mut().clear());
     clear_document_dirty();
 }
@@ -57,6 +66,12 @@ pub fn create_element(tag: &str) -> u32 {
     })
 }
 
+pub fn set_html_element(node: u32, is_html_element: bool) {
+    with_document_mut(|doc| {
+        doc.get_node_mut(NodeId::from_u32(node)).is_html_element = is_html_element;
+    });
+}
+
 pub fn create_text_node(text: &str) -> u32 {
     with_document_mut(|doc| {
         let el = doc.create_text_node(text);
@@ -68,6 +83,10 @@ pub fn body_id() -> u32 {
     with_document(|doc| doc.body().id.as_u32())
 }
 
+pub(crate) fn set_html_document(html_document: bool) {
+    with_document_mut(|document| document.set_html_document(html_document));
+}
+
 pub fn append_child(parent: u32, child: u32) {
     let old_parent = parent_node(child);
     let old_previous = previous_sibling(child);
@@ -76,6 +95,7 @@ pub fn append_child(parent: u32, child: u32) {
         doc.append_child(NodeId::from_u32(parent), NodeId::from_u32(child));
     });
     mark_dom_dirty();
+    crate::jsdom::run_media_source_insertion_steps(parent, child);
     if let Some(old_parent) = old_parent {
         crate::observers_web::notify_child_list(old_parent, &[], &[child], old_previous, old_next);
     }
@@ -121,6 +141,7 @@ pub fn insert_before(parent: u32, new_child: u32, ref_child: u32) {
         );
     });
     mark_dom_dirty();
+    crate::jsdom::run_media_source_insertion_steps(parent, new_child);
     if let Some(old_parent) = old_parent {
         crate::observers_web::notify_child_list(
             old_parent,
@@ -150,8 +171,8 @@ pub fn set_attribute(node: u32, name: &str, value: &str) {
         el.set_attribute(doc, name, value);
     });
     mark_dom_dirty();
+    crate::observers_web::notify_attribute(node, name, old_value.as_deref());
     if old_value.as_deref() != Some(value) {
-        crate::observers_web::notify_attribute(node, name, old_value.as_deref());
         #[cfg(feature = "dynamic-js")]
         if matches!(
             name.to_ascii_lowercase().as_str(),
@@ -196,8 +217,8 @@ pub(crate) fn set_attribute_ns_parts(
         el.set_attribute_ns(doc, namespace, qualified_name, prefix, local_name, value);
     });
     mark_dom_dirty();
+    crate::observers_web::notify_attribute_ns(node, local_name, namespace, old_value.as_deref());
     if old_value.as_deref() != Some(value) {
-        crate::observers_web::notify_attribute(node, qualified_name, old_value.as_deref());
         #[cfg(feature = "dynamic-js")]
         if namespace.is_none() && matches!(local_name.to_ascii_lowercase().as_str(), "src" | "type")
         {
@@ -225,7 +246,7 @@ pub fn get_attribute_ns(node: u32, namespace: Option<&str>, local_name: &str) ->
 pub fn set_text_content(node: u32, text: &str) {
     let old_text = get_text_content(node);
     let old_children = children(node);
-    let character_data = node_type(node) == 3;
+    let character_data = matches!(node_type(node), 3 | 4 | 7 | 8);
     with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.set_text_content(doc, text);
@@ -235,15 +256,22 @@ pub fn set_text_content(node: u32, text: &str) {
     for child in &old_children {
         crate::dynamic_script::notify_node_removed(*child);
     }
+    if character_data {
+        crate::observers_web::notify_character_data(node, old_text.as_deref());
+        if old_text.as_deref() != Some(text) {
+            #[cfg(feature = "dynamic-js")]
+            crate::dynamic_script::notify_script_mutated(node);
+        }
+        return;
+    }
     if old_text.as_deref() == Some(text) {
         return;
     }
-    if character_data {
-        crate::observers_web::notify_character_data(node, old_text.as_deref());
-    } else {
-        let new_children = children(node);
-        crate::observers_web::notify_child_list(node, &new_children, &old_children, None, None);
+    let new_children = children(node);
+    if old_children.is_empty() && new_children.is_empty() {
+        return;
     }
+    crate::observers_web::notify_child_list(node, &new_children, &old_children, None, None);
     #[cfg(feature = "dynamic-js")]
     crate::dynamic_script::notify_script_mutated(node);
 }
@@ -344,6 +372,13 @@ pub fn computed_style_property(node: u32, property: &str) -> String {
     })
 }
 
+pub fn computed_pseudo_style_property(node: u32, pseudo: &str, property: &str) -> String {
+    with_document(|doc| {
+        let style = doc.computed_pseudo_style_for(NodeId::from_u32(node), pseudo);
+        w3cos_dom::css_style::CSSStyleDeclaration::from_style(style).get_property(property)
+    })
+}
+
 pub fn children(node: u32) -> Vec<u32> {
     with_document(|doc| {
         doc.children_ids(NodeId::from_u32(node))
@@ -372,11 +407,23 @@ pub fn node_count() -> usize {
 // ── Phase 1 additions ──
 
 pub fn replace_child(parent: u32, new_child: u32, old_child: u32) {
+    if parent_node(old_child) != Some(parent) {
+        return;
+    }
+    if new_child == old_child {
+        let next = next_sibling(old_child);
+        remove_child(parent, old_child);
+        match next {
+            Some(next) => insert_before(parent, new_child, next),
+            None => append_child(parent, new_child),
+        }
+        return;
+    }
+    if let Some(old_parent) = parent_node(new_child) {
+        remove_child(old_parent, new_child);
+    }
     let previous = previous_sibling(old_child);
     let next = next_sibling(old_child);
-    let old_parent = parent_node(new_child);
-    let old_previous = previous_sibling(new_child);
-    let old_next = next_sibling(new_child);
     with_document_mut(|doc| {
         doc.replace_child(
             NodeId::from_u32(parent),
@@ -385,15 +432,7 @@ pub fn replace_child(parent: u32, new_child: u32, old_child: u32) {
         );
     });
     mark_dom_dirty();
-    if let Some(old_parent) = old_parent {
-        crate::observers_web::notify_child_list(
-            old_parent,
-            &[],
-            &[new_child],
-            old_previous,
-            old_next,
-        );
-    }
+    crate::jsdom::run_media_source_insertion_steps(parent, new_child);
     crate::observers_web::notify_child_list(parent, &[new_child], &[old_child], previous, next);
     #[cfg(feature = "dynamic-js")]
     {
@@ -404,6 +443,36 @@ pub fn replace_child(parent: u32, new_child: u32, old_child: u32) {
 
 pub fn clone_node(node: u32, deep: bool) -> u32 {
     with_document_mut(|doc| doc.clone_node(NodeId::from_u32(node), deep).as_u32())
+}
+
+pub fn matches_selector(node: u32, selector: &str) -> Result<bool, ()> {
+    with_document(|doc| doc.matches_selector(NodeId::from_u32(node), selector))
+}
+
+pub fn matches_selector_with_target(
+    node: u32,
+    selector: &str,
+    target_id: Option<&str>,
+) -> Result<bool, ()> {
+    with_document(|doc| {
+        doc.matches_selector_with_target(NodeId::from_u32(node), selector, target_id)
+    })
+}
+
+pub fn matches_selector_relative_to_scope(
+    node: u32,
+    selector: &str,
+    scope: u32,
+    target_id: Option<&str>,
+) -> Result<bool, ()> {
+    with_document(|doc| {
+        doc.matches_selector_relative_to_scope(
+            NodeId::from_u32(node),
+            selector,
+            NodeId::from_u32(scope),
+            target_id,
+        )
+    })
 }
 
 pub fn create_document_fragment() -> u32 {
@@ -537,29 +606,13 @@ pub fn remove_attribute(node: u32, name: &str) {
 pub fn remove_attribute_ns(node: u32, namespace: Option<&str>, local_name: &str) {
     let namespace = namespace.filter(|namespace| !namespace.is_empty());
     let previous = get_attribute_ns(node, namespace, local_name);
-    let qualified_name = with_document(|doc| {
-        let node = doc.get_node(NodeId::from_u32(node));
-        node.attribute_namespaces
-            .iter()
-            .find(|attribute| {
-                attribute
-                    .namespace
-                    .as_ref()
-                    .map(|value| value.as_str())
-                    .as_deref()
-                    == namespace
-                    && attribute.local_name.as_str() == local_name
-            })
-            .map(|attribute| attribute.qualified_name.as_str())
-            .unwrap_or_else(|| local_name.to_string())
-    });
     let removed = with_document_mut(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.remove_attribute_ns(doc, namespace, local_name)
     });
     if removed {
         mark_dom_dirty();
-        crate::observers_web::notify_attribute(node, &qualified_name, previous.as_deref());
+        crate::observers_web::notify_attribute_ns(node, local_name, namespace, previous.as_deref());
     }
 }
 
@@ -639,7 +692,13 @@ pub fn bounding_rect(node: u32) -> w3cos_dom::DOMRect {
 
 /// Build Component tree from the current DOM state (for rendering).
 pub fn to_component_tree() -> w3cos_std::Component {
-    with_document(|doc| doc.to_component_tree())
+    let mut tree = with_document(|doc| doc.to_component_tree());
+    #[cfg(feature = "dynamic-js")]
+    {
+        crate::jsdom::graft_shadow_component_subtrees(&mut tree);
+        crate::jsdom::graft_frame_component_subtrees(&mut tree);
+    }
+    tree
 }
 
 #[cfg(test)]

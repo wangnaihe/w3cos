@@ -13,6 +13,8 @@ use w3cos_runtime::dynamic_script::{
 use w3cos_runtime::headless::HeadlessFrame;
 
 const RESULT_GLOBAL: &str = "__w3cos_wpt_results_json";
+const PARTIAL_RESULT_GLOBAL: &str = "__w3cos_wpt_partial_results_json";
+const HEADLESS_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SuiteReport {
@@ -57,7 +59,7 @@ pub struct TestReport {
     pub status: CaseStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtests: Vec<SubtestReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
@@ -172,20 +174,21 @@ impl SuiteRunner {
         let server = StaticServer::start(self.root.clone())?;
         load_and_render(
             &server.url_for(path),
-            self.timeout,
+            effective_document_timeout(&self.root, path, self.timeout),
             self.manifest.viewport.width,
             self.manifest.viewport.height,
         )
     }
 
     fn run_testharness(&self, server: &StaticServer, test: &TestCase) -> Result<TestReport> {
-        load_document(
+        let timeout = effective_case_timeout(&self.root, test, self.timeout);
+        let _document = load_document(
             &server.url_for(&test.path),
-            self.timeout,
+            timeout,
             self.manifest.viewport.width,
             self.manifest.viewport.height,
         )?;
-        let payload = wait_for_harness_payload(self.timeout)?;
+        let payload = wait_for_harness_payload(timeout)?;
         let minimum = test.expected_subtests_min.unwrap_or(1);
         let subtests = payload
             .tests
@@ -243,11 +246,48 @@ impl SuiteRunner {
     }
 }
 
+/// WPT's `<meta name=timeout content=long>` grants six times the normal
+/// harness budget. Honor it in both the in-process loader and the isolated
+/// worker deadline so assertion-heavy conformance pages do not become false
+/// infrastructure errors.
+pub fn effective_case_timeout(root: &Path, test: &TestCase, default: Duration) -> Duration {
+    let mut timeout = effective_document_timeout(root, &test.path, default);
+    if let Some(reference) = test.reference.as_deref() {
+        timeout = timeout.max(effective_document_timeout(root, reference, default));
+    }
+    timeout
+}
+
+fn effective_document_timeout(root: &Path, relative: &str, default: Duration) -> Duration {
+    let Ok(source) = std::fs::read_to_string(root.join(relative)) else {
+        return default;
+    };
+    if declares_long_timeout(&source) {
+        default.saturating_mul(6)
+    } else {
+        default
+    }
+}
+
+fn declares_long_timeout(source: &str) -> bool {
+    source.split('>').any(|tag| {
+        let normalized = tag
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace() && !matches!(character, '\'' | '"'))
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        normalized.contains("<meta")
+            && normalized.contains("name=timeout")
+            && normalized.contains("content=long")
+    })
+}
+
 pub fn build_reftest_report(
     test: &TestCase,
     actual: &HeadlessFrame,
     expected: &HeadlessFrame,
     artifacts: &Path,
+    failure_artifacts_only: bool,
 ) -> Result<TestReport> {
     let reference = test
         .reference
@@ -257,12 +297,13 @@ pub fn build_reftest_report(
         .relation
         .ok_or_else(|| anyhow!("reftest {} has no relation", test.path))?;
     let (diff, diff_rgba) = compare_frames(actual, expected, test.fuzzy)?;
-    write_reftest_artifacts(test, actual, expected, &diff_rgba, artifacts)?;
-
     let passed = match relation {
         ReferenceRelation::Match => diff.within_fuzzy,
         ReferenceRelation::Mismatch => !diff.within_fuzzy,
     };
+    if !failure_artifacts_only || !passed {
+        write_reftest_artifacts(test, actual, expected, &diff_rgba, artifacts)?;
+    }
     Ok(TestReport {
         path: test.path.clone(),
         kind: test.kind,
@@ -307,13 +348,27 @@ fn write_reftest_artifacts(
 }
 
 fn load_and_render(url: &str, timeout: Duration, width: u32, height: u32) -> Result<HeadlessFrame> {
-    load_document(url, timeout, width, height)?;
+    // Keep the navigation loader alive until the frame has been captured. Its
+    // owned stylesheet/font/resource state is intentionally released on Drop.
+    let _document = load_document(url, timeout, width, height)?;
     w3cos_runtime::headless::render_document_rgba(width, height)
 }
 
-fn load_document(url: &str, timeout: Duration, width: u32, height: u32) -> Result<()> {
+fn load_document(url: &str, timeout: Duration, width: u32, height: u32) -> Result<DocumentLoader> {
+    let mut script_policy = ScriptPolicy::default();
+    // The runner's explicit per-case timeout is the authoritative budget.
+    // Keeping the production VM's five-second / one-million-instruction
+    // defaults here makes assertion-heavy WPT files fail before the harness
+    // or isolated outer worker deadline.
+    script_policy.limits.max_wall_time = Some(timeout);
+    script_policy.limits.max_instructions = 100_000_000;
+    let max_heap_mib = std::env::var("W3COS_WPT_MAX_HEAP_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(256);
+    script_policy.limits.max_heap_bytes = Some(max_heap_mib * 1024 * 1024);
     let mut loader = DocumentLoader::new(
-        ScriptPolicy::default(),
+        script_policy,
         DocumentLoaderOptions {
             timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
             ..DocumentLoaderOptions::default()
@@ -324,7 +379,7 @@ fn load_document(url: &str, timeout: Duration, width: u32, height: u32) -> Resul
     let deadline = Instant::now() + timeout;
     loop {
         match loader.poll() {
-            DocumentLoadProgress::Complete => return Ok(()),
+            DocumentLoadProgress::Complete => return Ok(loader),
             DocumentLoadProgress::Failed(error) => bail!("document load failed for {url}: {error}"),
             DocumentLoadProgress::Cancelled => bail!("document load was cancelled for {url}"),
             _ if Instant::now() >= deadline => bail!("document load timed out for {url}"),
@@ -335,9 +390,16 @@ fn load_document(url: &str, timeout: Duration, width: u32, height: u32) -> Resul
 
 fn wait_for_harness_payload(timeout: Duration) -> Result<HarnessPayload> {
     let deadline = Instant::now() + timeout;
+    let mut next_animation_frame = Instant::now();
     loop {
         w3cos_runtime::jsdom::drain_microtasks();
         w3cos_runtime::jsdom::tick_timers();
+        let now = Instant::now();
+        if now >= next_animation_frame {
+            w3cos_runtime::jsdom::run_animation_frame();
+            w3cos_runtime::jsdom::drain_microtasks();
+            next_animation_frame = now + HEADLESS_FRAME_INTERVAL;
+        }
         let value = w3cos_runtime::jsdom::window_value().get_property(RESULT_GLOBAL);
         if !value.is_undefined() {
             let json = value.to_js_string();
@@ -347,7 +409,12 @@ fn wait_for_harness_payload(timeout: Duration) -> Result<HarnessPayload> {
             }
         }
         if Instant::now() >= deadline {
-            bail!("WPT testharness did not publish a completion payload");
+            let partial = w3cos_runtime::jsdom::window_value()
+                .get_property(PARTIAL_RESULT_GLOBAL)
+                .to_js_string();
+            bail!(
+                "WPT testharness did not publish a completion payload; partial_results={partial}"
+            );
         }
         thread::sleep(Duration::from_millis(1));
     }
@@ -374,12 +441,21 @@ fn pixel_diff_report(diff: PixelDiff, test: &TestCase) -> PixelDiffReport {
 }
 
 fn artifact_stem(path: &str) -> String {
-    path.chars()
+    let mut sanitized = path
+        .chars()
         .map(|character| match character {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => character,
             _ => '_',
         })
-        .collect()
+        .collect::<String>();
+    sanitized.truncate(160);
+    format!("{sanitized}-{:016x}", stable_path_hash(path))
+}
+
+fn stable_path_hash(path: &str) -> u64 {
+    path.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 fn write_png(path: &Path, frame: &HeadlessFrame) -> Result<()> {
@@ -447,7 +523,14 @@ mod tests {
 
     #[test]
     fn artifact_names_cannot_create_subdirectories() {
-        assert_eq!(artifact_stem("css/box/test.html"), "css_box_test.html");
+        let first = artifact_stem("css/box/test.html");
+        let second = artifact_stem("css_box/test.html");
+        assert!(first.starts_with("css_box_test.html-"));
+        assert!(!first.contains('/'));
+        assert_ne!(first, second);
+
+        let long = artifact_stem(&format!("{}.html", "nested/".repeat(100)));
+        assert!(long.len() <= 177);
     }
 
     #[test]
@@ -464,5 +547,16 @@ mod tests {
 
         std::fs::write(&path, [0_u8; 7]).unwrap();
         assert!(read_frame(&path).is_err());
+    }
+
+    #[test]
+    fn long_timeout_metadata_is_attribute_order_and_quote_independent() {
+        for source in [
+            "<meta name=timeout content=long>",
+            "<META content='long' name=\"timeout\">",
+        ] {
+            assert!(declares_long_timeout(source));
+        }
+        assert!(!declares_long_timeout("<meta name=timeout content=normal>"));
     }
 }

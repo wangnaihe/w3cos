@@ -45,11 +45,11 @@ jobs:
           git -C "$wpt_dir" checkout --detach FETCH_HEAD
       - name: Run raw WPT smoke gate and baseline report
         run: |
-          cargo run --locked -p w3cos-wpt-runner -- \
+          cargo run --locked --profile wpt -p w3cos-wpt-runner -- \
             --wpt-root "$RUNNER_TEMP/wpt" \
             --suite tests/wpt/w3cos-smoke.json \
             --artifacts target/wpt-smoke
-          cargo run --locked -p w3cos-wpt-runner -- \
+          cargo run --locked --profile wpt -p w3cos-wpt-runner -- \
             --wpt-root "$RUNNER_TEMP/wpt" \
             --suite tests/wpt/w3cos-baseline.json \
             --artifacts target/wpt-baseline \

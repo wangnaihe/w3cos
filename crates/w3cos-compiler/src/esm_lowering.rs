@@ -4606,7 +4606,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         // Symbols use collision-resistant string sentinels in the compact
         // runtime. `Symbol.for(key)` must be stable because libraries use the
         // global registry for cross-module identity.
-        "Symbol" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"iterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_iterator\")), (\"asyncIterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_async_iterator\")), (\"for\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::from(format!(\"__w3cos_symbol_for:{}\", __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string()))))]))".to_string(),
+        "Symbol" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"iterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_iterator\")), (\"asyncIterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_async_iterator\")), (\"unscopables\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_unscopables\")), (\"for\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::from(format!(\"__w3cos_symbol_for:{}\", __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string()))))]))".to_string(),
         // Unimplemented builtin globals: harmless empty-object stubs keep
         // references total (`new X()` yields Undefined via construct on a
         // non-callable; `X.y` yields Undefined).

@@ -9,18 +9,58 @@ use std::time::Duration;
 
 const TESTHARNESS_REPORTER: &str = r#"(function () {
   var collected = [];
+  var lastAssertion = "";
   window.__w3cos_wpt_results_json = "";
+  window.__w3cos_wpt_partial_results_json = "[]";
+  // W3COS executes the same assertions more slowly than a browser JIT. Let
+  // the isolated runner's --timeout-ms budget own the file timeout so large
+  // synchronous WPT files are not marked timed out after completing cleanly.
+  setup({explicit_timeout: true, output: false});
+  function describeAssertion(name, values) {
+    lastAssertion = name + "(" + values.map(function (value) {
+      try { return format_value(value); } catch (_) { return String(value); }
+    }).join(", ") + ")";
+  }
+  ["assert_true", "assert_false"].forEach(function (name) {
+    var original = window[name];
+    if (typeof original !== "function") return;
+    window[name] = function (actual, description) {
+      try {
+        return original(actual, description);
+      } catch (error) {
+        describeAssertion(name, [actual, description]);
+        throw error;
+      }
+    };
+  });
+  ["assert_equals", "assert_not_equals", "assert_array_equals",
+   "assert_object_equals"].forEach(function (name) {
+    var original = window[name];
+    if (typeof original !== "function") return;
+    window[name] = function (actual, expected, description) {
+      try {
+        return original(actual, expected, description);
+      } catch (error) {
+        describeAssertion(name, [actual, expected, description]);
+        throw error;
+      }
+    };
+  });
   add_result_callback(function (test) {
+    var message = test.message || test.stack || "";
+    if (message === "Error" && lastAssertion) message += ": " + lastAssertion;
     collected.push({
       name: test.name,
       status: test.status,
-      message: test.message
+      message: message
     });
+    window.__w3cos_wpt_partial_results_json = JSON.stringify(collected);
+    lastAssertion = "";
   });
   add_completion_callback(function (_tests, status) {
     window.__w3cos_wpt_results_json = JSON.stringify({
       harness_status: status.status,
-      harness_message: status.message,
+      harness_message: status.message || status.stack || "",
       tests: collected
     });
   });
@@ -139,6 +179,25 @@ fn serve_connection(mut stream: TcpStream, root: &Path) -> Result<()> {
             TESTHARNESS_REPORTER.as_bytes(),
         );
     }
+    if relative == Path::new("dom/nodes/encoding.py") {
+        let label = match query_parameter(target, "label") {
+            Ok(Some(label)) => label,
+            Ok(None) | Err(_) => {
+                return write_response(&mut stream, method, 400, "text/plain", b"bad label");
+            }
+        };
+        let body = format!(
+            "<!doctype html><meta charset=\"{}\">",
+            escape_html_attribute(&label)
+        );
+        return write_response(
+            &mut stream,
+            method,
+            200,
+            "text/html",
+            body.as_bytes(),
+        );
+    }
 
     let file = root.join(&relative);
     if !file.is_file() {
@@ -213,6 +272,28 @@ fn percent_decode(input: &str) -> Result<String> {
     String::from_utf8(decoded).context("WPT request path is not UTF-8")
 }
 
+fn query_parameter(target: &str, requested_name: &str) -> Result<Option<String>> {
+    let Some((_, query)) = target.split_once('?') else {
+        return Ok(None);
+    };
+    for parameter in query.split('&') {
+        let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        if percent_decode(name)? == requested_name {
+            return percent_decode(&value.replace('+', " ")).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn escape_html_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 fn hex(byte: u8) -> Result<u8> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -234,12 +315,14 @@ fn content_type(path: &Path) -> &'static str {
         "xht" | "xhtml" => "application/xhtml+xml; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
         "json" => "application/json",
         "xml" => "application/xml",
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
+        "bmp" => "image/bmp",
         "webp" => "image/webp",
         "woff" => "font/woff",
         "woff2" => "font/woff2",
@@ -263,6 +346,18 @@ mod tests {
     }
 
     #[test]
+    fn serves_plain_text_resources_with_their_standard_mime_type() {
+        assert_eq!(
+            content_type(Path::new("dom/nodes/resources/blob.txt")),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            content_type(Path::new("dom/nodes/resources/pixel.bmp")),
+            "image/bmp"
+        );
+    }
+
+    #[test]
     fn serves_files_and_overrides_only_the_reporter() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join("resources")).unwrap();
@@ -277,6 +372,21 @@ mod tests {
         assert!(harness.ends_with("upstream-harness"));
         let reporter = http_get(&server.url_for("resources/testharnessreport.js"));
         assert!(reporter.contains("__w3cos_wpt_results_json"));
+        assert!(reporter.contains("setup({explicit_timeout: true, output: false})"));
+    }
+
+    #[test]
+    fn executes_the_character_set_fixture_without_a_python_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = StaticServer::start(directory.path().to_path_buf()).unwrap();
+
+        let response = http_get(&server.url_for("dom/nodes/encoding.py?label=iso-8859-2"));
+        assert_eq!(response, "<!doctype html><meta charset=\"iso-8859-2\">");
+
+        let escaped = http_get(&server.url_for("dom/nodes/encoding.py?label=%22%3E%3Cscript%3E"));
+        assert!(escaped.ends_with(
+            "<!doctype html><meta charset=\"&quot;&gt;&lt;script&gt;\">"
+        ));
     }
 
     fn http_get(url: &str) -> String {

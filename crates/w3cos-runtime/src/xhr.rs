@@ -59,6 +59,27 @@ fn dispatch(target: &Value, event_type: &str) {
     target.call_method("dispatchEvent", vec![event]);
 }
 
+fn response_document(source: &str, content_type: &str, url: &str) -> Option<Value> {
+    let mime_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let parser_content_type = match mime_type.as_str() {
+        "text/html" => "text/html",
+        "text/xml" => "text/xml",
+        "application/xml" => "application/xml",
+        "application/xhtml+xml" => "application/xhtml+xml",
+        "image/svg+xml" => "image/svg+xml",
+        mime_type if mime_type.ends_with("+xml") => "application/xml",
+        _ => return None,
+    };
+    let document = crate::jsdom::parse_frame_document(source, parser_content_type, url);
+    document.set_property("contentType", Value::string(&mime_type));
+    Some(document)
+}
+
 pub fn xml_http_request_event_target_class() -> Value {
     XHR_EVENT_TARGET_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
@@ -162,6 +183,7 @@ pub fn xml_http_request_class() -> Value {
             this.set_property("status", Value::Number(0.0));
             this.set_property("statusText", Value::string(""));
             this.set_property("response", Value::Null);
+            this.set_property("responseXML", Value::Null);
             this.set_property("responseText", Value::string(""));
             this.set_property("responseURL", Value::string(""));
             this.set_property("responseType", Value::string(""));
@@ -243,18 +265,28 @@ pub fn xml_http_request_class() -> Value {
                     let status = response.get_property("status");
                     let ok = status.to_u32() > 0;
                     let text = response.call_method("text", vec![]);
+                    let response_headers = response.get_property("headers");
+                    let content_type = response_headers
+                        .call_method("get", vec![Value::string("content-type")])
+                        .to_js_string();
+                    let response_type = this.get_property("responseType").to_js_string();
                     this.set_property("readyState", Value::Number(4.0));
                     this.set_property("status", status);
                     this.set_property("statusText", response.get_property("statusText"));
                     this.set_property("responseURL", Value::string(&url));
                     this.set_property("responseText", text.clone());
-                    let result = if this.get_property("responseType").to_js_string() == "json" {
+                    let response_xml = response_document(&text.to_js_string(), &content_type, &url)
+                        .unwrap_or(Value::Null);
+                    let result = if response_type == "json" {
                         w3cos_core::json::parse(vec![text])
+                    } else if response_type == "document" {
+                        response_xml.clone()
                     } else {
                         text
                     };
                     this.set_property("response", result);
-                    send_state.borrow_mut().response_headers = response.get_property("headers");
+                    this.set_property("responseXML", response_xml);
+                    send_state.borrow_mut().response_headers = response_headers;
                     dispatch(&upload, "progress");
                     dispatch(&upload, "load");
                     dispatch(&upload, "loadend");
@@ -392,6 +424,7 @@ pub fn reset_realm() {
             instance.set_property(method, Value::Undefined);
         }
         instance.set_property("response", Value::Null);
+        instance.set_property("responseXML", Value::Null);
         instance.set_property("upload", Value::Null);
     }
     for slot in [&XHR_CLASS, &XHR_EVENT_TARGET_CLASS, &XHR_UPLOAD_CLASS] {
@@ -406,6 +439,35 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    fn document_response_uses_the_normalized_response_mime_type() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+
+        let document = response_document(
+            "<root><child/></root>",
+            "Application/Example+XML; charset=utf-8",
+            "https://example.test/blob.xml",
+        )
+        .expect("XML response document");
+        assert_eq!(
+            document.get_property("contentType").to_js_string(),
+            "application/example+xml"
+        );
+        assert_eq!(
+            document.get_property("URL").to_js_string(),
+            "https://example.test/blob.xml"
+        );
+        assert_eq!(
+            document
+                .get_property("documentElement")
+                .get_property("localName")
+                .to_js_string(),
+            "root"
+        );
+        assert!(response_document("plain", "text/plain", "about:blank").is_none());
+    }
 
     #[test]
     fn xhr_and_upload_use_the_standard_event_target_hierarchy() {

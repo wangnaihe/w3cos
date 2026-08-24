@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::atom::Atom;
 use crate::css_style::CSSStyleDeclaration;
@@ -78,6 +79,9 @@ pub struct Document {
     image_render_sources: HashMap<NodeId, String>,
     // Selection state
     selection: Selection,
+    // HTML attribute selector matching has a few document-language-specific
+    // case-folding rules which do not apply to XML/XHTML documents.
+    html_document: bool,
 }
 
 impl Document {
@@ -96,6 +100,7 @@ impl Document {
             tag_index: HashMap::new(),
             image_render_sources: HashMap::new(),
             selection: Selection::new(),
+            html_document: true,
         };
 
         let root_id = doc.alloc_node(DomNode {
@@ -111,6 +116,7 @@ impl Document {
             attributes: Vec::new(),
             attribute_namespaces: Vec::new(),
             class_list: Vec::new(),
+            is_html_element: false,
         });
 
         let body_id = doc.alloc_node(DomNode::new_element(NodeId(1), "body"));
@@ -162,6 +168,14 @@ impl Document {
 
     pub fn body(&self) -> Element {
         Element::new(self.body_id)
+    }
+
+    pub fn set_html_document(&mut self, html_document: bool) {
+        self.html_document = html_document;
+    }
+
+    pub fn is_html_document(&self) -> bool {
+        self.html_document
     }
 
     /// O(1) lookup via HashMap index.
@@ -228,6 +242,9 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        if self.insertion_would_create_cycle(parent, child) {
+            return;
+        }
         self.unlink_from_parent(child);
 
         let parent_last = self.get_node(parent).last_child;
@@ -268,6 +285,7 @@ impl Document {
                 n.attribute_namespaces = node.attribute_namespaces.clone();
                 n.class_list = node.class_list.clone();
                 n.text_content = node.text_content.clone();
+                n.is_html_element = node.is_html_element;
                 n
             }
             NodeType::Text => {
@@ -328,6 +346,12 @@ impl Document {
     }
 
     pub fn insert_before(&mut self, parent: NodeId, new_child: NodeId, ref_child: NodeId) {
+        if new_child == ref_child {
+            return;
+        }
+        if self.insertion_would_create_cycle(parent, new_child) {
+            return;
+        }
         self.unlink_from_parent(new_child);
 
         let ref_prev = self.get_node(ref_child).prev_sibling;
@@ -344,6 +368,17 @@ impl Document {
         }
 
         self.mark_dirty(parent);
+    }
+
+    fn insertion_would_create_cycle(&self, parent: NodeId, child: NodeId) -> bool {
+        let mut current = Some(parent);
+        while let Some(node) = current {
+            if node == child {
+                return true;
+            }
+            current = self.get_node(node).parent;
+        }
+        false
     }
 
     fn unlink_from_parent(&mut self, child: NodeId) {
@@ -616,8 +651,7 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub fn to_component_tree(&self) -> w3cos_std::Component {
-        let mut ancestors = Vec::new();
-        self.node_to_component(self.body_id, &mut ancestors, None)
+        self.to_component_subtree(self.body_id)
     }
 
     /// Lower one connected DOM subtree while preserving selector ancestry.
@@ -670,8 +704,57 @@ impl Document {
         text
     }
 
+    /// Match one element against an authored selector list using the same
+    /// parser and tree context as stylesheet cascade matching.
+    pub fn matches_selector(&self, id: NodeId, selector: &str) -> Result<bool, ()> {
+        stylesheet::selector_matches_node(selector, self, id)
+    }
+
+    /// Match with browsing-context state that is intentionally not stored in
+    /// the platform-neutral DOM tree.
+    pub fn matches_selector_with_target(
+        &self,
+        id: NodeId,
+        selector: &str,
+        target_id: Option<&str>,
+    ) -> Result<bool, ()> {
+        stylesheet::selector_matches_node_with_target(selector, self, id, target_id)
+    }
+
+    pub fn matches_selector_relative_to_scope(
+        &self,
+        id: NodeId,
+        selector: &str,
+        scope: NodeId,
+        target_id: Option<&str>,
+    ) -> Result<bool, ()> {
+        stylesheet::selector_matches_node_relative_to_scope(selector, self, id, scope, target_id)
+    }
+
     /// Selector context for stylesheet matching: tag, id, classes, attributes.
     fn selector_context(&self, id: NodeId) -> stylesheet::SelectorContext {
+        let mut context = self.selector_context_base(id);
+        let Some(parent) = self.get_node(id).parent else {
+            return context;
+        };
+        let mut previous_siblings = Vec::new();
+        for sibling in self.children_ids(parent) {
+            if sibling == id {
+                break;
+            }
+            if self.get_node(sibling).node_type != NodeType::Element {
+                continue;
+            }
+            let sibling_context = self
+                .selector_context_base(sibling)
+                .with_shared_previous_siblings(previous_siblings.clone());
+            previous_siblings.push(Rc::new(sibling_context));
+        }
+        context.previous_siblings = previous_siblings;
+        context
+    }
+
+    fn selector_context_base(&self, id: NodeId) -> stylesheet::SelectorContext {
         let node = self.get_node(id);
         let id_attr = node
             .attributes
@@ -689,8 +772,20 @@ impl Document {
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
+        let is_first_child = node.parent.is_some_and(|parent| {
+            self.children_ids(parent)
+                .into_iter()
+                .find(|sibling| self.get_node(*sibling).node_type == NodeType::Element)
+                == Some(id)
+        });
+        let is_root = node
+            .parent
+            .is_none_or(|parent| self.get_node(parent).node_type == NodeType::Document);
         stylesheet::SelectorContext::new(&node.tag.as_str(), id_attr, &class_refs)
             .with_attributes(&attribute_refs)
+            .with_tree_state(is_first_child, is_root)
+            .with_html_document(self.html_document)
+            .with_html_element(self.html_document && node.is_html_element)
     }
 
     /// Computed style for a node: stylesheet-matched declarations first
@@ -699,14 +794,13 @@ impl Document {
     fn computed_style(
         &self,
         id: NodeId,
-        ancestors: &[stylesheet::SelectorContext],
+        _ancestors: &[stylesheet::SelectorContext],
         inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::style::Style {
         let inline = &self.styles[id.0 as usize];
         let node = self.get_node(id);
         let matched = if stylesheet::has_rules() && node.node_type == NodeType::Element {
-            let context = self.selector_context(id);
-            stylesheet::matching_declarations_for_context(&context, ancestors)
+            stylesheet::matching_declarations_for_node(self, id)
         } else {
             Vec::new()
         };
@@ -813,6 +907,190 @@ impl Document {
         self.computed_style(id, &ancestors, inherited.as_ref())
     }
 
+    /// Resolve the author cascade for a generated pseudo-element. Pseudo
+    /// declarations are matched against the originating element but remain
+    /// separate from its principal computed style.
+    pub fn computed_pseudo_style_for(
+        &self,
+        id: NodeId,
+        pseudo_element: &str,
+    ) -> w3cos_std::style::Style {
+        let mut merged = CSSStyleDeclaration::new();
+        for (property, value, _) in
+            stylesheet::matching_pseudo_declarations_for_node(self, id, pseudo_element)
+        {
+            merged.set_property(&property, &value);
+        }
+        merged.to_style()
+    }
+
+    fn render_child_ids(
+        &self,
+        parent_id: NodeId,
+        child_ids: Vec<NodeId>,
+        ancestors: &[stylesheet::SelectorContext],
+        parent_style: &w3cos_std::style::Style,
+    ) -> Vec<NodeId> {
+        use w3cos_std::style::{Display, WhiteSpace};
+
+        if !matches!(
+            parent_style.white_space,
+            WhiteSpace::Normal | WhiteSpace::NoWrap
+        ) {
+            return child_ids;
+        }
+
+        let is_collapsible_whitespace = |child_id: NodeId| {
+            let child = self.get_node(child_id);
+            child.node_type == NodeType::Text
+                && child
+                    .text_content
+                    .as_deref()
+                    .is_none_or(|text| text.trim().is_empty())
+        };
+        if !child_ids.iter().copied().any(is_collapsible_whitespace) {
+            return child_ids;
+        }
+
+        if matches!(parent_style.display, Display::Flex | Display::Grid) {
+            return child_ids
+                .into_iter()
+                .filter(|child_id| !is_collapsible_whitespace(*child_id))
+                .collect();
+        }
+        let mut child_ancestors = ancestors.to_vec();
+        child_ancestors.push(self.selector_context(parent_id));
+        let participates_in_inline_flow = child_ids
+            .iter()
+            .map(|child_id| {
+                let child = self.get_node(*child_id);
+                match child.node_type {
+                    NodeType::Text if is_collapsible_whitespace(*child_id) => None,
+                    NodeType::Text => Some(true),
+                    NodeType::Element => Some(matches!(
+                        self.computed_style(*child_id, &child_ancestors, Some(parent_style))
+                            .display,
+                        Display::Inline | Display::InlineBlock | Display::InlineFlex
+                    )),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        child_ids
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, child_id)| {
+                if !is_collapsible_whitespace(child_id) {
+                    return Some(child_id);
+                }
+                let inline_before = participates_in_inline_flow[..index]
+                    .iter()
+                    .rev()
+                    .find_map(|participates| *participates)
+                    .unwrap_or(false);
+                let inline_after = participates_in_inline_flow[index + 1..]
+                    .iter()
+                    .find_map(|participates| *participates)
+                    .unwrap_or(false);
+                (inline_before && inline_after).then_some(child_id)
+            })
+            .collect()
+    }
+
+    fn rendered_text_content(
+        &self,
+        child_ids: &[NodeId],
+        index: usize,
+        ancestors: &[stylesheet::SelectorContext],
+        parent_style: &w3cos_std::style::Style,
+    ) -> String {
+        use w3cos_std::style::{Display, WhiteSpace};
+
+        let child = self.get_node(child_ids[index]);
+        let raw = child.text_content.as_deref().unwrap_or_default();
+        if !matches!(
+            parent_style.white_space,
+            WhiteSpace::Normal | WhiteSpace::NoWrap
+        ) {
+            return raw.to_string();
+        }
+
+        let sibling_inline_state = |sibling_id: NodeId| {
+            let sibling = self.get_node(sibling_id);
+            match sibling.node_type {
+                NodeType::Text => Some(true),
+                NodeType::Element => Some(matches!(
+                    self.computed_style(sibling_id, ancestors, Some(parent_style))
+                        .display,
+                    Display::Inline | Display::InlineBlock | Display::InlineFlex
+                )),
+                _ => None,
+            }
+        };
+        let inline_before = child_ids[..index]
+            .iter()
+            .rev()
+            .find_map(|sibling| sibling_inline_state(*sibling))
+            .unwrap_or(false);
+        let inline_after = child_ids[index + 1..]
+            .iter()
+            .find_map(|sibling| sibling_inline_state(*sibling))
+            .unwrap_or(false);
+        collapse_css_whitespace(raw, inline_before, inline_after)
+    }
+
+    fn child_components(
+        &self,
+        child_ids: &[NodeId],
+        text_context_ids: &[NodeId],
+        ancestors: &mut Vec<stylesheet::SelectorContext>,
+        parent_style: &w3cos_std::style::Style,
+    ) -> Vec<w3cos_std::Component> {
+        let mut components = Vec::new();
+        for &child_id in child_ids {
+            let child = self.get_node(child_id);
+            if child.node_type == NodeType::Element {
+                let child_style = self.computed_style(child_id, ancestors, Some(parent_style));
+                if child_style.display == w3cos_std::style::Display::Contents {
+                    ancestors.push(self.selector_context(child_id));
+                    let nested_ids = self.render_child_ids(
+                        child_id,
+                        self.children_ids(child_id),
+                        ancestors,
+                        &child_style,
+                    );
+                    components.extend(self.child_components(
+                        &nested_ids,
+                        &nested_ids,
+                        ancestors,
+                        &child_style,
+                    ));
+                    ancestors.pop();
+                    continue;
+                }
+            }
+
+            let mut component = self.node_to_component(child_id, ancestors, Some(parent_style));
+            if child.node_type == NodeType::Text
+                && let w3cos_std::component::ComponentKind::Text { content } = &mut component.kind
+            {
+                let index = text_context_ids
+                    .iter()
+                    .position(|candidate| *candidate == child_id)
+                    .unwrap_or_default();
+                *content = self.rendered_text_content(
+                    text_context_ids,
+                    index,
+                    ancestors,
+                    parent_style,
+                );
+            }
+            components.push(component);
+        }
+        components
+    }
+
     fn node_to_component(
         &self,
         id: NodeId,
@@ -893,6 +1171,7 @@ impl Document {
                         .into_iter()
                         .collect();
                 }
+                child_ids = self.render_child_ids(id, child_ids, ancestors, &style);
                 if matches!(
                     tag.as_str(),
                     "abbr"
@@ -977,7 +1256,7 @@ impl Document {
                                     | w3cos_std::style::Display::Grid
                             )
                     });
-                let children: Vec<w3cos_std::Component> = child_ids
+                let rendered_child_ids = child_ids
                     .iter()
                     .filter(|child_id| {
                         let child = self.get_node(**child_id);
@@ -988,8 +1267,10 @@ impl Document {
                                 .as_deref()
                                 .is_none_or(|text| text.trim().is_empty()))
                     })
-                    .map(|&child_id| self.node_to_component(child_id, ancestors, Some(&style)))
-                    .collect();
+                    .copied()
+                    .collect::<Vec<_>>();
+                let children =
+                    self.child_components(&rendered_child_ids, &child_ids, ancestors, &style);
                 if pushed {
                     ancestors.pop();
                 }
@@ -1147,20 +1428,22 @@ impl Document {
                                 .attributes
                                 .iter()
                                 .find(|(key, _)| key.as_str() == "width")
-                                .and_then(|(_, value)| value.parse::<f32>().ok())
-                                .filter(|value| *value >= 0.0)
+                                .and_then(|(_, value)| {
+                                    parse_html_dimension_attribute(value.as_str())
+                                })
                         {
-                            image_style.width = w3cos_std::style::Dimension::Px(width);
+                            image_style.width = width;
                         }
                         if matches!(image_style.height, w3cos_std::style::Dimension::Auto)
                             && let Some(height) = node
                                 .attributes
                                 .iter()
                                 .find(|(key, _)| key.as_str() == "height")
-                                .and_then(|(_, value)| value.parse::<f32>().ok())
-                                .filter(|value| *value >= 0.0)
+                                .and_then(|(_, value)| {
+                                    parse_html_dimension_attribute(value.as_str())
+                                })
                         {
-                            image_style.height = w3cos_std::style::Dimension::Px(height);
+                            image_style.height = height;
                         }
                         w3cos_std::Component::image(src, image_style)
                     }
@@ -2145,6 +2428,56 @@ fn push_xml_escaped(out: &mut String, value: &str, attribute: bool) {
     }
 }
 
+fn collapse_css_whitespace(value: &str, keep_leading: bool, keep_trailing: bool) -> String {
+    let is_css_whitespace =
+        |character: char| matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000c}');
+    let starts_with_whitespace = value.chars().next().is_some_and(is_css_whitespace);
+    let ends_with_whitespace = value.chars().next_back().is_some_and(is_css_whitespace);
+    let mut output = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for character in value.chars() {
+        if is_css_whitespace(character) {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if pending_space {
+            output.push(' ');
+            pending_space = false;
+        }
+        output.push(character);
+    }
+    if output.is_empty() {
+        if starts_with_whitespace && keep_leading && keep_trailing {
+            output.push(' ');
+        }
+        return output;
+    }
+    if starts_with_whitespace && keep_leading {
+        output.insert(0, ' ');
+    }
+    if ends_with_whitespace && keep_trailing {
+        output.push(' ');
+    }
+    output
+}
+
+fn parse_html_dimension_attribute(value: &str) -> Option<w3cos_std::style::Dimension> {
+    let value = value.trim();
+    if let Some(percent) = value.strip_suffix('%') {
+        return percent
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(w3cos_std::style::Dimension::Percent);
+    }
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(w3cos_std::style::Dimension::Px)
+}
+
 #[cfg(test)]
 mod image_component_tests {
     use super::*;
@@ -2168,6 +2501,21 @@ mod image_component_tests {
         ));
         assert_eq!(image.style.width, Dimension::Px(320.0));
         assert_eq!(image.style.height, Dimension::Px(180.0));
+    }
+
+    #[test]
+    fn legacy_percentage_image_dimension_attribute_remains_responsive() {
+        let mut document = Document::new();
+        let image = document.create_element("img");
+        image.set_attribute(&mut document, "src", "stripe.png");
+        image.set_attribute(&mut document, "width", "100%");
+        image.set_attribute(&mut document, "height", "50");
+        document.body().append_child(&mut document, image);
+
+        let tree = document.to_component_tree();
+        let image = tree.children.first().expect("image component");
+        assert_eq!(image.style.width, Dimension::Percent(100.0));
+        assert_eq!(image.style.height, Dimension::Px(50.0));
     }
 
     #[test]
@@ -2241,5 +2589,45 @@ mod details_component_tests {
         let text = descendant_text(&tree);
         assert!(text.contains("Completed actions"));
         assert!(text.contains("Hidden history event"));
+    }
+}
+
+#[cfg(test)]
+mod tree_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn inserting_a_child_before_itself_is_a_noop() {
+        let mut document = Document::new();
+        let parent = document.create_element("div").id;
+        let first = document.create_element("first").id;
+        let second = document.create_element("second").id;
+        document.append_child(parent, first);
+        document.append_child(parent, second);
+
+        document.insert_before(parent, first, first);
+
+        assert_eq!(document.get_node(parent).first_child, Some(first));
+        assert_eq!(document.get_node(parent).last_child, Some(second));
+        assert_eq!(document.get_node(first).prev_sibling, None);
+        assert_eq!(document.get_node(first).next_sibling, Some(second));
+        assert_eq!(document.get_node(second).prev_sibling, Some(first));
+    }
+
+    #[test]
+    fn appending_a_node_to_itself_or_its_descendant_is_a_noop() {
+        let mut document = Document::new();
+        let parent = document.create_element("parent").id;
+        let child = document.create_element("child").id;
+        document.append_child(parent, child);
+
+        document.append_child(parent, parent);
+        document.append_child(child, parent);
+
+        assert_eq!(document.get_node(parent).parent, None);
+        assert_eq!(document.get_node(parent).first_child, Some(child));
+        assert_eq!(document.get_node(parent).last_child, Some(child));
+        assert_eq!(document.get_node(child).parent, Some(parent));
+        assert_eq!(document.get_node(child).next_sibling, None);
     }
 }

@@ -125,6 +125,8 @@ pub fn dom_exception_class() -> Value {
             Value::Undefined
         });
         let prototype = Value::object(HashMap::new());
+        class.set_property("name", Value::string("DOMException"));
+        class.set_property("length", Value::Number(0.0));
         prototype.set_property("constructor", class.clone());
         for property in ["code", "message", "name"] {
             prototype.set_property(property, Value::Undefined);

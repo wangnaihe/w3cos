@@ -421,12 +421,12 @@ fn leaf_taffy_size(
     // `display:inline` normally forces both axes to auto in `to_taffy_style`,
     // but replaced elements such as `<img>` still honor their CSS width and
     // height. Use the semantic dimensions here before applying leaf sizing.
-    let replaced_width = matches!(kind, ComponentKind::Image { .. })
-        .then(|| dim_to_px(style.width).map(Dimension::length))
-        .flatten();
-    let replaced_height = matches!(kind, ComponentKind::Image { .. })
-        .then(|| dim_to_px(style.height).map(Dimension::length))
-        .flatten();
+    let replaced_width = (matches!(kind, ComponentKind::Image { .. })
+        && !matches!(style.width, WDim::Auto))
+    .then_some(base.size.width);
+    let replaced_height = (matches!(kind, ComponentKind::Image { .. })
+        && !matches!(style.height, WDim::Auto))
+    .then_some(base.size.height);
     let width = if let Some(width) = replaced_width {
         width
     } else if matches!(style.width, WDim::Auto) {
@@ -828,7 +828,30 @@ fn build_taffy_tree(
     let my_idx = *idx;
     *idx += 1;
 
-    let style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    if comp.style.display == WDisplay::Inline
+        && matches!(
+            parent_display,
+            Some(WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid)
+        )
+    {
+        // A flex/grid item is blockified. Its authored inline outer display
+        // no longer suppresses width/height once it participates as an item.
+        style.size = Size {
+            width: to_taffy_dim(
+                comp.style.width,
+                comp.style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+            height: to_taffy_dim(
+                comp.style.height,
+                comp.style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+        };
+    }
 
     if comp.children.is_empty() {
         let size = leaf_taffy_size(&comp.kind, &comp.style, &style, parent_display);
@@ -917,6 +940,10 @@ fn build_taffy_tree(
                     (Dimension::length(w), size)
                 }
                 ComponentKind::TextInput { .. } if inline_control_in_block => {
+                    let w = leaf_intrinsic_size(&comp.kind, &comp.style).0;
+                    (Dimension::length(w), Dimension::length(w))
+                }
+                ComponentKind::Image { .. } => {
                     let w = leaf_intrinsic_size(&comp.kind, &comp.style).0;
                     (Dimension::length(w), Dimension::length(w))
                 }
@@ -1102,7 +1129,11 @@ fn update_text_leaf_heights(
 
 fn to_taffy_display(d: WDisplay) -> taffy::Display {
     match d {
-        WDisplay::Flex | WDisplay::Inline | WDisplay::InlineBlock | WDisplay::InlineFlex => {
+        WDisplay::Flex
+        | WDisplay::Inline
+        | WDisplay::InlineBlock
+        | WDisplay::InlineFlex
+        | WDisplay::Contents => {
             taffy::Display::Flex
         }
         WDisplay::Grid => taffy::Display::Grid,
@@ -1317,6 +1348,17 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             },
         ),
         WDisplay::InlineFlex => (
+            taffy::Display::Flex,
+            s.flex_grow,
+            s.flex_shrink,
+            Size {
+                width: to_taffy_dim(s.width, s.font_size, viewport_w, viewport_h),
+                height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
+            },
+        ),
+        // DOM lowering normally removes the generated box for `contents`.
+        // Synthetic Component trees can still reach this conversion path.
+        WDisplay::Contents => (
             taffy::Display::Flex,
             s.flex_grow,
             s.flex_shrink,
@@ -2264,6 +2306,27 @@ mod tests {
             ),
             (20.0, 10.0)
         );
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(800.0),
+                    ..Style::default()
+                },
+                vec![Component::image(
+                    source,
+                    Style {
+                        display: WDisp::Inline,
+                        ..Style::default()
+                    },
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!((image.width, image.height), (4.0, 2.0));
         crate::image_loader::invalidate(source);
     }
 
@@ -2294,6 +2357,34 @@ mod tests {
 
         assert_eq!(layout[1].0.width, 40.0);
         assert!(layout[1].0.height > 0.0, "replaced image height collapsed");
+    }
+
+    #[test]
+    fn percentage_sized_replaced_image_uses_containing_block_width() {
+        let image = Component::image(
+            "blob:w3cos/responsive-stripe",
+            Style {
+                display: WDisp::InlineBlock,
+                width: WDim::Percent(100.0),
+                height: WDim::Px(50.0),
+                ..Style::default()
+            },
+        );
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(800.0),
+                    ..Style::default()
+                },
+                vec![image],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        assert_eq!((layout[1].0.width, layout[1].0.height), (800.0, 50.0));
     }
 
     #[test]
@@ -2555,6 +2646,74 @@ mod tests {
             "default button should not stretch across a block container, got {}",
             button.width
         );
+    }
+
+    #[test]
+    fn adjacent_block_margins_collapse_for_text_and_container_boxes() {
+        let paragraph_style = Style {
+            display: WDisp::Block,
+            margin: w3cos_std::style::Edges {
+                top: w3cos_std::style::Spacing::Px(16.0),
+                right: w3cos_std::style::Spacing::Px(0.0),
+                bottom: w3cos_std::style::Spacing::Px(16.0),
+                left: w3cos_std::style::Spacing::Px(0.0),
+            },
+            color: w3cos_std::Color::BLACK,
+            ..Style::default()
+        };
+        let block_style = Style {
+            display: WDisp::Block,
+            color: w3cos_std::Color::BLACK,
+            ..Style::default()
+        };
+        let parent_style = Style {
+            display: WDisp::Block,
+            width: WDim::Px(800.0),
+            ..Style::default()
+        };
+        let reference = compute(
+            &Component::boxed(
+                parent_style.clone(),
+                vec![
+                    Component::text("first", paragraph_style.clone()),
+                    Component::text("second", paragraph_style),
+                ],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        let actual = compute(
+            &Component::boxed(
+                parent_style,
+                vec![
+                    Component::text(
+                        "first",
+                        Style {
+                            display: WDisp::Block,
+                            margin: w3cos_std::style::Edges {
+                                top: w3cos_std::style::Spacing::Px(16.0),
+                                right: w3cos_std::style::Spacing::Px(0.0),
+                                bottom: w3cos_std::style::Spacing::Px(16.0),
+                                left: w3cos_std::style::Spacing::Px(0.0),
+                            },
+                            color: w3cos_std::Color::BLACK,
+                            ..Style::default()
+                        },
+                    ),
+                    Component::boxed(
+                        block_style.clone(),
+                        vec![Component::text("second", block_style)],
+                    ),
+                ],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        let reference_second = reference.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let actual_second = actual.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!(actual_second.y, reference_second.y);
     }
 
     #[test]

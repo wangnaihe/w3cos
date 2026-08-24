@@ -16,7 +16,7 @@ use w3cos_core::Value;
 use w3cos_ir::BindingKind;
 use w3cos_vm::{
     BindingCell, BindingCells, Limits, Vm, VmError, binding_cell, external_binding_cell,
-    uninitialized_binding_cell,
+    property_binding_cell, uninitialized_binding_cell,
 };
 
 pub use crate::html_compat::DocumentCompatibilityMode;
@@ -25,6 +25,7 @@ pub use crate::html_parser_state::{DocumentParseProgress, StreamingDocumentParse
 #[cfg(test)]
 use crate::html_parser_state::{HTML_NAMESPACE, MATHML_NAMESPACE, SVG_NAMESPACE};
 use crate::html_parser_state::{parser_insertion_active, reset_parser_insertion_state};
+use crate::xml_tree_builder::StreamingXmlDocumentParser;
 
 thread_local! {
     static ACTIVE_DOCUMENT_LOADER: RefCell<Option<(ScriptLoader, String)>> =
@@ -33,12 +34,33 @@ thread_local! {
     static DYNAMIC_SCRIPT_NODES: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
     static DYNAMIC_STYLESHEET_NODES: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
     static DYNAMIC_IMAGE_NODES: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+    static DYNAMIC_FRAME_NODES: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+    static DOM_POST_INSERTION_SUPPRESSION_DEPTH: Cell<u32> = const { Cell::new(0) };
     static SCRIPT_LOADERS: RefCell<Vec<Weak<ScriptLoaderInner>>> =
         const { RefCell::new(Vec::new()) };
 }
 
+struct DomPostInsertionSuppressionGuard;
+
+impl Drop for DomPostInsertionSuppressionGuard {
+    fn drop(&mut self) {
+        DOM_POST_INSERTION_SUPPRESSION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn with_dom_post_insertion_steps_suppressed<T>(operation: impl FnOnce() -> T) -> T {
+    DOM_POST_INSERTION_SUPPRESSION_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    let _guard = DomPostInsertionSuppressionGuard;
+    operation()
+}
+
+fn dom_post_insertion_steps_suppressed() -> bool {
+    DOM_POST_INSERTION_SUPPRESSION_DEPTH.with(|depth| depth.get() > 0)
+}
+
 static NEXT_STYLESHEET_OWNER: AtomicU64 = AtomicU64::new(1);
 static NEXT_STYLESHEET_FONT_OWNER: AtomicU64 = AtomicU64::new(1);
+static NEXT_EVAL_RESULT: AtomicU64 = AtomicU64::new(1);
 
 const MAX_STYLESHEET_IMPORT_DEPTH: usize = 32;
 const MAX_STYLESHEET_IMPORTS: usize = 256;
@@ -131,8 +153,21 @@ impl ParserScriptHost for ScriptLoader {
         ScriptLoader::has_pending_parser_blocking_script(self)
     }
 
+    fn perform_microtask_checkpoint(&self) {
+        crate::jsdom::drain_microtasks();
+    }
+
     fn execute_pending_document_scripts(&self, document_url: &str) -> Result<()> {
         ScriptLoader::execute_pending_document_scripts(self, document_url).map(|_| ())
+    }
+
+    fn finish_parser_style(&self, node: u32, document_url: &str) -> Result<()> {
+        ScriptLoader::finish_parser_style(self, node, document_url);
+        Ok(())
+    }
+
+    fn register_inline_event_handler(&self, node: u32, event_type: &str, source: &str) {
+        ScriptLoader::register_inline_event_handler(self, node, event_type, source);
     }
 
     fn finish_document_parse(&self) {
@@ -148,15 +183,20 @@ struct ScriptLoaderInner {
     http_source_cache_stats: RefCell<HttpSourceCacheCounters>,
     script_retry_stats: RefCell<ScriptRetryCounters>,
     processed_elements: RefCell<Vec<Value>>,
+    classic_lexical_bindings: RefCell<HashMap<String, BindingCell>>,
+    realm_classic_lexical_bindings: RefCell<Vec<(Value, HashMap<String, BindingCell>)>>,
     pending_classic_fetches: RefCell<HashMap<String, PendingClassicFetch>>,
     processed_stylesheet_nodes: RefCell<HashSet<u32>>,
     installed_stylesheets: RefCell<HashMap<u32, InstalledStylesheet>>,
+    preferred_style_set: RefCell<Option<String>>,
     pending_stylesheet_fetches: RefCell<HashMap<u32, PendingStylesheetFetch>>,
     pending_stylesheet_font_fetches: RefCell<HashMap<u32, PendingStylesheetFontFetch>>,
     deferred_stylesheet_fonts: RefCell<HashMap<u32, DeferredStylesheetFontBatch>>,
     stylesheet_font_owners: RefCell<HashMap<u32, u64>>,
     processed_image_nodes: RefCell<HashSet<u32>>,
     pending_image_fetches: RefCell<HashMap<u32, PendingImageFetch>>,
+    processed_frame_nodes: RefCell<HashSet<u32>>,
+    pending_frame_fetches: RefCell<HashMap<u32, PendingFrameFetch>>,
     processed_background_images: RefCell<HashSet<String>>,
     pending_background_image_fetches: RefCell<HashMap<String, PendingBackgroundImageFetch>>,
     image_decode_waiters: RefCell<HashMap<u32, Vec<ImageDecodeWaiter>>>,
@@ -268,7 +308,9 @@ pub struct CompiledSourceCacheStats {
     pub persistent_errors: u64,
 }
 
-const PERSISTENT_COMPILED_CACHE_SCHEMA_VERSION: u32 = 1;
+// Classic scripts model top-level var/function declarations as live Window
+// bindings. Invalidate artifacts lowered with the former end-of-script copy.
+const PERSISTENT_COMPILED_CACHE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistentCompiledSource {
@@ -462,6 +504,11 @@ struct PendingImageFetch {
     request: BrowserImageRequest,
 }
 
+struct PendingFrameFetch {
+    request_url: String,
+    task: crate::fetch::BinaryFetchTask,
+}
+
 struct BrowserImageRequest {
     source: String,
     request_url: String,
@@ -543,6 +590,9 @@ impl Drop for ScriptLoaderInner {
                 task.cancel();
             }
         }
+        for fetch in self.pending_frame_fetches.get_mut().values() {
+            fetch.task.cancel();
+        }
         for fetch in self.pending_stylesheet_fetches.get_mut().values() {
             fetch.task.cancel();
         }
@@ -569,6 +619,7 @@ impl Drop for ScriptLoaderInner {
         stats.cancelled = stats.cancelled.saturating_add(cancelled as u64);
         self.pending_classic_fetches.get_mut().clear();
         self.pending_source_fetches.get_mut().clear();
+        self.pending_frame_fetches.get_mut().clear();
         self.pending_stylesheet_fetches.get_mut().clear();
         self.pending_stylesheet_font_fetches.get_mut().clear();
         self.installed_stylesheets.get_mut().clear();
@@ -675,11 +726,46 @@ pub enum DocumentLoadProgress {
 
 /// Top-level Browser navigation loader sharing Fetch, Cookie Store, the live
 /// DOM, [`StreamingDocumentParser`], and [`ScriptLoader`].
+enum NavigationDocumentParser {
+    Html(StreamingDocumentParser),
+    Xml(StreamingXmlDocumentParser),
+}
+
+impl NavigationDocumentParser {
+    fn write(&mut self, chunk: &str) -> Result<DocumentParseProgress> {
+        match self {
+            Self::Html(parser) => parser.write(chunk),
+            Self::Xml(parser) => parser.write(chunk),
+        }
+    }
+
+    fn finish(&mut self) -> Result<DocumentParseProgress> {
+        match self {
+            Self::Html(parser) => parser.finish(),
+            Self::Xml(parser) => parser.finish(),
+        }
+    }
+
+    fn resume(&mut self) -> Result<DocumentParseProgress> {
+        match self {
+            Self::Html(parser) => parser.resume(),
+            Self::Xml(parser) => parser.resume(),
+        }
+    }
+
+    fn is_blocked(&self) -> bool {
+        match self {
+            Self::Html(parser) => parser.is_blocked(),
+            Self::Xml(parser) => parser.is_blocked(),
+        }
+    }
+}
+
 pub struct DocumentLoader {
     script_loader: ScriptLoader,
     options: DocumentLoaderOptions,
     fetch: Option<crate::fetch::BytesFetchTask>,
-    parser: Option<StreamingDocumentParser>,
+    parser: Option<NavigationDocumentParser>,
     decoded_source: Option<String>,
     source_offset: usize,
     sniff_buffer: Vec<u8>,
@@ -890,6 +976,9 @@ impl DocumentLoader {
         self.final_url = Some(response.url.clone());
         self.redirected = response.redirected;
         crate::history::location_replace(&response.url);
+        let document = crate::jsdom::document_value();
+        document.set_property("URL", Value::string(&response.url));
+        document.set_property("documentURI", Value::string(&response.url));
         if !response.ok {
             self.install_error_page(format!(
                 "navigation failed with status {} {}",
@@ -905,8 +994,22 @@ impl DocumentLoader {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
+        crate::dom::set_html_document(!matches!(
+            media_type.as_str(),
+            "application/xhtml+xml" | "image/svg+xml"
+        ));
+        crate::jsdom::set_document_content_type(if media_type.is_empty() {
+            "text/html"
+        } else {
+            &media_type
+        });
+        let xml_document = matches!(
+            media_type.as_str(),
+            "application/xhtml+xml" | "image/svg+xml"
+        );
         let plain_text = if media_type.is_empty()
             || matches!(media_type.as_str(), "text/html" | "application/xhtml+xml")
+            || xml_document
         {
             false
         } else if media_type == "text/plain" {
@@ -919,10 +1022,21 @@ impl DocumentLoader {
             self.install_error_page(error.to_string());
             return;
         }
-        match StreamingDocumentParser::from_started_navigation(
-            Rc::new(self.script_loader.clone()),
-            &response.url,
-        ) {
+        let parser = if xml_document {
+            Ok(NavigationDocumentParser::Xml(
+                StreamingXmlDocumentParser::from_started_navigation(
+                    Rc::new(self.script_loader.clone()),
+                    &response.url,
+                ),
+            ))
+        } else {
+            StreamingDocumentParser::from_started_navigation(
+                Rc::new(self.script_loader.clone()),
+                &response.url,
+            )
+            .map(NavigationDocumentParser::Html)
+        };
+        match parser {
             Ok(parser) => {
                 self.parser = Some(parser);
                 self.decoded_source = Some(if plain_text {
@@ -958,6 +1072,10 @@ impl DocumentLoader {
             let buffered = self.sniff_buffer.split_off(bom_bytes);
             self.sniff_buffer.clear();
             let decoded = decoder.decode(&buffered, final_chunk)?;
+            crate::jsdom::set_document_encoding(
+                &crate::jsdom::document_value(),
+                decoder.encoding_name(),
+            );
             self.decoder = Some(decoder);
             decoded
         };
@@ -1111,7 +1229,7 @@ impl DocumentLoader {
             &document_url,
         ) {
             Ok(parser) => {
-                self.parser = Some(parser);
+                self.parser = Some(NavigationDocumentParser::Html(parser));
                 self.decoded_source = Some(source);
                 self.source_offset = 0;
                 self.network_complete = true;
@@ -1128,42 +1246,32 @@ impl Drop for DocumentLoader {
     }
 }
 
-#[derive(Debug)]
-enum DocumentByteDecoder {
-    Utf8(Vec<u8>),
-    Utf16 {
-        little_endian: bool,
-        pending: Vec<u8>,
-    },
-    Windows1252,
+struct DocumentByteDecoder {
+    encoding: &'static encoding_rs::Encoding,
+    decoder: encoding_rs::Decoder,
 }
 
 impl DocumentByteDecoder {
+    fn new(encoding: &'static encoding_rs::Encoding) -> Self {
+        Self {
+            encoding,
+            decoder: encoding.new_decoder_without_bom_handling(),
+        }
+    }
+
     fn detect(
         bytes: &[u8],
         content_type: &str,
         final_chunk: bool,
     ) -> Result<Option<(Self, usize)>> {
         if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-            return Ok(Some((Self::Utf8(Vec::new()), 3)));
+            return Ok(Some((Self::new(encoding_rs::UTF_8), 3)));
         }
         if bytes.starts_with(&[0xff, 0xfe]) {
-            return Ok(Some((
-                Self::Utf16 {
-                    little_endian: true,
-                    pending: Vec::new(),
-                },
-                2,
-            )));
+            return Ok(Some((Self::new(encoding_rs::UTF_16LE), 2)));
         }
         if bytes.starts_with(&[0xfe, 0xff]) {
-            return Ok(Some((
-                Self::Utf16 {
-                    little_endian: false,
-                    pending: Vec::new(),
-                },
-                2,
-            )));
+            return Ok(Some((Self::new(encoding_rs::UTF_16BE), 2)));
         }
         let transport_charset = content_type_charset(content_type);
         if bytes.len() < 3
@@ -1176,110 +1284,72 @@ impl DocumentByteDecoder {
         if transport_charset.is_none() && bytes.len() < 1024 && !final_chunk {
             return Ok(None);
         }
-        let charset = transport_charset
-            .or_else(|| sniff_meta_charset(bytes))
-            .unwrap_or_else(|| "windows-1252".to_string());
-        let decoder = match charset.as_str() {
-            "utf-8" | "utf8" => Self::Utf8(Vec::new()),
-            "utf-16" | "utf-16le" => Self::Utf16 {
-                little_endian: true,
-                pending: Vec::new(),
-            },
-            "utf-16be" => Self::Utf16 {
-                little_endian: false,
-                pending: Vec::new(),
-            },
-            "windows-1252" | "cp1252" | "iso-8859-1" | "latin1" => Self::Windows1252,
-            _ => return Err(anyhow!("unsupported document charset {charset:?}")),
+        let encoding = if let Some(charset) = transport_charset {
+            encoding_for_label(&charset)?
+        } else if let Some(charset) = sniff_meta_charset(bytes) {
+            html_meta_encoding_for_label(&charset)?
+        } else {
+            encoding_rs::WINDOWS_1252
         };
-        Ok(Some((decoder, 0)))
+        Ok(Some((Self::new(encoding), 0)))
     }
 
     fn decode(&mut self, bytes: &[u8], final_chunk: bool) -> Result<String> {
-        match self {
-            Self::Utf8(pending) => {
-                pending.extend_from_slice(bytes);
-                let mut decoded = String::new();
-                loop {
-                    match std::str::from_utf8(pending) {
-                        Ok(text) => {
-                            decoded.push_str(text);
-                            pending.clear();
-                            break;
-                        }
-                        Err(error) => {
-                            let valid = error.valid_up_to();
-                            if valid > 0 {
-                                decoded.push_str(
-                                    std::str::from_utf8(&pending[..valid])
-                                        .expect("UTF-8 validator marks the prefix as valid"),
-                                );
-                                pending.drain(..valid);
-                            }
-                            if let Some(invalid) = error.error_len() {
-                                decoded.push(char::REPLACEMENT_CHARACTER);
-                                pending.drain(..invalid);
-                            } else {
-                                if final_chunk && !pending.is_empty() {
-                                    decoded.push(char::REPLACEMENT_CHARACTER);
-                                    pending.clear();
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(decoded)
+        let mut decoded = String::new();
+        let mut offset = 0;
+        loop {
+            let capacity = self
+                .decoder
+                .max_utf8_buffer_length(bytes.len().saturating_sub(offset))
+                .ok_or_else(|| anyhow!("document decode output exceeds addressable memory"))?;
+            decoded.reserve(capacity.max(4));
+            let (result, read, _) =
+                self.decoder
+                    .decode_to_string(&bytes[offset..], &mut decoded, final_chunk);
+            offset += read;
+            match result {
+                encoding_rs::CoderResult::InputEmpty => break,
+                encoding_rs::CoderResult::OutputFull => continue,
             }
-            Self::Utf16 {
-                little_endian,
-                pending,
-            } => {
-                pending.extend_from_slice(bytes);
-                if final_chunk && !pending.len().is_multiple_of(2) {
-                    return Err(anyhow!("UTF-16 document body has an odd byte length"));
-                }
-                let mut process_len = pending.len() / 2 * 2;
-                if !final_chunk && process_len >= 2 {
-                    let last = if *little_endian {
-                        u16::from_le_bytes([pending[process_len - 2], pending[process_len - 1]])
-                    } else {
-                        u16::from_be_bytes([pending[process_len - 2], pending[process_len - 1]])
-                    };
-                    if (0xd800..=0xdbff).contains(&last) {
-                        process_len -= 2;
-                    }
-                }
-                let decoded = decode_utf16_document(&pending[..process_len], *little_endian)?;
-                pending.drain(..process_len);
-                Ok(decoded)
-            }
-            Self::Windows1252 => Ok(decode_windows_1252(bytes)),
         }
+        Ok(decoded)
     }
+
+    fn encoding_name(&self) -> &'static str {
+        self.encoding.name()
+    }
+}
+
+fn encoding_for_label(label: &str) -> Result<&'static encoding_rs::Encoding> {
+    encoding_rs::Encoding::for_label(label.as_bytes())
+        .ok_or_else(|| anyhow!("unsupported document charset {label:?}"))
+}
+
+fn html_meta_encoding_for_label(label: &str) -> Result<&'static encoding_rs::Encoding> {
+    let encoding = encoding_for_label(label)?;
+    if matches!(encoding.name(), "UTF-16LE" | "UTF-16BE") {
+        Ok(encoding_rs::UTF_8)
+    } else if encoding.name() == "x-user-defined" {
+        Ok(encoding_rs::WINDOWS_1252)
+    } else {
+        Ok(encoding)
+    }
+}
+
+fn decode_document_bytes_with_encoding(
+    bytes: &[u8],
+    content_type: &str,
+) -> Result<(String, &'static str)> {
+    let (mut decoder, bom_bytes) = DocumentByteDecoder::detect(bytes, content_type, true)?
+        .expect("a final document chunk always selects an encoding");
+    let encoding_name = decoder.encoding_name();
+    let decoded = decoder.decode(&bytes[bom_bytes..], true)?;
+    Ok((decoded, encoding_name))
 }
 
 #[cfg(test)]
 fn decode_document_bytes(bytes: &[u8], content_type: &str) -> Result<String> {
-    if let Some(bytes) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
-        return Ok(String::from_utf8_lossy(bytes).into_owned());
-    }
-    if let Some(bytes) = bytes.strip_prefix(&[0xff, 0xfe]) {
-        return decode_utf16_document(bytes, true);
-    }
-    if let Some(bytes) = bytes.strip_prefix(&[0xfe, 0xff]) {
-        return decode_utf16_document(bytes, false);
-    }
-    let charset = content_type_charset(content_type)
-        .or_else(|| sniff_meta_charset(bytes))
-        .unwrap_or_else(|| "windows-1252".to_string());
-    match charset.as_str() {
-        "utf-8" | "utf8" => Ok(String::from_utf8_lossy(bytes).into_owned()),
-        "utf-16" | "utf-16le" => decode_utf16_document(bytes, true),
-        "utf-16be" => decode_utf16_document(bytes, false),
-        "windows-1252" | "cp1252" | "iso-8859-1" | "latin1" => Ok(decode_windows_1252(bytes)),
-        _ => Err(anyhow!("unsupported document charset {charset:?}")),
-    }
+    decode_document_bytes_with_encoding(bytes, content_type).map(|(decoded, _)| decoded)
 }
 
 fn content_type_charset(content_type: &str) -> Option<String> {
@@ -1326,39 +1396,6 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
     None
 }
 
-fn decode_utf16_document(bytes: &[u8], little_endian: bool) -> Result<String> {
-    if !bytes.len().is_multiple_of(2) {
-        return Err(anyhow!("UTF-16 document body has an odd byte length"));
-    }
-    let units = bytes.chunks_exact(2).map(|pair| {
-        if little_endian {
-            u16::from_le_bytes([pair[0], pair[1]])
-        } else {
-            u16::from_be_bytes([pair[0], pair[1]])
-        }
-    });
-    Ok(char::decode_utf16(units)
-        .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect())
-}
-
-fn decode_windows_1252(bytes: &[u8]) -> String {
-    const C1: [char; 32] = [
-        '\u{20ac}', '\u{0081}', '\u{201a}', '\u{0192}', '\u{201e}', '\u{2026}', '\u{2020}',
-        '\u{2021}', '\u{02c6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008d}',
-        '\u{017d}', '\u{008f}', '\u{0090}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}',
-        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02dc}', '\u{2122}', '\u{0161}', '\u{203a}',
-        '\u{0153}', '\u{009d}', '\u{017e}', '\u{0178}',
-    ];
-    bytes
-        .iter()
-        .map(|byte| match *byte {
-            0x80..=0x9f => C1[usize::from(*byte - 0x80)],
-            byte => char::from(byte),
-        })
-        .collect()
-}
-
 fn escape_html_text(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1376,15 +1413,20 @@ impl ScriptLoader {
             http_source_cache_stats: RefCell::new(HttpSourceCacheCounters::default()),
             script_retry_stats: RefCell::new(ScriptRetryCounters::default()),
             processed_elements: RefCell::new(Vec::new()),
+            classic_lexical_bindings: RefCell::new(HashMap::new()),
+            realm_classic_lexical_bindings: RefCell::new(Vec::new()),
             pending_classic_fetches: RefCell::new(HashMap::new()),
             processed_stylesheet_nodes: RefCell::new(HashSet::new()),
             installed_stylesheets: RefCell::new(HashMap::new()),
+            preferred_style_set: RefCell::new(None),
             pending_stylesheet_fetches: RefCell::new(HashMap::new()),
             pending_stylesheet_font_fetches: RefCell::new(HashMap::new()),
             deferred_stylesheet_fonts: RefCell::new(HashMap::new()),
             stylesheet_font_owners: RefCell::new(HashMap::new()),
             processed_image_nodes: RefCell::new(HashSet::new()),
             pending_image_fetches: RefCell::new(HashMap::new()),
+            processed_frame_nodes: RefCell::new(HashSet::new()),
+            pending_frame_fetches: RefCell::new(HashMap::new()),
             processed_background_images: RefCell::new(HashSet::new()),
             pending_background_image_fetches: RefCell::new(HashMap::new()),
             image_decode_waiters: RefCell::new(HashMap::new()),
@@ -1452,6 +1494,95 @@ impl ScriptLoader {
     }
 
     pub fn execute_source(&self, source: &str, specifier: &str) -> Result<Value> {
+        let result = self.execute_classic_source_without_microtask_drain(source, specifier)?;
+        crate::jsdom::drain_microtasks();
+        Ok(result)
+    }
+
+    fn evaluate_global_expression(&self, source: &str) -> Result<Value> {
+        let evaluation = NEXT_EVAL_RESULT.fetch_add(1, Ordering::Relaxed);
+        let result_key = format!("__w3cos_eval_result_{evaluation}");
+        let wrapped = format!("globalThis[\"{result_key}\"] = ({source});");
+        self.execute_classic_source_without_microtask_drain(
+            &wrapped,
+            &format!("inline:eval-expression-{evaluation}"),
+        )?;
+        let window = crate::jsdom::window_value();
+        let result = window.get_property(&result_key);
+        window.set_property(&result_key, Value::Undefined);
+        Ok(result)
+    }
+
+    fn construct_global_function(&self, arguments: &[Value]) -> Result<Value> {
+        let evaluation = NEXT_EVAL_RESULT.fetch_add(1, Ordering::Relaxed);
+        let result_key = format!("__w3cos_dynamic_function_{evaluation}");
+        let (parameters, body) = arguments.split_last().map_or_else(
+            || (String::new(), String::new()),
+            |(body, parameters)| {
+                (
+                    parameters
+                        .iter()
+                        .map(Value::to_js_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    body.to_js_string(),
+                )
+            },
+        );
+        let wrapped = format!(
+            "globalThis[\"{result_key}\"] = function({parameters}) {{\n{body}\n}};"
+        );
+        self.execute_classic_source_without_microtask_drain(
+            &wrapped,
+            &format!("inline:dynamic-function-{evaluation}"),
+        )?;
+        let window = crate::jsdom::window_value();
+        let function = window.get_property(&result_key);
+        window.set_property(&result_key, Value::Undefined);
+        Ok(function)
+    }
+
+    fn construct_global_function_in_realm(
+        &self,
+        arguments: &[Value],
+        global: &Value,
+        document: &Value,
+    ) -> Result<Value> {
+        let evaluation = NEXT_EVAL_RESULT.fetch_add(1, Ordering::Relaxed);
+        let result_key = format!("__w3cos_dynamic_realm_function_{evaluation}");
+        let (parameters, body) = arguments.split_last().map_or_else(
+            || (String::new(), String::new()),
+            |(body, parameters)| {
+                (
+                    parameters
+                        .iter()
+                        .map(Value::to_js_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    body.to_js_string(),
+                )
+            },
+        );
+        let wrapped = format!(
+            "globalThis[\"{result_key}\"] = function({parameters}) {{\n{body}\n}};"
+        );
+        self.execute_classic_source_in_realm(
+            &wrapped,
+            &format!("inline:dynamic-realm-function-{evaluation}"),
+            global,
+            document,
+        )?;
+        let function = global.get_property(&result_key);
+        global.set_property(&result_key, Value::Undefined);
+        crate::jsdom::associate_callback_global(&function, global);
+        Ok(function)
+    }
+
+    fn execute_classic_source_without_microtask_drain(
+        &self,
+        source: &str,
+        specifier: &str,
+    ) -> Result<Value> {
         if script_execution_route(specifier) == ScriptExecutionRoute::PrecompiledAot {
             return self.execute_precompiled_aot(specifier);
         }
@@ -1466,14 +1597,245 @@ impl ScriptLoader {
         let bindings = module
             .imports
             .iter()
-            .map(|import| (import.local, resolve_global(&import.imported)))
+            .map(|import| {
+                let binding = match import.specifier.as_str() {
+                    "w3cos:classic-global" => resolve_classic_global_binding(&import.imported),
+                    "w3cos:classic-lexical" => {
+                        self.classic_lexical_declaration_binding(&import.imported)
+                    }
+                    _ => self.classic_global_reference_binding(&import.imported),
+                };
+                (import.local, binding)
+            })
             .collect();
         let result = Vm::new(module, self.inner.policy.limits)
             .map_err(|error| anyhow!(error.to_string()))?
-            .run_with_bindings(bindings)
+            .run_with_cells(bindings)
             .map_err(|error| anyhow!(error.to_string()))?;
-        crate::jsdom::drain_microtasks();
         Ok(result)
+    }
+
+    fn execute_classic_source_in_realm(
+        &self,
+        source: &str,
+        specifier: &str,
+        global: &Value,
+        document: &Value,
+    ) -> Result<Value> {
+        self.check_source_size(source)?;
+        let module = self.lower_cached_source(source, specifier, CompileMode::ClassicScript)?;
+        let bindings = module
+            .imports
+            .iter()
+            .map(|import| {
+                let binding = match import.specifier.as_str() {
+                    "w3cos:classic-global" => {
+                        resolve_realm_classic_global_binding(&import.imported, global)
+                    }
+                    "w3cos:classic-lexical" => {
+                        self.realm_classic_lexical_declaration_binding(global, &import.imported)
+                    }
+                    _ => self.realm_classic_global_reference_binding(
+                        global,
+                        document,
+                        &import.imported,
+                    ),
+                };
+                (import.local, binding)
+            })
+            .collect();
+        Vm::new(module, self.inner.policy.limits)
+            .map_err(|error| anyhow!(error.to_string()))?
+            .run_with_cells(bindings)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
+    fn classic_lexical_declaration_binding(&self, name: &str) -> BindingCell {
+        self.inner
+            .classic_lexical_bindings
+            .borrow_mut()
+            .entry(name.to_string())
+            .or_insert_with(uninitialized_binding_cell)
+            .clone()
+    }
+
+    fn classic_global_reference_binding(&self, name: &str) -> BindingCell {
+        self.inner
+            .classic_lexical_bindings
+            .borrow()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| resolve_global_binding(name))
+    }
+
+    fn realm_classic_lexical_declaration_binding(
+        &self,
+        global: &Value,
+        name: &str,
+    ) -> BindingCell {
+        let mut realms = self.inner.realm_classic_lexical_bindings.borrow_mut();
+        let index = realms
+            .iter()
+            .position(|(candidate, _)| candidate.strict_eq(global))
+            .unwrap_or_else(|| {
+                realms.push((global.clone(), HashMap::new()));
+                realms.len() - 1
+            });
+        realms[index]
+            .1
+            .entry(name.to_string())
+            .or_insert_with(uninitialized_binding_cell)
+            .clone()
+    }
+
+    fn realm_classic_global_reference_binding(
+        &self,
+        global: &Value,
+        document: &Value,
+        name: &str,
+    ) -> BindingCell {
+        self.inner
+            .realm_classic_lexical_bindings
+            .borrow()
+            .iter()
+            .find(|(candidate, _)| candidate.strict_eq(global))
+            .and_then(|(_, bindings)| bindings.get(name))
+            .cloned()
+            .unwrap_or_else(|| resolve_realm_global_binding(name, global, document))
+    }
+
+    fn execute_frame_inline_scripts(
+        &self,
+        document: &Value,
+        frame_window: &Value,
+        document_url: &str,
+    ) {
+        if !self.inner.policy.allow_scripts {
+            return;
+        }
+        let scripts = document.call_method("getElementsByTagName", vec![Value::string("script")]);
+        for index in 0..scripts.get_property("length").to_u32() {
+            let script = scripts.get_property(&index.to_string());
+            let source_url = script.call_method("getAttribute", vec![Value::string("src")]);
+            if !source_url.is_null() && !source_url.to_js_string().trim().is_empty() {
+                continue;
+            }
+            let source = script_element_source(&script);
+            if source.trim().is_empty() {
+                continue;
+            }
+            if let Err(error) = self.execute_classic_source_in_realm(
+                &source,
+                &format!("{document_url}#inline-frame-script-{index}"),
+                frame_window,
+                document,
+            ) {
+                eprintln!(
+                    "[w3cos] warning: inline frame script {index} in {document_url} failed: {error:#}"
+                );
+            }
+        }
+    }
+
+    fn register_inline_event_handler(&self, node: u32, event_type: &str, source: &str) {
+        if !self.inner.policy.allow_scripts {
+            return;
+        }
+        let routes_to_window = node == crate::dom::body_id()
+            && matches!(
+                event_type,
+                "afterprint"
+                    | "beforeprint"
+                    | "beforeunload"
+                    | "blur"
+                    | "error"
+                    | "focus"
+                    | "hashchange"
+                    | "languagechange"
+                    | "load"
+                    | "message"
+                    | "messageerror"
+                    | "offline"
+                    | "online"
+                    | "pagehide"
+                    | "pageshow"
+                    | "popstate"
+                    | "rejectionhandled"
+                    | "resize"
+                    | "scroll"
+                    | "storage"
+                    | "unhandledrejection"
+                    | "unload"
+            );
+        let event_target = if routes_to_window {
+            crate::jsdom::window_value()
+        } else {
+            crate::jsdom::element_value(node)
+        };
+        if source.trim().is_empty() {
+            if !routes_to_window {
+                crate::jsdom::js_set_inline_event_listener(
+                    node,
+                    event_type,
+                    Value::Undefined,
+                );
+            }
+            return;
+        }
+        let handler_this = event_target.clone();
+        let weak_loader = Rc::downgrade(&self.inner);
+        let generation = self.inner.document_lifecycle_generation.get();
+        let event_type = event_type.to_string();
+        let handler_source = format!(
+            "(function(event) {{\n{source}\n}}).call(globalThis.__w3cos_inline_event_target, globalThis.__w3cos_inline_event);"
+        );
+        let source_hash = stable_source_hash(source.as_bytes());
+        let specifier = self
+            .inner
+            .document_url
+            .borrow()
+            .as_deref()
+            .map(|url| format!("{url}#inline-{event_type}-{node}-{source_hash:016x}"))
+            .unwrap_or_else(|| format!("inline:{event_type}:{node}:{source_hash:016x}"));
+        let event_type_for_listener = event_type.clone();
+        let callback = Value::function(move |_, arguments| {
+            let Some(inner) = weak_loader.upgrade() else {
+                return Value::Undefined;
+            };
+            if inner.document_lifecycle_generation.get() != generation {
+                return Value::Undefined;
+            }
+            let event = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let window = crate::jsdom::window_value();
+            let previous_target = window.get_property("__w3cos_inline_event_target");
+            let previous_event = window.get_property("__w3cos_inline_event");
+            window.set_property("__w3cos_inline_event_target", handler_this.clone());
+            window.set_property("__w3cos_inline_event", event.clone());
+            let result = ScriptLoader { inner }
+                .execute_classic_source_without_microtask_drain(&handler_source, &specifier);
+            window.set_property("__w3cos_inline_event_target", previous_target);
+            window.set_property("__w3cos_inline_event", previous_event);
+            match result {
+                Ok(result) => {
+                    if result == Value::Bool(false) {
+                        event.call_method("preventDefault", vec![]);
+                    }
+                    result
+                }
+                Err(error) => {
+                    eprintln!("[w3cos] inline {event_type} handler failed: {error:#}");
+                    Value::Undefined
+                }
+            }
+        });
+        if routes_to_window {
+            event_target.call_method(
+                "addEventListener",
+                vec![Value::string(&event_type_for_listener), callback],
+            );
+        } else {
+            crate::jsdom::js_set_inline_event_listener(node, &event_type_for_listener, callback);
+        }
     }
 
     pub fn load_and_execute(&self, url: &str) -> Result<Value> {
@@ -2760,6 +3122,7 @@ impl ScriptLoader {
         let stylesheets = self.inner.pending_stylesheet_fetches.borrow();
         let fonts = self.inner.pending_stylesheet_font_fetches.borrow();
         let images = self.inner.pending_image_fetches.borrow();
+        let frames = self.inner.pending_frame_fetches.borrow();
         let background_images = self.inner.pending_background_image_fetches.borrow();
         modules
             .values()
@@ -2772,6 +3135,7 @@ impl ScriptLoader {
             .chain(stylesheets.values().map(|_| active_poll))
             .chain(fonts.values().map(|_| active_poll))
             .chain(images.values().map(|_| active_poll))
+            .chain(frames.values().map(|_| active_poll))
             .chain(background_images.values().map(|_| active_poll))
             .min()
     }
@@ -2798,6 +3162,11 @@ impl ScriptLoader {
         // HTTP responses in the partitioned Browser cache but release decoded
         // aliases before the new document can paint.
         crate::image_loader::clear_cache();
+        self.inner.classic_lexical_bindings.borrow_mut().clear();
+        self.inner
+            .realm_classic_lexical_bindings
+            .borrow_mut()
+            .clear();
         for fetch in self.inner.pending_stylesheet_fetches.borrow().values() {
             fetch.task.cancel();
         }
@@ -2810,6 +3179,9 @@ impl ScriptLoader {
         }
         for fetch in self.inner.pending_image_fetches.borrow().values() {
             fetch.request.task.cancel();
+        }
+        for fetch in self.inner.pending_frame_fetches.borrow().values() {
+            fetch.task.cancel();
         }
         for fetch in self
             .inner
@@ -2836,6 +3208,8 @@ impl ScriptLoader {
             .clear();
         self.inner.deferred_stylesheet_fonts.borrow_mut().clear();
         self.inner.pending_image_fetches.borrow_mut().clear();
+        self.inner.pending_frame_fetches.borrow_mut().clear();
+        self.inner.processed_frame_nodes.borrow_mut().clear();
         self.inner.processed_image_nodes.borrow_mut().clear();
         self.inner
             .pending_background_image_fetches
@@ -2845,6 +3219,7 @@ impl ScriptLoader {
         self.inner.ready_stylesheets.borrow_mut().clear();
         self.inner.processed_stylesheet_nodes.borrow_mut().clear();
         self.inner.installed_stylesheets.borrow_mut().clear();
+        *self.inner.preferred_style_set.borrow_mut() = None;
         for owner in self.inner.stylesheet_font_owners.borrow().values() {
             crate::font_face::FontRegistry::global().clear_owner(*owner);
             crate::font_loading_web::clear_stylesheet_font_owner(*owner);
@@ -2854,6 +3229,7 @@ impl ScriptLoader {
         self.inner.next_stylesheet_apply.set(0);
         DYNAMIC_STYLESHEET_NODES.with(|nodes| nodes.borrow_mut().clear());
         DYNAMIC_IMAGE_NODES.with(|nodes| nodes.borrow_mut().clear());
+        DYNAMIC_FRAME_NODES.with(|nodes| nodes.borrow_mut().clear());
         w3cos_dom::stylesheet::clear_owner(self.inner.stylesheet_owner);
         *self.inner.module_request_origin.borrow_mut() =
             Some(document_url.origin().ascii_serialization());
@@ -2891,6 +3267,7 @@ impl ScriptLoader {
         if let Some(document_url) = document_url {
             self.prepare_pending_stylesheets(&document_url);
             self.prepare_pending_images(&document_url);
+            self.prepare_pending_frames(&document_url);
         }
         crate::jsdom::set_document_ready_state("interactive");
         self.drain_deferred_classic_scripts();
@@ -2950,6 +3327,9 @@ impl ScriptLoader {
         for fetch in self.inner.pending_image_fetches.borrow().values() {
             fetch.request.task.cancel();
         }
+        for fetch in self.inner.pending_frame_fetches.borrow().values() {
+            fetch.task.cancel();
+        }
         for fetch in self
             .inner
             .pending_background_image_fetches
@@ -2995,6 +3375,8 @@ impl ScriptLoader {
         self.inner.deferred_stylesheet_fonts.borrow_mut().clear();
         self.inner.pending_image_fetches.borrow_mut().clear();
         self.inner.processed_image_nodes.borrow_mut().clear();
+        self.inner.pending_frame_fetches.borrow_mut().clear();
+        self.inner.processed_frame_nodes.borrow_mut().clear();
         self.inner
             .pending_background_image_fetches
             .borrow_mut()
@@ -3003,6 +3385,7 @@ impl ScriptLoader {
         self.inner.ready_stylesheets.borrow_mut().clear();
         self.inner.processed_stylesheet_nodes.borrow_mut().clear();
         self.inner.installed_stylesheets.borrow_mut().clear();
+        *self.inner.preferred_style_set.borrow_mut() = None;
         for owner in self.inner.stylesheet_font_owners.borrow().values() {
             crate::font_face::FontRegistry::global().clear_owner(*owner);
             crate::font_loading_web::clear_stylesheet_font_owner(*owner);
@@ -3221,6 +3604,16 @@ impl ScriptLoader {
         }
     }
 
+    fn invalidate_frame_nodes(&self, nodes: &HashSet<u32>) {
+        for node in nodes {
+            if let Some(fetch) = self.inner.pending_frame_fetches.borrow_mut().remove(node) {
+                fetch.task.cancel();
+            }
+            self.inner.processed_frame_nodes.borrow_mut().remove(node);
+            self.complete_document_script_node(*node);
+        }
+    }
+
     fn invalidate_stylesheet_nodes(&self, nodes: &HashSet<u32>) {
         let removed = nodes
             .iter()
@@ -3301,8 +3694,9 @@ impl ScriptLoader {
     fn rebuild_stylesheet_rules(&self) {
         w3cos_dom::stylesheet::clear_owner(self.inner.stylesheet_owner);
         let installed = self.inner.installed_stylesheets.borrow().clone();
+        let preferred_style_set = self.inner.preferred_style_set.borrow().clone();
         let mut nodes = Vec::new();
-        for root in crate::dom::get_elements_by_tag_name("html") {
+        if let Some(root) = active_document_root() {
             collect_stylesheet_nodes_in_tree_order(root, &mut nodes);
         }
         let mut sheet_nodes = Vec::new();
@@ -3313,6 +3707,16 @@ impl ScriptLoader {
             let Some(stylesheet) = installed.get(&node) else {
                 continue;
             };
+            let rel = crate::dom::get_attribute(node, "rel").unwrap_or_default();
+            let is_alternate = rel
+                .split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("alternate"));
+            if is_alternate {
+                let title = crate::dom::get_attribute(node, "title").unwrap_or_default();
+                if title.is_empty() || preferred_style_set.as_deref() != Some(title.as_str()) {
+                    continue;
+                }
+            }
             sheet_nodes.push(node);
             let sheet_media = crate::dom::get_attribute(node, "media").unwrap_or_default();
             if !sheet_media.trim().is_empty() && !crate::jsdom::media_query_matches(&sheet_media) {
@@ -3349,12 +3753,29 @@ impl ScriptLoader {
         }
     }
 
+    fn apply_default_style_meta(&self, node: u32) {
+        if !crate::dom::tag_name(node).eq_ignore_ascii_case("meta") {
+            return;
+        }
+        let http_equiv = crate::dom::get_attribute(node, "http-equiv").unwrap_or_default();
+        if !http_equiv.eq_ignore_ascii_case("default-style") {
+            return;
+        }
+        let content = crate::dom::get_attribute(node, "content").unwrap_or_default();
+        let content = content.trim();
+        if content.is_empty() {
+            return;
+        }
+        *self.inner.preferred_style_set.borrow_mut() = Some(content.to_string());
+        self.rebuild_stylesheet_rules();
+    }
+
     fn prepare_pending_stylesheets(&self, document_url: &str) {
         let Ok(base) = Url::parse(document_url) else {
             return;
         };
         let mut nodes = Vec::new();
-        for root in crate::dom::get_elements_by_tag_name("html") {
+        if let Some(root) = active_document_root() {
             collect_stylesheet_nodes_in_tree_order(root, &mut nodes);
         }
         for node in nodes {
@@ -3371,10 +3792,13 @@ impl ScriptLoader {
             let element = crate::jsdom::element_value(node);
             let dynamically_inserted =
                 DYNAMIC_STYLESHEET_NODES.with(|nodes| nodes.borrow().contains(&node));
-            if !self.inner.parser_finished.get() && !dynamically_inserted {
-                // The streaming tree builder may expose parser-authored
-                // elements before their token/raw text is complete. Claim
-                // them together at EOF so CSS source order is exact.
+            if !self.inner.parser_finished.get()
+                && !dynamically_inserted
+                && tag.eq_ignore_ascii_case("style")
+            {
+                // A streaming parser exposes a <style> before its raw text is
+                // complete, so defer it until EOF. A <link> is complete at
+                // its start tag and must be available to later parser scripts.
                 continue;
             }
             if crate::dom::has_attribute(node, "disabled")
@@ -3431,6 +3855,27 @@ impl ScriptLoader {
                 Ok(url) if matches!(url.scheme(), "http" | "https") => {
                     self.start_stylesheet_fetch(element, node, url.as_str());
                 }
+                Ok(url) if url.scheme() == "data" => {
+                    match decode_frame_data_url(url.as_str()) {
+                        Ok((content_type, source))
+                            if content_type == "text/css" || content_type == "text/plain" =>
+                        {
+                            self.queue_stylesheet_result(
+                                element,
+                                node,
+                                Ok(Some((Some(url.to_string()), source))),
+                            );
+                        }
+                        Ok((content_type, _)) => self.queue_stylesheet_result(
+                            element,
+                            node,
+                            Err(format!(
+                                "data stylesheet has unsupported media type {content_type:?}"
+                            )),
+                        ),
+                        Err(error) => self.queue_stylesheet_result(element, node, Err(error)),
+                    }
+                }
                 Ok(url) => self.queue_stylesheet_result(
                     element,
                     node,
@@ -3449,6 +3894,40 @@ impl ScriptLoader {
         self.drain_ready_stylesheets();
     }
 
+    fn finish_parser_style(&self, node: u32, document_url: &str) {
+        if !crate::dom::is_connected(node)
+            || self
+                .inner
+                .processed_stylesheet_nodes
+                .borrow()
+                .contains(&node)
+            || !crate::dom::tag_name(node).eq_ignore_ascii_case("style")
+        {
+            return;
+        }
+        let content_type = crate::dom::get_attribute(node, "type").unwrap_or_default();
+        if crate::dom::has_attribute(node, "disabled")
+            || !content_type.is_empty() && !content_type.eq_ignore_ascii_case("text/css")
+        {
+            return;
+        }
+        let source = crate::dom::inner_text(node);
+        if source.is_empty() {
+            return;
+        }
+        self.inner
+            .processed_stylesheet_nodes
+            .borrow_mut()
+            .insert(node);
+        self.start_inline_stylesheet(
+            crate::jsdom::element_value(node),
+            node,
+            source,
+            document_url,
+        );
+        self.drain_ready_stylesheets();
+    }
+
     fn prepare_pending_images(&self, document_url: &str) {
         let Ok(base) = Url::parse(document_url) else {
             return;
@@ -3460,12 +3939,201 @@ impl ScriptLoader {
         }
     }
 
+    fn prepare_pending_frames(&self, document_url: &str) {
+        self.prepare_pending_frames_for_node(document_url, None);
+    }
+
+    fn prepare_pending_frames_for_node(&self, document_url: &str, only_node: Option<u32>) {
+        let Ok(base) = Url::parse(document_url) else {
+            return;
+        };
+        for node in crate::dom::get_elements_by_tag_name("iframe") {
+            if only_node.is_some_and(|only_node| node != only_node) {
+                continue;
+            }
+            if !crate::jsdom::node_is_connected(node) {
+                continue;
+            }
+            let dynamically_inserted =
+                DYNAMIC_FRAME_NODES.with(|nodes| nodes.borrow().contains(&node));
+            if !self.inner.parser_finished.get() && !dynamically_inserted {
+                continue;
+            }
+            if !self.inner.processed_frame_nodes.borrow_mut().insert(node) {
+                continue;
+            }
+            DYNAMIC_FRAME_NODES.with(|nodes| {
+                nodes.borrow_mut().remove(&node);
+            });
+            let element = crate::jsdom::element_value(node);
+            let source = crate::dom::get_attribute(node, "src").unwrap_or_default();
+            if source.trim().is_empty() {
+                if element.get_property("contentDocument").is_nullish() {
+                    let document =
+                        crate::jsdom::parse_frame_document("", "text/html", "about:blank");
+                    crate::jsdom::install_frame_document(node, document, "about:blank");
+                }
+                crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
+                crate::jsdom::dispatch_element_lifecycle_event(node, "load");
+                continue;
+            }
+            self.register_document_script(&element, false);
+            let resolved_url = match base.join(&source) {
+                Ok(url) => url,
+                Err(error) => {
+                    eprintln!("[w3cos] warning: invalid iframe URL {source:?}: {error}");
+                    crate::jsdom::dispatch_element_lifecycle_event(node, "error");
+                    self.complete_document_script_node(node);
+                    continue;
+                }
+            };
+            if resolved_url.scheme() == "data" {
+                let result = decode_frame_data_url(resolved_url.as_str()).and_then(
+                    |(content_type, frame_source)| {
+                        let document_url = resolved_url.to_string();
+                        let document = crate::jsdom::parse_frame_document(
+                            &frame_source,
+                            &content_type,
+                            &document_url,
+                        );
+                        crate::jsdom::install_frame_document(
+                            node,
+                            document.clone(),
+                            &document_url,
+                        );
+                        let frame_window = element.get_property("contentWindow");
+                        self.execute_frame_inline_scripts(
+                            &document,
+                            &frame_window,
+                            &document_url,
+                        );
+                        crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
+                        Ok(())
+                    },
+                );
+                match result {
+                    Ok(()) => crate::jsdom::dispatch_element_lifecycle_event(node, "load"),
+                    Err(error) => {
+                        eprintln!("[w3cos] warning: data iframe failed: {error}");
+                        crate::jsdom::dispatch_element_lifecycle_event(node, "error");
+                    }
+                }
+                self.complete_document_script_node(node);
+                continue;
+            }
+            if resolved_url.scheme() == "javascript" {
+                let document = {
+                    let current = element.get_property("contentDocument");
+                    if current.is_nullish() {
+                        let document = crate::jsdom::parse_frame_document(
+                            "",
+                            "text/html",
+                            "about:blank",
+                        );
+                        crate::jsdom::install_frame_document(
+                            node,
+                            document.clone(),
+                            "about:blank",
+                        );
+                        document
+                    } else {
+                        current
+                    }
+                };
+                let frame_window = element.get_property("contentWindow");
+                let payload = resolved_url
+                    .as_str()
+                    .split_once(':')
+                    .map(|(_, payload)| percent_decode_url_bytes(payload))
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default();
+                let result_key = format!("__w3cos_javascript_url_result_{node}");
+                let wrapped_source = format!("globalThis.{result_key} = ({payload});");
+                let result = self.execute_classic_source_in_realm(
+                    &wrapped_source,
+                    resolved_url.as_str(),
+                    &frame_window,
+                    &document,
+                );
+                match result {
+                    Ok(_) => {
+                        let value = frame_window.get_property(&result_key);
+                        frame_window.set_property(&result_key, Value::Undefined);
+                        if value.is_string() {
+                            let replacement = crate::jsdom::parse_frame_document(
+                                &value.to_js_string(),
+                                "text/html",
+                                "about:blank",
+                            );
+                            crate::jsdom::install_frame_document(
+                                node,
+                                replacement,
+                                "about:blank",
+                            );
+                        }
+                        crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
+                        crate::jsdom::dispatch_element_lifecycle_event(node, "load");
+                    }
+                    Err(error) => {
+                        eprintln!("[w3cos] warning: javascript iframe failed: {error:#}");
+                        crate::jsdom::dispatch_element_lifecycle_event(node, "error");
+                    }
+                }
+                self.complete_document_script_node(node);
+                continue;
+            }
+            let request_url = match resolved_url.scheme() {
+                "http" | "https" => resolved_url.to_string(),
+                scheme => {
+                    eprintln!(
+                        "[w3cos] warning: iframe URL scheme {:?} is not supported",
+                        scheme
+                    );
+                    crate::jsdom::dispatch_element_lifecycle_event(node, "error");
+                    self.complete_document_script_node(node);
+                    continue;
+                }
+            };
+            if !self.inner.policy.allow_network {
+                crate::jsdom::dispatch_element_lifecycle_event(node, "error");
+                self.complete_document_script_node(node);
+                continue;
+            }
+            let mut options = crate::fetch::FetchOptions::default();
+            options.headers.insert(
+                "accept".to_string(),
+                "text/html,application/xhtml+xml,application/xml,text/xml,*/*;q=0.1".to_string(),
+            );
+            let referrer_policy = {
+                let value = element
+                    .call_method("getAttribute", vec![Value::string("referrerpolicy")]);
+                crate::fetch::ScriptReferrerPolicy::parse(
+                    (!value.is_null()).then(|| value.to_js_string()).as_deref(),
+                )
+            };
+            let task = crate::fetch::fetch_script_bytes_async(
+                &request_url,
+                options,
+                base.origin().ascii_serialization(),
+                crate::cookie_store_web::snapshot(),
+                ModuleCredentialsMode::Include,
+                false,
+                document_url.to_string(),
+                referrer_policy,
+            );
+            self.inner
+                .pending_frame_fetches
+                .borrow_mut()
+                .insert(node, PendingFrameFetch { request_url, task });
+        }
+    }
+
     fn prepare_background_images(&self, document_url: &str) {
         let Ok(base) = Url::parse(document_url) else {
             return;
         };
         let mut nodes = Vec::new();
-        for root in crate::dom::get_elements_by_tag_name("html") {
+        if let Some(root) = active_document_root() {
             collect_dom_nodes_in_tree_order(root, &mut nodes);
         }
         let mut active_sources = HashSet::new();
@@ -5080,15 +5748,30 @@ impl ScriptLoader {
     /// HTML parsing and DOM insertion share this loader instead of owning a
     /// second JavaScript execution path.
     pub fn execute_pending_document_scripts(&self, document_url: &str) -> Result<usize> {
+        self.execute_pending_document_scripts_for_node(document_url, None)
+    }
+
+    /// Run the regular preparation algorithm while optionally limiting the
+    /// scan to one script whose children-changed steps fired. A connected
+    /// empty script that gains text must run synchronously without also
+    /// pulling earlier unprocessed sibling scripts forward in tree order.
+    fn execute_pending_document_scripts_for_node(
+        &self,
+        document_url: &str,
+        only_node: Option<u32>,
+    ) -> Result<usize> {
         let base = Url::parse(document_url)
             .map_err(|error| anyhow!("invalid document URL {document_url}: {error}"))?;
         *self.inner.module_request_origin.borrow_mut() = Some(base.origin().ascii_serialization());
         *self.inner.document_url.borrow_mut() = Some(base.to_string());
         crate::cookie_store_web::set_active_url(base.as_str());
-        self.prepare_mutated_images(document_url);
-        self.prepare_pending_stylesheets(document_url);
-        self.prepare_pending_images(document_url);
-        self.prepare_background_images(document_url);
+        if only_node.is_none() {
+            self.prepare_mutated_images(document_url);
+            self.prepare_pending_stylesheets(document_url);
+            self.prepare_pending_images(document_url);
+            self.prepare_pending_frames(document_url);
+            self.prepare_background_images(document_url);
+        }
         let scripts = crate::jsdom::document_value()
             .call_method("querySelectorAll", vec![Value::string("script")]);
         let length = scripts.get_property("length").to_u32();
@@ -5096,9 +5779,22 @@ impl ScriptLoader {
 
         for index in 0..length {
             let element = scripts.call_method("item", vec![Value::Number(f64::from(index))]);
-            if crate::jsdom::node_id_of(&element)
-                .is_some_and(|node| !crate::dom::is_connected(node))
-            {
+            if let Some(only_node) = only_node {
+                let only_element = crate::jsdom::element_value(only_node);
+                let is_only_node = match (element.as_object(), only_element.as_object()) {
+                    (Some(element), Some(only_element)) => element.ptr_eq(&only_element),
+                    _ => false,
+                };
+                if !is_only_node {
+                    continue;
+                }
+            }
+            // A DOM property setter can synchronously report children-changed
+            // steps while its proxy target is still mutably borrowed. The
+            // targeted path already knows the node and can reject an
+            // already-started script without borrowing that target again.
+            let element_node = only_node.or_else(|| crate::jsdom::node_id_of(&element));
+            if element_node.is_some_and(|node| !crate::dom::is_connected(node)) {
                 continue;
             }
             if self
@@ -5150,10 +5846,7 @@ impl ScriptLoader {
             }
 
             let src = element.call_method("getAttribute", vec![Value::string("src")]);
-            let has_inline_source = !element
-                .get_property("textContent")
-                .to_js_string()
-                .is_empty();
+            let has_inline_source = !script_element_source(&element).is_empty();
             if src.is_null() && !has_inline_source {
                 // Preparing an empty connected script aborts before setting the
                 // HTML "already started" flag. A later src/text mutation must
@@ -5193,7 +5886,7 @@ impl ScriptLoader {
                     .unwrap_or_default();
                 let specifier = if src.is_null() || src.to_js_string().is_empty() {
                     let specifier = format!("{document_url}#inline-script-{index}");
-                    let source = element.get_property("textContent").to_js_string();
+                    let source = script_element_source(&element);
                     match self.register_module_source(&specifier, &source) {
                         Ok(()) => Ok(specifier),
                         Err(error) => Err(error.to_string()),
@@ -5232,8 +5925,13 @@ impl ScriptLoader {
 
             let result = if src.is_null() || src.to_js_string().is_empty() {
                 let specifier = format!("{document_url}#inline-script-{index}");
-                let source = element.get_property("textContent").to_js_string();
-                self.execute_source(&source, &specifier).map(Some)
+                let source = script_element_source(&element);
+                // The HTML script-processing algorithm does not perform a
+                // microtask checkpoint in the middle of a re-entrant DOM
+                // insertion. The surrounding browser task drains after the
+                // current classic script returns.
+                self.execute_classic_source_without_microtask_drain(&source, &specifier)
+                    .map(Some)
             } else {
                 match base.join(&src.to_js_string()) {
                     Ok(resolved) => {
@@ -5293,6 +5991,9 @@ impl ScriptLoader {
                     }
                     return Err(error);
                 }
+            }
+            if self.has_pending_parser_blocking_script() {
+                break;
             }
         }
         Ok(executed)
@@ -5665,10 +6366,14 @@ impl ScriptLoader {
     }
 
     fn check_source_size(&self, source: &str) -> Result<()> {
-        if source.len() > self.inner.policy.max_source_bytes {
+        self.check_source_byte_size(source.len())
+    }
+
+    fn check_source_byte_size(&self, size: usize) -> Result<()> {
+        if size > self.inner.policy.max_source_bytes {
             return Err(anyhow!(
                 "dynamic script exceeds source limit ({} > {} bytes)",
-                source.len(),
+                size,
                 self.inner.policy.max_source_bytes
             ));
         }
@@ -5676,7 +6381,7 @@ impl ScriptLoader {
     }
 
     fn install_import_map_element(&self, element: &Value, document_url: &str) -> Result<()> {
-        let source = element.get_property("textContent").to_js_string();
+        let source = script_element_source(element);
         self.check_source_size(&source)?;
         let value: serde_json::Value = serde_json::from_str(&source)
             .map_err(|error| anyhow!("invalid import map JSON: {error}"))?;
@@ -5821,7 +6526,7 @@ impl ScriptLoader {
             }
             for import in &record.module.imports {
                 let cell = if import.specifier == "w3cos:global" {
-                    binding_cell(resolve_global(&import.imported))
+                    resolve_global_binding(&import.imported)
                 } else {
                     let dependency_url = self.resolve_module_url(url, &import.specifier)?;
                     let shared_external =
@@ -6583,6 +7288,110 @@ impl ScriptLoader {
         completed_count
     }
 
+    fn poll_frame_fetches(&self) -> usize {
+        let completed = {
+            let pending = self.inner.pending_frame_fetches.borrow();
+            pending
+                .iter()
+                .filter_map(|(node, fetch)| match fetch.task.receiver.try_recv() {
+                    Ok(result) => Some((*node, result)),
+                    Err(TryRecvError::Disconnected) => {
+                        Some((*node, Err("iframe fetch worker disconnected".to_string())))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let completed_count = completed.len();
+        for (node, result) in completed {
+            let Some(fetch) = self.inner.pending_frame_fetches.borrow_mut().remove(&node) else {
+                continue;
+            };
+            if !crate::dom::is_connected(node) {
+                self.complete_document_script_node(node);
+                continue;
+            }
+            let result = result.and_then(|response| {
+                for (url, cookie) in &response.set_cookies {
+                    crate::cookie_store_web::set_cookie_assignment_for_url(url, cookie, true);
+                }
+                if !response.ok {
+                    return Err(format!(
+                        "iframe fetch failed with status {} {}",
+                        response.status, response.status_text
+                    ));
+                }
+                self.check_source_byte_size(response.body.len())
+                    .map_err(|error| error.to_string())?;
+                let response_content_type =
+                    header_value(&response.headers, "content-type").unwrap_or_default();
+                let media_type = response_content_type
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                let content_type = match media_type.as_str() {
+                    "application/xhtml+xml" | "application/xml" | "text/xml" | "image/svg+xml" => {
+                        media_type.as_str()
+                    }
+                    "text/css" | "text/plain" | "image/bmp" | "image/gif" | "image/jpeg"
+                    | "image/png" => media_type.as_str(),
+                    _ => "text/html",
+                };
+                let document_url = Url::parse(&response.url)
+                    .ok()
+                    .map(|mut final_url| {
+                        if final_url.fragment().is_none()
+                            && let Ok(request_url) = Url::parse(&fetch.request_url)
+                        {
+                            final_url.set_fragment(request_url.fragment());
+                        }
+                        final_url.to_string()
+                    })
+                    .unwrap_or_else(|| response.url.clone());
+                let (source, encoding_name) = if matches!(
+                    content_type,
+                    "text/css"
+                        | "text/plain"
+                        | "image/bmp"
+                        | "image/gif"
+                        | "image/jpeg"
+                        | "image/png"
+                ) {
+                    (String::new(), "UTF-8")
+                } else {
+                    decode_document_bytes_with_encoding(&response.body, response_content_type)
+                        .map_err(|error| error.to_string())?
+                };
+                let document =
+                    crate::jsdom::parse_frame_document(&source, content_type, &document_url);
+                crate::jsdom::set_document_encoding(&document, encoding_name);
+                crate::jsdom::install_frame_document(node, document.clone(), &document_url);
+                let frame_window = crate::jsdom::element_value(node).get_property("contentWindow");
+                self.execute_frame_inline_scripts(
+                    &document,
+                    &frame_window,
+                    &document_url,
+                );
+                crate::jsdom::dispatch_frame_window_lifecycle_event(node, "load");
+                Ok(())
+            });
+            match result {
+                Ok(()) => crate::jsdom::dispatch_element_lifecycle_event(node, "load"),
+                Err(error) => {
+                    eprintln!(
+                        "[w3cos] warning: iframe {} failed: {error}",
+                        fetch.request_url
+                    );
+                    crate::jsdom::dispatch_element_lifecycle_event(node, "error");
+                }
+            }
+            self.complete_document_script_node(node);
+        }
+        completed_count
+    }
+
     fn complete_browser_image_request(
         &self,
         request: &BrowserImageRequest,
@@ -6688,6 +7497,7 @@ impl ScriptLoader {
 
     fn poll_source_fetches(&self) -> usize {
         let image_completed = self.poll_image_fetches();
+        let frame_completed = self.poll_frame_fetches();
         let background_image_completed = self.poll_background_image_fetches();
         let stylesheet_completed = self.poll_stylesheet_fetches();
         let stylesheet_font_completed = self.poll_stylesheet_font_fetches();
@@ -6852,6 +7662,7 @@ impl ScriptLoader {
         }
         completed
             + image_completed
+            + frame_completed
             + background_image_completed
             + classic_completed
             + stylesheet_completed
@@ -7159,6 +7970,7 @@ pub fn has_pending_script_fetches() -> bool {
                     || !inner.pending_stylesheet_fetches.borrow().is_empty()
                     || !inner.pending_stylesheet_font_fetches.borrow().is_empty()
                     || !inner.pending_image_fetches.borrow().is_empty()
+                    || !inner.pending_frame_fetches.borrow().is_empty()
             })
     })
 }
@@ -7903,7 +8715,7 @@ fn module_namespace(record: &Rc<ModuleRecord>) -> Value {
 }
 
 pub(crate) fn notify_node_inserted(node: u32) {
-    if parser_insertion_active() {
+    if parser_insertion_active() || dom_post_insertion_steps_suppressed() {
         return;
     }
     let mut scripts = HashSet::new();
@@ -7912,13 +8724,23 @@ pub(crate) fn notify_node_inserted(node: u32) {
     collect_stylesheet_nodes(node, &mut stylesheets);
     let mut images = HashSet::new();
     collect_image_nodes(node, &mut images);
-    if scripts.is_empty() && stylesheets.is_empty() && images.is_empty() {
+    let mut frames = HashSet::new();
+    collect_frame_nodes(node, &mut frames);
+    let mut default_style_metas = HashSet::new();
+    collect_default_style_meta_nodes(node, &mut default_style_metas);
+    if scripts.is_empty()
+        && stylesheets.is_empty()
+        && images.is_empty()
+        && frames.is_empty()
+        && default_style_metas.is_empty()
+    {
         return;
     }
     let has_active_loader = ACTIVE_DOCUMENT_LOADER.with(|active| active.borrow().is_some());
     if !has_active_loader {
         return;
     }
+    let has_scripts = !scripts.is_empty();
     DYNAMIC_SCRIPT_NODES.with(|nodes| {
         nodes.borrow_mut().extend(scripts);
     });
@@ -7926,19 +8748,91 @@ pub(crate) fn notify_node_inserted(node: u32) {
     DYNAMIC_STYLESHEET_NODES.with(|nodes| {
         nodes.borrow_mut().extend(stylesheets.iter().copied());
     });
+    DYNAMIC_FRAME_NODES.with(|nodes| {
+        nodes.borrow_mut().extend(frames.iter().copied());
+    });
     if has_stylesheets
-        && let Some((loader, _)) = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
+        && let Some((loader, document_url)) =
+            ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
     {
         loader.rebuild_stylesheet_rules();
+        // Stylesheet creation is an insertion step, so every inserted style
+        // or link is observable before any script post-insertion step runs.
+        loader.prepare_pending_stylesheets(&document_url);
+    }
+    if (has_scripts || !frames.is_empty() || !default_style_metas.is_empty())
+        && let Some((loader, document_url)) =
+            ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
+    {
+        // HTML post-insertion steps run in tree order. In particular, a
+        // script before an iframe must run before that iframe gets a browsing
+        // context, while a script after it must observe the context.
+        let mut inserted_nodes = Vec::new();
+        collect_dom_nodes_in_tree_order(node, &mut inserted_nodes);
+        for inserted_node in inserted_nodes {
+            let tag = crate::dom::tag_name(inserted_node);
+            if tag.eq_ignore_ascii_case("iframe") {
+                loader.prepare_pending_frames_for_node(&document_url, Some(inserted_node));
+            } else if tag.eq_ignore_ascii_case("meta")
+                && default_style_metas.contains(&inserted_node)
+                && crate::dom::is_connected(inserted_node)
+            {
+                loader.apply_default_style_meta(inserted_node);
+            } else if tag.eq_ignore_ascii_case("script") {
+                // Dynamically inserted classic scripts prepare synchronously.
+                // Inline sources run before the DOM insertion method returns;
+                // external sources only start their fetch here.
+                let _ = loader.execute_pending_document_scripts_for_node(
+                    &document_url,
+                    Some(inserted_node),
+                );
+            }
+        }
     }
     schedule_document_script_pump();
+}
+
+pub(crate) fn prepare_inserted_stylesheets(nodes: &[u32]) {
+    if parser_insertion_active() || dom_post_insertion_steps_suppressed() {
+        return;
+    }
+    let mut stylesheets = HashSet::new();
+    let mut frames = HashSet::new();
+    for node in nodes {
+        collect_stylesheet_nodes(*node, &mut stylesheets);
+        collect_frame_nodes(*node, &mut frames);
+    }
+    // Atomic insertion places every node in the tree before running any
+    // post-insertion step. Remember later frames so an earlier script cannot
+    // lazily create their browsing contexts ahead of their tree-order turn.
+    DYNAMIC_FRAME_NODES.with(|nodes| {
+        nodes.borrow_mut().extend(frames);
+    });
+    if stylesheets.is_empty() {
+        return;
+    }
+    DYNAMIC_STYLESHEET_NODES.with(|nodes| {
+        nodes.borrow_mut().extend(stylesheets);
+    });
+    if let Some((loader, document_url)) =
+        ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
+    {
+        // All insertion steps for an atomic batch precede every node's
+        // post-insertion steps. This makes a later style/link visible to an
+        // earlier script in the same fragment or multi-argument append.
+        loader.prepare_pending_stylesheets(&document_url);
+    }
+}
+
+pub(crate) fn frame_post_insertion_pending(node: u32) -> bool {
+    DYNAMIC_FRAME_NODES.with(|nodes| nodes.borrow().contains(&node))
 }
 
 /// Re-run the standard script preparation path when a connected, not-yet
 /// started script gains a source or inline text after insertion.
 pub(crate) fn notify_script_mutated(node: u32) {
     let tag = crate::dom::tag_name(node);
-    if parser_insertion_active() {
+    if parser_insertion_active() || dom_post_insertion_steps_suppressed() {
         return;
     }
     if tag.eq_ignore_ascii_case("img") {
@@ -7963,6 +8857,19 @@ pub(crate) fn notify_script_mutated(node: u32) {
         }
         return;
     }
+    if tag.eq_ignore_ascii_case("iframe") {
+        if !crate::dom::is_connected(node) {
+            return;
+        }
+        if let Some((loader, _)) = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone()) {
+            loader.invalidate_frame_nodes(&HashSet::from([node]));
+        }
+        DYNAMIC_FRAME_NODES.with(|nodes| {
+            nodes.borrow_mut().insert(node);
+        });
+        schedule_document_script_pump();
+        return;
+    }
     if !crate::dom::is_connected(node) {
         return;
     }
@@ -7970,17 +8877,71 @@ pub(crate) fn notify_script_mutated(node: u32) {
         DYNAMIC_SCRIPT_NODES.with(|nodes| {
             nodes.borrow_mut().insert(node);
         });
+        if let Some((loader, document_url)) =
+            ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
+        {
+            let _ = loader.execute_pending_document_scripts_for_node(&document_url, Some(node));
+        }
     } else if matches!(tag.as_str(), "style" | "link") {
         let nodes = HashSet::from([node]);
-        if let Some((loader, _)) = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone()) {
+        if let Some((loader, document_url)) =
+            ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())
+        {
             loader.invalidate_stylesheet_nodes(&nodes);
+            DYNAMIC_STYLESHEET_NODES.with(|nodes| {
+                nodes.borrow_mut().insert(node);
+            });
+            // Children-changed steps for a connected <style> synchronously
+            // replace its CSSStyleSheet before the mutation call returns.
+            loader.prepare_pending_stylesheets(&document_url);
+        } else {
+            DYNAMIC_STYLESHEET_NODES.with(|nodes| {
+                nodes.borrow_mut().insert(node);
+            });
         }
-        DYNAMIC_STYLESHEET_NODES.with(|nodes| {
-            nodes.borrow_mut().insert(node);
-        });
     } else {
         return;
     }
+    schedule_document_script_pump();
+}
+
+/// Re-select responsive image candidates after a preserved move changes an
+/// `<img>` element's picture parent or a `<source>` element's picture siblings.
+/// `moveBefore()` deliberately suppresses ordinary removal/insertion steps, so
+/// this relevant-mutation step must be queued explicitly without invalidating
+/// the preserved subtree itself.
+pub(crate) fn notify_picture_relevant_move(
+    moving: u32,
+    old_parent: Option<u32>,
+    new_parent: u32,
+) {
+    let tag = crate::dom::tag_name(moving);
+    let mut images = HashSet::new();
+    if tag.eq_ignore_ascii_case("img") {
+        let moved_between_picture_contexts = [old_parent, Some(new_parent)]
+            .into_iter()
+            .flatten()
+            .any(|parent| crate::dom::tag_name(parent).eq_ignore_ascii_case("picture"));
+        if moved_between_picture_contexts {
+            images.insert(moving);
+        }
+    } else if tag.eq_ignore_ascii_case("source") {
+        for picture in [old_parent, Some(new_parent)]
+            .into_iter()
+            .flatten()
+            .filter(|parent| crate::dom::tag_name(*parent).eq_ignore_ascii_case("picture"))
+        {
+            images.extend(
+                crate::dom::children(picture)
+                    .into_iter()
+                    .filter(|child| crate::dom::tag_name(*child).eq_ignore_ascii_case("img")),
+            );
+        }
+    }
+    if images.is_empty() {
+        return;
+    }
+    DYNAMIC_IMAGE_NODES.with(|nodes| nodes.borrow_mut().extend(images));
     schedule_document_script_pump();
 }
 
@@ -8062,7 +9023,9 @@ pub(crate) fn notify_node_removed(node: u32) {
     collect_stylesheet_nodes(node, &mut stylesheets);
     let mut images = HashSet::new();
     collect_image_nodes(node, &mut images);
-    if scripts.is_empty() && stylesheets.is_empty() && images.is_empty() {
+    let mut frames = HashSet::new();
+    collect_frame_nodes(node, &mut frames);
+    if scripts.is_empty() && stylesheets.is_empty() && images.is_empty() && frames.is_empty() {
         return;
     }
     DYNAMIC_SCRIPT_NODES.with(|nodes| {
@@ -8076,11 +9039,15 @@ pub(crate) fn notify_node_removed(node: u32) {
     DYNAMIC_IMAGE_NODES.with(|nodes| {
         nodes.borrow_mut().retain(|node| !images.contains(node));
     });
+    DYNAMIC_FRAME_NODES.with(|nodes| {
+        nodes.borrow_mut().retain(|node| !frames.contains(node));
+    });
     let active = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone());
     if let Some((loader, _)) = active {
         loader.cancel_removed_script_nodes(&scripts);
         loader.cancel_removed_stylesheet_nodes(&stylesheets);
         loader.invalidate_image_nodes(&images, true);
+        loader.invalidate_frame_nodes(&frames);
     }
 }
 
@@ -8093,6 +9060,17 @@ fn collect_script_nodes(node: u32, scripts: &mut HashSet<u32>) {
     }
 }
 
+fn script_element_source(element: &Value) -> String {
+    let Some(node) = crate::jsdom::node_id_of(element) else {
+        return element.get_property("textContent").to_js_string();
+    };
+    crate::dom::children(node)
+        .into_iter()
+        .filter(|child| matches!(crate::dom::node_type(*child), 3 | 4))
+        .filter_map(crate::dom::get_text_content)
+        .collect()
+}
+
 fn collect_stylesheet_nodes(node: u32, stylesheets: &mut HashSet<u32>) {
     if matches!(crate::dom::tag_name(node).as_str(), "style" | "link") {
         stylesheets.insert(node);
@@ -8102,12 +9080,33 @@ fn collect_stylesheet_nodes(node: u32, stylesheets: &mut HashSet<u32>) {
     }
 }
 
+fn collect_default_style_meta_nodes(node: u32, metas: &mut HashSet<u32>) {
+    if crate::dom::tag_name(node).eq_ignore_ascii_case("meta")
+        && crate::dom::get_attribute(node, "http-equiv")
+            .is_some_and(|value| value.eq_ignore_ascii_case("default-style"))
+    {
+        metas.insert(node);
+    }
+    for child in crate::dom::children(node) {
+        collect_default_style_meta_nodes(child, metas);
+    }
+}
+
 fn collect_image_nodes(node: u32, images: &mut HashSet<u32>) {
     if crate::dom::tag_name(node).eq_ignore_ascii_case("img") {
         images.insert(node);
     }
     for child in crate::dom::children(node) {
         collect_image_nodes(child, images);
+    }
+}
+
+fn collect_frame_nodes(node: u32, frames: &mut HashSet<u32>) {
+    if crate::dom::tag_name(node).eq_ignore_ascii_case("iframe") {
+        frames.insert(node);
+    }
+    for child in crate::dom::children(node) {
+        collect_frame_nodes(child, frames);
     }
 }
 
@@ -8365,6 +9364,10 @@ fn collect_stylesheet_nodes_in_tree_order(node: u32, stylesheets: &mut Vec<u32>)
     }
 }
 
+fn active_document_root() -> Option<u32> {
+    crate::jsdom::node_id_of(&crate::jsdom::document_value().get_property("documentElement"))
+}
+
 fn collect_dom_nodes_in_tree_order(node: u32, nodes: &mut Vec<u32>) {
     nodes.push(node);
     for child in crate::dom::children(node) {
@@ -8381,7 +9384,43 @@ pub(crate) fn reset_document_loader() {
     DYNAMIC_SCRIPT_NODES.with(|nodes| nodes.borrow_mut().clear());
     DYNAMIC_STYLESHEET_NODES.with(|nodes| nodes.borrow_mut().clear());
     DYNAMIC_IMAGE_NODES.with(|nodes| nodes.borrow_mut().clear());
+    DYNAMIC_FRAME_NODES.with(|nodes| nodes.borrow_mut().clear());
+    DOM_POST_INSERTION_SUPPRESSION_DEPTH.with(|depth| depth.set(0));
     reset_parser_insertion_state();
+}
+
+pub(crate) fn evaluate_global_expression(source: &str) -> Result<Value> {
+    let active = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone());
+    active
+        .map(|(loader, _)| loader)
+        .unwrap_or_else(|| ScriptLoader::new(ScriptPolicy::default()))
+        .evaluate_global_expression(source)
+}
+
+pub(crate) fn construct_global_function(arguments: &[Value]) -> Result<Value> {
+    let active = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone());
+    active
+        .map(|(loader, _)| loader)
+        .unwrap_or_else(|| ScriptLoader::new(ScriptPolicy::default()))
+        .construct_global_function(arguments)
+}
+
+pub(crate) fn construct_global_function_in_realm(
+    arguments: &[Value],
+    global: &Value,
+    document: &Value,
+) -> Result<Value> {
+    let active = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone());
+    active
+        .map(|(loader, _)| loader)
+        .unwrap_or_else(|| ScriptLoader::new(ScriptPolicy::default()))
+        .construct_global_function_in_realm(arguments, global, document)
+}
+
+pub(crate) fn update_inline_event_handler(node: u32, event_type: &str, source: &str) {
+    if let Some((loader, _)) = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone()) {
+        loader.register_inline_event_handler(node, event_type, source);
+    }
 }
 
 pub(crate) fn refresh_stylesheet_media_queries() {
@@ -8389,6 +9428,53 @@ pub(crate) fn refresh_stylesheet_media_queries() {
         loader.rebuild_stylesheet_rules();
         loader.activate_deferred_stylesheet_fonts();
     }
+}
+
+/// Resolve the first and last authored values for one active `@keyframes`
+/// property. Browser stylesheets are already owned by the document loader, so
+/// this follows the same connected tree order and replacement semantics as
+/// the ordinary rule registry.
+pub(crate) fn active_keyframe_property(
+    animation_name: &str,
+    property: &str,
+) -> Option<(String, String)> {
+    let (loader, _) = ACTIVE_DOCUMENT_LOADER.with(|slot| slot.borrow().clone())?;
+    let installed = loader.inner.installed_stylesheets.borrow().clone();
+    let mut nodes = Vec::new();
+    collect_stylesheet_nodes_in_tree_order(active_document_root()?, &mut nodes);
+    let mut resolved = None;
+    for node in nodes {
+        if !crate::dom::is_connected(node) || crate::dom::has_attribute(node, "disabled") {
+            continue;
+        }
+        let Some(stylesheet) = installed.get(&node) else {
+            continue;
+        };
+        let parsed = w3cos_compiler::css_parser::parse_css(&stylesheet.source);
+        for keyframes in parsed
+            .keyframes
+            .into_iter()
+            .filter(|keyframes| keyframes.name == animation_name)
+        {
+            let mut values = keyframes
+                .stops
+                .into_iter()
+                .filter_map(|stop| {
+                    let value = match property {
+                        "left" => stop.style.left,
+                        "transform" => stop.style.transform,
+                        _ => None,
+                    }?;
+                    Some((stop.offset, value))
+                })
+                .collect::<Vec<_>>();
+            values.sort_by(|left, right| left.0.total_cmp(&right.0));
+            if let (Some((_, from)), Some((_, to))) = (values.first(), values.last()) {
+                resolved = Some((from.clone(), to.clone()));
+            }
+        }
+    }
+    resolved
 }
 
 fn stylesheet_font_families(stack: &str) -> Vec<String> {
@@ -8450,9 +9536,29 @@ fn resolve_global(name: &str) -> Value {
     match name {
         "window" | "self" | "globalThis" => crate::jsdom::window_value(),
         "document" => crate::jsdom::document_value(),
+        "undefined" => Value::Undefined,
+        "NaN" => Value::Number(f64::NAN),
+        "Infinity" => Value::Number(f64::INFINITY),
+        "Symbol" => Value::object(HashMap::from([
+            (
+                "iterator".to_string(),
+                Value::string("__w3cos_symbol_iterator"),
+            ),
+            (
+                "asyncIterator".to_string(),
+                Value::string("__w3cos_symbol_async_iterator"),
+            ),
+            (
+                "unscopables".to_string(),
+                Value::string("__w3cos_symbol_unscopables"),
+            ),
+        ])),
         _ => {
             let value = crate::jsdom::window_value().get_property(name);
             if !value.is_undefined() {
+                return value;
+            }
+            if let Some(value) = crate::jsdom::window_named_property(name) {
                 return value;
             }
             match name {
@@ -8463,6 +9569,146 @@ fn resolve_global(name: &str) -> Value {
                 _ => Value::Undefined,
             }
         }
+    }
+}
+
+fn resolve_global_binding(name: &str) -> BindingCell {
+    let initial = resolve_global(name);
+    if matches!(name, "Object" | "Array" | "Math" | "JSON")
+        && crate::jsdom::window_value()
+            .get_property(name)
+            .is_undefined()
+    {
+        return binding_cell(initial);
+    }
+    if matches!(name, "window" | "self" | "globalThis") {
+        return external_binding_cell(
+            Value::function(|_, _| crate::jsdom::window_value()),
+            Value::Undefined,
+        );
+    }
+    if name == "document" {
+        return external_binding_cell(
+            Value::function(|_, _| crate::jsdom::document_value()),
+            Value::Undefined,
+        );
+    }
+    let getter_name = name.to_string();
+    let setter_name = name.to_string();
+    external_binding_cell(
+        Value::function(move |_, _| resolve_global(&getter_name)),
+        Value::function(move |_, args| {
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            crate::jsdom::window_value().set_property(&setter_name, value.clone());
+            value
+        }),
+    )
+}
+
+fn resolve_classic_global_binding(name: &str) -> BindingCell {
+    property_binding_cell(crate::jsdom::window_value(), name)
+}
+
+fn resolve_realm_classic_global_binding(name: &str, global: &Value) -> BindingCell {
+    property_binding_cell(global.clone(), name)
+}
+
+fn resolve_realm_global_binding(name: &str, global: &Value, document: &Value) -> BindingCell {
+    if matches!(name, "window" | "self" | "globalThis") {
+        let getter_global = global.clone();
+        return external_binding_cell(
+            Value::function(move |_, _| getter_global.clone()),
+            Value::Undefined,
+        );
+    }
+    if name == "document" {
+        let document = document.clone();
+        return external_binding_cell(
+            Value::function(move |_, _| document.clone()),
+            Value::Undefined,
+        );
+    }
+    let getter_global = global.clone();
+    let getter_name = name.to_string();
+    let setter_global = global.clone();
+    let setter_name = name.to_string();
+    external_binding_cell(
+        Value::function(move |_, _| {
+            let value = getter_global.get_property(&getter_name);
+            if value.is_undefined() {
+                resolve_global(&getter_name)
+            } else {
+                value
+            }
+        }),
+        Value::function(move |_, args| {
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            setter_global.set_property(&setter_name, value.clone());
+            value
+        }),
+    )
+}
+
+fn decode_frame_data_url(
+    url: &str,
+) -> std::result::Result<(String, String), String> {
+    let payload = url
+        .get(url.find(':').map_or(0, |index| index + 1)..)
+        .unwrap_or_default();
+    let (header, data) = payload
+        .split_once(',')
+        .ok_or_else(|| "data URL is missing the comma separator".to_string())?;
+    let mut parts = header.split(';');
+    let content_type = parts
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("text/plain")
+        .trim()
+        .to_ascii_lowercase();
+    let is_base64 = parts.any(|part| part.trim().eq_ignore_ascii_case("base64"));
+    let bytes = if is_base64 {
+        use base64::Engine as _;
+        let compact = data
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>();
+        base64::engine::general_purpose::STANDARD
+            .decode(compact.as_bytes())
+            .map_err(|error| format!("data URL base64 decode failed: {error}"))?
+    } else {
+        percent_decode_url_bytes(data)
+    };
+    Ok((
+        content_type,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    ))
+}
+
+fn percent_decode_url_bytes(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    decoded
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -8584,6 +9830,1389 @@ mod tests {
                 .call_method("getAttribute", vec![Value::string("data-runtime")])
                 .to_js_string(),
             "w3vm"
+        );
+    }
+
+    #[test]
+    fn classic_nested_closure_retains_for_each_callback_local_dom_value() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .execute_source(
+                r#"
+let retainedCheck;
+["document.body"].forEach(function (nodeExpression) {
+    var reference = eval(nodeExpression);
+    retainedCheck = function () {
+        return reference.contains(reference);
+    };
+});
+window.__nestedClosureContains = retainedCheck();
+"#,
+                "inline:nested-closure-dom-value",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value().get_property("__nestedClosureContains"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn classic_new_function_receives_source_level_call_arguments() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+var dynamicIdentity = new Function("value", "return value;");
+window.__dynamicFunctionArgument = dynamicIdentity(50);
+var dynamicRoot = document.createElement("div");
+for (var dynamicIndex = 0; dynamicIndex < 100; dynamicIndex++) {
+    var dynamicChild = document.createElement("span");
+    dynamicChild.className = "dynamic-child";
+    dynamicRoot.append(dynamicChild);
+}
+document.body.append(dynamicRoot);
+var dynamicNodeList = dynamicRoot.querySelectorAll(".dynamic-child");
+var dynamicIndexOf = new Function("nodeList", `
+    const el = nodeList[50];
+    let index = -1;
+    for (var j = 0; j < nodeList.length; j++) {
+        if (nodeList[j] === el) {
+            index = j;
+            break;
+        }
+    }
+    return index;
+`);
+window.__dynamicFunctionNodeListIndex = dynamicIndexOf(dynamicNodeList);
+"#,
+                "inline:dynamic-function-argument",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value().get_property("__dynamicFunctionArgument"),
+            Value::Number(50.0)
+        );
+        assert_eq!(
+            crate::jsdom::window_value().get_property("__dynamicFunctionNodeListIndex"),
+            Value::Number(50.0)
+        );
+    }
+
+    #[test]
+    fn classic_regexp_literal_uses_the_page_regexp_global() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+const validName = /^(?:[A-Za-z][^\0\t\n\f\r\u0020/>]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9-.:_\u0080-\u{10FFFF}]*)$/u;
+window.__regexpNameMatches = validName.test("div") && validName.test("smallEmoji🆖");
+"#,
+                "inline:regexp-name-validation",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value().get_property("__regexpNameMatches"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn classic_script_resolves_live_window_named_elements_by_id() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let document = crate::jsdom::document_value();
+        let element = document.call_method("createElement", vec![Value::string("div")]);
+        element.call_method(
+            "setAttribute",
+            vec![Value::string("id"), Value::string("namedTarget")],
+        );
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![element.clone()]);
+        let undefined_named = document.call_method("createElement", vec![Value::string("div")]);
+        undefined_named.set_property("id", Value::string("undefined"));
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![undefined_named]);
+
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+window.__namedElement = namedTarget === document.getElementById("namedTarget");
+window.__undefinedBuiltinWins = undefined === void 0;
+window.__elementRemoveIsUnscopable = Element.prototype[Symbol.unscopables].remove;
+"#,
+                "inline:window-named-property",
+            )
+            .unwrap();
+
+        assert_eq!(
+            crate::jsdom::window_value().get_property("__namedElement"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            crate::jsdom::window_value().get_property("__undefinedBuiltinWins"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            crate::jsdom::window_value().get_property("__elementRemoveIsUnscopable"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn classic_closure_reads_live_window_frames_binding() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .execute_source(
+                "onload = function () { return frames.length; };",
+                "inline:live-window-frames",
+            )
+            .unwrap();
+        assert!(
+            crate::jsdom::window_value()
+                .get_property("onload")
+                .is_callable()
+        );
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("onload")
+                .call(Value::Undefined, vec![])
+                .to_u32(),
+            0
+        );
+
+        let document = crate::jsdom::document_value();
+        let iframe = document.call_method("createElement", vec![Value::string("iframe")]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![iframe.clone()]);
+        let node = crate::jsdom::node_id_of(&iframe).unwrap();
+        let frame_document = crate::jsdom::parse_frame_document(
+            "<root/>",
+            "application/xml",
+            "https://example.test/frame.xml",
+        );
+        crate::jsdom::install_frame_document(
+            node,
+            frame_document,
+            "https://example.test/frame.xml",
+        );
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("onload")
+                .call(Value::Undefined, vec![])
+                .to_u32(),
+            1
+        );
+    }
+
+    #[test]
+    fn frame_function_observer_exception_reports_to_callback_global() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+        let document = crate::jsdom::document_value();
+        for _ in 0..3 {
+            let iframe = document.call_method("createElement", vec![Value::string("iframe")]);
+            document
+                .get_property("body")
+                .call_method("appendChild", vec![iframe]);
+        }
+        let frames = crate::jsdom::window_value().get_property("frames");
+        let frame0 = frames.get_property("0");
+        let frame1 = frames.get_property("1");
+        let callback = w3cos_core::class::construct(
+            &frame1.get_property("Function"),
+            vec![Value::string(
+                "throw new parent.frames[2].Error('PASS');",
+            )],
+        );
+        assert!(callback.is_callable());
+        assert!(
+            callback
+                .get_property("__w3cos_callback_global")
+                .strict_eq(&frame1)
+        );
+        assert!(w3cos_core::catch_js(|| callback.call(Value::Undefined, vec![])).is_err());
+
+        let error_calls = Rc::new(Cell::new(0_u32));
+        let observed_error_calls = Rc::clone(&error_calls);
+        frame1.set_property(
+            "onerror",
+            Value::function(move |_, _| {
+                observed_error_calls.set(observed_error_calls.get() + 1);
+                Value::Undefined
+            }),
+        );
+        loader.prepare_pending_frames("https://example.test/index.html");
+        assert!(
+            crate::jsdom::window_value()
+                .get_property("frames")
+                .get_property("1")
+                .strict_eq(&frame1)
+        );
+        let observer = w3cos_core::class::construct(
+            &frame0.get_property("MutationObserver"),
+            vec![callback],
+        );
+        let target = frame0.get_property("document").get_property("body");
+        observer.call_method(
+            "observe",
+            vec![
+                target.clone(),
+                Value::object(HashMap::from([
+                    ("childList".to_string(), Value::Bool(true)),
+                    ("subtree".to_string(), Value::Bool(true)),
+                ])),
+            ],
+        );
+        target.call_method("append", vec![Value::string("foo")]);
+        crate::jsdom::drain_microtasks();
+        assert_eq!(error_calls.get(), 1);
+        observer.call_method("disconnect", vec![]);
+
+        loader
+            .execute_source(
+                r#"
+window.__compiledFrameErrorCalls = "";
+frames[1].onerror = function () { window.__compiledFrameErrorCalls += "frame1"; };
+const compiledFrameTarget = frames[0].document.body;
+const compiledFrameObserver = new frames[0].MutationObserver(
+  new frames[1].Function("throw new parent.frames[2].Error('PASS');")
+);
+compiledFrameObserver.observe(compiledFrameTarget, { childList: true, subtree: true });
+compiledFrameTarget.append("bar");
+"#,
+                "inline:compiled-frame-observer-error",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__compiledFrameErrorCalls")
+                .to_js_string(),
+            "frame1"
+        );
+    }
+
+    #[test]
+    fn dynamically_inserted_scripts_and_iframes_run_post_insertion_steps_in_tree_order() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        loader
+            .execute_source(
+                r#"
+window.__frameState = "not run";
+window.__frame = document.createElement("iframe");
+const beforeScript = document.createElement("script");
+beforeScript.textContent = "window.__frameState = window.__frame.contentWindow ? 'ready' : 'null';";
+const beforeHost = document.createElement("div");
+beforeHost.appendChild(beforeScript);
+beforeHost.appendChild(window.__frame);
+document.body.appendChild(beforeHost);
+"#,
+                "inline:script-before-frame-post-insertion",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__frameState")
+                .to_js_string(),
+            "null"
+        );
+
+        loader
+            .execute_source(
+                r#"
+window.__frameState = "not run";
+window.__frame = document.createElement("iframe");
+const afterScript = document.createElement("script");
+afterScript.textContent = "window.__frameState = window.__frame.contentWindow ? 'ready' : 'null';";
+const afterHost = document.createElement("div");
+afterHost.appendChild(window.__frame);
+afterHost.appendChild(afterScript);
+document.body.appendChild(afterHost);
+"#,
+                "inline:frame-before-script-post-insertion",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__frameState")
+                .to_js_string(),
+            "ready"
+        );
+    }
+
+    #[test]
+    fn inserted_and_mutated_stylesheets_are_synchronously_script_observable() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        let document = crate::jsdom::document_value();
+        let style = document.call_method("createElement", vec![Value::string("style")]);
+        style.call_method(
+            "appendChild",
+            vec![document.call_method(
+                "createTextNode",
+                vec![Value::string("body {}")],
+            )],
+        );
+        crate::jsdom::window_value().set_property("__insertedStyle", style.clone());
+        let script = document.call_method("createElement", vec![Value::string("script")]);
+        script.set_property(
+            "textContent",
+            Value::string(
+                "window.__insertedRuleCount = window.__insertedStyle.sheet.cssRules.length;",
+            ),
+        );
+        let host = document.call_method("createElement", vec![Value::string("div")]);
+        host.call_method("appendChild", vec![script]);
+        host.call_method("appendChild", vec![style.clone()]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![host]);
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__insertedRuleCount")
+                .to_u32(),
+            1
+        );
+
+        let previous_sheet = style.get_property("sheet");
+        style.call_method(
+            "appendChild",
+            vec![document.call_method(
+                "createTextNode",
+                vec![Value::string("main {}")],
+            )],
+        );
+        assert_eq!(
+            style
+                .get_property("sheet")
+                .get_property("cssRules")
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+        assert!(!style.get_property("sheet").strict_eq(&previous_sheet));
+
+        let link = document.call_method("createElement", vec![Value::string("link")]);
+        link.set_property("rel", Value::string("stylesheet"));
+        link.set_property("href", Value::string("data:text/css,"));
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![link.clone()]);
+        assert!(!link.get_property("sheet").is_nullish());
+    }
+
+    #[test]
+    fn default_style_meta_synchronously_activates_a_matching_alternate_stylesheet() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        let mut parser =
+            StreamingDocumentParser::new(loader.clone(), "https://example.test/index.html")
+                .unwrap();
+        parser
+            .write(
+                r#"<!doctype html><html><head>
+                <link rel="alternate stylesheet" title="alternative"
+                      href="data:text/css,%23alternate-target%7Bdisplay%3Anone%7D">
+                </head><body><div id="alternate-target"></div></body></html>"#,
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+
+        let document = crate::jsdom::document_value();
+        let target = document.call_method(
+            "getElementById",
+            vec![Value::string("alternate-target")],
+        );
+        let computed_display = || {
+            crate::jsdom::window_value()
+                .call_method("getComputedStyle", vec![target.clone()])
+                .get_property("display")
+                .to_js_string()
+        };
+        assert_eq!(computed_display(), "block");
+
+        loader
+            .execute_source(
+                r#"
+let defaultStylePre = null;
+let defaultStylePost = null;
+const defaultStyleTarget = document.getElementById("alternate-target");
+const defaultStylePreScript = document.createElement("script");
+defaultStylePreScript.textContent = `defaultStylePre = getComputedStyle(defaultStyleTarget).display;`;
+const defaultStyleMeta = document.createElement("meta");
+defaultStyleMeta.httpEquiv = "default-style";
+defaultStyleMeta.content = "alternative";
+const defaultStylePostScript = document.createElement("script");
+defaultStylePostScript.textContent = `defaultStylePost = getComputedStyle(defaultStyleTarget).display;`;
+const defaultStyleFragment = document.createDocumentFragment();
+defaultStyleFragment.append(defaultStylePreScript, defaultStyleMeta, defaultStylePostScript);
+document.head.appendChild(defaultStyleFragment);
+window.__defaultStylePre = defaultStylePre;
+window.__defaultStylePost = defaultStylePost;
+"#,
+                "inline:default-style-meta-post-insertion",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__defaultStylePre")
+                .to_js_string(),
+            "block"
+        );
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__defaultStylePost")
+                .to_js_string(),
+            "none"
+        );
+        assert_eq!(computed_display(), "none");
+    }
+
+    #[test]
+    fn parser_link_stylesheet_is_ready_for_a_later_parser_script() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        let mut parser =
+            StreamingDocumentParser::new(loader, "https://example.test/index.html").unwrap();
+        parser
+            .write(
+                r#"<!doctype html><html><head>
+                <link rel="alternate stylesheet" title="alternative"
+                      href="data:text/css,%23parser-alternate-target%7Bdisplay%3Anone%7D">
+                </head><body><div id="parser-alternate-target"></div><script>
+                window.__parserAlternateBefore =
+                    getComputedStyle(document.getElementById("parser-alternate-target")).display;
+                const parserAlternateMeta = document.createElement("meta");
+                parserAlternateMeta.httpEquiv = "default-style";
+                parserAlternateMeta.content = "alternative";
+                document.head.appendChild(parserAlternateMeta);
+                window.__parserAlternateAfter =
+                    getComputedStyle(document.getElementById("parser-alternate-target")).display;
+                </script></body></html>"#,
+            )
+            .unwrap();
+
+        let window = crate::jsdom::window_value();
+        assert_eq!(
+            window.get_property("__parserAlternateBefore").to_js_string(),
+            "block"
+        );
+        assert_eq!(
+            window.get_property("__parserAlternateAfter").to_js_string(),
+            "none"
+        );
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+    }
+
+    #[test]
+    fn classic_script_reads_frame_document_element_dom_surface() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        let document = crate::jsdom::document_value();
+        let iframe = document.call_method("createElement", vec![Value::string("iframe")]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![iframe.clone()]);
+        let node = crate::jsdom::node_id_of(&iframe).unwrap();
+        let frame_document = crate::jsdom::parse_frame_document(
+            r#"<html id="html" lang="en"><body id="body"><div id="root"><div id="target"></div><div id="scope"><table id="table"><tr id="row"></tr></table></div></div></body></html>"#,
+            "text/html",
+            "https://example.test/frame.html#target",
+        );
+        crate::jsdom::install_frame_document(
+            node,
+            frame_document,
+            "https://example.test/frame.html#target",
+        );
+
+        loader
+            .execute_source(
+                r##"
+var frameRoot = frames[0].document.getElementById("root");
+window.__frameRootTagName = frameRoot.tagName;
+window.__frameRootLowerTagName = frameRoot.tagName.toLowerCase();
+window.__frameRootMatchesType = typeof frameRoot.matches;
+window.__frameRootMatches = frameRoot.matches("div");
+window.__frameRootNullMatches = frameRoot.matches(null);
+window.__frameRootOwnMatches = frameRoot.hasOwnProperty("matches");
+window.__frameRootInMatches = "matches" in frameRoot;
+var frameDetached = frameRoot.cloneNode(true);
+window.__frameDetachedOwnMatches = frameDetached.hasOwnProperty("matches");
+window.__frameDetachedInMatches = "matches" in frameDetached;
+function inheritedChecker(name) {
+  return function(object, propertyName) {
+    return ((typeof object === "object" && object !== null) || typeof object === "function") &&
+      ("hasOwnProperty" in object) && !object.hasOwnProperty(propertyName) &&
+      (propertyName in object) && name === "idlAttribute";
+  };
+}
+function idlAttribute(object, propertyName) {
+  return inheritedChecker("idlAttribute")(object, propertyName);
+}
+window.__frameRootIdlMatches = idlAttribute(frameRoot, "matches");
+window.__frameDetachedIdlMatches = idlAttribute(frameDetached, "matches");
+window.__frameHtmlMatches = frames[0].document.querySelector("#html").matches("html");
+window.__frameBodyMatches = frames[0].document.querySelector("#body").matches("body");
+window.__frameInheritedLangMatches = frames[0].document.querySelector("#target").matches(":lang(en)");
+window.__frameTargetHash = frames[0].document.location.hash;
+window.__frameTargetMatches = frames[0].document.querySelector("#target").matches(":target");
+window.__frameDocumentTargetMatches = frames[0].document.querySelector(":target") === frames[0].document.querySelector("#target");
+window.__frameScopedPrefixMatches = frames[0].document.querySelector("#table").matches(
+  ":nth-child(1) :nth-child(1)", frames[0].document.querySelector("#scope")
+);
+var frameNull = frames[0].document.createElement("null");
+frameRoot.appendChild(frameNull);
+window.__frameCreatedNodeTagName = frameNull.tagName;
+var frameRootClone = frameRoot.cloneNode(true);
+window.__frameRootCloneTagName = frameRootClone.tagName;
+"##,
+                "inline:frame-document-dom-surface",
+            )
+            .unwrap();
+
+        let window = crate::jsdom::window_value();
+        assert_eq!(
+            window.get_property("__frameRootTagName").to_js_string(),
+            "DIV"
+        );
+        assert_eq!(
+            window
+                .get_property("__frameRootLowerTagName")
+                .to_js_string(),
+            "div"
+        );
+        assert_eq!(
+            window.get_property("__frameRootMatchesType").to_js_string(),
+            "function"
+        );
+        assert!(window.get_property("__frameRootMatches").to_bool());
+        assert_eq!(
+            window.get_property("__frameRootNullMatches"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            window.get_property("__frameRootOwnMatches"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            window.get_property("__frameRootInMatches"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            window.get_property("__frameDetachedOwnMatches"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            window.get_property("__frameDetachedInMatches"),
+            Value::Bool(true)
+        );
+        assert!(window.get_property("__frameRootIdlMatches").to_bool());
+        assert!(window.get_property("__frameDetachedIdlMatches").to_bool());
+        assert!(window.get_property("__frameHtmlMatches").to_bool());
+        assert!(window.get_property("__frameBodyMatches").to_bool());
+        assert!(window.get_property("__frameInheritedLangMatches").to_bool());
+        assert_eq!(
+            window.get_property("__frameTargetHash").to_js_string(),
+            "#target"
+        );
+        assert!(window.get_property("__frameTargetMatches").to_bool());
+        assert!(
+            window
+                .get_property("__frameDocumentTargetMatches")
+                .to_bool()
+        );
+        assert!(window.get_property("__frameScopedPrefixMatches").to_bool());
+        assert_eq!(
+            window
+                .get_property("__frameCreatedNodeTagName")
+                .to_js_string(),
+            "NULL"
+        );
+        assert_eq!(
+            window
+                .get_property("__frameRootCloneTagName")
+                .to_js_string(),
+            "DIV"
+        );
+    }
+
+    #[test]
+    fn classic_function_forwards_arguments_through_array_prototype_slice() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+
+        loader
+            .execute_source(
+                r#"
+function wrap(callback) {
+  return function() {
+    return callback.apply(null, Array.prototype.slice.call(arguments));
+  };
+}
+var wrapped = wrap(function(event) { return event.target; });
+window.__forwardedArgument = wrapped({ target: "forwarded" });
+"#,
+                "inline:array-prototype-slice-arguments",
+            )
+            .unwrap();
+
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__forwardedArgument")
+                .to_js_string(),
+            "forwarded"
+        );
+    }
+
+    #[test]
+    fn classic_cross_script_call_preserves_caller_local_dom_binding() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        let document = crate::jsdom::document_value();
+        let iframe = document.call_method("createElement", vec![Value::string("iframe")]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![iframe.clone()]);
+        let frame_document = crate::jsdom::parse_frame_document(
+            r#"<div id="root"></div>"#,
+            "text/html",
+            "https://example.test/frame.html",
+        );
+        crate::jsdom::install_frame_document(
+            crate::jsdom::node_id_of(&iframe).unwrap(),
+            frame_document,
+            "https://example.test/frame.html",
+        );
+
+        loader
+            .execute_source(
+                r#"
+function appendSpecial(document, parent) {
+  parent.appendChild(document.createElement("null"));
+  var anyNamespace = document.createElement("div");
+  var nodes = [
+    document.createElement("div"),
+    document.createElementNS("http://www.w3.org/1999/xhtml", "div"),
+    document.createElementNS("", "div"),
+    document.createElementNS("http://www.example.org/ns", "div")
+  ];
+  for (var index = 0; index < nodes.length; index++) {
+    anyNamespace.appendChild(nodes[index]);
+  }
+  parent.appendChild(anyNamespace);
+}
+"#,
+                "inline:cross-script-callee",
+            )
+            .unwrap();
+        loader
+            .execute_source(
+                r#"
+function cloneAfterExternalCall(document) {
+  var element = document.getElementById("root");
+  appendSpecial(document, element);
+  window.__callerLocalBeforeClone = element.tagName;
+  window.__callerLocalClone = element.cloneNode(true).tagName;
+}
+"#,
+                "inline:cross-script-caller",
+            )
+            .unwrap();
+        loader
+            .execute_source(
+                r#"cloneAfterExternalCall(frames[0].document);"#,
+                "inline:cross-script-invoke",
+            )
+            .unwrap();
+
+        let window = crate::jsdom::window_value();
+        assert_eq!(
+            window
+                .get_property("__callerLocalBeforeClone")
+                .to_js_string(),
+            "DIV"
+        );
+        assert_eq!(
+            window.get_property("__callerLocalClone").to_js_string(),
+            "DIV"
+        );
+    }
+
+    #[test]
+    fn compiled_script_observes_webidl_type_error_identity() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .execute_source(
+                r#"
+var node = document.createTextNode("test");
+try {
+  node.appendData();
+  window.__typeErrorDidThrow = false;
+} catch (error) {
+  window.__typeErrorDidThrow = true;
+  window.__typeErrorConstructorMatches = error.constructor === TypeError;
+  window.__typeErrorName = error.name;
+  window.__typeErrorConstructorChain = Object.getPrototypeOf(TypeError) === Error;
+}
+"#,
+                "inline:type-error-identity",
+            )
+            .unwrap();
+        let window = crate::jsdom::window_value();
+        assert!(window.get_property("__typeErrorDidThrow").to_bool());
+        assert!(
+            window
+                .get_property("__typeErrorConstructorMatches")
+                .to_bool()
+        );
+        assert_eq!(
+            window.get_property("__typeErrorName").to_js_string(),
+            "TypeError"
+        );
+        assert!(window.get_property("__typeErrorConstructorChain").to_bool());
+    }
+
+    #[test]
+    fn compiled_script_distinguishes_strict_collection_assignment() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .execute_source(
+                r#"
+var collection = document.body.children;
+collection[5] = "ignored";
+window.__sloppyCollectionValue = collection[5];
+try {
+  (function () {
+    "use strict";
+    collection[5] = "blocked";
+  })();
+  window.__strictCollectionDidThrow = false;
+} catch (error) {
+  window.__strictCollectionDidThrow = true;
+  window.__strictCollectionErrorName = error.name;
+  window.__strictCollectionConstructorMatches = error.constructor === TypeError;
+}
+"#,
+                "inline:strict-collection-assignment",
+            )
+            .unwrap();
+        let window = crate::jsdom::window_value();
+        assert!(
+            window
+                .get_property("__sloppyCollectionValue")
+                .is_undefined()
+        );
+        assert!(window.get_property("__strictCollectionDidThrow").to_bool());
+        assert_eq!(
+            window
+                .get_property("__strictCollectionErrorName")
+                .to_js_string(),
+            "TypeError"
+        );
+        assert!(
+            window
+                .get_property("__strictCollectionConstructorMatches")
+                .to_bool()
+        );
+    }
+
+    #[test]
+    fn compiled_script_records_reflected_property_mutations_in_order() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+var node = document.createElement("p");
+node.id = "n00";
+document.body.appendChild(node);
+var observer = new MutationObserver(function () {});
+observer.observe(node, {
+  subtree: true,
+  childList: true,
+  attributes: true,
+  characterData: true,
+  attributeOldValue: true,
+  characterDataOldValue: true
+});
+node.id = "foo";
+node.id = "bar";
+node.className = "bar";
+node.textContent = "old data";
+node.firstChild.data = "new data";
+var records = observer.takeRecords();
+var summary = "";
+for (var i = 0; i < records.length; i++) {
+  if (i > 0) summary += ",";
+  summary += records[i].type + ":" + records[i].attributeName + ":" + records[i].oldValue;
+}
+window.__mutationRecordSummary = summary;
+"#,
+                "inline:mutation-record-order",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__mutationRecordSummary")
+                .to_js_string(),
+            "attributes:id:n00,attributes:id:foo,attributes:class:null,childList:null:null,characterData:null:old data"
+        );
+    }
+
+    #[test]
+    fn compiled_script_coalesces_replace_all_mutations() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+var parent = document.createElement("div");
+parent.innerHTML = "<p>old text</p>";
+document.body.appendChild(parent);
+var oldChild = parent.firstChild;
+var observer = new MutationObserver(function () {});
+observer.observe(parent, { childList: true, subtree: true });
+parent.innerHTML = "<span>new</span><span>text</span>";
+var innerRecords = observer.takeRecords();
+window.__innerRecordCount = innerRecords.length;
+window.__innerAddedCount = innerRecords[0].addedNodes.length;
+window.__innerRemovedCount = innerRecords[0].removedNodes.length;
+window.__innerRemovedIdentity = innerRecords[0].removedNodes[0] === oldChild;
+var replaced = parent.firstChild;
+replaced.outerHTML = "<b>next</b>";
+var outerRecords = observer.takeRecords();
+window.__outerRecordCount = outerRecords.length;
+window.__outerAddedCount = outerRecords[0].addedNodes.length;
+window.__outerRemovedCount = outerRecords[0].removedNodes.length;
+window.__outerRemovedIdentity = outerRecords[0].removedNodes[0] === replaced;
+var callbackParent = document.createElement("div");
+var callbackObserver = new MutationObserver(function (records) {
+  window.__callbackRecordCount = records.length;
+  window.__callbackAddedType = records[0].addedNodes[0].nodeType;
+  window.__callbackAddedData = records[0].addedNodes[0].data;
+});
+callbackObserver.observe(callbackParent, { childList: true });
+callbackParent.textContent = "foo";
+var textParent = document.createElement("div");
+var textObserver = new MutationObserver(function () {});
+textObserver.observe(textParent, { childList: true });
+textParent.textContent = "foo";
+var firstTextRecords = textObserver.takeRecords();
+textParent.textContent = "foo";
+var sameTextRecords = textObserver.takeRecords();
+textParent.textContent = "bar";
+var changedTextRecords = textObserver.takeRecords();
+window.__firstTextSummary = firstTextRecords.length + ":" + firstTextRecords[0].addedNodes.length + ":" + firstTextRecords[0].removedNodes.length + ":" + firstTextRecords[0].addedNodes[0].nodeType + ":" + firstTextRecords[0].addedNodes[0].data;
+window.__sameTextSummary = sameTextRecords.length + ":" + sameTextRecords[0].addedNodes.length + ":" + sameTextRecords[0].removedNodes.length + ":" + sameTextRecords[0].removedNodes[0].nodeType + ":" + sameTextRecords[0].removedNodes[0].data + ":" + sameTextRecords[0].addedNodes[0].nodeType + ":" + sameTextRecords[0].addedNodes[0].data;
+window.__changedTextSummary = changedTextRecords.length + ":" + changedTextRecords[0].addedNodes.length + ":" + changedTextRecords[0].removedNodes.length + ":" + changedTextRecords[0].removedNodes[0].nodeType + ":" + changedTextRecords[0].removedNodes[0].data + ":" + changedTextRecords[0].addedNodes[0].nodeType + ":" + changedTextRecords[0].addedNodes[0].data;
+var xml = new DOMParser().parseFromString("<root></root>", "text/xml");
+var xmlElement = xml.createElement("somelement");
+xmlElement.appendChild(xml.createCDATASection("foo"));
+var xmlObserver = new MutationObserver(function () {});
+xmlObserver.observe(xmlElement, { childList: true });
+xmlElement.textContent = "foo";
+var xmlTextRecords = xmlObserver.takeRecords();
+window.__xmlTextSummary = xmlTextRecords.length + ":" + xmlTextRecords[0].addedNodes.length + ":" + xmlTextRecords[0].removedNodes.length + ":" + xmlTextRecords[0].removedNodes[0].nodeType + ":" + xmlTextRecords[0].removedNodes[0].data + ":" + xmlTextRecords[0].addedNodes[0].nodeType + ":" + xmlTextRecords[0].addedNodes[0].data;
+"#,
+                "inline:replace-all-mutation-records",
+            )
+            .unwrap();
+        assert_eq!(crate::jsdom::drain_microtasks(), 0);
+        let window = crate::jsdom::window_value();
+        assert_eq!(window.get_property("__innerRecordCount").to_u32(), 1);
+        assert_eq!(window.get_property("__innerAddedCount").to_u32(), 2);
+        assert_eq!(window.get_property("__innerRemovedCount").to_u32(), 1);
+        assert!(window.get_property("__innerRemovedIdentity").to_bool());
+        assert_eq!(window.get_property("__outerRecordCount").to_u32(), 1);
+        assert_eq!(window.get_property("__outerAddedCount").to_u32(), 1);
+        assert_eq!(window.get_property("__outerRemovedCount").to_u32(), 1);
+        assert!(window.get_property("__outerRemovedIdentity").to_bool());
+        assert_eq!(window.get_property("__callbackRecordCount").to_u32(), 1);
+        assert_eq!(window.get_property("__callbackAddedType").to_u32(), 3);
+        assert_eq!(
+            window.get_property("__callbackAddedData").to_js_string(),
+            "foo"
+        );
+        assert_eq!(
+            window.get_property("__firstTextSummary").to_js_string(),
+            "1:1:0:3:foo"
+        );
+        assert_eq!(
+            window.get_property("__sameTextSummary").to_js_string(),
+            "1:1:1:3:foo:3:foo"
+        );
+        assert_eq!(
+            window.get_property("__changedTextSummary").to_js_string(),
+            "1:1:1:3:foo:3:bar"
+        );
+        assert_eq!(
+            window.get_property("__xmlTextSummary").to_js_string(),
+            "1:1:1:4:foo:3:foo"
+        );
+    }
+
+    #[test]
+    fn compiled_script_uses_dom_child_list_mutation_algorithms() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+var fragmentTarget = document.createElement("div");
+var tail = document.createElement("span");
+fragmentTarget.appendChild(tail);
+var fragment = document.createDocumentFragment();
+var firstText = document.createTextNode("11");
+var secondText = document.createTextNode("22");
+fragment.appendChild(firstText);
+fragment.appendChild(secondText);
+var targetObserver = new MutationObserver(function () {});
+var fragmentObserver = new MutationObserver(function () {});
+targetObserver.observe(fragmentTarget, { childList: true });
+fragmentObserver.observe(fragment, { childList: true });
+fragmentTarget.insertBefore(fragment, tail);
+var targetRecords = targetObserver.takeRecords();
+var fragmentRecords = fragmentObserver.takeRecords();
+window.__fragmentMutationSummary = targetRecords.length + ":" + targetRecords[0].addedNodes.length + ":" + (targetRecords[0].addedNodes[0] === firstText) + ":" + (targetRecords[0].addedNodes[1] === secondText) + ":" + (targetRecords[0].nextSibling === tail) + ":" + fragmentRecords.length + ":" + fragmentRecords[0].removedNodes.length;
+
+var replaceTarget = document.createElement("div");
+var replaceFirst = document.createElement("span");
+var replaceLast = document.createElement("span");
+replaceTarget.appendChild(replaceFirst);
+replaceTarget.appendChild(replaceLast);
+var replaceObserver = new MutationObserver(function () {});
+replaceObserver.observe(replaceTarget, { childList: true });
+replaceTarget.replaceChild(replaceLast, replaceFirst);
+var replaceRecords = replaceObserver.takeRecords();
+window.__internalReplaceSummary = replaceRecords.length + ":" + (replaceRecords[0].removedNodes[0] === replaceLast) + ":" + (replaceRecords[0].previousSibling === replaceFirst) + ":" + (replaceRecords[1].removedNodes[0] === replaceFirst) + ":" + (replaceRecords[1].addedNodes[0] === replaceLast) + ":" + (replaceRecords[1].previousSibling === null) + ":" + (replaceRecords[1].nextSibling === null);
+
+var selfTarget = document.createElement("div");
+var selfChild = document.createElement("span");
+selfTarget.appendChild(selfChild);
+var selfObserver = new MutationObserver(function () {});
+selfObserver.observe(selfTarget, { childList: true });
+selfTarget.replaceChild(selfChild, selfChild);
+var selfRecords = selfObserver.takeRecords();
+window.__selfReplaceSummary = selfRecords.length + ":" + (selfRecords[0].removedNodes[0] === selfChild) + ":" + (selfRecords[1].addedNodes[0] === selfChild) + ":" + (selfTarget.firstChild === selfChild);
+
+var allTarget = document.createElement("div");
+var allFirst = document.createElement("span");
+var allRetained = document.createElement("span");
+var allLast = document.createElement("span");
+allTarget.appendChild(allFirst);
+allTarget.appendChild(allRetained);
+allTarget.appendChild(allLast);
+var allObserver = new MutationObserver(function () {});
+allObserver.observe(allTarget, { childList: true });
+allTarget.replaceChildren(allRetained);
+var allRecords = allObserver.takeRecords();
+window.__replaceChildrenSummary = allRecords.length + ":" + allRecords[0].removedNodes.length + ":" + allRecords[0].addedNodes.length + ":" + (allRecords[0].removedNodes[1] === allRetained) + ":" + (allRecords[0].addedNodes[0] === allRetained) + ":" + (allTarget.firstChild === allRetained);
+
+var previousParent = document.createElement("div");
+var movedFirst = document.createElement("span");
+var movedSecond = document.createElement("span");
+previousParent.appendChild(movedFirst);
+previousParent.appendChild(movedSecond);
+var movedTarget = document.createElement("div");
+movedTarget.appendChild(document.createElement("i"));
+var previousObserver = new MutationObserver(function () {});
+var movedObserver = new MutationObserver(function () {});
+previousObserver.observe(previousParent, { childList: true });
+movedObserver.observe(movedTarget, { childList: true });
+movedTarget.replaceChildren(movedFirst, movedSecond);
+var previousRecords = previousObserver.takeRecords();
+var movedRecords = movedObserver.takeRecords();
+window.__movedReplaceChildrenSummary = previousRecords.length + ":" + (previousRecords[0].removedNodes[0] === movedFirst) + ":" + (previousRecords[1].removedNodes[0] === movedSecond) + ":" + movedRecords.length + ":" + movedRecords[0].removedNodes.length + ":" + movedRecords[0].addedNodes.length;
+"#,
+                "inline:dom-child-list-mutation-algorithms",
+            )
+            .unwrap();
+        let window = crate::jsdom::window_value();
+        assert_eq!(
+            window
+                .get_property("__fragmentMutationSummary")
+                .to_js_string(),
+            "1:2:true:true:true:1:2"
+        );
+        assert_eq!(
+            window
+                .get_property("__internalReplaceSummary")
+                .to_js_string(),
+            "2:true:true:true:true:true:true"
+        );
+        assert_eq!(
+            window.get_property("__selfReplaceSummary").to_js_string(),
+            "2:true:true:true"
+        );
+        assert_eq!(
+            window
+                .get_property("__replaceChildrenSummary")
+                .to_js_string(),
+            "1:3:1:true:true:true"
+        );
+        assert_eq!(
+            window
+                .get_property("__movedReplaceChildrenSummary")
+                .to_js_string(),
+            "2:true:true:1:1:2"
+        );
+    }
+
+    #[test]
+    fn compiled_script_applies_mutation_observer_dictionary_presence_rules() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+var target = document.createElement("div");
+var observer = new MutationObserver(function () {});
+try {
+  observer.observe(target, {});
+  window.__emptyOptionsThrowsTypeError = false;
+} catch (error) {
+  window.__emptyOptionsThrowsTypeError = error.constructor === TypeError;
+}
+try {
+  observer.observe(target, { childList: true, attributeOldValue: true, attributes: false });
+  window.__attributeConflictThrowsTypeError = false;
+} catch (error) {
+  window.__attributeConflictThrowsTypeError = error.constructor === TypeError;
+}
+try {
+  observer.observe(target, { childList: true, characterDataOldValue: true, characterData: false });
+  window.__characterConflictThrowsTypeError = false;
+} catch (error) {
+  window.__characterConflictThrowsTypeError = error.constructor === TypeError;
+}
+observer.observe(target, { attributeOldValue: false });
+target.setAttribute("data-x", "1");
+var records = observer.takeRecords();
+window.__presenceRuleSummary = records.length + ":" + records[0].type + ":" + records[0].attributeName + ":" + records[0].oldValue;
+observer.observe(target, { attributes: true, attributeOldValue: true });
+target.setAttribute("data-x", "1");
+var sameValueRecords = observer.takeRecords();
+window.__sameAttributeValueSummary = sameValueRecords.length + ":" + sameValueRecords[0].attributeName + ":" + sameValueRecords[0].attributeNamespace + ":" + sameValueRecords[0].oldValue;
+target.setAttributeNS("http://example.test/ns", "example:private", "42");
+var namespaceRecords = observer.takeRecords();
+window.__attributeNamespaceSummary = namespaceRecords.length + ":" + namespaceRecords[0].attributeName + ":" + namespaceRecords[0].attributeNamespace + ":" + namespaceRecords[0].oldValue;
+var attrTarget = document.createElement("p");
+attrTarget.id = "attr-target";
+attrTarget.className = "c01 c02";
+var attrObserver = new MutationObserver(function () {});
+attrObserver.observe(attrTarget, { attributes: true, attributeOldValue: true });
+var attrIterations = 0;
+for (var index = 0; index < attrTarget.attributes.length && index < 10; index++) {
+  attrIterations++;
+  var attribute = attrTarget.attributes[index];
+  if (attribute.localName === "class") {
+    attribute.value = "c03";
+  }
+}
+var attrRecords = attrObserver.takeRecords();
+window.__attrValueMutationSummary = attrIterations + ":" + attrTarget.attributes.length + ":" + attrRecords.length + ":" + attrTarget.className;
+"#,
+                "inline:mutation-observer-dictionary-presence",
+            )
+            .unwrap();
+        let window = crate::jsdom::window_value();
+        assert!(
+            window
+                .get_property("__emptyOptionsThrowsTypeError")
+                .to_bool()
+        );
+        assert!(
+            window
+                .get_property("__attributeConflictThrowsTypeError")
+                .to_bool()
+        );
+        assert!(
+            window
+                .get_property("__characterConflictThrowsTypeError")
+                .to_bool()
+        );
+        assert_eq!(
+            window.get_property("__presenceRuleSummary").to_js_string(),
+            "1:attributes:data-x:null"
+        );
+        assert_eq!(
+            window
+                .get_property("__sameAttributeValueSummary")
+                .to_js_string(),
+            "1:data-x:null:1"
+        );
+        assert_eq!(
+            window
+                .get_property("__attributeNamespaceSummary")
+                .to_js_string(),
+            "1:private:http://example.test/ns:null"
+        );
+        assert_eq!(
+            window
+                .get_property("__attrValueMutationSummary")
+                .to_js_string(),
+            "2:2:1:c03"
+        );
+    }
+
+    #[test]
+    fn compiled_script_observes_character_data_remove_contract() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .execute_source(
+                r#"
+var node = document.createTextNode("text");
+var parent = document.createElement("div");
+window.__removePresent = "remove" in node;
+window.__removeType = typeof node.remove;
+window.__removeLength = node.remove.length;
+window.__removeInitialParent = node.parentNode === null;
+window.__removeInitialResult = node.remove() === undefined;
+parent.appendChild(node);
+window.__removeAppendedParent = node.parentNode === parent;
+window.__removeResult = node.remove() === undefined;
+window.__removeFinalParent = node.parentNode === null;
+window.__removeFinalLength = parent.childNodes.length;
+"#,
+                "inline:character-data-remove",
+            )
+            .unwrap();
+        let window = crate::jsdom::window_value();
+        assert!(window.get_property("__removePresent").to_bool());
+        assert_eq!(
+            window.get_property("__removeType").to_js_string(),
+            "function"
+        );
+        assert_eq!(window.get_property("__removeLength"), Value::Number(0.0));
+        assert!(window.get_property("__removeInitialParent").to_bool());
+        assert!(window.get_property("__removeInitialResult").to_bool());
+        assert!(window.get_property("__removeAppendedParent").to_bool());
+        assert!(window.get_property("__removeResult").to_bool());
+        assert!(window.get_property("__removeFinalParent").to_bool());
+        assert_eq!(
+            window.get_property("__removeFinalLength"),
+            Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn compiled_script_records_unchanged_character_data_for_all_node_kinds() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+var nodes = [
+  document.createTextNode("text"),
+  document.createComment("comment"),
+  document.createProcessingInstruction("target", "instruction")
+];
+var xml = new DOMParser().parseFromString("<root></root>", "text/xml");
+nodes.push(xml.createCDATASection("cdata"));
+var summary = "";
+for (var index = 0; index < nodes.length; index++) {
+  var node = nodes[index];
+  var observer = new MutationObserver(function () {});
+  observer.observe(node, { characterData: true, characterDataOldValue: true });
+  node.data = node.data;
+  var records = observer.takeRecords();
+  if (index > 0) summary += ",";
+  summary += node.nodeType + ":" + records.length + ":" + records[0].type + ":" + records[0].oldValue;
+}
+window.__unchangedCharacterDataSummary = summary;
+"#,
+                "inline:unchanged-character-data-mutations",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__unchangedCharacterDataSummary")
+                .to_js_string(),
+            "3:1:characterData:text,8:1:characterData:comment,7:1:characterData:instruction,4:1:characterData:cdata"
+        );
+    }
+
+    #[test]
+    fn compiled_script_range_mutations_update_both_character_data_boundaries() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        ScriptLoader::new(ScriptPolicy::default())
+            .execute_source(
+                r#"
+var host = document.createElement("p");
+var first = document.createTextNode("CHANN");
+var middle = document.createTextNode("NNN");
+var last = document.createTextNode("NGED");
+host.appendChild(first);
+host.appendChild(middle);
+host.appendChild(last);
+var firstObserver = new MutationObserver(function () {});
+var lastObserver = new MutationObserver(function () {});
+firstObserver.observe(first, { characterData: true, characterDataOldValue: true });
+lastObserver.observe(last, { characterData: true, characterDataOldValue: true });
+var range = document.createRange();
+range.setStart(first, 4);
+range.setEnd(last, 1);
+range.deleteContents();
+var firstRecords = firstObserver.takeRecords();
+var lastRecords = lastObserver.takeRecords();
+window.__rangeCharacterDataSummary = first.data + ":" + last.data + ":" + host.childNodes.length + ":" + firstRecords.length + ":" + firstRecords[0].oldValue + ":" + lastRecords.length + ":" + lastRecords[0].oldValue + ":" + range.collapsed;
+"#,
+                "inline:range-character-data-mutations",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__rangeCharacterDataSummary")
+                .to_js_string(),
+            "CHAN:GED:2:1:CHANN:1:NGED:true"
+        );
+    }
+
+    #[test]
+    fn compiled_callbacks_are_function_instances_across_classic_scripts() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .execute_source(
+                r#"
+function runSetup(callback) {
+  window.__callbackType = typeof callback;
+  window.__callbackInstance = callback instanceof Function;
+  if (callback instanceof Function) callback();
+}
+"#,
+                "external:test-harness-setup",
+            )
+            .unwrap();
+        loader
+            .execute_source(
+                r#"
+var initialized = false;
+runSetup(function() { initialized = true; });
+window.__setupInitialized = initialized;
+"#,
+                "inline:test-setup-caller",
+            )
+            .unwrap();
+
+        let window = crate::jsdom::window_value();
+        assert_eq!(
+            window.get_property("__callbackType").to_js_string(),
+            "function"
+        );
+        assert!(window.get_property("__callbackInstance").to_bool());
+        assert!(window.get_property("__setupInitialized").to_bool());
+    }
+
+    #[test]
+    fn compiled_function_callbacks_capture_reassigned_parameters() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .execute_source(
+                r#"
+window.__captureResults = [];
+function invoke(callback) {
+  callback();
+}
+function visit(values, expected) {
+  expected = Array(values.length).fill(expected);
+  for (var index = 0; index < values.length; index++) {
+    invoke(function () {
+      window.__captureResults.push(values[index] + ":" + expected[index]);
+    });
+  }
+}
+visit(["a", "b"], false);
+"#,
+                "inline:reassigned-parameter-capture",
+            )
+            .unwrap();
+        let observed = crate::jsdom::window_value().get_property("__captureResults");
+        assert_eq!(observed.get_property("length").to_u32(), 2);
+        assert_eq!(observed.get_property("0").to_js_string(), "a:false");
+        assert_eq!(observed.get_property("1").to_js_string(), "b:false");
+    }
+
+    #[test]
+    fn compiled_plain_constructor_receives_arguments_and_this() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .execute_source(
+                r#"
+function AssertionError(message) {
+  this.message = message;
+  this.stack = "custom stack";
+}
+AssertionError.prototype = Object.create(Error.prototype);
+try {
+  throw new AssertionError("expected detail");
+} catch (error) {
+  window.__plainConstructorMessage = error.message;
+  window.__plainConstructorStack = error.stack;
+  window.__plainConstructorType = typeof error;
+}
+"#,
+                "inline:plain-constructor",
+            )
+            .unwrap();
+
+        let window = crate::jsdom::window_value();
+        assert_eq!(
+            window
+                .get_property("__plainConstructorMessage")
+                .to_js_string(),
+            "expected detail"
+        );
+        assert_eq!(
+            window
+                .get_property("__plainConstructorStack")
+                .to_js_string(),
+            "custom stack"
+        );
+        assert_eq!(
+            window.get_property("__plainConstructorType").to_js_string(),
+            "object"
         );
     }
 
@@ -9569,10 +12198,12 @@ worker.postMessage(40);
         assert_eq!(
             document
                 .get_property("body")
-                .call_method("getAttribute", vec![Value::string("data-automatic")]),
-            Value::Null
+                .call_method("getAttribute", vec![Value::string("data-automatic")])
+                .to_js_string(),
+            "yes"
         );
-        assert!(crate::jsdom::drain_microtasks() >= 1);
+        assert_eq!(load_count.get(), 1);
+        crate::jsdom::drain_microtasks();
         assert_eq!(load_count.get(), 1);
         assert_eq!(
             document
@@ -9580,6 +12211,366 @@ worker.postMessage(40);
                 .call_method("getAttribute", vec![Value::string("data-automatic")])
                 .to_js_string(),
             "yes"
+        );
+    }
+
+    #[test]
+    fn dynamically_inserted_inline_script_mutations_share_one_observer_batch() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        let document = crate::jsdom::document_value();
+        let parent = document.call_method("createElement", vec![Value::string("p")]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![parent.clone()]);
+        crate::jsdom::window_value().set_property(
+            "__invokeDynamicSetup",
+            Value::function(|_, args| {
+                args.first()
+                    .cloned()
+                    .unwrap_or_default()
+                    .call(Value::Undefined, vec![])
+            }),
+        );
+        loader
+            .execute_source(
+                "var dynamicInserted; __invokeDynamicSetup(function () { dynamicInserted = document.createElement('span'); });",
+                "inline:dynamic-inserted-binding",
+            )
+            .unwrap();
+        let inserted = crate::jsdom::window_value().get_property("dynamicInserted");
+
+        let batch_sizes = Rc::new(RefCell::new(Vec::new()));
+        let observed_batch_sizes = Rc::clone(&batch_sizes);
+        let observer = w3cos_core::class::construct(
+            &crate::observers_web::mutation_observer_class(),
+            vec![Value::function(move |_, args| {
+                observed_batch_sizes
+                    .borrow_mut()
+                    .push(args.first().map_or(0, |records| records.iter().len()));
+                Value::Undefined
+            })],
+        );
+        observer.call_method(
+            "observe",
+            vec![
+                document.clone(),
+                Value::object(HashMap::from([
+                    ("childList".to_string(), Value::Bool(true)),
+                    ("subtree".to_string(), Value::Bool(true)),
+                ])),
+            ],
+        );
+
+        let script = document.call_method("createElement", vec![Value::string("script")]);
+        script.set_property(
+            "textContent",
+            Value::string("document.body.appendChild(dynamicInserted);"),
+        );
+        parent.call_method("appendChild", vec![script]);
+
+        assert!(inserted.get_property("isConnected").to_bool());
+        assert_eq!(batch_sizes.borrow().as_slice(), &[2]);
+    }
+
+    #[test]
+    fn parent_node_append_runs_post_insertion_steps_after_all_arguments_are_connected() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        let window = crate::jsdom::window_value();
+        let document = crate::jsdom::document_value();
+        let script1 = document.call_method("createElement", vec![Value::string("script")]);
+        let script2 = document.call_method("createElement", vec![Value::string("script")]);
+        window.set_property("script2", script2.clone());
+        window.set_property("script2Run", Value::Bool(false));
+        script1.set_property(
+            "textContent",
+            Value::string(
+                "window.script2ConnectedDuringFirst = window.script2.isConnected; window.script2.remove();",
+            ),
+        );
+        script2.set_property("textContent", Value::string("window.script2Run = true;"));
+
+        document
+            .get_property("body")
+            .call_method("append", vec![script1, script2.clone()]);
+
+        assert!(window.get_property("script2ConnectedDuringFirst").to_bool());
+        assert!(!window.get_property("script2Run").to_bool());
+        assert!(!script2.get_property("isConnected").to_bool());
+    }
+
+    #[test]
+    fn fragment_append_child_runs_scripts_after_all_children_are_connected() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        let window = crate::jsdom::window_value();
+        let document = crate::jsdom::document_value();
+        let script = document.call_method("createElement", vec![Value::string("script")]);
+        let later = document.call_method("createElement", vec![Value::string("div")]);
+        window.set_property("laterFragmentChild", later.clone());
+        script.set_property(
+            "textContent",
+            Value::string(
+                "window.laterFragmentChildWasConnected = window.laterFragmentChild.isConnected; \
+                 window.laterFragmentChildParent = window.laterFragmentChild.parentNode;",
+            ),
+        );
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+        fragment.call_method("appendChild", vec![script]);
+        fragment.call_method("appendChild", vec![later]);
+
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![fragment]);
+
+        assert!(window
+            .get_property("laterFragmentChildWasConnected")
+            .to_bool());
+        assert!(window
+            .get_property("laterFragmentChildParent")
+            .strict_eq(&document.get_property("head")));
+    }
+
+    #[test]
+    fn dynamically_inserted_classic_script_shares_global_lexical_bindings() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        loader
+            .execute_source(
+                r#"
+const sharedClassicEvents = [];
+const insertedClassicScript = document.createElement("script");
+insertedClassicScript.textContent = `sharedClassicEvents.push("inner");`;
+document.head.appendChild(insertedClassicScript);
+sharedClassicEvents.push("outer");
+window.__sharedClassicEvents = sharedClassicEvents.join(",");
+"#,
+                "inline:classic-global-lexical-owner",
+            )
+            .unwrap();
+
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__sharedClassicEvents")
+                .to_js_string(),
+            "inner,outer"
+        );
+    }
+
+    #[test]
+    fn dynamically_inserted_script_reads_a_global_lexical_updated_by_a_closure() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        loader
+            .execute_source(
+                r#"
+let lexicalInsertionScript = null;
+let lexicalLaterElement = null;
+let lexicalObservedParent = null;
+(function insertFromClosure() {
+    lexicalInsertionScript = document.createElement("script");
+    lexicalLaterElement = document.createElement("div");
+    lexicalInsertionScript.textContent = `lexicalObservedParent = lexicalLaterElement.parentNode;`;
+    const lexicalFragment = document.createDocumentFragment();
+    lexicalFragment.appendChild(lexicalInsertionScript);
+    lexicalFragment.appendChild(lexicalLaterElement);
+    document.head.appendChild(lexicalFragment);
+})();
+window.__lexicalClosureObservedParent = lexicalObservedParent;
+window.__lexicalClosureLaterParent = lexicalLaterElement.parentNode;
+"#,
+                "inline:classic-global-lexical-closure-owner",
+            )
+            .unwrap();
+
+        let window = crate::jsdom::window_value();
+        let head = crate::jsdom::document_value().get_property("head");
+        assert!(window.get_property("__lexicalClosureLaterParent").strict_eq(&head));
+        assert!(window
+            .get_property("__lexicalClosureObservedParent")
+            .strict_eq(&head));
+    }
+
+    #[test]
+    fn connected_empty_script_runs_when_a_text_child_is_appended() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        let document = crate::jsdom::document_value();
+        let script = document.call_method("createElement", vec![Value::string("script")]);
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![script.clone()]);
+        let source = document.call_method(
+            "createTextNode",
+            vec![Value::string(
+                r#"document.body.setAttribute("data-script-child", "executed");"#,
+            )],
+        );
+        script.call_method("appendChild", vec![source]);
+
+        assert_eq!(
+            document
+                .get_property("body")
+                .call_method("getAttribute", vec![Value::string("data-script-child")])
+                .to_js_string(),
+            "executed"
+        );
+    }
+
+    #[test]
+    fn connected_empty_script_runs_all_text_from_an_inserted_fragment_once() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        let document = crate::jsdom::document_value();
+        let window = crate::jsdom::window_value();
+        window.set_property("fragmentTextEvents", Value::array(Vec::new()));
+        let script = document.call_method("createElement", vec![Value::string("script")]);
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![script.clone()]);
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+        for source in [
+            "fragmentTextEvents.push('t1');",
+            "fragmentTextEvents.push('t2');",
+        ] {
+            let text = document.call_method(
+                "createTextNode",
+                vec![Value::string(source)],
+            );
+            fragment.call_method("appendChild", vec![text]);
+        }
+
+        script.call_method("appendChild", vec![fragment]);
+        assert_eq!(window.get_property("fragmentTextEvents").to_js_string(), "t1,t2");
+        window.set_property("fragmentTextScript", script);
+        loader
+            .execute_source(
+                r#"
+fragmentTextScript.appendChild(document.createTextNode("fragmentTextEvents.push('t3');"));
+fragmentTextScript.textContent = "fragmentTextEvents.push('t4');";
+fragmentTextScript.text = "fragmentTextEvents.push('t5');";
+"#,
+                "inline:already-started-script-mutations",
+            )
+            .unwrap();
+        assert_eq!(window.get_property("fragmentTextEvents").to_js_string(), "t1,t2");
+    }
+
+    #[test]
+    fn connected_outer_script_runs_before_an_inserted_nested_script() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        let document = crate::jsdom::document_value();
+        let window = crate::jsdom::window_value();
+        window.set_property("nestedScriptEvents", Value::array(Vec::new()));
+        let outer = document.call_method("createElement", vec![Value::string("script")]);
+        window.set_property("outerInsertionScript", outer.clone());
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![outer.clone()]);
+
+        let inner = document.call_method("createElement", vec![Value::string("script")]);
+        inner.set_property(
+            "textContent",
+            Value::string(
+                "nestedScriptEvents.push('inner'); outerInsertionScript.appendChild(new Text(\"nestedScriptEvents.push('late');\")); nestedScriptEvents.push('inner-ran');",
+            ),
+        );
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+        fragment.call_method(
+            "appendChild",
+            vec![document.call_method(
+                "createTextNode",
+                vec![Value::string("nestedScriptEvents.push('outer');")],
+            )],
+        );
+        fragment.call_method("appendChild", vec![inner]);
+        outer.call_method("appendChild", vec![fragment]);
+
+        assert_eq!(
+            window.get_property("nestedScriptEvents").to_js_string(),
+            "outer,inner,inner-ran"
+        );
+    }
+
+    #[test]
+    fn mutating_a_later_connected_script_runs_only_that_script_synchronously() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        loader
+            .attach_to_document("https://example.test/index.html")
+            .unwrap();
+
+        let window = crate::jsdom::window_value();
+        let document = crate::jsdom::document_value();
+        let first = document.call_method("createElement", vec![Value::string("script")]);
+        let second = document.call_method("createElement", vec![Value::string("script")]);
+        let third = document.call_method("createElement", vec![Value::string("script")]);
+        window.set_property("insertionEvents", Value::array(Vec::new()));
+        window.set_property("thirdInsertionScript", third.clone());
+        first.set_property(
+            "textContent",
+            Value::string(
+                r#"thirdInsertionScript.appendChild(new Text("insertionEvents.push('third');")); insertionEvents.push("first");"#,
+            ),
+        );
+        second.set_property(
+            "textContent",
+            Value::string(r#"insertionEvents.push("second");"#),
+        );
+        let container = document.call_method("createElement", vec![Value::string("div")]);
+        container.call_method("appendChild", vec![first]);
+        container.call_method("appendChild", vec![second]);
+        container.call_method("appendChild", vec![third]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![container]);
+
+        assert_eq!(
+            window.get_property("insertionEvents").to_js_string(),
+            "third,first,second"
         );
     }
 
@@ -9721,7 +12712,14 @@ worker.postMessage(40);
         document
             .get_property("head")
             .call_method("appendChild", vec![fragment]);
-        assert!(crate::jsdom::drain_microtasks() >= 1);
+        assert_eq!(
+            document
+                .get_property("body")
+                .call_method("getAttribute", vec![Value::string("data-fragment-script")])
+                .to_js_string(),
+            "yes"
+        );
+        crate::jsdom::drain_microtasks();
         assert_eq!(
             document
                 .get_property("body")
@@ -10654,6 +13652,15 @@ worker.postMessage(40);
 
         let document = crate::jsdom::document_value();
         assert_eq!(
+            document.get_property("characterSet").to_js_string(),
+            "windows-1252"
+        );
+        assert_eq!(document.get_property("charset").to_js_string(), "windows-1252");
+        assert_eq!(
+            document.get_property("inputEncoding").to_js_string(),
+            "windows-1252"
+        );
+        assert_eq!(
             document
                 .get_property("documentElement")
                 .call_method("getAttribute", vec![Value::string("lang")])
@@ -10691,6 +13698,227 @@ worker.postMessage(40);
         assert_eq!(
             document.get_property("readyState").to_js_string(),
             "complete"
+        );
+    }
+
+    #[test]
+    fn parser_script_checkpoints_deliver_mutations_before_script_evaluation() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        let mut parser =
+            StreamingDocumentParser::new(loader, "https://example.test/mutations.html").unwrap();
+        parser
+            .write(
+                r#"<!doctype html><script>
+var parserMutationBatchSizes = "";
+var parserInsertedElement;
+var parserMutationObserver = new MutationObserver(function (records) {
+  parserMutationBatchSizes += (parserMutationBatchSizes ? "," : "") + records.length;
+});
+parserInsertedElement = document.createElement("span");
+parserMutationObserver.observe(document, { subtree: true, childList: true });
+</script><p id="parser-target"></p><script>
+var parserInsertedScript = document.createElement("script");
+parserInsertedScript.textContent = "document.body.appendChild(parserInsertedElement);";
+document.getElementById("parser-target").appendChild(parserInsertedScript);
+</script><script>
+window.__parserMutationBatchSizes = parserMutationBatchSizes;
+parserMutationObserver.disconnect();
+</script>"#,
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+
+        assert_eq!(
+            crate::jsdom::window_value()
+                .get_property("__parserMutationBatchSizes")
+                .to_js_string(),
+            "3,2,2"
+        );
+    }
+
+    #[test]
+    fn parser_authored_body_load_attribute_runs_in_the_page_realm() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        let mut parser =
+            StreamingDocumentParser::new(loader, "https://example.test/onload.html").unwrap();
+        parser
+            .write(
+                r#"<!doctype html><html><head>
+                <style><![CDATA[.target { color: fuchsia; background-color: fuchsia; }]]></style>
+                <script>
+                    function markLoaded() {
+                        document.body.setAttribute("data-function-handler", "yes");
+                    }
+                    window.onload = function(event) {
+                        document.body.setAttribute("data-window-handler", event.type);
+                    };
+                </script></head><body onload="markLoaded(); document.body.setAttribute('data-direct-handler', event.type)"><div class=target></div></body></html>"#,
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+        crate::jsdom::drain_microtasks();
+
+        let body = crate::jsdom::document_value().get_property("body");
+        assert_eq!(
+            body.call_method("getAttribute", vec![Value::string("data-function-handler")])
+                .to_js_string(),
+            "yes"
+        );
+        assert_eq!(
+            body.call_method("getAttribute", vec![Value::string("data-direct-handler")])
+                .to_js_string(),
+            "load"
+        );
+        assert_eq!(
+            body.call_method("getAttribute", vec![Value::string("data-window-handler")])
+                .to_js_string(),
+            "load"
+        );
+        let target = crate::jsdom::document_value()
+            .call_method("querySelector", vec![Value::string(".target")]);
+        assert!(
+            !target.is_nullish(),
+            "the styled target must remain queryable"
+        );
+        assert_eq!(target.get_property("className").to_js_string(), "target");
+        let style = crate::jsdom::document_value()
+            .call_method("querySelector", vec![Value::string("style")]);
+        assert_eq!(
+            style.get_property("textContent").to_js_string().trim(),
+            ".target { color: fuchsia; background-color: fuchsia; }"
+        );
+        assert_eq!(
+            crate::jsdom::document_value()
+                .get_property("styleSheets")
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        let sheet = style.get_property("sheet");
+        assert_eq!(
+            sheet
+                .get_property("cssRules")
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        assert_eq!(
+            sheet
+                .get_property("cssRules")
+                .get_property("0")
+                .get_property("selectorText")
+                .to_js_string(),
+            ".target"
+        );
+        assert_eq!(
+            sheet
+                .get_property("cssRules")
+                .get_property("0")
+                .get_property("style")
+                .get_property("cssText")
+                .to_js_string(),
+            "color: fuchsia; background-color: fuchsia;"
+        );
+        let target_node = crate::jsdom::node_id_of(&target).expect("target node id");
+        assert_eq!(
+            w3cos_dom::stylesheet::matching_declarations("div", None, &["target"], &[]),
+            vec![
+                ("color".to_string(), "fuchsia".to_string(), 1000),
+                ("background-color".to_string(), "fuchsia".to_string(), 1000)
+            ]
+        );
+        assert_eq!(
+            crate::dom::computed_style_property(target_node, "color"),
+            "#ff00ff"
+        );
+        let window = crate::jsdom::window_value();
+        assert!(
+            window.get_property("getComputedStyle").is_function(),
+            "the live Window realm must retain getComputedStyle"
+        );
+        let computed = window.call_method("getComputedStyle", vec![target.clone()]);
+        assert!(
+            computed.is_object(),
+            "getComputedStyle must return a declaration"
+        );
+        assert_eq!(
+            computed
+                .call_method("getPropertyValue", vec![Value::string("color")])
+                .to_js_string(),
+            "#ff00ff"
+        );
+        assert_eq!(
+            computed.get_property("color").to_js_string(),
+            "rgb(255, 0, 255)"
+        );
+        assert_eq!(
+            computed.get_property("backgroundColor").to_js_string(),
+            "rgb(255, 0, 255)"
+        );
+    }
+
+    #[test]
+    fn parser_absolute_lengths_size_and_paint_an_empty_block() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        let mut parser =
+            StreamingDocumentParser::new(loader, "https://example.test/absolute.html").unwrap();
+        parser
+            .write(
+                "<!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.0 Strict//EN' 'http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd'>\
+                 <html xmlns='http://www.w3.org/1999/xhtml'><head>\
+                 <title>CSS Test</title><meta name='assert' content='absolute block' />\
+                 <style type='text/css'>span { background-color: black; display: block; height: 1in; width: 1in; }</style>\
+                 </head><body><p>Test passes if there is a filled black square.</p>\
+                 <div><span id=target></span></div></body></html>",
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+
+        let target = crate::dom::get_element_by_id("target").expect("target span");
+        let component = crate::dom::with_document(|document| {
+            document.to_component_subtree(w3cos_dom::node::NodeId::from_u32(target))
+        });
+        assert_eq!(component.style.display, w3cos_std::style::Display::Block);
+        assert_eq!(component.style.width, w3cos_std::style::Dimension::Px(96.0));
+        assert_eq!(
+            component.style.height,
+            w3cos_std::style::Dimension::Px(96.0)
+        );
+        assert_eq!(component.style.background, w3cos_std::Color::BLACK);
+
+        let root = crate::dom::to_component_tree();
+        let flat = crate::layout::pre_flatten(&root);
+        let target_index = flat
+            .iter()
+            .position(|node| {
+                matches!(
+                    node.on_click,
+                    w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(target)
+                )
+            })
+            .expect("target component");
+        let layout = crate::layout::compute(&root, 800.0, 600.0).unwrap();
+        let target_layout = layout
+            .iter()
+            .find(|(_, index)| *index == target_index)
+            .map(|(rect, _)| *rect)
+            .expect("target layout");
+        assert_eq!((target_layout.width, target_layout.height), (96.0, 96.0));
+        let frame = crate::headless::render_document_rgba(800, 600).unwrap();
+        let black_pixels = frame
+            .rgba
+            .chunks_exact(4)
+            .filter(|pixel| *pixel == [0, 0, 0, 255])
+            .count();
+        assert!(
+            black_pixels >= 96 * 96,
+            "painted black pixels: {black_pixels}"
         );
     }
 
@@ -11316,7 +14544,10 @@ worker.postMessage(40);
         let document = crate::jsdom::document_value();
         let target = document.call_method("querySelector", vec![Value::string(".target")]);
         let computed = crate::jsdom::window_value().call_method("getComputedStyle", vec![target]);
-        assert_eq!(computed.get_property("color").to_js_string(), "#0000ff");
+        assert_eq!(
+            computed.get_property("color").to_js_string(),
+            "rgb(0, 0, 255)"
+        );
         assert_eq!(computed.get_property("width").to_js_string(), "10px");
         assert_eq!(computed.get_property("height").to_js_string(), "20px");
 
@@ -11336,6 +14567,89 @@ worker.postMessage(40);
                 "each authored stylesheet must expose its CSSStyleSheet"
             );
         }
+    }
+
+    #[test]
+    fn descendant_stylesheet_selector_reacts_to_move_before() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        let loader = ScriptLoader::new(ScriptPolicy::default());
+        let mut parser =
+            StreamingDocumentParser::new(loader, "https://example.test/index.html").unwrap();
+        parser
+            .write(
+                r#"<!doctype html><html><head><style>
+                    #new_parent #target { color: green; }
+                </style></head><body>
+                    <div id="new_parent"></div>
+                    <div><div id="mv"><div id="target">target</div></div></div>
+                    <script>
+                        window.__descendantBefore = getComputedStyle(target).color;
+                        new_parent.moveBefore(mv, null);
+                        window.__descendantAfter = getComputedStyle(target).color;
+                    </script>
+                </body></html>"#,
+            )
+            .unwrap();
+        let window = crate::jsdom::window_value();
+        assert_eq!(
+            window.get_property("__descendantBefore").to_js_string(),
+            "rgb(0, 0, 0)"
+        );
+        assert_eq!(
+            window.get_property("__descendantAfter").to_js_string(),
+            "rgb(0, 128, 0)"
+        );
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+    }
+
+    #[test]
+    fn document_loader_executes_dynamically_replaced_inline_event_handler() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind inline handler fixture");
+        let address = listener.local_addr().expect("inline handler fixture address");
+        let server = thread::spawn(move || {
+            let (mut document, _) = listener.accept().expect("accept inline handler document");
+            let request = read_http_request(&mut document);
+            assert!(request.starts_with("GET /index.html "));
+            let body = r#"<!doctype html><div id="target"></div><script>
+var dynamicInlineResult;
+var target = document.getElementById("target");
+target.setAttribute("onclick", "dynamicInlineResult = this.id;");
+target.dispatchEvent(new Event("click"));
+window.__dynamicInlineHandler = dynamicInlineResult;
+</script>"#;
+            write!(
+                document,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write inline handler document");
+        });
+
+        let mut loader =
+            DocumentLoader::new(ScriptPolicy::default(), DocumentLoaderOptions::default());
+        loader
+            .navigate(&format!("http://{address}/index.html"))
+            .unwrap();
+        for _ in 0..5_000 {
+            match loader.poll() {
+                DocumentLoadProgress::Complete => break,
+                DocumentLoadProgress::Failed(error) => {
+                    panic!("inline handler navigation failed: {error}")
+                }
+                _ => thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(loader.progress(), &DocumentLoadProgress::Complete);
+        server.join().expect("inline handler fixture completed");
+        assert_eq!(
+            crate::jsdom::window_value().get_property("__dynamicInlineHandler"),
+            Value::string("target")
+        );
     }
 
     #[test]
@@ -11496,7 +14810,10 @@ worker.postMessage(40);
         let target = document.call_method("querySelector", vec![Value::string(".target")]);
         let computed =
             || crate::jsdom::window_value().call_method("getComputedStyle", vec![target.clone()]);
-        assert_eq!(computed().get_property("color").to_js_string(), "#000000");
+        assert_eq!(
+            computed().get_property("color").to_js_string(),
+            "rgb(0, 0, 0)"
+        );
         assert_eq!(computed().get_property("height").to_js_string(), "20px");
         assert_eq!(computed().get_property("width").to_js_string(), "20px");
         assert_eq!(
@@ -11569,7 +14886,10 @@ worker.postMessage(40);
         let document = crate::jsdom::document_value();
         let target = document.call_method("querySelector", vec![Value::string(".target")]);
         let computed = crate::jsdom::window_value().call_method("getComputedStyle", vec![target]);
-        assert_eq!(computed.get_property("color").to_js_string(), "#000000");
+        assert_eq!(
+            computed.get_property("color").to_js_string(),
+            "rgb(0, 0, 0)"
+        );
         assert_eq!(computed.get_property("height").to_js_string(), "12px");
         assert_eq!(
             document.get_property("readyState").to_js_string(),
@@ -13014,7 +16334,10 @@ worker.postMessage(40);
         let target = document.call_method("querySelector", vec![Value::string(".target")]);
         let computed =
             || crate::jsdom::window_value().call_method("getComputedStyle", vec![target.clone()]);
-        assert_eq!(computed().get_property("color").to_js_string(), "#008000");
+        assert_eq!(
+            computed().get_property("color").to_js_string(),
+            "rgb(0, 128, 0)"
+        );
         assert_eq!(computed().get_property("width").to_js_string(), "10px");
         assert_eq!(computed().get_property("height").to_js_string(), "10px");
         assert_eq!(
@@ -13035,7 +16358,10 @@ worker.postMessage(40);
         );
 
         crate::jsdom::set_viewport(500.0, 900.0);
-        assert_eq!(computed().get_property("color").to_js_string(), "#0000ff");
+        assert_eq!(
+            computed().get_property("color").to_js_string(),
+            "rgb(0, 0, 255)"
+        );
         assert_eq!(computed().get_property("width").to_js_string(), "25px");
         assert_eq!(computed().get_property("height").to_js_string(), "10px");
 
@@ -13043,7 +16369,10 @@ worker.postMessage(40);
         assert_eq!(computed().get_property("height").to_js_string(), "30px");
 
         crate::jsdom::set_viewport(300.0, 900.0);
-        assert_eq!(computed().get_property("color").to_js_string(), "#0000ff");
+        assert_eq!(
+            computed().get_property("color").to_js_string(),
+            "rgb(0, 0, 255)"
+        );
         assert_eq!(computed().get_property("width").to_js_string(), "20px");
     }
 
@@ -13114,7 +16443,7 @@ worker.postMessage(40);
                 .get_property("color")
                 .to_js_string()
         };
-        assert_eq!(computed_color(), "#0000ff");
+        assert_eq!(computed_color(), "rgb(0, 0, 255)");
         assert_eq!(
             document
                 .get_property("styleSheets")
@@ -13135,7 +16464,7 @@ worker.postMessage(40);
         let theme = document.call_method("querySelector", vec![Value::string("#theme")]);
         theme.set_property("disabled", Value::Bool(true));
         crate::jsdom::drain_microtasks();
-        assert_eq!(computed_color(), "#008000");
+        assert_eq!(computed_color(), "rgb(0, 128, 0)");
         assert_eq!(
             document
                 .get_property("styleSheets")
@@ -13154,7 +16483,7 @@ worker.postMessage(40);
             }
             thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert_eq!(computed_color(), "#0000ff");
+        assert_eq!(computed_color(), "rgb(0, 0, 255)");
         assert_eq!(
             document
                 .get_property("styleSheets")
@@ -13172,7 +16501,7 @@ worker.postMessage(40);
             }
             thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert_eq!(computed_color(), "#800080");
+        assert_eq!(computed_color(), "rgb(128, 0, 128)");
         assert_eq!(
             theme
                 .get_property("sheet")
@@ -13185,7 +16514,7 @@ worker.postMessage(40);
             .get_property("head")
             .call_method("removeChild", vec![theme.clone()]);
         crate::jsdom::drain_microtasks();
-        assert_eq!(computed_color(), "#008000");
+        assert_eq!(computed_color(), "rgb(0, 128, 0)");
         assert_eq!(
             document
                 .get_property("styleSheets")
@@ -13271,7 +16600,10 @@ worker.postMessage(40);
                 document.call_method("querySelector", vec![Value::string(".cached-target")]);
             let computed =
                 crate::jsdom::window_value().call_method("getComputedStyle", vec![target]);
-            assert_eq!(computed.get_property("color").to_js_string(), "#800080");
+            assert_eq!(
+                computed.get_property("color").to_js_string(),
+                "rgb(128, 0, 128)"
+            );
         }
         server.join().expect("stylesheet cache fixture completed");
         assert_eq!(
@@ -13356,7 +16688,10 @@ worker.postMessage(40);
         let document = crate::jsdom::document_value();
         let target = document.call_method("querySelector", vec![Value::string(".cors-target")]);
         let computed = crate::jsdom::window_value().call_method("getComputedStyle", vec![target]);
-        assert_eq!(computed.get_property("color").to_js_string(), "#000000");
+        assert_eq!(
+            computed.get_property("color").to_js_string(),
+            "rgb(0, 0, 0)"
+        );
         assert_eq!(
             document
                 .get_property("styleSheets")
@@ -13741,6 +17076,18 @@ worker.postMessage(40);
             decode_document_bytes(b"Price \x80", "text/html").unwrap(),
             "Price €"
         );
+        for (label, expected) in [
+            ("latin2", "ISO-8859-2"),
+            ("csiso2022kr", "replacement"),
+            ("shift_jis", "Shift_JIS"),
+            ("utf-16be", "UTF-8"),
+            ("x-user-defined", "windows-1252"),
+        ] {
+            let source = format!("<meta charset=\"{label}\">");
+            let (_, encoding) =
+                decode_document_bytes_with_encoding(source.as_bytes(), "text/html").unwrap();
+            assert_eq!(encoding, expected, "label {label:?}");
+        }
         assert!(
             decode_document_bytes(b"body", "text/html; charset=made-up")
                 .unwrap_err()

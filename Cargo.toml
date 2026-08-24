@@ -52,6 +52,7 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 flate2 = "1.1"
 wuff = "0.2.8"
+encoding_rs = "0.8"
 
 # Layout: Taffy 0.9 — Flexbox + Grid + Block + position
 taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout", "content_size"] }
@@ -115,6 +116,10 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.wpt]
+inherits = "release"
+panic = "unwind"
 
 [profile.release-size]
 inherits = "release"

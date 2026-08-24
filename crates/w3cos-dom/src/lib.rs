@@ -72,6 +72,31 @@ mod tests {
     }
 
     #[test]
+    fn display_contents_promotes_children_into_the_parent_component() {
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        parent.style_mut(&mut doc).set_property("display", "flex");
+        parent.style_mut(&mut doc).set_property("width", "100px");
+        let contents = doc.create_element("div");
+        contents
+            .style_mut(&mut doc)
+            .set_property("display", "contents");
+        let child = doc.create_element("div");
+        child.style_mut(&mut doc).set_property("display", "inline");
+        child.style_mut(&mut doc).set_property("height", "100px");
+        child.style_mut(&mut doc).set_property("flex-grow", "1");
+        contents.append_child(&mut doc, child);
+        parent.append_child(&mut doc, contents);
+        doc.body().append_child(&mut doc, parent);
+
+        let tree = doc.to_component_tree();
+        let parent = &tree.children[0];
+        assert_eq!(parent.children.len(), 1);
+        assert_eq!(parent.children[0].style.flex_grow, 1.0);
+        assert_eq!(parent.children[0].style.height, Dimension::Px(100.0));
+    }
+
+    #[test]
     fn svg_subtree_lowers_to_one_retained_document() {
         let mut doc = Document::new();
         let svg = doc.create_element("svg");
@@ -428,6 +453,66 @@ mod tests {
     }
 
     #[test]
+    fn block_flow_drops_inter_element_whitespace_but_keeps_inline_spacing() {
+        use w3cos_std::ComponentKind;
+
+        let mut doc = Document::new();
+        let paragraph = doc.create_element("p");
+        let paragraph_text = doc.create_text_node("first");
+        doc.append_child(paragraph.id, paragraph_text.id);
+        doc.append_child(doc.body().id, paragraph.id);
+        let block_space = doc.create_text_node("\n    ");
+        doc.append_child(doc.body().id, block_space.id);
+        let div = doc.create_element("div");
+        let div_text = doc.create_text_node("second");
+        doc.append_child(div.id, div_text.id);
+        doc.append_child(doc.body().id, div.id);
+
+        let tree = doc.to_component_tree();
+        assert_eq!(tree.children.len(), 2);
+
+        let mut inline_doc = Document::new();
+        for (index, text) in ["left", "right"].into_iter().enumerate() {
+            if index > 0 {
+                let spacing = inline_doc.create_text_node(" ");
+                inline_doc.append_child(inline_doc.body().id, spacing.id);
+            }
+            let span = inline_doc.create_element("span");
+            let text = inline_doc.create_text_node(text);
+            inline_doc.append_child(span.id, text.id);
+            inline_doc.append_child(inline_doc.body().id, span.id);
+        }
+        let inline_tree = inline_doc.to_component_tree();
+        assert_eq!(inline_tree.children.len(), 3);
+        assert!(matches!(
+            &inline_tree.children[1].kind,
+            ComponentKind::Text { content } if content == " "
+        ));
+
+        let mut nested_doc = Document::new();
+        let span = nested_doc.create_element("span");
+        for content in ["\n  ", "content", "  \n"] {
+            let text = nested_doc.create_text_node(content);
+            nested_doc.append_child(span.id, text.id);
+        }
+        nested_doc.append_child(nested_doc.body().id, span.id);
+        let nested_tree = nested_doc.to_component_tree();
+        assert!(matches!(
+            &nested_tree.children[0].kind,
+            ComponentKind::Text { content } if content == "content"
+        ));
+
+        let mut collapsed_doc = Document::new();
+        let indented = collapsed_doc.create_text_node("\n    Filler   Text\n  ");
+        collapsed_doc.append_child(collapsed_doc.body().id, indented.id);
+        let collapsed_tree = collapsed_doc.to_component_tree();
+        assert!(matches!(
+            &collapsed_tree.children[0].kind,
+            ComponentKind::Text { content } if content == "Filler Text"
+        ));
+    }
+
+    #[test]
     fn test_element_set_attribute() {
         let mut doc = Document::new();
         let el = doc.create_element("div");
@@ -494,7 +579,7 @@ mod tests {
             "href",
             "#renamed",
         );
-        assert_eq!(el.get_attribute(&doc, "xlink:href"), None);
+        assert_eq!(el.get_attribute(&doc, "xlink:href"), Some("#ordinary"));
         assert_eq!(el.get_attribute(&doc, "legacy:href"), Some("#renamed"));
         assert_eq!(
             el.get_attribute_ns(&doc, Some("http://www.w3.org/1999/xlink"), "href"),
@@ -511,6 +596,39 @@ mod tests {
         assert_eq!(
             cloned.get_attribute_ns(&doc, Some("http://www.w3.org/1999/xlink"), "href"),
             None
+        );
+        assert_eq!(cloned.get_attribute(&doc, "xlink:href"), Some("#ordinary"));
+    }
+
+    #[test]
+    fn test_remove_attribute_only_removes_first_matching_qualified_name() {
+        let mut doc = Document::new();
+        let el = doc.create_element("p");
+        el.set_attribute(&mut doc, "x", "first");
+        el.set_attribute_ns(&mut doc, Some("foo"), "x", None, "x", "second");
+
+        assert_eq!(doc.get_node(el.id).attributes.len(), 2);
+        assert_eq!(el.get_attribute(&doc, "x"), Some("first"));
+        assert_eq!(el.get_attribute_ns(&doc, None, "x"), Some("first"));
+        assert_eq!(el.get_attribute_ns(&doc, Some("foo"), "x"), Some("second"));
+
+        el.remove_attribute(&mut doc, "x");
+
+        assert_eq!(doc.get_node(el.id).attributes.len(), 1);
+        assert_eq!(el.get_attribute(&doc, "x"), Some("second"));
+        assert_eq!(el.get_attribute_ns(&doc, None, "x"), None);
+        assert_eq!(el.get_attribute_ns(&doc, Some("foo"), "x"), Some("second"));
+
+        let namespaced = doc.create_element("p");
+        namespaced.set_attribute_ns(&mut doc, Some("foo"), "x", None, "x", "first");
+        namespaced.set_attribute_ns(&mut doc, Some("foo2"), "x", None, "x", "second");
+        namespaced.remove_attribute(&mut doc, "x");
+
+        assert_eq!(namespaced.get_attribute(&doc, "x"), Some("second"));
+        assert_eq!(namespaced.get_attribute_ns(&doc, Some("foo"), "x"), None);
+        assert_eq!(
+            namespaced.get_attribute_ns(&doc, Some("foo2"), "x"),
+            Some("second")
         );
     }
 
@@ -665,6 +783,25 @@ mod tests {
     }
 
     #[test]
+    fn component_tree_inherits_styles_from_the_html_root() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("html", &[("color", "green"), ("font-size", "20px")]);
+
+        let mut doc = Document::new();
+        let body = doc.body();
+        let document = doc.get_node(body.id).parent.expect("document root");
+        let html = doc.create_element("html");
+        doc.remove_child(document, body.id);
+        doc.append_child(document, html.id);
+        doc.append_child(html.id, body.id);
+
+        let tree = doc.to_component_tree();
+        assert_eq!(tree.style.color, w3cos_std::Color::rgb(0, 128, 0));
+        assert_eq!(tree.style.font_size, 20.0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_stylesheet_attribute_rule_applies_in_component_tree() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
@@ -756,6 +893,26 @@ mod tests {
             inner_component.style.position,
             w3cos_std::style::Position::Absolute
         ));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_stylesheet_sibling_selectors_use_element_siblings_only() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".first + .second", &[("color", "red")]);
+        crate::stylesheet::register_rule(".first ~ .third", &[("color", "blue")]);
+
+        let mut doc = Document::new();
+        for class_name in ["first", "second", "third"] {
+            let element = doc.create_element("div");
+            element.class_list_add(&mut doc, class_name);
+            doc.append_child(doc.body().id, element.id);
+            let whitespace = doc.create_text_node("\n  ");
+            doc.append_child(doc.body().id, whitespace.id);
+        }
+        let tree = doc.to_component_tree();
+        assert_eq!(tree.children[1].style.color, w3cos_std::Color::rgb(255, 0, 0));
+        assert_eq!(tree.children[2].style.color, w3cos_std::Color::rgb(0, 0, 255));
         crate::stylesheet::clear_rules();
     }
 

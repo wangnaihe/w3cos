@@ -72,6 +72,7 @@ mod html_fragment_policy;
 mod html_parser_host;
 mod html_parser_state;
 mod html_tree_builder;
+mod xml_tree_builder;
 pub mod image_decoder_web;
 pub mod image_loader;
 pub mod indexed_db;

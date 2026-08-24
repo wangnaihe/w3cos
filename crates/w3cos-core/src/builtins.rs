@@ -1,12 +1,14 @@
 #![allow(non_upper_case_globals, non_snake_case)]
 
 use crate::Value;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 thread_local! {
     static OBJECT_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static ARRAY_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone, Copy)]
@@ -40,21 +42,43 @@ pub fn object_value() -> Value {
 
 fn build_object_value() -> Value {
     let mut properties = HashMap::new();
-    let prototype = Value::object(HashMap::from([(
-        "hasOwnProperty".to_string(),
-        Value::function(|this, arguments| this.call_method("hasOwnProperty", arguments)),
-    )]));
-    let has_own_property = prototype.get_property("hasOwnProperty");
-    crate::class::define_property(
-        &prototype,
-        "hasOwnProperty",
-        &Value::object(HashMap::from([
-            ("value".into(), has_own_property),
-            ("writable".into(), Value::Bool(true)),
-            ("enumerable".into(), Value::Bool(false)),
-            ("configurable".into(), Value::Bool(true)),
-        ])),
-    );
+    let prototype = Value::object(HashMap::from([
+        (
+            "hasOwnProperty".to_string(),
+            Value::function(|this, arguments| this.call_method("hasOwnProperty", arguments)),
+        ),
+        (
+            "isPrototypeOf".to_string(),
+            Value::function(|this, arguments| {
+                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let mut current = crate::class::get_prototype_of(&value);
+                let mut visited = Vec::new();
+                while current.is_object() {
+                    if current.strict_eq(&this) {
+                        return Value::Bool(true);
+                    }
+                    if visited.iter().any(|seen: &Value| seen.strict_eq(&current)) {
+                        break;
+                    }
+                    visited.push(current.clone());
+                    current = crate::class::get_prototype_of(&current);
+                }
+                Value::Bool(false)
+            }),
+        ),
+    ]));
+    for method in ["hasOwnProperty", "isPrototypeOf"] {
+        crate::class::define_property(
+            &prototype,
+            method,
+            &Value::object(HashMap::from([
+                ("value".into(), prototype.get_property(method)),
+                ("writable".into(), Value::Bool(true)),
+                ("enumerable".into(), Value::Bool(false)),
+                ("configurable".into(), Value::Bool(true)),
+            ])),
+        );
+    }
     properties.insert("prototype".to_string(), prototype);
     for name in ["keys", "values", "is"] {
         let method = name.to_string();
@@ -79,6 +103,15 @@ fn build_object_value() -> Value {
         "getPrototypeOf".into(),
         Value::function(|_, arguments| {
             crate::class::get_prototype_of(&arguments.first().cloned().unwrap_or(Value::Undefined))
+        }),
+    );
+    properties.insert(
+        "setPrototypeOf".into(),
+        Value::function(|_, arguments| {
+            let object = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let prototype = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+            crate::class::set_prototype_of(&object, &prototype);
+            object
         }),
     );
     properties.insert(
@@ -115,7 +148,7 @@ fn build_object_value() -> Value {
         Value::function(|_, arguments| {
             arguments
                 .first()
-                .map(object_keys)
+                .map(object_own_property_names)
                 .unwrap_or_else(|| Value::array(Vec::new()))
         }),
     );
@@ -165,6 +198,17 @@ fn build_object_value() -> Value {
 }
 
 pub fn array_value() -> Value {
+    ARRAY_CONSTRUCTOR.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        let value = build_array_value();
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
+fn build_array_value() -> Value {
     let mut properties = HashMap::new();
     properties.insert(
         "isArray".into(),
@@ -172,15 +216,173 @@ pub fn array_value() -> Value {
     );
     properties.insert(
         "from".into(),
-        Value::function(|_, arguments| {
-            let source = arguments.first().cloned().unwrap_or(Value::Undefined);
-            array_from(source)
-        }),
+        Value::function(|_, arguments| array_from(&arguments)),
     );
     properties.insert(
         "of".into(),
         Value::function(|_, arguments| Value::array(arguments)),
     );
+    let prototype = Value::object(HashMap::new());
+    let values = Value::function(|this, _| live_array_like_values_iterator(this));
+    prototype.set_property("values", values.clone());
+    prototype.set_property("__w3cos_symbol_iterator", values);
+    prototype.set_property(
+        "keys",
+        Value::function(|this, _| {
+            let keys = (0..array_like_snapshot(&this).len())
+                .map(|index| Value::Number(index as f64))
+                .collect();
+            Value::array(keys).call_method("__w3cos_symbol_iterator", Vec::new())
+        }),
+    );
+    prototype.set_property(
+        "entries",
+        Value::function(|this, _| {
+            let entries = array_like_snapshot(&this)
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| Value::array(vec![Value::Number(index as f64), value]))
+                .collect();
+            Value::array(entries).call_method("__w3cos_symbol_iterator", Vec::new())
+        }),
+    );
+    prototype.set_property(
+        "forEach",
+        Value::function(|this, arguments| {
+            let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+            for (index, value) in array_like_snapshot(&this).into_iter().enumerate() {
+                callback.call(
+                    this_arg.clone(),
+                    vec![value, Value::Number(index as f64), this.clone()],
+                );
+            }
+            Value::Undefined
+        }),
+    );
+    prototype.set_property(
+        "map",
+        Value::function(|this, arguments| {
+            let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+            let length = this.get_property("length").to_number();
+            let length = if length.is_finite() && length > 0.0 {
+                length.floor() as usize
+            } else {
+                0
+            };
+            Value::array(
+                (0..length)
+                    .map(|index| {
+                        if !Value::string(&index.to_string()).js_in(&this).to_bool() {
+                            return crate::value::array_hole();
+                        }
+                        callback.call(
+                            this_arg.clone(),
+                            vec![
+                                this.get_property(&index.to_string()),
+                                Value::Number(index as f64),
+                                this.clone(),
+                            ],
+                        )
+                    })
+                    .collect(),
+            )
+        }),
+    );
+    prototype.set_property(
+        "filter",
+        Value::function(|this, arguments| {
+            let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+            let length = this.get_property("length").to_number();
+            let length = if length.is_finite() && length > 0.0 {
+                length.floor() as usize
+            } else {
+                0
+            };
+            let mut selected = Vec::new();
+            for index in 0..length {
+                if !Value::string(&index.to_string()).js_in(&this).to_bool() {
+                    continue;
+                }
+                let value = this.get_property(&index.to_string());
+                if callback
+                    .call(
+                        this_arg.clone(),
+                        vec![
+                            value.clone(),
+                            Value::Number(index as f64),
+                            this.clone(),
+                        ],
+                    )
+                    .to_bool()
+                {
+                    selected.push(value);
+                }
+            }
+            Value::array(selected)
+        }),
+    );
+    prototype.set_property(
+        "indexOf",
+        Value::function(|this, arguments| {
+            let length = this.get_property("length").to_number();
+            let length = if length.is_finite() && length > 0.0 {
+                length.floor() as usize
+            } else {
+                0
+            };
+            if length == 0 {
+                return Value::Number(-1.0);
+            }
+            let needle = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let from = arguments.get(1).map_or(0.0, Value::to_number);
+            if from.is_infinite() && from.is_sign_positive() {
+                return Value::Number(-1.0);
+            }
+            let start = if from.is_nan() {
+                0
+            } else if from < 0.0 {
+                (length as f64 + from.ceil()).max(0.0) as usize
+            } else {
+                from.floor().max(0.0) as usize
+            };
+            let intrinsic = this
+                .as_object()
+                .map(|object| object.borrow().get_direct("__w3cosArrayIndexOf"))
+                .unwrap_or(Value::Undefined);
+            if intrinsic.is_callable() {
+                return intrinsic.call(
+                    this,
+                    vec![
+                        needle,
+                        Value::Number(length as f64),
+                        Value::Number(start as f64),
+                    ],
+                );
+            }
+            for index in start..length {
+                let key = index.to_string();
+                if Value::string(&key).js_in(&this).to_bool()
+                    && this.get_property(&key).strict_eq(&needle)
+                {
+                    return Value::Number(index as f64);
+                }
+            }
+            Value::Number(-1.0)
+        }),
+    );
+    prototype.set_property(
+        "slice",
+        Value::function(|this, arguments| {
+            let values = array_like_slots(&this);
+            let start = array_slice_index(arguments.first(), values.len(), 0);
+            let end = array_slice_index(arguments.get(1), values.len(), values.len());
+            Value::array(values[start.min(end)..end].to_vec())
+        }),
+    );
+    properties.insert("prototype".into(), prototype);
     Value::callable(properties, |_, arguments| {
         if let [length] = arguments.as_slice()
             && let Some(length) = length.as_number()
@@ -198,7 +400,97 @@ pub fn array_value() -> Value {
     })
 }
 
-fn array_from(source: Value) -> Value {
+fn live_array_like_values_iterator(value: Value) -> Value {
+    let index = Rc::new(Cell::new(0_u32));
+    let next_index = Rc::clone(&index);
+    let iterable = value.clone();
+    let iterator = Value::object(HashMap::from([(
+        "next".to_string(),
+        Value::function(move |_, _| {
+            let current = next_index.get();
+            let length = iterable.get_property("length").to_u32();
+            let done = current >= length;
+            let value = if done {
+                Value::Undefined
+            } else {
+                next_index.set(current + 1);
+                iterable.get_property(&current.to_string())
+            };
+            Value::object(HashMap::from([
+                ("value".to_string(), value),
+                ("done".to_string(), Value::Bool(done)),
+            ]))
+        }),
+    )]));
+    let self_iterator = iterator.clone();
+    iterator.set_property(
+        "__w3cos_symbol_iterator",
+        Value::function(move |_, _| self_iterator.clone()),
+    );
+    iterator
+}
+
+fn array_like_snapshot(value: &Value) -> Vec<Value> {
+    if let Some(values) = value.as_array() {
+        return values
+            .borrow()
+            .iter()
+            .filter(|value| !crate::value::is_array_hole(value))
+            .cloned()
+            .collect();
+    }
+    let snapshot = value.get_property("__w3cosMapValuesSnapshot");
+    if snapshot.is_callable() {
+        return snapshot.call(value.clone(), Vec::new()).iter().collect();
+    }
+    let length = value.get_property("length").to_number();
+    if !length.is_finite() || length <= 0.0 {
+        return Vec::new();
+    }
+    (0..length.floor() as usize)
+        .map(|index| value.get_property(&index.to_string()))
+        .collect()
+}
+
+fn array_like_slots(value: &Value) -> Vec<Value> {
+    if let Some(values) = value.as_array() {
+        return values.borrow().clone();
+    }
+    let length = value.get_property("length").to_number();
+    if !length.is_finite() || length <= 0.0 {
+        return Vec::new();
+    }
+    (0..length.floor() as usize)
+        .map(|index| value.get_property(&index.to_string()))
+        .collect()
+}
+
+fn array_slice_index(argument: Option<&Value>, length: usize, fallback: usize) -> usize {
+    let Some(argument) = argument else {
+        return fallback;
+    };
+    if argument.is_undefined() {
+        return fallback;
+    }
+    let number = argument.to_number();
+    if number.is_nan() {
+        0
+    } else if number < 0.0 {
+        (length as f64 + number.trunc()).max(0.0) as usize
+    } else {
+        (number.trunc() as usize).min(length)
+    }
+}
+
+fn array_from(arguments: &[Value]) -> Value {
+    let source = arguments.first().cloned().unwrap_or(Value::Undefined);
+    let map_function = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+    if !map_function.is_undefined() && !map_function.is_callable() {
+        crate::throw_value(crate::value::type_error(
+            "Array.from map function must be callable",
+        ));
+    }
+    let this_argument = arguments.get(2).cloned().unwrap_or(Value::Undefined);
     // `Array.from` must prefer a real iterator, but the lightweight runtime's
     // generic object heuristic also classifies host array-like proxies as
     // iterable. FileList is one of those: its indexed values are exposed by a
@@ -219,16 +511,31 @@ fn array_from(source: Value) -> Value {
             .get_property("__w3cosMapValuesSnapshot")
             .is_undefined()
         || !source.get_property("__w3cosMapValues").is_undefined();
-    if has_explicit_iterator && source.is_iterable() {
-        return Value::array(source.iter().collect());
-    }
-    let length = source.get_property("length").to_number();
-    if !length.is_finite() || length <= 0.0 {
-        return Value::array(Vec::new());
+    let values = if has_explicit_iterator && source.is_iterable() {
+        source.iter().collect::<Vec<_>>()
+    } else {
+        let length = source.get_property("length").to_number();
+        if !length.is_finite() || length <= 0.0 {
+            Vec::new()
+        } else {
+            (0..length.floor() as usize)
+            .map(|index| source.get_property(&index.to_string()))
+            .collect()
+        }
+    };
+    if map_function.is_undefined() {
+        return Value::array(values);
     }
     Value::array(
-        (0..length.floor() as usize)
-            .map(|index| source.get_property(&index.to_string()))
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                map_function.call(
+                    this_argument.clone(),
+                    vec![value, Value::Number(index as f64)],
+                )
+            })
             .collect(),
     )
 }
@@ -298,9 +605,7 @@ impl BuiltinObject {
                 .first()
                 .map(object_values)
                 .unwrap_or_else(|| Value::array(Vec::new())),
-            (BuiltinKind::Array, "from") => {
-                array_from(arguments.first().cloned().unwrap_or(Value::Undefined))
-            }
+            (BuiltinKind::Array, "from") => array_from(&arguments),
             (BuiltinKind::Console, _) => {
                 // Debug channel for compiled apps: W3COS_JS_CONSOLE=1 makes
                 // console.* print to stderr (production default stays silent).
@@ -410,12 +715,17 @@ fn js_round(value: f64) -> f64 {
 
 pub(crate) fn object_keys(value: &Value) -> Value {
     if let Some(object) = value.as_object() {
+        let keys = object.borrow().own_keys().iter().collect::<Vec<_>>();
         return Value::array(
-            object
-                .borrow()
-                .keys()
-                .into_iter()
-                .map(Value::from)
+            keys.into_iter()
+                .filter(|key| {
+                    let key = key.to_js_string();
+                    object
+                        .borrow()
+                        .get_own_property_descriptor(&key)
+                        .get_property("enumerable")
+                        .to_bool()
+                })
                 .collect(),
         );
     }
@@ -433,14 +743,30 @@ pub(crate) fn object_keys(value: &Value) -> Value {
     Value::array(Vec::new())
 }
 
-fn object_values(value: &Value) -> Value {
+fn object_own_property_names(value: &Value) -> Value {
     if let Some(object) = value.as_object() {
-        let object = object.borrow();
+        return object.borrow().own_keys();
+    }
+    if let Some(values) = value.as_array() {
+        let mut keys = values
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| !crate::value::is_array_hole(value))
+            .map(|(index, _)| Value::from(index.to_string()))
+            .collect::<Vec<_>>();
+        keys.push(Value::from("length"));
+        return Value::array(keys);
+    }
+    Value::array(Vec::new())
+}
+
+fn object_values(value: &Value) -> Value {
+    if value.as_object().is_some() {
+        let keys = object_keys(value);
         return Value::array(
-            object
-                .keys()
-                .into_iter()
-                .map(|key| object.get_direct(&key))
+            keys.iter()
+                .map(|key| value.get_property(&key.to_js_string()))
                 .collect(),
         );
     }
@@ -541,8 +867,9 @@ fn build_error_classes() -> HashMap<String, Value> {
     for name in ERROR_CLASS_NAMES {
         let error_name = (*name).to_string();
         let constructor_name = error_name.clone();
-        let constructor =
-            Value::function(move |_, arguments| error_instance(&constructor_name, arguments));
+        let constructor = Value::callable(HashMap::new(), move |_, arguments| {
+            error_instance(&constructor_name, arguments)
+        });
         constructor.set_property("name", Value::string(name));
         let prototype = Value::object(HashMap::from([
             ("name".to_string(), Value::string(name)),
@@ -573,6 +900,7 @@ fn build_error_classes() -> HashMap<String, Value> {
         .copied()
         .filter(|name| *name != "Error")
     {
+        crate::class::set_prototype_of(&classes[name], &classes["Error"]);
         crate::class::set_prototype_of(&classes[name].get_property("prototype"), &error_prototype);
     }
     classes
@@ -1269,6 +1597,67 @@ mod tests {
     }
 
     #[test]
+    fn array_prototype_map_is_generic_for_array_like_objects() {
+        let source = Value::object(HashMap::from([
+            ("0".to_string(), Value::string("first")),
+            ("1".to_string(), Value::string("second")),
+            ("length".to_string(), Value::Number(2.0)),
+        ]));
+        let map = array_value().get_property("prototype").get_property("map");
+        let mapped = map.call(
+            source,
+            vec![Value::function(|_, arguments| {
+                arguments[0].get_property("length")
+            })],
+        );
+
+        assert_eq!(mapped.get_property("length"), Value::Number(2.0));
+        assert_eq!(mapped.get_property("0"), Value::Number(5.0));
+        assert_eq!(mapped.get_property("1"), Value::Number(6.0));
+    }
+
+    #[test]
+    fn array_prototype_filter_is_generic_for_array_like_objects() {
+        let source = Value::object(HashMap::from([
+            ("0".to_string(), Value::string("first")),
+            ("1".to_string(), Value::string("second")),
+            ("length".to_string(), Value::Number(2.0)),
+        ]));
+        let filter = array_value()
+            .get_property("prototype")
+            .get_property("filter");
+        let filtered = filter.call(
+            source,
+            vec![Value::function(|_, arguments| {
+                Value::Bool(arguments[0].to_js_string().starts_with('s'))
+            })],
+        );
+
+        assert_eq!(filtered.get_property("length"), Value::Number(1.0));
+        assert_eq!(filtered.get_property("0"), Value::string("second"));
+    }
+
+    #[test]
+    fn array_prototype_index_of_is_generic_and_observes_length() {
+        let needle = Value::object(HashMap::new());
+        let source = Value::object(HashMap::from([
+            ("0".to_string(), Value::string("first")),
+            ("1".to_string(), needle.clone()),
+            ("length".to_string(), Value::Number(2.0)),
+        ]));
+        let index_of = array_value()
+            .get_property("prototype")
+            .get_property("indexOf");
+
+        assert_eq!(
+            index_of.call(source.clone(), vec![needle.clone()]),
+            Value::Number(1.0)
+        );
+        source.set_property("length", Value::Number(1.0));
+        assert_eq!(index_of.call(source, vec![needle]), Value::Number(-1.0));
+    }
+
+    #[test]
     fn array_from_materializes_array_like_objects() {
         let file = Value::object(HashMap::from([(
             "name".to_string(),
@@ -1287,6 +1676,32 @@ mod tests {
             files.get_property("0").get_property("name").to_js_string(),
             "photo.png"
         );
+    }
+
+    #[test]
+    fn array_from_applies_mapping_function_with_index_and_this_argument() {
+        let this_argument = Value::object(HashMap::from([(
+            "prefix".to_string(),
+            Value::string("item"),
+        )]));
+        let mapped = array_value().call_method(
+            "from",
+            vec![
+                Value::array(vec![Value::string("a"), Value::string("b")]),
+                Value::function(|this, arguments| {
+                    Value::string(&format!(
+                        "{}-{}-{}",
+                        this.get_property("prefix").to_js_string(),
+                        arguments[0].to_js_string(),
+                        arguments[1].to_u32()
+                    ))
+                }),
+                this_argument,
+            ],
+        );
+
+        assert_eq!(mapped.get_property("0"), Value::string("item-a-0"));
+        assert_eq!(mapped.get_property("1"), Value::string("item-b-1"));
     }
 
     #[test]
@@ -1342,6 +1757,27 @@ mod tests {
     }
 
     #[test]
+    fn object_set_prototype_of_and_is_prototype_of_share_the_live_chain() {
+        let object = object_value();
+        let prototype = object.call_method(
+            "create",
+            vec![object.get_property("prototype")],
+        );
+        let target = Value::object(HashMap::new());
+
+        assert!(
+            object
+                .call_method("setPrototypeOf", vec![target.clone(), prototype.clone()])
+                .strict_eq(&target)
+        );
+        assert!(
+            prototype
+                .call_method("isPrototypeOf", vec![target])
+                .to_bool()
+        );
+    }
+
+    #[test]
     fn object_entries_preserve_property_insertion_order() {
         let object = Value::object(HashMap::new());
         object.set_property("none", Value::Number(0.0));
@@ -1383,6 +1819,7 @@ mod tests {
 
     #[test]
     fn error_family_has_browser_shaped_instances_and_prototypes() {
+        assert!(crate::class::get_prototype_of(&error_class("TypeError")) == error_class("Error"));
         let cause = Value::string("root");
         let type_error = crate::class::construct(
             &error_class("TypeError"),

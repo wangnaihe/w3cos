@@ -48,6 +48,7 @@
 //! boundary (`Notify` would fire desktop notifications via `state::execute_action`).
 
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -103,6 +104,10 @@ const EVENT_COUNT_TYPES: &[&str] = &[
     "pointerleave",
 ];
 
+const POPOVER_OPEN_EXPANDO: &str = "__w3cos_popover_open";
+const DIALOG_MODAL_EXPANDO: &str = "__w3cos_dialog_modal";
+const DIALOG_RETURN_VALUE_EXPANDO: &str = "__w3cos_dialog_return_value";
+
 fn initial_event_counts() -> HashMap<String, u64> {
     EVENT_COUNT_TYPES
         .iter()
@@ -117,6 +122,7 @@ struct JsListener {
     event_type: EventType,
     handler: Value,
     capture: bool,
+    inline: bool,
 }
 
 struct JsTimer {
@@ -150,6 +156,43 @@ enum ElementMemo {
     Weak(WeakJsObject),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CssMotionKind {
+    Animation,
+    Transition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CssMotionValue {
+    Length(f32),
+    TranslateX(f32),
+}
+
+#[derive(Debug, Clone)]
+struct CssMotion {
+    node: u32,
+    pseudo: Option<String>,
+    property: String,
+    kind: CssMotionKind,
+    label: String,
+    from: CssMotionValue,
+    to: CssMotionValue,
+    started_at: Instant,
+    delay: Duration,
+    duration: Duration,
+    easing: w3cos_std::style::Easing,
+    direction: w3cos_std::style::AnimationDirection,
+    event_pending: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TransitionSnapshot {
+    pseudo: Option<String>,
+    property: String,
+    value: CssMotionValue,
+    transition: w3cos_std::style::Transition,
+}
+
 thread_local! {
     /// Monotonic identity for the active document Realm. Every node-backed JS
     /// facade captures this value so an externally retained facade cannot
@@ -160,10 +203,20 @@ thread_local! {
     /// (node, key) → JS expando properties assigned through the set trap
     /// (plus bridge-cached "style"/"classList"/"__ctx2d" values).
     static ELEMENT_PROPS: RefCell<HashMap<(u32, String), Value>> = RefCell::new(HashMap::new());
+    /// Processing-instruction attributes are projected from `data`, but values
+    /// containing quotes must remain readable after standards serialization.
+    static PROCESSING_INSTRUCTION_ATTRIBUTES: RefCell<HashMap<u32, (String, Vec<(String, String)>)>> = RefCell::new(HashMap::new());
+    /// Native Attr identity is `(owner element, namespace, local name)`.
+    /// Repeated access through `attributes`, `getAttributeNode`, and
+    /// `getAttributeNodeNS` must return the same JS object until it is removed.
+    static ATTRIBUTE_VALUES: RefCell<HashMap<(u32, Option<String>, String), Value>> = RefCell::new(HashMap::new());
     /// (node, kebab-prop) → raw CSS value cache. `CSSStyleDeclaration` drops
     /// properties it does not know, so reads of e.g. `lineHeight` would
     /// otherwise come back "".
     static STYLE_CACHE: RefCell<HashMap<(u32, String), String>> = RefCell::new(HashMap::new());
+    /// Active CSS animations/transitions sampled by CSSOM and geometry reads.
+    /// The corresponding JS facades live in `animations_web::ANIMATIONS`.
+    static CSS_MOTIONS: RefCell<Vec<CssMotion>> = const { RefCell::new(Vec::new()) };
     /// JS event listener registry. Delivery for native events consults this
     /// at drain time; `dispatchEvent` consults it synchronously.
     static LISTENERS: RefCell<Vec<JsListener>> = RefCell::new(Vec::new());
@@ -188,6 +241,10 @@ thread_local! {
     /// JS timers (setTimeout/setInterval).
     static JS_TIMERS: RefCell<Vec<JsTimer>> = RefCell::new(Vec::new());
     static NEXT_TIMER_ID: Cell<u32> = Cell::new(1);
+    /// Stable implementation-specific ordering for roots in disconnected DOM
+    /// trees. The DOM standard permits either direction, but requires the
+    /// result to remain consistent when the operands are reversed.
+    static NEXT_DISCONNECTED_NODE_ORDER: Cell<u64> = Cell::new(1);
     /// requestAnimationFrame callbacks: (id, callback).
     static RAF_QUEUE: RefCell<Vec<(u32, Value)>> = RefCell::new(Vec::new());
     static NEXT_RAF_ID: Cell<u32> = Cell::new(1);
@@ -231,6 +288,9 @@ thread_local! {
     static MEDIA_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static DOM_COLLECTION_CLASSES: RefCell<Option<HashMap<String, Value>>> =
         const { RefCell::new(None) };
+    static SELECTOR_ID_CACHE_GENERATION: Cell<u64> = const { Cell::new(0) };
+    static SELECTOR_ID_CACHE: RefCell<HashMap<u32, HashMap<String, Vec<u32>>>> =
+        RefCell::new(HashMap::new());
     static LEGACY_ELEMENT_FACTORY_CLASSES: RefCell<Option<HashMap<String, Value>>> =
         const { RefCell::new(None) };
     static BAR_PROP_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -257,6 +317,9 @@ thread_local! {
     static EVAL_WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
     static FUNCTION_WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
     static RANGE_COMPLEX_WARNING_EMITTED: Cell<bool> = const { Cell::new(false) };
+    /// Mutable Range objects participate in DOM's live-range maintenance
+    /// algorithms while nodes are removed and inserted.
+    static LIVE_RANGES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
     /// performance.now() origin.
     static START_TIME: Instant = Instant::now();
     static TIME_ORIGIN: f64 = SystemTime::now()
@@ -425,13 +488,52 @@ pub(crate) fn realm_function(
     generation: u32,
     f: impl Fn(Value, Vec<Value>) -> Value + 'static,
 ) -> Value {
-    Value::function(move |this, args| {
+    let function = Value::function(move |this, args| {
         if bridge_realm_is_current(generation) {
             f(this, args)
         } else {
             Value::Undefined
         }
-    })
+    });
+    function.set_property("length", Value::Number(0.0));
+    function
+}
+
+pub(crate) fn associate_callback_global(callback: &Value, global: &Value) {
+    if callback.is_callable() {
+        callback.set_property("__w3cos_callback_global", global.clone());
+    }
+}
+
+pub(crate) fn report_callback_exception(callback: &Value, exception: Value) {
+    let global = callback.get_property("__w3cos_callback_global");
+    let global = if global.is_object() {
+        global
+    } else {
+        window_value()
+    };
+    let handler = global.get_property("onerror");
+    if !handler.is_callable() {
+        return;
+    }
+    let message = exception.get_property("message");
+    let message = if message.is_undefined() {
+        Value::string(&exception.to_js_string())
+    } else {
+        message
+    };
+    let _ = w3cos_core::catch_js(|| {
+        handler.call(
+            global,
+            vec![
+                message,
+                Value::string(""),
+                Value::Number(0.0),
+                Value::Number(0.0),
+                exception,
+            ],
+        )
+    });
 }
 
 pub(crate) type WeakRealmObject = WeakJsObject;
@@ -578,6 +680,10 @@ fn shadow_host_for_root(root: u32) -> Option<u32> {
     })
 }
 
+pub(crate) fn shadow_root_id_for_host(host: u32) -> Option<u32> {
+    SHADOW_ROOTS.with(|roots| roots.borrow().get(&host).map(|info| info.root))
+}
+
 fn tree_root(mut node: u32) -> u32 {
     while let Some(parent) = dom::parent_node(node) {
         node = parent;
@@ -585,11 +691,41 @@ fn tree_root(mut node: u32) -> u32 {
     node
 }
 
-fn node_is_connected(node: u32) -> bool {
+fn shadow_including_tree_root(mut node: u32) -> u32 {
+    loop {
+        let root = tree_root(node);
+        let Some(host) = shadow_host_for_root(root) else {
+            return root;
+        };
+        node = host;
+    }
+}
+
+pub(crate) fn node_is_connected(node: u32) -> bool {
     if dom::is_connected(node) {
         return true;
     }
-    shadow_host_for_root(tree_root(node)).is_some_and(node_is_connected)
+    let root = tree_root(node);
+    if shadow_host_for_root(root).is_some_and(node_is_connected) {
+        return true;
+    }
+    get_expando(root, "parentNode")
+        .is_some_and(|parent| parent.get_property("nodeType").to_u32() == 9)
+}
+
+fn nodes_have_same_shadow_including_root(left: u32, right: u32) -> bool {
+    let left_connected = node_is_connected(left);
+    let right_connected = node_is_connected(right);
+    if left_connected || right_connected {
+        return left_connected
+            && right_connected
+            && get_expando(left, "ownerDocument")
+                .unwrap_or_else(document_value)
+                .strict_eq(
+                    &get_expando(right, "ownerDocument").unwrap_or_else(document_value),
+                );
+    }
+    shadow_including_tree_root(left) == shadow_including_tree_root(right)
 }
 
 fn root_node_value(node: u32, composed: bool) -> Value {
@@ -685,14 +821,26 @@ fn shadow_root_value(host: u32, options: Value) -> Value {
         if !warned.replace(true) {
             eprintln!(
                 "[W3C OS][compat warning] ShadowRoot tree/query/event semantics are available; \
-                 slot distribution, declarative shadow DOM, and composed rendering are not yet \
-                 implemented"
+                 slot distribution and composed rendering are not yet implemented"
             );
         }
     });
     let value = element_value(root);
     w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("ShadowRoot"));
     value
+}
+
+pub(crate) fn activate_declarative_shadow_root(host: u32, template: u32, mode: &str) -> bool {
+    if SHADOW_ROOTS.with(|roots| roots.borrow().contains_key(&host)) {
+        return false;
+    }
+    let options = Value::object(HashMap::from([("mode".to_string(), Value::string(mode))]));
+    let shadow_root = shadow_root_value(host, options);
+    let Some(root) = node_id_of(&shadow_root) else {
+        return false;
+    };
+    set_expando(template, "content", element_value(root));
+    true
 }
 
 /// Extract the DOM node id carried by an element Value (`__node_id` hidden
@@ -742,13 +890,36 @@ fn build_dom_collection_classes() -> HashMap<String, Value> {
         class.set_property("name", Value::string(name));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
-        let methods: &[&str] = if name == "NodeList" {
-            &["entries", "forEach", "item", "keys", "values"]
+        prototype.set_property(
+            "item",
+            func(|this, args| {
+                let value = this.get_property(&arg(&args, 0).to_u32().to_string());
+                if value.is_undefined() {
+                    Value::Null
+                } else {
+                    value
+                }
+            }),
+        );
+        if name == "HTMLCollection" {
+            prototype.set_property(
+                "namedItem",
+                func(|this, args| {
+                    let lookup = this.get_property("__w3cosCollectionNamedItem");
+                    lookup.call(this, vec![arg(&args, 0)])
+                }),
+            );
         } else {
-            &["item", "namedItem"]
-        };
-        for method in methods {
-            prototype.set_property(method, func(|_, _| Value::Undefined));
+            let array_prototype = w3cos_core::array_value().get_property("prototype");
+            for method in [
+                "entries",
+                "forEach",
+                "keys",
+                "values",
+                "__w3cos_symbol_iterator",
+            ] {
+                prototype.set_property(method, array_prototype.get_property(method));
+            }
         }
         prototype.set_property("length", Value::Undefined);
         class.set_property("prototype", prototype);
@@ -770,93 +941,218 @@ fn dom_collection_class(name: &str) -> Value {
     })
 }
 
-fn collection_value(provider: CollectionProvider, class_name: &'static str) -> Value {
+fn html_collection_supported_names(items: &[Value]) -> Vec<(String, Value)> {
+    let mut names = Vec::new();
+    for item in items {
+        let id = item.call_method("getAttribute", vec![Value::string("id")]);
+        let id = if id.is_null() {
+            String::new()
+        } else {
+            id.to_js_string()
+        };
+        if !id.is_empty() && !names.iter().any(|(name, _)| name == &id) {
+            names.push((id, item.clone()));
+        }
+        if item.get_property("namespaceURI").to_js_string()
+            == crate::html_parser_state::HTML_NAMESPACE
+        {
+            let name = item.call_method("getAttribute", vec![Value::string("name")]);
+            let name = if name.is_null() {
+                String::new()
+            } else {
+                name.to_js_string()
+            };
+            if !name.is_empty() && !names.iter().any(|(known, _)| known == &name) {
+                names.push((name, item.clone()));
+            }
+        }
+    }
+    names
+}
+
+fn collection_value(
+    provider: CollectionProvider,
+    static_items: Option<Rc<Vec<Value>>>,
+    class_name: &'static str,
+) -> Value {
     let generation = realm_generation();
     let snapshot_provider = provider.clone();
-    let target = HashMap::from([(
-        "__w3cosMapValuesSnapshot".to_string(),
-        func(move |_, _| js_array(snapshot_provider())),
-    )]);
+    let index_provider = provider.clone();
+    let index_static_items = static_items.clone();
+    let named_item_provider = provider.clone();
+    let target = HashMap::from([
+        ("__w3cosRejectIndexedSet".to_string(), Value::Bool(true)),
+        (
+            "__w3cosMapValuesSnapshot".to_string(),
+            func(move |_, _| js_array(snapshot_provider())),
+        ),
+        (
+            "__w3cosArrayIndexOf".to_string(),
+            func(move |_, args| {
+                let needle = arg(&args, 0);
+                let length = arg(&args, 1).to_u32() as usize;
+                let start = arg(&args, 2).to_u32() as usize;
+                let index_in = |items: &[Value]| {
+                    let end = length.min(items.len());
+                    items[start.min(end)..end]
+                        .iter()
+                        .position(|value| value.strict_eq(&needle))
+                        .map_or(Value::Number(-1.0), |offset| {
+                            Value::Number((start + offset) as f64)
+                        })
+                };
+                if let Some(items) = &index_static_items {
+                    index_in(items)
+                } else {
+                    index_in(&index_provider())
+                }
+            }),
+        ),
+        (
+            "__w3cosCollectionNamedItem".to_string(),
+            func(move |_, args| {
+                let name = arg(&args, 0).to_js_string();
+                html_collection_supported_names(&named_item_provider())
+                    .into_iter()
+                    .find_map(|(candidate, value)| (candidate == name).then_some(value))
+                    .unwrap_or(Value::Null)
+            }),
+        ),
+    ]);
     let get_provider = provider.clone();
+    let get_static_items = static_items.clone();
+    let descriptor_provider = provider.clone();
+    let descriptor_static_items = static_items.clone();
+    let has_provider = provider.clone();
+    let has_static_items = static_items.clone();
+    let keys_provider = provider;
+    let keys_static_items = static_items;
     let handler = ProxyBuilder::new()
         .get(move |target, key, _| {
             if !bridge_realm_is_current(generation) {
                 return Value::Undefined;
             }
             if let Ok(index) = key.parse::<usize>() {
-                return get_provider()
-                    .get(index)
-                    .cloned()
-                    .unwrap_or(Value::Undefined);
+                return if let Some(items) = get_static_items.as_ref() {
+                    items.get(index).cloned().unwrap_or(Value::Undefined)
+                } else {
+                    get_provider()
+                        .get(index)
+                        .cloned()
+                        .unwrap_or(Value::Undefined)
+                };
+            }
+            let has_own_property = target
+                .as_object()
+                .is_some_and(|object| object.borrow().has_own_property(key));
+            if has_own_property {
+                return target.get_property(key);
+            }
+            if class_name == "HTMLCollection"
+                && let Some((_, value)) = html_collection_supported_names(&get_provider())
+                    .into_iter()
+                    .find(|(name, _)| name == key)
+            {
+                return value;
+            }
+            let inherited = target.get_property(key);
+            if !inherited.is_undefined() {
+                return inherited;
             }
             match key {
-                "length" => Value::Number(get_provider().len() as f64),
-                "item" => {
-                    let provider = get_provider.clone();
-                    func(move |_, args| {
-                        provider()
-                            .get(arg(&args, 0).to_u32() as usize)
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                    })
-                }
-                "namedItem" if class_name == "HTMLCollection" => {
-                    let provider = get_provider.clone();
-                    func(move |_, args| {
-                        let name = arg(&args, 0).to_js_string();
-                        provider()
-                            .into_iter()
-                            .find(|item| {
-                                item.get_property("id").to_js_string() == name
-                                    || item.get_property("name").to_js_string() == name
-                            })
-                            .unwrap_or(Value::Null)
-                    })
-                }
-                "forEach" if class_name == "NodeList" => {
-                    let provider = get_provider.clone();
-                    func(move |_, args| {
-                        let callback = arg(&args, 0);
-                        let this_arg = arg(&args, 1);
-                        for (index, item) in provider().into_iter().enumerate() {
-                            callback.call(
-                                this_arg.clone(),
-                                vec![item, Value::Number(index as f64), Value::Undefined],
-                            );
-                        }
-                        Value::Undefined
-                    })
-                }
-                "entries" => {
-                    let provider = get_provider.clone();
-                    func(move |_, _| {
-                        js_array(
-                            provider()
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, value)| {
-                                    js_array(vec![Value::Number(index as f64), value])
-                                })
-                                .collect(),
-                        )
-                    })
-                }
-                "keys" => {
-                    let provider = get_provider.clone();
-                    func(move |_, _| {
-                        js_array(
-                            (0..provider().len())
-                                .map(|index| Value::Number(index as f64))
-                                .collect(),
-                        )
-                    })
-                }
-                "values" => {
-                    let provider = get_provider.clone();
-                    func(move |_, _| js_array(provider()))
-                }
+                "length" => Value::Number(
+                    get_static_items
+                        .as_ref()
+                        .map_or_else(|| get_provider().len(), |items| items.len())
+                        as f64,
+                ),
                 _ => target.get_property(key),
             }
+        })
+        .get_own_property_descriptor(move |target, key| {
+            let value = key.parse::<usize>().ok().and_then(|index| {
+                if let Some(items) = descriptor_static_items.as_ref() {
+                    items.get(index).cloned()
+                } else {
+                    descriptor_provider().get(index).cloned()
+                }
+            });
+            value.map_or_else(
+                || {
+                    if class_name == "HTMLCollection"
+                        && let Some((_, value)) =
+                            html_collection_supported_names(&descriptor_provider())
+                                .into_iter()
+                                .find(|(name, _)| name == key)
+                    {
+                        return Value::object(HashMap::from([
+                            ("value".to_string(), value),
+                            ("writable".to_string(), Value::Bool(false)),
+                            ("enumerable".to_string(), Value::Bool(false)),
+                            ("configurable".to_string(), Value::Bool(true)),
+                        ]));
+                    }
+                    if key.starts_with("__w3cos") {
+                        return Value::Undefined;
+                    }
+                    target
+                        .as_object()
+                        .map(|object| object.borrow().get_own_property_descriptor(key))
+                        .unwrap_or(Value::Undefined)
+                },
+                |value| {
+                    Value::object(HashMap::from([
+                        ("value".to_string(), value),
+                        ("writable".to_string(), Value::Bool(false)),
+                        ("enumerable".to_string(), Value::Bool(true)),
+                        ("configurable".to_string(), Value::Bool(true)),
+                    ]))
+                },
+            )
+        })
+        .has(move |target, key| {
+            key == "length"
+                || matches!(key, "item" | "entries" | "forEach" | "keys" | "values")
+                || (class_name == "HTMLCollection" && key == "namedItem")
+                || key
+                    .parse::<usize>()
+                    .ok()
+                    .is_some_and(|index| {
+                        index
+                            < has_static_items
+                                .as_ref()
+                                .map_or_else(|| has_provider().len(), |items| items.len())
+                    })
+                || (class_name == "HTMLCollection"
+                    && html_collection_supported_names(&has_provider())
+                        .iter()
+                        .any(|(name, _)| name == key))
+                || target
+                    .as_object()
+                    .is_some_and(|object| object.borrow().has_direct(key))
+        })
+        .own_keys(move |target| {
+            let items = keys_static_items
+                .as_ref()
+                .map_or_else(|| keys_provider(), |items| items.as_ref().clone());
+            let mut keys = (0..items.len())
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>();
+            if class_name == "HTMLCollection" {
+                keys.extend(
+                    html_collection_supported_names(&items)
+                        .into_iter()
+                        .map(|(name, _)| name),
+                );
+            }
+            if let Some(target) = target.as_object() {
+                for key in target.borrow().keys() {
+                    if !key.starts_with("__w3cos") && !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+            js_array(keys.into_iter().map(Value::from).collect())
         })
         .build();
     let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(target, handler))));
@@ -869,21 +1165,138 @@ fn collection_value(provider: CollectionProvider, class_name: &'static str) -> V
 
 pub(crate) fn node_list(items: Vec<Value>) -> Value {
     let items = Rc::new(items);
-    collection_value(Rc::new(move || items.as_ref().clone()), "NodeList")
+    collection_value(
+        Rc::new({
+            let items = items.clone();
+            move || items.as_ref().clone()
+        }),
+        Some(items),
+        "NodeList",
+    )
 }
 
 fn live_node_list(provider: impl Fn() -> Vec<Value> + 'static) -> Value {
-    collection_value(Rc::new(provider), "NodeList")
+    collection_value(Rc::new(provider), None, "NodeList")
 }
 
 fn html_collection(provider: impl Fn() -> Vec<Value> + 'static) -> Value {
-    collection_value(Rc::new(provider), "HTMLCollection")
+    collection_value(Rc::new(provider), None, "HTMLCollection")
 }
 
 fn element_or_null(node: Option<u32>) -> Value {
     match node {
         Some(id) => element_value(id),
         None => Value::Null,
+    }
+}
+
+fn child_nodes_value(node: u32) -> Value {
+    if let Some(list) = get_expando(node, "childNodes") {
+        return list;
+    }
+    let list = live_node_list(move || dom::children(node).into_iter().map(element_value).collect());
+    set_expando(node, "childNodes", list.clone());
+    list
+}
+
+fn normalize_node_subtree(parent: u32) {
+    let children = dom::children(parent);
+    let mut index = 0;
+    while index < children.len() {
+        let child = children[index];
+        if dom::node_type(child) != 3 {
+            normalize_node_subtree(child);
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < children.len() && dom::node_type(children[index]) == 3 {
+            index += 1;
+        }
+        let run = &children[start..index];
+        let survivor = run
+            .iter()
+            .copied()
+            .find(|node| !dom::get_text_content(*node).unwrap_or_default().is_empty());
+        if let Some(survivor) = survivor {
+            let data = run
+                .iter()
+                .filter_map(|node| dom::get_text_content(*node))
+                .collect::<String>();
+            dom::set_text_content(survivor, &data);
+            for node in run.iter().copied().filter(|node| *node != survivor) {
+                dom::remove_child(parent, node);
+            }
+        } else {
+            for node in run {
+                dom::remove_child(parent, *node);
+            }
+        }
+    }
+}
+
+fn insert_adjacent_node(target: u32, position: &str, child: u32) -> bool {
+    let position = position.to_ascii_lowercase();
+    let parent_or_document_error = || {
+        if get_expando(target, "parentNode")
+            .is_some_and(|parent| parent.get_property("nodeType").to_u32() == 9)
+        {
+            dom_exception(
+                "The document cannot contain another element or a text node",
+                "HierarchyRequestError",
+            );
+        }
+        None
+    };
+    let (parent, reference) = match position.as_str() {
+        "beforebegin" => {
+            let Some(parent) = dom::parent_node(target).or_else(&parent_or_document_error) else {
+                return false;
+            };
+            (parent, Some(target))
+        }
+        "afterbegin" => (target, dom::first_child(target)),
+        "beforeend" => (target, None),
+        "afterend" => {
+            let Some(parent) = dom::parent_node(target).or_else(parent_or_document_error) else {
+                return false;
+            };
+            (parent, dom::next_sibling(target))
+        }
+        _ => dom_exception("The insertion position is invalid", "SyntaxError"),
+    };
+    if parent == 0 {
+        dom_exception(
+            "The document cannot contain another element or a text node",
+            "HierarchyRequestError",
+        );
+    }
+    ensure_tree_insertion(parent, child);
+    match reference {
+        Some(reference) => dom::insert_before(parent, child, reference),
+        None => dom::append_child(parent, child),
+    }
+    pin_element_subtree(child);
+    true
+}
+
+fn descendant_text_content(node: u32) -> String {
+    match dom::node_type(node) {
+        3 | 4 => dom::get_text_content(node).unwrap_or_default(),
+        1 | 11 => dom::children(node)
+            .into_iter()
+            .map(descendant_text_content)
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+fn node_text_content(node: u32) -> Value {
+    match dom::node_type(node) {
+        1 | 11 => Value::string(&descendant_text_content(node)),
+        3 | 4 | 7 | 8 => Value::string(&dom::get_text_content(node).unwrap_or_default()),
+        _ => Value::Null,
     }
 }
 
@@ -1009,16 +1422,259 @@ fn event_type_name(et: EventType) -> String {
 /// descendant chains (`div .foo`). NOT supported: `>`, `+`, `~`, `:pseudo`,
 /// `[attr]`, `*` — see module docs / gap report.
 
-fn matches_simple(selector: &str, node: u32) -> bool {
-    if selector.is_empty() || selector.contains(['>', '+', '~', ':', '[', ']', '*']) {
+fn element_is_invalid(node: u32) -> bool {
+    let tag = dom::tag_name(node);
+    let required = dom::get_attribute(node, "required").is_some();
+    let self_invalid = match tag.as_str() {
+        "input" | "textarea" if required => {
+            dom::get_attribute(node, "value").is_none_or(|value| value.is_empty())
+        }
+        "select" if required => !descendant_elements(node).into_iter().any(|option| {
+            dom::tag_name(option) == "option"
+                && dom::get_attribute(option, "selected").is_some()
+                && dom::get_attribute(option, "value").map_or_else(
+                    || !dom::inner_text(option).is_empty(),
+                    |value| !value.is_empty(),
+                )
+        }),
+        _ => false,
+    };
+    self_invalid
+        || matches!(tag.as_str(), "fieldset" | "form")
+            && descendant_elements(node)
+                .into_iter()
+                .any(element_is_invalid)
+}
+
+fn popover_is_open(node: u32) -> bool {
+    get_expando(node, POPOVER_OPEN_EXPANDO).as_ref() == Some(&Value::Bool(true))
+}
+
+fn ensure_popover_can_toggle(node: u32) {
+    if dom::node_type(node) != 1 || !dom::has_attribute(node, "popover") {
+        dom_exception(
+            "The element does not have a popover attribute",
+            "NotSupportedError",
+        );
+    }
+    if !node_is_connected(node) {
+        dom_exception(
+            "The popover element is not connected to a document",
+            "InvalidStateError",
+        );
+    }
+}
+
+fn set_popover_open(node: u32, open: bool) {
+    ensure_popover_can_toggle(node);
+    set_expando(node, POPOVER_OPEN_EXPANDO, Value::Bool(open));
+}
+
+fn dialog_is_modal(node: u32) -> bool {
+    dom::tag_name(node) == "dialog"
+        && dom::has_attribute(node, "open")
+        && get_expando(node, DIALOG_MODAL_EXPANDO).as_ref() == Some(&Value::Bool(true))
+}
+
+fn ensure_dialog_element(node: u32) {
+    if dom::tag_name(node) != "dialog" {
+        type_error("Dialog methods require an HTMLDialogElement");
+    }
+}
+
+fn show_dialog(node: u32, modal: bool) {
+    ensure_dialog_element(node);
+    if modal && !node_is_connected(node) {
+        dom_exception(
+            "The dialog is not connected to a document",
+            "InvalidStateError",
+        );
+    }
+    if dom::has_attribute(node, "open") {
+        if dialog_is_modal(node) == modal {
+            return;
+        }
+        dom_exception(
+            "The dialog is already open in a different mode",
+            "InvalidStateError",
+        );
+    }
+    dom::set_attribute(node, "open", "");
+    set_expando(node, DIALOG_MODAL_EXPANDO, Value::Bool(modal));
+}
+
+fn close_dialog(node: u32, return_value: Value) {
+    ensure_dialog_element(node);
+    if !dom::has_attribute(node, "open") {
+        return;
+    }
+    if !return_value.is_undefined() {
+        set_expando(
+            node,
+            DIALOG_RETURN_VALUE_EXPANDO,
+            Value::string(&return_value.to_js_string()),
+        );
+    }
+    dom::remove_attribute(node, "open");
+    set_expando(node, DIALOG_MODAL_EXPANDO, Value::Bool(false));
+    dispatch_sync(node, event_type_for("close"), EventData::None);
+}
+
+fn element_has_focus(node: u32) -> bool {
+    ACTIVE_ELEMENT.with(|active| *active.borrow() == Some(node))
+}
+
+fn element_has_focus_within(node: u32) -> bool {
+    ACTIVE_ELEMENT.with(|active| {
+        active
+            .borrow()
+            .is_some_and(|focused| focused == node || is_ancestor_of(node, focused))
+    })
+}
+
+fn matches_simple(selector: &str, node: u32, scope: Option<u32>) -> bool {
+    if selector.is_empty() || matches!(selector, ">" | "+" | "~") {
         return false;
     }
     if dom::node_type(node) != 1 {
         return false;
     }
+    if !selector.contains(":scope")
+        && !selector.contains(":has(")
+        && !selector.contains(":invalid")
+        && !selector.contains(":target")
+        && !selector.contains(":popover-open")
+        && !selector.contains(":modal")
+        && !selector.contains(":focus")
+        && let Ok(matched) = dom::matches_selector(node, selector)
+    {
+        return matched;
+    }
+    let mut compound = selector.to_string();
+
+    while let Some(start) = compound.find('[') {
+        let Some(relative_end) = compound[start + 1..].find(']') else {
+            return false;
+        };
+        let end = start + 1 + relative_end;
+        let attribute = compound[start + 1..end].trim();
+        let matches = if let Some((name, expected)) = attribute.split_once('=') {
+            let expected = expected
+                .trim()
+                .strip_prefix(['\'', '"'])
+                .and_then(|value| value.strip_suffix(['\'', '"']))
+                .unwrap_or(expected.trim());
+            dom::get_attribute(node, name.trim()).as_deref() == Some(expected)
+        } else {
+            dom::get_attribute(node, attribute).is_some()
+        };
+        if !matches {
+            return false;
+        }
+        compound.replace_range(start..=end, "");
+    }
+
+    if let Some(start) = compound.find(":not(") {
+        let Some(relative_end) = compound[start + 5..].find(')') else {
+            return false;
+        };
+        let end = start + 5 + relative_end;
+        if matches_simple(&compound[start + 5..end], node, scope) {
+            return false;
+        }
+        compound.replace_range(start..=end, "");
+    }
+    if let Some(start) = compound.find(":has(") {
+        let Some(relative_end) = compound[start + 5..].find(')') else {
+            return false;
+        };
+        let end = start + 5 + relative_end;
+        let relative = compound[start + 5..end].trim();
+        let matches = relative == "> :scope"
+            && scope.is_some_and(|scope| {
+                dom::children(node)
+                    .into_iter()
+                    .any(|child| child == scope && dom::node_type(child) == 1)
+            });
+        if !matches {
+            return false;
+        }
+        compound.replace_range(start..=end, "");
+    }
+    for pseudo in [
+        ":scope",
+        ":empty",
+        ":first-child",
+        ":last-child",
+        ":invalid",
+        ":target",
+        ":popover-open",
+        ":modal",
+        ":focus-within",
+        ":focus",
+    ] {
+        if !compound.contains(pseudo) {
+            continue;
+        }
+        let matches = match pseudo {
+            ":scope" => scope == Some(node),
+            ":empty" => dom::children(node).is_empty(),
+            ":first-child" => dom::parent_node(node).is_some_and(|parent| {
+                dom::children(parent)
+                    .into_iter()
+                    .find(|child| dom::node_type(*child) == 1)
+                    == Some(node)
+            }),
+            ":last-child" => dom::parent_node(node).is_some_and(|parent| {
+                dom::children(parent)
+                    .into_iter()
+                    .rev()
+                    .find(|child| dom::node_type(*child) == 1)
+                    == Some(node)
+            }),
+            ":invalid" => element_is_invalid(node),
+            ":target" => {
+                let owner_document =
+                    get_expando(node, "ownerDocument").unwrap_or_else(document_value);
+                let hash = owner_document
+                    .get_property("location")
+                    .get_property("hash")
+                    .to_js_string();
+                node_is_connected(node)
+                    && hash.strip_prefix('#').is_some_and(|target| {
+                        !target.is_empty()
+                        && dom::get_attribute(node, "id").as_deref() == Some(target)
+                    })
+            }
+            ":popover-open" => popover_is_open(node),
+            ":modal" => dialog_is_modal(node),
+            ":focus-within" => element_has_focus_within(node),
+            ":focus" => element_has_focus(node),
+            _ => false,
+        };
+        if !matches {
+            return false;
+        }
+        compound = compound.replace(pseudo, "");
+    }
+    if compound.contains(['>', '+', '~', ':', '[', ']']) {
+        return false;
+    }
+
+    let no_namespace = compound.starts_with('|');
+    if no_namespace && !namespace_uri(node).is_empty() {
+        return false;
+    }
+    let compound = compound
+        .strip_prefix("*|")
+        .or_else(|| compound.strip_prefix('|'))
+        .unwrap_or(&compound);
+    if compound == "*" {
+        return true;
+    }
     // #id part
-    if let Some(hash) = selector.find('#') {
-        let id: String = selector[hash + 1..]
+    if let Some(hash) = compound.find('#') {
+        let id: String = compound[hash + 1..]
             .chars()
             .take_while(|c| *c != '.' && *c != '#')
             .collect();
@@ -1027,7 +1683,7 @@ fn matches_simple(selector: &str, node: u32) -> bool {
         }
     }
     // .class parts
-    for cls in selector.split('.').skip(1) {
+    for cls in compound.split('.').skip(1) {
         let cls: String = cls.chars().take_while(|c| *c != '#').collect();
         if cls.is_empty() {
             continue;
@@ -1037,14 +1693,84 @@ fn matches_simple(selector: &str, node: u32) -> bool {
         }
     }
     // tag part (leading run before '.' or '#')
-    let tag: String = selector
+    let tag: String = compound
         .chars()
         .take_while(|c| *c != '.' && *c != '#')
         .collect();
-    if !tag.is_empty() && dom::tag_name(node) != tag.to_ascii_lowercase() {
+    let html_document = get_expando(node, "ownerDocument")
+        .unwrap_or_else(document_value)
+        .get_property("contentType")
+        .to_js_string()
+        == "text/html";
+    if !tag.is_empty() && !element_matches_tag_name(node, &tag, html_document) {
         return false;
     }
     true
+}
+
+/// Split a descendant selector only on whitespace outside attribute values.
+/// A plain `split_whitespace` turns `[title='two words']` into three invalid
+/// selector components even though the spaces belong to the quoted value.
+fn selector_chain_parts(selector: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = None;
+    let mut bracket_depth = 0_u32;
+    let mut paren_depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in selector.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' if bracket_depth > 0 || paren_depth > 0 => quote = Some(ch),
+            '[' => {
+                bracket_depth += 1;
+                start.get_or_insert(index);
+            }
+            ']' => {
+                if bracket_depth == 0 {
+                    return Vec::new();
+                }
+                bracket_depth -= 1;
+            }
+            '(' => {
+                paren_depth += 1;
+                start.get_or_insert(index);
+            }
+            ')' => {
+                if paren_depth == 0 {
+                    return Vec::new();
+                }
+                paren_depth -= 1;
+            }
+            _ if ch.is_whitespace() && bracket_depth == 0 && paren_depth == 0 => {
+                if let Some(part_start) = start.take() {
+                    parts.push(&selector[part_start..index]);
+                }
+            }
+            _ => {
+                start.get_or_insert(index);
+            }
+        }
+    }
+
+    if quote.is_some() || bracket_depth != 0 || paren_depth != 0 {
+        return Vec::new();
+    }
+    if let Some(part_start) = start {
+        parts.push(&selector[part_start..]);
+    }
+    parts
 }
 
 fn is_ancestor_of(ancestor: u32, node: u32) -> bool {
@@ -1058,87 +1784,255 @@ fn is_ancestor_of(ancestor: u32, node: u32) -> bool {
     false
 }
 
+fn ensure_tree_parent_and_ancestry(parent: u32, child: u32) {
+    if parent == child || is_ancestor_of(child, parent) {
+        dom_exception(
+            "A node cannot be inserted into itself or one of its descendants",
+            "HierarchyRequestError",
+        );
+    }
+    if matches!(dom::node_type(parent), 3 | 4 | 7 | 8 | 10) {
+        dom_exception(
+            "This node type cannot contain children",
+            "HierarchyRequestError",
+        );
+    }
+}
+
+fn ensure_tree_child_type_and_adopt(parent: u32, child: u32) {
+    let child_type = dom::node_type(child);
+    if !matches!(child_type, 1 | 3 | 4 | 7 | 8 | 10 | 11)
+        || (child_type == 10 && dom::node_type(parent) != 9)
+        || (child_type == 3 && dom::node_type(parent) == 9)
+    {
+        dom_exception(
+            "This node type is not valid at the requested position",
+            "HierarchyRequestError",
+        );
+    }
+
+    let owner_document = if parent == 0 {
+        document_value()
+    } else {
+        get_expando(parent, "ownerDocument").unwrap_or_else(document_value)
+    };
+    walk_subtree(child, &mut |descendant| {
+        set_expando(descendant, "ownerDocument", owner_document.clone());
+        update_cached_attribute_owner_document(descendant, &owner_document);
+    });
+}
+
+fn ensure_tree_insertion(parent: u32, child: u32) {
+    ensure_tree_parent_and_ancestry(parent, child);
+    ensure_tree_child_type_and_adopt(parent, child);
+}
+
 pub(crate) fn is_ancestor_node(ancestor: u32, node: u32) -> bool {
     is_ancestor_of(ancestor, node)
 }
 
-/// Right-to-left descendant-combinator matching against the ancestor chain.
-fn matches_selector_chain(node: u32, parts: &[&str]) -> bool {
-    if parts.is_empty() || !matches_simple(parts[parts.len() - 1], node) {
-        return false;
-    }
-    let mut pi = parts.len() - 1;
-    let mut cur = dom::parent_node(node);
-    while pi > 0 {
-        let target = parts[pi - 1];
-        let mut found = false;
-        let mut ancestor = cur;
-        while let Some(id) = ancestor {
-            if matches_simple(target, id) {
-                cur = dom::parent_node(id);
-                found = true;
-                break;
-            }
-            ancestor = dom::parent_node(id);
+fn previous_element_sibling(node: u32) -> Option<u32> {
+    let mut sibling = dom::previous_sibling(node);
+    while let Some(candidate) = sibling {
+        if dom::node_type(candidate) == 1 {
+            return Some(candidate);
         }
-        if !found {
-            return false;
-        }
-        pi -= 1;
+        sibling = dom::previous_sibling(candidate);
     }
-    true
+    None
 }
 
-/// Candidate nodes for the right-most simple selector, using the document's
-/// id/class/tag indexes for speed.
-fn selector_candidates(simple: &str) -> Vec<u32> {
-    if let Some(hash) = simple.find('#') {
-        let id: String = simple[hash + 1..]
-            .chars()
-            .take_while(|c| *c != '.' && *c != '#')
-            .collect();
-        return dom::get_element_by_id(&id).into_iter().collect();
+fn matches_selector_chain_at(node: u32, parts: &[&str], index: usize, scope: Option<u32>) -> bool {
+    if !matches_simple(parts[index], node, scope) {
+        return false;
     }
-    if let Some(dot) = simple.find('.') {
-        let first_class: String = simple[dot + 1..]
-            .chars()
-            .take_while(|c| *c != '.' && *c != '#')
-            .collect();
-        if !first_class.is_empty() {
-            return dom::get_elements_by_class_name(&first_class);
+    if index == 0 {
+        return true;
+    }
+    let (left, combinator) = if matches!(parts[index - 1], ">" | "+" | "~") {
+        if index < 2 {
+            return false;
+        }
+        (index - 2, Some(parts[index - 1]))
+    } else {
+        (index - 1, None)
+    };
+    match combinator {
+        Some(">") => dom::parent_node(node)
+            .is_some_and(|parent| matches_selector_chain_at(parent, parts, left, scope)),
+        Some("+") => previous_element_sibling(node)
+            .is_some_and(|sibling| matches_selector_chain_at(sibling, parts, left, scope)),
+        Some("~") => {
+            let mut sibling = previous_element_sibling(node);
+            while let Some(candidate) = sibling {
+                if matches_selector_chain_at(candidate, parts, left, scope) {
+                    return true;
+                }
+                sibling = previous_element_sibling(candidate);
+            }
+            false
+        }
+        _ => {
+            let mut ancestor = dom::parent_node(node);
+            while let Some(candidate) = ancestor {
+                if matches_selector_chain_at(candidate, parts, left, scope) {
+                    return true;
+                }
+                ancestor = dom::parent_node(candidate);
+            }
+            false
         }
     }
-    let tag: String = simple
-        .chars()
-        .take_while(|c| *c != '.' && *c != '#')
-        .collect();
-    if tag.is_empty() {
-        Vec::new()
-    } else {
-        dom::get_elements_by_tag_name(&tag.to_ascii_lowercase())
+}
+
+/// Right-to-left selector matching against the ancestor/sibling chain.
+fn matches_selector_chain_in_scope(node: u32, parts: &[&str], scope: Option<u32>) -> bool {
+    !parts.is_empty() && matches_selector_chain_at(node, parts, parts.len() - 1, scope)
+}
+
+fn selector_uses_runtime_state(selector: &str) -> bool {
+    [
+        ":scope",
+        ":invalid",
+        ":target",
+        ":popover-open",
+        ":modal",
+        ":focus-within",
+        ":focus",
+    ]
+    .into_iter()
+    .any(|pseudo| selector.contains(pseudo))
+        || selector_has_no_namespace_type(selector)
+}
+
+fn selector_has_no_namespace_type(selector: &str) -> bool {
+    let chars = selector.chars().collect::<Vec<_>>();
+    chars.iter().enumerate().any(|(index, character)| {
+        if *character != '|' {
+            return false;
+        }
+        let boundary_before = index == 0
+            || matches!(
+                chars[index - 1],
+                ' ' | '\t' | '\n' | '\r' | '\u{000c}' | '>' | '+' | '~' | ',' | '('
+            );
+        boundary_before
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| *next == '*' || *next == '-' || *next == '_' || next.is_alphabetic())
+    })
+}
+
+fn selector_for_static_validation(selector: &str) -> String {
+    let chars = selector.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(selector.len() + 2);
+    for (index, character) in chars.iter().enumerate() {
+        if *character == '|'
+            && (index == 0
+                || matches!(
+                    chars[index - 1],
+                    ' ' | '\t' | '\n' | '\r' | '\u{000c}' | '>' | '+' | '~' | ',' | '('
+                ))
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| *next == '*' || *next == '-' || *next == '_' || next.is_alphabetic())
+        {
+            normalized.push('*');
+        }
+        normalized.push(*character);
     }
+    normalized
+}
+
+fn query_selector_matches(node: u32, selector: &str, scope: Option<u32>) -> bool {
+    if selector_uses_runtime_state(selector) {
+        let parts = selector_chain_parts(selector);
+        return matches_selector_chain_in_scope(node, &parts, scope);
+    }
+    dom::matches_selector(node, selector).is_ok_and(|matched| matched)
+}
+
+fn simple_id_selector(selector: &str) -> Option<String> {
+    w3cos_dom::stylesheet::parse_simple_id_selector(selector)
+}
+
+fn cached_subtree_id_matches(root: u32, include_root: bool, id: &str) -> Vec<u32> {
+    let generation = dom::mutation_generation();
+    SELECTOR_ID_CACHE_GENERATION.with(|cached_generation| {
+        if cached_generation.get() != generation {
+            cached_generation.set(generation);
+            SELECTOR_ID_CACHE.with(|cache| cache.borrow_mut().clear());
+        }
+    });
+    SELECTOR_ID_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let index = cache.entry(root).or_insert_with(|| {
+            let mut index = HashMap::<String, Vec<u32>>::new();
+            for node in inclusive_descendant_elements(root) {
+                if let Some(id) = dom::get_attribute(node, "id") {
+                    index.entry(id).or_default().push(node);
+                }
+            }
+            index
+        });
+        index
+            .get(id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|node| include_root || *node != root)
+            .collect()
+    })
 }
 
 fn query_selector_all_scoped(scope: Option<u32>, selector: &str) -> Vec<u32> {
-    let selector = selector.trim();
-    let parts: Vec<&str> = selector.split_whitespace().collect();
-    if parts.is_empty() {
+    let selector = w3cos_dom::stylesheet::trim_css_whitespace(selector);
+    if let Some(id) = simple_id_selector(selector) {
+        let root = scope.unwrap_or_else(document_element_id);
+        return cached_subtree_id_matches(root, scope.is_none(), &id);
+    }
+    if selector_uses_runtime_state(selector) && selector_chain_parts(selector).is_empty() {
         return Vec::new();
     }
-    let candidates = selector_candidates(parts[parts.len() - 1]);
+    let candidates = scope.map_or_else(
+        || inclusive_descendant_elements(document_element_id()),
+        descendant_elements,
+    );
     candidates
         .into_iter()
-        .filter(|&c| {
-            scope.is_none_or(|s| is_ancestor_of(s, c)) && matches_selector_chain(c, &parts)
-        })
+        .filter(|candidate| query_selector_matches(*candidate, selector, scope))
         .collect()
+}
+
+fn query_selector_argument(args: &[Value], validation_node: u32) -> String {
+    if args.is_empty() {
+        type_error("querySelector requires a selector");
+    }
+    let selector = arg(args, 0).to_js_string();
+    let selector_for_validation = [
+        ":focus-within",
+        ":popover-open",
+        ":invalid",
+        ":target",
+        ":modal",
+        ":focus",
+        ":scope",
+    ]
+    .into_iter()
+    .fold(selector.clone(), |selector, pseudo| {
+        selector.replace(pseudo, ":root")
+    });
+    let selector_for_validation = selector_for_static_validation(&selector_for_validation);
+    if dom::matches_selector(validation_node, &selector_for_validation).is_err() {
+        dom_exception("Invalid selector", "SyntaxError");
+    }
+    selector
 }
 
 fn query_live_document_all(selector: &str) -> Vec<u32> {
     let root = document_element_id();
-    let parts: Vec<&str> = selector.split_whitespace().collect();
     let mut matches = Vec::new();
-    if !parts.is_empty() && matches_selector_chain(root, &parts) {
+    if query_selector_matches(root, selector, Some(root)) {
         matches.push(root);
     }
     matches.extend(query_selector_all_scoped(Some(root), selector));
@@ -1219,6 +2113,24 @@ fn walk_subtree(root: u32, visit: &mut impl FnMut(u32)) {
     }
 }
 
+fn copy_cloned_node_identity(source: u32, clone: u32) {
+    for key in [
+        "namespaceURI",
+        "prefix",
+        "localName",
+        "ownerDocument",
+        "publicId",
+        "systemId",
+    ] {
+        if let Some(value) = get_expando(source, key) {
+            set_expando(clone, key, value);
+        }
+    }
+    for (source_child, clone_child) in dom::children(source).into_iter().zip(dom::children(clone)) {
+        copy_cloned_node_identity(source_child, clone_child);
+    }
+}
+
 fn pin_element_subtree(root: u32) {
     walk_subtree(root, &mut pin_element_wrapper);
 }
@@ -1266,20 +2178,490 @@ fn release_element_wrapper(node: u32) {
 fn purge_detached_node_js(node: u32) {
     ELEMENT_PROPS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
     STYLE_CACHE.with(|cache| cache.borrow_mut().retain(|(id, _), _| *id != node));
-    LISTENERS.with(|listeners| listeners.borrow_mut().retain(|listener| listener.node != node));
+    LISTENERS.with(|listeners| {
+        listeners
+            .borrow_mut()
+            .retain(|listener| listener.node != node)
+    });
     NATIVELY_REGISTERED.with(|registered| registered.borrow_mut().retain(|(id, _)| *id != node));
 }
 
 pub(crate) fn create_namespaced_element(namespace: &str, tag: &str) -> u32 {
     let id = dom::create_element(tag);
-    set_expando(id, "namespaceURI", Value::string(namespace));
+    dom::set_html_element(id, namespace == crate::html_parser_state::HTML_NAMESPACE);
+    let (prefix, local_name) = tag
+        .split_once(':')
+        .map_or((None, tag), |(prefix, local_name)| {
+            (Some(prefix), local_name)
+        });
+    set_expando(
+        id,
+        "namespaceURI",
+        if namespace.is_empty() {
+            Value::Null
+        } else {
+            Value::string(namespace)
+        },
+    );
+    set_expando(
+        id,
+        "prefix",
+        prefix.map(Value::string).unwrap_or(Value::Null),
+    );
+    set_expando(id, "localName", Value::string(local_name));
     id
 }
 
 pub(crate) fn namespace_uri(node: u32) -> String {
-    get_expando(node, "namespaceURI")
-        .map(|namespace| namespace.to_js_string())
-        .unwrap_or_else(|| "http://www.w3.org/1999/xhtml".to_string())
+    match get_expando(node, "namespaceURI") {
+        Some(namespace) if namespace.is_null() => String::new(),
+        Some(namespace) => namespace.to_js_string(),
+        None => "http://www.w3.org/1999/xhtml".to_string(),
+    }
+}
+
+fn normalized_namespace_argument(value: &Value) -> Option<String> {
+    (!value.is_null() && !value.is_undefined())
+        .then(|| value.to_js_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn declared_namespace_uri(node: u32, prefix: Option<&str>) -> Option<Option<String>> {
+    dom::with_document(|document| {
+        let node = document.get_node(NodeId::from_u32(node));
+        node.attributes
+            .iter()
+            .enumerate()
+            .find_map(|(index, (qualified_name, value))| {
+                let metadata = node.attribute_namespace_at(index);
+                let namespace = metadata
+                    .and_then(|attribute| attribute.namespace.as_ref())
+                    .map(|namespace| namespace.as_str());
+                if namespace.as_deref() != Some(crate::html_parser_state::XMLNS_NAMESPACE) {
+                    return None;
+                }
+                let attribute_prefix = metadata
+                    .and_then(|attribute| attribute.prefix.as_ref())
+                    .map(|prefix| prefix.as_str());
+                let local_name = metadata
+                    .map(|attribute| attribute.local_name.as_str())
+                    .unwrap_or_else(|| qualified_name.as_str());
+                let matches = match prefix {
+                    None => attribute_prefix.is_none() && local_name == "xmlns",
+                    Some(prefix) => {
+                        attribute_prefix.as_deref() == Some("xmlns") && local_name == prefix
+                    }
+                };
+                matches.then(|| (!value.is_empty()).then(|| value.clone()))
+            })
+    })
+}
+
+fn declared_prefix_for_namespace(node: u32, namespace: &str) -> Option<String> {
+    dom::with_document(|document| {
+        let node = document.get_node(NodeId::from_u32(node));
+        node.attributes
+            .iter()
+            .enumerate()
+            .find_map(|(index, (_, value))| {
+                let metadata = node.attribute_namespace_at(index);
+                let attribute_namespace = metadata
+                    .and_then(|attribute| attribute.namespace.as_ref())
+                    .map(|namespace| namespace.as_str());
+                let attribute_prefix = metadata
+                    .and_then(|attribute| attribute.prefix.as_ref())
+                    .map(|prefix| prefix.as_str());
+                (attribute_namespace.as_deref() == Some(crate::html_parser_state::XMLNS_NAMESPACE)
+                    && attribute_prefix.as_deref() == Some("xmlns")
+                    && value == namespace)
+                    .then(|| {
+                        metadata
+                            .expect("namespaced attribute metadata was present")
+                            .local_name
+                            .as_str()
+                    })
+            })
+    })
+}
+
+fn lookup_namespace_uri_for_native_node(node: u32, prefix: Option<&str>) -> Option<String> {
+    match dom::node_type(node) {
+        1 => {
+            if prefix == Some("xml") {
+                return Some(crate::html_parser_state::XML_NAMESPACE.to_string());
+            }
+            if prefix == Some("xmlns") {
+                return Some(crate::html_parser_state::XMLNS_NAMESPACE.to_string());
+            }
+            let element_prefix = get_expando(node, "prefix")
+                .and_then(|prefix| (!prefix.is_null()).then(|| prefix.to_js_string()))
+                .filter(|prefix| !prefix.is_empty());
+            let element_namespace = namespace_uri(node);
+            if !element_namespace.is_empty() && element_prefix.as_deref() == prefix {
+                return Some(element_namespace);
+            }
+            if let Some(namespace) = declared_namespace_uri(node, prefix) {
+                return namespace;
+            }
+            dom::parent_node(node)
+                .filter(|parent| dom::node_type(*parent) == 1)
+                .and_then(|parent| lookup_namespace_uri_for_native_node(parent, prefix))
+        }
+        3 | 4 | 7 | 8 => dom::parent_node(node)
+            .filter(|parent| dom::node_type(*parent) == 1)
+            .and_then(|parent| lookup_namespace_uri_for_native_node(parent, prefix)),
+        _ => None,
+    }
+}
+
+fn lookup_prefix_for_native_node(node: u32, namespace: &str) -> Option<String> {
+    match dom::node_type(node) {
+        1 => {
+            if namespace == crate::html_parser_state::XML_NAMESPACE {
+                return Some("xml".to_string());
+            }
+            if namespace == crate::html_parser_state::XMLNS_NAMESPACE {
+                return Some("xmlns".to_string());
+            }
+            let element_prefix = get_expando(node, "prefix")
+                .and_then(|prefix| (!prefix.is_null()).then(|| prefix.to_js_string()))
+                .filter(|prefix| !prefix.is_empty());
+            if namespace_uri(node) == namespace && element_prefix.is_some() {
+                return element_prefix;
+            }
+            if let Some(prefix) = declared_prefix_for_namespace(node, namespace) {
+                return Some(prefix);
+            }
+            dom::parent_node(node)
+                .filter(|parent| dom::node_type(*parent) == 1)
+                .and_then(|parent| lookup_prefix_for_native_node(parent, namespace))
+        }
+        3 | 4 | 7 | 8 => dom::parent_node(node)
+            .filter(|parent| dom::node_type(*parent) == 1)
+            .and_then(|parent| lookup_prefix_for_native_node(parent, namespace)),
+        _ => None,
+    }
+}
+
+fn lookup_namespace_uri_for_value(node: &Value, prefix: &Value) -> Option<String> {
+    let prefix = normalized_namespace_argument(prefix);
+    match node.get_property("nodeType").to_u32() {
+        9 => node
+            .get_property("documentElement")
+            .as_object()
+            .and_then(|_| node_id_of(&node.get_property("documentElement")))
+            .and_then(|root| lookup_namespace_uri_for_native_node(root, prefix.as_deref())),
+        2 => node
+            .get_property("ownerElement")
+            .as_object()
+            .and_then(|_| node_id_of(&node.get_property("ownerElement")))
+            .and_then(|owner| lookup_namespace_uri_for_native_node(owner, prefix.as_deref())),
+        _ => node_id_of(node)
+            .and_then(|node| lookup_namespace_uri_for_native_node(node, prefix.as_deref())),
+    }
+}
+
+fn lookup_namespace_uri_result(node: &Value, prefix: &Value) -> Value {
+    lookup_namespace_uri_for_value(node, prefix)
+        .map(|namespace| Value::string(&namespace))
+        .unwrap_or(Value::Null)
+}
+
+fn lookup_prefix_result(node: &Value, namespace: &Value) -> Value {
+    let Some(namespace) = normalized_namespace_argument(namespace) else {
+        return Value::Null;
+    };
+    let prefix = match node.get_property("nodeType").to_u32() {
+        9 => node
+            .get_property("documentElement")
+            .as_object()
+            .and_then(|_| node_id_of(&node.get_property("documentElement")))
+            .and_then(|root| lookup_prefix_for_native_node(root, &namespace)),
+        2 => node
+            .get_property("ownerElement")
+            .as_object()
+            .and_then(|_| node_id_of(&node.get_property("ownerElement")))
+            .and_then(|owner| lookup_prefix_for_native_node(owner, &namespace)),
+        _ => node_id_of(node).and_then(|node| lookup_prefix_for_native_node(node, &namespace)),
+    };
+    prefix
+        .map(|prefix| Value::string(&prefix))
+        .unwrap_or(Value::Null)
+}
+
+fn is_default_namespace_result(node: &Value, namespace: &Value) -> Value {
+    Value::Bool(
+        lookup_namespace_uri_for_value(node, &Value::Null)
+            == normalized_namespace_argument(namespace),
+    )
+}
+
+fn native_node_namespace(node: u32) -> Option<String> {
+    match get_expando(node, "namespaceURI") {
+        Some(namespace) if namespace.is_null() => None,
+        Some(namespace) => Some(namespace.to_js_string()),
+        None if dom::node_type(node) == 1 => {
+            Some(crate::html_parser_state::HTML_NAMESPACE.to_string())
+        }
+        None => None,
+    }
+}
+
+fn native_node_prefix(node: u32) -> Option<String> {
+    get_expando(node, "prefix")
+        .filter(|prefix| !prefix.is_null() && !prefix.is_undefined())
+        .map(|prefix| prefix.to_js_string())
+        .filter(|prefix| !prefix.is_empty())
+}
+
+fn native_node_local_name(node: u32) -> String {
+    get_expando(node, "localName")
+        .map(|name| name.to_js_string())
+        .unwrap_or_else(|| dom::tag_name(node))
+}
+
+fn native_node_attributes(node: u32) -> Vec<(Option<String>, String, String)> {
+    let mut attributes = dom::with_document(|document| {
+        let node = document.get_node(NodeId::from_u32(node));
+        node.attributes
+            .iter()
+            .enumerate()
+            .map(|(index, (qualified_name, value))| {
+                let metadata = node.attribute_namespace_at(index);
+                (
+                    metadata
+                        .and_then(|attribute| attribute.namespace.as_ref())
+                        .map(|namespace| namespace.as_str()),
+                    metadata
+                        .map(|attribute| attribute.local_name.as_str())
+                        .unwrap_or_else(|| qualified_name.as_str()),
+                    value.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    attributes.sort();
+    attributes
+}
+
+fn native_nodes_are_equal(left: u32, right: u32) -> bool {
+    if left == right {
+        return true;
+    }
+    let node_type = dom::node_type(left);
+    if node_type != dom::node_type(right) {
+        return false;
+    }
+
+    let properties_are_equal = match node_type {
+        1 => {
+            native_node_namespace(left) == native_node_namespace(right)
+                && native_node_prefix(left) == native_node_prefix(right)
+                && native_node_local_name(left) == native_node_local_name(right)
+                && native_node_attributes(left) == native_node_attributes(right)
+        }
+        3 | 4 | 8 => dom::get_text_content(left) == dom::get_text_content(right),
+        7 => {
+            dom::tag_name(left) == dom::tag_name(right)
+                && dom::get_text_content(left) == dom::get_text_content(right)
+        }
+        10 => {
+            dom::tag_name(left) == dom::tag_name(right)
+                && get_expando(left, "publicId").unwrap_or_else(|| Value::string(""))
+                    == get_expando(right, "publicId").unwrap_or_else(|| Value::string(""))
+                && get_expando(left, "systemId").unwrap_or_else(|| Value::string(""))
+                    == get_expando(right, "systemId").unwrap_or_else(|| Value::string(""))
+        }
+        11 => true,
+        _ => true,
+    };
+    properties_are_equal
+        && dom::children(left).len() == dom::children(right).len()
+        && dom::children(left)
+            .into_iter()
+            .zip(dom::children(right))
+            .all(|(left, right)| native_nodes_are_equal(left, right))
+}
+
+fn document_children_for_equality(document: &Value) -> Vec<Value> {
+    let children = document.get_property("__w3cos_document_children");
+    if let Some(children) = children.as_array() {
+        return children.borrow().clone();
+    }
+    if document.strict_eq(&document_value()) {
+        return global_document_children();
+    }
+    Vec::new()
+}
+
+fn nodes_are_equal(left: &Value, right: &Value) -> bool {
+    if left.strict_eq(right) {
+        return true;
+    }
+    match (node_id_of(left), node_id_of(right)) {
+        (Some(left), Some(right)) => native_nodes_are_equal(left, right),
+        (None, None)
+            if left.get_property("nodeType").to_u32() == 9
+                && right.get_property("nodeType").to_u32() == 9 =>
+        {
+            let left_children = document_children_for_equality(left);
+            let right_children = document_children_for_equality(right);
+            left_children.len() == right_children.len()
+                && left_children
+                    .iter()
+                    .zip(&right_children)
+                    .all(|(left, right)| nodes_are_equal(left, right))
+        }
+        (None, None)
+            if left.get_property("nodeType").to_u32() == 2
+                && right.get_property("nodeType").to_u32() == 2 =>
+        {
+            normalized_namespace_argument(&left.get_property("namespaceURI"))
+                == normalized_namespace_argument(&right.get_property("namespaceURI"))
+                && left.get_property("localName").to_js_string()
+                    == right.get_property("localName").to_js_string()
+                && left.get_property("value").to_js_string()
+                    == right.get_property("value").to_js_string()
+        }
+        _ => false,
+    }
+}
+
+fn element_qualified_name(node: u32) -> String {
+    let qualified_name = dom::tag_name(node);
+    if namespace_uri(node) != crate::html_parser_state::HTML_NAMESPACE {
+        return qualified_name;
+    }
+
+    let owner_document = get_expando(node, "ownerDocument").unwrap_or_else(document_value);
+    if owner_document.get_property("contentType").to_js_string() == "text/html" {
+        qualified_name.to_ascii_uppercase()
+    } else {
+        qualified_name
+    }
+}
+
+fn normalized_attribute_name(node: u32, name: &str) -> String {
+    let owner_document = get_expando(node, "ownerDocument").unwrap_or_else(document_value);
+    if namespace_uri(node) == crate::html_parser_state::HTML_NAMESPACE
+        && owner_document.get_property("contentType").to_js_string() == "text/html"
+    {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
+fn valid_processing_instruction_attribute_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.chars().any(|character| {
+            character == '\0'
+                || character.is_ascii_whitespace()
+                || matches!(character, '=' | '>' | '/')
+        })
+}
+
+fn processing_instruction_attributes(node: u32) -> Vec<(String, String)> {
+    let data = dom::get_text_content(node).unwrap_or_default();
+    if let Some(attributes) = PROCESSING_INSTRUCTION_ATTRIBUTES.with(|cache| {
+        cache
+            .borrow()
+            .get(&node)
+            .filter(|(cached_data, _)| cached_data == &data)
+            .map(|(_, attributes)| attributes.clone())
+    }) {
+        return attributes;
+    }
+    let bytes = data.as_bytes();
+    let mut attributes = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index == bytes.len() {
+            break;
+        }
+        let name_start = index;
+        while index < bytes.len() && bytes[index] != b'=' && !bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index == name_start || index == bytes.len() || bytes[index] != b'=' {
+            return Vec::new();
+        }
+        let name = &data[name_start..index];
+        if !valid_processing_instruction_attribute_name(name) {
+            return Vec::new();
+        }
+        index += 1;
+        let Some(quote) = bytes.get(index).copied().filter(|quote| matches!(quote, b'\'' | b'"'))
+        else {
+            return Vec::new();
+        };
+        index += 1;
+        let value_start = index;
+        while index < bytes.len() && bytes[index] != quote {
+            index += 1;
+        }
+        if index == bytes.len() {
+            return Vec::new();
+        }
+        attributes.push((
+            name.to_string(),
+            decode_html_entities(&data[value_start..index]),
+        ));
+        index += 1;
+        if index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+            return Vec::new();
+        }
+    }
+    PROCESSING_INSTRUCTION_ATTRIBUTES.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(node, (data, attributes.clone()));
+    });
+    attributes
+}
+
+fn serialize_processing_instruction_attributes(attributes: &[(String, String)]) -> String {
+    attributes
+        .iter()
+        .map(|(name, value)| {
+            let value = value
+                .replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            format!("{name}=\"{value}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn set_processing_instruction_attribute(node: u32, name: &str, value: Option<String>) {
+    if !valid_processing_instruction_attribute_name(name) {
+        dom_exception(
+            "Processing instruction attribute name is not valid",
+            "InvalidCharacterError",
+        );
+    }
+    let mut attributes = processing_instruction_attributes(node);
+    if let Some(index) = attributes.iter().position(|(current, _)| current == name) {
+        if let Some(value) = value {
+            attributes[index].1 = value;
+        } else {
+            attributes.remove(index);
+        }
+    } else if let Some(value) = value {
+        attributes.push((name.to_string(), value));
+    } else {
+        return;
+    }
+    let data = serialize_processing_instruction_attributes(&attributes);
+    dom::set_text_content(node, &data);
+    PROCESSING_INSTRUCTION_ATTRIBUTES.with(|cache| {
+        cache.borrow_mut().insert(node, (data, attributes));
+    });
 }
 
 pub(crate) fn ensure_template_content(node: u32) -> u32 {
@@ -1293,13 +2675,55 @@ pub(crate) fn ensure_template_content(node: u32) -> u32 {
 
 pub(crate) fn install_document_doctype(name: &str, public_id: &str, system_id: &str) {
     let doctype = create_document_type_value(name, public_id, system_id);
-    document_value().set_property("doctype", doctype);
+    let document = document_value();
+    if let Some(node) = node_id_of(&doctype) {
+        set_expando(node, "ownerDocument", document.clone());
+        set_expando(node, "parentNode", document.clone());
+    }
+    document.set_property("doctype", doctype);
+}
+
+pub(crate) fn sync_global_document_child_relationships() {
+    let document = document_value();
+    let children = global_document_children();
+    for (index, child) in children.iter().enumerate() {
+        if let Some(node) = node_id_of(child) {
+            set_expando(node, "parentNode", document.clone());
+            set_expando(
+                node,
+                "previousSibling",
+                index
+                    .checked_sub(1)
+                    .and_then(|previous| children.get(previous))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            set_expando(
+                node,
+                "nextSibling",
+                children.get(index + 1).cloned().unwrap_or(Value::Null),
+            );
+        }
+    }
 }
 
 pub(crate) fn set_document_compat_mode(quirks: bool) {
     document_value().set_property(
         "compatMode",
         Value::string(if quirks { "BackCompat" } else { "CSS1Compat" }),
+    );
+}
+
+pub(crate) fn set_document_content_type(content_type: &str) {
+    let document = document_value();
+    document.set_property("contentType", Value::string(content_type));
+    w3cos_core::class::set_prototype_of(
+        &document,
+        &crate::dom_constructors::prototype(if content_type == "text/html" {
+            "HTMLDocument"
+        } else {
+            "XMLDocument"
+        }),
     );
 }
 
@@ -1447,18 +2871,38 @@ fn build_element_value(node: u32) -> Value {
         .build();
 
     let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
-    let namespace = get_expando(node, "namespaceURI").map(|namespace| namespace.to_js_string());
+    let namespace_value = get_expando(node, "namespaceURI");
+    let has_explicit_namespace = namespace_value.is_some();
+    let namespace = namespace_value
+        .and_then(|namespace| (!namespace.is_null()).then(|| namespace.to_js_string()));
+    let local_name = get_expando(node, "localName")
+        .map(|name| name.to_js_string())
+        .unwrap_or_else(|| dom::tag_name(node));
     if namespace.as_deref() == Some("http://www.w3.org/1998/Math/MathML") {
         w3cos_core::class::set_prototype_of(
             &value,
             &math_ml_element_class().get_property("prototype"),
         );
+    } else if namespace.as_deref() == Some(crate::html_parser_state::HTML_NAMESPACE)
+        && local_name.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        // Namespace-aware creation preserves ASCII case. An upper-case local
+        // name therefore does not identify the lower-case built-in HTML tag.
+        w3cos_core::class::set_prototype_of(
+            &value,
+            &crate::dom_constructors::prototype("HTMLUnknownElement"),
+        );
+    } else if has_explicit_namespace
+        && namespace.as_deref() != Some(crate::html_parser_state::HTML_NAMESPACE)
+        && namespace.as_deref() != Some("http://www.w3.org/2000/svg")
+    {
+        w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Element"));
     } else {
         w3cos_core::class::set_prototype_of(
             &value,
             &crate::dom_constructors::prototype_for_node(
                 dom::node_type(node),
-                &dom::tag_name(node),
+                &local_name,
                 namespace.as_deref() == Some("http://www.w3.org/2000/svg"),
             ),
         );
@@ -1471,6 +2915,55 @@ fn child_elements(node: u32) -> Vec<u32> {
         .into_iter()
         .filter(|&c| dom::node_type(c) == 1)
         .collect()
+}
+
+fn child_elements_with_tags(node: u32, tags: &[&str]) -> Vec<u32> {
+    child_elements(node)
+        .into_iter()
+        .filter(|child| tags.contains(&dom::tag_name(*child).as_str()))
+        .collect()
+}
+
+fn table_rows(table: u32) -> Vec<u32> {
+    descendant_elements(table)
+        .into_iter()
+        .filter(|candidate| {
+            dom::tag_name(*candidate) == "tr"
+                && std::iter::successors(dom::parent_node(*candidate), |parent| {
+                    dom::parent_node(*parent)
+                })
+                .find(|ancestor| dom::tag_name(*ancestor) == "table")
+                    == Some(table)
+        })
+        .collect()
+}
+
+fn remove_indexed_table_row(rows: Vec<u32>, requested_index: Value) {
+    let index = requested_index.to_number() as i64;
+    let resolved = if index == -1 {
+        rows.len().checked_sub(1)
+    } else {
+        usize::try_from(index)
+            .ok()
+            .filter(|index| *index < rows.len())
+    };
+    let Some(index) = resolved else {
+        if index == -1 && rows.is_empty() {
+            return;
+        }
+        dom_exception("The row index is outside the collection", "IndexSizeError");
+    };
+    let row = rows[index];
+    let Some(parent) = dom::parent_node(row) else {
+        return;
+    };
+    let value = element_value(row);
+    let was_connected = dom::is_connected(row);
+    dom::remove_child(parent, row);
+    release_element_subtree(row);
+    if was_connected {
+        crate::custom_elements_web::disconnected_subtree(&value);
+    }
 }
 
 fn first_element_child(node: u32) -> Option<u32> {
@@ -1500,6 +2993,161 @@ fn clear_children(node: u32) {
     for c in dom::children(node) {
         dom::remove_child(node, c);
         release_element_subtree(c);
+    }
+}
+
+fn with_deferred_dom_post_insertion_steps<T>(operation: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "dynamic-js")]
+    {
+        crate::dynamic_script::with_dom_post_insertion_steps_suppressed(operation)
+    }
+    #[cfg(not(feature = "dynamic-js"))]
+    {
+        operation()
+    }
+}
+
+fn run_dom_post_insertion_steps(node: u32) {
+    #[cfg(feature = "dynamic-js")]
+    crate::dynamic_script::notify_node_inserted(node);
+    #[cfg(not(feature = "dynamic-js"))]
+    let _ = node;
+}
+
+fn run_dom_batch_insertion_steps(nodes: &[u32]) {
+    #[cfg(feature = "dynamic-js")]
+    crate::dynamic_script::prepare_inserted_stylesheets(nodes);
+    #[cfg(not(feature = "dynamic-js"))]
+    let _ = nodes;
+}
+
+fn run_script_mutation_steps(node: u32) {
+    #[cfg(feature = "dynamic-js")]
+    crate::dynamic_script::notify_script_mutated(node);
+    #[cfg(not(feature = "dynamic-js"))]
+    let _ = node;
+}
+
+pub(crate) fn run_media_source_insertion_steps(parent: u32, child: u32) {
+    if matches!(dom::tag_name(parent).as_str(), "audio" | "video")
+        && dom::tag_name(child).eq_ignore_ascii_case("source")
+        && !dom::has_attribute(child, "src")
+    {
+        // The media resource selection algorithm runs during insertion,
+        // before post-insertion steps execute an earlier sibling script.
+        set_expando(parent, "networkState", Value::Number(3.0));
+    }
+}
+
+fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
+    ensure_tree_insertion(parent, child);
+    if dom::node_type(child) != 11 {
+        preserve_moved_option_selectedness(child);
+        blur_focus_for_standard_reparent(child);
+        match reference {
+            Some(reference) => dom::insert_before(parent, child, reference),
+            None => dom::append_child(parent, child),
+        }
+        pin_element_subtree(child);
+        if dom::is_connected(child) {
+            crate::custom_elements_web::connected_subtree(&element_value(child));
+        }
+        return;
+    }
+
+    let added = dom::children(child);
+    if added.is_empty() {
+        return;
+    }
+    for node in &added {
+        ensure_tree_insertion(parent, *node);
+    }
+    for node in &added {
+        blur_focus_for_standard_reparent(*node);
+    }
+    let previous = reference.and_then(dom::previous_sibling).or_else(|| {
+        reference
+            .is_none()
+            .then(|| dom::last_child(parent))
+            .flatten()
+    });
+    with_deferred_dom_post_insertion_steps(|| {
+        crate::observers_web::with_mutation_notifications_suppressed(|| {
+            for node in &added {
+                match reference {
+                    Some(reference) => dom::insert_before(parent, *node, reference),
+                    None => dom::append_child(parent, *node),
+                }
+            }
+        });
+    });
+    crate::observers_web::notify_child_list(child, &[], &added, None, None);
+    crate::observers_web::notify_child_list(parent, &added, &[], previous, reference);
+    for node in &added {
+        pin_element_subtree(*node);
+        if dom::is_connected(*node) {
+            crate::custom_elements_web::connected_subtree(&element_value(*node));
+        }
+    }
+    run_dom_batch_insertion_steps(&added);
+    run_script_mutation_steps(parent);
+    for node in added {
+        run_dom_post_insertion_steps(node);
+    }
+}
+
+fn replace_child_or_fragment(parent: u32, child: u32, old_child: u32) {
+    if dom::node_type(child) != 11 {
+        dom::replace_child(parent, child, old_child);
+        pin_element_subtree(child);
+        return;
+    }
+
+    let added = dom::children(child);
+    for node in &added {
+        ensure_tree_insertion(parent, *node);
+    }
+    let previous = dom::previous_sibling(old_child);
+    let next = dom::next_sibling(old_child);
+    with_deferred_dom_post_insertion_steps(|| {
+        crate::observers_web::with_mutation_notifications_suppressed(|| {
+            for node in &added {
+                dom::insert_before(parent, *node, old_child);
+            }
+            dom::remove_child(parent, old_child);
+        });
+    });
+    if !added.is_empty() {
+        crate::observers_web::notify_child_list(child, &[], &added, None, None);
+    }
+    crate::observers_web::notify_child_list(parent, &added, &[old_child], previous, next);
+    for node in &added {
+        pin_element_subtree(*node);
+        if dom::is_connected(*node) {
+            crate::custom_elements_web::connected_subtree(&element_value(*node));
+        }
+    }
+    run_dom_batch_insertion_steps(&added);
+    run_script_mutation_steps(parent);
+    for node in added {
+        run_dom_post_insertion_steps(node);
+    }
+}
+
+fn replace_all_children(node: u32, replacement: impl FnOnce()) {
+    let removed = dom::children(node);
+    crate::observers_web::with_mutation_notifications_suppressed(|| {
+        clear_children(node);
+        replacement();
+    });
+    let added = dom::children(node);
+    if !added.is_empty() || !removed.is_empty() {
+        crate::observers_web::notify_child_list(node, &added, &removed, None, None);
+    }
+    run_dom_batch_insertion_steps(&added);
+    run_script_mutation_steps(node);
+    for added_node in added {
+        run_dom_post_insertion_steps(added_node);
     }
 }
 
@@ -1629,23 +3277,295 @@ pub(crate) fn append_sanitized_html_fragment(parent: u32, html: &str) {
 }
 
 fn append_html_fragment_mode(parent: u32, html: &str, sanitize: bool) {
-    if let Err(error) =
-        crate::html_tree_builder::append_html_fragment_with_streaming_parser(parent, html, sanitize)
-    {
-        eprintln!("[w3cos] inert HTML fragment parse failed: {error}");
+    let existing_children = dom::children(parent).into_iter().collect::<HashSet<_>>();
+    match crate::html_tree_builder::append_html_fragment_with_streaming_parser(
+        parent, html, sanitize,
+    ) {
+        Ok(()) => {
+            for child in dom::children(parent) {
+                if !existing_children.contains(&child) {
+                    crate::custom_elements_web::upgrade_subtree(&element_value(child));
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("[w3cos] inert HTML fragment parse failed: {error}");
+        }
     }
 }
 
 fn descendant_elements(root: u32) -> Vec<u32> {
     let mut output = Vec::new();
-    let mut pending = dom::children(root);
+    let mut pending = dom::children(root).into_iter().rev().collect::<Vec<_>>();
     while let Some(node) = pending.pop() {
-        pending.extend(dom::children(node));
         if dom::node_type(node) == 1 {
             output.push(node);
         }
+        pending.extend(dom::children(node).into_iter().rev());
     }
     output
+}
+
+fn inclusive_descendant_elements(root: u32) -> Vec<u32> {
+    let mut output = Vec::new();
+    if dom::node_type(root) == 1 {
+        output.push(root);
+    }
+    output.extend(descendant_elements(root));
+    output
+}
+
+fn exposes_window_name(node: u32) -> bool {
+    matches!(
+        dom::tag_name(node).as_str(),
+        "embed" | "form" | "img" | "object"
+    )
+}
+
+/// Resolve the named properties exposed by the active Window. The HTML
+/// named-access algorithm is live: adding, removing, or renaming a connected
+/// element must be observable by a later classic-script identifier lookup.
+pub(crate) fn window_named_property(name: &str) -> Option<Value> {
+    if name.is_empty() {
+        return None;
+    }
+    inclusive_descendant_elements(document_element_id())
+        .into_iter()
+        .find(|node| {
+            dom::get_attribute(*node, "id").as_deref() == Some(name)
+                || (exposes_window_name(*node)
+                    && dom::get_attribute(*node, "name").as_deref() == Some(name))
+        })
+        .map(element_value)
+}
+
+fn virtual_document_elements(document: &Value) -> Vec<u32> {
+    virtual_document_children(document)
+        .into_iter()
+        .filter_map(|child| node_id_of(&child))
+        .flat_map(inclusive_descendant_elements)
+        .collect()
+}
+
+fn normalized_namespace(value: &Value) -> Option<String> {
+    if value.is_null() || value.is_undefined() || value.to_js_string().is_empty() {
+        None
+    } else {
+        Some(value.to_js_string())
+    }
+}
+
+fn valid_element_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if first.is_ascii_alphabetic() {
+        return characters.all(|character| {
+            character != '\0'
+                && !matches!(character, '\t' | '\n' | '\u{000c}' | '\r' | ' ' | '/' | '>')
+        });
+    }
+    (matches!(first, ':' | '_') || !first.is_ascii())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '.' | ':' | '_')
+                || !character.is_ascii()
+        })
+}
+
+fn valid_namespace_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.chars().all(|character| {
+            character != '\0'
+                && !matches!(
+                    character,
+                    '\t' | '\n' | '\u{000c}' | '\r' | ' ' | '/' | '>' | ':'
+                )
+        })
+}
+
+fn validate_and_extract_qualified_name(
+    namespace: Option<&str>,
+    qualified_name: &str,
+) -> (Option<String>, String) {
+    let (prefix, local_name) = qualified_name
+        .split_once(':')
+        .map_or((None, qualified_name), |(prefix, local_name)| {
+            (Some(prefix), local_name)
+        });
+    if !valid_element_name(local_name)
+        || prefix.is_some_and(|prefix| !valid_namespace_prefix(prefix))
+    {
+        dom_exception(
+            "The qualified name is not a valid element name",
+            "InvalidCharacterError",
+        );
+    }
+
+    const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+    const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+    if prefix.is_some() && namespace.is_none()
+        || prefix == Some("xml") && namespace != Some(XML_NAMESPACE)
+        || (qualified_name == "xmlns" || prefix == Some("xmlns"))
+            && namespace != Some(XMLNS_NAMESPACE)
+        || namespace == Some(XMLNS_NAMESPACE)
+            && qualified_name != "xmlns"
+            && prefix != Some("xmlns")
+    {
+        dom_exception(
+            "The qualified name is not valid for the supplied namespace",
+            "NamespaceError",
+        );
+    }
+    (prefix.map(str::to_string), local_name.to_string())
+}
+
+fn html_class_tokens(value: &str) -> Vec<&str> {
+    value
+        .split([' ', '\t', '\n', '\r', '\x0c'])
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn element_matches_class_names(node: u32, requested_names: &str) -> bool {
+    let requested_names = html_class_tokens(requested_names);
+    if requested_names.is_empty() {
+        return false;
+    }
+    let classes = dom::class_name(node);
+    let classes = html_class_tokens(&classes);
+    let quirks_mode = get_expando(node, "ownerDocument")
+        .unwrap_or_else(document_value)
+        .get_property("compatMode")
+        .to_js_string()
+        == "BackCompat";
+    requested_names.into_iter().all(|requested| {
+        classes.iter().any(|class| {
+            if quirks_mode {
+                class.eq_ignore_ascii_case(requested)
+            } else {
+                class == &requested
+            }
+        })
+    })
+}
+
+fn element_matches_tag_name(node: u32, requested_name: &str, html_document: bool) -> bool {
+    if requested_name == "*" {
+        return true;
+    }
+    if namespace_uri(node) == crate::html_parser_state::HTML_NAMESPACE && html_document {
+        dom::tag_name(node) == requested_name.to_ascii_lowercase()
+    } else {
+        dom::tag_name(node) == requested_name
+    }
+}
+
+fn element_matches_namespace(node: u32, namespace: &Option<String>, local_name: &str) -> bool {
+    let namespace_matches = namespace.as_deref() == Some("*")
+        || match namespace {
+            Some(namespace) => namespace_uri(node) == *namespace,
+            None => get_expando(node, "namespaceURI").is_some_and(|namespace| namespace.is_null()),
+        };
+    let qualified_name = dom::tag_name(node);
+    let node_local_name = qualified_name
+        .rsplit_once(':')
+        .map_or(qualified_name.as_str(), |(_, local_name)| local_name);
+    namespace_matches && (local_name == "*" || node_local_name == local_name)
+}
+
+fn document_node_value(mut props: HashMap<String, Value>) -> Value {
+    // Node.nodeValue and Node.textContent are writable-but-inert on Document.
+    // Use the runtime's accessor convention so ordinary mutable document
+    // properties (doctype, contentType, title, ...) retain their live storage.
+    for name in ["nodeValue", "textContent"] {
+        props.insert(format!("__w3cos_getter_{name}"), func(|_, _| Value::Null));
+        props.insert(
+            format!("__w3cos_setter_{name}"),
+            func(|_, _| Value::Undefined),
+        );
+    }
+    for name in [
+        "nextSibling",
+        "previousSibling",
+        "ownerDocument",
+        "parentNode",
+        "parentElement",
+    ] {
+        props.entry(name.to_string()).or_insert(Value::Null);
+    }
+    props
+        .entry("isConnected".to_string())
+        .or_insert(Value::Bool(true));
+    let character_set = props
+        .get("characterSet")
+        .cloned()
+        .unwrap_or_else(|| Value::string("UTF-8"));
+    props
+        .entry("charset".to_string())
+        .or_insert_with(|| character_set.clone());
+    props
+        .entry("inputEncoding".to_string())
+        .or_insert(character_set);
+    props.remove("childNodes");
+    props
+        .entry("__w3cos_getter_childNodes".to_string())
+        .or_insert_with(|| func(|document, _| virtual_document_child_nodes(document)));
+    props.entry("cloneNode".to_string()).or_insert_with(|| {
+        func(|document, args| clone_document_node(&document, arg(&args, 0).to_bool()))
+    });
+    props
+        .entry("lookupNamespaceURI".to_string())
+        .or_insert_with(|| {
+            func(|document, args| lookup_namespace_uri_result(&document, &arg(&args, 0)))
+        });
+    props
+        .entry("lookupPrefix".to_string())
+        .or_insert_with(|| func(|document, args| lookup_prefix_result(&document, &arg(&args, 0))));
+    props
+        .entry("isDefaultNamespace".to_string())
+        .or_insert_with(|| {
+            func(|document, args| is_default_namespace_result(&document, &arg(&args, 0)))
+        });
+    props.entry("isEqualNode".to_string()).or_insert_with(|| {
+        func(|document, args| Value::Bool(nodes_are_equal(&document, &arg(&args, 0))))
+    });
+    props
+        .entry("replaceChildren".to_string())
+        .or_insert_with(|| {
+            func(|document, args| {
+                replace_virtual_document_children(&document, args);
+                Value::Undefined
+            })
+        });
+    Value::object(props)
+}
+
+fn clone_document_node(document: &Value, deep: bool) -> Value {
+    let prototype_name = document
+        .get_property("__w3cos_document_prototype")
+        .to_js_string();
+    let clone = empty_document_value(
+        &document.get_property("contentType").to_js_string(),
+        &prototype_name,
+    );
+    if deep {
+        let children = virtual_document_children(document)
+            .into_iter()
+            .filter_map(|child| node_id_of(&child))
+            .map(|child| {
+                let cloned_child = dom::clone_node(child, true);
+                copy_cloned_node_identity(child, cloned_child);
+                walk_subtree(cloned_child, &mut |descendant| {
+                    set_expando(descendant, "ownerDocument", clone.clone())
+                });
+                element_value(cloned_child)
+            })
+            .collect();
+        set_virtual_document_children(&clone, children);
+    }
+    clone
 }
 
 fn parsed_document_value(
@@ -1654,12 +3574,20 @@ fn parsed_document_value(
     head: Option<u32>,
     body: Option<u32>,
 ) -> Value {
+    let implementation = dom_implementation_value();
+    let html_document = content_type == "text/html";
     let mut props = HashMap::from([
         ("nodeType".to_string(), Value::Number(9.0)),
         ("nodeName".to_string(), Value::string("#document")),
         ("contentType".to_string(), Value::string(content_type)),
         ("URL".to_string(), Value::string("about:blank")),
         ("documentURI".to_string(), Value::string("about:blank")),
+        ("compatMode".to_string(), Value::string("CSS1Compat")),
+        ("characterSet".to_string(), Value::string("UTF-8")),
+        ("charset".to_string(), Value::string("UTF-8")),
+        ("inputEncoding".to_string(), Value::string("UTF-8")),
+        ("title".to_string(), Value::string("")),
+        ("location".to_string(), Value::Null),
         ("defaultView".to_string(), Value::Null),
         ("documentElement".to_string(), element_value(root)),
         (
@@ -1675,16 +3603,27 @@ fn parsed_document_value(
             node_list(vec![element_value(root)]),
         ),
         (
+            "__w3cos_document_prototype".to_string(),
+            Value::string(if content_type == "text/html" {
+                "HTMLDocument"
+            } else {
+                "XMLDocument"
+            }),
+        ),
+        (
             "__w3cos_document_root".to_string(),
             Value::Number(root as f64),
+        ),
+        (
+            "__w3cos_document_children".to_string(),
+            js_array(vec![element_value(root)]),
         ),
     ]);
     props.insert(
         "querySelector".to_string(),
         func(move |_, args| {
-            let selector = arg(&args, 0).to_js_string();
-            let parts: Vec<&str> = selector.split_whitespace().collect();
-            if !parts.is_empty() && matches_selector_chain(root, &parts) {
+            let selector = query_selector_argument(&args, root);
+            if query_selector_matches(root, &selector, Some(root)) {
                 return element_value(root);
             }
             element_or_null(
@@ -1697,10 +3636,9 @@ fn parsed_document_value(
     props.insert(
         "querySelectorAll".to_string(),
         func(move |_, args| {
-            let selector = arg(&args, 0).to_js_string();
+            let selector = query_selector_argument(&args, root);
             let mut matches = Vec::new();
-            let parts: Vec<&str> = selector.split_whitespace().collect();
-            if !parts.is_empty() && matches_selector_chain(root, &parts) {
+            if query_selector_matches(root, &selector, Some(root)) {
                 matches.push(root);
             }
             matches.extend(query_selector_all_scoped(Some(root), &selector));
@@ -1711,49 +3649,211 @@ fn parsed_document_value(
         "getElementById".to_string(),
         func(move |_, args| {
             let id = arg(&args, 0).to_js_string();
-            let found = dom::get_element_by_id(&id)
-                .filter(|node| *node == root || is_ancestor_of(root, *node));
+            let found = inclusive_descendant_elements(root)
+                .into_iter()
+                .find(|node| dom::get_attribute(*node, "id").as_deref() == Some(&id));
             element_or_null(found)
         }),
     );
     props.insert(
         "getElementsByTagName".to_string(),
         func(move |_, args| {
-            let tag = arg(&args, 0).to_js_string().to_ascii_lowercase();
+            let tag = arg(&args, 0).to_js_string();
             html_collection(move || {
-                let mut nodes = vec![root];
-                nodes.extend(descendant_elements(root));
-                nodes.retain(|node| tag == "*" || dom::tag_name(*node) == tag);
-                nodes.into_iter().map(element_value).collect()
+                inclusive_descendant_elements(root)
+                    .into_iter()
+                    .filter(|node| element_matches_tag_name(*node, &tag, html_document))
+                    .map(element_value)
+                    .collect()
+            })
+        }),
+    );
+    props.insert(
+        "getElementsByTagNameNS".to_string(),
+        func(move |_, args| {
+            let namespace = normalized_namespace(&arg(&args, 0));
+            let local_name = arg(&args, 1).to_js_string();
+            html_collection(move || {
+                inclusive_descendant_elements(root)
+                    .into_iter()
+                    .filter(|node| element_matches_namespace(*node, &namespace, &local_name))
+                    .map(element_value)
+                    .collect()
+            })
+        }),
+    );
+    props.insert(
+        "getElementsByClassName".to_string(),
+        func(move |_, args| {
+            let class_names = arg(&args, 0).to_js_string();
+            html_collection(move || {
+                inclusive_descendant_elements(root)
+                    .into_iter()
+                    .filter(|node| element_matches_class_names(*node, &class_names))
+                    .map(element_value)
+                    .collect()
             })
         }),
     );
     props.insert(
         "createElement".to_string(),
-        func(|_, args| element_value(dom::create_element(&arg(&args, 0).to_js_string()))),
+        func({
+            let is_html = content_type == "text/html";
+            let element_namespace = match content_type {
+                "text/html" => None,
+                "application/xhtml+xml" => Some(crate::html_parser_state::HTML_NAMESPACE),
+                _ => Some(""),
+            };
+            move |document, args| {
+                let mut tag = arg(&args, 0).to_js_string();
+                if !valid_element_name(&tag) {
+                    dom_exception("The element name is not valid", "InvalidCharacterError");
+                }
+                if is_html {
+                    tag.make_ascii_lowercase();
+                }
+                let node = dom::create_element(&tag);
+                if let Some(namespace) = element_namespace {
+                    dom::set_html_element(
+                        node,
+                        namespace == crate::html_parser_state::HTML_NAMESPACE,
+                    );
+                    set_expando(
+                        node,
+                        "namespaceURI",
+                        if namespace.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::string(namespace)
+                        },
+                    );
+                }
+                set_expando(node, "ownerDocument", document);
+                element_value(node)
+            }
+        }),
+    );
+    props.insert(
+        "createElementNS".to_string(),
+        func(|document, args| {
+            let namespace = normalized_namespace(&arg(&args, 0));
+            let qualified_name = arg(&args, 1).to_js_string();
+            validate_and_extract_qualified_name(namespace.as_deref(), &qualified_name);
+            let node =
+                create_namespaced_element(namespace.as_deref().unwrap_or(""), &qualified_name);
+            set_expando(node, "ownerDocument", document);
+            let element = element_value(node);
+            if namespace.as_deref() == Some("http://www.w3.org/1998/Math/MathML") {
+                w3cos_core::class::set_prototype_of(
+                    &element,
+                    &math_ml_element_class().get_property("prototype"),
+                );
+            }
+            element
+        }),
     );
     props.insert(
         "createTextNode".to_string(),
-        func(|_, args| element_value(dom::create_text_node(&arg(&args, 0).to_js_string()))),
+        func(|document, args| {
+            let node = dom::create_text_node(&arg(&args, 0).to_js_string());
+            set_expando(node, "ownerDocument", document);
+            element_value(node)
+        }),
+    );
+    props.insert(
+        "createComment".to_string(),
+        func(|document, args| {
+            let node = dom::create_comment(&arg(&args, 0).to_js_string());
+            set_expando(node, "ownerDocument", document);
+            element_value(node)
+        }),
     );
     props.insert(
         "createCDATASection".to_string(),
+        func(|document, args| create_cdata_section_value(&document, &arg(&args, 0).to_js_string())),
+    );
+    props.insert(
+        "createProcessingInstruction".to_string(),
+        func(|document, args| {
+            let instruction = create_processing_instruction_value(
+                &arg(&args, 0).to_js_string(),
+                &arg(&args, 1).to_js_string(),
+            );
+            if let Some(node) = node_id_of(&instruction) {
+                set_expando(node, "ownerDocument", document);
+            }
+            instruction
+        }),
+    );
+    props.insert(
+        "createDocumentFragment".to_string(),
+        func(|document, _| {
+            let node = dom::create_document_fragment();
+            set_expando(node, "ownerDocument", document);
+            element_value(node)
+        }),
+    );
+    props.insert(
+        "createAttribute".to_string(),
         func({
             let is_html = content_type == "text/html";
-            move |_, args| {
-                if is_html {
-                    dom_exception(
-                        "CDATA sections are not supported in HTML documents",
-                        "NotSupportedError",
-                    );
-                }
-                let data = arg(&args, 0).to_js_string();
-                if data.contains("]]>") {
-                    dom_exception("CDATA data must not contain ']]>'", "InvalidCharacterError");
-                }
-                element_value(dom::create_cdata_section(&data))
-            }
+            move |document, args| detached_attribute_value(&document, arg(&args, 0), is_html)
         }),
+    );
+    props.insert(
+        "createAttributeNS".to_string(),
+        func(|document, args| {
+            detached_namespaced_attribute_value(&document, arg(&args, 0), arg(&args, 1))
+        }),
+    );
+    props.insert(
+        "isSameNode".to_string(),
+        func(|document, args| Value::Bool(document.strict_eq(&arg(&args, 0)))),
+    );
+    props.insert(
+        "isEqualNode".to_string(),
+        func(|document, args| Value::Bool(nodes_are_equal(&document, &arg(&args, 0)))),
+    );
+    props.insert("getRootNode".to_string(), func(|document, _| document));
+    props.insert(
+        "normalize".to_string(),
+        func(move |_, _| {
+            normalize_node_subtree(root);
+            Value::Undefined
+        }),
+    );
+    props.insert("parentNode".to_string(), Value::Null);
+    props.insert("parentElement".to_string(), Value::Null);
+    props.insert(
+        "adoptNode".to_string(),
+        func(|document, args| adopt_node_into(&document, arg(&args, 0))),
+    );
+    props.insert(
+        "importNode".to_string(),
+        func(|document, args| import_node_into(&document, arg(&args, 0), arg(&args, 1).to_bool())),
+    );
+    for (name, prepend) in [("append", false), ("prepend", true)] {
+        props.insert(
+            name.to_string(),
+            func(move |document, args| {
+                validate_document_parent_node_insertion(&document, &args, prepend);
+                insert_virtual_document_children(&document, args, prepend);
+                Value::Undefined
+            }),
+        );
+    }
+    props.insert(
+        "appendChild".to_string(),
+        func(|document, args| {
+            let child = arg(&args, 0);
+            validate_document_parent_node_insertion(&document, std::slice::from_ref(&child), false);
+            insert_virtual_document_children(&document, vec![child.clone()], false);
+            child
+        }),
+    );
+    props.insert(
+        "createCDATASection".to_string(),
+        func(|document, args| create_cdata_section_value(&document, &arg(&args, 0).to_js_string())),
     );
     props.insert(
         "createProcessingInstruction".to_string(),
@@ -1764,8 +3864,14 @@ fn parsed_document_value(
             )
         }),
     );
-    props.insert("implementation".to_string(), dom_implementation_value());
-    let document = Value::object(props);
+    props.insert("implementation".to_string(), implementation.clone());
+    install_virtual_document_node_mutations(&mut props);
+    let document = document_node_value(props);
+    implementation.set_property("__w3cos_owner_document", document.clone());
+    walk_subtree(root, &mut |node| {
+        set_expando(node, "ownerDocument", document.clone())
+    });
+    set_virtual_document_children(&document, vec![element_value(root)]);
     w3cos_core::class::set_prototype_of(
         &document,
         &crate::dom_constructors::prototype(if content_type == "text/html" {
@@ -1777,21 +3883,1410 @@ fn parsed_document_value(
     document
 }
 
+pub(crate) fn parse_frame_document(source: &str, content_type: &str, url: &str) -> Value {
+    let document = if matches!(content_type, "text/css" | "text/plain")
+        || (content_type.starts_with("image/") && content_type != "image/svg+xml")
+    {
+        empty_document_value(content_type, "Document")
+    } else {
+        parse_document(source, content_type)
+    };
+    document.set_property("URL", Value::string(url));
+    document.set_property("documentURI", Value::string(url));
+    document
+}
+
+pub(crate) fn set_document_encoding(document: &Value, encoding: &str) {
+    let encoding = Value::string(encoding);
+    document.set_property("characterSet", encoding.clone());
+    document.set_property("charset", encoding.clone());
+    document.set_property("inputEncoding", encoding);
+}
+
+pub(crate) fn install_frame_document(node: u32, document: Value, url: &str) {
+    let parent_window = window_value();
+    let parsed_url = url::Url::parse(url).ok();
+    let location = Value::object(HashMap::from([
+        ("href".to_string(), Value::string(url)),
+        (
+            "hash".to_string(),
+            Value::string(
+                &parsed_url
+                    .as_ref()
+                    .and_then(|url| url.fragment())
+                    .map(|fragment| format!("#{fragment}"))
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "origin".to_string(),
+            Value::string(
+                &parsed_url
+                    .as_ref()
+                    .map(|url| url.origin().ascii_serialization())
+                    .unwrap_or_else(|| "null".to_string()),
+            ),
+        ),
+    ]));
+    let frame_window = Value::object(HashMap::from([
+        ("document".to_string(), document.clone()),
+        ("location".to_string(), location.clone()),
+        (
+            "TypeError".to_string(),
+            parent_window.get_property("TypeError"),
+        ),
+        (
+            "DOMException".to_string(),
+            parent_window.get_property("DOMException"),
+        ),
+        (
+            "NodeList".to_string(),
+            parent_window.get_property("NodeList"),
+        ),
+    ]));
+    for key in ["self", "window", "globalThis"] {
+        frame_window.set_property(key, frame_window.clone());
+    }
+    for name in [
+        "Error",
+        "EvalError",
+        "RangeError",
+        "ReferenceError",
+        "SyntaxError",
+        "TypeError",
+        "URIError",
+        "AggregateError",
+        "MutationObserver",
+    ] {
+        frame_window.set_property(name, parent_window.get_property(name));
+    }
+    frame_window.set_property(
+        "Function",
+        frame_function_compat_class(frame_window.clone(), document.clone()),
+    );
+    for name in crate::dom_constructors::DOM_CONSTRUCTOR_NAMES {
+        frame_window.set_property(name, parent_window.get_property(name));
+    }
+    for (name, node_type) in [
+        ("Text", 3_u16),
+        ("Comment", 8_u16),
+        ("DocumentFragment", 11_u16),
+    ] {
+        let owner_document = document.clone();
+        let parent_constructor = parent_window.get_property(name);
+        let constructor = Value::function(move |_, args| {
+            let node = match node_type {
+                3 => dom::create_text_node(
+                    &args
+                        .first()
+                        .filter(|value| !value.is_undefined())
+                        .map(Value::to_js_string)
+                        .unwrap_or_default(),
+                ),
+                8 => dom::create_comment(
+                    &args
+                        .first()
+                        .filter(|value| !value.is_undefined())
+                        .map(Value::to_js_string)
+                        .unwrap_or_default(),
+                ),
+                _ => dom::create_document_fragment(),
+            };
+            set_expando(node, "ownerDocument", owner_document.clone());
+            element_value(node)
+        });
+        constructor.set_property("name", Value::string(name));
+        constructor.set_property("prototype", parent_constructor.get_property("prototype"));
+        frame_window.set_property(name, constructor);
+    }
+    frame_window.set_property("top", parent_window.clone());
+    frame_window.set_property("parent", parent_window);
+    document.set_property("defaultView", frame_window.clone());
+    document.set_property("location", location);
+    set_expando(node, "contentDocument", document);
+    set_expando(node, "contentWindow", frame_window);
+}
+
+fn ensure_frame_browsing_context(node: u32) {
+    if get_expando(node, "contentDocument").is_some() || !node_is_connected(node) {
+        return;
+    }
+    let document = parse_frame_document("", "text/html", "about:blank");
+    install_frame_document(node, document, "about:blank");
+}
+
+fn frame_windows_value() -> Value {
+    js_array(
+        dom::get_elements_by_tag_name("iframe")
+            .into_iter()
+            .filter(|node| dom::is_connected(*node))
+            .filter_map(|node| {
+                ensure_frame_browsing_context(node);
+                get_expando(node, "contentWindow")
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn graft_frame_component_subtrees(component: &mut w3cos_std::Component) {
+    let host_node = match &component.on_click {
+        w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok(),
+        _ => None,
+    };
+    if let Some(frame_node) = host_node.filter(|node| dom::tag_name(*node) == "iframe") {
+        let frame_body = get_expando(frame_node, "contentDocument")
+            .map(|document| document.get_property("body"))
+            .and_then(|body| node_id_of(&body));
+        if let Some(frame_body) = frame_body {
+            let frame = dom::with_document(|document| {
+                document.to_component_subtree(NodeId::from_u32(frame_body))
+            });
+            component.children = vec![frame];
+        }
+    }
+    for child in &mut component.children {
+        graft_frame_component_subtrees(child);
+    }
+}
+
+fn assigned_nodes_for_slot_node(slot: u32) -> Vec<u32> {
+    let root = tree_root(slot);
+    let Some(host) = shadow_host_for_root(root) else {
+        return Vec::new();
+    };
+    let slot_name = dom::get_attribute(slot, "name").unwrap_or_default();
+    dom::children(host)
+        .into_iter()
+        .filter(|child| {
+            dom::get_attribute(*child, "slot").unwrap_or_default() == slot_name
+                && matches!(dom::node_type(*child), 1 | 3)
+        })
+        .collect()
+}
+
+fn assigned_slot_for_node(node: u32) -> Option<u32> {
+    let host = dom::parent_node(node)?;
+    let root = shadow_root_id_for_host(host)?;
+    let requested_name = dom::get_attribute(node, "slot").unwrap_or_default();
+    descendant_elements(root).into_iter().find(|candidate| {
+        dom::tag_name(*candidate) == "slot"
+            && dom::get_attribute(*candidate, "name").unwrap_or_default() == requested_name
+    })
+}
+
+fn affected_slots_for_node_position(node: u32) -> HashSet<u32> {
+    let mut slots = HashSet::new();
+    if dom::tag_name(node) == "slot" {
+        slots.insert(node);
+    }
+    let Some(parent) = dom::parent_node(node) else {
+        return slots;
+    };
+    if dom::tag_name(parent) == "slot" {
+        slots.insert(parent);
+    }
+    if let Some(root) = shadow_root_id_for_host(parent) {
+        let requested_name = dom::get_attribute(node, "slot").unwrap_or_default();
+        slots.extend(descendant_elements(root).into_iter().filter(|candidate| {
+            dom::tag_name(*candidate) == "slot"
+                && dom::get_attribute(*candidate, "name").unwrap_or_default() == requested_name
+        }));
+    }
+    slots
+}
+
+fn queue_slotchange(slot: u32) {
+    let target = element_value(slot);
+    queue_microtask_value(Value::function(move |_, _| {
+        let event = w3cos_core::class::construct(
+            &crate::web_events::event_class(),
+            vec![Value::string("slotchange")],
+        );
+        target.call_method("dispatchEvent", vec![event]);
+        Value::Undefined
+    }));
+}
+
+fn compose_shadow_slots(component: &mut w3cos_std::Component) {
+    let node = match &component.on_click {
+        w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok(),
+        _ => None,
+    };
+    if let Some(slot) = node.filter(|node| dom::tag_name(*node) == "slot") {
+        let assigned = assigned_nodes_for_slot_node(slot);
+        if !assigned.is_empty() {
+            component.children = assigned
+                .into_iter()
+                .map(|node| {
+                    dom::with_document(|document| {
+                        document.to_component_subtree(NodeId::from_u32(node))
+                    })
+                })
+                .collect();
+        }
+    }
+    for child in &mut component.children {
+        compose_shadow_slots(child);
+    }
+}
+
+pub(crate) fn graft_shadow_component_subtrees(component: &mut w3cos_std::Component) {
+    let host = match &component.on_click {
+        w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok(),
+        _ => None,
+    };
+    if let Some(root) = host.and_then(shadow_root_id_for_host) {
+        let mut shadow = dom::with_document(|document| {
+            document.to_component_subtree(NodeId::from_u32(root))
+        });
+        compose_shadow_slots(&mut shadow);
+        component.children = shadow.children;
+    }
+    for child in &mut component.children {
+        graft_shadow_component_subtrees(child);
+    }
+}
+
+pub(crate) fn empty_document_value(content_type: &str, prototype_name: &str) -> Value {
+    let implementation = dom_implementation_value();
+    let html_document = content_type == "text/html";
+    let mut props = HashMap::from([
+        ("nodeType".to_string(), Value::Number(9.0)),
+        ("nodeName".to_string(), Value::string("#document")),
+        ("contentType".to_string(), Value::string(content_type)),
+        ("URL".to_string(), Value::string("about:blank")),
+        ("documentURI".to_string(), Value::string("about:blank")),
+        ("compatMode".to_string(), Value::string("CSS1Compat")),
+        ("characterSet".to_string(), Value::string("UTF-8")),
+        ("charset".to_string(), Value::string("UTF-8")),
+        ("inputEncoding".to_string(), Value::string("UTF-8")),
+        ("title".to_string(), Value::string("")),
+        ("location".to_string(), Value::Null),
+        ("defaultView".to_string(), Value::Null),
+        ("doctype".to_string(), Value::Null),
+        ("documentElement".to_string(), Value::Null),
+        ("firstChild".to_string(), Value::Null),
+        ("lastChild".to_string(), Value::Null),
+        ("childNodes".to_string(), node_list(Vec::new())),
+        ("implementation".to_string(), implementation.clone()),
+        (
+            "__w3cos_document_children".to_string(),
+            js_array(Vec::new()),
+        ),
+        (
+            "__w3cos_document_prototype".to_string(),
+            Value::string(prototype_name),
+        ),
+    ]);
+    props.insert(
+        "createElement".to_string(),
+        func(|document, args| {
+            let tag = arg(&args, 0).to_js_string();
+            if !valid_element_name(&tag) {
+                dom_exception("The element name is not valid", "InvalidCharacterError");
+            }
+            let node = dom::create_element(&tag);
+            dom::set_html_element(node, false);
+            set_expando(node, "ownerDocument", document);
+            set_expando(node, "namespaceURI", Value::Null);
+            let element = element_value(node);
+            w3cos_core::class::set_prototype_of(
+                &element,
+                &crate::dom_constructors::prototype("Element"),
+            );
+            element
+        }),
+    );
+    props.insert(
+        "createElementNS".to_string(),
+        func(|document, args| {
+            let namespace = normalized_namespace(&arg(&args, 0));
+            let qualified_name = arg(&args, 1).to_js_string();
+            validate_and_extract_qualified_name(namespace.as_deref(), &qualified_name);
+            let node =
+                create_namespaced_element(namespace.as_deref().unwrap_or(""), &qualified_name);
+            set_expando(node, "ownerDocument", document);
+            element_value(node)
+        }),
+    );
+    props.insert(
+        "createTextNode".to_string(),
+        func(|document, args| {
+            let node = dom::create_text_node(&arg(&args, 0).to_js_string());
+            set_expando(node, "ownerDocument", document);
+            element_value(node)
+        }),
+    );
+    props.insert(
+        "createComment".to_string(),
+        func(|document, args| {
+            let node = dom::create_comment(&arg(&args, 0).to_js_string());
+            set_expando(node, "ownerDocument", document);
+            element_value(node)
+        }),
+    );
+    props.insert(
+        "createCDATASection".to_string(),
+        func(|document, args| create_cdata_section_value(&document, &arg(&args, 0).to_js_string())),
+    );
+    props.insert(
+        "createProcessingInstruction".to_string(),
+        func(|document, args| {
+            let instruction = create_processing_instruction_value(
+                &arg(&args, 0).to_js_string(),
+                &arg(&args, 1).to_js_string(),
+            );
+            if let Some(node) = node_id_of(&instruction) {
+                set_expando(node, "ownerDocument", document);
+            }
+            instruction
+        }),
+    );
+    props.insert(
+        "createDocumentFragment".to_string(),
+        func(|document, _| {
+            let node = dom::create_document_fragment();
+            set_expando(node, "ownerDocument", document);
+            element_value(node)
+        }),
+    );
+    props.insert(
+        "createAttribute".to_string(),
+        func(|document, args| detached_attribute_value(&document, arg(&args, 0), false)),
+    );
+    props.insert(
+        "createAttributeNS".to_string(),
+        func(|document, args| {
+            detached_namespaced_attribute_value(&document, arg(&args, 0), arg(&args, 1))
+        }),
+    );
+    props.insert(
+        "getElementById".to_string(),
+        func(|document, args| {
+            let id = arg(&args, 0).to_js_string();
+            if id.is_empty() {
+                return Value::Null;
+            }
+            element_or_null(
+                virtual_document_elements(&document)
+                    .into_iter()
+                    .find(|node| dom::get_attribute(*node, "id").as_deref() == Some(&id)),
+            )
+        }),
+    );
+    props.insert(
+        "getElementsByTagName".to_string(),
+        func(move |document, args| {
+            let tag = arg(&args, 0).to_js_string();
+            let provider_document = document.clone();
+            html_collection(move || {
+                virtual_document_elements(&provider_document)
+                    .into_iter()
+                    .filter(|node| element_matches_tag_name(*node, &tag, html_document))
+                    .map(element_value)
+                    .collect()
+            })
+        }),
+    );
+    props.insert(
+        "getElementsByTagNameNS".to_string(),
+        func(|document, args| {
+            let namespace = normalized_namespace(&arg(&args, 0));
+            let local_name = arg(&args, 1).to_js_string();
+            let provider_document = document.clone();
+            html_collection(move || {
+                virtual_document_elements(&provider_document)
+                    .into_iter()
+                    .filter(|node| element_matches_namespace(*node, &namespace, &local_name))
+                    .map(element_value)
+                    .collect()
+            })
+        }),
+    );
+    props.insert(
+        "getElementsByClassName".to_string(),
+        func(|document, args| {
+            let class_names = arg(&args, 0).to_js_string();
+            let provider_document = document.clone();
+            html_collection(move || {
+                virtual_document_elements(&provider_document)
+                    .into_iter()
+                    .filter(|node| element_matches_class_names(*node, &class_names))
+                    .map(element_value)
+                    .collect()
+            })
+        }),
+    );
+    props.insert(
+        "isSameNode".to_string(),
+        func(|document, args| Value::Bool(document.strict_eq(&arg(&args, 0)))),
+    );
+    props.insert(
+        "normalize".to_string(),
+        func(|document, _| {
+            for child in virtual_document_children(&document) {
+                if let Some(node) = node_id_of(&child) {
+                    normalize_node_subtree(node);
+                }
+            }
+            Value::Undefined
+        }),
+    );
+    props.insert("getRootNode".to_string(), func(|document, _| document));
+    props.insert("parentNode".to_string(), Value::Null);
+    props.insert("parentElement".to_string(), Value::Null);
+    props.insert(
+        "adoptNode".to_string(),
+        func(|document, args| adopt_node_into(&document, arg(&args, 0))),
+    );
+    props.insert(
+        "importNode".to_string(),
+        func(|document, args| import_node_into(&document, arg(&args, 0), arg(&args, 1).to_bool())),
+    );
+    for (name, prepend) in [("append", false), ("prepend", true)] {
+        props.insert(
+            name.to_string(),
+            func(move |document, args| {
+                validate_document_parent_node_insertion(&document, &args, prepend);
+                insert_virtual_document_children(&document, args, prepend);
+                Value::Undefined
+            }),
+        );
+    }
+    props.insert(
+        "appendChild".to_string(),
+        func(|document, args| {
+            let child = arg(&args, 0);
+            validate_document_parent_node_insertion(&document, std::slice::from_ref(&child), false);
+            insert_virtual_document_children(&document, vec![child.clone()], false);
+            child
+        }),
+    );
+    install_virtual_document_node_mutations(&mut props);
+    let document = document_node_value(props);
+    implementation.set_property("__w3cos_owner_document", document.clone());
+    w3cos_core::class::set_prototype_of(
+        &document,
+        &crate::dom_constructors::prototype(prototype_name),
+    );
+    document
+}
+
+pub(crate) fn document_fragment_value() -> Value {
+    element_value(dom::create_document_fragment())
+}
+
+pub(crate) fn document_fragment_get_element_by_id(fragment: Value, args: Vec<Value>) -> Value {
+    let Some(node) = node_id_of(&fragment) else {
+        return Value::Null;
+    };
+    let id = arg(&args, 0).to_js_string();
+    if id.is_empty() {
+        return Value::Null;
+    }
+    descendant_elements(node)
+        .into_iter()
+        .find(|candidate| dom::get_attribute(*candidate, "id").as_deref() == Some(id.as_str()))
+        .map(element_value)
+        .unwrap_or(Value::Null)
+}
+
+pub(crate) fn node_prototype_insert_before(receiver: Value, args: Vec<Value>) -> Value {
+    if let Some(node) = node_id_of(&receiver) {
+        return element_computed_get(node, "insertBefore").call(receiver, args);
+    }
+    if receiver.get_property("nodeType").to_u32() == 9
+        && receiver
+            .get_property("__w3cos_document_children")
+            .as_array()
+            .is_some()
+    {
+        return virtual_document_insert_before(receiver, args);
+    }
+
+    if args.len() < 2 {
+        type_error("insertBefore requires 2 arguments");
+    }
+    if !is_dom_node_value(&arg(&args, 0)) {
+        type_error("insertBefore requires a Node as its first argument");
+    }
+    dom_exception(
+        "This node type cannot contain children",
+        "HierarchyRequestError",
+    )
+}
+
+pub(crate) fn node_prototype_replace_child(receiver: Value, args: Vec<Value>) -> Value {
+    if let Some(node) = node_id_of(&receiver) {
+        return element_computed_get(node, "replaceChild").call(receiver, args);
+    }
+    if receiver.get_property("nodeType").to_u32() == 9
+        && receiver
+            .get_property("__w3cos_document_children")
+            .as_array()
+            .is_some()
+    {
+        return virtual_document_replace_child(receiver, args);
+    }
+
+    if args.len() < 2 {
+        type_error("replaceChild requires 2 arguments");
+    }
+    if !is_dom_node_value(&arg(&args, 0)) || !is_dom_node_value(&arg(&args, 1)) {
+        type_error("replaceChild requires Node arguments");
+    }
+    dom_exception(
+        "This node type cannot contain children",
+        "HierarchyRequestError",
+    )
+}
+
+pub(crate) fn node_prototype_clone_node(receiver: Value, args: Vec<Value>) -> Value {
+    let Some(node) = node_id_of(&receiver) else {
+        type_error("Node.prototype.cloneNode called on an incompatible receiver");
+    };
+    element_computed_get(node, "cloneNode").call(receiver, args)
+}
+
+pub(crate) fn element_prototype_attach_shadow(receiver: Value, args: Vec<Value>) -> Value {
+    let Some(node) = node_id_of(&receiver) else {
+        type_error("Element.prototype.attachShadow called on an incompatible receiver");
+    };
+    element_computed_get(node, "attachShadow").call(receiver, args)
+}
+
+pub(crate) fn shadow_root_prototype_inner_html_get(receiver: Value) -> Value {
+    node_id_of(&receiver)
+        .map(|node| element_computed_get(node, "innerHTML"))
+        .unwrap_or(Value::Undefined)
+}
+
+pub(crate) fn shadow_root_prototype_inner_html_set(receiver: Value, args: Vec<Value>) -> Value {
+    let Some(node) = node_id_of(&receiver) else {
+        type_error("ShadowRoot.innerHTML requires a ShadowRoot receiver");
+    };
+    element_computed_set(node, "innerHTML", arg(&args, 0));
+    Value::Undefined
+}
+
+fn dom_node_parent(node: &Value) -> Option<Value> {
+    let parent = node.get_property("parentNode");
+    (!parent.is_nullish() && is_dom_node_value(&parent)).then_some(parent)
+}
+
+fn dom_node_ancestor_path(node: &Value) -> Vec<Value> {
+    let mut path = vec![node.clone()];
+    while let Some(parent) = dom_node_parent(path.last().expect("a node path is never empty")) {
+        if path.iter().any(|ancestor| ancestor.strict_eq(&parent)) {
+            break;
+        }
+        path.push(parent);
+    }
+    path
+}
+
+fn disconnected_node_order(root: &Value) -> u64 {
+    const KEY: &str = "__w3cos_disconnected_node_order";
+    let existing = root.get_property(KEY).to_number();
+    if existing.is_finite() && existing >= 1.0 {
+        return existing as u64;
+    }
+    let next = NEXT_DISCONNECTED_NODE_ORDER.with(|order| {
+        let next = order.get();
+        order.set(next.saturating_add(1));
+        next
+    });
+    root.set_property(KEY, Value::Number(next as f64));
+    next
+}
+
+fn dom_node_children(node: &Value) -> Vec<Value> {
+    if node.get_property("nodeType").to_u32() == 9 {
+        if node.strict_eq(&document_value()) {
+            return global_document_children();
+        }
+        return virtual_document_children(node);
+    }
+    node_id_of(node)
+        .map(dom::children)
+        .unwrap_or_default()
+        .into_iter()
+        .map(element_value)
+        .collect()
+}
+
+pub(crate) fn node_prototype_contains(receiver: Value, args: Vec<Value>) -> Value {
+    if !is_dom_node_value(&receiver) {
+        type_error("Node.prototype.contains called on an incompatible receiver");
+    }
+    let other = arg(&args, 0);
+    if other.is_nullish() {
+        return Value::Bool(false);
+    }
+    if !is_dom_node_value(&other) {
+        type_error("Node.prototype.contains requires a Node or null");
+    }
+    Value::Bool(
+        receiver.strict_eq(&other)
+            || dom_node_ancestor_path(&other)
+                .into_iter()
+                .skip(1)
+                .any(|ancestor| ancestor.strict_eq(&receiver)),
+    )
+}
+
+pub(crate) fn node_prototype_compare_document_position(
+    receiver: Value,
+    args: Vec<Value>,
+) -> Value {
+    const DISCONNECTED: u16 = 0x01;
+    const PRECEDING: u16 = 0x02;
+    const FOLLOWING: u16 = 0x04;
+    const CONTAINS: u16 = 0x08;
+    const CONTAINED_BY: u16 = 0x10;
+    const IMPLEMENTATION_SPECIFIC: u16 = 0x20;
+
+    if !is_dom_node_value(&receiver) {
+        type_error("Node.prototype.compareDocumentPosition called on an incompatible receiver");
+    }
+    let other = arg(&args, 0);
+    if !is_dom_node_value(&other) {
+        type_error("Node.prototype.compareDocumentPosition requires a Node");
+    }
+    if receiver.strict_eq(&other) {
+        return Value::Number(0.0);
+    }
+
+    let receiver_path = dom_node_ancestor_path(&receiver);
+    let other_path = dom_node_ancestor_path(&other);
+    let receiver_root = receiver_path.last().expect("a node path has a root");
+    let other_root = other_path.last().expect("a node path has a root");
+    if !receiver_root.strict_eq(other_root) {
+        let direction = if disconnected_node_order(receiver_root)
+            < disconnected_node_order(other_root)
+        {
+            FOLLOWING
+        } else {
+            PRECEDING
+        };
+        return Value::Number((DISCONNECTED | IMPLEMENTATION_SPECIFIC | direction) as f64);
+    }
+
+    if receiver_path
+        .iter()
+        .skip(1)
+        .any(|ancestor| ancestor.strict_eq(&other))
+    {
+        return Value::Number((CONTAINS | PRECEDING) as f64);
+    }
+    if other_path
+        .iter()
+        .skip(1)
+        .any(|ancestor| ancestor.strict_eq(&receiver))
+    {
+        return Value::Number((CONTAINED_BY | FOLLOWING) as f64);
+    }
+
+    let receiver_from_root = receiver_path.iter().rev().collect::<Vec<_>>();
+    let other_from_root = other_path.iter().rev().collect::<Vec<_>>();
+    let divergent_index = receiver_from_root
+        .iter()
+        .zip(&other_from_root)
+        .position(|(left, right)| !left.strict_eq(right))
+        .expect("distinct nodes in one tree must have divergent branches");
+    let common_parent = receiver_from_root[divergent_index - 1];
+    let receiver_branch = receiver_from_root[divergent_index];
+    let other_branch = other_from_root[divergent_index];
+    let children = dom_node_children(common_parent);
+    let receiver_index = children
+        .iter()
+        .position(|child| child.strict_eq(receiver_branch));
+    let other_index = children
+        .iter()
+        .position(|child| child.strict_eq(other_branch));
+    let direction = if receiver_index.zip(other_index).is_some_and(|(left, right)| left < right) {
+        FOLLOWING
+    } else {
+        PRECEDING
+    };
+    Value::Number(direction as f64)
+}
+
+pub(crate) fn node_prototype_has_child_nodes(receiver: Value, _args: Vec<Value>) -> Value {
+    if !is_dom_node_value(&receiver) {
+        type_error("Node.prototype.hasChildNodes called on an incompatible receiver");
+    }
+    if receiver.get_property("nodeType").to_u32() == 9 {
+        let children = if receiver.strict_eq(&document_value()) {
+            global_document_children()
+        } else {
+            virtual_document_children(&receiver)
+        };
+        return Value::Bool(!children.is_empty());
+    }
+    Value::Bool(
+        node_id_of(&receiver)
+            .and_then(dom::first_child)
+            .is_some(),
+    )
+}
+
+fn validate_document_parent_node_insertion(document: &Value, args: &[Value], prepend: bool) {
+    let existing_children = virtual_document_children(document);
+    let existing_element_count = existing_children
+        .iter()
+        .filter(|child| child.get_property("nodeType").to_u32() == 1)
+        .count();
+    let existing_doctype_count = existing_children
+        .iter()
+        .filter(|child| child.get_property("nodeType").to_u32() == 10)
+        .count();
+    let mut inserted_element_count = 0;
+    let mut inserted_doctype_count = 0;
+
+    for argument in args {
+        let Some(node) = node_id_of(argument) else {
+            dom_exception(
+                "Documents cannot be inserted into documents and text is not a valid document child",
+                "HierarchyRequestError",
+            );
+        };
+
+        match dom::node_type(node) {
+            3 => dom_exception(
+                "Text is not a valid document child",
+                "HierarchyRequestError",
+            ),
+            10 => inserted_doctype_count += 1,
+            1 => inserted_element_count += 1,
+            11 => {
+                let children = dom::children(node);
+                let element_count = children
+                    .iter()
+                    .filter(|child| dom::node_type(**child) == 1)
+                    .count();
+                let contains_text = children.iter().any(|child| dom::node_type(*child) == 3);
+                let doctype_count = children
+                    .iter()
+                    .filter(|child| dom::node_type(**child) == 10)
+                    .count();
+                if contains_text {
+                    dom_exception(
+                        "The document fragment is not a valid document child sequence",
+                        "HierarchyRequestError",
+                    );
+                }
+                inserted_element_count += element_count;
+                inserted_doctype_count += doctype_count;
+            }
+            _ => {}
+        }
+    }
+
+    if existing_element_count + inserted_element_count > 1 {
+        dom_exception(
+            "A document can contain only one element",
+            "HierarchyRequestError",
+        );
+    }
+    if existing_doctype_count + inserted_doctype_count > 1
+        || (!prepend && inserted_doctype_count > 0 && existing_element_count > 0)
+    {
+        dom_exception(
+            "The document already has a doctype or the requested position follows its element",
+            "HierarchyRequestError",
+        );
+    }
+}
+
+fn virtual_document_children(document: &Value) -> Vec<Value> {
+    document
+        .get_property("__w3cos_document_children")
+        .as_array()
+        .map(|children| children.borrow().clone())
+        .unwrap_or_default()
+}
+
+fn virtual_document_child_nodes(document: Value) -> Value {
+    let cached = document.get_property("__w3cos_cached_child_nodes");
+    if !cached.is_undefined() {
+        return cached;
+    }
+    let provider_document = document.clone();
+    let list = live_node_list(move || virtual_document_children(&provider_document));
+    document.set_property("__w3cos_cached_child_nodes", list.clone());
+    list
+}
+
+fn set_virtual_document_children(document: &Value, children: Vec<Value>) {
+    for child in virtual_document_children(document) {
+        if let Some(node) = node_id_of(&child) {
+            set_expando(node, "parentNode", Value::Null);
+            set_expando(node, "previousSibling", Value::Null);
+            set_expando(node, "nextSibling", Value::Null);
+        }
+    }
+    for (index, child) in children.iter().enumerate() {
+        if let Some(node) = node_id_of(child) {
+            set_expando(node, "ownerDocument", document.clone());
+            set_expando(node, "parentNode", document.clone());
+            set_expando(
+                node,
+                "previousSibling",
+                index
+                    .checked_sub(1)
+                    .and_then(|previous| children.get(previous))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            set_expando(
+                node,
+                "nextSibling",
+                children.get(index + 1).cloned().unwrap_or(Value::Null),
+            );
+        }
+    }
+    let first = children.first().cloned().unwrap_or(Value::Null);
+    let last = children.last().cloned().unwrap_or(Value::Null);
+    let doctype = children
+        .iter()
+        .find(|child| child.get_property("nodeType").to_u32() == 10)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let document_element = children
+        .iter()
+        .find(|child| child.get_property("nodeType").to_u32() == 1)
+        .cloned()
+        .unwrap_or(Value::Null);
+    document.set_property("__w3cos_document_children", js_array(children.clone()));
+    document.set_property("firstChild", first);
+    document.set_property("lastChild", last);
+    document.set_property("doctype", doctype);
+    document.set_property("documentElement", document_element);
+}
+
+fn is_dom_node_value(value: &Value) -> bool {
+    node_id_of(value).is_some()
+        || matches!(value.get_property("nodeType").to_u32(), 2 | 9)
+}
+
+fn validate_virtual_document_child_sequence(children: &[Value]) {
+    let mut element_index = None;
+    let mut doctype_index = None;
+    for (index, child) in children.iter().enumerate() {
+        let node_type = child.get_property("nodeType").to_u32();
+        match node_type {
+            1 if element_index.replace(index).is_some() => dom_exception(
+                "A document can contain only one element",
+                "HierarchyRequestError",
+            ),
+            10 if doctype_index.replace(index).is_some() => dom_exception(
+                "A document can contain only one doctype",
+                "HierarchyRequestError",
+            ),
+            3 | 4 => dom_exception(
+                "Text is not a valid document child",
+                "HierarchyRequestError",
+            ),
+            1 | 7 | 8 | 10 => {}
+            _ => dom_exception(
+                "This node type is not a valid document child",
+                "HierarchyRequestError",
+            ),
+        }
+    }
+    if doctype_index
+        .zip(element_index)
+        .is_some_and(|(doctype, element)| doctype > element)
+    {
+        dom_exception(
+            "A document doctype must precede its element",
+            "HierarchyRequestError",
+        );
+    }
+}
+
+fn virtual_document_insert_before(document: Value, args: Vec<Value>) -> Value {
+    if args.len() < 2 {
+        type_error("insertBefore requires 2 arguments");
+    }
+    let new_child = arg(&args, 0);
+    let reference = arg(&args, 1);
+    if !is_dom_node_value(&new_child) {
+        type_error("insertBefore requires a Node as its first argument");
+    }
+
+    // DOM pre-insert checks the parent and host-including ancestry before
+    // reference membership and node-position validity.
+    if new_child.get_property("nodeType").to_u32() == 9 {
+        dom_exception("Documents cannot be inserted", "HierarchyRequestError");
+    }
+    let children = virtual_document_children(&document);
+    let reference = if reference.is_null() || reference.is_undefined() {
+        None
+    } else {
+        if !is_dom_node_value(&reference) {
+            type_error("insertBefore reference must be a Node, null, or undefined");
+        }
+        if !children
+            .iter()
+            .any(|existing| existing.strict_eq(&reference))
+        {
+            dom_exception(
+                "The reference node is not a child of this parent",
+                "NotFoundError",
+            );
+        }
+        Some(reference)
+    };
+
+    if reference
+        .as_ref()
+        .is_some_and(|reference| reference.strict_eq(&new_child))
+    {
+        return new_child;
+    }
+
+    let node = node_id_of(&new_child)
+        .unwrap_or_else(|| dom_exception("This node cannot be inserted", "HierarchyRequestError"));
+    let inserted = if dom::node_type(node) == 11 {
+        dom::children(node)
+            .into_iter()
+            .map(element_value)
+            .collect::<Vec<_>>()
+    } else {
+        vec![new_child.clone()]
+    };
+
+    let mut candidate = children;
+    candidate.retain(|existing| {
+        !inserted
+            .iter()
+            .any(|inserted| inserted.strict_eq(existing))
+    });
+    let insertion_index = reference
+        .as_ref()
+        .and_then(|reference| {
+            candidate
+                .iter()
+                .position(|existing| existing.strict_eq(reference))
+        })
+        .unwrap_or(candidate.len());
+    candidate.splice(insertion_index..insertion_index, inserted.iter().cloned());
+    validate_virtual_document_child_sequence(&candidate);
+
+    for inserted in &inserted {
+        adopt_node_into(&document, inserted.clone());
+    }
+    set_virtual_document_children(&document, candidate);
+    new_child
+}
+
+fn virtual_document_replace_child(document: Value, args: Vec<Value>) -> Value {
+    if args.len() < 2 {
+        type_error("replaceChild requires 2 arguments");
+    }
+    let new_child = arg(&args, 0);
+    let old_child = arg(&args, 1);
+    if !is_dom_node_value(&new_child) || !is_dom_node_value(&old_child) {
+        type_error("replaceChild requires Node arguments");
+    }
+
+    let children = virtual_document_children(&document);
+    if !children
+        .iter()
+        .any(|existing| existing.strict_eq(&old_child))
+    {
+        dom_exception("The node is not a child of this parent", "NotFoundError");
+    }
+    if new_child.strict_eq(&old_child) {
+        return old_child;
+    }
+    if new_child.get_property("nodeType").to_u32() == 9 {
+        dom_exception("Documents cannot be inserted", "HierarchyRequestError");
+    }
+    let node = node_id_of(&new_child)
+        .unwrap_or_else(|| dom_exception("This node cannot be inserted", "HierarchyRequestError"));
+    let inserted = if dom::node_type(node) == 11 {
+        dom::children(node)
+            .into_iter()
+            .map(element_value)
+            .collect::<Vec<_>>()
+    } else {
+        vec![new_child]
+    };
+
+    let mut candidate = children;
+    candidate.retain(|existing| {
+        !inserted
+            .iter()
+            .any(|inserted| inserted.strict_eq(existing))
+    });
+    let old_index = candidate
+        .iter()
+        .position(|existing| existing.strict_eq(&old_child))
+        .expect("the replaced document child remains after moving inserted nodes");
+    candidate.splice(old_index..=old_index, inserted.iter().cloned());
+    validate_virtual_document_child_sequence(&candidate);
+
+    for inserted in &inserted {
+        adopt_node_into(&document, inserted.clone());
+    }
+    set_virtual_document_children(&document, candidate);
+    old_child
+}
+
+fn virtual_document_move_before(document: Value, args: Vec<Value>) -> Value {
+    if args.len() < 2 {
+        type_error("moveBefore requires 2 arguments");
+    }
+    let moving = arg(&args, 0);
+    let reference = arg(&args, 1);
+    if !is_dom_node_value(&moving) {
+        type_error("moveBefore requires a Node as its first argument");
+    }
+    if !reference.is_null() && !reference.is_undefined() && !is_dom_node_value(&reference) {
+        type_error("moveBefore reference must be a Node, null, or undefined");
+    }
+    let Some(moving_id) = node_id_of(&moving) else {
+        dom_exception(
+            "Only Element and CharacterData nodes can be moved",
+            "HierarchyRequestError",
+        );
+    };
+
+    let moving_document = get_expando(moving_id, "ownerDocument").unwrap_or_else(document_value);
+    if !moving_document.strict_eq(&document) || !node_is_connected(moving_id) {
+        dom_exception(
+            "The destination and moved node must have the same shadow-including root",
+            "HierarchyRequestError",
+        );
+    }
+
+    // A preserved move into a Document may place document-compatible
+    // CharacterData there, but it cannot move the document element/doctype or
+    // introduce Text. This is intentionally narrower than ordinary pre-insert.
+    if !matches!(dom::node_type(moving_id), 7 | 8) {
+        dom_exception(
+            "This node type cannot be moved directly into a Document",
+            "HierarchyRequestError",
+        );
+    }
+
+    let children = virtual_document_children(&document);
+    let reference = if reference.is_null() || reference.is_undefined() {
+        None
+    } else {
+        if !children
+            .iter()
+            .any(|existing| existing.strict_eq(&reference))
+        {
+            dom_exception(
+                "The reference node is not a child of this parent",
+                "NotFoundError",
+            );
+        }
+        Some(reference)
+    };
+    if reference
+        .as_ref()
+        .is_some_and(|reference| reference.strict_eq(&moving))
+    {
+        return Value::Undefined;
+    }
+
+    let mut candidate = children
+        .into_iter()
+        .filter(|existing| !existing.strict_eq(&moving))
+        .collect::<Vec<_>>();
+    let insertion_index = reference
+        .as_ref()
+        .and_then(|reference| {
+            candidate
+                .iter()
+                .position(|existing| existing.strict_eq(reference))
+        })
+        .unwrap_or(candidate.len());
+
+    with_deferred_dom_post_insertion_steps(|| {
+        if let Some(parent) = dom::parent_node(moving_id) {
+            dom::remove_child(parent, moving_id);
+        }
+        candidate.insert(insertion_index, moving.clone());
+        set_virtual_document_children(&document, candidate);
+    });
+    pin_element_subtree(moving_id);
+    Value::Undefined
+}
+
+fn install_virtual_document_node_mutations(props: &mut HashMap<String, Value>) {
+    props.insert(
+        "removeChild".to_string(),
+        func(|document, args| {
+            let child = arg(&args, 0);
+            if !is_dom_node_value(&child) {
+                type_error("removeChild requires a Node");
+            }
+            let mut children = virtual_document_children(&document);
+            let Some(index) = children
+                .iter()
+                .position(|existing| existing.strict_eq(&child))
+            else {
+                dom_exception("The node is not a child of this parent", "NotFoundError");
+            };
+            children.remove(index);
+            set_virtual_document_children(&document, children);
+            child
+        }),
+    );
+    let insert_before = func(virtual_document_insert_before);
+    insert_before.set_property("length", Value::Number(2.0));
+    props.insert("insertBefore".to_string(), insert_before);
+    let replace_child = func(virtual_document_replace_child);
+    replace_child.set_property("length", Value::Number(2.0));
+    props.insert("replaceChild".to_string(), replace_child);
+    let move_before = func(virtual_document_move_before);
+    move_before.set_property("length", Value::Number(2.0));
+    props.insert("moveBefore".to_string(), move_before);
+}
+
+fn replace_virtual_document_children(document: &Value, arguments: Vec<Value>) {
+    let mut replacements = Vec::new();
+    for argument in arguments {
+        let Some(node) = node_id_of(&argument) else {
+            dom_exception(
+                "Only document fragments, doctypes, elements, character data, and comments can be document children",
+                "HierarchyRequestError",
+            );
+        };
+        if dom::node_type(node) == 11 {
+            replacements.extend(dom::children(node).into_iter().map(element_value));
+        } else {
+            replacements.push(argument);
+        }
+    }
+
+    let mut element_index = None;
+    let mut doctype_index = None;
+    for (index, replacement) in replacements.iter().enumerate() {
+        let node = node_id_of(replacement).expect("document replacement nodes were normalized");
+        match dom::node_type(node) {
+            1 if element_index.replace(index).is_some() => dom_exception(
+                "A document can contain only one element",
+                "HierarchyRequestError",
+            ),
+            10 if doctype_index.replace(index).is_some() => dom_exception(
+                "A document can contain only one doctype",
+                "HierarchyRequestError",
+            ),
+            3 | 4 => dom_exception(
+                "Text is not a valid document child",
+                "HierarchyRequestError",
+            ),
+            1 | 7 | 8 | 10 => {}
+            _ => dom_exception(
+                "This node type is not a valid document child",
+                "HierarchyRequestError",
+            ),
+        }
+    }
+    if doctype_index
+        .zip(element_index)
+        .is_some_and(|(doctype, element)| doctype > element)
+    {
+        dom_exception(
+            "A document doctype must precede its element",
+            "HierarchyRequestError",
+        );
+    }
+
+    for replacement in &replacements {
+        adopt_node_into(document, replacement.clone());
+    }
+    set_virtual_document_children(document, replacements);
+}
+
+fn insert_virtual_document_children(document: &Value, args: Vec<Value>, prepend: bool) {
+    let mut inserted = Vec::new();
+    for argument in args {
+        let Some(node) = node_id_of(&argument) else {
+            continue;
+        };
+        if dom::node_type(node) == 11 {
+            inserted.extend(dom::children(node).into_iter().map(element_value));
+        } else {
+            inserted.push(argument);
+        }
+    }
+    let mut children = virtual_document_children(document);
+    for child in &inserted {
+        children.retain(|existing| !existing.strict_eq(child));
+    }
+    if prepend {
+        inserted.extend(children);
+        set_virtual_document_children(document, inserted);
+    } else {
+        children.extend(inserted);
+        set_virtual_document_children(document, children);
+    }
+}
+
+fn adopt_node_into(document: &Value, node: Value) -> Value {
+    let Some(id) = node_id_of(&node) else {
+        if node.get_property("nodeType").to_u32() == 9 {
+            dom_exception("Documents cannot be adopted", "NotSupportedError");
+        }
+        return node;
+    };
+
+    if let Some(parent) = dom::parent_node(id) {
+        dom::remove_child(parent, id);
+    }
+    if let Some(parent_document) = get_expando(id, "parentNode")
+        && parent_document.get_property("nodeType").to_u32() == 9
+    {
+        if parent_document
+            .get_property("__w3cos_document_children")
+            .as_array()
+            .is_some()
+        {
+            let children = virtual_document_children(&parent_document)
+                .into_iter()
+                .filter(|child| !child.strict_eq(&node))
+                .collect();
+            set_virtual_document_children(&parent_document, children);
+        } else if parent_document.get_property("doctype").strict_eq(&node) {
+            parent_document.set_property("doctype", Value::Null);
+        }
+    }
+    set_expando(id, "parentNode", Value::Null);
+    walk_subtree(id, &mut |child| {
+        set_expando(child, "ownerDocument", document.clone());
+        update_cached_attribute_owner_document(child, document);
+    });
+    node
+}
+
+fn import_node_into(document: &Value, node: Value, deep: bool) -> Value {
+    if node.get_property("nodeType").to_u32() == 9 {
+        dom_exception("Documents cannot be imported", "NotSupportedError");
+    }
+    if let Some(id) = node_id_of(&node) {
+        let clone = dom::clone_node(id, deep);
+        copy_cloned_node_identity(id, clone);
+        walk_subtree(clone, &mut |child| {
+            set_expando(child, "ownerDocument", document.clone())
+        });
+        return element_value(clone);
+    }
+    if node.get_property("nodeType").to_u32() == 2 {
+        let imported = Value::object(HashMap::from([
+            ("nodeType".to_string(), Value::Number(2.0)),
+            ("nodeName".to_string(), node.get_property("nodeName")),
+            ("nodeValue".to_string(), node.get_property("nodeValue")),
+            ("name".to_string(), node.get_property("name")),
+            ("value".to_string(), node.get_property("value")),
+            ("prefix".to_string(), node.get_property("prefix")),
+            (
+                "namespaceURI".to_string(),
+                node.get_property("namespaceURI"),
+            ),
+            ("localName".to_string(), node.get_property("localName")),
+            ("ownerDocument".to_string(), document.clone()),
+            ("ownerElement".to_string(), Value::Null),
+            ("specified".to_string(), Value::Bool(true)),
+        ]));
+        w3cos_core::class::set_prototype_of(&imported, &crate::dom_constructors::prototype("Attr"));
+        return imported;
+    }
+    Value::Null
+}
+
 fn parse_document(source: &str, content_type: &str) -> Value {
     parse_document_mode(source, content_type, false)
 }
 
-fn parse_document_mode(source: &str, content_type: &str, sanitize: bool) -> Value {
-    let container = dom::create_element("div");
-    if sanitize {
-        append_sanitized_html_fragment(container, source);
-    } else {
-        append_html_fragment(container, source);
+fn html_start_tag_attributes(source: &str, expected_tag: &str) -> Vec<(String, String)> {
+    let bytes = source.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let Some(relative_start) = source[pos..].find('<') else {
+            break;
+        };
+        let start = pos + relative_start + 1;
+        if start >= bytes.len() || matches!(bytes[start], b'/' | b'!' | b'?') {
+            pos = start;
+            continue;
+        }
+        let mut name_end = start;
+        while name_end < bytes.len()
+            && (bytes[name_end].is_ascii_alphanumeric() || matches!(bytes[name_end], b'-' | b':'))
+        {
+            name_end += 1;
+        }
+        if !source[start..name_end].eq_ignore_ascii_case(expected_tag) {
+            pos = name_end.max(start + 1);
+            continue;
+        }
+        let mut end = name_end;
+        let mut quote = None;
+        while end < bytes.len() {
+            match (quote, bytes[end]) {
+                (Some(active), current) if active == current => quote = None,
+                (None, current @ (b'\'' | b'"')) => quote = Some(current),
+                (None, b'>') => return parse_html_attributes(&source[name_end..end]),
+                _ => {}
+            }
+            end += 1;
+        }
+        break;
     }
+    Vec::new()
+}
+
+fn apply_html_start_tag_attributes(node: u32, source: &str, tag: &str) {
+    for (name, value) in html_start_tag_attributes(source, tag) {
+        apply_html_attribute(node, &name, &value);
+    }
+}
+
+fn html_document_type_name(source: &str) -> Option<String> {
+    let lower = source.to_ascii_lowercase();
+    let marker = "<!doctype";
+    let marker_end = lower.find(marker)? + marker.len();
+    let remainder = source
+        .get(marker_end..)?
+        .trim_start_matches(['\u{0009}', '\u{000a}', '\u{000c}', '\u{000d}', '\u{0020}']);
+    let name_end = remainder
+        .find(|character: char| {
+            matches!(
+                character,
+                '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' | '\u{0020}' | '>'
+            )
+        })
+        .unwrap_or(remainder.len());
+    let name = remainder.get(..name_end)?;
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+fn parse_document_mode(source: &str, content_type: &str, sanitize: bool) -> Value {
     let supported = matches!(
         content_type,
         "text/html" | "text/xml" | "application/xml" | "application/xhtml+xml" | "image/svg+xml"
     );
+    let container = dom::create_element("div");
+    if sanitize {
+        append_sanitized_html_fragment(container, source);
+    } else if content_type == "text/html" || !supported {
+        append_html_fragment(container, source);
+    } else {
+        if let Err(error) = crate::xml_tree_builder::append_xml_document_fragment(container, source)
+        {
+            let parser_error = dom::create_element("parsererror");
+            dom::set_text_content(parser_error, &error.to_string());
+            return parsed_document_value(parser_error, "application/xml", None, None);
+        }
+    }
     if !supported {
         let error = dom::create_element("parsererror");
         dom::set_text_content(error, &format!("Unsupported MIME type: {content_type}"));
@@ -1821,12 +5316,20 @@ fn parse_document_mode(source: &str, content_type: &str, sanitize: bool) -> Valu
             dom::append_child(html, node);
             body = Some(node);
         }
+        apply_html_start_tag_attributes(html, source, "html");
+        apply_html_start_tag_attributes(head.expect("HTML head was created"), source, "head");
+        apply_html_start_tag_attributes(body.expect("HTML body was created"), source, "body");
         if existing_html.is_none() {
             for child in dom::children(container) {
-                dom::append_child(body.unwrap(), child);
+                dom::append_child(body.expect("HTML body was created"), child);
             }
         }
-        return parsed_document_value(html, content_type, head, body);
+        let document = parsed_document_value(html, content_type, head, body);
+        if let Some(name) = html_document_type_name(source) {
+            let doctype = create_document_type_value(&name, "", "");
+            set_virtual_document_children(&document, vec![doctype, element_value(html)]);
+        }
+        return document;
     }
 
     XML_PARSER_WARNING_EMITTED.with(|warned| {
@@ -1837,11 +5340,31 @@ fn parse_document_mode(source: &str, content_type: &str, sanitize: bool) -> Valu
             );
         }
     });
-    let root = first_element_child(container).unwrap_or_else(|| {
+    let root = first_element_child(container);
+    if root.is_none() {
+        let children = dom::children(container);
+        if children.iter().any(|node| dom::node_type(*node) == 7) {
+            let document = empty_document_value(content_type, "XMLDocument");
+            let children = children
+                .into_iter()
+                .map(|node| {
+                    dom::remove_child(container, node);
+                    set_expando(node, "ownerDocument", document.clone());
+                    element_value(node)
+                })
+                .collect();
+            set_virtual_document_children(&document, children);
+            return document;
+        }
+    }
+    let root = root.unwrap_or_else(|| {
         let error = dom::create_element("parsererror");
         dom::set_text_content(error, "No document element");
         error
     });
+    if dom::parent_node(root) == Some(container) {
+        dom::remove_child(container, root);
+    }
     if content_type == "image/svg+xml" {
         set_expando(
             root,
@@ -1849,7 +5372,24 @@ fn parse_document_mode(source: &str, content_type: &str, sanitize: bool) -> Valu
             Value::string("http://www.w3.org/2000/svg"),
         );
     }
-    parsed_document_value(root, content_type, None, None)
+    let xhtml_document = namespace_uri(root) == crate::html_parser_state::HTML_NAMESPACE
+        && dom::tag_name(root) == "html";
+    let head = xhtml_document.then(|| {
+        child_elements(root)
+            .into_iter()
+            .find(|node| dom::tag_name(*node) == "head")
+    });
+    let body = xhtml_document.then(|| {
+        child_elements(root)
+            .into_iter()
+            .find(|node| dom::tag_name(*node) == "body")
+    });
+    let document = parsed_document_value(root, content_type, head.flatten(), body.flatten());
+    if let Some(name) = html_document_type_name(source) {
+        let doctype = create_document_type_value(&name, "", "");
+        set_virtual_document_children(&document, vec![doctype, element_value(root)]);
+    }
+    document
 }
 
 pub(crate) fn sanitized_document_value(source: &str) -> Value {
@@ -2029,6 +5569,17 @@ fn eval_compat_value() -> Value {
         if !input.is_string() {
             return input;
         }
+        #[cfg(feature = "dynamic-js")]
+        {
+            return crate::dynamic_script::evaluate_global_expression(&input.to_js_string())
+                .unwrap_or_else(|error| {
+                    w3cos_core::throw_value(w3cos_core::error_instance(
+                        "EvalError",
+                        vec![Value::string(&error.to_string())],
+                    ))
+                });
+        }
+        #[cfg(not(feature = "dynamic-js"))]
         EVAL_WARNING_EMITTED.with(|warned| {
             if !warned.replace(true) {
                 eprintln!(
@@ -2037,12 +5588,25 @@ fn eval_compat_value() -> Value {
                 );
             }
         });
+        #[cfg(not(feature = "dynamic-js"))]
         Value::Undefined
     })
 }
 
 fn function_compat_class() -> Value {
-    let class = Value::function(|_, _| {
+    let class = Value::function(|_, args| {
+        #[cfg(feature = "dynamic-js")]
+        {
+            return crate::dynamic_script::construct_global_function(&args).unwrap_or_else(
+                |error| {
+                    w3cos_core::throw_value(w3cos_core::error_instance(
+                        "SyntaxError",
+                        vec![Value::string(&error.to_string())],
+                    ))
+                },
+            );
+        }
+        #[cfg(not(feature = "dynamic-js"))]
         FUNCTION_WARNING_EMITTED.with(|warned| {
             if !warned.replace(true) {
                 eprintln!(
@@ -2051,12 +5615,124 @@ fn function_compat_class() -> Value {
                 );
             }
         });
+        #[cfg(not(feature = "dynamic-js"))]
         Value::function(|_, _| Value::Undefined)
     });
     class.set_property("name", Value::string("Function"));
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", class.clone());
     class.set_property("prototype", prototype);
+    class
+}
+
+fn frame_function_compat_class(global: Value, document: Value) -> Value {
+    let parent_function = window_value().get_property("Function");
+    let class = Value::function(move |_, args| {
+        #[cfg(feature = "dynamic-js")]
+        {
+            return crate::dynamic_script::construct_global_function_in_realm(
+                &args,
+                &global,
+                &document,
+            )
+            .unwrap_or_else(|error| {
+                w3cos_core::throw_value(w3cos_core::error_instance(
+                    "SyntaxError",
+                    vec![Value::string(&error.to_string())],
+                ))
+            });
+        }
+        #[cfg(not(feature = "dynamic-js"))]
+        Value::function(|_, _| Value::Undefined)
+    });
+    class.set_property("name", Value::string("Function"));
+    class.set_property("prototype", parent_function.get_property("prototype"));
+    class
+}
+
+fn string_compat_class() -> Value {
+    let class = Value::function(|_, args| {
+        Value::string(&args.first().map(Value::to_js_string).unwrap_or_default())
+    });
+    class.set_property("name", Value::string("String"));
+    class.set_property(
+        "fromCharCode",
+        Value::function(|_, args| {
+            let units = args
+                .iter()
+                .map(|value| value.to_u32() as u16)
+                .collect::<Vec<_>>();
+            Value::string(&String::from_utf16_lossy(&units))
+        }),
+    );
+    class.set_property(
+        "fromCodePoint",
+        Value::function(|_, args| {
+            let text = args
+                .iter()
+                .filter_map(|value| char::from_u32(value.to_u32()))
+                .collect::<String>();
+            Value::string(&text)
+        }),
+    );
+    let prototype = class.get_property("prototype");
+    prototype.set_property("constructor", class.clone());
+    class
+}
+
+fn number_compat_class() -> Value {
+    let class =
+        Value::function(|_, args| Value::Number(args.first().map(Value::to_number).unwrap_or(0.0)));
+    class.set_property("name", Value::string("Number"));
+    class.set_property(
+        "isFinite",
+        Value::function(|_, args| {
+            Value::Bool(
+                args.first()
+                    .is_some_and(|value| value.is_number() && value.to_number().is_finite()),
+            )
+        }),
+    );
+    class.set_property(
+        "isInteger",
+        Value::function(|_, args| {
+            Value::Bool(args.first().is_some_and(|value| {
+                let number = value.to_number();
+                value.is_number() && number.is_finite() && number.fract() == 0.0
+            }))
+        }),
+    );
+    class.set_property(
+        "isNaN",
+        Value::function(|_, args| {
+            Value::Bool(
+                args.first()
+                    .is_some_and(|value| value.is_number() && value.to_number().is_nan()),
+            )
+        }),
+    );
+    class.set_property(
+        "isSafeInteger",
+        Value::function(|_, args| {
+            Value::Bool(args.first().is_some_and(|value| {
+                let number = value.to_number();
+                value.is_number()
+                    && number.is_finite()
+                    && number.fract() == 0.0
+                    && number.abs() <= 9_007_199_254_740_991.0
+            }))
+        }),
+    );
+    let prototype = class.get_property("prototype");
+    prototype.set_property("constructor", class.clone());
+    class
+}
+
+fn boolean_compat_class() -> Value {
+    let class = Value::function(|_, args| Value::Bool(args.first().is_some_and(Value::to_bool)));
+    class.set_property("name", Value::string("Boolean"));
+    let prototype = class.get_property("prototype");
+    prototype.set_property("constructor", class.clone());
     class
 }
 
@@ -2609,6 +6285,30 @@ fn stylesheet_value() -> Value {
     value.set_property("removeRule", value.get_property("deleteRule"));
     w3cos_core::class::set_prototype_of(&value, &css_style_sheet_class().get_property("prototype"));
     value
+}
+
+fn processing_instruction_sheet(node: u32) -> Value {
+    if let Some(sheet) = get_expando(node, "sheet") {
+        return sheet;
+    }
+    if dom::tag_name(node) != "xml-stylesheet" {
+        return Value::Null;
+    }
+    let attributes = parse_html_attributes(&dom::get_text_content(node).unwrap_or_default());
+    let href = attributes
+        .iter()
+        .find_map(|(name, value)| (name == "href").then(|| value.clone()));
+    let css_type = attributes
+        .iter()
+        .find_map(|(name, value)| (name == "type").then(|| value.as_str()));
+    let Some(href) = href.filter(|_| css_type.is_none_or(|value| value == "text/css")) else {
+        return Value::Null;
+    };
+    let sheet = stylesheet_value();
+    sheet.set_property("href", Value::string(&href));
+    sheet.set_property("ownerNode", element_value(node));
+    set_expando(node, "sheet", sheet.clone());
+    sheet
 }
 
 pub(crate) fn install_author_stylesheet(node: u32, href: Option<&str>, source: &str) -> Value {
@@ -3255,6 +6955,104 @@ fn validate_form(node: u32, report: bool) -> bool {
     })
 }
 
+fn form_owner_value(node: u32) -> Value {
+    if let Some(form_id) = dom::get_attribute(node, "form").filter(|id| !id.is_empty()) {
+        return inclusive_descendant_elements(document_element_id())
+            .into_iter()
+            .find(|candidate| {
+                dom::tag_name(*candidate).eq_ignore_ascii_case("form")
+                    && dom::get_attribute(*candidate, "id").as_deref() == Some(form_id.as_str())
+            })
+            .map(element_value)
+            .unwrap_or(Value::Null);
+    }
+    let mut ancestor = dom::parent_node(node);
+    while let Some(candidate) = ancestor {
+        if dom::tag_name(candidate).eq_ignore_ascii_case("form") {
+            return element_value(candidate);
+        }
+        ancestor = dom::parent_node(candidate);
+    }
+    Value::Null
+}
+
+fn select_owner(option: u32) -> Option<u32> {
+    let mut ancestor = dom::parent_node(option);
+    while let Some(candidate) = ancestor {
+        if dom::tag_name(candidate).eq_ignore_ascii_case("select") {
+            return Some(candidate);
+        }
+        ancestor = dom::parent_node(candidate);
+    }
+    None
+}
+
+fn select_options(select: u32) -> Vec<u32> {
+    descendant_elements(select)
+        .into_iter()
+        .filter(|candidate| dom::tag_name(*candidate).eq_ignore_ascii_case("option"))
+        .collect()
+}
+
+fn explicit_option_selectedness(option: u32) -> Option<bool> {
+    get_expando(option, "selected")
+        .map(|selected| selected.to_bool())
+        .or_else(|| dom::has_attribute(option, "selected").then_some(true))
+}
+
+fn option_is_selected(option: u32) -> bool {
+    if let Some(selected) = explicit_option_selectedness(option) {
+        return selected;
+    }
+    let Some(select) = select_owner(option) else {
+        return false;
+    };
+    if dom::has_attribute(select, "multiple") {
+        return false;
+    }
+    let options = select_options(select);
+    !options
+        .iter()
+        .any(|candidate| explicit_option_selectedness(*candidate) == Some(true))
+        && options.first().copied() == Some(option)
+}
+
+fn set_option_selectedness(option: u32, selected: bool) {
+    set_expando(option, "selected", Value::Bool(selected));
+    if !selected {
+        return;
+    }
+    let Some(select) = select_owner(option) else {
+        return;
+    };
+    if dom::has_attribute(select, "multiple") {
+        return;
+    }
+    for candidate in select_options(select) {
+        if candidate != option {
+            set_expando(candidate, "selected", Value::Bool(false));
+        }
+    }
+}
+
+fn preserve_moved_option_selectedness(root: u32) {
+    for option in inclusive_descendant_elements(root)
+        .into_iter()
+        .filter(|candidate| dom::tag_name(*candidate).eq_ignore_ascii_case("option"))
+    {
+        if option_is_selected(option) {
+            set_expando(option, "selected", Value::Bool(true));
+        }
+    }
+}
+
+fn select_selected_index(select: u32) -> i64 {
+    select_options(select)
+        .into_iter()
+        .position(option_is_selected)
+        .map_or(-1, |index| index as i64)
+}
+
 fn scroll_alignment_delta(
     target_start: f32,
     target_size: f32,
@@ -3395,7 +7193,7 @@ fn forced_scroll_size(node: u32) -> (f64, f64) {
     // CSSOM layout reads are synchronous in browsers. React relies on that
     // when it reads scrollHeight in an effect that can run before our first
     // native paint, so compute an ephemeral layout rather than exposing zero.
-    let root = dom::with_document(|document| document.to_component_tree());
+    let root = dom::to_component_tree();
     let flat = crate::layout::pre_flatten(&root);
     let Some(target_index) = flat.iter().position(|info| {
         matches!(
@@ -3424,6 +7222,72 @@ fn forced_scroll_size(node: u32) -> (f64, f64) {
     )
 }
 
+fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
+    let live = dom::bounding_rect(node);
+    if !dom::is_document_dirty()
+        && (live.width != 0.0 || live.height != 0.0 || live.x != 0.0 || live.y != 0.0)
+    {
+        return apply_css_motion_to_rect(node, live);
+    }
+
+    // Geometry APIs synchronously flush pending style and layout in browsers.
+    // Compute a transient tree here so script reads observe parser styles and
+    // inline mutations even before the native render loop's next frame.
+    let root = dom::to_component_tree();
+    let flat = crate::layout::pre_flatten(&root);
+    let Some(target_index) = flat.iter().position(|info| {
+        matches!(
+            info.on_click,
+            w3cos_std::EventAction::NativeHost { id, .. } if *id == u64::from(node)
+        )
+    }) else {
+        return live;
+    };
+    let (viewport_width, viewport_height, _) = viewport();
+    let Ok(layouts) = crate::layout::compute(
+        &root,
+        viewport_width as f32,
+        viewport_height as f32,
+    ) else {
+        return live;
+    };
+    let rect = layouts
+        .into_iter()
+        .find(|(_, index)| *index == target_index)
+        .map_or(live, |(rect, _)| {
+            w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height)
+        });
+    apply_css_motion_to_rect(node, rect)
+}
+
+fn apply_css_motion_to_rect(node: u32, mut rect: w3cos_dom::DOMRect) -> w3cos_dom::DOMRect {
+    if let Some(CssMotionValue::Length(sampled)) = sampled_css_motion_value(node, None, "left") {
+        let final_left = CSS_MOTIONS.with(|motions| {
+            motions
+                .borrow()
+                .iter()
+                .rev()
+                .find(|motion| {
+                    motion.node == node
+                        && motion.pseudo.is_none()
+                        && motion.property == "left"
+                })
+                .and_then(|motion| match motion.to {
+                    CssMotionValue::Length(value) => Some(value),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        });
+        rect.x += sampled - final_left;
+    }
+    if let Some(CssMotionValue::TranslateX(sampled)) =
+        sampled_css_motion_value(node, None, "transform")
+    {
+        rect.x += sampled;
+    }
+    rect
+}
+
 fn element_computed_get(node: u32, key: &str) -> Value {
     if let Some(value) = svg_computed_get(node, key) {
         return value;
@@ -3431,30 +7295,67 @@ fn element_computed_get(node: u32, key: &str) -> Value {
     match key {
         // ── Node identity ──
         "nodeType" => Value::Number(dom::node_type(node) as f64),
-        "nodeName" => Value::string(&dom::node_name(node)),
+        "nodeName" => {
+            if dom::node_type(node) == 1 {
+                Value::string(&element_qualified_name(node))
+            } else {
+                Value::string(&dom::node_name(node))
+            }
+        }
         "localName" => {
             if dom::node_type(node) == 1 {
-                Value::string(&dom::tag_name(node))
+                get_expando(node, "localName")
+                    .unwrap_or_else(|| Value::string(&dom::tag_name(node)))
+            } else {
+                Value::Undefined
+            }
+        }
+        "prefix" => {
+            if dom::node_type(node) == 1 {
+                get_expando(node, "prefix").unwrap_or(Value::Null)
             } else {
                 Value::Undefined
             }
         }
         "tagName" => {
             if dom::node_type(node) == 1 {
-                Value::string(&dom::tag_name(node).to_ascii_uppercase())
+                Value::string(&element_qualified_name(node))
             } else {
                 Value::Undefined
             }
         }
-        "namespaceURI" => Value::string("http://www.w3.org/1999/xhtml"),
-        "ownerDocument" => document_value(),
+        "namespaceURI" => get_expando(node, "namespaceURI").unwrap_or_else(|| {
+            if dom::node_type(node) == 1 {
+                Value::string(crate::html_parser_state::HTML_NAMESPACE)
+            } else {
+                Value::Null
+            }
+        }),
+        "ownerDocument" => get_expando(node, "ownerDocument").unwrap_or_else(document_value),
+        "baseURI" => get_expando(node, "ownerDocument")
+            .unwrap_or_else(document_value)
+            .get_property("URL"),
         "isConnected" => Value::Bool(node_is_connected(node)),
+        "contentDocument" | "contentWindow" if dom::tag_name(node) == "iframe" => {
+            #[cfg(feature = "dynamic-js")]
+            let can_create_context =
+                !crate::dynamic_script::frame_post_insertion_pending(node);
+            #[cfg(not(feature = "dynamic-js"))]
+            let can_create_context = true;
+            if can_create_context {
+                ensure_frame_browsing_context(node);
+            }
+            get_expando(node, key).unwrap_or(Value::Null)
+        }
         "buffered" | "played" | "seekable"
             if matches!(dom::tag_name(node).as_str(), "audio" | "video") =>
         {
             crate::compat_web::time_ranges_value(Vec::new())
         }
         "error" if matches!(dom::tag_name(node).as_str(), "audio" | "video") => Value::Null,
+        "networkState" if matches!(dom::tag_name(node).as_str(), "audio" | "video") => {
+            get_expando(node, "networkState").unwrap_or(Value::Number(0.0))
+        }
         "textTracks" if matches!(dom::tag_name(node).as_str(), "audio" | "video") => {
             if let Some(list) = get_expando(node, "textTracks") {
                 list
@@ -3548,10 +7449,52 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 .is_some_and(|options| options.get_property("subtree").to_bool());
             crate::animations_web::animations_for(Some(node), subtree)
         }),
+        "showPopover" if dom::node_type(node) == 1 => func(move |_, _| {
+            set_popover_open(node, true);
+            Value::Undefined
+        }),
+        "hidePopover" if dom::node_type(node) == 1 => func(move |_, _| {
+            set_popover_open(node, false);
+            Value::Undefined
+        }),
+        "togglePopover" if dom::node_type(node) == 1 => func(move |_, args| {
+            let force = arg(&args, 0);
+            let open = if force.is_undefined() {
+                !popover_is_open(node)
+            } else {
+                force.to_bool()
+            };
+            set_popover_open(node, open);
+            Value::Bool(open)
+        }),
+        "open" if dom::tag_name(node) == "dialog" => {
+            Value::Bool(dom::has_attribute(node, "open"))
+        }
+        "returnValue" if dom::tag_name(node) == "dialog" => {
+            get_expando(node, DIALOG_RETURN_VALUE_EXPANDO).unwrap_or_else(|| Value::string(""))
+        }
+        "show" if dom::tag_name(node) == "dialog" => func(move |_, _| {
+            show_dialog(node, false);
+            Value::Undefined
+        }),
+        "showModal" if dom::tag_name(node) == "dialog" => func(move |_, _| {
+            show_dialog(node, true);
+            Value::Undefined
+        }),
+        "close" if dom::tag_name(node) == "dialog" => func(move |_, args| {
+            close_dialog(node, arg(&args, 0));
+            Value::Undefined
+        }),
 
         // ── Tree traversal ──
-        "parentNode" => element_or_null(dom::parent_node(node)),
+        "parentNode" => {
+            get_expando(node, "parentNode").unwrap_or_else(|| match dom::parent_node(node) {
+                Some(0) => document_value(),
+                parent => element_or_null(parent),
+            })
+        }
         "parentElement" => match dom::parent_node(node) {
+            Some(0) => Value::Null,
             Some(p) if dom::node_type(p) == 1 => element_value(p),
             _ => Value::Null,
         },
@@ -3561,19 +7504,68 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 .map(element_value)
                 .collect()
         }),
-        "childNodes" => {
-            live_node_list(move || dom::children(node).into_iter().map(element_value).collect())
+        "tBodies" if dom::tag_name(node) == "table" => html_collection(move || {
+            child_elements_with_tags(node, &["tbody"])
+                .into_iter()
+                .map(element_value)
+                .collect()
+        }),
+        "rows" if dom::tag_name(node) == "table" => {
+            html_collection(move || table_rows(node).into_iter().map(element_value).collect())
         }
+        "rows" if matches!(dom::tag_name(node).as_str(), "thead" | "tbody" | "tfoot") => {
+            html_collection(move || {
+                child_elements_with_tags(node, &["tr"])
+                    .into_iter()
+                    .map(element_value)
+                    .collect()
+            })
+        }
+        "cells" if dom::tag_name(node) == "tr" => html_collection(move || {
+            child_elements_with_tags(node, &["td", "th"])
+                .into_iter()
+                .map(element_value)
+                .collect()
+        }),
+        "deleteRow" if dom::tag_name(node) == "table" => func(move |_, args| {
+            remove_indexed_table_row(table_rows(node), arg(&args, 0));
+            Value::Undefined
+        }),
+        "deleteRow" if matches!(dom::tag_name(node).as_str(), "thead" | "tbody" | "tfoot") => {
+            func(move |_, args| {
+                remove_indexed_table_row(child_elements_with_tags(node, &["tr"]), arg(&args, 0));
+                Value::Undefined
+            })
+        }
+        "childNodes" => child_nodes_value(node),
         "childElementCount" => Value::Number(child_elements(node).len() as f64),
         "firstChild" => element_or_null(dom::first_child(node)),
         "lastChild" => element_or_null(dom::last_child(node)),
-        "nextSibling" => element_or_null(dom::next_sibling(node)),
-        "previousSibling" => element_or_null(dom::previous_sibling(node)),
+        "nextSibling" => {
+            if is_global_document_child(node) {
+                global_document_sibling(node, true)
+            } else {
+                get_expando(node, "nextSibling")
+                    .unwrap_or_else(|| element_or_null(dom::next_sibling(node)))
+            }
+        }
+        "previousSibling" => {
+            if is_global_document_child(node) {
+                global_document_sibling(node, false)
+            } else {
+                get_expando(node, "previousSibling")
+                    .unwrap_or_else(|| element_or_null(dom::previous_sibling(node)))
+            }
+        }
         "firstElementChild" => element_or_null(first_element_child(node)),
         "lastElementChild" => element_or_null(child_elements(node).into_iter().last()),
         "nextElementSibling" => element_or_null(sibling_element(node, true)),
         "previousElementSibling" => element_or_null(sibling_element(node, false)),
         "hasChildNodes" => func(move |_, _| Value::Bool(dom::first_child(node).is_some())),
+        "normalize" => func(move |_, _| {
+            normalize_node_subtree(node);
+            Value::Undefined
+        }),
         "getRootNode" => func(move |_, args| {
             let composed = arg(&args, 0).get_property("composed").to_bool();
             root_node_value(node, composed)
@@ -3584,12 +7576,24 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             };
             Value::Bool(other == node || is_ancestor_of(node, other))
         }),
-        "isSameNode" | "isEqualNode" => {
+        "lookupNamespaceURI" => {
+            func(move |_, args| lookup_namespace_uri_result(&element_value(node), &arg(&args, 0)))
+        }
+        "lookupPrefix" => {
+            func(move |_, args| lookup_prefix_result(&element_value(node), &arg(&args, 0)))
+        }
+        "isDefaultNamespace" => {
+            func(move |_, args| is_default_namespace_result(&element_value(node), &arg(&args, 0)))
+        }
+        "isSameNode" => {
             func(move |_, args| Value::Bool(node_id_of(&arg(&args, 0)) == Some(node)))
         }
+        "isEqualNode" => func(move |_, args| {
+            Value::Bool(nodes_are_equal(&element_value(node), &arg(&args, 0)))
+        }),
 
         // ── Text content ──
-        "textContent" => Value::string(&dom::inner_text(node)),
+        "textContent" => node_text_content(node),
         "nodeValue" | "data" => match dom::get_text_content(node) {
             Some(t) => Value::string(&t),
             None => Value::Null,
@@ -3601,6 +7605,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 .count() as f64,
         ),
         "substringData" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => func(move |_, args| {
+            if args.len() < 2 {
+                w3cos_core::throw_value(w3cos_core::error_instance(
+                    "TypeError",
+                    vec![Value::string("substringData requires 2 arguments")],
+                ));
+            }
             let units = dom::get_text_content(node)
                 .unwrap_or_default()
                 .encode_utf16()
@@ -3618,6 +7628,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::string(&String::from_utf16_lossy(&units[offset..end]))
         }),
         "appendData" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => func(move |_, args| {
+            if args.is_empty() {
+                w3cos_core::throw_value(w3cos_core::error_instance(
+                    "TypeError",
+                    vec![Value::string("appendData requires 1 argument")],
+                ));
+            }
             let mut data = dom::get_text_content(node).unwrap_or_default();
             data.push_str(&arg(&args, 0).to_js_string());
             dom::set_text_content(node, &data);
@@ -3687,7 +7703,9 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             }
             Value::string(&text)
         }
-        "assignedSlot" if matches!(dom::node_type(node), 3 | 4) => Value::Null,
+        "assignedSlot" if matches!(dom::node_type(node), 1 | 3 | 4) => {
+            element_or_null(assigned_slot_for_node(node))
+        }
         "splitText" if matches!(dom::node_type(node), 3 | 4) => func(move |_, args| {
             let mut units = dom::get_text_content(node)
                 .unwrap_or_default()
@@ -3716,9 +7734,11 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             element_value(new_node)
         }),
         "target" if dom::node_type(node) == 7 => Value::string(&dom::tag_name(node)),
-        "sheet" if dom::node_type(node) == 7 => Value::Null,
+        "sheet" if dom::node_type(node) == 7 => processing_instruction_sheet(node),
         "name" if dom::node_type(node) == 10 => Value::string(&dom::tag_name(node)),
-        "publicId" | "systemId" if dom::node_type(node) == 10 => Value::string(""),
+        "publicId" | "systemId" if dom::node_type(node) == 10 => {
+            get_expando(node, key).unwrap_or_else(|| Value::string(""))
+        }
         "innerText" => Value::string(&dom::inner_text(node)),
         "innerHTML" => {
             let mut s = dom::get_text_content(node).unwrap_or_default();
@@ -3728,60 +7748,217 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::string(&s)
         }
         "outerHTML" => Value::string(&dom::outer_html(node)),
+        "insertAdjacentElement" => func(move |_, args| {
+            let element = arg(&args, 1);
+            let Some(child) = node_id_of(&element) else {
+                type_error("insertAdjacentElement requires an Element");
+            };
+            if dom::node_type(child) != 1 {
+                type_error("insertAdjacentElement requires an Element");
+            }
+            if insert_adjacent_node(node, &arg(&args, 0).to_js_string(), child) {
+                element
+            } else {
+                Value::Null
+            }
+        }),
+        "insertAdjacentText" => func(move |_, args| {
+            let child = dom::create_text_node(&arg(&args, 1).to_js_string());
+            insert_adjacent_node(node, &arg(&args, 0).to_js_string(), child);
+            Value::Undefined
+        }),
 
         // ── Attributes ──
+        "getAttribute" if dom::node_type(node) == 7 => func(move |_, args| {
+            let name = arg(&args, 0).to_js_string();
+            processing_instruction_attributes(node)
+                .into_iter()
+                .find(|(current, _)| current == &name)
+                .map(|(_, value)| Value::string(&value))
+                .unwrap_or(Value::Null)
+        }),
+        "getAttributeNames" if dom::node_type(node) == 7 => func(move |_, _| {
+            js_array(
+                processing_instruction_attributes(node)
+                    .into_iter()
+                    .map(|(name, _)| Value::string(&name))
+                    .collect(),
+            )
+        }),
+        "hasAttribute" if dom::node_type(node) == 7 => func(move |_, args| {
+            let name = arg(&args, 0).to_js_string();
+            Value::Bool(
+                processing_instruction_attributes(node)
+                    .iter()
+                    .any(|(current, _)| current == &name),
+            )
+        }),
+        "hasAttributes" if dom::node_type(node) == 7 => func(move |_, _| {
+            Value::Bool(!processing_instruction_attributes(node).is_empty())
+        }),
+        "setAttribute" if dom::node_type(node) == 7 => func(move |_, args| {
+            set_processing_instruction_attribute(
+                node,
+                &arg(&args, 0).to_js_string(),
+                Some(arg(&args, 1).to_js_string()),
+            );
+            Value::Undefined
+        }),
+        "removeAttribute" if dom::node_type(node) == 7 => func(move |_, args| {
+            set_processing_instruction_attribute(node, &arg(&args, 0).to_js_string(), None);
+            Value::Undefined
+        }),
+        "toggleAttribute" if dom::node_type(node) == 7 => func(move |_, args| {
+            let name = arg(&args, 0).to_js_string();
+            if !valid_processing_instruction_attribute_name(&name) {
+                dom_exception(
+                    "Processing instruction attribute name is not valid",
+                    "InvalidCharacterError",
+                );
+            }
+            let has = processing_instruction_attributes(node)
+                .iter()
+                .any(|(current, _)| current == &name);
+            let force = arg(&args, 1);
+            let want = if force.is_undefined() {
+                !has
+            } else {
+                force.to_bool()
+            };
+            if want && !has {
+                set_processing_instruction_attribute(node, &name, Some(String::new()));
+            } else if !want && has {
+                set_processing_instruction_attribute(node, &name, None);
+            }
+            Value::Bool(want)
+        }),
         "id" => Value::string(&dom::get_attribute(node, "id").unwrap_or_default()),
+        "name" if exposes_window_name(node) => {
+            Value::string(&dom::get_attribute(node, "name").unwrap_or_default())
+        }
+        "name" if dom::tag_name(node) == "slot" => {
+            Value::string(&dom::get_attribute(node, "name").unwrap_or_default())
+        }
         "className" => Value::string(&dom::class_name(node)),
         "classList" => class_list_value(node),
         "attributes" => attributes_value(node),
         "dataset" => dataset_value(node),
-        "getAttribute" => {
-            func(
-                move |_, args| match dom::get_attribute(node, &arg(&args, 0).to_js_string()) {
-                    Some(v) => Value::from(v),
-                    None => Value::Null,
-                },
-            )
-        }
+        "getAttributeNames" => func(move |_, _| {
+            js_array(dom::with_document(|document| {
+                document
+                    .get_node(NodeId::from_u32(node))
+                    .attributes
+                    .iter()
+                    .map(|(name, _)| Value::string(&name.as_str()))
+                    .collect()
+            }))
+        }),
+        "getAttribute" => func(move |_, args| {
+            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
+            match dom::get_attribute(node, &name) {
+                Some(v) => Value::from(v),
+                None => Value::Null,
+            }
+        }),
         "getAttributeNS" => func(move |_, args| {
-            let namespace_value = arg(&args, 0);
-            let namespace = (!namespace_value.is_null())
-                .then(|| namespace_value.to_js_string())
-                .filter(|namespace| !namespace.is_empty());
+            let namespace = normalized_namespace_argument(&arg(&args, 0));
             match dom::get_attribute_ns(node, namespace.as_deref(), &arg(&args, 1).to_js_string()) {
                 Some(v) => Value::from(v),
                 None => Value::Null,
             }
         }),
-        "setAttribute" => func(move |_, args| {
-            dom::set_attribute(
+        "getAttributeNode" => func(move |_, args| {
+            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
+            attribute_node_by_qualified_name(node, &name)
+        }),
+        "getAttributeNodeNS" => func(move |_, args| {
+            let namespace = normalized_namespace_argument(&arg(&args, 0));
+            attribute_node_by_namespace(node, namespace.as_deref(), &arg(&args, 1).to_js_string())
+        }),
+        "setAttributeNode" | "setAttributeNodeNS" => func(move |_, args| {
+            let attribute = arg(&args, 0);
+            if attribute.get_property("nodeType").to_u32() != 2 {
+                type_error("setAttributeNode requires an Attr node");
+            }
+            let current_owner = attribute.get_property("ownerElement");
+            if !current_owner.is_null()
+                && !current_owner.is_undefined()
+                && node_id_of(&current_owner) != Some(node)
+            {
+                dom_exception("The attribute is already in use", "InUseAttributeError");
+            }
+            let qualified_name = attribute.get_property("name").to_js_string();
+            let local_name = attribute.get_property("localName").to_js_string();
+            let namespace = normalized_namespace_argument(&attribute.get_property("namespaceURI"));
+            let prefix = normalized_namespace_argument(&attribute.get_property("prefix"));
+            let previous = if namespace.is_some() {
+                attribute_node_by_namespace(node, namespace.as_deref(), &local_name)
+            } else {
+                attribute_node_by_qualified_name(node, &qualified_name)
+            };
+            dom::set_attribute_ns_parts(
                 node,
-                &arg(&args, 0).to_js_string(),
-                &arg(&args, 1).to_js_string(),
+                namespace.as_deref(),
+                &qualified_name,
+                prefix.as_deref(),
+                &local_name,
+                &attribute.get_property("value").to_js_string(),
             );
+            if !previous.is_null() && !previous.strict_eq(&attribute) {
+                detach_attribute_value(node, &previous);
+            }
+            attribute.set_property("ownerElement", element_value(node));
+            cache_attribute_value(
+                node,
+                namespace.as_deref(),
+                &local_name,
+                attribute.clone(),
+            );
+            previous
+        }),
+        "setAttribute" => func(move |_, args| {
+            let requested_name = arg(&args, 0).to_js_string();
+            if !valid_attribute_name(&requested_name) {
+                dom_exception("Attribute name is not valid", "InvalidCharacterError");
+            }
+            let name = normalized_attribute_name(node, &requested_name);
+            let value = arg(&args, 1).to_js_string();
+            dom::set_attribute(node, &name, &value);
+            #[cfg(feature = "dynamic-js")]
+            if let Some(event_type) = name.strip_prefix("on").filter(|event| !event.is_empty()) {
+                crate::dynamic_script::update_inline_event_handler(node, event_type, &value);
+            }
             Value::Undefined
         }),
         "setAttributeNS" => func(move |_, args| {
-            let namespace_value = arg(&args, 0);
-            let namespace = (!namespace_value.is_null())
-                .then(|| namespace_value.to_js_string())
-                .filter(|namespace| !namespace.is_empty());
-            dom::set_attribute_ns(
+            let namespace = normalized_namespace_argument(&arg(&args, 0));
+            let qualified_name = arg(&args, 1).to_js_string();
+            let (prefix, local_name) =
+                validate_and_extract_qualified_name(namespace.as_deref(), &qualified_name);
+            dom::set_attribute_ns_parts(
                 node,
                 namespace.as_deref(),
-                &arg(&args, 1).to_js_string(),
+                &qualified_name,
+                prefix.as_deref(),
+                &local_name,
                 &arg(&args, 2).to_js_string(),
             );
             Value::Undefined
         }),
         "hasAttribute" => func(move |_, args| {
-            Value::Bool(dom::has_attribute(node, &arg(&args, 0).to_js_string()))
+            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
+            Value::Bool(dom::has_attribute(node, &name))
+        }),
+        "hasAttributes" => func(move |_, _| {
+            Value::Bool(dom::with_document(|document| {
+                !document
+                    .get_node(NodeId::from_u32(node))
+                    .attributes
+                    .is_empty()
+            }))
         }),
         "hasAttributeNS" => func(move |_, args| {
-            let namespace_value = arg(&args, 0);
-            let namespace = (!namespace_value.is_null())
-                .then(|| namespace_value.to_js_string())
-                .filter(|namespace| !namespace.is_empty());
+            let namespace = normalized_namespace_argument(&arg(&args, 0));
             Value::Bool(dom::has_attribute_ns(
                 node,
                 namespace.as_deref(),
@@ -3789,19 +7966,60 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             ))
         }),
         "removeAttribute" => func(move |_, args| {
-            dom::remove_attribute(node, &arg(&args, 0).to_js_string());
+            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
+            let previous = attribute_node_by_qualified_name(node, &name);
+            dom::remove_attribute(node, &name);
+            if !previous.is_null() {
+                detach_attribute_value(node, &previous);
+            }
             Value::Undefined
         }),
         "removeAttributeNS" => func(move |_, args| {
-            let namespace_value = arg(&args, 0);
-            let namespace = (!namespace_value.is_null())
-                .then(|| namespace_value.to_js_string())
-                .filter(|namespace| !namespace.is_empty());
-            dom::remove_attribute_ns(node, namespace.as_deref(), &arg(&args, 1).to_js_string());
+            let namespace = normalized_namespace_argument(&arg(&args, 0));
+            let local_name = arg(&args, 1).to_js_string();
+            let previous =
+                attribute_node_by_namespace(node, namespace.as_deref(), &local_name);
+            dom::remove_attribute_ns(node, namespace.as_deref(), &local_name);
+            if !previous.is_null() {
+                detach_attribute_value(node, &previous);
+            }
             Value::Undefined
         }),
+        "removeAttributeNode" => func(move |_, args| {
+            let attribute = arg(&args, 0);
+            if attribute.get_property("nodeType").to_u32() != 2 {
+                type_error("removeAttributeNode requires an Attr node");
+            }
+            if node_id_of(&attribute.get_property("ownerElement")) != Some(node) {
+                dom_exception("The attribute is not owned by this element", "NotFoundError");
+            }
+            let namespace = normalized_namespace_argument(&attribute.get_property("namespaceURI"));
+            let local_name = attribute.get_property("localName").to_js_string();
+            let current = if namespace.is_some() {
+                attribute_node_by_namespace(node, namespace.as_deref(), &local_name)
+            } else {
+                attribute_node_by_qualified_name(
+                    node,
+                    &attribute.get_property("name").to_js_string(),
+                )
+            };
+            if current.is_null() || !current.strict_eq(&attribute) {
+                dom_exception("The attribute is not owned by this element", "NotFoundError");
+            }
+            if namespace.is_some() {
+                dom::remove_attribute_ns(node, namespace.as_deref(), &local_name);
+            } else {
+                dom::remove_attribute(node, &attribute.get_property("name").to_js_string());
+            }
+            detach_attribute_value(node, &attribute);
+            attribute
+        }),
         "toggleAttribute" => func(move |_, args| {
-            let name = arg(&args, 0).to_js_string();
+            let requested_name = arg(&args, 0).to_js_string();
+            if !valid_attribute_name(&requested_name) {
+                dom_exception("Attribute name is not valid", "InvalidCharacterError");
+            }
+            let name = normalized_attribute_name(node, &requested_name);
             let force = arg(&args, 1);
             let has = dom::has_attribute(node, &name);
             let want = if force.is_undefined() {
@@ -3846,62 +8064,216 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         // ── Tree mutation ──
         "appendChild" => func(move |_, args| {
             let child = arg(&args, 0);
-            if let Some(cid) = node_id_of(&child) {
-                dom::append_child(node, cid);
-                pin_element_subtree(cid);
-                if dom::is_connected(cid) {
-                    crate::custom_elements_web::connected_subtree(&child);
+            let Some(cid) = node_id_of(&child) else {
+                if child.get_property("nodeType").to_u32() == 9 {
+                    dom_exception("Documents cannot be inserted", "HierarchyRequestError");
                 }
-            }
+                type_error("appendChild requires a Node");
+            };
+            insert_child_or_fragment(node, cid, None);
             child
         }),
         "removeChild" => func(move |_, args| {
             let child = arg(&args, 0);
-            if let Some(cid) = node_id_of(&child) {
-                let was_connected = dom::is_connected(cid);
-                dom::remove_child(node, cid);
-                release_element_subtree(cid);
-                if was_connected {
-                    crate::custom_elements_web::disconnected_subtree(&child);
+            let Some(cid) = node_id_of(&child) else {
+                if child.get_property("nodeType").to_u32() == 9 {
+                    dom_exception("The node is not a child of this parent", "NotFoundError");
                 }
+                type_error("removeChild requires a Node");
+            };
+            if dom::parent_node(cid) != Some(node) {
+                dom_exception("The node is not a child of this parent", "NotFoundError");
+            }
+            let was_connected = dom::is_connected(cid);
+            dom::remove_child(node, cid);
+            release_element_subtree(cid);
+            if was_connected {
+                crate::custom_elements_web::disconnected_subtree(&child);
             }
             child
         }),
         "insertBefore" => func(move |_, args| {
+            if args.len() < 2 {
+                type_error("insertBefore requires 2 arguments");
+            }
             let new_child = arg(&args, 0);
             let ref_child = arg(&args, 1);
-            if let Some(nid) = node_id_of(&new_child) {
-                match node_id_of(&ref_child) {
-                    Some(rid) => dom::insert_before(node, nid, rid),
-                    None => dom::append_child(node, nid),
-                }
-                pin_element_subtree(nid);
-                if dom::is_connected(nid) {
-                    crate::custom_elements_web::connected_subtree(&new_child);
-                }
+            let inserted_node = node_id_of(&new_child);
+            if inserted_node.is_none() && new_child.get_property("nodeType").to_u32() != 9 {
+                type_error("insertBefore requires a Node as its first argument");
             }
+            let reference = if ref_child.is_null() || ref_child.is_undefined() {
+                None
+            } else if let Some(reference) = node_id_of(&ref_child) {
+                Some(reference)
+            } else {
+                type_error("insertBefore reference must be a Node, null, or undefined");
+            };
+
+            // DOM pre-insert validates the parent and inclusive-ancestor
+            // relationship before checking whether the reference is a child,
+            // then validates the inserted node's type and document position.
+            if let Some(inserted_node) = inserted_node {
+                ensure_tree_parent_and_ancestry(node, inserted_node);
+            }
+            if let Some(reference) = reference
+                && dom::parent_node(reference) != Some(node)
+            {
+                dom_exception(
+                    "The reference node is not a child of this parent",
+                    "NotFoundError",
+                );
+            }
+            let Some(nid) = inserted_node else {
+                dom_exception("Documents cannot be inserted", "HierarchyRequestError");
+            };
+            ensure_tree_child_type_and_adopt(node, nid);
+            insert_child_or_fragment(node, nid, reference);
             new_child
         }),
+        "moveBefore" => {
+            let method = func(move |_, args| {
+                if args.len() < 2 {
+                    type_error("moveBefore requires 2 arguments");
+                }
+                let moving = arg(&args, 0);
+                let reference = arg(&args, 1);
+                if !reference.is_null()
+                    && !reference.is_undefined()
+                    && !is_dom_node_value(&reference)
+                {
+                    type_error("moveBefore reference must be a Node, null, or undefined");
+                }
+                let Some(moving_id) = node_id_of(&moving) else {
+                    if is_dom_node_value(&moving) {
+                        dom_exception(
+                            "Only Element and CharacterData nodes can be moved",
+                            "HierarchyRequestError",
+                        );
+                    }
+                    type_error("moveBefore requires a Node");
+                };
+                if !nodes_have_same_shadow_including_root(node, moving_id) {
+                    dom_exception(
+                        "The destination and moved node must have the same shadow-including root",
+                        "HierarchyRequestError",
+                    );
+                }
+                ensure_tree_parent_and_ancestry(node, moving_id);
+                if !matches!(dom::node_type(moving_id), 1 | 3 | 4 | 7 | 8) {
+                    dom_exception(
+                        "Only Element and CharacterData nodes can be moved",
+                        "HierarchyRequestError",
+                    );
+                }
+                let reference_id = if reference.is_null() || reference.is_undefined() {
+                    None
+                } else {
+                    let Some(reference_id) = node_id_of(&reference) else {
+                        dom_exception(
+                            "The reference node is not a child of this parent",
+                            "NotFoundError",
+                        );
+                    };
+                    if dom::parent_node(reference_id) != Some(node) {
+                        dom_exception(
+                            "The reference node is not a child of this parent",
+                            "NotFoundError",
+                        );
+                    }
+                    Some(reference_id)
+                };
+                if reference_id == Some(moving_id) {
+                    return Value::Undefined;
+                }
+                let transition_before = (dom::node_type(moving_id) == 1)
+                    .then(|| capture_transition_snapshots(moving_id));
+                let was_connected = node_is_connected(moving_id);
+                let old_parent = dom::parent_node(moving_id);
+                let mut affected_slots = affected_slots_for_node_position(moving_id);
+                preserve_moved_option_selectedness(moving_id);
+                let destination_children = dom::children(node)
+                    .into_iter()
+                    .filter(|child| *child != moving_id)
+                    .collect::<Vec<_>>();
+                let insertion_index = reference_id
+                    .and_then(|reference| {
+                        destination_children
+                            .iter()
+                            .position(|child| *child == reference)
+                    })
+                    .unwrap_or(destination_children.len()) as u32;
+                adjust_live_ranges_for_removal(moving_id);
+                adjust_live_ranges_for_insertion(node, insertion_index);
+                with_deferred_dom_post_insertion_steps(|| {
+                    match reference_id {
+                        Some(reference_id) => dom::insert_before(node, moving_id, reference_id),
+                        None => dom::append_child(node, moving_id),
+                    }
+                });
+                pin_element_subtree(moving_id);
+                affected_slots.extend(affected_slots_for_node_position(moving_id));
+                for slot in affected_slots {
+                    queue_slotchange(slot);
+                }
+                if was_connected && node_is_connected(moving_id) {
+                    crate::custom_elements_web::moved_subtree(&moving);
+                }
+                crate::dynamic_script::notify_picture_relevant_move(moving_id, old_parent, node);
+                schedule_focus_revalidation_after_move(moving_id);
+                if let Some(before) = transition_before {
+                    let after = capture_transition_snapshots(moving_id);
+                    start_changed_transitions(moving_id, &before, &after);
+                }
+                Value::Undefined
+            });
+            method.set_property("length", Value::Number(2.0));
+            method
+        }
         "replaceChild" => func(move |_, args| {
+            if args.len() < 2 {
+                type_error("replaceChild requires 2 arguments");
+            }
             let new_child = arg(&args, 0);
             let old_child = arg(&args, 1);
-            if let (Some(nid), Some(oid)) = (node_id_of(&new_child), node_id_of(&old_child)) {
-                let old_was_connected = dom::is_connected(oid);
-                dom::replace_child(node, nid, oid);
-                release_element_subtree(oid);
-                pin_element_subtree(nid);
-                if old_was_connected {
-                    crate::custom_elements_web::disconnected_subtree(&old_child);
-                }
-                if dom::is_connected(nid) {
-                    crate::custom_elements_web::connected_subtree(&new_child);
-                }
+            if !is_dom_node_value(&new_child) || !is_dom_node_value(&old_child) {
+                type_error("replaceChild requires Node arguments");
+            }
+            let inserted_node = node_id_of(&new_child);
+            if let Some(inserted_node) = inserted_node {
+                ensure_tree_parent_and_ancestry(node, inserted_node);
+            } else if matches!(dom::node_type(node), 3 | 4 | 7 | 8 | 10) {
+                dom_exception(
+                    "This node type cannot contain children",
+                    "HierarchyRequestError",
+                );
+            }
+            let Some(old_node) = node_id_of(&old_child) else {
+                dom_exception("The node is not a child of this parent", "NotFoundError");
+            };
+            if dom::parent_node(old_node) != Some(node) {
+                dom_exception("The node is not a child of this parent", "NotFoundError");
+            }
+            let Some(inserted_node) = inserted_node else {
+                dom_exception("Documents cannot be inserted", "HierarchyRequestError");
+            };
+            ensure_tree_child_type_and_adopt(node, inserted_node);
+            let old_was_connected = dom::is_connected(old_node);
+            replace_child_or_fragment(node, inserted_node, old_node);
+            release_element_subtree(old_node);
+            if old_was_connected {
+                crate::custom_elements_web::disconnected_subtree(&old_child);
+            }
+            if dom::node_type(inserted_node) != 11 && dom::is_connected(inserted_node) {
+                crate::custom_elements_web::connected_subtree(&new_child);
             }
             old_child
         }),
         "cloneNode" => func(move |_, args| {
             let deep = arg(&args, 0).to_bool();
-            element_value(dom::clone_node(node, deep))
+            let clone = dom::clone_node(node, deep);
+            copy_cloned_node_identity(node, clone);
+            element_value(clone)
         }),
         "remove" => func(move |_, _| {
             if let Some(parent) = dom::parent_node(node) {
@@ -3912,26 +8284,52 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 if was_connected {
                     crate::custom_elements_web::disconnected_subtree(&element);
                 }
+            } else if let Some(parent_document) = get_expando(node, "parentNode")
+                && parent_document.get_property("nodeType").to_u32() == 9
+            {
+                let element = element_value(node);
+                if parent_document
+                    .get_property("__w3cos_document_children")
+                    .as_array()
+                    .is_some()
+                {
+                    let children = virtual_document_children(&parent_document)
+                        .into_iter()
+                        .filter(|child| !child.strict_eq(&element))
+                        .collect();
+                    set_virtual_document_children(&parent_document, children);
+                } else if parent_document.get_property("doctype").strict_eq(&element) {
+                    parent_document.set_property("doctype", Value::Null);
+                    set_expando(node, "parentNode", Value::Null);
+                }
             }
             Value::Undefined
         }),
         "append" | "prepend" => {
             let prepend = key == "prepend";
             func(move |_, args| {
-                for a in args {
-                    let cid = match (&a, node_id_of(&a)) {
-                        (Value::String(s), _) => dom::create_text_node(s),
-                        (_, Some(id)) => id,
-                        _ => continue,
-                    };
-                    if prepend {
-                        match dom::first_child(node) {
-                            Some(first) => dom::insert_before(node, cid, first),
-                            None => dom::append_child(node, cid),
+                let reference = prepend.then(|| dom::first_child(node)).flatten();
+                let mut inserted = Vec::new();
+                with_deferred_dom_post_insertion_steps(|| {
+                    for argument in args {
+                        let child = if let Some(child) = node_id_of(&argument) {
+                            ensure_tree_insertion(node, child);
+                            blur_focus_for_standard_reparent(child);
+                            child
+                        } else {
+                            dom::create_text_node(&argument.to_js_string())
+                        };
+                        match reference {
+                            Some(reference) => dom::insert_before(node, child, reference),
+                            None => dom::append_child(node, child),
                         }
-                    } else {
-                        dom::append_child(node, cid);
+                        inserted.push(child);
                     }
+                });
+                run_dom_batch_insertion_steps(&inserted);
+                run_script_mutation_steps(node);
+                for child in inserted {
+                    run_dom_post_insertion_steps(child);
                 }
                 Value::Undefined
             })
@@ -3942,18 +8340,47 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 let Some(parent) = dom::parent_node(node) else {
                     return Value::Undefined;
                 };
-                for a in args {
-                    let cid = match (&a, node_id_of(&a)) {
-                        (Value::String(s), _) => dom::create_text_node(s),
-                        (_, Some(id)) => id,
-                        _ => continue,
-                    };
-                    if before {
-                        dom::insert_before(parent, cid, node);
-                    } else {
-                        match dom::next_sibling(node) {
-                            Some(next) => dom::insert_before(parent, cid, next),
-                            None => dom::append_child(parent, cid),
+                let argument_nodes = args.iter().filter_map(node_id_of).collect::<HashSet<_>>();
+                if before {
+                    let mut sibling = dom::previous_sibling(node);
+                    while sibling.is_some_and(|id| argument_nodes.contains(&id)) {
+                        sibling = sibling.and_then(dom::previous_sibling);
+                    }
+                    let mut previous = sibling;
+                    for argument in args {
+                        let child = if let Some(child) = node_id_of(&argument) {
+                            ensure_tree_insertion(parent, child);
+                            child
+                        } else {
+                            dom::create_text_node(&argument.to_js_string())
+                        };
+                        let reference = previous.and_then(dom::next_sibling).or_else(|| {
+                            previous
+                                .is_none()
+                                .then(|| dom::first_child(parent))
+                                .flatten()
+                        });
+                        match reference {
+                            Some(reference) => dom::insert_before(parent, child, reference),
+                            None => dom::append_child(parent, child),
+                        }
+                        previous = Some(child);
+                    }
+                } else {
+                    let mut reference = dom::next_sibling(node);
+                    while reference.is_some_and(|id| argument_nodes.contains(&id)) {
+                        reference = reference.and_then(dom::next_sibling);
+                    }
+                    for argument in args {
+                        let child = if let Some(child) = node_id_of(&argument) {
+                            ensure_tree_insertion(parent, child);
+                            child
+                        } else {
+                            dom::create_text_node(&argument.to_js_string())
+                        };
+                        match reference {
+                            Some(reference) => dom::insert_before(parent, child, reference),
+                            None => dom::append_child(parent, child),
                         }
                     }
                 }
@@ -3962,37 +8389,59 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }
         "replaceWith" => func(move |_, args| {
             if let Some(parent) = dom::parent_node(node) {
-                let mut inserted = false;
-                for a in &args {
-                    let cid = match (a, node_id_of(a)) {
-                        (Value::String(s), _) => dom::create_text_node(s),
-                        (_, Some(id)) => id,
-                        _ => continue,
-                    };
-                    if !inserted {
-                        dom::replace_child(parent, cid, node);
-                        inserted = true;
+                let argument_nodes = args.iter().filter_map(node_id_of).collect::<HashSet<_>>();
+                let keeps_context = argument_nodes.contains(&node);
+                let reference = if keeps_context {
+                    let mut sibling = dom::next_sibling(node);
+                    while sibling.is_some_and(|id| argument_nodes.contains(&id)) {
+                        sibling = sibling.and_then(dom::next_sibling);
+                    }
+                    sibling
+                } else {
+                    Some(node)
+                };
+                for argument in args {
+                    let child = if let Some(child) = node_id_of(&argument) {
+                        ensure_tree_insertion(parent, child);
+                        child
                     } else {
-                        dom::append_child(parent, cid);
+                        dom::create_text_node(&argument.to_js_string())
+                    };
+                    match reference {
+                        Some(reference_node) => dom::insert_before(parent, child, reference_node),
+                        None => dom::append_child(parent, child),
                     }
                 }
-                if !inserted {
+                if !keeps_context && dom::parent_node(node) == Some(parent) {
                     dom::remove_child(parent, node);
                 }
             }
             Value::Undefined
         }),
         "replaceChildren" => func(move |_, args| {
-            clear_children(node);
-            dom::set_text_content(node, "");
-            for a in args {
-                let cid = match (&a, node_id_of(&a)) {
-                    (Value::String(s), _) => dom::create_text_node(s),
-                    (_, Some(id)) => id,
-                    _ => continue,
-                };
-                dom::append_child(node, cid);
+            let replacements = args
+                .into_iter()
+                .map(|argument| {
+                    node_id_of(&argument)
+                        .unwrap_or_else(|| dom::create_text_node(&argument.to_js_string()))
+                })
+                .collect::<Vec<_>>();
+            for replacement in &replacements {
+                ensure_tree_insertion(node, *replacement);
             }
+            for replacement in &replacements {
+                if let Some(previous_parent) = dom::parent_node(*replacement)
+                    && previous_parent != node
+                {
+                    dom::remove_child(previous_parent, *replacement);
+                }
+            }
+            replace_all_children(node, || {
+                for replacement in &replacements {
+                    dom::append_child(node, *replacement);
+                    pin_element_subtree(*replacement);
+                }
+            });
             Value::Undefined
         }),
         "insertAdjacentHTML" => func(move |_, args| {
@@ -4053,17 +8502,55 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }),
 
         // ── Selectors ──
-        "matches" => func(move |_, args| {
+        "matches" | "webkitMatchesSelector" => func(move |_, args| {
+            if args.is_empty() {
+                type_error("matches requires one argument");
+            }
             let sel = arg(&args, 0).to_js_string();
-            let parts: Vec<&str> = sel.split_whitespace().collect();
-            Value::Bool(matches_selector_chain(node, &parts))
+            let owner_document = get_expando(node, "ownerDocument").unwrap_or_else(document_value);
+            let hash = owner_document
+                .get_property("location")
+                .get_property("hash")
+                .to_js_string();
+            let target_id = hash.strip_prefix('#').filter(|target| !target.is_empty());
+            if sel.contains(":popover-open")
+                || sel.contains(":modal")
+                || sel.contains(":focus")
+            {
+                let parts = selector_chain_parts(&sel);
+                if parts.is_empty() {
+                    dom_exception("Invalid selector", "SyntaxError");
+                }
+                return Value::Bool(matches_selector_chain_in_scope(
+                    node,
+                    &parts,
+                    Some(node),
+                ));
+            }
+            match dom::matches_selector_with_target(node, &sel, target_id) {
+                Ok(true) => Value::Bool(true),
+                Ok(false) => {
+                    let relative_match = args
+                        .get(1)
+                        .and_then(node_id_of)
+                        .filter(|scope| dom::node_type(*scope) == 1)
+                        .is_some_and(|scope| {
+                            dom::matches_selector_relative_to_scope(node, &sel, scope, target_id)
+                                .is_ok_and(|matched| matched)
+                        });
+                    Value::Bool(relative_match)
+                }
+                Err(()) => dom_exception("Invalid selector", "SyntaxError"),
+            }
         }),
         "closest" => func(move |_, args| {
             let sel = arg(&args, 0).to_js_string();
-            let parts: Vec<&str> = sel.split_whitespace().collect();
+            let parts = selector_chain_parts(&sel);
             let mut cur = Some(node);
             while let Some(id) = cur {
-                if dom::node_type(id) == 1 && matches_selector_chain(id, &parts) {
+                if dom::node_type(id) == 1
+                    && matches_selector_chain_in_scope(id, &parts, Some(node))
+                {
                     return element_value(id);
                 }
                 cur = dom::parent_node(id);
@@ -4071,7 +8558,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::Null
         }),
         "querySelector" => func(move |_, args| {
-            let sel = arg(&args, 0).to_js_string();
+            let sel = query_selector_argument(&args, node);
             element_or_null(
                 query_selector_all_scoped(Some(node), &sel)
                     .into_iter()
@@ -4079,7 +8566,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             )
         }),
         "querySelectorAll" => func(move |_, args| {
-            let sel = arg(&args, 0).to_js_string();
+            let sel = query_selector_argument(&args, node);
             node_list(
                 query_selector_all_scoped(Some(node), &sel)
                     .into_iter()
@@ -4087,38 +8574,69 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                     .collect(),
             )
         }),
+        "getElementById" if dom::node_type(node) == 11 => func(move |_, args| {
+            let id = arg(&args, 0).to_js_string();
+            if id.is_empty() {
+                return Value::Null;
+            }
+            descendant_elements(node)
+                .into_iter()
+                .find(|candidate| {
+                    dom::get_attribute(*candidate, "id").as_deref() == Some(id.as_str())
+                })
+                .map(element_value)
+                .unwrap_or(Value::Null)
+        }),
         "getElementsByTagName" => func(move |_, args| {
-            let tag = arg(&args, 0).to_js_string().to_ascii_lowercase();
+            let tag = arg(&args, 0).to_js_string();
+            let html_document = get_expando(node, "ownerDocument")
+                .unwrap_or_else(document_value)
+                .get_property("contentType")
+                .to_js_string()
+                == "text/html";
             html_collection(move || {
-                dom::get_elements_by_tag_name(&tag)
+                descendant_elements(node)
                     .into_iter()
-                    .filter(|&c| is_ancestor_of(node, c))
+                    .filter(|candidate| element_matches_tag_name(*candidate, &tag, html_document))
+                    .map(element_value)
+                    .collect()
+            })
+        }),
+        "getElementsByTagNameNS" => func(move |_, args| {
+            let namespace = normalized_namespace(&arg(&args, 0));
+            let local_name = arg(&args, 1).to_js_string();
+            html_collection(move || {
+                descendant_elements(node)
+                    .into_iter()
+                    .filter(|candidate| {
+                        element_matches_namespace(*candidate, &namespace, &local_name)
+                    })
                     .map(element_value)
                     .collect()
             })
         }),
         "getElementsByClassName" => func(move |_, args| {
-            let class = arg(&args, 0).to_js_string();
+            let class_names = arg(&args, 0).to_js_string();
             html_collection(move || {
-                dom::get_elements_by_class_name(&class)
+                descendant_elements(node)
                     .into_iter()
-                    .filter(|&c| is_ancestor_of(node, c))
+                    .filter(|candidate| element_matches_class_names(*candidate, &class_names))
                     .map(element_value)
                     .collect()
             })
         }),
 
         // ── Layout (zeros until the layout engine runs) ──
-        "getBoundingClientRect" => func(move |_, _| rect_value(dom::bounding_rect(node))),
+        "getBoundingClientRect" => func(move |_, _| rect_value(forced_bounding_rect(node))),
         "getClientRects" => func(move |_, _| {
-            crate::geometry_web::rect_list(vec![rect_value(dom::bounding_rect(node))])
+            crate::geometry_web::rect_list(vec![rect_value(forced_bounding_rect(node))])
         }),
-        "offsetWidth" | "clientWidth" => Value::Number(dom::bounding_rect(node).width as f64),
-        "offsetHeight" | "clientHeight" => Value::Number(dom::bounding_rect(node).height as f64),
+        "offsetWidth" | "clientWidth" => Value::Number(forced_bounding_rect(node).width as f64),
+        "offsetHeight" | "clientHeight" => Value::Number(forced_bounding_rect(node).height as f64),
         "scrollWidth" => Value::Number(forced_scroll_size(node).0),
         "scrollHeight" => Value::Number(forced_scroll_size(node).1),
-        "offsetTop" => Value::Number(dom::bounding_rect(node).y as f64),
-        "offsetLeft" => Value::Number(dom::bounding_rect(node).x as f64),
+        "offsetTop" => Value::Number(forced_bounding_rect(node).y as f64),
+        "offsetLeft" => Value::Number(forced_bounding_rect(node).x as f64),
         "offsetParent" => Value::Null,
         "clientTop" | "clientLeft" => Value::Number(0.0),
         "scrollTop" => Value::Number(dom::get_scroll_offset(node).1 as f64),
@@ -4150,17 +8668,11 @@ fn element_computed_get(node: u32, key: &str) -> Value {
 
         // ── Focus (bridge-side tracking; no real input focus yet) ──
         "focus" => func(move |_, _| {
-            ACTIVE_ELEMENT.with(|a| *a.borrow_mut() = Some(node));
-            dispatch_sync(node, EventType::Focus, EventData::Focus);
+            focus_element(node);
             Value::Undefined
         }),
         "blur" => func(move |_, _| {
-            ACTIVE_ELEMENT.with(|a| {
-                if *a.borrow() == Some(node) {
-                    *a.borrow_mut() = None;
-                }
-            });
-            dispatch_sync(node, EventType::Blur, EventData::Focus);
+            blur_element(node);
             Value::Undefined
         }),
         "click" => func(move |_, _| {
@@ -4193,6 +8705,17 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "dispatchEvent" => func(move |_, args| Value::Bool(js_dispatch_event(node, arg(&args, 0)))),
 
         // ── Form-ish ──
+        "form"
+            if matches!(
+                dom::tag_name(node).as_str(),
+                "button" | "fieldset" | "input" | "object" | "output" | "select" | "textarea"
+            ) =>
+        {
+            form_owner_value(node)
+        }
+        "selectedIndex" if dom::tag_name(node) == "select" => {
+            Value::Number(select_selected_index(node) as f64)
+        }
         "validity"
             if matches!(
                 dom::tag_name(node).as_str(),
@@ -4281,6 +8804,9 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             };
             Value::string(&dom::get_attribute(node, attribute).unwrap_or_default())
         }
+        "src" if dom::tag_name(node) == "iframe" => {
+            Value::string(&dom::get_attribute(node, "src").unwrap_or_default())
+        }
         "src" | "srcset" | "sizes" | "crossOrigin" | "referrerPolicy" | "decoding" | "loading"
         | "fetchPriority"
             if dom::tag_name(node) == "img" =>
@@ -4298,6 +8824,14 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }
         "currentSrc" if dom::tag_name(node) == "img" => {
             get_expando(node, "__w3cos_image_current_src").unwrap_or_else(|| Value::string(""))
+        }
+        "href" if dom::tag_name(node) == "a" => {
+            let href = dom::get_attribute(node, "href").unwrap_or_default();
+            Value::string(
+                &url::Url::parse(&href)
+                    .map(|url| url.to_string())
+                    .unwrap_or(href),
+            )
         }
         "naturalWidth" if dom::tag_name(node) == "img" => {
             get_expando(node, "__w3cos_image_natural_width").unwrap_or(Value::Number(0.0))
@@ -4351,6 +8885,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "type" | "media" if dom::tag_name(node) == "style" => {
             Value::string(&dom::get_attribute(node, key).unwrap_or_default())
         }
+        "content" | "name" | "media" | "scheme" if dom::tag_name(node) == "meta" => {
+            Value::string(&dom::get_attribute(node, key).unwrap_or_default())
+        }
+        "httpEquiv" if dom::tag_name(node) == "meta" => Value::string(
+            &dom::get_attribute(node, "http-equiv").unwrap_or_default(),
+        ),
         "disabled" if matches!(dom::tag_name(node).as_str(), "link" | "style") => {
             Value::Bool(dom::has_attribute(node, "disabled"))
         }
@@ -4365,8 +8905,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "defaultSelected" if dom::tag_name(node) == "option" => {
             Value::Bool(dom::has_attribute(node, "selected"))
         }
-        "selected" if dom::tag_name(node) == "option" => get_expando(node, "selected")
-            .unwrap_or_else(|| Value::Bool(dom::has_attribute(node, "selected"))),
+        "selected" if dom::tag_name(node) == "option" => Value::Bool(option_is_selected(node)),
         "checked" => {
             if is_inputish(node) {
                 Value::Bool(dom::has_attribute(node, "checked"))
@@ -4488,6 +9027,24 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             resolved_thenable(Value::Undefined)
         }),
 
+        "assignedNodes" if dom::tag_name(node) == "slot" => func(move |_, _| {
+            js_array(
+                assigned_nodes_for_slot_node(node)
+                    .into_iter()
+                    .map(element_value)
+                    .collect(),
+            )
+        }),
+        "assignedElements" if dom::tag_name(node) == "slot" => func(move |_, _| {
+            js_array(
+                assigned_nodes_for_slot_node(node)
+                    .into_iter()
+                    .filter(|assigned| dom::node_type(*assigned) == 1)
+                    .map(element_value)
+                    .collect(),
+            )
+        }),
+
         // ── Pointer capture ──
         "setPointerCapture" => func(move |_, args| {
             set_pointer_capture(node, arg(&args, 0).to_number() as i64);
@@ -4521,21 +9078,77 @@ fn element_computed_get(node: u32, key: &str) -> Value {
 
 fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
     match key {
-        "textContent" => {
-            clear_children(node);
-            dom::set_text_content(node, &value.to_js_string());
+        "textContent" if matches!(dom::node_type(node), 1 | 11) => {
+            replace_all_children(node, || {
+                if !value.is_null() && !value.is_undefined() {
+                    let text = value.to_js_string();
+                    if !text.is_empty() {
+                        let child = dom::create_text_node(&text);
+                        ensure_tree_insertion(node, child);
+                        dom::append_child(node, child);
+                    }
+                }
+            });
         }
-        "nodeValue" | "data" => {
-            dom::set_text_content(node, &value.to_js_string());
+        "textContent" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => {
+            let text = if value.is_null() {
+                String::new()
+            } else {
+                value.to_js_string()
+            };
+            dom::set_text_content(node, &text);
         }
+        "textContent" => {}
+        "nodeValue" | "data" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => {
+            let text = if value.is_null() {
+                String::new()
+            } else {
+                value.to_js_string()
+            };
+            dom::set_text_content(node, &text);
+        }
+        "nodeValue" => {}
         "innerText" => {
             clear_children(node);
             dom::set_text_content(node, &value.to_js_string());
         }
         "innerHTML" => {
-            clear_children(node);
-            dom::set_text_content(node, "");
-            append_html_fragment(node, &value.to_js_string());
+            replace_all_children(node, || {
+                append_html_fragment(node, &value.to_js_string());
+            });
+        }
+        "outerHTML" => {
+            if let Some(parent) = dom::parent_node(node) {
+                let container = dom::create_element("div");
+                append_html_fragment(container, &value.to_js_string());
+                let added = dom::children(container);
+                let previous = dom::previous_sibling(node);
+                let next = dom::next_sibling(node);
+                let element = element_value(node);
+                let was_connected = dom::is_connected(node);
+                crate::observers_web::with_mutation_notifications_suppressed(|| {
+                    for child in &added {
+                        ensure_tree_insertion(parent, *child);
+                        dom::insert_before(parent, *child, node);
+                        pin_element_subtree(*child);
+                        if dom::is_connected(*child) {
+                            crate::custom_elements_web::connected_subtree(&element_value(*child));
+                        }
+                    }
+                    dom::remove_child(parent, node);
+                    release_element_subtree(node);
+                });
+                crate::observers_web::notify_child_list(parent, &added, &[node], previous, next);
+                if was_connected
+                    && get_expando(node, "__w3cos_custom_element_upgraded")
+                        .is_some_and(|upgraded| upgraded.to_bool())
+                {
+                    queue_microtask_value(func(move |_, _| {
+                        crate::custom_elements_web::disconnected_subtree(&element);
+                        Value::Undefined
+                    }));
+                }
+            }
         }
         "text" if dom::tag_name(node) == "script" => {
             clear_children(node);
@@ -4550,6 +9163,9 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
                 other => other,
             };
             dom::set_attribute(node, attribute, &value.to_js_string());
+        }
+        "src" if dom::tag_name(node) == "iframe" => {
+            dom::set_attribute(node, "src", &value.to_js_string());
         }
         "src" | "srcset" | "sizes" | "crossOrigin" | "referrerPolicy" | "decoding" | "loading"
         | "fetchPriority"
@@ -4572,6 +9188,9 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
         "srcset" | "sizes" | "media" | "type" if dom::tag_name(node) == "source" => {
             dom::set_attribute(node, key, &value.to_js_string());
         }
+        "href" if dom::tag_name(node) == "a" => {
+            dom::set_attribute(node, "href", &value.to_js_string());
+        }
         "width" | "height" if dom::tag_name(node) == "img" => {
             let dimension = value.to_number().max(0.0).trunc() as u32;
             dom::set_attribute(node, key, &dimension.to_string());
@@ -4588,6 +9207,12 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
         }
         "type" | "media" if dom::tag_name(node) == "style" => {
             dom::set_attribute(node, key, &value.to_js_string());
+        }
+        "content" | "name" | "media" | "scheme" if dom::tag_name(node) == "meta" => {
+            dom::set_attribute(node, key, &value.to_js_string());
+        }
+        "httpEquiv" if dom::tag_name(node) == "meta" => {
+            dom::set_attribute(node, "http-equiv", &value.to_js_string());
         }
         "disabled" if matches!(dom::tag_name(node).as_str(), "link" | "style") => {
             if value.to_bool() {
@@ -4622,8 +9247,29 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
             }
         }
         "id" => dom::set_attribute(node, "id", &value.to_js_string()),
-        "className" => dom::set_class_name(node, &value.to_js_string()),
+        "name" if exposes_window_name(node) => {
+            dom::set_attribute(node, "name", &value.to_js_string())
+        }
+        "name" if dom::tag_name(node) == "slot" => {
+            dom::set_attribute(node, "name", &value.to_js_string())
+        }
+        "className" => dom::set_attribute(node, "class", &value.to_js_string()),
+        "style" => apply_html_attribute(node, "style", &value.to_js_string()),
+        // Web IDL exposes Element.classList as a readonly [SameObject]
+        // attribute. Assignment is ignored rather than replacing the live
+        // DOMTokenList bridge object.
+        "classList" => {}
         "value" => dom::set_attribute(node, "value", &value.to_js_string()),
+        "defaultSelected" if dom::tag_name(node) == "option" => {
+            if value.to_bool() {
+                dom::set_attribute(node, "selected", "");
+            } else {
+                dom::remove_attribute(node, "selected");
+            }
+        }
+        "selected" if dom::tag_name(node) == "option" => {
+            set_option_selectedness(node, value.to_bool());
+        }
         "checked" => {
             if value.to_bool() {
                 dom::set_attribute(node, "checked", "");
@@ -4692,15 +9338,42 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
     true
 }
 
+fn named_node_map_reserved_property(name: &str) -> bool {
+    matches!(
+        name,
+        "length"
+            | "item"
+            | "getNamedItem"
+            | "getNamedItemNS"
+            | "removeNamedItem"
+            | "removeNamedItemNS"
+            | "setNamedItem"
+            | "setNamedItemNS"
+            | "constructor"
+            | "__proto__"
+            | "hasOwnProperty"
+            | "isPrototypeOf"
+            | "propertyIsEnumerable"
+            | "toLocaleString"
+            | "toString"
+            | "valueOf"
+    )
+}
+
+fn attribute_count(node: u32) -> usize {
+    dom::with_document(|document| document.get_node(NodeId::from_u32(node)).attributes.len())
+}
+
 fn attributes_value(node: u32) -> Value {
     let attrs: Vec<(String, String, Option<String>, Option<String>, String)> =
         dom::with_document(|doc| {
             let node = doc.get_node(NodeId::from_u32(node));
             node.attributes
                 .iter()
-                .map(|(name, value)| {
+                .enumerate()
+                .map(|(index, (name, value))| {
                     let qualified_name = name.as_str();
-                    let metadata = node.attribute_namespace(&qualified_name);
+                    let metadata = node.attribute_namespace_at(index);
                     (
                         qualified_name.clone(),
                         value.clone(),
@@ -4717,37 +9390,39 @@ fn attributes_value(node: u32) -> Value {
                 })
                 .collect()
         });
+    let lowercase_names_only = namespace_uri(node) == crate::html_parser_state::HTML_NAMESPACE
+        && get_expando(node, "ownerDocument")
+            .unwrap_or_else(document_value)
+            .get_property("contentType")
+            .to_js_string()
+            == "text/html";
+    let mut seen_names = HashSet::new();
+    let supported_names = attrs
+        .iter()
+        .map(|(qualified_name, _, _, _, _)| qualified_name.clone())
+        .filter(|name| !lowercase_names_only || name == &name.to_ascii_lowercase())
+        .filter(|name| !named_node_map_reserved_property(name))
+        .filter(|name| seen_names.insert(name.clone()))
+        .collect::<Vec<_>>();
     let mut props = HashMap::new();
     let len = attrs.len();
     let mut attr_values = Vec::with_capacity(len);
     let mut attrs_by_name = HashMap::with_capacity(len);
     for (i, (name, value, namespace, prefix, local_name)) in attrs.into_iter().enumerate() {
-        let attr = Value::object(HashMap::from([
-            ("name".to_string(), Value::string(&name)),
-            ("localName".to_string(), Value::string(&local_name)),
-            ("value".to_string(), Value::string(&value)),
-            ("nodeName".to_string(), Value::string(&name)),
-            ("nodeValue".to_string(), Value::string(&value)),
-            ("nodeType".to_string(), Value::Number(2.0)),
-            (
-                "namespaceURI".to_string(),
-                namespace
-                    .as_deref()
-                    .map(Value::string)
-                    .unwrap_or(Value::Null),
-            ),
-            (
-                "prefix".to_string(),
-                prefix.as_deref().map(Value::string).unwrap_or(Value::Null),
-            ),
-            ("ownerElement".to_string(), element_value(node)),
-            ("specified".to_string(), Value::Bool(true)),
-        ]));
-        w3cos_core::class::set_prototype_of(&attr, &crate::dom_constructors::prototype("Attr"));
+        let attr = attribute_value(
+            node,
+            &name,
+            &local_name,
+            namespace.as_deref(),
+            prefix.as_deref(),
+            &value,
+        );
         attr_values.push(attr.clone());
         attrs_by_name.insert(name.clone(), attr.clone());
         props.insert(i.to_string(), attr.clone());
-        props.insert(name, attr);
+        if !named_node_map_reserved_property(&name) {
+            props.insert(name, attr);
+        }
     }
     props.insert("length".to_string(), Value::Number(len as f64));
     let attr_values_for_ns = attr_values.clone();
@@ -4798,12 +9473,23 @@ fn attributes_value(node: u32) -> Value {
     );
     props.insert(
         "removeNamedItem".to_string(),
-        func(move |_, args| {
+        func(move |this, args| {
             let name = arg(&args, 0).to_js_string();
-            let previous = dom::get_attribute(node, &name)
-                .map(|value| attribute_value(node, &name, &name, None, None, &value))
-                .unwrap_or(Value::Null);
+            let identity_key = format!("__w3cos_named_attribute_{name}");
+            let attached = this.get_property(&identity_key);
+            let previous = if attached.is_undefined() {
+                dom::get_attribute(node, &name)
+                    .map(|value| attribute_value(node, &name, &name, None, None, &value))
+                    .unwrap_or(Value::Null)
+            } else {
+                attached
+            };
             dom::remove_attribute(node, &name);
+            this.delete_property(&identity_key);
+            if !named_node_map_reserved_property(&name) {
+                this.delete_property(&name);
+            }
+            this.set_property("length", Value::Number(attribute_count(node) as f64));
             previous
         }),
     );
@@ -4833,13 +9519,25 @@ fn attributes_value(node: u32) -> Value {
     );
     props.insert(
         "setNamedItem".to_string(),
-        func(move |_, args| {
+        func(move |this, args| {
             let attribute = arg(&args, 0);
             let name = attribute.get_property("name").to_js_string();
-            let previous = dom::get_attribute(node, &name)
-                .map(|value| attribute_value(node, &name, &name, None, None, &value))
-                .unwrap_or(Value::Null);
+            let identity_key = format!("__w3cos_named_attribute_{name}");
+            let attached = this.get_property(&identity_key);
+            let previous = if attached.is_undefined() {
+                dom::get_attribute(node, &name)
+                    .map(|value| attribute_value(node, &name, &name, None, None, &value))
+                    .unwrap_or(Value::Null)
+            } else {
+                attached
+            };
             dom::set_attribute(node, &name, &attribute.get_property("value").to_js_string());
+            attribute.set_property("ownerElement", element_value(node));
+            this.set_property(&identity_key, attribute.clone());
+            if !named_node_map_reserved_property(&name) {
+                this.set_property(&name, attribute);
+            }
+            this.set_property("length", Value::Number(attribute_count(node) as f64));
             previous
         }),
     );
@@ -4880,12 +9578,160 @@ fn attributes_value(node: u32) -> Value {
             previous
         }),
     );
-    let value = Value::object(props);
-    w3cos_core::class::set_prototype_of(
-        &value,
-        &crate::dom_constructors::prototype("NamedNodeMap"),
-    );
+    let own_names = supported_names.clone();
+    let descriptor_names = supported_names.into_iter().collect::<HashSet<_>>();
+    let handler = ProxyBuilder::new()
+        .get_own_property_descriptor(move |target, key| {
+            if let Ok(index) = key.parse::<usize>()
+                && index < len
+            {
+                return Value::object(HashMap::from([
+                    ("value".to_string(), target.get_property(key)),
+                    ("writable".to_string(), Value::Bool(false)),
+                    ("enumerable".to_string(), Value::Bool(true)),
+                    ("configurable".to_string(), Value::Bool(true)),
+                ]));
+            }
+            if descriptor_names.contains(key) {
+                return Value::object(HashMap::from([
+                    ("value".to_string(), target.get_property(key)),
+                    ("writable".to_string(), Value::Bool(false)),
+                    ("enumerable".to_string(), Value::Bool(false)),
+                    ("configurable".to_string(), Value::Bool(true)),
+                ]));
+            }
+            Value::Undefined
+        })
+        .own_keys(move |_target| {
+            let mut keys = (0..len)
+                .map(|index| Value::from(index.to_string()))
+                .collect::<Vec<_>>();
+            keys.extend(own_names.iter().cloned().map(Value::from));
+            js_array(keys)
+        })
+        .build();
+    let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
+    let prototype = crate::dom_constructors::prototype("NamedNodeMap");
+    w3cos_core::class::set_prototype_of(&value, &prototype);
+    prototype.set_property("item", value.get_property("item"));
+    if prototype.get_property("toString").is_undefined() {
+        prototype.set_property(
+            "toString",
+            func(|_, _| Value::string("[object NamedNodeMap]")),
+        );
+    }
     value
+}
+
+fn valid_attribute_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.chars().any(|character| {
+            character == '\0'
+                || character == '/'
+                || character == '>'
+                || character == '='
+                || character.is_ascii_whitespace()
+        })
+}
+
+fn detached_attribute_value(document: &Value, name: Value, is_html: bool) -> Value {
+    let mut name = name.to_js_string();
+    if is_html {
+        name.make_ascii_lowercase();
+    }
+    if !valid_attribute_name(&name) {
+        dom_exception("Attribute name is not valid", "InvalidCharacterError");
+    }
+    detached_attribute_value_from_parts(document, &name, &name, None, None, "")
+}
+
+fn detached_namespaced_attribute_value(
+    document: &Value,
+    namespace: Value,
+    qualified_name: Value,
+) -> Value {
+    let namespace = normalized_namespace(&namespace);
+    let qualified_name = qualified_name.to_js_string();
+    let (prefix, local_name) =
+        validate_and_extract_qualified_name(namespace.as_deref(), &qualified_name);
+    detached_attribute_value_from_parts(
+        document,
+        &qualified_name,
+        &local_name,
+        namespace.as_deref(),
+        prefix.as_deref(),
+        "",
+    )
+}
+
+fn detached_attribute_value_from_parts(
+    document: &Value,
+    qualified_name: &str,
+    local_name: &str,
+    namespace: Option<&str>,
+    prefix: Option<&str>,
+    value: &str,
+) -> Value {
+    let mut props = HashMap::from([
+        ("name".to_string(), Value::string(qualified_name)),
+        ("localName".to_string(), Value::string(local_name)),
+        ("value".to_string(), Value::string(value)),
+        ("nodeName".to_string(), Value::string(qualified_name)),
+        ("nodeValue".to_string(), Value::string(value)),
+        ("textContent".to_string(), Value::string(value)),
+        ("nodeType".to_string(), Value::Number(2.0)),
+        (
+            "namespaceURI".to_string(),
+            namespace.map(Value::string).unwrap_or(Value::Null),
+        ),
+        (
+            "prefix".to_string(),
+            prefix.map(Value::string).unwrap_or(Value::Null),
+        ),
+        ("ownerDocument".to_string(), document.clone()),
+        ("baseURI".to_string(), document.get_property("URL")),
+        ("ownerElement".to_string(), Value::Null),
+        ("specified".to_string(), Value::Bool(true)),
+        (
+            "isSameNode".to_string(),
+            func(|attribute, args| Value::Bool(attribute.strict_eq(&arg(&args, 0)))),
+        ),
+    ]);
+    props.insert(
+        "isEqualNode".to_string(),
+        func(|attribute, args| Value::Bool(nodes_are_equal(&attribute, &arg(&args, 0)))),
+    );
+    props.insert(
+        "cloneNode".to_string(),
+        func(|attribute, _| {
+            let document = attribute.get_property("ownerDocument");
+            let namespace = normalized_namespace_argument(&attribute.get_property("namespaceURI"));
+            let prefix = normalized_namespace_argument(&attribute.get_property("prefix"));
+            detached_attribute_value_from_parts(
+                &document,
+                &attribute.get_property("name").to_js_string(),
+                &attribute.get_property("localName").to_js_string(),
+                namespace.as_deref(),
+                prefix.as_deref(),
+                &attribute.get_property("value").to_js_string(),
+            )
+        }),
+    );
+    props.insert(
+        "lookupNamespaceURI".to_string(),
+        func(|attribute, args| lookup_namespace_uri_result(&attribute, &arg(&args, 0))),
+    );
+    props.insert(
+        "lookupPrefix".to_string(),
+        func(|attribute, args| lookup_prefix_result(&attribute, &arg(&args, 0))),
+    );
+    props.insert(
+        "isDefaultNamespace".to_string(),
+        func(|attribute, args| is_default_namespace_result(&attribute, &arg(&args, 0))),
+    );
+    let attribute = Value::object(props);
+    w3cos_core::class::set_prototype_of(&attribute, &crate::dom_constructors::prototype("Attr"));
+    attribute
 }
 
 fn attribute_value(
@@ -4896,26 +9742,249 @@ fn attribute_value(
     prefix: Option<&str>,
     value: &str,
 ) -> Value {
-    let attribute = Value::object(HashMap::from([
-        ("name".to_string(), Value::string(qualified_name)),
-        ("localName".to_string(), Value::string(local_name)),
-        ("value".to_string(), Value::string(value)),
-        ("nodeName".to_string(), Value::string(qualified_name)),
-        ("nodeValue".to_string(), Value::string(value)),
+    let cache_key = attribute_cache_key(owner, namespace, local_name);
+    if let Some(attribute) =
+        ATTRIBUTE_VALUES.with(|cache| cache.borrow().get(&cache_key).cloned())
+    {
+        return attribute;
+    }
+    let qualified_name = qualified_name.to_string();
+    let local_name = local_name.to_string();
+    let namespace = namespace.map(str::to_string);
+    let prefix = prefix.map(str::to_string);
+    let stored_value = Rc::new(RefCell::new(value.to_string()));
+    let mut props = HashMap::from([
+        ("name".to_string(), Value::string(&qualified_name)),
+        ("localName".to_string(), Value::string(&local_name)),
+        ("nodeName".to_string(), Value::string(&qualified_name)),
         ("nodeType".to_string(), Value::Number(2.0)),
         (
             "namespaceURI".to_string(),
-            namespace.map(Value::string).unwrap_or(Value::Null),
+            namespace
+                .as_deref()
+                .map(Value::string)
+                .unwrap_or(Value::Null),
         ),
         (
             "prefix".to_string(),
-            prefix.map(Value::string).unwrap_or(Value::Null),
+            prefix.as_deref().map(Value::string).unwrap_or(Value::Null),
         ),
         ("ownerElement".to_string(), element_value(owner)),
+        (
+            "ownerDocument".to_string(),
+            get_expando(owner, "ownerDocument").unwrap_or_else(document_value),
+        ),
+        (
+            "baseURI".to_string(),
+            get_expando(owner, "ownerDocument")
+                .unwrap_or_else(document_value)
+                .get_property("URL"),
+        ),
         ("specified".to_string(), Value::Bool(true)),
-    ]));
+        (
+            "isSameNode".to_string(),
+            func(|attribute, args| Value::Bool(attribute.strict_eq(&arg(&args, 0)))),
+        ),
+    ]);
+    for property in ["value", "nodeValue", "textContent"] {
+        let getter_qualified_name = qualified_name.clone();
+        let getter_local_name = local_name.clone();
+        let getter_namespace = namespace.clone();
+        let getter_stored_value = Rc::clone(&stored_value);
+        props.insert(
+            format!("__w3cos_getter_{property}"),
+            func(move |_, _| {
+                let current = if let Some(namespace) = getter_namespace.as_deref() {
+                    dom::get_attribute_ns(owner, Some(namespace), &getter_local_name)
+                } else {
+                    dom::get_attribute(owner, &getter_qualified_name)
+                };
+                if let Some(current) = current {
+                    *getter_stored_value.borrow_mut() = current;
+                }
+                Value::string(&getter_stored_value.borrow())
+            }),
+        );
+        let setter_qualified_name = qualified_name.clone();
+        let setter_local_name = local_name.clone();
+        let setter_namespace = namespace.clone();
+        let setter_prefix = prefix.clone();
+        let setter_stored_value = Rc::clone(&stored_value);
+        props.insert(
+            format!("__w3cos_setter_{property}"),
+            func(move |_, args| {
+                let value = arg(&args, 0).to_js_string();
+                let attached = if let Some(namespace) = setter_namespace.as_deref() {
+                    dom::get_attribute_ns(owner, Some(namespace), &setter_local_name).is_some()
+                } else {
+                    dom::get_attribute(owner, &setter_qualified_name).is_some()
+                };
+                if attached {
+                    dom::set_attribute_ns_parts(
+                        owner,
+                        setter_namespace.as_deref(),
+                        &setter_qualified_name,
+                        setter_prefix.as_deref(),
+                        &setter_local_name,
+                        &value,
+                    );
+                }
+                *setter_stored_value.borrow_mut() = value;
+                Value::Undefined
+            }),
+        );
+    }
+    props.insert(
+        "lookupNamespaceURI".to_string(),
+        func(|attribute, args| lookup_namespace_uri_result(&attribute, &arg(&args, 0))),
+    );
+    props.insert(
+        "lookupPrefix".to_string(),
+        func(|attribute, args| lookup_prefix_result(&attribute, &arg(&args, 0))),
+    );
+    props.insert(
+        "isDefaultNamespace".to_string(),
+        func(|attribute, args| is_default_namespace_result(&attribute, &arg(&args, 0))),
+    );
+    let attribute = Value::object(props);
     w3cos_core::class::set_prototype_of(&attribute, &crate::dom_constructors::prototype("Attr"));
+    ATTRIBUTE_VALUES.with(|cache| {
+        cache.borrow_mut().insert(cache_key, attribute.clone());
+    });
     attribute
+}
+
+fn attribute_cache_key(
+    owner: u32,
+    namespace: Option<&str>,
+    local_name: &str,
+) -> (u32, Option<String>, String) {
+    (
+        owner,
+        namespace.map(str::to_string),
+        local_name.to_string(),
+    )
+}
+
+fn cache_attribute_value(
+    owner: u32,
+    namespace: Option<&str>,
+    local_name: &str,
+    attribute: Value,
+) {
+    ATTRIBUTE_VALUES.with(|cache| {
+        cache.borrow_mut().insert(
+            attribute_cache_key(owner, namespace, local_name),
+            attribute,
+        );
+    });
+}
+
+fn detach_attribute_value(owner: u32, attribute: &Value) {
+    let namespace = normalized_namespace_argument(&attribute.get_property("namespaceURI"));
+    let local_name = attribute.get_property("localName").to_js_string();
+    ATTRIBUTE_VALUES.with(|cache| {
+        cache
+            .borrow_mut()
+            .remove(&attribute_cache_key(owner, namespace.as_deref(), &local_name));
+    });
+    attribute.set_property("ownerElement", Value::Null);
+}
+
+fn update_cached_attribute_owner_document(owner: u32, document: &Value) {
+    ATTRIBUTE_VALUES.with(|cache| {
+        for ((candidate_owner, _, _), attribute) in cache.borrow().iter() {
+            if *candidate_owner == owner {
+                attribute.set_property("ownerDocument", document.clone());
+                attribute.set_property("baseURI", document.get_property("URL"));
+            }
+        }
+    });
+}
+
+fn attribute_node_by_qualified_name(node: u32, requested_name: &str) -> Value {
+    let attribute = dom::with_document(|document| {
+        let node = document.get_node(NodeId::from_u32(node));
+        node.attributes
+            .iter()
+            .enumerate()
+            .find(|(_, (name, _))| name.as_str() == requested_name)
+            .map(|(index, (name, value))| {
+                let metadata = node.attribute_namespace_at(index);
+                (
+                    name.as_str().to_string(),
+                    metadata
+                        .map(|attribute| attribute.local_name.as_str())
+                        .unwrap_or_else(|| name.as_str())
+                        .to_string(),
+                    metadata
+                        .and_then(|attribute| attribute.namespace.as_ref())
+                        .map(|namespace| namespace.as_str().to_string()),
+                    metadata
+                        .and_then(|attribute| attribute.prefix.as_ref())
+                        .map(|prefix| prefix.as_str().to_string()),
+                    value.clone(),
+                )
+            })
+    });
+    attribute
+        .map(|(qualified_name, local_name, namespace, prefix, value)| {
+            attribute_value(
+                node,
+                &qualified_name,
+                &local_name,
+                namespace.as_deref(),
+                prefix.as_deref(),
+                &value,
+            )
+        })
+        .unwrap_or(Value::Null)
+}
+
+fn attribute_node_by_namespace(
+    node: u32,
+    requested_namespace: Option<&str>,
+    requested_local_name: &str,
+) -> Value {
+    let attribute = dom::with_document(|document| {
+        let node = document.get_node(NodeId::from_u32(node));
+        node.attributes
+            .iter()
+            .enumerate()
+            .find_map(|(index, (qualified_name, value))| {
+                let metadata = node.attribute_namespace_at(index);
+                let namespace = metadata
+                    .and_then(|attribute| attribute.namespace.as_ref())
+                    .map(|namespace| namespace.as_str());
+                let local_name = metadata
+                    .map(|attribute| attribute.local_name.as_str())
+                    .unwrap_or_else(|| qualified_name.as_str());
+                (namespace.as_deref() == requested_namespace && local_name == requested_local_name)
+                    .then(|| {
+                        (
+                            qualified_name.as_str(),
+                            local_name,
+                            namespace,
+                            metadata
+                                .and_then(|attribute| attribute.prefix.as_ref())
+                                .map(|prefix| prefix.as_str()),
+                            value.clone(),
+                        )
+                    })
+            })
+    });
+    attribute
+        .map(|(qualified_name, local_name, namespace, prefix, value)| {
+            attribute_value(
+                node,
+                &qualified_name,
+                &local_name,
+                namespace.as_deref(),
+                prefix.as_deref(),
+                &value,
+            )
+        })
+        .unwrap_or(Value::Null)
 }
 
 fn dataset_attribute_name(key: &str) -> String {
@@ -5014,14 +10083,65 @@ fn dataset_value(node: u32) -> Value {
 
 // ── classList ──────────────────────────────────────────────────────────────
 
-fn class_token_values(node: u32) -> Vec<Value> {
+fn class_token_strings(node: u32) -> Vec<String> {
     dom::with_document(|doc| {
         doc.get_node(NodeId::from_u32(node))
             .class_list
             .iter()
-            .map(|token| Value::string(&token.as_str()))
+            .map(|token| token.as_str().to_string())
             .collect()
     })
+}
+
+fn class_token_values(node: u32) -> Vec<Value> {
+    class_token_strings(node)
+        .into_iter()
+        .map(Value::from)
+        .collect()
+}
+
+fn validate_class_token_sequence(tokens: &[&str]) {
+    if tokens.iter().any(|token| token.is_empty()) {
+        dom_exception("The token must not be empty.", "SyntaxError");
+    }
+    if tokens.iter().any(|token| {
+        token
+            .bytes()
+            .any(|byte| matches!(byte, b'\t' | b'\n' | 0x0c | b'\r' | b' '))
+    }) {
+        dom_exception(
+            "The token must not contain ASCII whitespace.",
+            "InvalidCharacterError",
+        );
+    }
+}
+
+fn validate_class_token(token: &str) {
+    validate_class_token_sequence(&[token]);
+}
+
+fn validated_class_tokens(args: &[Value]) -> Vec<String> {
+    let tokens = args.iter().map(Value::to_js_string).collect::<Vec<_>>();
+    validate_class_token_sequence(&tokens.iter().map(String::as_str).collect::<Vec<_>>());
+    tokens
+}
+
+fn write_class_tokens(node: u32, tokens: &[String]) {
+    let before = capture_transition_snapshots(node);
+    let old_value = dom::get_attribute(node, "class");
+    dom::set_class_name(node, &tokens.join(" "));
+    crate::observers_web::notify_attribute(node, "class", old_value.as_deref());
+    let after = capture_transition_snapshots(node);
+    start_changed_transitions(node, &before, &after);
+}
+
+fn write_class_value(node: u32, value: &str) {
+    let before = capture_transition_snapshots(node);
+    let old_value = dom::get_attribute(node, "class");
+    dom::set_class_name(node, value);
+    crate::observers_web::notify_attribute(node, "class", old_value.as_deref());
+    let after = capture_transition_snapshots(node);
+    start_changed_transitions(node, &before, &after);
 }
 
 fn class_list_value(node: u32) -> Value {
@@ -5032,8 +10152,15 @@ fn class_list_value(node: u32) -> Value {
     props.insert(
         "add".to_string(),
         func(move |_, args| {
-            for a in args {
-                dom::class_list_add(node, &a.to_js_string());
+            let additions = validated_class_tokens(&args);
+            let mut tokens = class_token_strings(node);
+            for addition in additions {
+                if !tokens.contains(&addition) {
+                    tokens.push(addition);
+                }
+            }
+            if dom::get_attribute(node, "class").is_some() || !tokens.is_empty() {
+                write_class_tokens(node, &tokens);
             }
             Value::Undefined
         }),
@@ -5041,8 +10168,11 @@ fn class_list_value(node: u32) -> Value {
     props.insert(
         "remove".to_string(),
         func(move |_, args| {
-            for a in args {
-                dom::class_list_remove(node, &a.to_js_string());
+            let removals = validated_class_tokens(&args);
+            if dom::get_attribute(node, "class").is_some() {
+                let mut tokens = class_token_strings(node);
+                tokens.retain(|token| !removals.contains(token));
+                write_class_tokens(node, &tokens);
             }
             Value::Undefined
         }),
@@ -5050,17 +10180,21 @@ fn class_list_value(node: u32) -> Value {
     props.insert(
         "toggle".to_string(),
         func(move |_, args| {
-            let class = arg(&args, 0).to_js_string();
+            let token = arg(&args, 0).to_js_string();
+            validate_class_token(&token);
             let force = arg(&args, 1);
-            if force.is_undefined() {
-                Value::Bool(dom::class_list_toggle(node, &class))
-            } else if force.to_bool() {
-                dom::class_list_add(node, &class);
-                Value::Bool(true)
-            } else {
-                dom::class_list_remove(node, &class);
-                Value::Bool(false)
+            let mut tokens = class_token_strings(node);
+            let contains = tokens.contains(&token);
+            if !force.is_undefined() && force.to_bool() == contains {
+                return Value::Bool(contains);
             }
+            if contains {
+                tokens.retain(|candidate| candidate != &token);
+            } else {
+                tokens.push(token);
+            }
+            write_class_tokens(node, &tokens);
+            Value::Bool(!contains)
         }),
     );
     props.insert(
@@ -5077,13 +10211,18 @@ fn class_list_value(node: u32) -> Value {
         func(move |_, args| {
             let old = arg(&args, 0).to_js_string();
             let new = arg(&args, 1).to_js_string();
-            if dom::class_list_contains(node, &old) {
-                dom::class_list_remove(node, &old);
-                dom::class_list_add(node, &new);
-                Value::Bool(true)
-            } else {
-                Value::Bool(false)
+            validate_class_token_sequence(&[&old, &new]);
+            let mut tokens = class_token_strings(node);
+            let Some(old_index) = tokens.iter().position(|token| token == &old) else {
+                return Value::Bool(false);
+            };
+            if old != new {
+                tokens[old_index] = new;
+                let mut seen = HashSet::new();
+                tokens.retain(|token| seen.insert(token.clone()));
             }
+            write_class_tokens(node, &tokens);
+            Value::Bool(true)
         }),
     );
     props.insert(
@@ -5101,7 +10240,7 @@ fn class_list_value(node: u32) -> Value {
     );
     props.insert(
         "toString".to_string(),
-        func(move |_, _| Value::string(&dom::class_name(node))),
+        func(move |_, _| Value::string(&dom::get_attribute(node, "class").unwrap_or_default())),
     );
     props.insert(
         "values".to_string(),
@@ -5142,7 +10281,10 @@ fn class_list_value(node: u32) -> Value {
             Value::Undefined
         }),
     );
-    props.insert("supports".to_string(), func(|_, _| Value::Bool(false)));
+    props.insert(
+        "supports".to_string(),
+        func(|_, _| type_error("DOMTokenList.supports is not supported for classList.")),
+    );
     // Live getters via the value.rs getter convention (plain object).
     props.insert(
         "__w3cos_getter_length".to_string(),
@@ -5154,9 +10296,29 @@ fn class_list_value(node: u32) -> Value {
     );
     props.insert(
         "__w3cos_getter_value".to_string(),
-        func(move |_, _| Value::string(&dom::class_name(node))),
+        func(move |_, _| Value::string(&dom::get_attribute(node, "class").unwrap_or_default())),
     );
-    let value = Value::object(props);
+    props.insert(
+        "__w3cos_setter_value".to_string(),
+        func(move |_, args| {
+            write_class_value(node, &arg(&args, 0).to_js_string());
+            Value::Undefined
+        }),
+    );
+    let handler = ProxyBuilder::new()
+        .get(move |target, key, _receiver| {
+            if let Ok(index) = key.parse::<u32>() {
+                if index.to_string() == key {
+                    return class_token_strings(node)
+                        .get(index as usize)
+                        .map(|token| Value::string(token))
+                        .unwrap_or(Value::Undefined);
+                }
+            }
+            target.get_property(key)
+        })
+        .build();
+    let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
     w3cos_core::class::set_prototype_of(
         &value,
         &crate::dom_constructors::prototype("DOMTokenList"),
@@ -5165,7 +10327,347 @@ fn class_list_value(node: u32) -> Value {
     value
 }
 
-// ── style proxy ────────────────────────────────────────────────────────────
+// ── CSS motion + style proxy ──────────────────────────────────────────────
+
+fn css_motion_value(property: &str, value: &str) -> Option<CssMotionValue> {
+    let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::new();
+    declaration.set_property(property, value);
+    let style = declaration.to_style();
+    match property {
+        "left" => Some(CssMotionValue::Length(match style.left {
+            w3cos_std::style::Dimension::Px(value) => value,
+            w3cos_std::style::Dimension::Rem(value) | w3cos_std::style::Dimension::Em(value) => {
+                value * 16.0
+            }
+            _ => 0.0,
+        })),
+        "transform" => Some(CssMotionValue::TranslateX(style.transform.translate_x)),
+        _ => None,
+    }
+}
+
+fn css_motion_value_from_style(
+    style: &w3cos_std::style::Style,
+    property: &str,
+) -> Option<CssMotionValue> {
+    match property {
+        "left" => Some(CssMotionValue::Length(match style.left {
+            w3cos_std::style::Dimension::Px(value) => value,
+            w3cos_std::style::Dimension::Rem(value) | w3cos_std::style::Dimension::Em(value) => {
+                value * style.font_size
+            }
+            _ => 0.0,
+        })),
+        "transform" => Some(CssMotionValue::TranslateX(style.transform.translate_x)),
+        _ => None,
+    }
+}
+
+fn css_motion_value_lerp(
+    from: CssMotionValue,
+    to: CssMotionValue,
+    progress: f32,
+) -> CssMotionValue {
+    match (from, to) {
+        (CssMotionValue::Length(from), CssMotionValue::Length(to)) => {
+            CssMotionValue::Length(from + (to - from) * progress)
+        }
+        (CssMotionValue::TranslateX(from), CssMotionValue::TranslateX(to)) => {
+            CssMotionValue::TranslateX(from + (to - from) * progress)
+        }
+        _ => to,
+    }
+}
+
+fn css_motion_value_to_css(value: CssMotionValue) -> String {
+    match value {
+        CssMotionValue::Length(value) => format!("{value}px"),
+        CssMotionValue::TranslateX(value) => {
+            format!("matrix(1, 0, 0, 1, {value}, 0)")
+        }
+    }
+}
+
+fn sample_css_motion(motion: &CssMotion, now: Instant) -> CssMotionValue {
+    let elapsed = now.saturating_duration_since(motion.started_at);
+    if elapsed < motion.delay {
+        return motion.from;
+    }
+    let active = elapsed.saturating_sub(motion.delay).as_secs_f32();
+    let duration = motion.duration.as_secs_f32().max(0.001);
+    let mut progress = if motion.kind == CssMotionKind::Animation {
+        (active / duration).fract()
+    } else {
+        (active / duration).clamp(0.0, 1.0)
+    };
+    if motion.kind == CssMotionKind::Animation {
+        let iteration = (active / duration).floor() as u64;
+        progress = match motion.direction {
+            w3cos_std::style::AnimationDirection::Normal => progress,
+            w3cos_std::style::AnimationDirection::Reverse => 1.0 - progress,
+            w3cos_std::style::AnimationDirection::Alternate => {
+                if iteration.is_multiple_of(2) {
+                    progress
+                } else {
+                    1.0 - progress
+                }
+            }
+            w3cos_std::style::AnimationDirection::AlternateReverse => {
+                if iteration.is_multiple_of(2) {
+                    1.0 - progress
+                } else {
+                    progress
+                }
+            }
+        };
+    }
+    css_motion_value_lerp(motion.from, motion.to, motion.easing.interpolate(progress))
+}
+
+fn sampled_css_motion_value(
+    node: u32,
+    pseudo: Option<&str>,
+    property: &str,
+) -> Option<CssMotionValue> {
+    let now = Instant::now();
+    CSS_MOTIONS.with(|motions| {
+        motions
+            .borrow()
+            .iter()
+            .rev()
+            .find(|motion| {
+                motion.node == node
+                    && motion.pseudo.as_deref() == pseudo
+                    && motion.property == property
+            })
+            .map(|motion| sample_css_motion(motion, now))
+    })
+}
+
+fn transition_applies(transition: &w3cos_std::style::Transition, property: &str) -> bool {
+    use w3cos_std::style::TransitionProperty;
+    match &transition.property {
+        TransitionProperty::All => true,
+        TransitionProperty::Transform => property == "transform",
+        TransitionProperty::Custom(candidate) => candidate.eq_ignore_ascii_case(property),
+        _ => false,
+    }
+}
+
+fn motion_style(node: u32, pseudo: Option<&str>) -> w3cos_std::style::Style {
+    dom::with_document(|document| match pseudo {
+        Some(pseudo) => {
+            document.computed_pseudo_style_for(NodeId::from_u32(node), pseudo)
+        }
+        None => document.computed_style_for(NodeId::from_u32(node)),
+    })
+}
+
+fn capture_transition_snapshots(node: u32) -> Vec<TransitionSnapshot> {
+    let mut snapshots = Vec::new();
+    for pseudo in [None, Some("::before"), Some("::after")] {
+        let style = motion_style(node, pseudo);
+        let Some(transition) = style.transition.clone() else {
+            continue;
+        };
+        if transition.duration_ms == 0 {
+            continue;
+        }
+        for property in ["left", "transform"] {
+            if !transition_applies(&transition, property) {
+                continue;
+            }
+            if let Some(value) = css_motion_value_from_style(&style, property) {
+                snapshots.push(TransitionSnapshot {
+                    pseudo: pseudo.map(str::to_string),
+                    property: property.to_string(),
+                    value,
+                    transition: transition.clone(),
+                });
+            }
+        }
+    }
+    snapshots
+}
+
+fn start_css_transition(
+    node: u32,
+    from: &TransitionSnapshot,
+    to: &TransitionSnapshot,
+) {
+    if from.value == to.value {
+        return;
+    }
+    let sampled_from = sampled_css_motion_value(node, from.pseudo.as_deref(), &from.property)
+        .unwrap_or(from.value);
+    CSS_MOTIONS.with(|motions| {
+        let mut motions = motions.borrow_mut();
+        motions.retain(|motion| {
+            !(motion.node == node
+                && motion.kind == CssMotionKind::Transition
+                && motion.pseudo == from.pseudo
+                && motion.property == from.property)
+        });
+        motions.push(CssMotion {
+            node,
+            pseudo: from.pseudo.clone(),
+            property: from.property.clone(),
+            kind: CssMotionKind::Transition,
+            label: from.property.clone(),
+            from: sampled_from,
+            to: to.value,
+            started_at: Instant::now(),
+            delay: Duration::from_millis(u64::from(to.transition.delay_ms)),
+            duration: Duration::from_millis(u64::from(to.transition.duration_ms)),
+            easing: to.transition.easing,
+            direction: w3cos_std::style::AnimationDirection::Normal,
+            event_pending: true,
+        });
+    });
+    crate::animations_web::css_motion_animation(
+        node,
+        "transition",
+        &from.property,
+        from.pseudo.as_deref(),
+        &from.property,
+    );
+}
+
+fn start_changed_transitions(
+    node: u32,
+    before: &[TransitionSnapshot],
+    after: &[TransitionSnapshot],
+) {
+    for to in after {
+        if let Some(from) = before.iter().find(|from| {
+            from.pseudo == to.pseudo && from.property == to.property
+        }) {
+            start_css_transition(node, from, to);
+        }
+    }
+}
+
+fn scan_css_animations() {
+    for node in 0..dom::node_count() as u32 {
+        if dom::node_type(node) != 1 || !dom::is_connected(node) {
+            continue;
+        }
+        let style = motion_style(node, None);
+        let Some(animation) = style.animation.clone() else {
+            continue;
+        };
+        if animation.name.is_empty() || animation.name == "none" || animation.duration_ms == 0 {
+            continue;
+        }
+        let already_started = CSS_MOTIONS.with(|motions| {
+            motions.borrow().iter().any(|motion| {
+                motion.node == node
+                    && motion.kind == CssMotionKind::Animation
+                    && motion.label == animation.name
+            })
+        });
+        if already_started {
+            continue;
+        }
+        let keyframes = ["transform", "left"].into_iter().find_map(|property| {
+            crate::dynamic_script::active_keyframe_property(&animation.name, property)
+                .and_then(|(from, to)| {
+                    Some((
+                        property,
+                        css_motion_value(property, &from)?,
+                        css_motion_value(property, &to)?,
+                    ))
+                })
+        });
+        let Some((property, from, to)) = keyframes else {
+            continue;
+        };
+        CSS_MOTIONS.with(|motions| {
+            motions.borrow_mut().push(CssMotion {
+                node,
+                pseudo: None,
+                property: property.to_string(),
+                kind: CssMotionKind::Animation,
+                label: animation.name.clone(),
+                from,
+                to,
+                started_at: Instant::now(),
+                delay: Duration::from_millis(u64::from(animation.delay_ms)),
+                duration: Duration::from_millis(u64::from(animation.duration_ms)),
+                easing: animation.easing,
+                direction: animation.direction,
+                event_pending: true,
+            });
+        });
+        crate::animations_web::css_motion_animation(
+            node,
+            "animation",
+            &animation.name,
+            None,
+            property,
+        );
+    }
+}
+
+fn dispatch_css_motion_event(node: u32, event_type: &str) {
+    let event = w3cos_core::class::construct(
+        &crate::web_events::event_class(),
+        vec![
+            Value::string(event_type),
+            Value::object(HashMap::from([("bubbles".to_string(), Value::Bool(true))])),
+        ],
+    );
+    element_value(node).call_method("dispatchEvent", vec![event]);
+}
+
+fn tick_css_motions() {
+    scan_css_animations();
+    let now = Instant::now();
+    let events = CSS_MOTIONS.with(|motions| {
+        motions
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|motion| {
+                if motion.event_pending && now.saturating_duration_since(motion.started_at) >= motion.delay {
+                    motion.event_pending = false;
+                    Some((
+                        motion.node,
+                        if motion.kind == CssMotionKind::Animation {
+                            "animationstart"
+                        } else {
+                            "transitionstart"
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    for (node, event_type) in events {
+        dispatch_css_motion_event(node, event_type);
+    }
+}
+
+pub(crate) fn commit_css_motion_style(
+    node: u32,
+    pseudo: Option<&str>,
+    property: &str,
+) {
+    if pseudo.is_some() {
+        return;
+    }
+    let Some(value) = sampled_css_motion_value(node, None, property) else {
+        return;
+    };
+    let value = css_motion_value_to_css(value);
+    STYLE_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert((node, property.to_string()), value.clone());
+    });
+    dom::set_style_property(node, property, &value);
+}
 
 fn style_read(node: u32, kebab: &str) -> String {
     if let Some(v) = STYLE_CACHE.with(|c| c.borrow().get(&(node, kebab.to_string())).cloned()) {
@@ -5188,6 +10690,7 @@ pub(crate) fn resolved_style_property(node: u32, kebab: &str) -> String {
 }
 
 fn style_apply(node: u32, kebab: &str, value: &str) {
+    let before = capture_transition_snapshots(node);
     STYLE_CACHE.with(|c| {
         c.borrow_mut()
             .insert((node, kebab.to_string()), value.to_string());
@@ -5195,6 +10698,8 @@ fn style_apply(node: u32, kebab: &str, value: &str) {
     // Forward to the typed style (known properties drive layout; unknown ones
     // are dropped there but stay in the bridge cache).
     dom::set_style_property(node, kebab, value);
+    let after = capture_transition_snapshots(node);
+    start_changed_transitions(node, &before, &after);
 }
 
 fn style_css_text(node: u32) -> String {
@@ -5497,6 +11002,23 @@ fn style_value(node: u32) -> Value {
                 _ => Value::string(&style_read(node, &camel_to_kebab(key))),
             }
         })
+        .has(move |target, key| {
+            if target
+                .as_object()
+                .is_some_and(|object| object.borrow().has_direct(key))
+            {
+                return true;
+            }
+            let property = camel_to_kebab(key);
+            !w3cos_dom::css_style::CSSStyleDeclaration::new()
+                .get_property(&property)
+                .is_empty()
+                || STYLE_CACHE.with(|cache| {
+                    cache
+                        .borrow()
+                        .contains_key(&(node, property.to_string()))
+                })
+        })
         .set(move |_target, key, value, _receiver| {
             if bridge_realm_is_current(generation) {
                 if key == "cssText" {
@@ -5520,8 +11042,40 @@ fn style_value(node: u32) -> Value {
     value
 }
 
-fn computed_style_value(node: u32) -> Value {
+fn serialize_computed_style_property(property: &str, value: &str) -> String {
+    if property != "color" && !property.ends_with("-color") {
+        return value.to_string();
+    }
+    let Some(color) = w3cos_std::color::Color::from_css(value) else {
+        return value.to_string();
+    };
+    if color.a == 255 {
+        return format!("rgb({}, {}, {})", color.r, color.g, color.b);
+    }
+    let mut alpha = format!("{:.3}", f64::from(color.a) / 255.0);
+    while alpha.ends_with('0') {
+        alpha.pop();
+    }
+    if alpha.ends_with('.') {
+        alpha.push('0');
+    }
+    format!("rgba({}, {}, {}, {alpha})", color.r, color.g, color.b)
+}
+
+fn computed_style_property_value(node: u32, pseudo: Option<&str>, property: &str) -> String {
+    if let Some(value) = sampled_css_motion_value(node, pseudo, property) {
+        return css_motion_value_to_css(value);
+    }
+    let value = match pseudo {
+        Some(pseudo) => dom::computed_pseudo_style_property(node, pseudo, property),
+        None => dom::computed_style_property(node, property),
+    };
+    serialize_computed_style_property(property, &value)
+}
+
+fn computed_style_value(node: u32, pseudo: Option<String>) -> Value {
     let generation = realm_generation();
+    let getter_pseudo = pseudo.clone();
     let handler = ProxyBuilder::new()
         .get(move |target, key, _| {
             if !bridge_realm_is_current(generation) {
@@ -5531,16 +11085,24 @@ fn computed_style_value(node: u32) -> Value {
             if !stored.is_undefined() {
                 return stored;
             }
-            Value::string(&dom::computed_style_property(node, &camel_to_kebab(key)))
+            let property = camel_to_kebab(key);
+            Value::string(&computed_style_property_value(
+                node,
+                getter_pseudo.as_deref(),
+                &property,
+            ))
         })
         .build();
+    let method_pseudo = pseudo;
     let target = HashMap::from([
         (
             "getPropertyValue".to_string(),
             func(move |_, args| {
-                Value::string(&dom::computed_style_property(
+                let property = camel_to_kebab(&arg(&args, 0).to_js_string());
+                Value::string(&computed_style_property_value(
                     node,
-                    &camel_to_kebab(&arg(&args, 0).to_js_string()),
+                    method_pseudo.as_deref(),
+                    &property,
                 ))
             }),
         ),
@@ -5577,9 +11139,33 @@ fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Va
             event_type: et,
             handler,
             capture,
+            inline: false,
         })
     });
     ensure_native_registration(node, et);
+}
+
+pub(crate) fn js_set_inline_event_listener(node: u32, type_name: &str, handler: Value) {
+    let event_type = event_type_for(type_name);
+    let installs_handler = handler.is_function();
+    LISTENERS.with(|listeners| {
+        let mut listeners = listeners.borrow_mut();
+        listeners.retain(|listener| {
+            !(listener.inline && listener.node == node && listener.event_type == event_type)
+        });
+        if installs_handler {
+            listeners.push(JsListener {
+                node,
+                event_type,
+                handler,
+                capture: false,
+                inline: true,
+            });
+        }
+    });
+    if installs_handler {
+        ensure_native_registration(node, event_type);
+    }
 }
 
 /// Register the w3cos-dom-side snapshot closure once per (node, event_type).
@@ -5993,6 +11579,80 @@ fn dispatch_sync(target: u32, et: EventType, data: EventData) -> bool {
     let mut ev = Event::new(et, NodeId::from_u32(target));
     ev.data = data;
     dispatch_event_to_js(ev)
+}
+
+fn blur_element(node: u32) {
+    let was_active = ACTIVE_ELEMENT.with(|active| {
+        if *active.borrow() != Some(node) {
+            return false;
+        }
+        *active.borrow_mut() = None;
+        true
+    });
+    if !was_active {
+        return;
+    }
+    dispatch_sync(node, EventType::Blur, EventData::Focus);
+    dispatch_sync(node, EventType::FocusOut, EventData::Focus);
+}
+
+fn focus_element(node: u32) {
+    let previous = ACTIVE_ELEMENT.with(|active| *active.borrow());
+    if previous == Some(node) {
+        return;
+    }
+    if let Some(previous) = previous {
+        blur_element(previous);
+    }
+    ACTIVE_ELEMENT.with(|active| *active.borrow_mut() = Some(node));
+    dispatch_sync(node, EventType::Focus, EventData::Focus);
+    dispatch_sync(node, EventType::FocusIn, EventData::Focus);
+}
+
+fn blur_focus_for_standard_reparent(node: u32) {
+    if dom::parent_node(node).is_none() {
+        return;
+    }
+    let focused = ACTIVE_ELEMENT.with(|active| *active.borrow());
+    if let Some(focused) = focused
+        && (focused == node || is_ancestor_of(node, focused))
+    {
+        blur_element(focused);
+    }
+}
+
+fn focus_is_suppressed(node: u32) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if dom::has_attribute(candidate, "inert") || dom::has_attribute(candidate, "hidden") {
+            return true;
+        }
+        let display = dom::with_document(|document| {
+            Element::new(NodeId::from_u32(candidate))
+                .get_computed_style(document)
+                .get_property("display")
+        });
+        if display == "none" {
+            return true;
+        }
+        current = dom::parent_node(candidate);
+    }
+    false
+}
+
+fn schedule_focus_revalidation_after_move(moved: u32) {
+    let focused = ACTIVE_ELEMENT.with(|active| *active.borrow());
+    let Some(focused) = focused.filter(|focused| {
+        *focused == moved || is_ancestor_of(moved, *focused)
+    }) else {
+        return;
+    };
+    queue_microtask_value(func(move |_, _| {
+        if element_has_focus(focused) && focus_is_suppressed(focused) {
+            blur_element(focused);
+        }
+        Value::Undefined
+    }));
 }
 
 /// Deliver a platform/session-history traversal to `window` listeners.
@@ -7464,6 +13124,140 @@ fn range_hidden(v: &Value, key: &str) -> u32 {
     v.get_property(key).to_u32()
 }
 
+fn child_below_ancestor(ancestor: u32, mut node: u32) -> Option<u32> {
+    while let Some(parent) = dom::parent_node(node) {
+        if parent == ancestor {
+            return Some(node);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn compare_boundary_points(
+    left_container: u32,
+    left_offset: u32,
+    right_container: u32,
+    right_offset: u32,
+) -> Option<Ordering> {
+    if left_container == 0 || right_container == 0 {
+        return None;
+    }
+    if left_container == right_container {
+        return Some(left_offset.cmp(&right_offset));
+    }
+    if tree_root(left_container) != tree_root(right_container) {
+        return None;
+    }
+
+    if let Some(child) = child_below_ancestor(left_container, right_container) {
+        let child_index = dom::children(left_container)
+            .iter()
+            .position(|candidate| *candidate == child)? as u32;
+        return Some(if child_index < left_offset {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        });
+    }
+    if let Some(child) = child_below_ancestor(right_container, left_container) {
+        let child_index = dom::children(right_container)
+            .iter()
+            .position(|candidate| *candidate == child)? as u32;
+        return Some(if child_index < right_offset {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+
+    let mut left_branch = left_container;
+    let mut left_ancestors = HashMap::new();
+    while let Some(parent) = dom::parent_node(left_branch) {
+        left_ancestors.insert(parent, left_branch);
+        left_branch = parent;
+    }
+    let mut right_branch = right_container;
+    while let Some(parent) = dom::parent_node(right_branch) {
+        if let Some(left_child) = left_ancestors.get(&parent) {
+            let children = dom::children(parent);
+            let left_index = children.iter().position(|child| child == left_child)?;
+            let right_index = children
+                .iter()
+                .position(|child| *child == right_branch)?;
+            return Some(left_index.cmp(&right_index));
+        }
+        right_branch = parent;
+    }
+    None
+}
+
+fn range_intersects_node(range: &Value, node: u32) -> bool {
+    let Some(parent) = dom::parent_node(node) else {
+        return false;
+    };
+    let Some(index) = dom::children(parent)
+        .iter()
+        .position(|child| *child == node)
+        .map(|index| index as u32)
+    else {
+        return false;
+    };
+    let start_container = range_hidden(range, "__sc");
+    let end_container = range_hidden(range, "__ec");
+    compare_boundary_points(start_container, range_hidden(range, "__so"), parent, index + 1)
+        .is_some_and(|ordering| ordering == Ordering::Less)
+        && compare_boundary_points(
+            end_container,
+            range_hidden(range, "__eo"),
+            parent,
+            index,
+        )
+        .is_some_and(|ordering| ordering == Ordering::Greater)
+}
+
+fn adjust_live_ranges_for_removal(node: u32) {
+    let Some(parent) = dom::parent_node(node) else {
+        return;
+    };
+    let Some(index) = dom::children(parent)
+        .iter()
+        .position(|child| *child == node)
+        .map(|index| index as u32)
+    else {
+        return;
+    };
+    LIVE_RANGES.with(|ranges| {
+        for range in ranges.borrow().iter() {
+            for (container_key, offset_key) in [("__sc", "__so"), ("__ec", "__eo")] {
+                let container = range_hidden(range, container_key);
+                let offset = range_hidden(range, offset_key);
+                if container == node || (container != 0 && is_ancestor_of(node, container)) {
+                    range.set_property(container_key, Value::Number(parent as f64));
+                    range.set_property(offset_key, Value::Number(index as f64));
+                } else if container == parent && offset > index {
+                    range.set_property(offset_key, Value::Number((offset - 1) as f64));
+                }
+            }
+        }
+    });
+}
+
+fn adjust_live_ranges_for_insertion(parent: u32, index: u32) {
+    LIVE_RANGES.with(|ranges| {
+        for range in ranges.borrow().iter() {
+            for (container_key, offset_key) in [("__sc", "__so"), ("__ec", "__eo")] {
+                if range_hidden(range, container_key) == parent {
+                    let offset = range_hidden(range, offset_key);
+                    if offset > index {
+                        range.set_property(offset_key, Value::Number((offset + 1) as f64));
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn range_to_w3cos(v: &Value) -> w3cos_dom::selection::Range {
     let mut r = w3cos_dom::selection::Range::new();
     r.set_start(
@@ -7580,6 +13374,52 @@ fn range_fragment(v: &Value, extract: bool) -> Value {
             v.set_property("__so", Value::Number(from as f64));
         }
         return element_value(fragment);
+    }
+
+    let start_parent = dom::parent_node(start_container);
+    let end_parent = dom::parent_node(end_container);
+    if start_parent == end_parent
+        && start_parent.is_some()
+        && matches!(dom::node_type(start_container), 3 | 4 | 7 | 8)
+        && matches!(dom::node_type(end_container), 3 | 4 | 7 | 8)
+    {
+        let parent = start_parent.expect("matching character-data parents");
+        let children = dom::children(parent);
+        let start_index = children.iter().position(|child| *child == start_container);
+        let end_index = children.iter().position(|child| *child == end_container);
+        if let (Some(start_index), Some(end_index)) = (start_index, end_index)
+            && start_index < end_index
+        {
+            let start_text = dom::get_text_content(start_container).unwrap_or_default();
+            let end_text = dom::get_text_content(end_container).unwrap_or_default();
+            let start_chars = start_text.chars().collect::<Vec<_>>();
+            let end_chars = end_text.chars().collect::<Vec<_>>();
+            let from = start.min(start_chars.len());
+            let to = end.min(end_chars.len());
+            let mut selected = start_chars[from..].iter().collect::<String>();
+            for child in &children[start_index + 1..end_index] {
+                selected.push_str(&dom::get_descendant_text_content(*child));
+            }
+            selected.extend(end_chars[..to].iter());
+            if !selected.is_empty() {
+                dom::append_child(fragment, dom::create_text_node(&selected));
+            }
+            if extract {
+                dom::set_text_content(
+                    start_container,
+                    &start_chars[..from].iter().collect::<String>(),
+                );
+                for child in children[start_index + 1..end_index].iter().copied() {
+                    dom::remove_child(parent, child);
+                }
+                dom::set_text_content(end_container, &end_chars[to..].iter().collect::<String>());
+                v.set_property("__ec", Value::Number(start_container as f64));
+                v.set_property("__eo", Value::Number(from as f64));
+                v.set_property("__sc", Value::Number(start_container as f64));
+                v.set_property("__so", Value::Number(from as f64));
+            }
+            return element_value(fragment);
+        }
     }
 
     range_warn_complex();
@@ -7842,6 +13682,18 @@ pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
         }),
     );
     value.set_property(
+        "intersectsNode",
+        func({
+            let v = value.clone();
+            move |_, args| {
+                Value::Bool(
+                    node_id_of(&arg(&args, 0))
+                        .is_some_and(|node| range_intersects_node(&v, node)),
+                )
+            }
+        }),
+    );
+    value.set_property(
         "getBoundingClientRect",
         func({
             let v = value.clone();
@@ -7935,6 +13787,7 @@ pub(crate) fn range_value(sc: u32, so: u32, ec: u32, eo: u32) -> Value {
         }),
     );
     w3cos_core::class::set_prototype_of(&value, &crate::dom_constructors::prototype("Range"));
+    LIVE_RANGES.with(|ranges| ranges.borrow_mut().push(value.clone()));
     value
 }
 
@@ -8022,12 +13875,20 @@ pub(crate) fn static_range_value(args: Vec<Value>) -> Value {
 }
 
 pub(crate) fn text_value(args: Vec<Value>) -> Value {
-    let data = args.first().map(Value::to_js_string).unwrap_or_default();
+    let data = args
+        .first()
+        .filter(|value| !value.is_undefined())
+        .map(Value::to_js_string)
+        .unwrap_or_default();
     element_value(dom::create_text_node(&data))
 }
 
 pub(crate) fn comment_value(args: Vec<Value>) -> Value {
-    let data = args.first().map(Value::to_js_string).unwrap_or_default();
+    let data = args
+        .first()
+        .filter(|value| !value.is_undefined())
+        .map(Value::to_js_string)
+        .unwrap_or_default();
     element_value(dom::create_comment(&data))
 }
 
@@ -8039,14 +13900,54 @@ fn dom_exception(message: &str, name: &str) -> ! {
     w3cos_core::throw_value(dom_exception_value(message, name))
 }
 
+fn type_error(message: &str) -> ! {
+    w3cos_core::throw_value(w3cos_core::error_instance(
+        "TypeError",
+        vec![Value::string(message)],
+    ))
+}
+
 fn valid_xml_name(name: &str) -> bool {
     let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|ch| ch == '_' || ch == ':' || ch.is_ascii_alphabetic())
-        && chars.all(|ch| {
-            ch == '_' || ch == ':' || ch == '-' || ch == '.' || ch.is_ascii_alphanumeric()
-        })
+    chars.next().is_some_and(valid_xml_name_start_character) && chars.all(valid_xml_name_character)
+}
+
+fn valid_xml_name_start_character(character: char) -> bool {
+    matches!(character, ':' | '_' | 'A'..='Z' | 'a'..='z')
+        || matches!(character as u32,
+            0x00C0..=0x00D6
+                | 0x00D8..=0x00F6
+                | 0x00F8..=0x02FF
+                | 0x0370..=0x037D
+                | 0x037F..=0x1FFF
+                | 0x200C..=0x200D
+                | 0x2070..=0x218F
+                | 0x2C00..=0x2FEF
+                | 0x3001..=0xD7FF
+                | 0xF900..=0xFDCF
+                | 0xFDF0..=0xFFFD
+                | 0x10000..=0xEFFFF)
+}
+
+fn valid_xml_name_character(character: char) -> bool {
+    valid_xml_name_start_character(character)
+        || matches!(character, '-' | '.' | '0'..='9' | '\u{00B7}')
+        || matches!(character as u32, 0x0300..=0x036F | 0x203F..=0x2040)
+}
+
+fn create_cdata_section_value(document: &Value, data: &str) -> Value {
+    if document.get_property("contentType").to_js_string() == "text/html" {
+        dom_exception(
+            "CDATA sections are not supported in HTML documents",
+            "NotSupportedError",
+        );
+    }
+    if data.contains("]]>") {
+        dom_exception("CDATA data must not contain ']]>'", "InvalidCharacterError");
+    }
+    let node = dom::create_cdata_section(data);
+    set_expando(node, "ownerDocument", document.clone());
+    element_value(node)
 }
 
 fn create_processing_instruction_value(target: &str, data: &str) -> Value {
@@ -8066,7 +13967,11 @@ fn create_processing_instruction_value(target: &str, data: &str) -> Value {
 }
 
 fn create_document_type_value(name: &str, public_id: &str, system_id: &str) -> Value {
-    if !valid_xml_name(name) {
+    if name.contains(['\0', '>'])
+        || name
+            .chars()
+            .any(|character| matches!(character, '\t' | '\n' | '\u{000c}' | '\r' | ' '))
+    {
         dom_exception(
             "Document type name is not a valid XML name",
             "InvalidCharacterError",
@@ -8082,49 +13987,65 @@ fn dom_implementation_value() -> Value {
     let value = Value::object(HashMap::new());
     value.set_property(
         "createDocumentType",
-        func(|_, args| {
-            create_document_type_value(
+        func(|implementation, args| {
+            let doctype = create_document_type_value(
                 &arg(&args, 0).to_js_string(),
                 &arg(&args, 1).to_js_string(),
                 &arg(&args, 2).to_js_string(),
-            )
+            );
+            if let Some(node) = node_id_of(&doctype) {
+                let owner = implementation.get_property("__w3cos_owner_document");
+                if !owner.is_undefined() {
+                    set_expando(node, "ownerDocument", owner);
+                }
+            }
+            doctype
         }),
     );
     value.set_property(
         "createDocument",
         func(|_, args| {
-            let namespace = arg(&args, 0);
-            let qualified_name = arg(&args, 1).to_js_string();
-            if qualified_name.is_empty() {
-                dom_exception(
-                    "Empty document roots are not supported by this runtime",
-                    "NotSupportedError",
-                );
+            if args.len() < 2 {
+                type_error("createDocument requires namespace and qualifiedName");
             }
-            if !valid_xml_name(&qualified_name) {
-                dom_exception(
-                    "Document element name is not a valid XML name",
-                    "InvalidCharacterError",
-                );
-            }
-            let root = dom::create_element(&qualified_name);
-            if !namespace.is_null() {
-                set_expando(
-                    root,
-                    "namespaceURI",
-                    Value::string(&namespace.to_js_string()),
-                );
-            }
-            let document = parsed_document_value(root, "application/xml", None, None);
+            let namespace_value = arg(&args, 0);
+            let namespace = normalized_namespace(&namespace_value);
+            let qualified_name_value = arg(&args, 1);
+            let qualified_name = if qualified_name_value.is_null() {
+                String::new()
+            } else {
+                qualified_name_value.to_js_string()
+            };
             let doctype = arg(&args, 2);
-            document.set_property(
-                "doctype",
-                if node_id_of(&doctype).is_some_and(|node| dom::node_type(node) == 10) {
-                    doctype
-                } else {
-                    Value::Null
-                },
-            );
+            if !doctype.is_null()
+                && !doctype.is_undefined()
+                && !node_id_of(&doctype).is_some_and(|node| dom::node_type(node) == 10)
+            {
+                type_error("createDocument doctype must be a DocumentType");
+            }
+            let content_type = match namespace.as_deref() {
+                Some(crate::html_parser_state::HTML_NAMESPACE) => "application/xhtml+xml",
+                Some("http://www.w3.org/2000/svg") => "image/svg+xml",
+                _ => "application/xml",
+            };
+            if qualified_name.is_empty() {
+                let document = empty_document_value(content_type, "XMLDocument");
+                if let Some(node) = node_id_of(&doctype)
+                    && dom::node_type(node) == 10
+                {
+                    set_virtual_document_children(&document, vec![doctype]);
+                }
+                return document;
+            }
+            validate_and_extract_qualified_name(namespace.as_deref(), &qualified_name);
+            let root =
+                create_namespaced_element(namespace.as_deref().unwrap_or(""), &qualified_name);
+            let document = parsed_document_value(root, content_type, None, None);
+            if node_id_of(&doctype).is_some_and(|node| dom::node_type(node) == 10) {
+                set_virtual_document_children(&document, vec![doctype, element_value(root)]);
+            } else {
+                document.set_property("doctype", Value::Null);
+            }
             document
         }),
     );
@@ -8142,7 +14063,10 @@ fn dom_implementation_value() -> Value {
                 dom::append_child(title_node, dom::create_text_node(&title.to_js_string()));
                 dom::append_child(head, title_node);
             }
-            parsed_document_value(html, "text/html", Some(head), Some(body))
+            let document = parsed_document_value(html, "text/html", Some(head), Some(body));
+            let doctype = create_document_type_value("html", "", "");
+            set_virtual_document_children(&document, vec![doctype, element_value(html)]);
+            document
         }),
     );
     value.set_property("hasFeature", func(|_, _| Value::Bool(true)));
@@ -8331,8 +14255,68 @@ fn head_id() -> u32 {
 }
 
 fn document_element_id() -> u32 {
+    if document_value().get_property("contentType").to_js_string() != "text/html" {
+        return dom::children(0)
+            .into_iter()
+            .find(|node| dom::node_type(*node) == 1)
+            .unwrap_or_else(dom::body_id);
+    }
     ensure_html_structure();
     HTML_ID.with(|h| h.borrow().unwrap())
+}
+
+fn global_document_children() -> Vec<Value> {
+    if document_value().get_property("contentType").to_js_string() == "text/html" {
+        ensure_html_structure();
+    }
+    let document = document_value();
+    let doctype = document.get_property("doctype");
+    let mut children = dom::children(0)
+        .into_iter()
+        .filter(|node| matches!(dom::node_type(*node), 1 | 7 | 8))
+        .map(element_value)
+        .collect::<Vec<_>>();
+    if !doctype.is_null() && !doctype.is_undefined() {
+        let position = children
+            .iter()
+            .position(|child| child.get_property("nodeType").to_u32() == 1)
+            .unwrap_or(children.len());
+        children.insert(position, doctype);
+    }
+    children
+}
+
+fn is_global_document_child(node: u32) -> bool {
+    dom::parent_node(node) == Some(0)
+        || get_expando(node, "parentNode")
+            .is_some_and(|parent| parent.strict_eq(&document_value()))
+}
+
+fn global_document_sibling(node: u32, next: bool) -> Value {
+    let children = global_document_children();
+    let Some(index) = children
+        .iter()
+        .position(|child| node_id_of(child) == Some(node))
+    else {
+        return Value::Null;
+    };
+    let sibling = if next {
+        children.get(index + 1)
+    } else {
+        index.checked_sub(1).and_then(|index| children.get(index))
+    };
+    sibling.cloned().unwrap_or(Value::Null)
+}
+
+fn global_document_child_nodes() -> Value {
+    let document = document_value();
+    let cached = document.get_property("__w3cos_cached_child_nodes");
+    if !cached.is_undefined() {
+        return cached;
+    }
+    let list = live_node_list(global_document_children);
+    document.set_property("__w3cos_cached_child_nodes", list.clone());
+    list
 }
 
 /// Lazily create the `<html>`/`<head>` structure: root(#document) gets an
@@ -8746,9 +14730,28 @@ pub fn document_value() -> Value {
 
 fn build_document_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
+    let implementation = dom_implementation_value();
 
     props.insert("nodeType".to_string(), Value::Number(9.0));
     props.insert("nodeName".to_string(), Value::string("#document"));
+    props.insert("parentNode".to_string(), Value::Null);
+    props.insert("parentElement".to_string(), Value::Null);
+    props.insert(
+        "isSameNode".to_string(),
+        func(|document, args| Value::Bool(document.strict_eq(&arg(&args, 0)))),
+    );
+    props.insert(
+        "isEqualNode".to_string(),
+        func(|document, args| Value::Bool(nodes_are_equal(&document, &arg(&args, 0)))),
+    );
+    props.insert("getRootNode".to_string(), func(|document, _| document));
+    props.insert(
+        "normalize".to_string(),
+        func(|_, _| {
+            normalize_node_subtree(0);
+            Value::Undefined
+        }),
+    );
     props.insert("onvisibilitychange".to_string(), Value::Null);
     props.insert("characterSet".to_string(), Value::string("UTF-8"));
     props.insert("compatMode".to_string(), Value::string("CSS1Compat"));
@@ -8768,7 +14771,7 @@ fn build_document_value() -> Value {
     );
     props.insert("adoptedStyleSheets".to_string(), js_array(vec![]));
     props.insert("doctype".to_string(), Value::Null);
-    props.insert("implementation".to_string(), dom_implementation_value());
+    props.insert("implementation".to_string(), implementation.clone());
     props.insert(
         "featurePolicy".to_string(),
         crate::compat_web::feature_policy_value(),
@@ -8786,7 +14789,13 @@ fn build_document_value() -> Value {
     props.insert(
         "createElement".to_string(),
         func(|_, args| {
-            let tag = arg(&args, 0).to_js_string().to_ascii_lowercase();
+            let mut tag = arg(&args, 0).to_js_string();
+            if !valid_element_name(&tag) {
+                dom_exception("The element name is not valid", "InvalidCharacterError");
+            }
+            if document_value().get_property("contentType").to_js_string() == "text/html" {
+                tag.make_ascii_lowercase();
+            }
             let id = dom::create_element(&tag);
             let element = element_value(id);
             if tag == "template" {
@@ -8803,11 +14812,15 @@ fn build_document_value() -> Value {
     props.insert(
         "createElementNS".to_string(),
         func(|_, args| {
-            let ns = arg(&args, 0).to_js_string();
-            let tag = arg(&args, 1).to_js_string().to_ascii_lowercase();
-            let id = create_namespaced_element(&ns, &tag);
+            let namespace = normalized_namespace(&arg(&args, 0));
+            // Namespace-aware creation preserves the supplied qualified name.
+            // HTML case folding is a reflected `tagName`/`nodeName` rule and
+            // only applies when the owner document itself is an HTML document.
+            let tag = arg(&args, 1).to_js_string();
+            validate_and_extract_qualified_name(namespace.as_deref(), &tag);
+            let id = create_namespaced_element(namespace.as_deref().unwrap_or(""), &tag);
             let element = element_value(id);
-            if ns == "http://www.w3.org/1998/Math/MathML" {
+            if namespace.as_deref() == Some("http://www.w3.org/1998/Math/MathML") {
                 w3cos_core::class::set_prototype_of(
                     &element,
                     &math_ml_element_class().get_property("prototype"),
@@ -8826,12 +14839,7 @@ fn build_document_value() -> Value {
     );
     props.insert(
         "createCDATASection".to_string(),
-        func(|_, _| {
-            dom_exception(
-                "CDATA sections are not supported in HTML documents",
-                "NotSupportedError",
-            )
-        }),
+        func(|document, args| create_cdata_section_value(&document, &arg(&args, 0).to_js_string())),
     );
     props.insert(
         "createProcessingInstruction".to_string(),
@@ -8846,10 +14854,77 @@ fn build_document_value() -> Value {
         "createDocumentFragment".to_string(),
         func(|_, _| element_value(dom::create_document_fragment())),
     );
+    props.insert(
+        "createEvent".to_string(),
+        func(|_, args| {
+            let requested = arg(&args, 0).to_js_string();
+            let interface = match requested.to_ascii_lowercase().as_str() {
+                "beforeunloadevent" => "BeforeUnloadEvent",
+                "compositionevent" => "CompositionEvent",
+                "customevent" => "CustomEvent",
+                "devicemotionevent" => "DeviceMotionEvent",
+                "deviceorientationevent" => "DeviceOrientationEvent",
+                "dragevent" => "DragEvent",
+                "event" | "events" | "htmlevents" | "svgevents" => "Event",
+                "focusevent" => "FocusEvent",
+                "hashchangeevent" => "HashChangeEvent",
+                "keyboardevent" => "KeyboardEvent",
+                "messageevent" => "MessageEvent",
+                "mouseevent" | "mouseevents" => "MouseEvent",
+                "storageevent" => "StorageEvent",
+                "textevent" => "TextEvent",
+                "touchevent" => "TouchEvent",
+                "uievent" | "uievents" => "UIEvent",
+                _ => {
+                    return dom_exception(
+                        &format!("The event interface {requested:?} is not supported"),
+                        "NotSupportedError",
+                    );
+                }
+            };
+            w3cos_core::class::construct(
+                &window_value().get_property(interface),
+                vec![Value::string("")],
+            )
+        }),
+    );
+    props.insert(
+        "createAttribute".to_string(),
+        func(|document, args| detached_attribute_value(&document, arg(&args, 0), true)),
+    );
+    props.insert(
+        "createAttributeNS".to_string(),
+        func(|document, args| {
+            detached_namespaced_attribute_value(&document, arg(&args, 0), arg(&args, 1))
+        }),
+    );
+    props.insert(
+        "appendChild".to_string(),
+        func(|document, args| {
+            let child = arg(&args, 0);
+            let Some(node) = node_id_of(&child) else {
+                return child;
+            };
+            match dom::node_type(node) {
+                7 | 8 => {
+                    dom::append_child(0, node);
+                    set_expando(node, "ownerDocument", document);
+                    child
+                }
+                _ => dom_exception(
+                    "This node is not valid at the requested document position",
+                    "HierarchyRequestError",
+                ),
+            }
+        }),
+    );
     for (name, iterator) in [("createTreeWalker", false), ("createNodeIterator", true)] {
         props.insert(
             name.to_string(),
             func(move |_, args| {
+                if args.is_empty() {
+                    type_error(&format!("Document.{name} requires a root node"));
+                }
                 let root_value = arg(&args, 0);
                 let Some(root) = traversal_root(&root_value) else {
                     return Value::Null;
@@ -8859,7 +14934,12 @@ fn build_document_value() -> Value {
                 } else {
                     arg(&args, 1).to_u32()
                 };
-                traversal_value(root, what_to_show, arg(&args, 2), iterator)
+                let filter = if arg(&args, 2).is_undefined() {
+                    Value::Null
+                } else {
+                    arg(&args, 2)
+                };
+                traversal_value(root, what_to_show, filter, iterator)
             }),
         );
     }
@@ -8867,22 +14947,29 @@ fn build_document_value() -> Value {
         "getElementById".to_string(),
         func(|_, args| {
             let root = document_element_id();
-            let found = dom::get_element_by_id(&arg(&args, 0).to_js_string())
-                .filter(|node| *node == root || is_ancestor_of(root, *node));
+            let id = arg(&args, 0).to_js_string();
+            if id.is_empty() {
+                return Value::Null;
+            }
+            let found = inclusive_descendant_elements(root)
+                .into_iter()
+                .find(|node| dom::get_attribute(*node, "id").as_deref() == Some(&id));
             element_or_null(found)
         }),
     );
     props.insert(
         "querySelector".to_string(),
         func(|_, args| {
-            let sel = arg(&args, 0).to_js_string();
+            let root = document_element_id();
+            let sel = query_selector_argument(&args, root);
             element_or_null(query_live_document_all(&sel).into_iter().next())
         }),
     );
     props.insert(
         "querySelectorAll".to_string(),
         func(|_, args| {
-            let sel = arg(&args, 0).to_js_string();
+            let root = document_element_id();
+            let sel = query_selector_argument(&args, root);
             node_list(
                 query_live_document_all(&sel)
                     .into_iter()
@@ -8933,10 +15020,27 @@ fn build_document_value() -> Value {
     props.insert(
         "getElementsByTagName".to_string(),
         func(|_, args| {
-            let tag = arg(&args, 0).to_js_string().to_ascii_lowercase();
+            let tag = arg(&args, 0).to_js_string();
+            let html_document =
+                document_value().get_property("contentType").to_js_string() == "text/html";
             html_collection(move || {
-                dom::get_elements_by_tag_name(&tag)
+                inclusive_descendant_elements(document_element_id())
                     .into_iter()
+                    .filter(|node| element_matches_tag_name(*node, &tag, html_document))
+                    .map(element_value)
+                    .collect()
+            })
+        }),
+    );
+    props.insert(
+        "getElementsByTagNameNS".to_string(),
+        func(|_, args| {
+            let namespace = normalized_namespace(&arg(&args, 0));
+            let local_name = arg(&args, 1).to_js_string();
+            html_collection(move || {
+                inclusive_descendant_elements(document_element_id())
+                    .into_iter()
+                    .filter(|node| element_matches_namespace(*node, &namespace, &local_name))
                     .map(element_value)
                     .collect()
             })
@@ -8945,10 +15049,11 @@ fn build_document_value() -> Value {
     props.insert(
         "getElementsByClassName".to_string(),
         func(|_, args| {
-            let class = arg(&args, 0).to_js_string();
+            let class_names = arg(&args, 0).to_js_string();
             html_collection(move || {
-                dom::get_elements_by_class_name(&class)
+                inclusive_descendant_elements(document_element_id())
                     .into_iter()
+                    .filter(|node| element_matches_class_names(*node, &class_names))
                     .map(element_value)
                     .collect()
             })
@@ -8959,7 +15064,7 @@ fn build_document_value() -> Value {
         func(|_, args| {
             let name = arg(&args, 0).to_js_string();
             live_node_list(move || {
-                dom::get_elements_by_tag_name("*")
+                inclusive_descendant_elements(document_element_id())
                     .into_iter()
                     .filter(|node| dom::get_attribute(*node, "name").as_deref() == Some(&name))
                     .map(element_value)
@@ -8986,25 +15091,11 @@ fn build_document_value() -> Value {
     props.insert("hasFocus".to_string(), func(|_, _| Value::Bool(true)));
     props.insert(
         "adoptNode".to_string(),
-        func(|_, args| {
-            let node = arg(&args, 0);
-            if let Some(id) = node_id_of(&node)
-                && let Some(parent) = dom::parent_node(id)
-            {
-                dom::remove_child(parent, id);
-            }
-            node
-        }),
+        func(|document, args| adopt_node_into(&document, arg(&args, 0))),
     );
     props.insert(
         "importNode".to_string(),
-        func(|_, args| {
-            let node = arg(&args, 0);
-            let Some(id) = node_id_of(&node) else {
-                return Value::Null;
-            };
-            element_value(dom::clone_node(id, arg(&args, 1).to_bool()))
-        }),
+        func(|document, args| import_node_into(&document, arg(&args, 0), arg(&args, 1).to_bool())),
     );
     props.insert(
         "addEventListener".to_string(),
@@ -9029,19 +15120,64 @@ fn build_document_value() -> Value {
         "dispatchEvent".to_string(),
         func(|_, args| Value::Bool(js_dispatch_event(0, arg(&args, 0)))),
     );
-
     // Live getters via the value.rs getter convention.
     props.insert(
         "__w3cos_getter_body".to_string(),
-        func(|_, _| element_value(dom::body_id())),
+        func(|_, _| {
+            if document_value().get_property("contentType").to_js_string() == "text/html" {
+                return element_value(dom::body_id());
+            }
+            element_or_null(
+                inclusive_descendant_elements(document_element_id())
+                    .into_iter()
+                    .find(|node| {
+                        namespace_uri(*node) == crate::html_parser_state::HTML_NAMESPACE
+                            && dom::tag_name(*node) == "body"
+                    }),
+            )
+        }),
     );
     props.insert(
         "__w3cos_getter_head".to_string(),
-        func(|_, _| element_value(head_id())),
+        func(|_, _| {
+            if document_value().get_property("contentType").to_js_string() == "text/html" {
+                return element_value(head_id());
+            }
+            element_or_null(
+                inclusive_descendant_elements(document_element_id())
+                    .into_iter()
+                    .find(|node| {
+                        namespace_uri(*node) == crate::html_parser_state::HTML_NAMESPACE
+                            && dom::tag_name(*node) == "head"
+                    }),
+            )
+        }),
     );
     props.insert(
         "__w3cos_getter_documentElement".to_string(),
         func(|_, _| element_value(document_element_id())),
+    );
+    props.insert(
+        "__w3cos_getter_childNodes".to_string(),
+        func(|_, _| global_document_child_nodes()),
+    );
+    props.insert(
+        "__w3cos_getter_firstChild".to_string(),
+        func(|_, _| {
+            global_document_children()
+                .into_iter()
+                .next()
+                .unwrap_or(Value::Null)
+        }),
+    );
+    props.insert(
+        "__w3cos_getter_lastChild".to_string(),
+        func(|_, _| {
+            global_document_children()
+                .into_iter()
+                .last()
+                .unwrap_or(Value::Null)
+        }),
     );
     props.insert(
         "__w3cos_getter_scrollingElement".to_string(),
@@ -9117,7 +15253,8 @@ fn build_document_value() -> Value {
         func(|_, _| location_value()),
     );
 
-    let document = Value::object(props);
+    let document = document_node_value(props);
+    implementation.set_property("__w3cos_owner_document", document.clone());
     w3cos_core::class::set_prototype_of(
         &document,
         &crate::dom_constructors::prototype("HTMLDocument"),
@@ -10325,6 +16462,9 @@ fn build_window_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
 
     props.insert("document".to_string(), document_value());
+    props.insert("String".to_string(), string_compat_class());
+    props.insert("Number".to_string(), number_compat_class());
+    props.insert("Boolean".to_string(), boolean_compat_class());
     props.insert("Promise".to_string(), promise_constructor_value());
     props.insert("BarProp".to_string(), bar_prop_class());
     for name in [
@@ -11396,6 +17536,7 @@ fn build_window_value() -> Value {
         props.insert(name.to_string(), w3cos_core::error_class(name));
     }
     props.insert("BigInt".to_string(), w3cos_core::bigint::bigint_class());
+    props.insert("RegExp".to_string(), w3cos_core::regexp::regexp_class());
     props.insert(
         "WeakMap".to_string(),
         w3cos_core::collections::weak_map_class(),
@@ -11709,8 +17850,14 @@ fn build_window_value() -> Value {
     props.insert("origin".to_string(), Value::string("w3cos://app"));
     props.insert("name".to_string(), Value::string(""));
     props.insert("status".to_string(), Value::string(""));
-    props.insert("length".to_string(), Value::Number(0.0));
-    props.insert("frames".to_string(), js_array(vec![]));
+    props.insert(
+        "__w3cos_getter_frames".to_string(),
+        func(|_, _| frame_windows_value()),
+    );
+    props.insert(
+        "__w3cos_getter_length".to_string(),
+        func(|_, _| frame_windows_value().get_property("length")),
+    );
     props.insert(
         "navigation".to_string(),
         crate::navigation_web::navigation_value(),
@@ -11977,7 +18124,13 @@ fn build_window_value() -> Value {
     props.insert(
         "getComputedStyle".to_string(),
         func(|_, args| match node_id_of(&arg(&args, 0)) {
-            Some(node) => computed_style_value(node),
+            Some(node) => {
+                let pseudo = arg(&args, 1).to_js_string();
+                computed_style_value(
+                    node,
+                    matches!(pseudo.as_str(), "::before" | "::after").then_some(pseudo),
+                )
+            }
             None => Value::object(HashMap::new()),
         }),
     );
@@ -12121,8 +18274,20 @@ fn build_window_value() -> Value {
     props.insert(
         "open".to_string(),
         func(|_, _| {
-            warn_host_api("window.open()", "null");
-            Value::Null
+            let document = document_value()
+                .get_property("implementation")
+                .call_method("createHTMLDocument", vec![Value::Undefined]);
+            document.set_property("URL", Value::string("about:blank"));
+            document.set_property("documentURI", Value::string("about:blank"));
+            let popup = Value::object(HashMap::from([
+                ("document".to_string(), document.clone()),
+                ("closed".to_string(), Value::Bool(false)),
+                ("opener".to_string(), window_value()),
+            ]));
+            popup.set_property("window", popup.clone());
+            popup.set_property("self", popup.clone());
+            document.set_property("defaultView", popup.clone());
+            popup
         }),
     );
     props.insert(
@@ -12169,8 +18334,41 @@ fn build_window_value() -> Value {
         "dispatchEvent".to_string(),
         func(|_, args| Value::Bool(js_dispatch_event(0, arg(&args, 0)))),
     );
+    props.insert(
+        "postMessage".to_string(),
+        func(|target, args| {
+            let data = arg(&args, 0);
+            let target_origin = arg(&args, 1).to_js_string();
+            let own_origin = target
+                .get_property("location")
+                .get_property("origin")
+                .to_js_string();
+            if target_origin == "*" || target_origin == own_origin {
+                queue_window_message(target, data);
+            }
+            Value::Undefined
+        }),
+    );
 
-    let window = Value::object(props);
+    let handler = ProxyBuilder::new()
+        .get(|target, key, _| {
+            let has_stored_property = target
+                .as_object()
+                .is_some_and(|object| object.borrow().has_direct(key));
+            if has_stored_property {
+                target.get_property(key)
+            } else {
+                window_named_property(key).unwrap_or(Value::Undefined)
+            }
+        })
+        .has(|target, key| {
+            target
+                .as_object()
+                .is_some_and(|object| object.borrow().has_direct(key))
+                || window_named_property(key).is_some()
+        })
+        .build();
+    let window = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(props, handler))));
     w3cos_core::class::set_prototype_of(&window, &window_class().get_property("prototype"));
     window
 }
@@ -12255,6 +18453,7 @@ pub fn tick_timers() -> usize {
 /// batch the same timestamp and defers callbacks registered by a callback to
 /// the next frame, matching browser rAF batching semantics.
 pub fn run_animation_frame() -> usize {
+    tick_css_motions();
     let callbacks: Vec<Value> = RAF_QUEUE
         .with(|q| std::mem::take(&mut *q.borrow_mut()))
         .into_iter()
@@ -12275,13 +18474,12 @@ pub fn run_animation_frame() -> usize {
 /// True when a rendering opportunity is needed for queued rAF callbacks.
 pub fn has_pending_animation_frame() -> bool {
     RAF_QUEUE.with(|q| !q.borrow().is_empty())
+        || CSS_MOTIONS.with(|motions| !motions.borrow().is_empty())
 }
 
 /// Queue a microtask (also used internally for thenable callbacks).
 pub fn queue_microtask_value(callback: Value) {
-    if callback.is_function() {
-        MICROTASKS.with(|m| m.borrow_mut().push(callback));
-    }
+    w3cos_core::promise::queue_microtask(callback);
 }
 
 /// Update the live document readiness state and synchronously dispatch the
@@ -12315,12 +18513,45 @@ pub(crate) fn dispatch_element_lifecycle_event(node: u32, event_type: &str) {
     dispatch_lifecycle_event(&element_value(node), event_type);
 }
 
+pub(crate) fn dispatch_frame_window_lifecycle_event(node: u32, event_type: &str) {
+    if let Some(frame_window) = get_expando(node, "contentWindow") {
+        dispatch_lifecycle_event(&frame_window, event_type);
+    }
+}
+
 fn dispatch_lifecycle_event(target: &Value, event_type: &str) {
     let event = w3cos_core::class::construct(
         &crate::web_events::event_class(),
         vec![Value::string(event_type)],
     );
-    target.call_method("dispatchEvent", vec![event]);
+    target.call_method("dispatchEvent", vec![event.clone()]);
+    let handler = target.get_property(&format!("on{event_type}"));
+    if handler.is_callable() {
+        handler.call(target.clone(), vec![event]);
+    }
+}
+
+fn queue_window_message(target: Value, data: Value) {
+    queue_microtask_value(Value::function(move |_, _| {
+        let event = w3cos_core::class::construct(
+            &crate::web_events::event_subclass_class("MessageEvent"),
+            vec![
+                Value::string("message"),
+                Value::object(HashMap::from([
+                    ("data".to_string(), data.clone()),
+                    ("origin".to_string(), Value::string("null")),
+                    ("source".to_string(), Value::Null),
+                    ("ports".to_string(), Value::array(vec![])),
+                ])),
+            ],
+        );
+        target.call_method("dispatchEvent", vec![event.clone()]);
+        let handler = target.get_property("onmessage");
+        if handler.is_callable() {
+            handler.call(target.clone(), vec![event]);
+        }
+        Value::Undefined
+    }));
 }
 
 /// Drain pending native event snapshots and the microtask queue (repeating
@@ -12381,7 +18612,8 @@ pub(crate) fn drain_bootstrap_tasks(max_turns: usize) -> usize {
 pub fn has_pending_work() -> bool {
     let timers = JS_TIMERS.with(|t| !t.borrow().is_empty());
     let raf = RAF_QUEUE.with(|q| !q.borrow().is_empty());
-    let micro = MICROTASKS.with(|m| !m.borrow().is_empty());
+    let micro =
+        MICROTASKS.with(|m| !m.borrow().is_empty()) || w3cos_core::promise::queue_count() > 0;
     let events = PENDING_EVENTS.with(|q| !q.borrow().is_empty());
     let native_io = crate::websocket::has_pending_js_sockets()
         || crate::eventsource::has_pending_js_sources()
@@ -12437,7 +18669,12 @@ pub fn reset_bridge() {
     w3cos_core::promise::advance_realm_generation();
     ELEMENT_VALUES.with(|c| c.borrow_mut().clear());
     ELEMENT_PROPS.with(|c| c.borrow_mut().clear());
+    PROCESSING_INSTRUCTION_ATTRIBUTES.with(|cache| cache.borrow_mut().clear());
+    ATTRIBUTE_VALUES.with(|cache| cache.borrow_mut().clear());
+    SELECTOR_ID_CACHE.with(|cache| cache.borrow_mut().clear());
+    SELECTOR_ID_CACHE_GENERATION.with(|generation| generation.set(0));
     STYLE_CACHE.with(|c| c.borrow_mut().clear());
+    CSS_MOTIONS.with(|motions| motions.borrow_mut().clear());
     LISTENERS.with(|l| l.borrow_mut().clear());
     NATIVELY_REGISTERED.with(|r| r.borrow_mut().clear());
     PENDING_EVENTS.with(|q| q.borrow_mut().clear());
@@ -12460,6 +18697,7 @@ pub fn reset_bridge() {
     EVENT_COUNTS.with(|counts| *counts.borrow_mut() = initial_event_counts());
     MEDIA_QUERY_LISTS.with(|lists| lists.borrow_mut().clear());
     AUTHOR_STYLE_SHEETS.with(|sheets| sheets.borrow_mut().clear());
+    LIVE_RANGES.with(|ranges| ranges.borrow_mut().clear());
     ACTIVE_ELEMENT.with(|a| *a.borrow_mut() = None);
     HTML_ID.with(|h| *h.borrow_mut() = None);
     HEAD_ID.with(|h| *h.borrow_mut() = None);
@@ -12602,6 +18840,57 @@ mod tests {
         assert!(
             weak.upgrade().is_none(),
             "detached createElement wrapper must drop without reset_bridge"
+        );
+    }
+
+    #[test]
+    fn css_transition_exposes_midpoint_event_and_web_animation_facade() {
+        setup();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            "#item",
+            &[
+                ("left", "0px"),
+                ("transition", "left 60s steps(1, jump-both)"),
+            ],
+        );
+        let item = create_in_body("div");
+        item.set_property("id", Value::string("item"));
+        let starts = Rc::new(Cell::new(0_u32));
+        let starts_for_listener = Rc::clone(&starts);
+        item.call_method(
+            "addEventListener",
+            vec![
+                Value::string("transitionstart"),
+                func(move |_, _| {
+                    starts_for_listener.set(starts_for_listener.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+
+        item.get_property("style")
+            .set_property("left", Value::string("400px"));
+        run_animation_frame();
+
+        assert_eq!(starts.get(), 1);
+        assert_eq!(
+            window_value()
+                .call_method("getComputedStyle", vec![item.clone()])
+                .get_property("left")
+                .to_js_string(),
+            "200px"
+        );
+        assert_eq!(
+            item.call_method("getAnimations", Vec::new())
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        assert!(
+            item.get_property("style")
+                .as_object()
+                .is_some_and(|style| style.borrow().has("transform"))
         );
     }
 
@@ -12870,6 +19159,373 @@ mod tests {
     }
 
     #[test]
+    fn dom_implementation_documents_keep_their_metadata_and_owner_document() {
+        setup();
+        let implementation = document_value().get_property("implementation");
+        let document =
+            implementation.call_method("createHTMLDocument", vec![Value::string("W3COS title")]);
+
+        assert_eq!(
+            document.get_property("compatMode"),
+            Value::string("CSS1Compat")
+        );
+        assert_eq!(
+            document.get_property("characterSet"),
+            Value::string("UTF-8")
+        );
+        assert_eq!(document.get_property("charset"), Value::string("UTF-8"));
+        assert_eq!(
+            document.get_property("inputEncoding"),
+            Value::string("UTF-8")
+        );
+        assert!(document.get_property("location").is_null());
+        assert_eq!(
+            document
+                .get_property("childNodes")
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+
+        let doctype = document.get_property("doctype");
+        assert_eq!(doctype.get_property("name"), Value::string("html"));
+        assert!(doctype.get_property("ownerDocument") == document);
+
+        let div = document.call_method("createElement", vec![Value::string("DIV")]);
+        assert_eq!(div.get_property("localName"), Value::string("div"));
+        assert!(div.get_property("ownerDocument") == document);
+
+        let anchor = document.call_method("createElement", vec![Value::string("a")]);
+        anchor.set_property("href", Value::string("http://example.org/?ä"));
+        assert_eq!(
+            anchor.get_property("href"),
+            Value::string("http://example.org/?%C3%A4")
+        );
+    }
+
+    #[test]
+    fn virtual_document_replace_children_validates_and_updates_the_live_child_list() {
+        setup();
+        let implementation = document_value().get_property("implementation");
+        let document = implementation.call_method("createHTMLDocument", vec![Value::Undefined]);
+        let anchor = document.call_method("createElement", vec![Value::string("a")]);
+        document.call_method("replaceChildren", vec![anchor.clone()]);
+        assert_eq!(
+            document
+                .get_property("childNodes")
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        assert!(document.get_property("childNodes").get_property("0") == anchor);
+        assert!(document.get_property("documentElement") == anchor);
+
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+        let single = document.call_method("createElement", vec![Value::string("main")]);
+        fragment.call_method("appendChild", vec![single.clone()]);
+        document.call_method("replaceChildren", vec![fragment]);
+        assert_eq!(
+            document
+                .get_property("childNodes")
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        assert!(document.get_property("childNodes").get_property("0") == single);
+
+        let invalid_fragment = document.call_method("createDocumentFragment", vec![]);
+        invalid_fragment.call_method(
+            "appendChild",
+            vec![document.call_method("createElement", vec![Value::string("a")])],
+        );
+        invalid_fragment.call_method(
+            "appendChild",
+            vec![document.call_method("createElement", vec![Value::string("b")])],
+        );
+        for invalid in [
+            invalid_fragment,
+            document.call_method("createTextNode", vec![Value::string("text")]),
+            implementation.call_method("createHTMLDocument", vec![Value::Undefined]),
+        ] {
+            let error = w3cos_core::catch_js(|| {
+                document.call_method("replaceChildren", vec![invalid.clone()])
+            })
+            .expect_err("invalid document replacement must throw");
+            assert_eq!(
+                error.get_property("name").to_js_string(),
+                "HierarchyRequestError"
+            );
+        }
+
+        document.call_method("replaceChildren", vec![]);
+        assert_eq!(
+            document
+                .get_property("childNodes")
+                .get_property("length")
+                .to_u32(),
+            0
+        );
+        assert!(document.get_property("documentElement").is_null());
+    }
+
+    #[test]
+    fn insert_adjacent_rejects_siblings_of_a_virtual_document_element() {
+        setup();
+        let implementation = document_value().get_property("implementation");
+        let created_document =
+            implementation.call_method("createHTMLDocument", vec![Value::Undefined]);
+        let root = created_document.get_property("documentElement");
+        let child = document_value().call_method("createElement", vec![Value::string("aside")]);
+
+        for (method, value) in [
+            ("insertAdjacentElement", child),
+            ("insertAdjacentText", Value::string("text")),
+        ] {
+            let error = w3cos_core::catch_js(|| {
+                root.call_method(method, vec![Value::string("beforebegin"), value])
+            })
+            .expect_err("a document element cannot gain an element sibling");
+            assert_eq!(
+                error.get_property("name").to_js_string(),
+                "HierarchyRequestError"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_popup_document_adopts_a_moved_subtree() {
+        setup();
+        let document = document_value();
+        let adopted = create_in_body("div");
+        adopted.call_method(
+            "setAttribute",
+            vec![Value::string("data-route"), Value::string("inbox")],
+        );
+        let adopted_attribute = adopted
+            .get_property("attributes")
+            .get_property("0");
+        assert!(adopted.get_property("ownerDocument") == document);
+        assert!(adopted_attribute.get_property("ownerDocument") == document);
+
+        let popup = window_value().call_method("open", vec![]);
+        let popup_document = popup.get_property("document");
+        popup_document
+            .get_property("body")
+            .call_method("appendChild", vec![document.get_property("body")]);
+
+        assert!(adopted.get_property("ownerDocument") == popup_document);
+        assert!(adopted_attribute.get_property("ownerDocument") == popup_document);
+        assert!(popup_document.get_property("defaultView") == popup);
+    }
+
+    #[test]
+    fn document_type_accepts_legacy_names_and_binds_to_its_document() {
+        setup();
+        let global_document = document_value();
+        let global_implementation = global_document.get_property("implementation");
+        for name in ["", "1foo", "@foo", "edi:<", "prefix::local"] {
+            let doctype = global_implementation.call_method(
+                "createDocumentType",
+                vec![
+                    Value::string(name),
+                    Value::string("public"),
+                    Value::string("system"),
+                ],
+            );
+            assert_eq!(doctype.get_property("name"), Value::string(name));
+            assert!(doctype.get_property("ownerDocument") == global_document);
+        }
+
+        let created_document =
+            global_implementation.call_method("createHTMLDocument", vec![Value::Undefined]);
+        let implementation = created_document.get_property("implementation");
+        let doctype = implementation.call_method(
+            "createDocumentType",
+            vec![Value::string("html"), Value::string(""), Value::string("")],
+        );
+        assert!(doctype.get_property("ownerDocument") == created_document);
+    }
+
+    #[test]
+    fn document_type_rejects_child_insertion() {
+        setup();
+        let document = document_value();
+        let doctype = document.get_property("implementation").call_method(
+            "createDocumentType",
+            vec![
+                Value::string("html"),
+                Value::string(""),
+                Value::string(""),
+            ],
+        );
+        let text = document.call_method("createTextNode", vec![Value::string("invalid")]);
+        let error = w3cos_core::catch_js(|| doctype.call_method("appendChild", vec![text]))
+            .expect_err("document types cannot contain children");
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "HierarchyRequestError"
+        );
+    }
+
+    #[test]
+    fn insert_before_validates_web_idl_parent_ancestry_and_reference_in_order() {
+        setup();
+        let document = document_value();
+        let leaf = document.call_method("createTextNode", vec![Value::string("leaf")]);
+        let type_error = w3cos_core::catch_js(|| {
+            leaf.call_method("insertBefore", vec![Value::Null, Value::Null])
+        })
+        .expect_err("the first argument must be a Node before parent validation");
+        assert_eq!(type_error.get_property("name").to_js_string(), "TypeError");
+
+        let child = document.call_method("createTextNode", vec![Value::string("child")]);
+        let hierarchy_error = w3cos_core::catch_js(|| {
+            leaf.call_method("insertBefore", vec![child, Value::Null])
+        })
+        .expect_err("character data cannot contain children");
+        assert_eq!(
+            hierarchy_error.get_property("name").to_js_string(),
+            "HierarchyRequestError"
+        );
+
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        let foreign_reference =
+            document.call_method("createElement", vec![Value::string("span")]);
+        let doctype = document.get_property("implementation").call_method(
+            "createDocumentType",
+            vec![Value::string("html"), Value::string(""), Value::string("")],
+        );
+        let not_found = w3cos_core::catch_js(|| {
+            parent.call_method("insertBefore", vec![doctype, foreign_reference])
+        })
+        .expect_err("reference membership precedes inserted child position checks");
+        assert_eq!(not_found.get_property("name").to_js_string(), "NotFoundError");
+
+        let insert_before = crate::dom_constructors::prototype("Node")
+            .get_property("insertBefore");
+        assert_eq!(insert_before.get_property("length"), Value::Number(2.0));
+        let prototype_not_found = w3cos_core::catch_js(|| {
+            insert_before.call(
+                parent.clone(),
+                vec![
+                    document.call_method("createElement", vec![Value::string("em")]),
+                    document.call_method("createElement", vec![Value::string("strong")]),
+                ],
+            )
+        })
+        .expect_err("Node.prototype.insertBefore must preserve its receiver");
+        assert_eq!(
+            prototype_not_found.get_property("name").to_js_string(),
+            "NotFoundError"
+        );
+
+        let created_document = document.get_property("implementation").call_method(
+            "createHTMLDocument",
+            vec![Value::string("prototype dispatch")],
+        );
+        assert_eq!(
+            created_document
+                .get_property("insertBefore")
+                .get_property("length"),
+            Value::Number(2.0)
+        );
+        let document_hierarchy_error = w3cos_core::catch_js(|| {
+            insert_before.call(
+                created_document.clone(),
+                vec![
+                    created_document.call_method(
+                        "createTextNode",
+                        vec![Value::string("invalid")],
+                    ),
+                    Value::Null,
+                ],
+            )
+        })
+        .expect_err("Node.prototype.insertBefore must dispatch virtual documents");
+        assert_eq!(
+            document_hierarchy_error
+                .get_property("name")
+                .to_js_string(),
+            "HierarchyRequestError"
+        );
+
+        let foreign_document = document.get_property("implementation").call_method(
+            "createHTMLDocument",
+            vec![Value::string("foreign")],
+        );
+        let document_reference_error = w3cos_core::catch_js(|| {
+            insert_before.call(
+                parent,
+                vec![
+                    foreign_document,
+                    document.call_method("createElement", vec![Value::string("aside")]),
+                ],
+            )
+        })
+        .expect_err("reference membership precedes document child type validation");
+        assert_eq!(
+            document_reference_error.get_property("name").to_js_string(),
+            "NotFoundError"
+        );
+    }
+
+    #[test]
+    fn character_data_constructors_treat_missing_or_undefined_data_as_empty() {
+        setup();
+        for value in [text_value(vec![]), text_value(vec![Value::Undefined])]
+            .into_iter()
+            .chain([comment_value(vec![]), comment_value(vec![Value::Undefined])])
+        {
+            assert_eq!(value.get_property("data"), Value::string(""));
+            assert_eq!(value.get_property("nodeValue"), Value::string(""));
+        }
+    }
+
+    #[test]
+    fn document_and_document_fragment_constructors_create_live_nodes() {
+        setup();
+        let window = window_value();
+        let document = w3cos_core::class::construct(&window.get_property("Document"), vec![]);
+        assert!(w3cos_core::class::instance_of(
+            &document,
+            &window.get_property("Document")
+        ));
+        assert!(!w3cos_core::class::instance_of(
+            &document,
+            &window.get_property("XMLDocument")
+        ));
+        assert!(document.get_property("documentElement").is_null());
+        assert_eq!(
+            document.get_property("contentType"),
+            Value::string("application/xml")
+        );
+        assert_eq!(
+            document
+                .get_property("childNodes")
+                .get_property("length")
+                .to_u32(),
+            0
+        );
+        let cdata =
+            document.call_method("createCDATASection", vec![Value::string("character data")]);
+        assert_eq!(cdata.get_property("nodeType").to_u32(), 4);
+        assert!(cdata.get_property("ownerDocument") == document);
+        let instruction = document.call_method(
+            "createProcessingInstruction",
+            vec![Value::string("target"), Value::string("data")],
+        );
+        assert_eq!(instruction.get_property("nodeType").to_u32(), 7);
+        assert!(instruction.get_property("ownerDocument") == document);
+
+        let fragment =
+            w3cos_core::class::construct(&window.get_property("DocumentFragment"), vec![]);
+        let text = document.call_method("createTextNode", vec![Value::string("text")]);
+        fragment.call_method("appendChild", vec![text.clone()]);
+        assert!(fragment.get_property("firstChild") == text);
+        assert!(fragment.get_property("ownerDocument") == document_value());
+    }
+
+    #[test]
     fn html_script_element_reflects_loading_properties_without_dynamic_runtime() {
         setup();
         let document = document_value();
@@ -13004,6 +19660,18 @@ mod tests {
     }
 
     #[test]
+    fn inserting_an_empty_source_synchronously_sets_media_network_state() {
+        setup();
+        let document = document_value();
+        let video = document.call_method("createElement", vec![Value::string("video")]);
+        let source = document.call_method("createElement", vec![Value::string("source")]);
+
+        assert_eq!(video.get_property("networkState").to_u32(), 0);
+        video.call_method("appendChild", vec![source]);
+        assert_eq!(video.get_property("networkState").to_u32(), 3);
+    }
+
+    #[test]
     fn shadow_roots_are_queryable_connected_and_obey_open_closed_modes() {
         setup();
         let window = window_value();
@@ -13058,6 +19726,56 @@ mod tests {
         );
         assert!(closed_host.get_property("shadowRoot").is_null());
         assert_eq!(closed_root.get_property("mode").to_js_string(), "closed");
+    }
+
+    #[test]
+    fn window_named_properties_and_document_name_lists_follow_the_document_tree() {
+        setup();
+        let window = window_value();
+        let document = document_value();
+        let image = document.call_method("createElement", vec![Value::string("img")]);
+        image.set_property("name", Value::string("target"));
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![image.clone()]);
+
+        let list = document.call_method("getElementsByName", vec![Value::string("target")]);
+        assert!(window.get_property("target") == image);
+        assert_eq!(list.get_property("length").to_u32(), 1);
+
+        let host = create_in_body("div");
+        let root = host.call_method(
+            "attachShadow",
+            vec![Value::object(HashMap::from([(
+                "mode".to_string(),
+                Value::string("open"),
+            )]))],
+        );
+        root.call_method("appendChild", vec![image]);
+
+        assert!(window.get_property("target").is_undefined());
+        assert_eq!(list.get_property("length").to_u32(), 0);
+    }
+
+    #[test]
+    fn live_node_list_iterator_observes_nodes_appended_after_iteration_starts() {
+        setup();
+        let document = document_value();
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        let first = document.call_method("createElement", vec![Value::string("span")]);
+        parent.call_method("appendChild", vec![first.clone()]);
+        let list = parent.get_property("childNodes");
+        assert!(
+            list.as_object()
+                .is_some_and(|object| object.borrow().has("__w3cos_symbol_iterator"))
+        );
+
+        let mut iterator = list.iter();
+        assert!(iterator.next().is_some_and(|value| value == first));
+        let second = document.call_method("createElement", vec![Value::string("b")]);
+        parent.call_method("appendChild", vec![second.clone()]);
+        assert!(iterator.next().is_some_and(|value| value == second));
+        assert!(iterator.next().is_none());
     }
 
     #[test]
@@ -13579,16 +20297,25 @@ mod tests {
                 .to_number(),
             7.0
         );
-        assert!(
+        #[cfg(feature = "dynamic-js")]
+        assert_eq!(
             window
                 .call_method("eval", vec![Value::string("1 + 1")])
-                .is_undefined()
+                .to_number(),
+            2.0
         );
+        #[cfg(not(feature = "dynamic-js"))]
+        assert!(window
+            .call_method("eval", vec![Value::string("1 + 1")])
+            .is_undefined());
         let dynamic = w3cos_core::class::construct(
             &window.get_property("Function"),
             vec![Value::string("return 1")],
         );
         assert!(dynamic.is_function());
+        #[cfg(feature = "dynamic-js")]
+        assert_eq!(dynamic.call(Value::Undefined, vec![]).to_number(), 1.0);
+        #[cfg(not(feature = "dynamic-js"))]
         assert!(dynamic.call(Value::Undefined, vec![]).is_undefined());
         assert!(window.get_property("Report").is_function());
     }
@@ -13613,6 +20340,8 @@ mod tests {
         );
         // classList identity is stable.
         assert!(cl == div.get_property("classList"));
+        div.set_property("classList", Value::string("replacement"));
+        assert!(cl == div.get_property("classList"));
         assert!(w3cos_core::class::instance_of(
             &cl,
             &window_value().get_property("DOMTokenList")
@@ -13629,6 +20358,85 @@ mod tests {
             })],
         );
         assert_eq!(visited.borrow().as_slice(), ["bar"]);
+    }
+
+    #[test]
+    fn class_list_reflects_raw_attribute_and_validates_atomic_mutations() {
+        setup();
+        let div = create_in_body("div");
+        let class_list = div.get_property("classList");
+        div.call_method(
+            "setAttribute",
+            vec![Value::string("class"), Value::string("   a  a b")],
+        );
+
+        assert_eq!(
+            class_list.call_method("toString", vec![]).to_js_string(),
+            "   a  a b"
+        );
+        assert_eq!(class_list.get_property("value").to_js_string(), "   a  a b");
+        assert_eq!(class_list.get_property("0").to_js_string(), "a");
+        assert_eq!(class_list.get_property("1").to_js_string(), "b");
+
+        class_list.call_method("add", vec![Value::string("c")]);
+        assert_eq!(
+            div.call_method("getAttribute", vec![Value::string("class")])
+                .to_js_string(),
+            "a b c"
+        );
+
+        let error = w3cos_core::catch_js(|| {
+            class_list.call_method("add", vec![Value::string("d"), Value::string("bad token")])
+        })
+        .expect_err("an invalid token must throw before the class attribute changes");
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "InvalidCharacterError"
+        );
+        assert_eq!(
+            div.call_method("getAttribute", vec![Value::string("class")])
+                .to_js_string(),
+            "a b c"
+        );
+
+        assert!(
+            class_list
+                .call_method("replace", vec![Value::string("b"), Value::string("d")])
+                .to_bool()
+        );
+        assert_eq!(
+            div.call_method("getAttribute", vec![Value::string("class")])
+                .to_js_string(),
+            "a d c"
+        );
+
+        class_list.set_property("value", Value::string("c b a"));
+        assert!(
+            class_list
+                .call_method("replace", vec![Value::string("c"), Value::string("a")])
+                .to_bool()
+        );
+        assert_eq!(
+            div.call_method("getAttribute", vec![Value::string("class")])
+                .to_js_string(),
+            "a b"
+        );
+
+        let error = w3cos_core::catch_js(|| {
+            class_list.call_method("replace", vec![Value::string(" "), Value::string("")])
+        })
+        .expect_err("an empty replacement token takes precedence over whitespace validation");
+        assert_eq!(error.get_property("name").to_js_string(), "SyntaxError");
+
+        class_list.set_property("value", Value::string("  x x y "));
+        assert_eq!(class_list.get_property("value").to_js_string(), "  x x y ");
+        assert_eq!(class_list.get_property("length").to_u32(), 2);
+
+        let error = w3cos_core::catch_js(|| {
+            class_list.call_method("supports", vec![Value::string("anything")])
+        })
+        .expect_err("classList.supports must throw");
+        assert_eq!(error.get_property("name").to_js_string(), "TypeError");
     }
 
     #[test]
@@ -13775,6 +20583,147 @@ mod tests {
         assert_eq!(all.get_property("length").to_number(), 1.0);
         let missing = doc.call_method("querySelector", vec![Value::string("#nope")]);
         assert!(missing.is_null());
+
+        let empty = create_in_body("div");
+        empty.set_property("id", Value::string(""));
+        assert!(
+            doc.call_method("getElementById", vec![Value::string("")])
+                .is_null()
+        );
+        let undefined = create_in_body("div");
+        undefined.set_property("id", Value::string("undefined"));
+        assert!(doc.call_method("getElementById", vec![Value::Undefined]) == undefined);
+
+        let live_attr = create_in_body("div");
+        live_attr.set_property("id", Value::string("before"));
+        live_attr
+            .get_property("attributes")
+            .get_property("0")
+            .set_property("value", Value::string("after"));
+        assert!(
+            doc.call_method("getElementById", vec![Value::string("before")])
+                .is_null()
+        );
+        assert!(doc.call_method("getElementById", vec![Value::string("after")]) == live_attr);
+
+        let replaced = create_in_body("div");
+        replaced.set_property("id", Value::string("old-outer"));
+        replaced.set_property("outerHTML", Value::string("<div id='new-outer'></div>"));
+        assert!(
+            doc.call_method("getElementById", vec![Value::string("old-outer")])
+                .is_null()
+        );
+        assert!(
+            !doc.call_method("getElementById", vec![Value::string("new-outer")])
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn query_selector_requires_an_argument_and_rejects_invalid_syntax() {
+        setup();
+        let document = document_value();
+        let element = create_in_body("div");
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+
+        for root in [document, element, fragment] {
+            let missing = w3cos_core::catch_js(|| root.call_method("querySelector", vec![]))
+                .expect_err("a missing selector must throw");
+            assert_eq!(missing.get_property("name").to_js_string(), "TypeError");
+
+            let invalid = w3cos_core::catch_js(|| {
+                root.call_method("querySelectorAll", vec![Value::string("div,")])
+            })
+            .expect_err("invalid selector syntax must throw");
+            assert_eq!(invalid.get_property("name").to_js_string(), "SyntaxError");
+        }
+    }
+
+    #[test]
+    fn query_selector_distinguishes_no_namespace_elements() {
+        setup();
+        let document = document_value();
+        let root = create_in_body("div");
+        let html_child = document.call_method("createElement", vec![Value::string("div")]);
+        let no_namespace_child = document.call_method(
+            "createElementNS",
+            vec![Value::Null, Value::string("div")],
+        );
+        root.call_method("appendChild", vec![html_child]);
+        root.call_method("appendChild", vec![no_namespace_child.clone()]);
+
+        let matches = root.call_method("querySelectorAll", vec![Value::string("|div")]);
+        assert_eq!(matches.get_property("length").to_u32(), 1);
+        assert!(matches.get_property("0") == no_namespace_child);
+    }
+
+    #[test]
+    fn live_xhtml_document_creates_cdata_and_unicode_processing_instructions() {
+        setup();
+        let document = document_value();
+        document.set_property("contentType", Value::string("application/xhtml+xml"));
+        let cdata = document.call_method("createCDATASection", vec![Value::string("a < b")]);
+        assert_eq!(cdata.get_property("nodeType"), Value::Number(4.0));
+        assert!(cdata.get_property("ownerDocument") == document);
+        let instruction = document.call_method(
+            "createProcessingInstruction",
+            vec![Value::string("A·A"), Value::string("x")],
+        );
+        assert_eq!(instruction.get_property("target"), Value::string("A·A"));
+        assert!(instruction.get_property("ownerDocument") == document);
+
+        let stylesheet_instruction = document.call_method(
+            "createProcessingInstruction",
+            vec![
+                Value::string("xml-stylesheet"),
+                Value::string("href=\"data:text/css,&#x41;&amp;&apos;\" type=\"text/css\""),
+            ],
+        );
+        assert_eq!(
+            stylesheet_instruction
+                .get_property("sheet")
+                .get_property("href"),
+            Value::string("data:text/css,A&'")
+        );
+    }
+
+    #[test]
+    fn non_markup_frame_documents_preserve_response_content_type() {
+        setup();
+        for content_type in [
+            "text/css",
+            "text/plain",
+            "image/bmp",
+            "image/gif",
+            "image/jpeg",
+            "image/png",
+        ] {
+            let document = parse_frame_document(
+                "not parsed as HTML",
+                content_type,
+                "https://example.test/resource",
+            );
+            assert_eq!(
+                document.get_property("contentType"),
+                Value::string(content_type)
+            );
+            assert!(document.get_property("documentElement").is_null());
+        }
+    }
+
+    #[test]
+    fn xml_frame_documents_project_their_doctype_before_the_root_element() {
+        setup();
+        let document = parse_frame_document(
+            "<!DOCTYPE foo [<!ELEMENT foo EMPTY>]><foo/>",
+            "application/xml",
+            "https://example.test/frame.xml",
+        );
+        let doctype = document.get_property("doctype");
+        assert_eq!(doctype.get_property("nodeType"), Value::Number(10.0));
+        assert_eq!(doctype.get_property("name"), Value::string("foo"));
+        assert!(document.get_property("firstChild") == doctype);
+        assert!(doctype.get_property("nextSibling") == document.get_property("documentElement"));
     }
 
     #[test]
@@ -13822,6 +20771,224 @@ mod tests {
     }
 
     #[test]
+    fn node_tree_relation_methods_cover_documents_siblings_and_disconnected_roots() {
+        setup();
+        let document = document_value();
+        let parent = create_in_body("div");
+        let first = document.call_method("createElement", vec![Value::string("span")]);
+        let second = document.call_method("createElement", vec![Value::string("span")]);
+        parent.call_method("appendChild", vec![first.clone()]);
+        parent.call_method("appendChild", vec![second.clone()]);
+
+        assert!(document.get_property("nextSibling").is_null());
+        assert!(document.get_property("previousSibling").is_null());
+        assert!(document.get_property("ownerDocument").is_null());
+        assert!(document.call_method("hasChildNodes", vec![]).to_bool());
+        assert_eq!(document.get_property("charset"), Value::string("UTF-8"));
+        assert_eq!(
+            document.get_property("inputEncoding"),
+            Value::string("UTF-8")
+        );
+        assert!(document.call_method("contains", vec![parent.clone()]).to_bool());
+        assert!(parent.call_method("contains", vec![first.clone()]).to_bool());
+        assert!(!first.call_method("contains", vec![parent.clone()]).to_bool());
+        assert_eq!(
+            parent
+                .call_method("compareDocumentPosition", vec![first.clone()])
+                .to_u32(),
+            0x10 | 0x04
+        );
+        assert_eq!(
+            first
+                .call_method("compareDocumentPosition", vec![parent.clone()])
+                .to_u32(),
+            0x08 | 0x02
+        );
+        assert_eq!(
+            first
+                .call_method("compareDocumentPosition", vec![second.clone()])
+                .to_u32(),
+            0x04
+        );
+        assert_eq!(
+            second
+                .call_method("compareDocumentPosition", vec![first.clone()])
+                .to_u32(),
+            0x02
+        );
+        let doctype = document.get_property("doctype");
+        if !doctype.is_nullish() {
+            assert!(
+                document
+                    .get_property("documentElement")
+                    .get_property("previousSibling")
+                    .strict_eq(&doctype)
+            );
+            assert!(
+                doctype
+                    .get_property("nextSibling")
+                    .strict_eq(&document.get_property("documentElement"))
+            );
+            assert_eq!(
+                doctype
+                    .call_method("compareDocumentPosition", vec![parent.clone()])
+                    .to_u32(),
+                0x04
+            );
+            assert_eq!(
+                parent
+                    .call_method("compareDocumentPosition", vec![doctype])
+                    .to_u32(),
+                0x02
+            );
+        }
+
+        let detached = document.call_method("createElement", vec![Value::string("aside")]);
+        let forward = first
+            .call_method("compareDocumentPosition", vec![detached.clone()])
+            .to_u32();
+        let reverse = detached
+            .call_method("compareDocumentPosition", vec![first])
+            .to_u32();
+        assert_eq!(forward & (0x01 | 0x20), 0x01 | 0x20);
+        assert_eq!(reverse & (0x01 | 0x20), 0x01 | 0x20);
+        assert_eq!(forward & (0x02 | 0x04), (reverse & (0x02 | 0x04)) ^ 0x06);
+    }
+
+    #[test]
+    fn child_node_after_converts_values_and_preserves_argument_order() {
+        setup();
+        let document = document_value();
+        let parent = create_in_body("div");
+        let child = document.call_method("createElement", vec![Value::string("test")]);
+        let x = document.call_method("createElement", vec![Value::string("x")]);
+        let y = document.call_method("createElement", vec![Value::string("y")]);
+        parent.call_method("appendChild", vec![child.clone()]);
+        parent.call_method("appendChild", vec![x.clone()]);
+        parent.call_method("appendChild", vec![y.clone()]);
+
+        child.call_method(
+            "after",
+            vec![y, x, Value::Null, Value::Undefined, Value::string("text")],
+        );
+
+        assert_eq!(
+            parent.get_property("innerHTML").to_js_string(),
+            "<test></test><y></y><x></x>nullundefinedtext"
+        );
+    }
+
+    #[test]
+    fn parent_node_prepend_converts_values_and_preserves_argument_order() {
+        setup();
+        let document = document_value();
+        let parent = create_in_body("div");
+        let existing = document.call_method("createElement", vec![Value::string("existing")]);
+        let first = document.call_method("createElement", vec![Value::string("first")]);
+        parent.call_method("appendChild", vec![existing]);
+
+        parent.call_method("prepend", vec![first, Value::Null, Value::string("text")]);
+
+        assert_eq!(
+            parent.get_property("innerHTML").to_js_string(),
+            "<first></first>nulltext<existing></existing>"
+        );
+    }
+
+    #[test]
+    fn child_node_replace_with_keeps_context_when_it_is_an_argument() {
+        setup();
+        let document = document_value();
+        let parent = create_in_body("div");
+        let child = document.call_method("createElement", vec![Value::string("test")]);
+        let sibling = document.call_method("createElement", vec![Value::string("x")]);
+        parent.call_method("appendChild", vec![child.clone()]);
+        parent.call_method("appendChild", vec![sibling.clone()]);
+        parent.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("tail")])],
+        );
+
+        child
+            .clone()
+            .call_method("replaceWith", vec![sibling, child]);
+
+        assert_eq!(
+            parent.get_property("innerHTML").to_js_string(),
+            "<x></x><test></test>tail"
+        );
+    }
+
+    #[test]
+    fn query_selector_attribute_matching_includes_empty_values() {
+        setup();
+        let root = create_in_body("div");
+        root.call_method(
+            "setAttribute",
+            vec![Value::string("id"), Value::string("root")],
+        );
+        root.set_property(
+            "innerHTML",
+            Value::string("<div id=\"\"></div><div id></div><div></div>"),
+        );
+        assert!(window_value().get_property("root") == root);
+        assert!(
+            window_value()
+                .as_object()
+                .is_some_and(|window| window.borrow().has("root"))
+        );
+
+        assert_eq!(
+            root.call_method("querySelectorAll", vec![Value::string("[id]")])
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+        assert_eq!(
+            root.call_method("querySelectorAll", vec![Value::string("[id='']")])
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+    }
+
+    #[test]
+    fn query_selector_keeps_whitespace_inside_quoted_attribute_values() {
+        setup();
+        let document = document_value();
+        let link = create_in_body("a");
+        link.call_method(
+            "setAttribute",
+            vec![
+                Value::string("title"),
+                Value::string("test with - dash and space"),
+            ],
+        );
+
+        let selector = Value::string("a[title='test with - dash and space']");
+        assert!(document.call_method("querySelector", vec![selector.clone()]) == link);
+        assert_eq!(
+            document
+                .call_method("querySelectorAll", vec![selector.clone()])
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        let matches = document.call_method("querySelectorAll", vec![selector]);
+        assert!(matches.get_property("0") == link);
+        assert!(
+            matches
+                .call_method("hasOwnProperty", vec![Value::string("0")])
+                .to_bool()
+        );
+        assert!(
+            !matches
+                .call_method("hasOwnProperty", vec![Value::string("length")])
+                .to_bool()
+        );
+    }
+
+    #[test]
     fn node_lists_are_static_and_html_collections_are_live_and_named() {
         setup();
         let window = window_value();
@@ -13856,6 +21023,20 @@ mod tests {
         assert_eq!(initial_query.get_property("length").to_u32(), 0);
         assert!(children.call_method("namedItem", vec![Value::string("primary")]) == article);
         assert!(articles.call_method("item", vec![Value::Number(0.0)]) == article);
+        assert!(!articles.try_set_property("0", Value::string("blocked")));
+        let strict_error = w3cos_core::catch_js(|| {
+            w3cos_core::intrinsics::set_property_strict(
+                &articles,
+                &Value::string("0"),
+                Value::string("blocked"),
+            )
+        })
+        .expect_err("strict assignment to a collection index must throw");
+        assert_eq!(
+            strict_error.get_property("name").to_js_string(),
+            "TypeError"
+        );
+        assert!(strict_error.get_property("constructor") == window.get_property("TypeError"));
 
         let calls = Rc::new(Cell::new(0_u32));
         let callback_calls = calls.clone();
@@ -13871,6 +21052,835 @@ mod tests {
             );
         assert_eq!(calls.get(), 1);
         assert_eq!(articles.iter().count(), 1);
+
+        body.call_method("removeChild", vec![article]);
+        assert_eq!(articles.get_property("length").to_u32(), 0);
+
+        let class_matches = document.call_method(
+            "getElementsByClassName",
+            vec![Value::string("featured current")],
+        );
+        let classified = document.call_method("createElement", vec![Value::string("aside")]);
+        classified.set_property("className", Value::string("current featured extra"));
+        body.call_method("appendChild", vec![classified.clone()]);
+        assert_eq!(class_matches.get_property("length").to_u32(), 1);
+        body.call_method("removeChild", vec![classified]);
+        assert_eq!(class_matches.get_property("length").to_u32(), 0);
+
+        let foreign = document.call_method(
+            "createElementNS",
+            vec![Value::string("test"), Value::string("ST")],
+        );
+        let foreign_by_tag =
+            document.call_method("getElementsByTagName", vec![Value::string("ST")]);
+        let foreign_by_namespace = document.call_method(
+            "getElementsByTagNameNS",
+            vec![Value::string("test"), Value::string("ST")],
+        );
+        body.call_method("appendChild", vec![foreign.clone()]);
+        assert_eq!(foreign_by_tag.get_property("length").to_u32(), 1);
+        assert_eq!(foreign_by_namespace.get_property("length").to_u32(), 1);
+        assert!(foreign_by_namespace.get_property("0") == foreign);
+        body.call_method("removeChild", vec![foreign]);
+        assert_eq!(foreign_by_tag.get_property("length").to_u32(), 0);
+        assert_eq!(foreign_by_namespace.get_property("length").to_u32(), 0);
+    }
+
+    #[test]
+    fn table_row_and_cell_collections_are_live_and_delete_row_mutates_the_tree() {
+        setup();
+        let document = document_value();
+        let table = create_in_body("table");
+        let body = document.call_method("createElement", vec![Value::string("tbody")]);
+        let first_row = document.call_method("createElement", vec![Value::string("tr")]);
+        let first_cell = document.call_method("createElement", vec![Value::string("td")]);
+        first_row.call_method("appendChild", vec![first_cell.clone()]);
+        body.call_method("appendChild", vec![first_row]);
+        table.call_method("appendChild", vec![body.clone()]);
+
+        let bodies = table.get_property("tBodies");
+        let table_rows = table.get_property("rows");
+        let section_rows = body.get_property("rows");
+        assert_eq!(bodies.get_property("length").to_u32(), 1);
+        assert_eq!(table_rows.get_property("length").to_u32(), 1);
+        assert_eq!(section_rows.get_property("length").to_u32(), 1);
+        assert!(
+            section_rows
+                .get_property("0")
+                .get_property("cells")
+                .get_property("0")
+                == first_cell
+        );
+
+        let second_row = document.call_method("createElement", vec![Value::string("tr")]);
+        body.call_method("appendChild", vec![second_row]);
+        assert_eq!(table_rows.get_property("length").to_u32(), 2);
+        assert_eq!(section_rows.get_property("length").to_u32(), 2);
+
+        table.call_method("deleteRow", vec![Value::Number(0.0)]);
+        assert_eq!(table_rows.get_property("length").to_u32(), 1);
+        assert_eq!(section_rows.get_property("length").to_u32(), 1);
+    }
+
+    #[test]
+    fn class_name_collections_use_html_space_and_quirks_ascii_case_rules() {
+        setup();
+        let document = document_value();
+        set_document_compat_mode(true);
+
+        let mixed_case = create_in_body("div");
+        mixed_case.set_property("className", Value::string("a A"));
+        let quirks_matches =
+            document.call_method("getElementsByClassName", vec![Value::string("A a")]);
+        assert_eq!(quirks_matches.get_property("length").to_u32(), 1);
+        assert!(quirks_matches.get_property("0") == mixed_case);
+
+        let non_breaking_space = create_in_body("span");
+        non_breaking_space.set_property("className", Value::string("\u{00a0}"));
+        let unicode_matches =
+            document.call_method("getElementsByClassName", vec![Value::string("\u{00a0}")]);
+        assert_eq!(unicode_matches.get_property("length").to_u32(), 1);
+        assert!(unicode_matches.get_property("0") == non_breaking_space);
+    }
+
+    #[test]
+    fn deep_clone_preserves_svg_node_identity_metadata() {
+        setup();
+        let document = document_value();
+        let svg = document.call_method(
+            "createElementNS",
+            vec![
+                Value::string("http://www.w3.org/2000/svg"),
+                Value::string("svg"),
+            ],
+        );
+        let use_element = document.call_method(
+            "createElementNS",
+            vec![
+                Value::string("http://www.w3.org/2000/svg"),
+                Value::string("use"),
+            ],
+        );
+        svg.call_method("appendChild", vec![use_element]);
+
+        let clone = svg.call_method("cloneNode", vec![Value::Bool(true)]);
+        assert_eq!(
+            clone.get_property("namespaceURI"),
+            Value::string("http://www.w3.org/2000/svg")
+        );
+        assert_eq!(clone.get_property("localName"), Value::string("svg"));
+        assert_eq!(
+            clone
+                .get_property("firstElementChild")
+                .get_property("namespaceURI"),
+            Value::string("http://www.w3.org/2000/svg")
+        );
+        assert!(clone.get_property("ownerDocument") == document);
+    }
+
+    #[test]
+    fn detached_attribute_clone_preserves_namespace_and_value() {
+        setup();
+        let document = document_value();
+        let attribute = document.call_method(
+            "createAttributeNS",
+            vec![Value::string("urn:test"), Value::string("prefix:name")],
+        );
+        attribute.set_property("value", Value::string("value"));
+        let clone = attribute.call_method("cloneNode", vec![]);
+
+        assert!(w3cos_core::class::instance_of(
+            &clone,
+            &window_value().get_property("Attr")
+        ));
+        assert!(!clone.strict_eq(&attribute));
+        assert_eq!(clone.get_property("nodeType"), Value::Number(2.0));
+        assert_eq!(clone.get_property("namespaceURI"), Value::string("urn:test"));
+        assert_eq!(clone.get_property("prefix"), Value::string("prefix"));
+        assert_eq!(clone.get_property("localName"), Value::string("name"));
+        assert_eq!(clone.get_property("value"), Value::string("value"));
+    }
+
+    #[test]
+    fn deep_document_clone_preserves_doctype_metadata_and_child_ownership() {
+        setup();
+        let implementation = document_value().get_property("implementation");
+        let doctype = implementation.call_method(
+            "createDocumentType",
+            vec![
+                Value::string("name"),
+                Value::string("publicId"),
+                Value::string("systemId"),
+            ],
+        );
+        let xml_document = implementation.call_method(
+            "createDocument",
+            vec![Value::string("namespace"), Value::string(""), doctype],
+        );
+        let xml_clone = xml_document.call_method("cloneNode", vec![Value::Bool(true)]);
+        assert_eq!(
+            xml_clone.get_property("childNodes").get_property("length"),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            xml_clone.get_property("doctype").get_property("publicId"),
+            Value::string("publicId")
+        );
+        assert_eq!(
+            xml_clone.get_property("doctype").get_property("systemId"),
+            Value::string("systemId")
+        );
+
+        let html_document =
+            implementation.call_method("createHTMLDocument", vec![Value::Undefined]);
+        let html_clone = html_document.call_method("cloneNode", vec![Value::Bool(true)]);
+        assert_eq!(
+            html_clone.get_property("childNodes").get_property("length"),
+            Value::Number(2.0)
+        );
+        assert!(
+            html_clone
+                .get_property("documentElement")
+                .get_property("ownerDocument")
+                == html_clone
+        );
+
+        let parser =
+            w3cos_core::class::construct(&window_value().get_property("DOMParser"), vec![]);
+        let parsed_document = parser.call_method(
+            "parseFromString",
+            vec![
+                Value::string("<!DOCTYPE html><html></html>"),
+                Value::string("text/html"),
+            ],
+        );
+        let parsed_clone = parsed_document.call_method("cloneNode", vec![Value::Bool(true)]);
+        assert_eq!(
+            parsed_clone
+                .get_property("childNodes")
+                .get_property("length"),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            parsed_clone.get_property("doctype").get_property("name"),
+            Value::string("html")
+        );
+    }
+
+    #[test]
+    fn parsed_xhtml_document_preserves_tree_and_native_clone_identity() {
+        setup();
+        let document = parse_frame_document(
+            "<!DOCTYPE html><html xmlns='http://www.w3.org/1999/xhtml'><head/><body><div id='root'><span id='child'/></div></body></html>",
+            "application/xhtml+xml",
+            "https://example.test/frame.xhtml#child",
+        );
+        document.set_property(
+            "location",
+            Value::object(HashMap::from([(
+                "hash".to_string(),
+                Value::string("#child"),
+            )])),
+        );
+        let root = document.call_method("getElementById", vec![Value::string("root")]);
+        assert_eq!(root.get_property("nodeType"), Value::Number(1.0));
+        assert_eq!(document.get_property("body").get_property("nodeName"), Value::string("body"));
+        assert!(document.call_method("querySelector", vec![Value::string(":root")])
+            == document.get_property("documentElement"));
+        assert_eq!(
+            document
+                .call_method("querySelectorAll", vec![Value::string(":target")])
+                .get_property("length"),
+            Value::Number(1.0)
+        );
+
+        let clone = root.call_method("cloneNode", vec![Value::Bool(true)]);
+        assert_eq!(clone.get_property("nodeType"), Value::Number(1.0));
+        assert_eq!(clone.get_property("childElementCount"), Value::Number(1.0));
+        assert!(clone
+            .call_method("querySelector", vec![Value::string(":target")])
+            .is_null());
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+        assert!(fragment.call_method("appendChild", vec![clone.clone()]) == clone);
+    }
+
+    #[test]
+    fn is_equal_node_compares_properties_attributes_and_descendants() {
+        setup();
+        let implementation = document_value().get_property("implementation");
+        let left_doctype = implementation.call_method(
+            "createDocumentType",
+            vec![
+                Value::string("html"),
+                Value::string("public"),
+                Value::string("system"),
+            ],
+        );
+        let right_doctype = implementation.call_method(
+            "createDocumentType",
+            vec![
+                Value::string("html"),
+                Value::string("public"),
+                Value::string("system"),
+            ],
+        );
+        assert!(
+            left_doctype
+                .call_method("isEqualNode", vec![right_doctype.clone()])
+                .to_bool()
+        );
+        right_doctype.set_property("systemId", Value::string("different"));
+        assert!(
+            !left_doctype
+                .call_method("isEqualNode", vec![right_doctype])
+                .to_bool()
+        );
+
+        let left = document_value().call_method(
+            "createElementNS",
+            vec![Value::string("urn:test"), Value::string("prefix:root")],
+        );
+        let right = document_value().call_method(
+            "createElementNS",
+            vec![Value::string("urn:test"), Value::string("prefix:root")],
+        );
+        for element in [&left, &right] {
+            element.call_method(
+                "setAttributeNS",
+                vec![
+                    Value::string("urn:attribute"),
+                    Value::string("prefix:value"),
+                    Value::string("same"),
+                ],
+            );
+            element.call_method(
+                "appendChild",
+                vec![document_value()
+                    .call_method("createComment", vec![Value::string("child")])],
+            );
+        }
+        assert!(left.call_method("isEqualNode", vec![right.clone()]).to_bool());
+        right
+            .get_property("firstChild")
+            .set_property("data", Value::string("different"));
+        assert!(!left.call_method("isEqualNode", vec![right]).to_bool());
+
+        let left_document = implementation.call_method("createHTMLDocument", vec![]);
+        let right_document = implementation.call_method("createHTMLDocument", vec![]);
+        assert!(
+            left_document
+                .call_method("isEqualNode", vec![right_document.clone()])
+                .to_bool()
+        );
+        right_document
+            .get_property("body")
+            .call_method("appendChild", vec![right_document.call_method(
+                "createElement",
+                vec![Value::string("div")],
+            )]);
+        assert!(
+            !left_document
+                .call_method("isEqualNode", vec![right_document])
+                .to_bool()
+        );
+    }
+
+    #[test]
+    fn namespace_lookup_uses_element_identity_declarations_and_ancestor_context() {
+        setup();
+        let document = document_value();
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+        assert!(
+            fragment
+                .call_method("lookupNamespaceURI", vec![Value::Null])
+                .is_null()
+        );
+        assert!(
+            fragment
+                .call_method("isDefaultNamespace", vec![Value::Null])
+                .to_bool()
+        );
+
+        let element = document.call_method(
+            "createElementNS",
+            vec![Value::string("fooNamespace"), Value::string("prefix:elem")],
+        );
+        assert_eq!(
+            element.call_method("lookupNamespaceURI", vec![Value::string("prefix")]),
+            Value::string("fooNamespace")
+        );
+        assert_eq!(
+            element.call_method("lookupPrefix", vec![Value::string("fooNamespace")]),
+            Value::string("prefix")
+        );
+        assert_eq!(
+            element.call_method("lookupNamespaceURI", vec![Value::string("xml")]),
+            Value::string(crate::html_parser_state::XML_NAMESPACE)
+        );
+        element.call_method(
+            "setAttributeNS",
+            vec![
+                Value::string(crate::html_parser_state::XMLNS_NAMESPACE),
+                Value::string("xmlns:bar"),
+                Value::string("barURI"),
+            ],
+        );
+        element.call_method(
+            "setAttributeNS",
+            vec![
+                Value::string(crate::html_parser_state::XMLNS_NAMESPACE),
+                Value::string("xmlns"),
+                Value::string("bazURI"),
+            ],
+        );
+        assert_eq!(
+            element.call_method("lookupNamespaceURI", vec![Value::Null]),
+            Value::string("bazURI")
+        );
+        assert_eq!(
+            element.call_method("lookupNamespaceURI", vec![Value::string("bar")]),
+            Value::string("barURI")
+        );
+        assert_eq!(
+            element.call_method("lookupPrefix", vec![Value::string("barURI")]),
+            Value::string("bar")
+        );
+        assert!(
+            element
+                .call_method("lookupPrefix", vec![Value::string("bazURI")])
+                .is_null()
+        );
+
+        let comment = document.call_method("createComment", vec![Value::string("comment")]);
+        element.call_method("appendChild", vec![comment.clone()]);
+        assert_eq!(
+            comment.call_method("lookupNamespaceURI", vec![Value::Null]),
+            Value::string("bazURI")
+        );
+        assert_eq!(
+            comment.call_method("lookupPrefix", vec![Value::string("barURI")]),
+            Value::string("bar")
+        );
+
+        let attribute = document.call_method("createAttribute", vec![Value::string("foo")]);
+        assert!(
+            attribute
+                .call_method("lookupNamespaceURI", vec![Value::string("xml")])
+                .is_null()
+        );
+        document
+            .get_property("body")
+            .call_method("setAttributeNode", vec![attribute.clone()]);
+        assert_eq!(
+            attribute.call_method("lookupNamespaceURI", vec![Value::string("xml")]),
+            Value::string(crate::html_parser_state::XML_NAMESPACE)
+        );
+    }
+
+    #[test]
+    fn node_list_reads_an_overridden_length_accessor() {
+        setup();
+        let list = node_list(vec![Value::Null; 3]);
+        let descriptor = Value::object(HashMap::from([
+            ("configurable".to_string(), Value::Bool(true)),
+            ("get".to_string(), func(|_, _| Value::Number(1.0))),
+        ]));
+        w3cos_core::object_value().call_method(
+            "defineProperty",
+            vec![list.clone(), Value::string("length"), descriptor],
+        );
+        assert_eq!(list.get_property("length"), Value::Number(1.0));
+    }
+
+    #[test]
+    fn node_list_generic_index_of_uses_observable_length_and_host_snapshot() {
+        setup();
+        let first = Value::object(HashMap::new());
+        let needle = Value::object(HashMap::new());
+        let list = node_list(vec![first, needle.clone()]);
+        let index_of = w3cos_core::array_value()
+            .get_property("prototype")
+            .get_property("indexOf");
+        assert_eq!(
+            index_of.call(list.clone(), vec![needle.clone()]),
+            Value::Number(1.0)
+        );
+
+        let prototype = Value::object(HashMap::new());
+        w3cos_core::object_value().call_method(
+            "defineProperty",
+            vec![
+                prototype.clone(),
+                Value::string("length"),
+                Value::object(HashMap::from([(
+                    "get".to_string(),
+                    func(|_, _| Value::Number(1.0)),
+                )])),
+            ],
+        );
+        w3cos_core::object_value().call_method("setPrototypeOf", vec![list.clone(), prototype]);
+        assert_eq!(list.get_property("length"), Value::Number(1.0));
+        assert_eq!(index_of.call(list, vec![needle]), Value::Number(-1.0));
+    }
+
+    #[test]
+    fn document_fragment_get_element_by_id_and_node_base_uri_are_live() {
+        setup();
+        let document = document_value();
+        let fragment = document.call_method("createDocumentFragment", vec![]);
+        let element = document.call_method("createElement", vec![Value::string("div")]);
+        element.set_property("id", Value::string("target"));
+        fragment.call_method("appendChild", vec![element.clone()]);
+
+        assert!(fragment.call_method("getElementById", vec![Value::string("target")]) == element);
+        assert!(
+            fragment
+                .call_method("getElementById", vec![Value::string("")])
+                .is_null()
+        );
+        assert_eq!(
+            element.get_property("baseURI"),
+            document.get_property("URL")
+        );
+        assert_eq!(
+            document
+                .call_method("createAttribute", vec![Value::string("class")])
+                .get_property("baseURI"),
+            document.get_property("URL")
+        );
+    }
+
+    #[test]
+    fn window_frames_initializes_connected_iframe_browsing_contexts() {
+        setup();
+        create_in_body("iframe");
+
+        let frames = window_value().get_property("frames");
+        assert_eq!(frames.get_property("length"), Value::Number(1.0));
+        assert_eq!(
+            frames
+                .get_property("0")
+                .get_property("document")
+                .get_property("nodeType"),
+            Value::Number(9.0)
+        );
+    }
+
+    #[test]
+    fn frame_document_adoption_preserves_collection_htmlness() {
+        setup();
+        let document = document_value();
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        let child1 = document.call_method(
+            "createElementNS",
+            vec![
+                Value::string(crate::html_parser_state::HTML_NAMESPACE),
+                Value::string("a"),
+            ],
+        );
+        let child2 = document.call_method(
+            "createElementNS",
+            vec![
+                Value::string(crate::html_parser_state::HTML_NAMESPACE),
+                Value::string("A"),
+            ],
+        );
+        let child3 = document.call_method(
+            "createElementNS",
+            vec![Value::string(""), Value::string("a")],
+        );
+        let child4 = document.call_method(
+            "createElementNS",
+            vec![Value::string(""), Value::string("A")],
+        );
+        for child in [&child1, &child2, &child3, &child4] {
+            parent.call_method("appendChild", vec![child.clone()]);
+        }
+        let old_list = parent.call_method("getElementsByTagName", vec![Value::string("A")]);
+        assert_eq!(old_list.get_property("length").to_u32(), 2);
+        assert!(
+            old_list
+                .call_method("hasOwnProperty", vec![Value::Number(0.0)])
+                .to_bool()
+        );
+        assert!(
+            old_list
+                .call_method("hasOwnProperty", vec![Value::Number(1.0)])
+                .to_bool()
+        );
+        assert!(old_list.get_property("0") == child1);
+        assert!(old_list.get_property("1") == child4);
+
+        let iframe = create_in_body("iframe");
+        let iframe_node = node_id_of(&iframe).unwrap();
+        assert_eq!(
+            iframe
+                .get_property("contentDocument")
+                .get_property("nodeType"),
+            Value::Number(9.0)
+        );
+        let frame_document = parse_frame_document(
+            "<root/>",
+            "application/xml",
+            "https://example.test/frame.xml",
+        );
+        assert!(
+            frame_document
+                .get_property("firstChild")
+                .get_property("parentNode")
+                == frame_document
+        );
+        install_frame_document(
+            iframe_node,
+            frame_document.clone(),
+            "https://example.test/frame.xml",
+        );
+        assert_eq!(
+            window_value()
+                .get_property("frames")
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        assert!(
+            window_value()
+                .get_property("frames")
+                .get_property("0")
+                .get_property("document")
+                == frame_document
+        );
+
+        frame_document
+            .get_property("documentElement")
+            .call_method("appendChild", vec![parent.clone()]);
+        assert!(parent.get_property("ownerDocument") == frame_document);
+        assert_eq!(old_list.get_property("length").to_u32(), 2);
+        assert!(old_list.get_property("0") == child1);
+        assert!(old_list.get_property("1") == child4);
+        let new_list = parent.call_method("getElementsByTagName", vec![Value::string("A")]);
+        assert_eq!(new_list.get_property("length").to_u32(), 2);
+        assert!(new_list.get_property("0") == child2);
+        assert!(new_list.get_property("1") == child4);
+        assert!(child3.get_property("ownerDocument") == frame_document);
+    }
+
+    #[test]
+    fn parent_move_before_reparents_and_frame_body_projects_for_rendering() {
+        setup();
+        let document = document_value();
+        let source = document.call_method("createElement", vec![Value::string("select")]);
+        let target = document.call_method("createElement", vec![Value::string("select")]);
+        let option = document.call_method("createElement", vec![Value::string("option")]);
+        source.call_method("appendChild", vec![option.clone()]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![source]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![target.clone()]);
+        target.call_method("moveBefore", vec![option.clone(), Value::Null]);
+        assert!(option.get_property("parentNode") == target);
+
+        let iframe = create_in_body("iframe");
+        let iframe_node = node_id_of(&iframe).unwrap();
+        let frame_document = parse_frame_document(
+            "<body><span>FRAME-CONTENT</span></body>",
+            "text/html",
+            "about:blank",
+        );
+        let frame_span = frame_document.call_method("querySelector", vec![Value::string("span")]);
+        assert!(frame_span.get_property("isConnected").to_bool());
+        install_frame_document(iframe_node, frame_document, "about:blank");
+        fn text_content(component: &w3cos_std::Component) -> String {
+            let mut text = match &component.kind {
+                w3cos_std::component::ComponentKind::Text { content } => content.clone(),
+                _ => String::new(),
+            };
+            for child in &component.children {
+                text.push_str(&text_content(child));
+            }
+            text
+        }
+        assert!(text_content(&dom::to_component_tree()).contains("FRAME-CONTENT"));
+        document
+            .get_property("body")
+            .call_method("removeChild", vec![iframe]);
+        assert!(frame_span.get_property("isConnected").to_bool());
+    }
+
+    #[test]
+    fn popover_open_selector_survives_move_before() {
+        setup();
+        let document = document_value();
+        let body = document.get_property("body");
+        let old_parent = document.call_method("createElement", vec![Value::string("section")]);
+        let new_parent = document.call_method("createElement", vec![Value::string("section")]);
+        let popover = document.call_method("createElement", vec![Value::string("div")]);
+        popover.call_method(
+            "setAttribute",
+            vec![Value::string("popover"), Value::string("")],
+        );
+        old_parent.call_method("appendChild", vec![popover.clone()]);
+        body.call_method("appendChild", vec![old_parent]);
+        body.call_method("appendChild", vec![new_parent.clone()]);
+
+        popover.call_method("showPopover", vec![]);
+        assert!(
+            document.call_method("querySelector", vec![Value::string(":popover-open")])
+                == popover
+        );
+
+        new_parent.call_method("moveBefore", vec![popover.clone(), Value::Null]);
+        assert!(
+            document.call_method("querySelector", vec![Value::string(":popover-open")])
+                == popover
+        );
+    }
+
+    #[test]
+    fn modal_dialog_selector_survives_move_before() {
+        setup();
+        let document = document_value();
+        let body = document.get_property("body");
+        let old_parent = document.call_method("createElement", vec![Value::string("section")]);
+        let new_parent = document.call_method("createElement", vec![Value::string("section")]);
+        let dialog = document.call_method("createElement", vec![Value::string("dialog")]);
+        old_parent.call_method("appendChild", vec![dialog.clone()]);
+        body.call_method("appendChild", vec![old_parent]);
+        body.call_method("appendChild", vec![new_parent.clone()]);
+
+        dialog.call_method("showModal", vec![]);
+        assert!(
+            dialog
+                .call_method("matches", vec![Value::string(":modal")])
+                .to_bool()
+        );
+
+        new_parent.call_method("moveBefore", vec![dialog.clone(), Value::Null]);
+        assert!(
+            dialog
+                .call_method("matches", vec![Value::string(":modal")])
+                .to_bool()
+        );
+    }
+
+    #[test]
+    fn move_before_requires_a_shared_shadow_including_root() {
+        setup();
+        let document = document_value();
+        let connected_destination = create_in_body("div");
+        assert_eq!(
+            connected_destination
+                .get_property("moveBefore")
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+        let disconnected_origin =
+            document.call_method("createElement", vec![Value::string("section")]);
+        let disconnected_child =
+            document.call_method("createElement", vec![Value::string("p")]);
+        disconnected_origin.call_method("appendChild", vec![disconnected_child.clone()]);
+
+        let error = w3cos_core::catch_js(|| {
+            connected_destination.call_method(
+                "moveBefore",
+                vec![disconnected_child.clone(), Value::Null],
+            )
+        })
+        .expect_err("moving between connected and disconnected roots must throw");
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "HierarchyRequestError"
+        );
+
+        let disconnected_destination =
+            document.call_method("createElement", vec![Value::string("aside")]);
+        let error = w3cos_core::catch_js(|| {
+            disconnected_destination.call_method(
+                "moveBefore",
+                vec![disconnected_child.clone(), Value::Null],
+            )
+        })
+        .expect_err("moving between unrelated disconnected roots must throw");
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "HierarchyRequestError"
+        );
+
+        disconnected_origin.call_method("appendChild", vec![disconnected_destination.clone()]);
+        disconnected_destination.call_method(
+            "moveBefore",
+            vec![disconnected_child.clone(), Value::Null],
+        );
+        assert!(disconnected_child.get_property("parentNode") == disconnected_destination);
+    }
+
+    #[test]
+    fn virtual_document_move_before_accepts_comments_but_rejects_elements() {
+        setup();
+        let implementation = document_value().get_property("implementation");
+        let document =
+            implementation.call_method("createHTMLDocument", vec![Value::Undefined]);
+        assert!(document.get_property("isConnected").to_bool());
+        let body = document.get_property("body");
+        let comment = document.call_method("createComment", vec![Value::string("comment")]);
+        body.call_method("appendChild", vec![comment.clone()]);
+
+        document.call_method("moveBefore", vec![comment.clone(), Value::Null]);
+        assert!(comment.get_property("parentNode") == document);
+        assert!(document.get_property("lastChild") == comment);
+
+        let error = w3cos_core::catch_js(|| {
+            document.call_method("moveBefore", vec![body.clone(), Value::Null])
+        })
+        .expect_err("moving an Element directly into a Document must throw");
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "HierarchyRequestError"
+        );
+    }
+
+    #[test]
+    fn compiled_move_before_enforces_required_and_node_arguments() {
+        setup();
+        crate::dynamic_script::ScriptLoader::new(crate::dynamic_script::ScriptPolicy::default())
+            .execute_source(
+                r#"
+var moving = document.createTextNode("moving");
+try {
+  document.body.moveBefore(moving);
+  window.__moveBeforeMissingThrew = false;
+} catch (error) {
+  window.__moveBeforeMissingThrew = true;
+  window.__moveBeforeMissingName = error.name;
+  window.__moveBeforeMissingConstructor = error.constructor === TypeError;
+}
+try {
+  document.body.moveBefore(moving, { invalid: true });
+  window.__moveBeforeInvalidReferenceThrew = false;
+} catch (error) {
+  window.__moveBeforeInvalidReferenceThrew = true;
+  window.__moveBeforeInvalidReferenceName = error.name;
+  window.__moveBeforeInvalidReferenceConstructor = error.constructor === TypeError;
+}
+"#,
+                "inline:move-before-webidl",
+            )
+            .unwrap();
+        let window = window_value();
+        for prefix in ["__moveBeforeMissing", "__moveBeforeInvalidReference"] {
+            assert!(window.get_property(&format!("{prefix}Threw")).to_bool());
+            assert_eq!(
+                window.get_property(&format!("{prefix}Name")).to_js_string(),
+                "TypeError"
+            );
+            assert!(
+                window
+                    .get_property(&format!("{prefix}Constructor"))
+                    .to_bool()
+            );
+        }
     }
 
     #[test]
@@ -13898,6 +21908,31 @@ mod tests {
         let removed = body.call_method("removeChild", vec![a.clone()]);
         assert!(removed == a);
         assert_eq!(dom::children(body_id).len(), 0);
+    }
+
+    #[test]
+    fn character_data_remove_has_child_node_shape_and_detaches() {
+        setup();
+        let document = document_value();
+        let text = document.call_method("createTextNode", vec![Value::string("text")]);
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        let remove = text.get_property("remove");
+        assert!(Value::string("remove").js_in(&text).to_bool());
+        assert!(remove.is_function());
+        assert_eq!(remove.get_property("length"), Value::Number(0.0));
+        assert!(text.get_property("parentNode").is_null());
+        assert!(text.call_method("remove", vec![]).is_undefined());
+        parent.call_method("appendChild", vec![text.clone()]);
+        assert!(text.get_property("parentNode") == parent);
+        assert!(text.call_method("remove", vec![]).is_undefined());
+        assert!(text.get_property("parentNode").is_null());
+        assert_eq!(
+            parent
+                .get_property("childNodes")
+                .get_property("length")
+                .to_u32(),
+            0
+        );
     }
 
     #[test]
@@ -13950,6 +21985,47 @@ mod tests {
         let adopted = doc.call_method("adoptNode", vec![source.clone()]);
         assert!(adopted == source);
         assert!(source.get_property("parentNode").is_null());
+    }
+
+    #[test]
+    fn named_node_map_preserves_inserted_attribute_identity_and_reserved_members() {
+        setup();
+        let document = document_value();
+        let element = document.call_method("createElement", vec![Value::string("div")]);
+        let attributes = element.get_property("attributes");
+        let attribute = document.call_method("createAttribute", vec![Value::string("route")]);
+
+        assert!(
+            attributes
+                .call_method("setNamedItem", vec![attribute.clone()])
+                .is_null()
+        );
+        assert!(attributes.get_property("route") == attribute);
+        assert_eq!(attributes.get_property("length").to_u32(), 1);
+        assert!(
+            attributes.get_property("item")
+                == crate::dom_constructors::prototype("NamedNodeMap").get_property("item")
+        );
+        assert!(
+            attributes.call_method("removeNamedItem", vec![Value::string("route")]) == attribute
+        );
+        assert!(attributes.get_property("route").is_undefined());
+        assert_eq!(attributes.get_property("length").to_u32(), 0);
+
+        element.call_method(
+            "setAttributeNS",
+            vec![
+                Value::string("urn:reserved"),
+                Value::string("toString"),
+                Value::string("attribute"),
+            ],
+        );
+        assert!(
+            element
+                .get_property("attributes")
+                .get_property("toString")
+                .is_function()
+        );
     }
 
     #[test]
@@ -14400,6 +22476,202 @@ mod tests {
         assert_eq!(dispatch_native_submit_for_control(button_id), None);
         assert_eq!(dispatch_native_submit_for_control(caption_id), None);
         assert_eq!(submissions.get(), 2);
+    }
+
+    #[test]
+    fn form_associated_controls_expose_their_live_form_owner() {
+        setup();
+        let document = document_value();
+        let form = create_in_body("form");
+        form.call_method(
+            "setAttribute",
+            vec![Value::string("id"), Value::string("owner")],
+        );
+        let nested_button = document.call_method("createElement", vec![Value::string("button")]);
+        form.call_method("appendChild", vec![nested_button.clone()]);
+        assert!(nested_button.get_property("form").strict_eq(&form));
+
+        let external_button =
+            document.call_method("createElement", vec![Value::string("button")]);
+        external_button.call_method(
+            "setAttribute",
+            vec![Value::string("form"), Value::string("owner")],
+        );
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![external_button.clone()]);
+        assert!(external_button.get_property("form").strict_eq(&form));
+    }
+
+    #[test]
+    fn duplicate_form_ids_resolve_the_owner_in_tree_order_after_move_before() {
+        setup();
+        let document = document_value();
+        let body = document.get_property("body");
+        let form1 = document.call_method("createElement", vec![Value::string("form")]);
+        form1.set_property("id", Value::string("owner"));
+        body.call_method("appendChild", vec![form1.clone()]);
+        let button = document.call_method("createElement", vec![Value::string("button")]);
+        button.call_method(
+            "setAttribute",
+            vec![Value::string("form"), Value::string("owner")],
+        );
+        body.call_method("appendChild", vec![button.clone()]);
+        let form2 = document.call_method("createElement", vec![Value::string("form")]);
+        form2.set_property("id", Value::string("owner"));
+        body.call_method("appendChild", vec![form2.clone()]);
+
+        assert!(button.get_property("form").strict_eq(&form1));
+        body.call_method("moveBefore", vec![form2.clone(), form1]);
+        assert!(button.get_property("form").strict_eq(&form2));
+    }
+
+    #[test]
+    fn option_selectedness_and_selected_index_follow_move_before() {
+        setup();
+        let document = document_value();
+        let body = document.get_property("body");
+        let select = document.call_method("createElement", vec![Value::string("select")]);
+        let group = document.call_method("createElement", vec![Value::string("optgroup")]);
+        let option_a = document.call_method("createElement", vec![Value::string("option")]);
+        let option_b = document.call_method("createElement", vec![Value::string("option")]);
+        let option_c = document.call_method("createElement", vec![Value::string("option")]);
+        select.call_method("appendChild", vec![option_a.clone()]);
+        group.call_method("appendChild", vec![option_b.clone()]);
+        select.call_method("appendChild", vec![group]);
+        select.call_method("appendChild", vec![option_c.clone()]);
+        body.call_method("appendChild", vec![select.clone()]);
+
+        assert!(option_a.get_property("selected").to_bool());
+        assert_eq!(select.get_property("selectedIndex"), Value::Number(0.0));
+        body.call_method("moveBefore", vec![option_a.clone(), Value::Null]);
+        assert!(option_a.get_property("selected").to_bool());
+        assert!(option_b.get_property("selected").to_bool());
+        body.call_method("moveBefore", vec![option_b.clone(), Value::Null]);
+        assert!(option_b.get_property("selected").to_bool());
+        assert!(option_c.get_property("selected").to_bool());
+        select.call_method("moveBefore", vec![option_a.clone(), option_c.clone()]);
+        assert!(option_a.get_property("selected").to_bool());
+        assert!(!option_c.get_property("selected").to_bool());
+        assert_eq!(select.get_property("selectedIndex"), Value::Number(0.0));
+
+        option_c.set_property("selected", Value::Bool(true));
+        assert_eq!(select.get_property("selectedIndex"), Value::Number(1.0));
+        select.call_method("moveBefore", vec![option_c, option_a]);
+        assert_eq!(select.get_property("selectedIndex"), Value::Number(0.0));
+    }
+
+    #[test]
+    fn moved_display_contents_child_becomes_a_sized_flex_item() {
+        setup();
+        let document = document_value();
+        let body = document.get_property("body");
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        parent.set_property("id", Value::string("new_parent"));
+        let parent_style = parent.get_property("style");
+        parent_style.set_property("width", Value::string("100px"));
+        parent_style.set_property("display", Value::string("flex"));
+        let old_parent = document.call_method("createElement", vec![Value::string("div")]);
+        let wrapper = document.call_method("createElement", vec![Value::string("div")]);
+        wrapper.set_property("id", Value::string("mv"));
+        wrapper
+            .get_property("style")
+            .set_property("display", Value::string("contents"));
+        let child = document.call_method("createElement", vec![Value::string("div")]);
+        let child_style = child.get_property("style");
+        child_style.set_property("display", Value::string("inline"));
+        child_style.set_property("background", Value::string("green"));
+        child_style.set_property("height", Value::string("100px"));
+        child_style.set_property("flexGrow", Value::string("1"));
+        let child_id = node_id_of(&child).unwrap();
+        wrapper.call_method("appendChild", vec![child]);
+        old_parent.call_method("appendChild", vec![wrapper]);
+        body.call_method("appendChild", vec![parent]);
+        body.call_method("appendChild", vec![old_parent]);
+
+        crate::dynamic_script::ScriptLoader::new(crate::dynamic_script::ScriptPolicy::default())
+            .execute_source("new_parent.moveBefore(mv, null);", "inline:flex-move")
+            .unwrap();
+
+        let tree = crate::dom::to_component_tree();
+        let flat = crate::layout::pre_flatten(&tree);
+        let child_index = flat
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.on_click,
+                    w3cos_std::EventAction::NativeHost { id, .. }
+                        if *id == u64::from(child_id)
+                )
+            })
+            .expect("promoted child component");
+        let rect = crate::layout::compute(&tree, 800.0, 600.0)
+            .unwrap()
+            .into_iter()
+            .find_map(|(rect, index)| (index == child_index).then_some(rect))
+            .expect("promoted child layout");
+        assert_eq!((rect.width, rect.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn live_range_snaps_to_old_parent_when_ancestor_moves() {
+        setup();
+        let document = document_value();
+        let body = document.get_property("body");
+        let old_parent = document.call_method("createElement", vec![Value::string("div")]);
+        let movable = document.call_method("createElement", vec![Value::string("div")]);
+        let start = document.call_method("createElement", vec![Value::string("span")]);
+        let middle = document.call_method("createElement", vec![Value::string("span")]);
+        let end = document.call_method("createElement", vec![Value::string("span")]);
+        let new_parent = document.call_method("createElement", vec![Value::string("div")]);
+        movable.call_method("appendChild", vec![start.clone()]);
+        movable.call_method("appendChild", vec![middle.clone()]);
+        old_parent.call_method("appendChild", vec![movable.clone()]);
+        old_parent.call_method("appendChild", vec![end.clone()]);
+        body.call_method("appendChild", vec![old_parent.clone()]);
+        body.call_method("appendChild", vec![new_parent.clone()]);
+
+        let range = document.call_method("createRange", vec![]);
+        range.call_method("setStart", vec![start, Value::Number(0.0)]);
+        range.call_method("setEnd", vec![end.clone(), Value::Number(0.0)]);
+        assert_eq!(
+            range.call_method("intersectsNode", vec![middle.clone()]),
+            Value::Bool(true)
+        );
+
+        new_parent.call_method("moveBefore", vec![movable, Value::Null]);
+
+        assert!(range.get_property("startContainer").strict_eq(&old_parent));
+        assert!(range.get_property("endContainer").strict_eq(&end));
+        assert_eq!(
+            range.call_method("intersectsNode", vec![middle]),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn document_create_event_uses_legacy_aliases_and_empty_initial_state() {
+        setup();
+        let document = document_value();
+        for (alias, interface) in [
+            ("EVENTS", "Event"),
+            ("MouseEvents", "MouseEvent"),
+            ("uievents", "UIEvent"),
+            ("CustomEvent", "CustomEvent"),
+        ] {
+            let event = document.call_method("createEvent", vec![Value::string(alias)]);
+            assert!(w3cos_core::class::instance_of(
+                &event,
+                &window_value().get_property(interface)
+            ));
+            assert_eq!(event.get_property("type"), Value::string(""));
+            assert_eq!(event.get_property("target"), Value::Null);
+            assert_eq!(event.get_property("eventPhase"), Value::Number(0.0));
+            assert_eq!(event.get_property("bubbles"), Value::Bool(false));
+            assert_eq!(event.get_property("cancelable"), Value::Bool(false));
+            assert_eq!(event.get_property("defaultPrevented"), Value::Bool(false));
+            assert_eq!(event.get_property("isTrusted"), Value::Bool(false));
+        }
     }
 
     #[test]
@@ -15070,10 +23342,13 @@ mod tests {
         let document = document_value();
         let host = create_in_body("section");
         let delivered = Rc::new(RefCell::new(Vec::<Value>::new()));
+        let callback_receivers = Rc::new(RefCell::new(Vec::<Value>::new()));
         let delivered_for_callback = Rc::clone(&delivered);
+        let receivers_for_callback = Rc::clone(&callback_receivers);
         let observer = w3cos_core::class::construct(
             &window.get_property("MutationObserver"),
-            vec![func(move |_, args| {
+            vec![func(move |this, args| {
+                receivers_for_callback.borrow_mut().push(this);
                 delivered_for_callback
                     .borrow_mut()
                     .extend(arg(&args, 0).iter());
@@ -15115,6 +23390,7 @@ mod tests {
 
         assert!(delivered.borrow().is_empty());
         assert_eq!(drain_microtasks(), 1);
+        assert!(callback_receivers.borrow()[0] == observer);
         let records = delivered.borrow();
         assert_eq!(records.len(), 4);
         assert_eq!(records[0].get_property("type").to_js_string(), "attributes");
@@ -15163,6 +23439,84 @@ mod tests {
                 .get_property("length")
                 .to_u32(),
             0
+        );
+    }
+
+    #[test]
+    fn mutation_observer_records_reflected_properties_before_tree_changes() {
+        setup();
+        let window = window_value();
+        let host = create_in_body("p");
+        host.set_property("id", Value::string("n00"));
+        let observer = w3cos_core::class::construct(
+            &window.get_property("MutationObserver"),
+            vec![func(|_, _| Value::Undefined)],
+        );
+        observer.call_method(
+            "observe",
+            vec![
+                host.clone(),
+                Value::object(HashMap::from([
+                    ("attributes".to_string(), Value::Bool(true)),
+                    ("attributeOldValue".to_string(), Value::Bool(true)),
+                    ("childList".to_string(), Value::Bool(true)),
+                    ("characterData".to_string(), Value::Bool(true)),
+                    ("characterDataOldValue".to_string(), Value::Bool(true)),
+                    ("subtree".to_string(), Value::Bool(true)),
+                ])),
+            ],
+        );
+
+        host.set_property("id", Value::string("foo"));
+        host.set_property("id", Value::string("bar"));
+        host.set_property("className", Value::string("bar"));
+        host.set_property("textContent", Value::string("old data"));
+        host.get_property("firstChild")
+            .set_property("data", Value::string("new data"));
+
+        let records = observer.call_method("takeRecords", vec![]);
+        assert_eq!(records.get_property("length").to_u32(), 5);
+        assert_eq!(
+            records
+                .get_property("0")
+                .get_property("type")
+                .to_js_string(),
+            "attributes"
+        );
+        assert_eq!(
+            records
+                .get_property("0")
+                .get_property("oldValue")
+                .to_js_string(),
+            "n00"
+        );
+        assert_eq!(
+            records
+                .get_property("3")
+                .get_property("type")
+                .to_js_string(),
+            "childList"
+        );
+        assert_eq!(
+            records
+                .get_property("2")
+                .get_property("type")
+                .to_js_string(),
+            "attributes"
+        );
+        assert_eq!(
+            records
+                .get_property("2")
+                .get_property("attributeName")
+                .to_js_string(),
+            "class"
+        );
+        assert_eq!(
+            records
+                .get_property("4")
+                .get_property("type")
+                .to_js_string(),
+            "characterData"
         );
     }
 
@@ -15601,13 +23955,18 @@ mod tests {
             xml.get_property("documentElement")
                 .get_property("tagName")
                 .to_js_string(),
-            "ROOT"
+            "root"
         );
         assert_eq!(
             xml.call_method("getElementById", vec![Value::string("r")])
                 .get_property("tagName")
                 .to_js_string(),
-            "ROOT"
+            "root"
+        );
+        assert!(
+            xml.get_property("documentElement")
+                .get_property("parentNode")
+                == xml
         );
         let serializer =
             w3cos_core::class::construct(&window.get_property("XMLSerializer"), vec![]);
@@ -16438,15 +24797,18 @@ mod tests {
     }
 
     #[test]
-    fn bounding_client_rect_zeroes_until_layout() {
+    fn bounding_client_rect_flushes_pending_style_and_layout() {
         setup();
         let div = create_in_body("div");
+        div.get_property("style")
+            .set_property("width", Value::string("100px"));
         let rect = div.call_method("getBoundingClientRect", vec![]);
-        for key in [
-            "x", "y", "width", "height", "top", "left", "right", "bottom",
-        ] {
-            assert_eq!(rect.get_property(key).to_number(), 0.0, "{key}");
-        }
+        assert_eq!(rect.get_property("width").to_number(), 100.0);
+
+        div.get_property("style")
+            .set_property("width", Value::string("200px"));
+        let rect = div.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(rect.get_property("width").to_number(), 200.0);
     }
 
     #[test]
@@ -16649,8 +25011,18 @@ mod tests {
         let div = create_in_body("div");
         div.get_property("style")
             .set_property("width", Value::string("42px"));
+        div.get_property("style")
+            .set_property("backgroundColor", Value::string("#008000"));
         let cs = win.call_method("getComputedStyle", vec![div]);
         assert_eq!(cs.get_property("width").to_js_string(), "42px");
+        assert_eq!(
+            cs.get_property("backgroundColor").to_js_string(),
+            "rgb(0, 128, 0)"
+        );
+        assert_eq!(
+            serialize_computed_style_property("color", "rgba(255, 0, 0, 0.5)"),
+            "rgba(255, 0, 0, 0.502)"
+        );
     }
 
     #[test]

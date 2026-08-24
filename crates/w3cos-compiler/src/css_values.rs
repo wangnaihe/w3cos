@@ -58,8 +58,7 @@ pub fn parse_plain_px(value: &str) -> Option<f32> {
     if trimmed.starts_with("calc(") {
         return css_parse_calc_px(trimmed);
     }
-    let v = trimmed.trim_end_matches("px");
-    v.parse().ok()
+    w3cos_std::style::parse_absolute_length_px(trimmed)
 }
 
 /// Parse spacing used by padding/margin.

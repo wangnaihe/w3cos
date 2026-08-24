@@ -1523,6 +1523,7 @@ impl Value {
             ValueUnpack::Number(_) => "number",
             ValueUnpack::String(value) if value.starts_with("__w3cos_symbol_") => "symbol",
             ValueUnpack::String(_) => "string",
+            ValueUnpack::Object(object) if object.borrow().call_slot().is_some() => "function",
             ValueUnpack::Array(_) | ValueUnpack::Object(_) => "object",
             ValueUnpack::Function(_) => "function",
         }
@@ -1691,8 +1692,13 @@ impl Value {
         if let Some(o) = obj.as_object() {
             return Value::Bool(o.borrow().has(&key));
         }
+        if let Some(function) = obj.as_function() {
+            return Value::Bool(function.has_own_property(&key));
+        }
         if let Some(arr) = obj.as_array() {
-            return if let Ok(idx) = key.parse::<usize>() {
+            return if key == "length" {
+                Value::Bool(true)
+            } else if let Ok(idx) = key.parse::<usize>() {
                 Value::Bool(
                     arr.borrow()
                         .get(idx)
@@ -1802,8 +1808,23 @@ impl Value {
     /// the object has no own data property `key` but a `__w3cos_setter_{key}`
     /// function is reachable through the prototype chain, the setter is
     /// invoked with the object as receiver instead of storing directly.
-    pub fn set_property(&self, key: &str, value: Value) {
+    pub fn try_set_property(&self, key: &str, value: Value) -> bool {
         if let Some(o) = self.as_object() {
+            let rejects_indexed_set = o
+                .borrow()
+                .get_direct("__w3cosRejectIndexedSet")
+                .to_bool();
+            let canonical_index = key
+                .parse::<u32>()
+                .is_ok_and(|index| index.to_string() == key);
+            if rejects_indexed_set && canonical_index {
+                return false;
+            }
+            let descriptor = o.borrow().get_own_property_descriptor(key);
+            let writable = descriptor.get_property("writable");
+            if writable.is_bool() && !writable.to_bool() {
+                return false;
+            }
             let has_own = o.borrow().properties.contains_key(key);
             if !has_own {
                 let setter = o
@@ -1812,16 +1833,15 @@ impl Value {
                     .clone();
                 if !setter.is_undefined() {
                     setter.call(self.clone(), vec![value]);
-                    return;
+                    return true;
                 }
             }
-            o.borrow_mut().set(key, value, &Value::Undefined);
-            return;
+            return o.borrow_mut().set(key, value, self);
         }
         if let Some(arr) = self.as_array() {
             if let Ok(idx) = key.parse::<usize>() {
                 if crate::binary::set_typed_array_index(self, idx, value.clone()) {
-                    return;
+                    return true;
                 }
                 let mut a = arr.borrow_mut();
                 if idx >= a.len() {
@@ -1829,17 +1849,23 @@ impl Value {
                 }
                 a[idx] = value;
             }
-            return;
+            return true;
         }
         match self {
             // JS functions are objects: properties attach to the function
             // value (decorator ids, constructor statics).
-            _ if self.as_function().is_some() => self
-                .as_function()
-                .expect("function")
-                .set_property(key, value),
-            _ => {}
+            _ if self.as_function().is_some() => {
+                self.as_function()
+                    .expect("function")
+                    .set_property(key, value);
+                true
+            }
+            _ => false,
         }
+    }
+
+    pub fn set_property(&self, key: &str, value: Value) {
+        let _ = self.try_set_property(key, value);
     }
 
     /// Delete an own property and return the JavaScript-style success value.
@@ -2070,12 +2096,17 @@ impl Value {
                 .unwrap_or(Value::Undefined)
                 .to_js_string();
             return Value::Bool(match self {
-                _ if self.as_object().is_some() => self
-                    .as_object()
-                    .expect("object")
-                    .borrow()
-                    .properties
-                    .contains_key(property.as_str()),
+                _ if self.as_object().is_some() => {
+                    let object = self.as_object().expect("object");
+                    let object = object.borrow();
+                    if object.is_proxy() {
+                        object
+                            .get_own_property_descriptor(property.as_str())
+                            .is_object()
+                    } else {
+                        object.has_own_property(property.as_str())
+                    }
+                }
                 _ if self.as_array().is_some() => {
                     let values = self.as_array().expect("array");
                     property == "length"
@@ -3003,6 +3034,18 @@ fn array_call_method(
             values.borrow_mut().reverse();
             this.clone()
         }
+        "fill" => {
+            let length = values.borrow().len();
+            let start = array_index(args.get(1), length, 0);
+            let end = array_index(args.get(2), length, length).max(start);
+            let fill_value = arg(0);
+            let mut values = values.borrow_mut();
+            for slot in &mut values[start..end] {
+                *slot = fill_value.clone();
+            }
+            values.refresh_heap_accounting();
+            this.clone()
+        }
         "flat" => {
             let depth = args
                 .first()
@@ -3607,6 +3650,10 @@ mod tests {
         assert_eq!(Value::String("hi".into()).type_of(), "string");
         assert_eq!(Value::Bool(true).type_of(), "boolean");
         assert_eq!(
+            Value::callable(HashMap::new(), |_, _| Value::Undefined).type_of(),
+            "function"
+        );
+        assert_eq!(
             Value::String("__w3cos_symbol_for:react.element".into()).type_of(),
             "symbol"
         );
@@ -3672,6 +3719,22 @@ mod tests {
     }
 
     #[test]
+    fn array_fill_materializes_sparse_slots_and_honors_bounds() {
+        let array = crate::builtins::array_value().call(
+            Value::Undefined,
+            vec![Value::Number(4.0)],
+        );
+        assert!(array.call_method("fill", vec![Value::string("x")]) == array);
+        assert_eq!(array.to_js_string(), "x,x,x,x");
+
+        array.call_method(
+            "fill",
+            vec![Value::string("y"), Value::Number(1.0), Value::Number(-1.0)],
+        );
+        assert_eq!(array.to_js_string(), "x,y,y,x");
+    }
+
+    #[test]
     fn plain_objects_expose_has_own_property() {
         let object = crate::js_object! {
             "present" => Value::Undefined,
@@ -3684,6 +3747,37 @@ mod tests {
         assert!(
             !object
                 .call_method("hasOwnProperty", vec![Value::from("missing")])
+                .to_bool()
+        );
+    }
+
+    #[test]
+    fn proxy_has_own_property_observes_the_descriptor_trap() {
+        let handler = crate::ProxyBuilder::new()
+            .get_own_property_descriptor(|_, key| {
+                if key == "virtual" {
+                    Value::object(HashMap::from([(
+                        "configurable".to_string(),
+                        Value::Bool(true),
+                    )]))
+                } else {
+                    Value::Undefined
+                }
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(crate::JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+
+        assert!(
+            proxy
+                .call_method("hasOwnProperty", vec![Value::string("virtual")])
+                .to_bool()
+        );
+        assert!(
+            !proxy
+                .call_method("hasOwnProperty", vec![Value::string("missing")])
                 .to_bool()
         );
     }
@@ -3926,6 +4020,11 @@ mod tests {
         assert!(Value::Number(0.0).js_in(&arr).to_bool());
         assert!(Value::Number(1.0).js_in(&arr).to_bool());
         assert!(!Value::Number(2.0).js_in(&arr).to_bool());
+
+        let function = Value::function(|_, _| Value::Undefined);
+        function.set_property("ELEMENT_NODE", Value::Number(1.0));
+        assert!(Value::string("ELEMENT_NODE").js_in(&function).to_bool());
+        assert!(!Value::string("TEXT_NODE").js_in(&function).to_bool());
     }
 
     #[test]

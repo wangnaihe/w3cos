@@ -673,6 +673,85 @@ pub fn animate_element(target: Value, keyframes: Value, options: Value, node: u3
     animation
 }
 
+/// Create (or return) the Web Animations facade corresponding to one CSS
+/// animation/transition. CSS-driven effects share `getAnimations()` with
+/// script-created effects, as required by the Web Animations integration.
+pub(crate) fn css_motion_animation(
+    node: u32,
+    kind: &str,
+    label: &str,
+    pseudo: Option<&str>,
+    property: &str,
+) -> Value {
+    let pseudo = pseudo.unwrap_or_default();
+    if let Some(existing) = ANIMATIONS.with(|animations| {
+        animations
+            .borrow()
+            .iter()
+            .find(|animation| {
+                animation.get_property("__w3cos_animation_target").to_u32() == node
+                    && animation
+                        .get_property("__w3cos_css_motion_kind")
+                        .to_js_string()
+                        == kind
+                    && animation
+                        .get_property("__w3cos_css_motion_pseudo")
+                        .to_js_string()
+                        == pseudo
+                    && animation
+                        .get_property("__w3cos_css_motion_property")
+                        .to_js_string()
+                        == property
+            })
+            .cloned()
+    }) {
+        return existing;
+    }
+
+    let effect = keyframe_effect_value(
+        crate::jsdom::element_value(node),
+        Value::array(Vec::new()),
+        Value::Undefined,
+    );
+    if !pseudo.is_empty() {
+        effect.set_property("pseudoElement", Value::string(pseudo));
+    }
+    let animation = animation_value(effect, document_timeline_value());
+    animation.set_property("__w3cos_animation_target", Value::Number(node as f64));
+    animation.set_property("__w3cos_css_motion_kind", Value::string(kind));
+    animation.set_property("__w3cos_css_motion_pseudo", Value::string(pseudo));
+    animation.set_property("__w3cos_css_motion_property", Value::string(property));
+    if kind == "animation" {
+        animation.set_property("animationName", Value::string(label));
+        w3cos_core::class::set_prototype_of(
+            &animation,
+            &class_for("CSSAnimation").get_property("prototype"),
+        );
+    } else {
+        animation.set_property("transitionProperty", Value::string(label));
+        w3cos_core::class::set_prototype_of(
+            &animation,
+            &class_for("CSSTransition").get_property("prototype"),
+        );
+    }
+    let commit_pseudo = pseudo.to_string();
+    let commit_property = property.to_string();
+    animation.set_property(
+        "commitStyles",
+        realm_animation_function(move |_, _| {
+            crate::jsdom::commit_css_motion_style(
+                node,
+                (!commit_pseudo.is_empty()).then_some(commit_pseudo.as_str()),
+                &commit_property,
+            );
+            Value::Undefined
+        }),
+    );
+    animation.call_method("play", Vec::new());
+    ANIMATIONS.with(|animations| animations.borrow_mut().push(animation.clone()));
+    animation
+}
+
 pub fn animations_for(node: Option<u32>, subtree: bool) -> Value {
     Value::array(ANIMATIONS.with(|animations| {
         animations

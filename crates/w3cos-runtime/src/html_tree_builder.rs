@@ -68,6 +68,7 @@ impl StreamingDocumentParser {
             for (attribute, value) in &entry.attributes {
                 crate::jsdom::apply_html_attribute(replacement, attribute, value);
             }
+            self.register_inline_event_handlers(replacement, &entry.attributes);
             append_parser_child(self.current_parent(), replacement);
             self.stack.push(replacement);
             if let Some(active) = self.active_formatting[index].as_mut() {
@@ -535,8 +536,13 @@ impl StreamingDocumentParser {
         if self.fragment_root.is_some() {
             return Ok(());
         }
+        self.script_host.perform_microtask_checkpoint();
         self.script_host
             .execute_pending_document_scripts(&self.document_url)?;
+        // The parser pauses while the script runs. Deliver mutations and
+        // promise jobs created by that script before tokenization resumes and
+        // inserts the next parser-authored node.
+        self.script_host.perform_microtask_checkpoint();
         self.paused = self.script_host.has_pending_parser_blocking_script();
         Ok(())
     }
@@ -579,27 +585,30 @@ impl StreamingDocumentParser {
         self.leave_foreign_content_for_html_breakout(&name, &attributes);
         match name.as_str() {
             "html" if !has_open_template => {
-                for (attribute, value) in attributes {
-                    crate::jsdom::apply_html_attribute(self.html, &attribute, &value);
+                for (attribute, value) in &attributes {
+                    crate::jsdom::apply_html_attribute(self.html, attribute, value);
                 }
+                self.register_inline_event_handlers(self.html, &attributes);
                 self.stack.clear();
                 self.stack.push(self.html);
                 return Ok(());
             }
             "head" if !has_open_template => {
                 self.section = DocumentInsertionSection::Head;
-                for (attribute, value) in attributes {
-                    crate::jsdom::apply_html_attribute(self.head, &attribute, &value);
+                for (attribute, value) in &attributes {
+                    crate::jsdom::apply_html_attribute(self.head, attribute, value);
                 }
+                self.register_inline_event_handlers(self.head, &attributes);
                 self.stack.clear();
                 self.stack.extend([self.html, self.head]);
                 return Ok(());
             }
             "body" if !has_open_template => {
                 self.enter_body();
-                for (attribute, value) in attributes {
-                    crate::jsdom::apply_html_attribute(self.body, &attribute, &value);
+                for (attribute, value) in &attributes {
+                    crate::jsdom::apply_html_attribute(self.body, attribute, value);
                 }
+                self.register_inline_event_handlers(self.body, &attributes);
                 return Ok(());
             }
             _ => {}
@@ -654,21 +663,45 @@ impl StreamingDocumentParser {
             crate::jsdom::ensure_template_content(element);
         }
         let formatting_attributes = attributes.clone();
-        for (attribute, value) in attributes {
-            if self.sanitize && is_unsafe_fragment_attribute(&attribute, &value) {
+        for (attribute, value) in &attributes {
+            if self.sanitize && is_unsafe_fragment_attribute(attribute, value) {
                 continue;
             }
-            let adjusted_attribute = adjust_foreign_attribute(namespace, &attribute);
+            let adjusted_attribute = adjust_foreign_attribute(namespace, attribute);
             crate::jsdom::apply_html_attribute_ns(
                 element,
                 adjusted_attribute.namespace,
                 adjusted_attribute.qualified_name,
                 adjusted_attribute.prefix,
                 adjusted_attribute.local_name,
-                &value,
+                value,
             );
         }
-        if self.should_foster_parent_element(&name) {
+        if !self.sanitize {
+            self.register_inline_event_handlers(element, &attributes);
+        }
+        let declarative_shadow_root = if namespace == HTML_NAMESPACE && name == "template" {
+            attributes
+                .iter()
+                .find(|(attribute, value)| {
+                    attribute.eq_ignore_ascii_case("shadowrootmode")
+                        && matches!(value.to_ascii_lowercase().as_str(), "open" | "closed")
+                })
+                .map(|(_, mode)| {
+                    crate::jsdom::activate_declarative_shadow_root(
+                        self.current_parent(),
+                        element,
+                        &mode.to_ascii_lowercase(),
+                    )
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if declarative_shadow_root {
+            // A declarative shadow template is consumed by the parser. Its
+            // template contents target is the newly-created shadow root.
+        } else if self.should_foster_parent_element(&name) {
             self.insert_at_foster_parent(element);
         } else {
             append_parser_child(self.current_parent(), element);
@@ -698,6 +731,19 @@ impl StreamingDocumentParser {
             self.script_checkpoint(element)?;
         }
         Ok(())
+    }
+
+    fn register_inline_event_handlers(&self, node: u32, attributes: &[(String, String)]) {
+        for (name, source) in attributes {
+            let Some(event_type) = name
+                .strip_prefix("on")
+                .filter(|event_type| !event_type.is_empty())
+            else {
+                continue;
+            };
+            self.script_host
+                .register_inline_event_handler(node, event_type, source);
+        }
     }
 
     fn prepare_table_context(&mut self, incoming: &str) {
@@ -903,6 +949,7 @@ impl StreamingDocumentParser {
             section: DocumentInsertionSection::Head,
             active_formatting: Vec::new(),
             template_modes: Vec::new(),
+            custom_entities: std::collections::HashMap::new(),
             doctype_seen: false,
             document_mode_locked: false,
             compatibility_mode: DocumentCompatibilityMode::NoQuirks,
@@ -928,6 +975,7 @@ impl StreamingDocumentParser {
             section: DocumentInsertionSection::Body,
             active_formatting: Vec::new(),
             template_modes: Vec::new(),
+            custom_entities: std::collections::HashMap::new(),
             doctype_seen: true,
             document_mode_locked: true,
             compatibility_mode: DocumentCompatibilityMode::NoQuirks,
@@ -980,6 +1028,65 @@ impl StreamingDocumentParser {
         self.parse_errors
     }
 
+    fn register_custom_entities_from_doctype(&mut self, token: &str) {
+        if crate::jsdom::document_value()
+            .get_property("contentType")
+            .to_js_string()
+            != "application/xhtml+xml"
+        {
+            return;
+        }
+        let mut cursor = token;
+        while let Some(entity_start) = cursor.find("<!ENTITY") {
+            let declaration = cursor[entity_start + "<!ENTITY".len()..].trim_start();
+            if declaration.starts_with('%') {
+                cursor = &declaration[1..];
+                continue;
+            }
+            let name_end = declaration
+                .find(char::is_whitespace)
+                .unwrap_or(declaration.len());
+            let name = &declaration[..name_end];
+            let value = declaration[name_end..].trim_start();
+            let Some(quote @ ('\'' | '"')) = value.chars().next() else {
+                cursor = &declaration[name_end..];
+                continue;
+            };
+            let quoted = &value[quote.len_utf8()..];
+            let Some(value_end) = quoted.find(quote) else {
+                break;
+            };
+            if !name.is_empty() {
+                self.custom_entities
+                    .insert(name.to_string(), quoted[..value_end].to_string());
+            }
+            cursor = &quoted[value_end + quote.len_utf8()..];
+        }
+    }
+
+    fn expand_custom_entity_before_markup(&mut self) -> bool {
+        if self.custom_entities.is_empty() {
+            return false;
+        }
+        let text_end = self.buffer.find('<').unwrap_or(self.buffer.len());
+        let text = &self.buffer[..text_end];
+        let replacement = self
+            .custom_entities
+            .iter()
+            .filter_map(|(name, value)| {
+                let entity = format!("&{name};");
+                text.find(&entity)
+                    .map(|offset| (offset, entity.len(), value.clone()))
+            })
+            .min_by_key(|(offset, _, _)| *offset);
+        let Some((offset, entity_len, replacement)) = replacement else {
+            return false;
+        };
+        self.buffer
+            .replace_range(offset..offset + entity_len, &replacement);
+        true
+    }
+
     pub(crate) fn drive(&mut self) -> Result<DocumentParseProgress> {
         if self.complete {
             return Ok(DocumentParseProgress::Complete);
@@ -1018,12 +1125,15 @@ impl StreamingDocumentParser {
                         let text = std::mem::take(&mut self.buffer);
                         self.append_raw_text(&raw_tag, &text);
                         let node = self.stack.pop();
-                        if raw_tag == "script"
-                            && let Some(node) = node
-                        {
-                            self.script_checkpoint(node)?;
-                            if self.paused {
-                                return Ok(DocumentParseProgress::BlockedOnScript);
+                        if let Some(node) = node {
+                            if raw_tag == "style" {
+                                self.script_host
+                                    .finish_parser_style(node, &self.document_url)?;
+                            } else if raw_tag == "script" {
+                                self.script_checkpoint(node)?;
+                                if self.paused {
+                                    return Ok(DocumentParseProgress::BlockedOnScript);
+                                }
                             }
                         }
                         continue;
@@ -1038,14 +1148,21 @@ impl StreamingDocumentParser {
                 self.append_raw_text(&raw_tag, &text);
                 self.buffer.drain(..close_start + relative_end + 1);
                 let node = self.stack.pop();
-                if raw_tag == "script"
-                    && let Some(node) = node
-                {
-                    self.script_checkpoint(node)?;
-                    if self.paused {
-                        return Ok(DocumentParseProgress::BlockedOnScript);
+                if let Some(node) = node {
+                    if raw_tag == "style" {
+                        self.script_host
+                            .finish_parser_style(node, &self.document_url)?;
+                    } else if raw_tag == "script" {
+                        self.script_checkpoint(node)?;
+                        if self.paused {
+                            return Ok(DocumentParseProgress::BlockedOnScript);
+                        }
                     }
                 }
+                continue;
+            }
+
+            if self.expand_custom_entity_before_markup() {
                 continue;
             }
 
@@ -1077,7 +1194,11 @@ impl StreamingDocumentParser {
                 let comment = self.buffer[4..end].to_string();
                 self.buffer.drain(..end + 3);
                 let node = crate::dom::create_comment(&comment);
-                append_parser_child(self.current_parent(), node);
+                if self.fragment_root.is_none() && !self.doctype_seen {
+                    crate::dom::insert_before(0, node, self.html);
+                } else {
+                    append_parser_child(self.current_parent(), node);
+                }
                 continue;
             }
 
@@ -1120,7 +1241,26 @@ impl StreamingDocumentParser {
                 self.handle_doctype(&token);
                 continue;
             }
-            if token.starts_with('!') || token.starts_with('?') {
+            if token.starts_with('?') {
+                let instruction = token
+                    .strip_prefix('?')
+                    .unwrap_or(&token)
+                    .strip_suffix('?')
+                    .unwrap_or_else(|| token.strip_prefix('?').unwrap_or(&token));
+                let split = instruction
+                    .find(char::is_whitespace)
+                    .unwrap_or(instruction.len());
+                let target = &instruction[..split];
+                let data = instruction[split..].trim_start_matches(char::is_whitespace);
+                let node = crate::dom::create_processing_instruction(target, data);
+                if self.fragment_root.is_none() && !self.doctype_seen {
+                    crate::dom::insert_before(0, node, self.html);
+                } else {
+                    append_parser_child(self.current_parent(), node);
+                }
+                continue;
+            }
+            if token.starts_with('!') {
                 self.parse_errors += 1;
                 continue;
             }
@@ -1181,6 +1321,17 @@ impl StreamingDocumentParser {
     fn append_raw_text(&self, tag: &str, text: &str) {
         if matches!(tag, "title" | "textarea") {
             self.append_text_to_current(&crate::jsdom::decode_html_entities(text));
+        } else if matches!(tag, "script" | "style") {
+            let text = strip_cdata_wrapper(text).unwrap_or(text);
+            if crate::jsdom::document_value()
+                .get_property("contentType")
+                .to_js_string()
+                == "application/xhtml+xml"
+            {
+                self.append_text_to_current(&crate::jsdom::decode_html_entities(text));
+            } else {
+                self.append_text_to_current(text);
+            }
         } else {
             self.append_text_to_current(text);
         }
@@ -1227,6 +1378,7 @@ impl StreamingDocumentParser {
             self.parse_errors += 1;
             return;
         }
+        self.register_custom_entities_from_doctype(token);
         let parsed = parse_document_doctype(token);
         if parsed.malformed {
             self.parse_errors += 1;
@@ -1247,6 +1399,10 @@ impl StreamingDocumentParser {
         self.compatibility_mode = DocumentCompatibilityMode::Quirks;
         self.document_mode_locked = true;
     }
+}
+
+fn strip_cdata_wrapper(text: &str) -> Option<&str> {
+    text.trim().strip_prefix("<![CDATA[")?.strip_suffix("]]>")
 }
 
 pub(crate) fn append_html_fragment_with_streaming_parser(
@@ -1495,6 +1651,93 @@ mod tests {
                 )
                 .to_bool()
         );
+    }
+
+    #[test]
+    fn parser_preserves_question_mark_markup_as_processing_instructions() {
+        let (document, parser) =
+            parse_document("<!doctype html><body><p id=target><?processing data?></p>");
+        let instruction = document
+            .call_method("querySelector", vec![Value::string("#target")])
+            .get_property("firstChild");
+        assert_eq!(instruction.get_property("nodeType").to_u32(), 7);
+        assert_eq!(
+            instruction.get_property("target").to_js_string(),
+            "processing"
+        );
+        assert_eq!(instruction.get_property("data").to_js_string(), "data");
+        assert_eq!(parser.parse_error_count(), 0);
+    }
+
+    #[test]
+    fn feature_neutral_parser_unwraps_xhtml_cdata_in_script_and_style() {
+        let (document, _) = parse_document(
+            "<!doctype html><head>\
+             <style id=style><![CDATA[.target { color: green; }]]></style>\
+             <script id=script><![CDATA[const answer = 42;]]></script>\
+             </head>",
+        );
+        let source = |selector: &str| {
+            document
+                .call_method("querySelector", vec![Value::string(selector)])
+                .get_property("textContent")
+                .to_js_string()
+        };
+        assert_eq!(source("#style"), ".target { color: green; }");
+        assert_eq!(source("#script"), "const answer = 42;");
+    }
+
+    #[test]
+    fn xhtml_parser_decodes_entities_in_script_source() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost),
+            "https://example.test/document.xhtml",
+        )
+        .expect("create XHTML parser");
+        parser
+            .write("<html><body><script id='script'>for (let i = 0; i &lt; 2; i++) {}</script></body></html>")
+            .expect("write XHTML");
+        assert_eq!(
+            parser.finish().expect("finish XHTML"),
+            DocumentParseProgress::Complete
+        );
+        let script = crate::jsdom::document_value()
+            .call_method("querySelector", vec![Value::string("#script")]);
+        assert_eq!(
+            script.get_property("textContent").to_js_string(),
+            "for (let i = 0; i < 2; i++) {}"
+        );
+    }
+
+    #[test]
+    fn xhtml_parser_expands_internal_general_entities_as_markup() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost),
+            "https://example.test/document.xhtml",
+        )
+        .expect("create XHTML parser");
+        parser
+            .write(
+                "<!DOCTYPE html [<!ENTITY tree \"<span id='leaf'>value</span>\">]><html><body><p id='parent'>&tree;</p></body></html>",
+            )
+            .expect("write XHTML entity document");
+        assert_eq!(
+            parser.finish().expect("finish XHTML"),
+            DocumentParseProgress::Complete
+        );
+        let parent = crate::jsdom::document_value()
+            .call_method("getElementById", vec![Value::string("parent")]);
+        let child = parent.get_property("firstElementChild");
+        assert_eq!(child.get_property("id").to_js_string(), "leaf");
+        assert_eq!(child.get_property("textContent").to_js_string(), "value");
     }
 
     #[test]

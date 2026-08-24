@@ -21,9 +21,12 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
     // component ergonomics, so the HTML user-agent origin owns this correction.
     style.flex_direction = FlexDirection::Row;
     style.display = match local_name {
-        "a" | "abbr" | "b" | "code" | "em" | "i" | "img" | "label" | "small" | "span"
-        | "strong" => Display::Inline,
-        "button" | "input" | "select" | "textarea" => Display::InlineBlock,
+        "base" | "head" | "link" | "meta" | "noembed" | "noframes" | "param" | "script"
+        | "style" | "template" | "title" => Display::None,
+        "a" | "abbr" | "b" | "code" | "em" | "i" | "label" | "small" | "span" | "strong" => {
+            Display::Inline
+        }
+        "button" | "img" | "input" | "select" | "textarea" => Display::InlineBlock,
         _ => Display::Block,
     };
 
@@ -99,5 +102,9 @@ mod tests {
         assert_eq!(html_default_style("div").display, Display::Block);
         assert_eq!(html_default_style("div").flex_direction, FlexDirection::Row);
         assert_eq!(html_default_style("span").display, Display::Inline);
+        assert_eq!(html_default_style("img").display, Display::InlineBlock);
+        assert_eq!(html_default_style("script").display, Display::None);
+        assert_eq!(html_default_style("style").display, Display::None);
+        assert_eq!(html_default_style("head").display, Display::None);
     }
 }

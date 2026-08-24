@@ -3,6 +3,29 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::safe_area::{SafeAreaEdge, SafeAreaInsets};
 
+/// Resolve CSS absolute lengths to canonical CSS pixels (96 px per inch).
+/// Unitless values remain accepted for the runtime's existing native-style
+/// compatibility; CSS declaration validation decides where only zero is legal.
+pub fn parse_absolute_length_px(value: &str) -> Option<f32> {
+    let value = value.trim();
+    for (suffix, pixels_per_unit) in [
+        ("px", 1.0_f32),
+        ("cm", 96.0 / 2.54),
+        ("mm", 96.0 / 25.4),
+        ("q", 96.0 / 101.6),
+        ("in", 96.0),
+        ("pt", 96.0 / 72.0),
+        ("pc", 16.0),
+    ] {
+        if let Some(number) = value.strip_suffix(suffix)
+            && let Ok(number) = number.trim().parse::<f32>()
+        {
+            return Some(number * pixels_per_unit);
+        }
+    }
+    value.parse().ok()
+}
+
 /// CSS Modern Subset — Flexbox, Grid, Block, Inline, and positioning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Style {
@@ -579,6 +602,7 @@ pub enum Display {
     Inline,
     InlineBlock,
     InlineFlex,
+    Contents,
     None,
 }
 
@@ -1098,6 +1122,16 @@ pub enum Easing {
     EaseOut,
     EaseInOut,
     CubicBezier(f32, f32, f32, f32),
+    Steps(u32, StepPosition),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StepPosition {
+    JumpStart,
+    #[default]
+    JumpEnd,
+    JumpNone,
+    JumpBoth,
 }
 
 impl Easing {
@@ -1110,6 +1144,23 @@ impl Easing {
             Easing::EaseOut => cubic_bezier(0.0, 0.0, 0.58, 1.0, t),
             Easing::EaseInOut => cubic_bezier(0.42, 0.0, 0.58, 1.0, t),
             Easing::CubicBezier(x1, y1, x2, y2) => cubic_bezier(*x1, *y1, *x2, *y2, t),
+            Easing::Steps(steps, position) => {
+                let steps = (*steps).max(1) as f32;
+                match position {
+                    StepPosition::JumpStart => ((t * steps).floor() + 1.0).min(steps) / steps,
+                    StepPosition::JumpEnd => (t * steps).floor() / steps,
+                    StepPosition::JumpNone => {
+                        if steps <= 1.0 {
+                            t
+                        } else {
+                            ((t * steps).floor()).min(steps - 1.0) / (steps - 1.0)
+                        }
+                    }
+                    StepPosition::JumpBoth => {
+                        ((t * steps).floor() + 1.0).min(steps + 1.0) / (steps + 1.0)
+                    }
+                }
+            }
         }
     }
 }
@@ -1161,6 +1212,14 @@ mod easing_tests {
         assert!((midpoint - 0.802).abs() < 0.002, "midpoint={midpoint}");
         assert_eq!(Easing::Ease.interpolate(0.0), 0.0);
         assert_eq!(Easing::Ease.interpolate(1.0), 1.0);
+    }
+
+    #[test]
+    fn css_steps_jump_both_has_the_extra_midpoint_step() {
+        assert_eq!(
+            Easing::Steps(1, super::StepPosition::JumpBoth).interpolate(0.25),
+            0.5
+        );
     }
 }
 

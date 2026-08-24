@@ -29,6 +29,33 @@
       "expected_subtests_min": 1
     },
     {
+      "path": "dom/nodes/Element-hasAttribute.html",
+      "kind": "testharness",
+      "expected_subtests_min": 2
+    },
+    {
+      "path": "dom/nodes/Element-removeAttribute.html",
+      "kind": "testharness",
+      "expected_subtests_min": 2
+    },
+    {
+      "path": "dom/nodes/ParentNode-querySelectors-space-and-dash-attribute-value.html",
+      "kind": "testharness",
+      "expected_subtests_min": 2
+    },
+    {
+      "path": "css/CSS2/cascade/inherit-computed-001.html",
+      "kind": "reftest",
+      "reference": "css/CSS2/cascade/inherit-computed-001-ref.html",
+      "relation": "match"
+    },
+    {
+      "path": "css/CSS2/box-display/block-in-inline-with-padded-parent.html",
+      "kind": "reftest",
+      "reference": "css/CSS2/box-display/block-in-inline-with-padded-parent-ref.html",
+      "relation": "match"
+    },
+    {
       "path": "css/CSS2/stacking-context/opacity-affects-block-in-inline.html",
       "kind": "reftest",
       "reference": "css/CSS2/stacking-context/opacity-affects-block-in-inline-ref.html",

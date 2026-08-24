@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const FORMAT_VERSION: u32 = 17;
+pub const FORMAT_VERSION: u32 = 19;
 
 macro_rules! id {
     ($name:ident) => {
@@ -167,6 +167,7 @@ pub enum Instruction {
         object: Register,
         key: Register,
         value: Register,
+        strict: bool,
     },
     /// Defines an own data property without invoking an inherited setter.
     /// Class field initializers use ECMAScript `[[Define]]`, not `[[Set]]`.
@@ -802,7 +803,12 @@ fn registers(instruction: &Instruction) -> Vec<Register> {
         Instruction::Unary { dst, value, .. } => vec![*dst, *value],
         Instruction::GetProperty { dst, object, key }
         | Instruction::DeleteProperty { dst, object, key } => vec![*dst, *object, *key],
-        Instruction::SetProperty { object, key, value }
+        Instruction::SetProperty {
+            object,
+            key,
+            value,
+            ..
+        }
         | Instruction::DefineField { object, key, value } => vec![*object, *key, *value],
         Instruction::DefinePrivate {
             object,

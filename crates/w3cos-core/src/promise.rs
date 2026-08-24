@@ -219,9 +219,13 @@ fn schedule_reaction(reaction: Reaction, is_fulfilled: bool, value: Value) {
         run_reaction(&reaction, is_fulfilled, value.clone());
         Value::Undefined
     });
+    queue_microtask_for_generation(job, realm_generation);
+}
+
+fn queue_microtask_for_generation(callback: Value, realm_generation: u64) {
     PROMISE_MICROTASKS.with(|queue| {
         queue.borrow_mut().push(MicrotaskJob {
-            callback: job,
+            callback,
             realm_generation,
         })
     });
@@ -484,6 +488,16 @@ pub fn race(args: Vec<Value>) -> Value {
 
 // ── Microtask queue ────────────────────────────────────────────────────
 
+/// Enqueue a host or JavaScript microtask in the same FIFO used by Promise
+/// reactions. Browsers expose one microtask queue, so embedder jobs such as
+/// MutationObserver delivery must not be drained in a separate phase.
+pub fn queue_microtask(callback: Value) {
+    if callback.is_function() {
+        let realm_generation = MICROTASK_REALM_GENERATION.with(Cell::get);
+        queue_microtask_for_generation(callback, realm_generation);
+    }
+}
+
 /// Run every queued reaction job until the queue is empty (jobs may
 /// enqueue more jobs). Returns the number of jobs run. Panics crossing a
 /// job boundary are contained so one bad job cannot abort the drain.
@@ -634,6 +648,35 @@ mod tests {
         // Each level is one reaction job; jobs enqueue the next level.
         assert_eq!(drain_microtasks(), 3);
         assert_eq!(log.borrow().as_slice(), &["3".to_string()]);
+    }
+
+    #[test]
+    fn host_microtasks_share_fifo_order_with_promise_reactions() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let before_log = Rc::clone(&log);
+        queue_microtask(Value::function(move |_, _| {
+            before_log.borrow_mut().push("host-before".to_string());
+            Value::Undefined
+        }));
+        let promise_log = Rc::clone(&log);
+        resolve(vec![]).call_method(
+            "then",
+            vec![Value::function(move |_, _| {
+                promise_log.borrow_mut().push("promise".to_string());
+                Value::Undefined
+            })],
+        );
+        let after_log = Rc::clone(&log);
+        queue_microtask(Value::function(move |_, _| {
+            after_log.borrow_mut().push("host-after".to_string());
+            Value::Undefined
+        }));
+
+        assert_eq!(drain_microtasks(), 3);
+        assert_eq!(
+            log.borrow().as_slice(),
+            &["host-before", "promise", "host-after"]
+        );
     }
 
     #[test]

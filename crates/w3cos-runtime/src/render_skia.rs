@@ -46,7 +46,9 @@ thread_local! {
         }
         #[cfg(not(test))]
         {
-            host_typeface().expect("host Skia font")
+            host_typeface()
+                .or_else(|| primary_typeface(include_bytes!("../assets/Inter-Regular.ttf")))
+                .expect("embedded Skia fallback font")
         }
     };
     static SKIA_IMAGE_UPLOADS: Cell<u64> = const { Cell::new(0) };
@@ -893,7 +895,7 @@ fn render_node(
             ..
         } => {
             if let Some(raster) = crate::svg_renderer::get_or_render(source, *width, *height) {
-                draw_decoded_image(canvas, rect, &raster, style.opacity);
+                draw_decoded_image(canvas, rect, &raster, style.opacity, true);
             }
         }
         ComponentKind::Root
@@ -982,10 +984,20 @@ fn effect_path(
 }
 
 fn draw_image(canvas: &Canvas, rect: LayoutRect, src: &str, opacity: f32) {
+    draw_image_with_edge_antialiasing(canvas, rect, src, opacity, true);
+}
+
+fn draw_image_with_edge_antialiasing(
+    canvas: &Canvas,
+    rect: LayoutRect,
+    src: &str,
+    opacity: f32,
+    anti_alias: bool,
+) {
     let Some(decoded) = crate::image_loader::get_or_load(src) else {
         return;
     };
-    draw_decoded_image(canvas, rect, &decoded, opacity);
+    draw_decoded_image(canvas, rect, &decoded, opacity, anti_alias);
 }
 
 fn draw_decoded_image(
@@ -993,12 +1005,13 @@ fn draw_decoded_image(
     rect: LayoutRect,
     decoded: &crate::image_loader::DecodedImage,
     opacity: f32,
+    anti_alias: bool,
 ) {
     let Some(image) = cached_skia_image(decoded) else {
         return;
     };
     let mut paint = Paint::default();
-    paint.set_anti_alias(true);
+    paint.set_anti_alias(anti_alias);
     paint.set_alpha_f(opacity.clamp(0.0, 1.0));
     canvas.draw_image_rect(image, None, to_rect(rect), &paint);
 }
@@ -1016,7 +1029,7 @@ fn draw_canvas(canvas: &Canvas, client_index: usize, rect: LayoutRect, opacity: 
         intrinsic_height: snapshot.height,
         data: snapshot.pixels,
     };
-    draw_decoded_image(canvas, rect, &decoded, opacity);
+    draw_decoded_image(canvas, rect, &decoded, opacity, true);
 }
 
 
@@ -1574,11 +1587,18 @@ fn draw_background_image(
             crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.geometry.clip,
         };
         let save = canvas.save();
-        canvas.clip_rrect(
-            RRect::new_rect_xy(to_rect(clip.rect), clip.radius, clip.radius),
-            None,
-            Some(true),
-        );
+        if clip.radius > 0.0 {
+            canvas.clip_rrect(
+                RRect::new_rect_xy(to_rect(clip.rect), clip.radius, clip.radius),
+                None,
+                Some(true),
+            );
+        } else {
+            // Skia's zero-radius RRect clip uses subtly different coverage
+            // from a CSS rectangle. Use the rectangular primitive so raster
+            // backgrounds and solid/image reference boxes share exact edges.
+            canvas.clip_rect(to_rect(clip.rect), None, Some(true));
+        }
         let blend_mode = match &layer {
             crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.blend_mode,
             crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.blend_mode,
@@ -1591,7 +1611,16 @@ fn draw_background_image(
         match layer {
             crate::background_image::BackgroundPaintLayer::Raster(layer) => {
                 for tile in &layer.tiles {
-                    draw_image(canvas, *tile, &layer.source, opacity);
+                    // The background painting area owns edge coverage. Keeping
+                    // tile edges non-AA avoids double-blended outer edges and
+                    // seams between repeated tiles.
+                    draw_image_with_edge_antialiasing(
+                        canvas,
+                        *tile,
+                        &layer.source,
+                        opacity,
+                        false,
+                    );
                 }
             }
             crate::background_image::BackgroundPaintLayer::Gradient(layer) => {

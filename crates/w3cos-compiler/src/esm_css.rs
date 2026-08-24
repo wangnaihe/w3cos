@@ -220,6 +220,12 @@ fn finish_raw_rules(
     let mut unresolved_vars: Vec<String> = Vec::new();
     let mut literal_calcs: Vec<String> = Vec::new();
     for rule in raw_rules {
+        // CSS 2.1 invalidates an entire selector list when any member is
+        // syntactically invalid. Validate before flattening the comma group,
+        // otherwise a valid sibling selector would be applied on its own.
+        if !selector_list_is_syntactically_valid(&rule.selectors) {
+            continue;
+        }
         let declarations: Vec<(String, String)> = rule
             .declarations
             .iter()
@@ -260,6 +266,61 @@ fn finish_raw_rules(
     for value in literal_calcs.iter().take(20) {
         out.warn(format!("css: non-px calc() kept literal: {value}"));
     }
+}
+
+fn selector_list_is_syntactically_valid(selectors: &str) -> bool {
+    split_selector_group(selectors)
+        .iter()
+        .all(|selector| selector_is_syntactically_valid(selector))
+}
+
+fn selector_is_syntactically_valid(selector: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() || selector.starts_with(|character: char| character.is_ascii_digit()) {
+        return false;
+    }
+    let bytes = selector.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'[' {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor + 1;
+        let mut quote = None;
+        cursor = start;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'\'' | b'"' if quote == Some(bytes[cursor]) => quote = None,
+                b'\'' | b'"' if quote.is_none() => quote = Some(bytes[cursor]),
+                b']' if quote.is_none() => break,
+                _ => {}
+            }
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || quote.is_some() {
+            return false;
+        }
+        let expression = selector[start..cursor].trim();
+        if expression.is_empty() {
+            return false;
+        }
+        let operator = ["~=", "|=", "^=", "$=", "*=", "="]
+            .into_iter()
+            .find_map(|operator| expression.split_once(operator));
+        let (name, value) = operator.map_or((expression, None), |(name, value)| {
+            (name, Some(value.trim()))
+        });
+        let name = name.trim();
+        if name.starts_with(|character: char| character.is_ascii_digit()) {
+            return false;
+        }
+        if value.is_some_and(str::is_empty) {
+            return false;
+        }
+        cursor += 1;
+    }
+    true
 }
 
 /// A raw parsed rule: unsplit selector group + unprocessed declarations.
@@ -467,10 +528,15 @@ fn parse_at_rule(
             );
         }
         "container" => {
-            if container_query_matches_mobile_viewport(&prelude) {
-                parse_block_into(
-                    block_str, path, warnings, rules, imports, font_faces, media, false,
-                );
+            let first_nested_rule = rules.len();
+            parse_block_into(
+                block_str, path, warnings, rules, imports, font_faces, media, false,
+            );
+            for rule in &mut rules[first_nested_rule..] {
+                rule.declarations.push((
+                    "__w3cos_container_query".to_string(),
+                    prelude.clone(),
+                ));
             }
         }
         "font-face" => {
@@ -487,42 +553,6 @@ fn parse_at_rule(
         _ => {}
     }
     (pos, false)
-}
-
-fn container_query_matches_mobile_viewport(prelude: &str) -> bool {
-    const VIEWPORT_WIDTH: f32 = 402.0;
-    const VIEWPORT_HEIGHT: f32 = 874.0;
-
-    let conditions = prelude
-        .split(" and ")
-        .map(|part| {
-            let condition = part
-                .trim()
-                .trim_start_matches(|character| character != '(')
-                .trim_matches(|character| character == '(' || character == ')');
-            let (feature, value) = condition.split_once(':')?;
-            let value = value.trim();
-            let length = value
-                .strip_suffix("rem")
-                .and_then(|value| value.trim().parse::<f32>().ok())
-                .map(|value| value * 16.0)
-                .or_else(|| {
-                    value
-                        .strip_suffix("px")
-                        .and_then(|value| value.trim().parse::<f32>().ok())
-                })?;
-            Some(match feature.trim() {
-                "min-width" => VIEWPORT_WIDTH >= length,
-                "max-width" => VIEWPORT_WIDTH <= length,
-                "min-height" => VIEWPORT_HEIGHT >= length,
-                "max-height" => VIEWPORT_HEIGHT <= length,
-                _ => false,
-            })
-        })
-        .collect::<Option<Vec<_>>>();
-    conditions.is_some_and(|conditions| {
-        !conditions.is_empty() && conditions.into_iter().all(|matches| matches)
-    })
 }
 
 fn parse_import_prelude(prelude: &str) -> Option<StylesheetImport> {
@@ -874,6 +904,24 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_selector_member_discards_complete_css_rule() {
+        let sheet = parse_css_source(
+            "[1digit], div { color: red; } [title~=], p.valid { color: red; }",
+            "invalid.css",
+        );
+        assert!(sheet.rules.is_empty());
+    }
+
+    #[test]
+    fn quoted_empty_attribute_value_remains_valid() {
+        let sheet = parse_css_source(
+            "[title~=\"\"], p.valid { color: green; }",
+            "empty-token.css",
+        );
+        assert_eq!(sheet.rules.len(), 2);
+    }
     use crate::esm_resolver::EsmResolver;
 
     fn write_fixture(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
@@ -1141,14 +1189,31 @@ mod tests {
             }",
             "container.css",
         );
-        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules[0].selector, ".wide");
         assert_eq!(
-            sheet.rules[0].selector,
+            sheet.rules[0].declarations,
+            vec![
+                ("grid-template-columns".to_string(), "1fr 1fr".to_string()),
+                (
+                    "__w3cos_container_query".to_string(),
+                    "semantic-surface (min-width: 44rem)".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            sheet.rules[1].selector,
             ".semantic-grid[data-collapse='auto']"
         );
         assert_eq!(
-            sheet.rules[0].declarations,
-            vec![("--semantic-grid-columns".to_string(), "1".to_string())]
+            sheet.rules[1].declarations,
+            vec![
+                ("--semantic-grid-columns".to_string(), "1".to_string()),
+                (
+                    "__w3cos_container_query".to_string(),
+                    "semantic-surface (max-width: 30rem)".to_string(),
+                ),
+            ]
         );
     }
 

@@ -13,7 +13,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use w3cos_core::Value;
-use w3cos_vm::{Limits, Vm, binding_cell, external_binding_cell};
+use w3cos_vm::{
+    Limits, Vm, binding_cell, external_binding_cell, uninitialized_binding_cell,
+};
 
 use crate::worker::{WorkerEvent, WorkerScope};
 
@@ -85,33 +87,40 @@ fn run_dedicated_worker_inner(
     ]));
     let mut cells = HashMap::new();
     for import in &module.imports {
-        if import.specifier != "w3cos:global" {
+        if import.specifier != "w3cos:global"
+            && import.specifier != "w3cos:classic-global"
+            && import.specifier != "w3cos:classic-lexical"
+        {
             return Err(format!(
                 "dedicated worker scripts cannot import {}",
                 import.specifier
             ));
         }
-        let cell = match import.imported.as_str() {
-            "onmessage" => {
-                let getter_self = self_obj.clone();
-                let setter_self = self_obj.clone();
-                external_binding_cell(
-                    Value::function(move |_, _| getter_self.get_property("onmessage")),
-                    Value::function(move |_, args| {
-                        setter_self.set_property(
-                            "onmessage",
-                            args.first().cloned().unwrap_or(Value::Null),
-                        );
-                        Value::Undefined
-                    }),
-                )
+        let cell = if import.specifier == "w3cos:classic-lexical" {
+            uninitialized_binding_cell()
+        } else {
+            match import.imported.as_str() {
+                "onmessage" => {
+                    let getter_self = self_obj.clone();
+                    let setter_self = self_obj.clone();
+                    external_binding_cell(
+                        Value::function(move |_, _| getter_self.get_property("onmessage")),
+                        Value::function(move |_, args| {
+                            setter_self.set_property(
+                                "onmessage",
+                                args.first().cloned().unwrap_or(Value::Null),
+                            );
+                            Value::Undefined
+                        }),
+                    )
+                }
+                imported => binding_cell(resolve_worker_global(
+                    imported,
+                    &self_obj,
+                    &post_message,
+                    &close,
+                )),
             }
-            imported => binding_cell(resolve_worker_global(
-                imported,
-                &self_obj,
-                &post_message,
-                &close,
-            )),
         };
         cells.insert(import.local, cell);
     }

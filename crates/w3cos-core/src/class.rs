@@ -135,7 +135,19 @@ pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
     if crate::binary::typed_array_instance_of(obj, class_value) {
         return true;
     }
-    let Some(target) = class_value.get_property("prototype").as_object() else {
+    // Ordinary JavaScript closures are represented by `Value::Function`, not
+    // `JsObject`, so they do not participate in the object prototype walk
+    // below.  They are nevertheless Function instances in JavaScript.  Keep
+    // the recognition tied to the intrinsic constructor's self-referential
+    // prototype shape rather than accepting any callable named `Function`.
+    let prototype = class_value.get_property("prototype");
+    let is_function_constructor = class_value.is_function()
+        && class_value.get_property("name").to_js_string() == "Function"
+        && prototype.get_property("constructor") == *class_value;
+    if is_function_constructor && obj.is_callable() {
+        return true;
+    }
+    let Some(target) = prototype.as_object() else {
         return false;
     };
     let Some(object) = obj.as_object() else {

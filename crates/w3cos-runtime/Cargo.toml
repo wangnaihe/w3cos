@@ -48,6 +48,7 @@ fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 anyhow = { workspace = true }
 image = { workspace = true }
 flate2 = { workspace = true }
+encoding_rs = { workspace = true }
 wuff = { workspace = true, optional = true }
 resvg = { workspace = true }
 serde = { workspace = true }

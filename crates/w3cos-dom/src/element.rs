@@ -55,16 +55,19 @@ impl Element {
             return;
         }
         let atom_name = Atom::intern(name);
-        let node = doc.get_node_mut(self.id);
-        node.attribute_namespaces
-            .retain(|attribute| attribute.qualified_name != atom_name);
-        if let Some(attr) = node.attributes.iter_mut().find(|(k, _)| *k == atom_name) {
+        let existing_index = doc
+            .get_node(self.id)
+            .attributes
+            .iter()
+            .position(|(key, _)| *key == atom_name);
+        if let Some(existing_index) = existing_index {
+            let old_value = doc.get_node(self.id).attributes[existing_index].1.clone();
+            let node = doc.get_node_mut(self.id);
             if name == "id" {
-                let old_val = attr.1.clone();
-                attr.1 = value.to_string();
-                doc.update_id_index(self.id, Some(&old_val), value);
+                node.attributes[existing_index].1 = value.to_string();
+                doc.update_id_index(self.id, Some(&old_value), value);
             } else {
-                attr.1 = value.to_string();
+                node.attributes[existing_index].1 = value.to_string();
             }
         } else {
             let node = doc.get_node_mut(self.id);
@@ -85,6 +88,9 @@ impl Element {
         local_name: &str,
         value: &str,
     ) {
+        let old_id = (namespace.is_none() && local_name == "id")
+            .then(|| self.get_attribute_ns(doc, None, "id").map(str::to_string))
+            .flatten();
         doc.get_node_mut(self.id).set_attribute_ns(
             namespace,
             qualified_name,
@@ -92,6 +98,21 @@ impl Element {
             local_name,
             value,
         );
+        if namespace.is_none() && local_name == "id" {
+            doc.update_id_index(self.id, old_id.as_deref(), value);
+        }
+        if namespace.is_none() && local_name.eq_ignore_ascii_case("class") {
+            let old_classes = std::mem::take(&mut doc.get_node_mut(self.id).class_list);
+            for class in old_classes {
+                doc.remove_from_class_index(self.id, &class);
+            }
+            for class in value
+                .split([' ', '\t', '\n', '\r', '\x0c'])
+                .filter(|class| !class.is_empty())
+            {
+                self.class_list_add(doc, class);
+            }
+        }
         doc.mark_dirty(self.id);
     }
 
@@ -121,11 +142,8 @@ impl Element {
                 doc.remove_from_class_index(self.id, &class);
             }
         }
-        let atom_name = Atom::intern(name);
         let node = doc.get_node_mut(self.id);
-        node.attributes.retain(|(k, _)| *k != atom_name);
-        node.attribute_namespaces
-            .retain(|attribute| attribute.qualified_name != atom_name);
+        node.remove_attribute(name);
         doc.mark_dirty(self.id);
     }
 
@@ -298,13 +316,21 @@ impl Element {
     pub fn set_class_name(&self, doc: &mut Document, name: &str) {
         let node = doc.get_node_mut(self.id);
         let class_attr = Atom::intern("class");
-        node.attribute_namespaces
-            .retain(|attribute| attribute.qualified_name != class_attr);
+        if let Some(index) = node
+            .attributes
+            .iter()
+            .position(|(name, _)| *name == class_attr)
+        {
+            node.clear_attribute_namespace(index);
+        }
         let old_classes: Vec<Atom> = std::mem::take(&mut node.class_list);
         for class in old_classes {
             doc.remove_from_class_index(self.id, &class);
         }
-        for class in name.split_whitespace() {
+        for class in name
+            .split([' ', '\t', '\n', '\r', '\x0c'])
+            .filter(|class| !class.is_empty())
+        {
             self.class_list_add(doc, class);
         }
         let node = doc.get_node_mut(self.id);
@@ -498,7 +524,7 @@ impl Element {
                     out.push(' ');
                     out.push_str(&k.as_str());
                     out.push_str("=\"");
-                    out.push_str(v);
+                    push_html_attribute_escaped(out, v);
                     out.push('"');
                 }
                 if !node.class_list.is_empty() {
@@ -531,6 +557,18 @@ impl Element {
                     child = doc.get_node(child_id).next_sibling;
                 }
             }
+        }
+    }
+}
+
+fn push_html_attribute_escaped(out: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            character => out.push(character),
         }
     }
 }

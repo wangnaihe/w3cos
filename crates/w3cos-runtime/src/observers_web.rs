@@ -1,6 +1,6 @@
 //! Browser-facing observer constructors.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Once;
@@ -19,6 +19,7 @@ thread_local! {
     static MUTATION_RECORD_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static MUTATION_OBSERVERS: RefCell<Vec<Rc<RefCell<MutationObserverState>>>> =
         const { RefCell::new(Vec::new()) };
+    static MUTATION_NOTIFICATIONS_SUPPRESSED: Cell<u32> = const { Cell::new(0) };
     static INTERSECTION_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static INTERSECTION_ENTRY_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static INTERSECTION_OBSERVERS: RefCell<Vec<Rc<RefCell<IntersectionObserverState>>>> =
@@ -39,6 +40,24 @@ thread_local! {
     static PERFORMANCE_ENTRIES: RefCell<Vec<PerformanceEntry>> = const { RefCell::new(Vec::new()) };
     static PERFORMANCE_OBSERVERS: RefCell<Vec<Rc<RefCell<PerformanceObserverState>>>> =
         const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn with_mutation_notifications_suppressed<R>(operation: impl FnOnce() -> R) -> R {
+    struct SuppressionGuard;
+
+    impl Drop for SuppressionGuard {
+        fn drop(&mut self) {
+            MUTATION_NOTIFICATIONS_SUPPRESSED.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+
+    MUTATION_NOTIFICATIONS_SUPPRESSED.with(|depth| depth.set(depth.get() + 1));
+    let _guard = SuppressionGuard;
+    operation()
+}
+
+fn mutation_notifications_suppressed() -> bool {
+    MUTATION_NOTIFICATIONS_SUPPRESSED.with(|depth| depth.get() > 0)
 }
 
 fn navigation_diagnostic_members(name: &str) -> &'static [&'static str] {
@@ -723,7 +742,7 @@ pub fn mutation_observer_class() -> Value {
                 w3cos_core::throw_value(w3cos_core::error_instance(
                     "TypeError",
                     vec![Value::string(
-                        "PerformanceObserver callback must be a function",
+                        "MutationObserver callback must be a function",
                     )],
                 ));
             }
@@ -746,35 +765,75 @@ pub fn mutation_observer_class() -> Value {
                     let Some(target) = crate::jsdom::node_id_of(&target_value).or_else(|| {
                         (target_value == crate::jsdom::document_value()).then_some(0)
                     }) else {
-                        w3cos_core::throw_value(Value::object(HashMap::from([
-                            ("name".to_string(), Value::string("TypeError")),
-                            (
-                                "message".to_string(),
-                                Value::string("MutationObserver.observe target must be a Node"),
-                            ),
-                        ])));
+                        w3cos_core::throw_value(w3cos_core::error_instance(
+                            "TypeError",
+                            vec![Value::string(
+                                "MutationObserver.observe target must be a Node",
+                            )],
+                        ));
                     };
                     let options = args.get(1).cloned().unwrap_or_default();
                     let attribute_filter = options.get_property("attributeFilter");
-                    let attribute_old_value = options.get_property("attributeOldValue").to_bool();
-                    let character_data_old_value =
-                        options.get_property("characterDataOldValue").to_bool();
-                    let attributes = options.get_property("attributes").to_bool()
-                        || attribute_old_value
-                        || !attribute_filter.is_undefined();
-                    let character_data = options.get_property("characterData").to_bool()
-                        || character_data_old_value;
+                    let attribute_filter_present = !attribute_filter.is_undefined();
+                    let attribute_old_value_value = options.get_property("attributeOldValue");
+                    let attribute_old_value_present = options
+                        .as_object()
+                        .is_some_and(|object| object.borrow().has("attributeOldValue"));
+                    let attribute_old_value = attribute_old_value_value.to_bool();
+                    let character_data_old_value_value =
+                        options.get_property("characterDataOldValue");
+                    let character_data_old_value_present = options
+                        .as_object()
+                        .is_some_and(|object| object.borrow().has("characterDataOldValue"));
+                    let character_data_old_value = character_data_old_value_value.to_bool();
+                    let attributes_value = options.get_property("attributes");
+                    let attributes_present = options
+                        .as_object()
+                        .is_some_and(|object| object.borrow().has("attributes"));
+                    let character_data_value = options.get_property("characterData");
+                    let character_data_present = options
+                        .as_object()
+                        .is_some_and(|object| object.borrow().has("characterData"));
+                    if attributes_present
+                        && !attributes_value.to_bool()
+                        && (attribute_old_value_present || attribute_filter_present)
+                    {
+                        w3cos_core::throw_value(w3cos_core::error_instance(
+                            "TypeError",
+                            vec![Value::string(
+                                "MutationObserver attributes cannot be false when attributeOldValue or attributeFilter is present",
+                            )],
+                        ));
+                    }
+                    if character_data_present
+                        && !character_data_value.to_bool()
+                        && character_data_old_value_present
+                    {
+                        w3cos_core::throw_value(w3cos_core::error_instance(
+                            "TypeError",
+                            vec![Value::string(
+                                "MutationObserver characterData cannot be false when characterDataOldValue is present",
+                            )],
+                        ));
+                    }
+                    let attributes = if attributes_present {
+                        attributes_value.to_bool()
+                    } else {
+                        attribute_old_value_present || attribute_filter_present
+                    };
+                    let character_data = if character_data_present {
+                        character_data_value.to_bool()
+                    } else {
+                        character_data_old_value_present
+                    };
                     let child_list = options.get_property("childList").to_bool();
                     if !attributes && !character_data && !child_list {
-                        w3cos_core::throw_value(Value::object(HashMap::from([
-                            ("name".to_string(), Value::string("TypeError")),
-                            (
-                                "message".to_string(),
-                                Value::string(
-                                    "MutationObserver options must enable at least one mutation type",
-                                ),
-                            ),
-                        ])));
+                        w3cos_core::throw_value(w3cos_core::error_instance(
+                            "TypeError",
+                            vec![Value::string(
+                                "MutationObserver options must enable at least one mutation type",
+                            )],
+                        ));
                     }
                     let observation = MutationObservation {
                         target,
@@ -879,7 +938,11 @@ fn schedule_mutation_delivery(state: &Rc<RefCell<MutationObserverState>>) {
                 std::mem::take(&mut state.pending),
             )
         };
-        callback.call(Value::Undefined, vec![Value::array(records), observer]);
+        if let Err(exception) = w3cos_core::catch_js(|| {
+            callback.call(observer.clone(), vec![Value::array(records), observer])
+        }) {
+            crate::jsdom::report_callback_exception(&callback, exception);
+        }
         Value::Undefined
     }));
 }
@@ -892,6 +955,7 @@ fn mutation_record(
     previous_sibling: Option<u32>,
     next_sibling: Option<u32>,
     attribute_name: Option<&str>,
+    attribute_namespace: Option<&str>,
     old_value: Option<&str>,
 ) -> Value {
     let value = Value::object(HashMap::from([
@@ -933,7 +997,12 @@ fn mutation_record(
             "attributeName".to_string(),
             attribute_name.map(Value::string).unwrap_or(Value::Null),
         ),
-        ("attributeNamespace".to_string(), Value::Null),
+        (
+            "attributeNamespace".to_string(),
+            attribute_namespace
+                .map(Value::string)
+                .unwrap_or(Value::Null),
+        ),
         (
             "oldValue".to_string(),
             old_value.map(Value::string).unwrap_or(Value::Null),
@@ -950,6 +1019,9 @@ pub fn notify_child_list(
     previous_sibling: Option<u32>,
     next_sibling: Option<u32>,
 ) {
+    if mutation_notifications_suppressed() {
+        return;
+    }
     MUTATION_OBSERVERS.with(|observers| {
         for state in observers.borrow().iter() {
             let matches = state.borrow().observations.iter().any(|observation| {
@@ -965,6 +1037,7 @@ pub fn notify_child_list(
                     next_sibling,
                     None,
                     None,
+                    None,
                 ));
                 schedule_mutation_delivery(state);
             }
@@ -973,6 +1046,18 @@ pub fn notify_child_list(
 }
 
 pub fn notify_attribute(target: u32, name: &str, old_value: Option<&str>) {
+    notify_attribute_ns(target, name, None, old_value);
+}
+
+pub fn notify_attribute_ns(
+    target: u32,
+    local_name: &str,
+    namespace: Option<&str>,
+    old_value: Option<&str>,
+) {
+    if mutation_notifications_suppressed() {
+        return;
+    }
     MUTATION_OBSERVERS.with(|observers| {
         for state in observers.borrow().iter() {
             let include_old_value = state
@@ -985,7 +1070,7 @@ pub fn notify_attribute(target: u32, name: &str, old_value: Option<&str>) {
                         && observation
                             .attribute_filter
                             .as_ref()
-                            .is_none_or(|filter| filter.contains(name))
+                            .is_none_or(|filter| filter.contains(local_name))
                 })
                 .map(|observation| observation.attribute_old_value)
                 .reduce(|left, right| left || right);
@@ -997,7 +1082,8 @@ pub fn notify_attribute(target: u32, name: &str, old_value: Option<&str>) {
                     &[],
                     None,
                     None,
-                    Some(name),
+                    Some(local_name),
+                    namespace,
                     include_old_value.then_some(old_value).flatten(),
                 ));
                 schedule_mutation_delivery(state);
@@ -1007,6 +1093,9 @@ pub fn notify_attribute(target: u32, name: &str, old_value: Option<&str>) {
 }
 
 pub fn notify_character_data(target: u32, old_value: Option<&str>) {
+    if mutation_notifications_suppressed() {
+        return;
+    }
     MUTATION_OBSERVERS.with(|observers| {
         for state in observers.borrow().iter() {
             let include_old_value = state
@@ -1024,6 +1113,7 @@ pub fn notify_character_data(target: u32, old_value: Option<&str>) {
                     target,
                     &[],
                     &[],
+                    None,
                     None,
                     None,
                     None,

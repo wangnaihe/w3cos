@@ -6,8 +6,8 @@ use std::rc::Rc;
 
 use crate::heap::{HeapAllocation, HeapKind};
 use crate::js_string::JsString;
-use crate::proxy::ProxyHandler;
 use crate::property_map::PropertyMap;
+use crate::proxy::ProxyHandler;
 use crate::value::{FunctionData, JsObjectRef, Value};
 
 #[derive(Clone)]
@@ -85,8 +85,8 @@ impl JsObject {
 
     fn from_interned_map(properties: HashMap<JsString, Value>) -> Self {
         let properties = PropertyMap::from_interned_hashmap(properties);
-        let has_getter_properties = properties
-            .any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
+        let has_getter_properties =
+            properties.any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
@@ -108,8 +108,8 @@ impl JsObject {
             .map(|(key, value)| (JsString::intern(&key), value))
             .collect();
         let properties = PropertyMap::from_interned_hashmap(properties);
-        let has_getter_properties = properties
-            .any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
+        let has_getter_properties =
+            properties.any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
@@ -132,8 +132,8 @@ impl JsObject {
             .map(|(key, value)| (JsString::intern(&key), value))
             .collect();
         let properties = PropertyMap::from_interned_hashmap(properties);
-        let has_getter_properties = properties
-            .any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
+        let has_getter_properties =
+            properties.any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let object = Self {
             properties,
@@ -215,12 +215,9 @@ impl JsObject {
 
     pub fn may_have_getter_properties(&self) -> bool {
         self.has_getter_properties
-            || self
-                .prototype
-                .as_ref()
-                .is_some_and(|prototype| {
-                    prototype.is_live() && prototype.borrow().may_have_getter_properties()
-                })
+            || self.prototype.as_ref().is_some_and(|prototype| {
+                prototype.is_live() && prototype.borrow().may_have_getter_properties()
+            })
     }
 
     /// `[[Has]]` — the `in` operator.
@@ -244,6 +241,16 @@ impl JsObject {
             }
         }
         false
+    }
+
+    pub fn has_own_property(&self, key: &str) -> bool {
+        self.properties.contains_key(key)
+            || self
+                .properties
+                .contains_key(format!("__w3cos_getter_{key}").as_str())
+            || self
+                .properties
+                .contains_key(format!("__w3cos_setter_{key}").as_str())
     }
 
     /// `[[Delete]]` — the `delete` operator.
@@ -346,7 +353,23 @@ impl JsObject {
             let desc = desc.borrow();
             if let Some(val) = desc.properties.get("value") {
                 self.properties.insert(JsString::intern(key), val.clone());
-                self.refresh_heap_accounting();
+                self.properties.remove(&format!("__w3cos_getter_{key}"));
+                self.properties.remove(&format!("__w3cos_setter_{key}"));
+            }
+            if let Some(getter) = desc.properties.get("get") {
+                self.properties.remove(key);
+                self.properties.insert(
+                    JsString::intern(&format!("__w3cos_getter_{key}")),
+                    getter.clone(),
+                );
+                self.has_getter_properties = true;
+            }
+            if let Some(setter) = desc.properties.get("set") {
+                self.properties.remove(key);
+                self.properties.insert(
+                    JsString::intern(&format!("__w3cos_setter_{key}")),
+                    setter.clone(),
+                );
             }
             if let Some(enumerable) = desc.properties.get("enumerable") {
                 if enumerable.to_bool() {
@@ -357,6 +380,7 @@ impl JsObject {
                     self.ensure_rare().non_enumerable.insert(key.to_string());
                 }
             }
+            self.refresh_heap_accounting();
         }
         true
     }
@@ -532,6 +556,26 @@ mod tests {
         assert!(!obj.has_direct("b"));
         obj.delete("a");
         assert!(!obj.has_direct("a"));
+    }
+
+    #[test]
+    fn own_property_check_includes_accessors_without_walking_the_prototype() {
+        let prototype = Value::object(HashMap::from([(
+            "inherited".to_string(),
+            Value::Bool(true),
+        )]))
+        .as_object()
+        .expect("object prototype");
+        let mut obj = JsObject::new();
+        obj.prototype = Some(prototype);
+        obj.set_direct(
+            "__w3cos_getter_length",
+            Value::function(|_, _| Value::Number(1.0)),
+        );
+
+        assert!(obj.has_own_property("length"));
+        assert!(!obj.has_own_property("inherited"));
+        assert!(obj.has_direct("inherited"));
     }
 
     #[test]

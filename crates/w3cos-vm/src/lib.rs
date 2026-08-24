@@ -24,6 +24,7 @@ pub struct BindingSlot {
     initialized: Cell<bool>,
     external_getter: Option<Value>,
     external_setter: Option<Value>,
+    external_property: Option<(Value, String)>,
 }
 
 impl BindingSlot {
@@ -44,7 +45,10 @@ impl BindingSlot {
     pub fn read_value(&self) -> Value {
         match &self.external_getter {
             Some(getter) => getter.call(Value::Undefined, Vec::new()),
-            None => self.borrow().clone(),
+            None => match &self.external_property {
+                Some((object, key)) => object.get_property(key),
+                None => self.borrow().clone(),
+            },
         }
     }
 
@@ -60,6 +64,11 @@ impl BindingSlot {
     fn initialize(&self, value: Value) {
         if let Some(setter) = &self.external_setter {
             setter.call(Value::Undefined, vec![value]);
+            self.initialized.set(true);
+            return;
+        }
+        if let Some((object, key)) = &self.external_property {
+            object.set_property(key, value);
             self.initialized.set(true);
             return;
         }
@@ -80,6 +89,10 @@ impl BindingSlot {
                 )));
             }
             setter.call(Value::Undefined, vec![value]);
+            return Ok(());
+        }
+        if let Some((object, key)) = &self.external_property {
+            object.set_property(key, value);
             return Ok(());
         }
         if !self.is_initialized() {
@@ -103,6 +116,7 @@ pub fn binding_cell(value: Value) -> BindingCell {
         initialized: Cell::new(true),
         external_getter: None,
         external_setter: None,
+        external_property: None,
     })
 }
 
@@ -112,6 +126,7 @@ pub fn uninitialized_binding_cell() -> BindingCell {
         initialized: Cell::new(false),
         external_getter: None,
         external_setter: None,
+        external_property: None,
     })
 }
 
@@ -121,6 +136,27 @@ pub fn external_binding_cell(getter: Value, setter: Value) -> BindingCell {
         initialized: Cell::new(true),
         external_getter: Some(getter),
         external_setter: setter.is_callable().then_some(setter),
+        external_property: None,
+    })
+}
+
+/// A live mutable binding backed directly by an object property. Classic
+/// script globals use this path so lexical reads avoid host-function calls
+/// while `window.name` and unqualified `name` remain the same storage.
+pub fn property_binding_cell(object: Value, key: impl Into<String>) -> BindingCell {
+    let key = key.into();
+    let has_property = object
+        .as_object()
+        .is_some_and(|object| object.borrow().has(&key));
+    if !has_property {
+        object.set_property(&key, Value::Undefined);
+    }
+    Rc::new(BindingSlot {
+        value: RefCell::new(Value::Undefined),
+        initialized: Cell::new(true),
+        external_getter: None,
+        external_setter: None,
+        external_property: Some((object, key)),
     })
 }
 
@@ -1821,8 +1857,25 @@ impl Vm {
                 registers[dst.0 as usize] =
                     w3cos_core::intrinsics::delete_property(&read(*object), &read(*key));
             }
-            Instruction::SetProperty { object, key, value } => {
-                w3cos_core::intrinsics::set_property(&read(*object), &read(*key), read(*value));
+            Instruction::SetProperty {
+                object,
+                key,
+                value,
+                strict,
+            } => {
+                if *strict {
+                    w3cos_core::intrinsics::set_property_strict(
+                        &read(*object),
+                        &read(*key),
+                        read(*value),
+                    );
+                } else {
+                    w3cos_core::intrinsics::set_property(
+                        &read(*object),
+                        &read(*key),
+                        read(*value),
+                    );
+                }
             }
             Instruction::DefineField { object, key, value } => {
                 w3cos_core::intrinsics::define_field(&read(*object), &read(*key), read(*value));
@@ -2756,6 +2809,19 @@ mod tests {
     }
 
     #[test]
+    fn property_binding_cells_alias_object_storage_without_host_callbacks() {
+        let global = Value::object(HashMap::new());
+        let cell = property_binding_cell(global.clone(), "result");
+        assert_eq!(cell.read("result").unwrap(), Value::Undefined);
+
+        global.set_property("result", Value::string("from-window"));
+        assert_eq!(cell.read("result").unwrap(), Value::string("from-window"));
+
+        cell.store("result", Value::string("from-script")).unwrap();
+        assert_eq!(global.get_property("result"), Value::string("from-script"));
+    }
+
+    #[test]
     fn async_frame_resumes_from_the_shared_promise_microtask_queue() {
         let awaited = Binding {
             id: BindingId(0),
@@ -2911,6 +2977,7 @@ mod tests {
                             object: Register(2),
                             key: Register(3),
                             value: Register(4),
+                            strict: false,
                         },
                         Instruction::GetProperty {
                             dst: Register(5),

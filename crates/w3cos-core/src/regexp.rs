@@ -549,8 +549,76 @@ fn translate_unicode_sets(source: &str, enabled: bool) -> String {
     output
 }
 
+fn translate_javascript_escapes(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut output = String::with_capacity(source.len());
+    let mut index = 0;
+    let mut in_character_class = false;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            let character = source[index..]
+                .chars()
+                .next()
+                .expect("index always starts on a character boundary");
+            match character {
+                '[' if in_character_class => output.push_str(r"\["),
+                '[' => {
+                    in_character_class = true;
+                    output.push('[');
+                }
+                ']' if in_character_class => {
+                    in_character_class = false;
+                    output.push(']');
+                }
+                _ => output.push(character),
+            }
+            index += character.len_utf8();
+            continue;
+        }
+        if bytes.get(index + 1) == Some(&b'/') {
+            output.push('/');
+            index += 2;
+            continue;
+        }
+        if bytes.get(index + 1) == Some(&b'\\') {
+            output.push_str(r"\\");
+            index += 2;
+            continue;
+        }
+        if bytes.get(index + 1) == Some(&b'0')
+            && bytes.get(index + 2).is_none_or(|next| !next.is_ascii_digit())
+        {
+            output.push_str(r"\x00");
+            index += 2;
+            continue;
+        }
+        if bytes.get(index + 1) == Some(&b'u')
+            && bytes.get(index + 2) != Some(&b'{')
+            && bytes
+                .get(index + 2..index + 6)
+                .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+        {
+            let code_unit = u16::from_str_radix(&source[index + 2..index + 6], 16)
+                .expect("four checked hexadecimal digits fit in a u16");
+            output.push_str(r"\u{");
+            if (0xd800..=0xdfff).contains(&code_unit) {
+                output.push_str("FFFD");
+            } else {
+                output.push_str(&source[index + 2..index + 6]);
+            }
+            output.push('}');
+            index += 6;
+            continue;
+        }
+        output.push('\\');
+        index += 1;
+    }
+    output
+}
+
 fn build_regex(source: &str, flags: &str) -> Option<Regex> {
-    let source = translate_unicode_sets(source, flags.contains('v'));
+    let source = translate_javascript_escapes(source);
+    let source = translate_unicode_sets(&source, flags.contains('v'));
     let modifiers = ['i', 'm', 's']
         .into_iter()
         .filter(|flag| flags.contains(*flag))
@@ -691,6 +759,29 @@ mod tests {
             &Value::object(HashMap::new()),
             &regexp_class()
         ));
+    }
+
+    #[test]
+    fn unicode_name_expression_accepts_the_full_scalar_range() {
+        let pattern = create(
+            r"^(?:[A-Za-z][^\0\t\n\f\r\u0020/>]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9-.:_\u0080-\u{10FFFF}]*)$",
+            "u",
+        );
+        assert!(pattern.call_method("test", vec![Value::from("div")]).to_bool());
+        assert!(pattern.call_method("test", vec![Value::from("smallEmoji🆖")]).to_bool());
+    }
+
+    #[test]
+    fn javascript_character_class_and_surrogate_escapes_translate_to_rust_regex() {
+        let punctuation = create(r"[-\/\\^$*+?.()|[\]{}]", "g");
+        assert!(punctuation.call_method("test", vec![Value::from("$")]).to_bool());
+        let surrogate = create(
+            r"([\ud800-\udbff]+)(?![\udc00-\udfff])|(^|[^\ud800-\udbff])([\udc00-\udfff]+)",
+            "g",
+        );
+        assert!(surrogate
+            .call_method("test", vec![Value::from("�")])
+            .to_bool());
     }
 
     #[test]

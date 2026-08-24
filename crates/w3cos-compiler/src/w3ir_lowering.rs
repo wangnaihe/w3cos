@@ -24,8 +24,14 @@ use w3cos_ir::{
 
 pub fn lower_script(source: &str, specifier: &str) -> Result<Module> {
     let parsed = parse(source, specifier)?;
-    let annex_b_function_declarations = !module_items_have_use_strict_directive(&parsed.body);
-    let mut builder = Builder::entry(false, annex_b_function_declarations);
+    let strict_mode = module_items_have_use_strict_directive(&parsed.body);
+    let annex_b_function_declarations = !strict_mode;
+    let mut builder = Builder::entry(
+        false,
+        annex_b_function_declarations,
+        strict_mode,
+        true,
+    );
     for item in &parsed.body {
         if let ModuleItem::Stmt(statement) = item {
             builder.predeclare_function_binding(statement)?;
@@ -73,7 +79,7 @@ pub(crate) fn lower_module_statements(
     specifier: &str,
     external_bindings: &[(String, bool)],
 ) -> Result<Module> {
-    let mut builder = Builder::entry(true, false);
+    let mut builder = Builder::entry(true, false, true, false);
     for (name, mutable) in external_bindings {
         builder.declare_external(name, *mutable)?;
     }
@@ -147,7 +153,7 @@ fn prune_unused_module_init_externals(module: &mut Module) {
 /// introduced.
 pub fn lower_module(source: &str, specifier: &str) -> Result<Module> {
     let parsed = parse(source, specifier)?;
-    let mut builder = Builder::entry(true, false);
+    let mut builder = Builder::entry(true, false, true, false);
 
     // Instantiate imports before evaluating declarations, matching the ESM
     // split between linking and execution.
@@ -733,13 +739,20 @@ struct Builder {
     /// members, and `None` outside class-member lexical `super` scope.
     class_super_is_static: Option<bool>,
     annex_b_function_declarations: bool,
+    strict_mode: bool,
+    classic_script_entry: bool,
     suspension_points: Vec<SuspensionPoint>,
     generator_suspension_points: Vec<GeneratorSuspensionPoint>,
     terminated: bool,
 }
 
 impl Builder {
-    fn entry(allows_await: bool, annex_b_function_declarations: bool) -> Self {
+    fn entry(
+        allows_await: bool,
+        annex_b_function_declarations: bool,
+        strict_mode: bool,
+        classic_script_entry: bool,
+    ) -> Self {
         Self {
             is_entry: true,
             instructions: Vec::new(),
@@ -776,6 +789,8 @@ impl Builder {
             is_generator: false,
             class_super_is_static: None,
             annex_b_function_declarations,
+            strict_mode,
+            classic_script_entry,
             suspension_points: Vec::new(),
             generator_suspension_points: Vec::new(),
             terminated: false,
@@ -790,6 +805,7 @@ impl Builder {
         is_async: bool,
         is_generator: bool,
         annex_b_function_declarations: bool,
+        strict_mode: bool,
     ) -> Self {
         Self {
             is_entry: false,
@@ -827,6 +843,8 @@ impl Builder {
             is_generator,
             class_super_is_static: None,
             annex_b_function_declarations,
+            strict_mode,
+            classic_script_entry: false,
             suspension_points: Vec::new(),
             generator_suspension_points: Vec::new(),
             terminated: false,
@@ -1132,6 +1150,19 @@ impl Builder {
                 "duplicate lexical binding {name:?} in the same block"
             ));
         }
+        if kind == VarDeclKind::Var && self.classic_script_entry {
+            return Ok(self.declare_classic_global(name));
+        }
+        if kind != VarDeclKind::Var && self.classic_script_entry && self.scopes.len() == 1 {
+            return Ok(self.declare_classic_lexical(
+                name,
+                match kind {
+                    VarDeclKind::Let => BindingKind::Let,
+                    VarDeclKind::Const => BindingKind::Const,
+                    VarDeclKind::Var => unreachable!(),
+                },
+            ));
+        }
         let binding = BindingId(self.next_binding);
         self.next_binding += 1;
         self.scopes[scope_index].insert(name.to_string(), binding);
@@ -1146,6 +1177,62 @@ impl Builder {
             mutable: kind != VarDeclKind::Const,
         });
         Ok(binding)
+    }
+
+    /// A classic script's top-level `var` and function declarations are live
+    /// global-object bindings. Model them as mutable host imports so re-entrant
+    /// event handlers observe writes immediately instead of receiving a copy at
+    /// the end of script evaluation.
+    fn declare_classic_global(&mut self, name: &str) -> BindingId {
+        if let Some(binding) = self.globals.get(name).copied() {
+            self.scopes[0].insert(name.to_string(), binding);
+            if let Some(declaration) = self
+                .bindings
+                .iter_mut()
+                .find(|candidate| candidate.id == binding)
+            {
+                declaration.mutable = true;
+            }
+            return binding;
+        }
+        let binding = BindingId(self.next_binding);
+        self.next_binding += 1;
+        self.scopes[0].insert(name.to_string(), binding);
+        self.globals.insert(name.to_string(), binding);
+        self.bindings.push(Binding {
+            id: binding,
+            name: name.to_string(),
+            kind: BindingKind::Var,
+            mutable: true,
+        });
+        self.imports.push(Import {
+            specifier: "w3cos:classic-global".into(),
+            imported: name.to_string(),
+            local: binding,
+        });
+        binding
+    }
+
+    /// A classic script's top-level lexical declarations live in the shared
+    /// global declarative environment, but are not properties of `window`.
+    /// The runtime links these imports to document-scoped cells so later
+    /// classic scripts observe the same live `let`/`const` binding.
+    fn declare_classic_lexical(&mut self, name: &str, kind: BindingKind) -> BindingId {
+        let binding = BindingId(self.next_binding);
+        self.next_binding += 1;
+        self.scopes[0].insert(name.to_string(), binding);
+        self.bindings.push(Binding {
+            id: binding,
+            name: name.to_string(),
+            kind,
+            mutable: kind == BindingKind::Let,
+        });
+        self.imports.push(Import {
+            specifier: "w3cos:classic-lexical".into(),
+            imported: name.to_string(),
+            local: binding,
+        });
+        binding
     }
 
     fn predeclare_var_bindings(&mut self, statement: &Stmt) -> Result<()> {
@@ -1385,6 +1472,9 @@ impl Builder {
     }
 
     fn declare_class_binding(&mut self, name: &str) -> Result<BindingId> {
+        if self.classic_script_entry && self.scopes.len() == 1 {
+            return Ok(self.declare_classic_lexical(name, BindingKind::Class));
+        }
         self.declare_current_binding(name, BindingKind::Class, false)
     }
 
@@ -1876,6 +1966,35 @@ impl Builder {
         let binding = self.declare_local_with_kind("arguments", BindingKind::Parameter, false)?;
         self.arguments_binding = Some(binding);
         Ok(())
+    }
+
+    fn prune_unused_arguments_binding(&mut self) {
+        let Some(binding) = self.arguments_binding else {
+            return;
+        };
+        let used = self
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| match instruction {
+                Instruction::LoadBinding {
+                    binding: candidate, ..
+                }
+                | Instruction::InitializeBinding {
+                    binding: candidate, ..
+                }
+                | Instruction::StoreBinding {
+                    binding: candidate, ..
+                }
+                | Instruction::RefreshBinding { binding: candidate } => *candidate == binding,
+                Instruction::CreateClosure { captures, .. } => captures.contains(&binding),
+                _ => false,
+            });
+        if used {
+            return;
+        }
+        self.arguments_binding = None;
+        self.bindings.retain(|candidate| candidate.id != binding);
     }
 
     fn lower_statement(&mut self, statement: &Stmt) -> Result<()> {
@@ -3105,16 +3224,21 @@ impl Builder {
         let target = match expression.arg.as_ref() {
             Expr::Ident(identifier) => {
                 let name = identifier.sym.to_string();
-                self.find_binding(&name).ok_or_else(|| {
-                    anyhow!("update of undeclared runtime binding {name:?} is not supported")
-                })?;
-                let binding = self.resolve_binding(&name);
-                let mutable = self
-                    .bindings
-                    .iter()
-                    .find(|candidate| candidate.id == binding)
-                    .is_none_or(|binding| binding.mutable);
-                LoweredAssignmentTarget::Binding { binding, mutable }
+                if self.find_binding(&name).is_some() {
+                    let binding = self.resolve_binding(&name);
+                    let mutable = self
+                        .bindings
+                        .iter()
+                        .find(|candidate| candidate.id == binding)
+                        .is_none_or(|binding| binding.mutable);
+                    LoweredAssignmentTarget::Binding { binding, mutable }
+                } else if self.annex_b_function_declarations {
+                    self.lower_sloppy_global_assignment_target(&name)
+                } else {
+                    return Err(anyhow!(
+                        "update of undeclared runtime binding {name:?} is not supported"
+                    ));
+                }
             }
             Expr::Member(member) => {
                 if matches!(member.prop, MemberProp::PrivateName(_)) {
@@ -3175,16 +3299,21 @@ impl Builder {
         match target {
             AssignTarget::Simple(SimpleAssignTarget::Ident(identifier)) => {
                 let name = identifier.id.sym.to_string();
-                self.find_binding(&name).ok_or_else(|| {
-                    anyhow!("assignment to undeclared runtime binding {name:?} is not supported")
-                })?;
-                let binding = self.resolve_binding(&name);
-                let mutable = self
-                    .bindings
-                    .iter()
-                    .find(|candidate| candidate.id == binding)
-                    .is_none_or(|binding| binding.mutable);
-                Ok(LoweredAssignmentTarget::Binding { binding, mutable })
+                if self.find_binding(&name).is_some() {
+                    let binding = self.resolve_binding(&name);
+                    let mutable = self
+                        .bindings
+                        .iter()
+                        .find(|candidate| candidate.id == binding)
+                        .is_none_or(|binding| binding.mutable);
+                    Ok(LoweredAssignmentTarget::Binding { binding, mutable })
+                } else if self.annex_b_function_declarations {
+                    Ok(self.lower_sloppy_global_assignment_target(&name))
+                } else {
+                    Err(anyhow!(
+                        "assignment to undeclared runtime binding {name:?} is not supported"
+                    ))
+                }
             }
             AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
                 if matches!(member.prop, MemberProp::PrivateName(_)) {
@@ -3205,6 +3334,25 @@ impl Builder {
             _ => Err(anyhow!(
                 "runtime W3IR assignment requires an identifier, member, or super target"
             )),
+        }
+    }
+
+    /// Keep unresolved sloppy assignments as live global-environment imports.
+    /// The browser runtime can then route the cell to an existing top-level
+    /// lexical declaration, or fall back to a `window` property when the name
+    /// is genuinely undeclared.
+    fn lower_sloppy_global_assignment_target(&mut self, name: &str) -> LoweredAssignmentTarget {
+        let binding = self.global(name);
+        if let Some(declaration) = self
+            .bindings
+            .iter_mut()
+            .find(|candidate| candidate.id == binding)
+        {
+            declaration.mutable = true;
+        }
+        LoweredAssignmentTarget::Binding {
+            binding,
+            mutable: true,
         }
     }
 
@@ -3282,7 +3430,12 @@ impl Builder {
                 self.terminate(Instruction::Throw { value: error });
             }
             LoweredAssignmentTarget::Property { object, key } => {
-                self.emit(Instruction::SetProperty { object, key, value });
+                self.emit(Instruction::SetProperty {
+                    object,
+                    key,
+                    value,
+                    strict: self.strict_mode,
+                });
             }
             LoweredAssignmentTarget::Private {
                 object,
@@ -4518,6 +4671,7 @@ impl Builder {
                         },
                         key,
                         value,
+                        strict: true,
                     });
                 }
                 ClassMember::PrivateMethod(method) => {
@@ -4634,6 +4788,7 @@ impl Builder {
             false,
             false,
             false,
+            self.strict_mode,
         );
         let mut values = Vec::new();
         if let Some(super_class) = &class.super_class {
@@ -4707,6 +4862,7 @@ impl Builder {
             false,
             false,
             false,
+            true,
         );
         child.class_super_is_static = Some(is_static);
         let this_binding = child.declare_this_binding()?;
@@ -4786,6 +4942,9 @@ impl Builder {
     ) -> Result<Register> {
         let function_id = FunctionId(self.next_function);
         self.next_function += 1;
+        let strict_mode = self.strict_mode
+            || class_super_is_static.is_some()
+            || statements_have_use_strict_directive(statements.iter());
         let mut child = Builder::nested(
             self.visible_bindings(),
             self.globals.clone(),
@@ -4793,8 +4952,8 @@ impl Builder {
             self.next_function,
             is_async,
             is_generator,
-            self.annex_b_function_declarations
-                && !statements_have_use_strict_directive(statements.iter()),
+            self.annex_b_function_declarations && !strict_mode,
+            strict_mode,
         );
         child.class_super_is_static = class_super_is_static
             .or_else(|| (!bind_this).then_some(self.class_super_is_static).flatten());
@@ -4845,6 +5004,7 @@ impl Builder {
             child.terminate(Instruction::Return { value });
         }
         child.seal_current_block();
+        child.prune_unused_arguments_binding();
 
         self.merge_child_scope(&child);
         let captures = child.capture_order.clone();
@@ -5188,7 +5348,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use w3cos_core::Value;
-    use w3cos_vm::{Limits, Vm, VmError};
+    use w3cos_vm::{Limits, Vm, VmError, property_binding_cell};
 
     #[test]
     fn module_init_prunes_unused_external_capture_adapters() {
@@ -5748,6 +5908,87 @@ mod tests {
             attributes.borrow().get("data-ready").map(String::as_str),
             Some("yes")
         );
+    }
+
+    #[test]
+    fn sloppy_classic_script_assigns_unresolved_identifiers_to_window() {
+        let module = lower_script(
+            "onload = function () { return 1; };",
+            "https://example.test/sloppy-global.js",
+        )
+        .unwrap();
+        let onload_binding = module
+            .imports
+            .iter()
+            .find(|import| import.imported == "onload")
+            .unwrap()
+            .local;
+        let window = Value::object(HashMap::new());
+
+        Vm::new(module, Limits::default())
+            .unwrap()
+            .run_with_cells(HashMap::from([(
+                onload_binding,
+                property_binding_cell(window.clone(), "onload"),
+            )]))
+            .unwrap();
+
+        assert_eq!(window.get_property("onload").type_of(), "function");
+        assert!(
+            lower_script(
+                "\"use strict\"; onload = function () {};",
+                "https://example.test/strict-global.js",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("undeclared runtime binding")
+        );
+        assert!(
+            lower_module(
+                "onload = function () {};",
+                "https://example.test/module-global.mjs",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("undeclared runtime binding")
+        );
+    }
+
+    #[test]
+    fn classic_top_level_declarations_use_live_mutable_global_imports() {
+        let module = lower_script(
+            r#"
+                var result;
+                function update() { result = "ready"; }
+                let private_value = 1;
+                update();
+                consume(result, private_value);
+            "#,
+            "https://example.test/live-classic-globals.js",
+        )
+        .unwrap();
+
+        for name in ["result", "update"] {
+            let import = module
+                .imports
+                .iter()
+                .find(|import| import.imported == name)
+                .unwrap_or_else(|| panic!("missing global import for {name}"));
+            assert_eq!(import.specifier, "w3cos:classic-global");
+            let binding = module.functions[0]
+                .bindings
+                .iter()
+                .find(|binding| binding.id == import.local)
+                .unwrap();
+            assert_eq!(binding.kind, BindingKind::Var);
+            assert!(binding.mutable);
+        }
+        let private_value = module
+            .imports
+            .iter()
+            .find(|import| import.imported == "private_value")
+            .expect("top-level lexical declaration must be linked");
+        assert_eq!(private_value.specifier, "w3cos:classic-lexical");
     }
 
     #[test]
@@ -9331,6 +9572,12 @@ mod tests {
             "https://example.test/function-arguments.js",
         )
         .unwrap();
+        let read = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("read"))
+            .expect("read function");
+        assert!(read.arguments_binding.is_some());
         let callback_binding = module
             .imports
             .iter()
@@ -9349,6 +9596,32 @@ mod tests {
             .run_with_bindings(HashMap::from([(callback_binding, callback)]))
             .unwrap();
         assert_eq!(observed.borrow().as_slice(), &[Value::string("ready")]);
+    }
+
+    #[test]
+    fn ordinary_functions_do_not_materialize_unobserved_arguments() {
+        let module = lower_script(
+            r#"
+                function passthrough(value) {
+                    return value;
+                }
+                callback(passthrough("ready"));
+            "#,
+            "https://example.test/function-unused-arguments.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("passthrough"))
+            .expect("passthrough function");
+        assert_eq!(function.arguments_binding, None);
+        assert!(
+            function
+                .bindings
+                .iter()
+                .all(|binding| binding.name != "arguments")
+        );
     }
 
     #[test]
@@ -9505,6 +9778,40 @@ mod tests {
             module_error.to_string().contains("Annex B"),
             "{module_error:#}"
         );
+    }
+
+    #[test]
+    fn property_assignment_preserves_function_strictness() {
+        let strict = lower_script(
+            r#"
+                function assign(target) {
+                    "use strict";
+                    target[5] = "value";
+                }
+            "#,
+            "https://example.test/strict-property-assignment.js",
+        )
+        .unwrap();
+        assert!(strict.functions.iter().any(|function| {
+            function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(instruction, Instruction::SetProperty { strict: true, .. })
+                })
+            })
+        }));
+
+        let sloppy = lower_script(
+            "function assign(target) { target[5] = 'value'; }",
+            "https://example.test/sloppy-property-assignment.js",
+        )
+        .unwrap();
+        assert!(!sloppy.functions.iter().any(|function| {
+            function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(instruction, Instruction::SetProperty { strict: true, .. })
+                })
+            })
+        }));
     }
 
     #[test]
@@ -10076,6 +10383,50 @@ mod tests {
             .run_with_bindings(HashMap::from([(callback_binding, callback)]))
             .unwrap();
         assert_eq!(observed.borrow().as_str(), "tile:ready?");
+    }
+
+    #[test]
+    fn nested_callbacks_capture_reassigned_parameters() {
+        let module = lower_script(
+            r#"
+                const invoke = (callback) => callback();
+                const visit = (values, expected) => {
+                    expected = [expected, expected];
+                    for (var index = 0; index < values.length; index++) {
+                        invoke(function () {
+                            report(values[index], expected[index]);
+                        });
+                    }
+                };
+                visit(["a", "b"], false);
+            "#,
+            "https://example.test/reassigned-parameter-capture.js",
+        )
+        .unwrap();
+        let report_binding = module
+            .imports
+            .iter()
+            .find(|import| import.imported == "report")
+            .unwrap()
+            .local;
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let report_observed = Rc::clone(&observed);
+        let report = Value::function(move |_, arguments| {
+            report_observed.borrow_mut().push((
+                arguments[0].to_js_string(),
+                arguments[1].to_bool(),
+            ));
+            Value::Undefined
+        });
+
+        Vm::new(module, Limits::default())
+            .unwrap()
+            .run_with_bindings(HashMap::from([(report_binding, report)]))
+            .unwrap();
+        assert_eq!(
+            observed.borrow().as_slice(),
+            &[("a".to_string(), false), ("b".to_string(), false)]
+        );
     }
 
     #[test]
