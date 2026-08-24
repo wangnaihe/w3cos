@@ -673,6 +673,66 @@ pub fn animate_element(target: Value, keyframes: Value, options: Value, node: u3
     animation
 }
 
+pub(crate) fn discrete_property_sample(
+    node: u32,
+    property: &str,
+) -> Option<(String, String, f64, String)> {
+    let key = if property == "float" {
+        "cssFloat".to_string()
+    } else {
+        let mut key = String::new();
+        let mut uppercase_next = false;
+        for character in property.chars() {
+            if character == '-' {
+                uppercase_next = true;
+            } else if uppercase_next {
+                key.extend(character.to_uppercase());
+                uppercase_next = false;
+            } else {
+                key.push(character);
+            }
+        }
+        key
+    };
+    ANIMATIONS.with(|animations| {
+        animations.borrow().iter().rev().find_map(|animation| {
+            if animation
+                .get_property("__w3cos_animation_target")
+                .to_u32()
+                != node
+            {
+                return None;
+            }
+            let effect = animation.get_property("effect");
+            let frames = effect.call_method("getKeyframes", Vec::new());
+            let values = frames
+                .iter()
+                .filter_map(|frame| {
+                    let value = frame.get_property(&key);
+                    (!value.is_undefined()).then(|| value.to_js_string())
+                })
+                .collect::<Vec<_>>();
+            let (Some(from), Some(to)) = (values.first(), values.last()) else {
+                return None;
+            };
+            let timing = effect.call_method("getTiming", Vec::new());
+            let duration = timing.get_property("duration").to_number();
+            if !duration.is_finite() || duration <= 0.0 {
+                return None;
+            }
+            let delay = timing.get_property("delay").to_number();
+            let current_time = animation.get_property("currentTime").to_number();
+            let progress = ((current_time - delay) / duration).clamp(0.0, 1.0);
+            Some((
+                from.clone(),
+                to.clone(),
+                progress,
+                timing.get_property("easing").to_js_string(),
+            ))
+        })
+    })
+}
+
 /// Create (or return) the Web Animations facade corresponding to one CSS
 /// animation/transition. CSS-driven effects share `getAnimations()` with
 /// script-created effects, as required by the Web Animations integration.

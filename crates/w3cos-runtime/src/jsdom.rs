@@ -193,6 +193,18 @@ struct TransitionSnapshot {
     transition: w3cos_std::style::Transition,
 }
 
+#[derive(Debug, Clone)]
+struct DiscreteCssTransition {
+    node: u32,
+    property: String,
+    from: String,
+    to: String,
+    started_at: Instant,
+    delay_ms: f64,
+    duration_ms: f64,
+    easing: w3cos_std::style::Easing,
+}
+
 thread_local! {
     /// Monotonic identity for the active document Realm. Every node-backed JS
     /// facade captures this value so an externally retained facade cannot
@@ -217,6 +229,7 @@ thread_local! {
     /// Active CSS animations/transitions sampled by CSSOM and geometry reads.
     /// The corresponding JS facades live in `animations_web::ANIMATIONS`.
     static CSS_MOTIONS: RefCell<Vec<CssMotion>> = const { RefCell::new(Vec::new()) };
+    static DISCRETE_CSS_TRANSITIONS: RefCell<Vec<DiscreteCssTransition>> = const { RefCell::new(Vec::new()) };
     /// JS event listener registry. Delivery for native events consults this
     /// at drain time; `dispatchEvent` consults it synchronously.
     static LISTENERS: RefCell<Vec<JsListener>> = RefCell::new(Vec::new());
@@ -10704,6 +10717,8 @@ fn style_apply(node: u32, kebab: &str, value: &str) {
     // The runtime currently samples transitions only for these two motion
     // values. Avoid six full computed-style cascades around unrelated inline
     // writes (CSS parsing tests perform thousands of color assignments).
+    let tracks_discrete_motion = is_discrete_css2_property(kebab);
+    let discrete_before = tracks_discrete_motion.then(|| inline_computed_style_fallback(node, kebab));
     let tracks_motion = matches!(kebab, "left" | "transform");
     let before = tracks_motion.then(|| capture_transition_snapshots(node));
     STYLE_CACHE.with(|c| {
@@ -10713,10 +10728,172 @@ fn style_apply(node: u32, kebab: &str, value: &str) {
     // Forward to the typed style (known properties drive layout; unknown ones
     // are dropped there but stay in the bridge cache).
     dom::set_style_property(node, kebab, &value);
+    if let Some(before) = discrete_before {
+        start_discrete_css_transition(node, kebab, before, inline_computed_style_fallback(node, kebab));
+    }
     if let Some(before) = before {
         let after = capture_transition_snapshots(node);
         start_changed_transitions(node, &before, &after);
     }
+}
+
+fn is_discrete_css2_property(property: &str) -> bool {
+    matches!(
+        property,
+        "border-bottom-style"
+            | "border-collapse"
+            | "border-left-style"
+            | "border-right-style"
+            | "border-top-style"
+            | "clear"
+            | "empty-cells"
+            | "float"
+    )
+}
+
+fn signed_css_time_ms(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let milliseconds = if let Some(milliseconds) = value.strip_suffix("ms") {
+        milliseconds.parse::<f64>().ok()?
+    } else if let Some(seconds) = value.strip_suffix('s') {
+        seconds.parse::<f64>().ok()? * 1_000.0
+    } else {
+        return None;
+    };
+    milliseconds.is_finite().then_some(milliseconds)
+}
+
+fn css_easing(value: &str) -> w3cos_std::style::Easing {
+    let mut declaration = w3cos_dom::css_style::CSSStyleDeclaration::new();
+    declaration.set_property("transition", &format!("all 1s {value}"));
+    declaration
+        .to_style()
+        .transition
+        .map(|transition| transition.easing)
+        .unwrap_or_default()
+}
+
+fn cached_style_value(node: u32, property: &str) -> String {
+    STYLE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&(node, property.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    })
+}
+
+fn start_discrete_css_transition(node: u32, property: &str, from: String, to: String) {
+    DISCRETE_CSS_TRANSITIONS.with(|motions| {
+        motions
+            .borrow_mut()
+            .retain(|motion| motion.node != node || motion.property != property);
+    });
+    if from == to
+        || !cached_style_value(node, "transition-behavior")
+            .eq_ignore_ascii_case("allow-discrete")
+    {
+        return;
+    }
+    let transition_property = cached_style_value(node, "transition-property");
+    if transition_property != "all" && !transition_property.eq_ignore_ascii_case(property) {
+        return;
+    }
+    let Some(duration_ms) = signed_css_time_ms(&cached_style_value(node, "transition-duration"))
+        .filter(|duration| *duration > 0.0)
+    else {
+        return;
+    };
+    let delay_ms = signed_css_time_ms(&cached_style_value(node, "transition-delay"))
+        .unwrap_or_default();
+    let easing = css_easing(&cached_style_value(node, "transition-timing-function"));
+    DISCRETE_CSS_TRANSITIONS.with(|motions| {
+        motions.borrow_mut().push(DiscreteCssTransition {
+            node,
+            property: property.to_string(),
+            from,
+            to,
+            started_at: Instant::now(),
+            delay_ms,
+            duration_ms,
+            easing,
+        });
+    });
+}
+
+fn sampled_discrete_css_transition(node: u32, property: &str) -> Option<String> {
+    DISCRETE_CSS_TRANSITIONS.with(|motions| {
+        motions
+            .borrow()
+            .iter()
+            .rev()
+            .find(|motion| motion.node == node && motion.property == property)
+            .map(|motion| {
+                let elapsed_ms = motion.started_at.elapsed().as_secs_f64() * 1_000.0;
+                let progress = ((elapsed_ms - motion.delay_ms) / motion.duration_ms).clamp(0.0, 1.0);
+                if motion.easing.interpolate(progress as f32) < 0.5 {
+                    motion.from.clone()
+                } else {
+                    motion.to.clone()
+                }
+            })
+    })
+}
+
+fn discrete_css_initial_value(property: &str) -> Option<&'static str> {
+    match property {
+        "border-bottom-style" | "border-left-style" | "border-right-style"
+        | "border-top-style" | "clear" | "float" => Some("none"),
+        "border-collapse" => Some("separate"),
+        "empty-cells" => Some("show"),
+        _ => None,
+    }
+}
+
+fn resolve_discrete_css_value(node: u32, property: &str, value: &str) -> String {
+    let initial = discrete_css_initial_value(property).unwrap_or_default();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "initial" | "unset" | "revert" | "revert-layer" => initial.to_string(),
+        "inherit" => dom::parent_node(node)
+            .map(|parent| computed_style_property_value(parent, None, property))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| initial.to_string()),
+        _ => value.trim().to_string(),
+    }
+}
+
+fn select_discrete_css_value(
+    node: u32,
+    property: &str,
+    from: &str,
+    to: &str,
+    progress: f64,
+    easing: &str,
+) -> String {
+    let value = if css_easing(easing).interpolate(progress as f32) < 0.5 {
+        from
+    } else {
+        to
+    };
+    resolve_discrete_css_value(node, property, value)
+}
+
+#[cfg(feature = "dynamic-js")]
+fn sampled_discrete_css_animation(node: u32, property: &str) -> Option<String> {
+    let name = cached_style_value(node, "animation-name");
+    let duration_ms = signed_css_time_ms(&cached_style_value(node, "animation-duration"))
+        .filter(|duration| *duration > 0.0)?;
+    let delay_ms = signed_css_time_ms(&cached_style_value(node, "animation-delay"))
+        .unwrap_or_default();
+    let (from, to) = crate::dynamic_script::active_keyframe_property(&name, property)?;
+    Some(select_discrete_css_value(
+        node,
+        property,
+        &from,
+        &to,
+        ((-delay_ms) / duration_ms).clamp(0.0, 1.0),
+        &cached_style_value(node, "animation-timing-function"),
+    ))
 }
 
 fn normalize_inline_style_property(property: &str, value: &str) -> Option<String> {
@@ -11098,6 +11275,24 @@ fn serialize_css_color(color: w3cos_std::color::Color) -> String {
 }
 
 fn computed_style_property_value(node: u32, pseudo: Option<&str>, property: &str) -> String {
+    if pseudo.is_none()
+        && let Some(value) = sampled_discrete_css_transition(node, property)
+    {
+        return value;
+    }
+    if pseudo.is_none() && is_discrete_css2_property(property) {
+        if let Some((from, to, progress, easing)) =
+            crate::animations_web::discrete_property_sample(node, property)
+        {
+            return select_discrete_css_value(
+                node, property, &from, &to, progress, &easing,
+            );
+        }
+        #[cfg(feature = "dynamic-js")]
+        if let Some(value) = sampled_discrete_css_animation(node, property) {
+            return value;
+        }
+    }
     if let Some(value) = sampled_css_motion_value(node, pseudo, property) {
         return css_motion_value_to_css(value);
     }
@@ -11112,12 +11307,8 @@ fn computed_style_property_value(node: u32, pseudo: Option<&str>, property: &str
 }
 
 fn inline_computed_style_fallback(node: u32, property: &str) -> String {
-    let initial = match property {
-        "border-bottom-style" | "border-left-style" | "border-right-style"
-        | "border-top-style" | "clear" | "float" => "none",
-        "border-collapse" => "separate",
-        "empty-cells" => "show",
-        _ => return String::new(),
+    let Some(initial) = discrete_css_initial_value(property) else {
+        return String::new();
     };
     let inline = style_read(node, property);
     match inline.to_ascii_lowercase().as_str() {
@@ -11148,6 +11339,12 @@ fn computed_style_value(node: u32, pseudo: Option<String>) -> Value {
                 getter_pseudo.as_deref(),
                 &property,
             ))
+        })
+        .has(move |target, key| {
+            target
+                .as_object()
+                .is_some_and(|object| object.borrow().has_direct(key))
+                || css_property_supported(&camel_to_kebab(key), "initial")
         })
         .build();
     let method_pseudo = pseudo;
@@ -18732,6 +18929,7 @@ pub fn reset_bridge() {
     SELECTOR_ID_CACHE_GENERATION.with(|generation| generation.set(0));
     STYLE_CACHE.with(|c| c.borrow_mut().clear());
     CSS_MOTIONS.with(|motions| motions.borrow_mut().clear());
+    DISCRETE_CSS_TRANSITIONS.with(|motions| motions.borrow_mut().clear());
     LISTENERS.with(|l| l.borrow_mut().clear());
     NATIVELY_REGISTERED.with(|r| r.borrow_mut().clear());
     PENDING_EVENTS.with(|q| q.borrow_mut().clear());
@@ -25137,6 +25335,61 @@ try {
                 .call_method("getComputedStyle", vec![child])
                 .get_property("float"),
             Value::string("none")
+        );
+    }
+
+    #[test]
+    fn allow_discrete_transition_samples_negative_delay_and_easing() {
+        setup();
+        let div = create_in_body("div");
+        let style = div.get_property("style");
+        style.set_property("cssFloat", Value::string("initial"));
+        style.set_property("transitionDuration", Value::string("100s"));
+        style.set_property("transitionDelay", Value::string("-50s"));
+        style.set_property("transitionTimingFunction", Value::string("linear"));
+        style.set_property("transitionProperty", Value::string("float"));
+        style.set_property("transitionBehavior", Value::string("allow-discrete"));
+        style.set_property("cssFloat", Value::string("right"));
+
+        assert_eq!(
+            window_value()
+                .call_method("getComputedStyle", vec![div])
+                .get_property("float"),
+            Value::string("right")
+        );
+    }
+
+    #[test]
+    fn web_animation_samples_discrete_css2_properties() {
+        setup();
+        let div = create_in_body("div");
+        let node = node_id_of(&div).expect("element node");
+        let animation = crate::animations_web::animate_element(
+            div.clone(),
+            Value::array(vec![
+                Value::object(HashMap::from([(
+                    "cssFloat".into(),
+                    Value::string("initial"),
+                )])),
+                Value::object(HashMap::from([(
+                    "cssFloat".into(),
+                    Value::string("right"),
+                )])),
+            ]),
+            Value::object(HashMap::from([
+                ("duration".into(), Value::Number(100_000.0)),
+                ("easing".into(), Value::string("linear")),
+            ])),
+            node,
+        );
+        animation.call_method("pause", Vec::new());
+        animation.set_property("currentTime", Value::Number(50_000.0));
+
+        assert_eq!(
+            window_value()
+                .call_method("getComputedStyle", vec![div])
+                .get_property("float"),
+            Value::string("right")
         );
     }
 
