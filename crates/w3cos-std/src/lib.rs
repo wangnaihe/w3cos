@@ -152,6 +152,24 @@ mod tests {
     }
 
     #[test]
+    fn color_from_css_validates_hex_and_normalizes_percentage_channels() {
+        assert_eq!(
+            Color::from_css("rgb(1%, 40%, 101%)"),
+            Some(Color::rgb(3, 102, 255))
+        );
+        assert_eq!(
+            Color::from_css("rgb(-1, +128, 256)"),
+            Some(Color::rgb(0, 128, 255))
+        );
+        assert_eq!(
+            Color::from_css("#1000"),
+            Some(Color::rgba(17, 0, 0, 0))
+        );
+        assert_eq!(Color::from_css("#00000"), None);
+        assert_eq!(Color::from_css("#00g"), None);
+    }
+
+    #[test]
     fn css_named_color_through_codegen_parser() {
         assert_eq!(Color::from_hex("transparent"), Color::TRANSPARENT);
         assert_eq!(Color::from_hex("white"), Color::WHITE);

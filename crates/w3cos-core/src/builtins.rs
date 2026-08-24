@@ -261,6 +261,26 @@ fn build_array_value() -> Value {
         }),
     );
     prototype.set_property(
+        "push",
+        Value::function(|this, arguments| {
+            if this.is_array() {
+                return this.call_method("push", arguments);
+            }
+            let length = this.get_property("length").to_number();
+            let mut length = if length.is_finite() && length > 0.0 {
+                length.floor() as usize
+            } else {
+                0
+            };
+            for value in arguments {
+                this.set_property(&length.to_string(), value);
+                length += 1;
+            }
+            this.set_property("length", Value::Number(length as f64));
+            Value::Number(length as f64)
+        }),
+    );
+    prototype.set_property(
         "map",
         Value::function(|this, arguments| {
             let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
@@ -416,7 +436,7 @@ fn live_array_like_values_iterator(value: Value) -> Value {
                 next_index.set(current + 1);
                 iterable.get_property(&current.to_string())
             };
-            Value::object(HashMap::from([
+            Value::collectable_object(HashMap::from([
                 ("value".to_string(), value),
                 ("done".to_string(), Value::Bool(done)),
             ]))
@@ -1635,6 +1655,22 @@ mod tests {
 
         assert_eq!(filtered.get_property("length"), Value::Number(1.0));
         assert_eq!(filtered.get_property("0"), Value::string("second"));
+    }
+
+    #[test]
+    fn array_method_reference_apply_uses_the_explicit_receiver() {
+        let targets = Value::array(vec![Value::string("existing")]);
+        let generated = Value::array(vec![Value::string("first"), Value::string("second")]);
+        let push = Value::array(Vec::new()).get_property("push");
+
+        assert!(push.is_callable());
+        assert_eq!(
+            push.call_method("apply", vec![targets.clone(), generated]),
+            Value::Number(3.0)
+        );
+        assert_eq!(targets.get_property("0"), Value::string("existing"));
+        assert_eq!(targets.get_property("1"), Value::string("first"));
+        assert_eq!(targets.get_property("2"), Value::string("second"));
     }
 
     #[test]

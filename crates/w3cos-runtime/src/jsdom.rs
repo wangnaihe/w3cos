@@ -5764,7 +5764,12 @@ fn css_property_supported(property: &str, value: &str) -> bool {
             | "background-attachment"
             | "background-blend-mode"
             | "border"
+            | "border-bottom-style"
+            | "border-collapse"
+            | "border-left-style"
             | "border-radius"
+            | "border-right-style"
+            | "border-top-style"
             | "bottom"
             | "box-shadow"
             | "box-sizing"
@@ -5772,6 +5777,7 @@ fn css_property_supported(property: &str, value: &str) -> bool {
             | "column-gap"
             | "contain"
             | "content"
+            | "clear"
             | "cursor"
             | "display"
             | "filter"
@@ -5781,6 +5787,7 @@ fn css_property_supported(property: &str, value: &str) -> bool {
             | "flex-grow"
             | "flex-shrink"
             | "flex-wrap"
+            | "float"
             | "font"
             | "font-family"
             | "font-size"
@@ -5809,6 +5816,7 @@ fn css_property_supported(property: &str, value: &str) -> bool {
             | "object-fit"
             | "opacity"
             | "order"
+            | "empty-cells"
             | "outline"
             | "overflow"
             | "overflow-x"
@@ -10690,16 +10698,41 @@ pub(crate) fn resolved_style_property(node: u32, kebab: &str) -> String {
 }
 
 fn style_apply(node: u32, kebab: &str, value: &str) {
-    let before = capture_transition_snapshots(node);
+    let Some(value) = normalize_inline_style_property(kebab, value) else {
+        return;
+    };
+    // The runtime currently samples transitions only for these two motion
+    // values. Avoid six full computed-style cascades around unrelated inline
+    // writes (CSS parsing tests perform thousands of color assignments).
+    let tracks_motion = matches!(kebab, "left" | "transform");
+    let before = tracks_motion.then(|| capture_transition_snapshots(node));
     STYLE_CACHE.with(|c| {
         c.borrow_mut()
-            .insert((node, kebab.to_string()), value.to_string());
+            .insert((node, kebab.to_string()), value.clone());
     });
     // Forward to the typed style (known properties drive layout; unknown ones
     // are dropped there but stay in the bridge cache).
-    dom::set_style_property(node, kebab, value);
-    let after = capture_transition_snapshots(node);
-    start_changed_transitions(node, &before, &after);
+    dom::set_style_property(node, kebab, &value);
+    if let Some(before) = before {
+        let after = capture_transition_snapshots(node);
+        start_changed_transitions(node, &before, &after);
+    }
+}
+
+fn normalize_inline_style_property(property: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    if property != "color" && !property.ends_with("-color") || value.is_empty() {
+        return Some(value.to_string());
+    }
+    let lower = value.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer" | "currentcolor"
+    ) || w3cos_std::color::Color::from_named(&lower).is_some()
+    {
+        return Some(lower);
+    }
+    w3cos_std::color::Color::from_css(&lower).map(serialize_css_color)
 }
 
 fn style_css_text(node: u32) -> String {
@@ -11010,9 +11043,7 @@ fn style_value(node: u32) -> Value {
                 return true;
             }
             let property = camel_to_kebab(key);
-            !w3cos_dom::css_style::CSSStyleDeclaration::new()
-                .get_property(&property)
-                .is_empty()
+            css_property_supported(&property, "initial")
                 || STYLE_CACHE.with(|cache| {
                     cache
                         .borrow()
@@ -11049,6 +11080,10 @@ fn serialize_computed_style_property(property: &str, value: &str) -> String {
     let Some(color) = w3cos_std::color::Color::from_css(value) else {
         return value.to_string();
     };
+    serialize_css_color(color)
+}
+
+fn serialize_css_color(color: w3cos_std::color::Color) -> String {
     if color.a == 255 {
         return format!("rgb({}, {}, {})", color.r, color.g, color.b);
     }
@@ -11057,7 +11092,7 @@ fn serialize_computed_style_property(property: &str, value: &str) -> String {
         alpha.pop();
     }
     if alpha.ends_with('.') {
-        alpha.push('0');
+        alpha.pop();
     }
     format!("rgba({}, {}, {}, {alpha})", color.r, color.g, color.b)
 }
@@ -11066,11 +11101,33 @@ fn computed_style_property_value(node: u32, pseudo: Option<&str>, property: &str
     if let Some(value) = sampled_css_motion_value(node, pseudo, property) {
         return css_motion_value_to_css(value);
     }
-    let value = match pseudo {
+    let mut value = match pseudo {
         Some(pseudo) => dom::computed_pseudo_style_property(node, pseudo, property),
         None => dom::computed_style_property(node, property),
     };
+    if value.is_empty() && pseudo.is_none() {
+        value = inline_computed_style_fallback(node, property);
+    }
     serialize_computed_style_property(property, &value)
+}
+
+fn inline_computed_style_fallback(node: u32, property: &str) -> String {
+    let initial = match property {
+        "border-bottom-style" | "border-left-style" | "border-right-style"
+        | "border-top-style" | "clear" | "float" => "none",
+        "border-collapse" => "separate",
+        "empty-cells" => "show",
+        _ => return String::new(),
+    };
+    let inline = style_read(node, property);
+    match inline.to_ascii_lowercase().as_str() {
+        "" | "initial" | "unset" | "revert" | "revert-layer" => initial.to_string(),
+        "inherit" => dom::parent_node(node)
+            .map(|parent| computed_style_property_value(parent, None, property))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| initial.to_string()),
+        _ => inline,
+    }
 }
 
 fn computed_style_value(node: u32, pseudo: Option<String>) -> Value {
@@ -25022,6 +25079,64 @@ try {
         assert_eq!(
             serialize_computed_style_property("color", "rgba(255, 0, 0, 0.5)"),
             "rgba(255, 0, 0, 0.502)"
+        );
+    }
+
+    #[test]
+    fn inline_style_canonicalizes_and_rejects_color_values() {
+        setup();
+        let div = create_in_body("div");
+        let style = div.get_property("style");
+
+        style.set_property("color", Value::string("#009"));
+        assert_eq!(
+            style.call_method("getPropertyValue", vec![Value::string("color")]),
+            Value::string("rgb(0, 0, 153)")
+        );
+
+        style.set_property("color", Value::string("rgb(1%, 40%, 101%)"));
+        assert_eq!(
+            style.call_method("getPropertyValue", vec![Value::string("color")]),
+            Value::string("rgb(3, 102, 255)")
+        );
+
+        style.set_property("color", Value::string("#00g"));
+        assert_eq!(
+            style.call_method("getPropertyValue", vec![Value::string("color")]),
+            Value::string("rgb(3, 102, 255)")
+        );
+    }
+
+    #[test]
+    fn computed_style_exposes_discrete_css2_properties_and_wide_keywords() {
+        setup();
+        let parent = create_in_body("div");
+        let child = document_value().call_method("createElement", vec![Value::string("div")]);
+        parent.call_method("appendChild", vec![child.clone()]);
+        let parent_style = parent.get_property("style");
+        let child_style = child.get_property("style");
+
+        assert!(css_property_supported("float", "initial"));
+        assert_eq!(
+            window_value()
+                .call_method("getComputedStyle", vec![child.clone()])
+                .get_property("float"),
+            Value::string("none")
+        );
+        parent_style.set_property("cssFloat", Value::string("left"));
+        child_style.set_property("cssFloat", Value::string("inherit"));
+        assert_eq!(
+            window_value()
+                .call_method("getComputedStyle", vec![child.clone()])
+                .get_property("float"),
+            Value::string("left")
+        );
+        child_style.set_property("cssFloat", Value::string("unset"));
+        assert_eq!(
+            window_value()
+                .call_method("getComputedStyle", vec![child])
+                .get_property("float"),
+            Value::string("none")
         );
     }
 

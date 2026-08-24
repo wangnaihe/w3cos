@@ -335,8 +335,12 @@ pub fn for_in_keys(value: &Value) -> Value {
             let key = key.to_js_string();
             let enumerable = {
                 let object = object.borrow();
-                let descriptor = object.get_own_property_descriptor(&key);
-                !descriptor.is_undefined() && descriptor.get_property("enumerable").to_bool()
+                if object.is_proxy() {
+                    let descriptor = object.get_own_property_descriptor(&key);
+                    !descriptor.is_undefined() && descriptor.get_property("enumerable").to_bool()
+                } else {
+                    object.own_property_enumerability(&key).unwrap_or(false)
+                }
             };
             if !enumerable {
                 continue;
@@ -811,6 +815,30 @@ mod tests {
             .map(|value| value.to_js_string())
             .collect::<Vec<_>>();
         assert_eq!(keys, vec!["only"]);
+    }
+
+    #[test]
+    fn for_in_keys_does_not_retain_descriptor_objects_for_plain_properties() {
+        crate::page_arena::reset();
+        let owner = crate::heap::HeapOwner::new();
+        let _scope = owner.enter();
+        let object = Value::object(HashMap::from([
+            ("first".into(), Value::Number(1.0)),
+            ("second".into(), Value::Number(2.0)),
+            ("third".into(), Value::Number(3.0)),
+        ]));
+        let warmup = for_in_keys(&object);
+        assert_eq!(warmup.iter().count(), 3);
+        drop(warmup);
+        let before = owner.snapshot();
+
+        for _ in 0..1_000 {
+            let keys = for_in_keys(&object);
+            assert_eq!(keys.iter().count(), 3);
+        }
+
+        let after = owner.snapshot();
+        assert_eq!(after.live_objects, before.live_objects);
     }
 }
 

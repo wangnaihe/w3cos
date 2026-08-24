@@ -1738,7 +1738,9 @@ impl Value {
             } else if key == "length" {
                 Value::Number(arr.borrow().len() as f64)
             } else {
-                Value::Undefined
+                crate::array_value()
+                    .get_property("prototype")
+                    .get_property(key)
             };
         }
         match self {
@@ -1836,7 +1838,23 @@ impl Value {
                     return true;
                 }
             }
-            return o.borrow_mut().set(key, value, self);
+            let proxy_set = {
+                let object = o.borrow();
+                object
+                    .proxy_handler
+                    .as_ref()
+                    .and_then(|handler| handler.set.as_ref())
+                    .map(|trap| (Rc::clone(trap), object.target_value()))
+            };
+            if let Some((trap, target)) = proxy_set {
+                // A Proxy trap is user code and can re-enter the receiver. Do
+                // not retain the RefCell borrow while it runs: DOM setters, in
+                // particular, may synchronously dispatch events or refresh a
+                // stylesheet and read another property from the same element.
+                return trap(&target, key, value, self);
+            }
+            o.borrow_mut().set_direct(key, value);
+            return true;
         }
         if let Some(arr) = self.as_array() {
             if let Ok(idx) = key.parse::<usize>() {
@@ -1914,6 +1932,10 @@ impl Value {
     pub fn object(props: HashMap<String, Value>) -> Self {
         let handle = crate::page_arena::alloc_object(crate::JsObject::from_map(props));
         Value::Imm(Immediate::from_object_handle(handle))
+    }
+
+    pub(crate) fn collectable_object(props: HashMap<String, Value>) -> Self {
+        Value::Object(Rc::new(RefCell::new(crate::JsObject::from_map(props))))
     }
 
     pub fn object_from_parts(parts: Vec<Value>) -> Self {
@@ -2499,6 +2521,9 @@ impl Value {
     }
 
     pub fn iter(&self) -> ValueIterator {
+        if let Some(values) = self.as_array() {
+            return ValueIterator::new(LiveArrayIterator { values, index: 0 });
+        }
         if let Some(iterator) = acquire_custom_iterator(self, "__w3cos_symbol_iterator", vec![]) {
             return ValueIterator::new(ProtocolValueIterator {
                 iterator,
@@ -2509,10 +2534,6 @@ impl Value {
             return iterator;
         }
         match self {
-            _ if self.as_array().is_some() => ValueIterator::new(LiveArrayIterator {
-                values: self.as_array().expect("array"),
-                index: 0,
-            }),
             _ if self.is_string() => {
                 let value = self.as_js_string().expect("string");
                 ValueIterator::new(
@@ -2582,17 +2603,17 @@ pub(crate) fn iterator_object(iterator: ValueIterator) -> Value {
     let iterator = Rc::new(RefCell::new(iterator));
     let next_iterator = Rc::clone(&iterator);
     let next = Value::function(move |_, _| {
-        if let Some(value) = next_iterator.borrow_mut().next() {
-            crate::js_object! {
-                "value" => value,
-                "done" => Value::Bool(false),
-            }
-        } else {
-            crate::js_object! {
-                "value" => Value::Undefined,
-                "done" => Value::Bool(true),
-            }
-        }
+        let (value, done) = next_iterator
+            .borrow_mut()
+            .next()
+            .map_or((Value::Undefined, true), |value| (value, false));
+        // Iterator result records normally die before the next step. Keep
+        // them on the collectable Rc path instead of the page arena, whose
+        // immediate handles intentionally cannot be reclaimed mid-page.
+        Value::collectable_object(HashMap::from([
+            ("value".to_string(), value),
+            ("done".to_string(), Value::Bool(done)),
+        ]))
     });
     let object = crate::js_object! { "next" => next };
     let iterator = object.clone();
@@ -3783,6 +3804,22 @@ mod tests {
     }
 
     #[test]
+    fn proxy_set_trap_can_reenter_the_receiver() {
+        let handler = crate::ProxyBuilder::new()
+            .set(|_target, _key, _value, receiver| {
+                assert_eq!(receiver.get_property("marker"), Value::string("ready"));
+                true
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(crate::JsObject::with_proxy(
+            HashMap::from([("marker".to_string(), Value::string("ready"))]),
+            handler,
+        ))));
+
+        assert!(proxy.try_set_property("textContent", Value::string("updated")));
+    }
+
+    #[test]
     fn arithmetic() {
         let a = Value::Number(10.0);
         let b = Value::Number(3.0);
@@ -4162,6 +4199,32 @@ mod tests {
                 .get_property("done")
                 .to_bool()
         );
+    }
+
+    #[test]
+    fn iterator_result_objects_are_reclaimed_between_steps() {
+        crate::page_arena::reset();
+        let owner = crate::heap::HeapOwner::new();
+        let _scope = owner.enter();
+        let values = Value::array(
+            (0..1_001)
+                .map(|index| Value::Number(index as f64))
+                .collect(),
+        );
+        let iterator = values.call_method("__w3cos_symbol_iterator", vec![]);
+        let warmup = iterator.call_method("next", vec![]);
+        assert_eq!(warmup.get_property("value"), Value::Number(0.0));
+        drop(warmup);
+        let before = owner.snapshot();
+
+        for index in 1..1_001 {
+            let result = iterator.call_method("next", vec![]);
+            assert!(!result.get_property("done").to_bool());
+            assert_eq!(result.get_property("value"), Value::Number(index as f64));
+        }
+
+        let after = owner.snapshot();
+        assert_eq!(after.live_objects, before.live_objects);
     }
 
     #[test]

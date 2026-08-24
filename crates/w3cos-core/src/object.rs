@@ -167,6 +167,16 @@ impl JsObject {
             .map_or(true, |rare| !rare.non_enumerable.contains(key))
     }
 
+    /// Return the enumerability of an ordinary own property without
+    /// materializing a JavaScript property-descriptor object.
+    pub(crate) fn own_property_enumerability(&self, key: &str) -> Option<bool> {
+        if self.has_own_property(key) {
+            Some(self.own_key_enumerable(key))
+        } else {
+            None
+        }
+    }
+
     // ── Proxy-aware property access ────────────────────────────────────
 
     /// `[[Get]]` — routes through `handler.get` if present.
@@ -504,7 +514,7 @@ impl JsObject {
     }
 
     /// Snapshot the raw properties as a `Value::Object` (used as `target` arg for traps).
-    fn target_value(&self) -> Value {
+    pub(crate) fn target_value(&self) -> Value {
         let heap_allocation = HeapAllocation::new(HeapKind::Object, std::mem::size_of::<Self>());
         let rare = self.rare.as_ref().map(|rare| {
             Box::new(RareObjectData {

@@ -19,22 +19,16 @@ impl Color {
 
     pub fn from_hex(hex: &str) -> Self {
         let bare_hex = hex.trim_start_matches('#');
-        let is_hex =
-            matches!(bare_hex.len(), 3 | 6 | 8) && bare_hex.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex = matches!(bare_hex.len(), 3 | 4 | 6 | 8)
+            && bare_hex.chars().all(|c| c.is_ascii_hexdigit());
         if !is_hex {
             return Self::from_named(hex).unwrap_or(Self::BLACK);
         }
         let hex = bare_hex;
-        let hex = if hex.len() == 3 {
-            format!(
-                "{}{}{}{}{}{}",
-                &hex[0..1],
-                &hex[0..1],
-                &hex[1..2],
-                &hex[1..2],
-                &hex[2..3],
-                &hex[2..3]
-            )
+        let hex = if matches!(hex.len(), 3 | 4) {
+            hex.chars()
+                .flat_map(|character| [character, character])
+                .collect()
         } else {
             hex.to_string()
         };
@@ -82,39 +76,42 @@ impl Color {
     }
 
     pub fn from_css(value: &str) -> Option<Self> {
-        let value = value.trim();
+        let value = value.trim().to_ascii_lowercase();
         if value.starts_with('#') {
-            return Some(Self::from_hex(value));
+            let hex = value.strip_prefix('#').expect("prefix checked");
+            return (matches!(hex.len(), 3 | 4 | 6 | 8)
+                && hex.chars().all(|character| character.is_ascii_hexdigit()))
+            .then(|| Self::from_hex(&value));
         }
-        if let Some(color) = Self::from_named(value) {
+        if let Some(color) = Self::from_named(&value) {
             return Some(color);
         }
         if let Some(arguments) = value
             .strip_prefix("rgb(")
             .and_then(|value| value.strip_suffix(')'))
         {
-            let channels = parse_css_number_list(arguments)?;
+            let channels = arguments.split(',').map(str::trim).collect::<Vec<_>>();
             return (channels.len() == 3).then(|| {
-                Self::rgb(
-                    css_rgb_channel(channels[0]),
-                    css_rgb_channel(channels[1]),
-                    css_rgb_channel(channels[2]),
-                )
-            });
+                Some(Self::rgb(
+                    parse_css_rgb_channel(channels[0])?,
+                    parse_css_rgb_channel(channels[1])?,
+                    parse_css_rgb_channel(channels[2])?,
+                ))
+            })?;
         }
         if let Some(arguments) = value
             .strip_prefix("rgba(")
             .and_then(|value| value.strip_suffix(')'))
         {
-            let channels = parse_css_number_list(arguments)?;
+            let channels = arguments.split(',').map(str::trim).collect::<Vec<_>>();
             return (channels.len() == 4).then(|| {
-                Self::rgba(
-                    css_rgb_channel(channels[0]),
-                    css_rgb_channel(channels[1]),
-                    css_rgb_channel(channels[2]),
-                    (channels[3].clamp(0.0, 1.0) * 255.0).round() as u8,
-                )
-            });
+                Some(Self::rgba(
+                    parse_css_rgb_channel(channels[0])?,
+                    parse_css_rgb_channel(channels[1])?,
+                    parse_css_rgb_channel(channels[2])?,
+                    parse_css_alpha_channel(channels[3])?,
+                ))
+            })?;
         }
         None
     }
@@ -128,13 +125,22 @@ impl Color {
     }
 }
 
-fn parse_css_number_list(value: &str) -> Option<Vec<f32>> {
-    value
-        .split(',')
-        .map(|part| part.trim().parse::<f32>().ok())
-        .collect()
+fn parse_css_rgb_channel(value: &str) -> Option<u8> {
+    let (number, maximum) = match value.strip_suffix('%') {
+        Some(percentage) => (percentage.parse::<f32>().ok()?, 100.0),
+        None => (value.parse::<f32>().ok()?, 255.0),
+    };
+    number
+        .is_finite()
+        .then(|| (number.clamp(0.0, maximum) * 255.0 / maximum).round() as u8)
 }
 
-fn css_rgb_channel(value: f32) -> u8 {
-    value.clamp(0.0, 255.0).round() as u8
+fn parse_css_alpha_channel(value: &str) -> Option<u8> {
+    let (number, maximum) = match value.strip_suffix('%') {
+        Some(percentage) => (percentage.parse::<f32>().ok()?, 100.0),
+        None => (value.parse::<f32>().ok()?, 1.0),
+    };
+    number
+        .is_finite()
+        .then(|| (number.clamp(0.0, maximum) * 255.0 / maximum).round() as u8)
 }
