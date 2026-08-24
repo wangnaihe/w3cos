@@ -2697,6 +2697,19 @@ pub(crate) fn install_document_doctype(name: &str, public_id: &str, system_id: &
 }
 
 pub(crate) fn sync_global_document_child_relationships() {
+    let root = document_element_id();
+    if namespace_uri(root) == crate::html_parser_state::HTML_NAMESPACE
+        && dom::tag_name(root) == "html"
+        && let Some(body) = inclusive_descendant_elements(root).into_iter().find(|node| {
+            namespace_uri(*node) == crate::html_parser_state::HTML_NAMESPACE
+                && dom::tag_name(*node) == "body"
+        })
+    {
+        // XML navigation replaces the bootstrap HTML shell. The JS-facing
+        // document getter already follows the parsed tree; keep the native
+        // component/layout bridge rooted at that same body.
+        dom::set_render_body(body);
+    }
     let document = document_value();
     let children = global_document_children();
     for (index, child) in children.iter().enumerate() {

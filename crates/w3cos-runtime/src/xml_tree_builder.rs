@@ -443,5 +443,12 @@ mod tests {
             instruction.get_property("data"),
             Value::string("href='support/style.css' type='text/css'")
         );
+        assert_eq!(
+            crate::dom::body_id(),
+            crate::jsdom::node_id_of(
+                &crate::jsdom::document_value().get_property("body")
+            )
+            .expect("XHTML body")
+        );
     }
 }

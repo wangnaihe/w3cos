@@ -83,6 +83,11 @@ pub fn body_id() -> u32 {
     with_document(|doc| doc.body().id.as_u32())
 }
 
+pub(crate) fn set_render_body(node: u32) {
+    with_document_mut(|document| document.set_render_body(NodeId::from_u32(node)));
+    mark_dom_dirty();
+}
+
 pub(crate) fn set_html_document(html_document: bool) {
     with_document_mut(|document| document.set_html_document(html_document));
 }

@@ -170,6 +170,15 @@ impl Document {
         Element::new(self.body_id)
     }
 
+    /// Select the body subtree used by the component/layout bridge.
+    ///
+    /// HTML parsing reuses the bootstrap body, while XML/XHTML parsing creates
+    /// its body from the response document and switches the render root here.
+    pub fn set_render_body(&mut self, body: NodeId) {
+        debug_assert_eq!(self.get_node(body).node_type, NodeType::Element);
+        self.body_id = body;
+    }
+
     pub fn set_html_document(&mut self, html_document: bool) {
         self.html_document = html_document;
     }
