@@ -1773,6 +1773,10 @@ fn update_text_leaf_heights(
                     {
                         h = h.max(browser_height);
                     }
+                    if style.box_sizing == WBoxSizing::ContentBox {
+                        let padding = style.padding_lengths();
+                        h = (h - padding.top - padding.bottom).max(0.0);
+                    }
                     let mut taffy_style = tree.style(node)?.clone();
                     let measured_height = Dimension::length(h);
                     if taffy_style.min_size.height != measured_height
@@ -4516,6 +4520,41 @@ mod tests {
         assert!(
             (padded_width - content_width - 16.0).abs() < 1.0,
             "normal inline padding should contribute once, got {content_width} -> {padded_width}"
+        );
+    }
+
+    #[test]
+    fn block_text_content_box_counts_em_padding_once() {
+        let text_style = Style {
+            display: WDisp::Block,
+            padding: w3cos_std::style::Edges {
+                top: WSpacing::Em(2.0),
+                right: WSpacing::Em(2.0),
+                bottom: WSpacing::Em(2.0),
+                left: WSpacing::Em(2.0),
+            },
+            ..Style::default()
+        };
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(800.0),
+                    height: WDim::Px(600.0),
+                    ..Style::default()
+                },
+                vec![Component::text("There should be one line.", text_style.clone())],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        let text = layout[1].0;
+        assert!(
+            (text.height - 83.2).abs() < 0.1,
+            "block text should have one 19.2px line plus 64px padding, got {}",
+            text.height
         );
     }
 
