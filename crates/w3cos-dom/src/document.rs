@@ -1033,6 +1033,40 @@ impl Document {
                 style.background_blend_mode = parent.background_blend_mode.clone();
             }
         }
+        if let Some(parent) = inherited {
+            let inherits_background_longhand = |property: &str| {
+                declared_property_value(&["background", property]).is_some_and(
+                    |(declared_property, value)| {
+                        css_property_eq(declared_property, property)
+                            && value.trim().eq_ignore_ascii_case("inherit")
+                    },
+                )
+            };
+            if inherits_background_longhand("background-image") {
+                style.background_image = parent.background_image.clone();
+            }
+            if inherits_background_longhand("background-size") {
+                style.background_size = parent.background_size.clone();
+            }
+            if inherits_background_longhand("background-position") {
+                style.background_position = parent.background_position.clone();
+            }
+            if inherits_background_longhand("background-repeat") {
+                style.background_repeat = parent.background_repeat.clone();
+            }
+            if inherits_background_longhand("background-origin") {
+                style.background_origin = parent.background_origin.clone();
+            }
+            if inherits_background_longhand("background-clip") {
+                style.background_clip = parent.background_clip.clone();
+            }
+            if inherits_background_longhand("background-attachment") {
+                style.background_attachment = parent.background_attachment.clone();
+            }
+            if inherits_background_longhand("background-blend-mode") {
+                style.background_blend_mode = parent.background_blend_mode.clone();
+            }
+        }
         if declared_value(&["border-color"])
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("currentcolor"))
         {

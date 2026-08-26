@@ -2824,6 +2824,29 @@ mod tests {
     }
 
     #[test]
+    fn test_background_position_inherit_uses_parent_computed_position() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("background-position", "192px")]);
+        crate::stylesheet::register_rule("#child", &[("background-position", "inherit")]);
+
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        parent.set_attribute(&mut doc, "id", "parent");
+        let child = doc.create_element("div");
+        child.set_attribute(&mut doc, "id", "child");
+        parent.append_child(&mut doc, child);
+        doc.body().append_child(&mut doc, parent);
+
+        assert_eq!(
+            doc.computed_style_for(child.id)
+                .background_position
+                .as_deref(),
+            Some("192px")
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_font_shorthand_survives_computed_style_inheritance() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("p", &[("font", "1em/1.25 serif")]);
