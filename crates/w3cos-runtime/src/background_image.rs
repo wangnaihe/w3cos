@@ -839,6 +839,7 @@ fn resolve_position(value: &str, area: LayoutRect, width: f32, height: f32) -> (
         [one] if matches!(*one, "left" | "right") => (*one, "50%"),
         [one] => (*one, "50%"),
         [first, second, ..] if matches!(*first, "top" | "bottom") => (*second, *first),
+        [first, second, ..] if matches!(*second, "left" | "right") => (*second, *first),
         [first, second, ..] => (*first, *second),
     };
     (
@@ -1125,6 +1126,21 @@ mod tests {
         assert_eq!(
             resolve_position("bottom 25% left 5px", area, 50.0, 20.0),
             (15.0, 80.0)
+        );
+    }
+
+    #[test]
+    fn two_keyword_position_accepts_vertical_then_horizontal_order() {
+        let area = LayoutRect {
+            x: 8.0,
+            y: 51.0,
+            width: 288.0,
+            height: 288.0,
+        };
+
+        assert_eq!(
+            resolve_position("center left", area, 96.0, 96.0),
+            (8.0, 147.0)
         );
     }
 
