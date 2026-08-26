@@ -4513,19 +4513,23 @@ fn inherit_text_style(
     if !declares("color") && !form_control {
         style.color = parent.color;
     }
-    if !declares("font-size") && !form_control && !heading {
+    if !declares("font-size") && !declares("font") && !form_control && !heading {
         style.font_size = parent.font_size;
     }
-    if !declares("font-weight") && !heading && !matches!(tag, "b" | "strong") {
+    if !declares("font-weight")
+        && !declares("font")
+        && !heading
+        && !matches!(tag, "b" | "strong")
+    {
         style.font_weight = parent.font_weight;
     }
-    if !declares("font-family") {
+    if !declares("font-family") && !declares("font") {
         style.font_family = parent.font_family.clone();
     }
-    if !declares("font-style") && !matches!(tag, "em" | "i") {
+    if !declares("font-style") && !declares("font") && !matches!(tag, "em" | "i") {
         style.font_style = parent.font_style;
     }
-    if !declares("line-height") {
+    if !declares("line-height") && !declares("font") {
         style.line_height = parent.line_height;
     }
     if !declares("letter-spacing") {

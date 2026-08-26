@@ -301,6 +301,7 @@ impl CSSStyleDeclaration {
                     self.inner.font_size = v
                 }
             }
+            "font" => apply_font_shorthand(&mut self.inner, value),
             "font-weight" | "fontWeight" => {
                 if let Ok(v) = value.parse() {
                     self.inner.font_weight = v
@@ -1419,6 +1420,110 @@ fn parse_font_style(value: &str) -> w3cos_std::style::FontStyle {
     }
 }
 
+fn apply_font_shorthand(style: &mut Style, value: &str) {
+    let (before_line_height, after_slash) = value
+        .split_once('/')
+        .map_or((value, None), |(before, after)| (before, Some(after)));
+    let before_parts = split_css_whitespace(before_line_height);
+    let Some((size_index, size)) = before_parts
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, value)| parse_font_size(value, style.font_size).map(|size| (index, size)))
+    else {
+        return;
+    };
+
+    style.font_size = size;
+    for part in &before_parts[..size_index] {
+        match part.as_str() {
+            "italic" | "oblique" | "normal" => style.font_style = parse_font_style(part),
+            "bold" => style.font_weight = 700,
+            _ => {
+                if let Ok(weight) = part.parse::<u16>() {
+                    style.font_weight = weight;
+                }
+            }
+        }
+    }
+
+    let family = if let Some(after_slash) = after_slash {
+        let after_slash = after_slash.trim_start();
+        let line_height_end = after_slash
+            .find(char::is_whitespace)
+            .unwrap_or(after_slash.len());
+        let line_height = &after_slash[..line_height_end];
+        if let Some(line_height) = parse_font_line_height(line_height, style.font_size) {
+            style.line_height = line_height;
+        }
+        after_slash[line_height_end..].trim()
+    } else {
+        value_after_nth_whitespace_token(value, size_index + 1)
+    };
+
+    if !family.is_empty() {
+        style.font_family = Some(family.trim_matches('"').trim_matches('\'').to_string());
+    }
+}
+
+fn parse_font_size(value: &str, inherited_size: f32) -> Option<f32> {
+    let value = value.trim();
+    if let Some(number) = value.strip_suffix("rem") {
+        return number.trim().parse::<f32>().ok().map(|number| number * 16.0);
+    }
+    if let Some(number) = value.strip_suffix("em") {
+        return number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|number| number * inherited_size);
+    }
+    if let Some(number) = value.strip_suffix('%') {
+        return number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|number| number * inherited_size / 100.0);
+    }
+    parse_px(value)
+}
+
+fn parse_font_line_height(value: &str, font_size: f32) -> Option<f32> {
+    let value = value.trim();
+    if value == "normal" {
+        return Some(1.2);
+    }
+    if let Some(number) = value.strip_suffix('%') {
+        return number.trim().parse::<f32>().ok().map(|number| number / 100.0);
+    }
+    if let Ok(number) = value.parse::<f32>() {
+        return Some(number.max(0.0));
+    }
+    if let Some(px) = parse_px(value) {
+        return Some((px / font_size.max(1.0)).max(0.0));
+    }
+    None
+}
+
+fn value_after_nth_whitespace_token(value: &str, token_count: usize) -> &str {
+    let mut seen = 0;
+    let mut in_token = false;
+    for (index, ch) in value.char_indices() {
+        if ch.is_whitespace() {
+            if in_token {
+                seen += 1;
+                in_token = false;
+            }
+        } else if !in_token {
+            if seen == token_count {
+                return &value[index..];
+            }
+            in_token = true;
+        }
+    }
+    ""
+}
+
 fn parse_word_break(value: &str) -> w3cos_std::style::WordBreak {
     use w3cos_std::style::WordBreak;
     match value.trim() {
@@ -1450,6 +1555,21 @@ mod overflow_wrap_tests {
             declaration.to_style().word_break,
             w3cos_std::style::WordBreak::BreakWord
         );
+    }
+}
+
+#[cfg(test)]
+mod font_shorthand_tests {
+    use super::*;
+
+    #[test]
+    fn font_shorthand_preserves_unitless_line_height() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font", "1em/1.25 serif");
+
+        let style = declaration.to_style();
+        assert_eq!(style.line_height, 1.25);
+        assert_eq!(style.font_family.as_deref(), Some("serif"));
     }
 }
 

@@ -1065,6 +1065,7 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "margin-bottom" => style.margin_bottom = css_parse_spacing(value),
         "margin-left" => style.margin_left = css_parse_spacing(value),
         "box-sizing" => style.box_sizing = Some(value.to_string()),
+        "font" => apply_font_shorthand(style, value),
         "font-size" => style.font_size = css_parse_px(value),
         "font-weight" => style.font_weight = parse_font_weight(value),
         "font-family" => {
@@ -1470,6 +1471,38 @@ fn parse_font_weight(value: &str) -> Option<u16> {
     }
 }
 
+fn apply_font_shorthand(style: &mut StyleDecl, value: &str) {
+    let Some((before_line_height, after_slash)) = value.split_once('/') else {
+        return;
+    };
+    let Some(size) = before_line_height.split_ascii_whitespace().next_back() else {
+        return;
+    };
+    if let Some(size) = w3cos_std::style::parse_absolute_length_px(size) {
+        style.font_size = Some(size);
+    }
+
+    let after_slash = after_slash.trim_start();
+    let line_height_end = after_slash
+        .find(char::is_whitespace)
+        .unwrap_or(after_slash.len());
+    let line_height = &after_slash[..line_height_end];
+    style.line_height = line_height
+        .parse::<f32>()
+        .ok()
+        .or_else(|| {
+            line_height
+                .strip_suffix('%')
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .map(|value| value / 100.0)
+        });
+
+    let family = after_slash[line_height_end..].trim();
+    if !family.is_empty() {
+        style.font_family = Some(family.trim_matches('"').trim_matches('\'').to_string());
+    }
+}
+
 fn parse_border_shorthand(style: &mut StyleDecl, value: &str) {
     let parts: Vec<&str> = value.split_whitespace().collect();
     for part in &parts {
@@ -1537,6 +1570,14 @@ mod tests {
         assert_eq!(sheet.rules[0].style.color.as_deref(), Some("#e94560"));
         assert_eq!(sheet.rules[0].style.font_size, Some(24.0));
         assert!(sheet.rules[0].layer.is_none());
+    }
+
+    #[test]
+    fn font_shorthand_preserves_unitless_line_height() {
+        let sheet = parse_css("p { font: 1em/1.25 serif; }");
+        let style = &sheet.rules[0].style;
+        assert_eq!(style.line_height, Some(1.25));
+        assert_eq!(style.font_family.as_deref(), Some("serif"));
     }
 
     #[test]

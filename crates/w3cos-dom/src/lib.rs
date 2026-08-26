@@ -2800,6 +2800,25 @@ mod tests {
     }
 
     #[test]
+    fn test_font_shorthand_survives_computed_style_inheritance() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("p", &[("font", "1em/1.25 serif")]);
+
+        let mut doc = Document::new();
+        let paragraph = doc.create_element("p");
+        let text = doc.create_element("span");
+        paragraph.append_child(&mut doc, text);
+        doc.body().append_child(&mut doc, paragraph);
+
+        let paragraph_style = doc.computed_style_for(paragraph.id);
+        assert_eq!(paragraph_style.font_size, 16.0);
+        assert_eq!(paragraph_style.line_height, 1.25);
+        assert_eq!(paragraph_style.font_family.as_deref(), Some("serif"));
+        assert_eq!(doc.computed_style_for(text.id).line_height, 1.25);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_scoped_inline_custom_properties_resolve_in_descendant_rules() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
