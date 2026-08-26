@@ -4514,7 +4514,7 @@ mod tests {
                 )
                 .is_undefined()
         );
-        assert!(signal.get_property("onabort").is_null());
+        assert!(signal.get_property("onabort").is_undefined());
         assert!(callback_marker_weak.upgrade().is_none());
         assert!(handler_marker_weak.upgrade().is_none());
 

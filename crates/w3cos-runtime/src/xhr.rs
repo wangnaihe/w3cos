@@ -561,8 +561,8 @@ mod tests {
             assert!(xhr.call_method(method, vec![]).is_undefined());
         }
         assert!(upload.call_method("dispatchEvent", vec![]).is_undefined());
-        assert!(xhr.get_property("upload").is_null());
-        assert!(xhr.get_property("response").is_null());
+        assert!(xhr.get_property("upload").is_undefined());
+        assert!(xhr.get_property("response").is_undefined());
         assert!(xhr_marker_weak.upgrade().is_none());
         assert!(upload_marker_weak.upgrade().is_none());
 
