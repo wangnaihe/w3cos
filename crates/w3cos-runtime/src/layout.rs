@@ -871,13 +871,18 @@ impl LayoutEngine {
             viewport_w,
             viewport_h,
         ) + root_margins.left;
+        let (root_relative_x, root_relative_y) = root_relative_offset(
+            flat.first().map(|entry| entry.style),
+            viewport_w,
+            viewport_h,
+        );
 
         collect_layouts_fast(
             flat,
             &self.tree,
             root_node,
-            root_x,
-            root_margins.top,
+            root_x + root_relative_x,
+            root_margins.top + root_relative_y,
             viewport_w,
             viewport_h,
             initial_containing_block,
@@ -975,13 +980,18 @@ pub fn compute_with_scroll(
         viewport_w,
         viewport_h,
     ) + root_margins.left;
+    let (root_relative_x, root_relative_y) = root_relative_offset(
+        flat.first().map(|entry| entry.style),
+        viewport_w,
+        viewport_h,
+    );
 
     collect_layouts_fast(
         &flat,
         &tree,
         root_node,
-        root_x,
-        root_margins.top,
+        root_x + root_relative_x,
+        root_margins.top + root_relative_y,
         viewport_w,
         viewport_h,
         initial_containing_block,
@@ -1098,6 +1108,45 @@ fn root_used_margins(
         bottom: resolve(style.margin.bottom),
         left: resolve(style.margin.left),
     }
+}
+
+fn root_relative_offset(
+    style: Option<&w3cos_std::style::Style>,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> (f32, f32) {
+    let Some(style) = style.filter(|style| matches!(style.position, WPos::Relative)) else {
+        return (0.0, 0.0);
+    };
+    let resolve_h = |dimension: WDim| {
+        dimension.resolve(
+            viewport_w,
+            ROOT_FONT_SIZE,
+            style.font_size,
+            viewport_w,
+            viewport_h,
+        )
+    };
+    let resolve_v = |dimension: WDim| {
+        dimension.resolve(
+            viewport_h,
+            ROOT_FONT_SIZE,
+            style.font_size,
+            viewport_w,
+            viewport_h,
+        )
+    };
+    let x = match (resolve_h(style.left), resolve_h(style.right)) {
+        (Some(left), _) => left,
+        (None, Some(right)) => -right,
+        (None, None) => 0.0,
+    };
+    let y = match (resolve_v(style.top), resolve_v(style.bottom)) {
+        (Some(top), _) => top,
+        (None, Some(bottom)) => -bottom,
+        (None, None) => 0.0,
+    };
+    (x, y)
 }
 
 // ---------------------------------------------------------------------------
@@ -1893,14 +1942,15 @@ fn compute_absolute_rect(
             viewport_h,
         )
     };
-    let width = match style.width {
-        WDim::Percent(_) => resolve_h(style.width).unwrap_or(fallback.width),
-        _ => fallback.width,
-    };
-    let height = match style.height {
-        WDim::Percent(_) => resolve_v(style.height).unwrap_or(fallback.height),
-        _ => fallback.height,
-    };
+    let (width, height) = positioned_percentage_border_box_size(
+        style,
+        containing_block.width,
+        containing_block.height,
+        viewport_w,
+        viewport_h,
+        fallback.width,
+        fallback.height,
+    );
 
     let x = match (resolve_h(style.left), resolve_h(style.right)) {
         (Some(left), _) => containing_block.x + left,
@@ -1951,14 +2001,9 @@ fn compute_fixed_rect(
     let right = resolve_h(style.right);
     let top = resolve_v(style.top);
     let bottom = resolve_v(style.bottom);
-    let width = match style.width {
-        WDim::Percent(_) => resolve_h(style.width).unwrap_or(width),
-        _ => width,
-    };
-    let height = match style.height {
-        WDim::Percent(_) => resolve_v(style.height).unwrap_or(height),
-        _ => height,
-    };
+    let (width, height) = positioned_percentage_border_box_size(
+        style, viewport_w, viewport_h, viewport_w, viewport_h, width, height,
+    );
 
     let x = match (left, right) {
         (Some(l), _) => l,
@@ -1977,6 +2022,70 @@ fn compute_fixed_rect(
         width,
         height,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn positioned_percentage_border_box_size(
+    style: &w3cos_std::style::Style,
+    containing_width: f32,
+    containing_height: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+    fallback_width: f32,
+    fallback_height: f32,
+) -> (f32, f32) {
+    let resolve_spacing = |spacing: WSpacing, percentage_basis: f32| match spacing {
+        WSpacing::Percent(value) => percentage_basis * value / 100.0,
+        WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
+        WSpacing::Em(value) => value * style.font_size,
+        WSpacing::Vw(value) => value * viewport_w / 100.0,
+        WSpacing::Vh(value) => value * viewport_h / 100.0,
+        WSpacing::Auto => 0.0,
+        other => other.resolve(&w3cos_std::safe_area::current()),
+    };
+    let content_width = style.width.resolve(
+        containing_width,
+        ROOT_FONT_SIZE,
+        style.font_size,
+        viewport_w,
+        viewport_h,
+    );
+    let content_height = style.height.resolve(
+        containing_height,
+        ROOT_FONT_SIZE,
+        style.font_size,
+        viewport_w,
+        viewport_h,
+    );
+    let width = if matches!(style.width, WDim::Percent(_)) {
+        let width = content_width.unwrap_or(fallback_width);
+        if style.box_sizing == WBoxSizing::ContentBox {
+            width
+                + resolve_spacing(style.padding.left, containing_width)
+                + resolve_spacing(style.padding.right, containing_width)
+                + style.border_left_width.unwrap_or(style.border_width)
+                + style.border_right_width.unwrap_or(style.border_width)
+        } else {
+            width
+        }
+    } else {
+        fallback_width
+    };
+    let height = if matches!(style.height, WDim::Percent(_)) {
+        let height = content_height.unwrap_or(fallback_height);
+        if style.box_sizing == WBoxSizing::ContentBox {
+            height
+                + resolve_spacing(style.padding.top, containing_width)
+                + resolve_spacing(style.padding.bottom, containing_width)
+                + style.border_top_width.unwrap_or(style.border_width)
+                + style.border_bottom_width.unwrap_or(style.border_width)
+        } else {
+            height
+        }
+    } else {
+        fallback_height
+    };
+    (width, height)
 }
 
 // ---------------------------------------------------------------------------
@@ -2775,6 +2884,23 @@ mod tests {
     }
 
     #[test]
+    fn root_relative_insets_offset_the_root_and_its_descendants() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                left: WDim::Px(100.0),
+                top: WDim::Px(100.0),
+                ..Style::default()
+            },
+            vec![Component::text("child", s())],
+        );
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!((layout[0].0.x, layout[0].0.y), (100.0, 100.0));
+        assert_eq!((layout[1].0.x, layout[1].0.y), (100.0, 100.0));
+    }
+
+    #[test]
     fn root_left_auto_margin_uses_the_initial_containing_block() {
         let root = Component::boxed(
             Style {
@@ -2825,6 +2951,15 @@ mod tests {
 
         let fixed = compute_fixed_rect(&style, 800.0, 600.0, 0.0, 0.0);
         assert_eq!((fixed.width, fixed.height), (800.0, 600.0));
+
+        let content_box_with_border = Style {
+            width: WDim::Percent(50.0),
+            height: WDim::Percent(50.0),
+            border_width: 10.0,
+            ..style
+        };
+        let fixed = compute_fixed_rect(&content_box_with_border, 800.0, 600.0, 0.0, 0.0);
+        assert_eq!((fixed.width, fixed.height), (420.0, 320.0));
     }
 
     #[test]
