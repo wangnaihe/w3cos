@@ -1881,10 +1881,38 @@ fn inline_absolute_static_rect(
     }
     let parent = tree.parent(node)?;
     let siblings = tree.children(parent).ok()?;
-    let mut cursor_x = 0.0_f32;
+    let parent_index = tree.get_node_context(parent).copied()?;
+    let parent_style = flat.get(parent_index)?.style;
+    let parent_margin = parent_style.margin_lengths();
+    let parent_padding = parent_style.padding_lengths();
+    let parent_border_left = parent_style
+        .border_left_width
+        .unwrap_or(parent_style.border_width);
+    let inline_start_is_meaningful = [
+        parent_margin.left,
+        parent_padding.left,
+        parent_border_left,
+        parent_margin.top,
+        parent_margin.bottom,
+        parent_padding.top,
+        parent_padding.bottom,
+        parent_style
+            .border_top_width
+            .unwrap_or(parent_style.border_width),
+        parent_style
+            .border_bottom_width
+            .unwrap_or(parent_style.border_width),
+    ]
+    .into_iter()
+    .any(|value| value.abs() > f32::EPSILON);
+    let mut cursor_x = parent_margin.left + parent_padding.left + parent_border_left;
     let mut cursor_y = 0.0_f32;
-    let mut line_height = 0.0_f32;
-    let mut has_meaningful_inline_predecessor = false;
+    let mut line_height = if inline_start_is_meaningful {
+        parent_style.font_size * parent_style.line_height
+    } else {
+        0.0
+    };
+    let mut has_meaningful_inline_predecessor = inline_start_is_meaningful;
     let mut crossed_forced_line_break = false;
     for sibling in siblings {
         if sibling == node {
@@ -1956,15 +1984,24 @@ fn inline_absolute_static_rect(
     }
     let fragmented_inline_start_padding = crossed_forced_line_break
         .then(|| {
-            let parent_index = tree.get_node_context(parent).copied()?;
-            let parent_style = flat.get(parent_index)?.style;
             matches!(parent_style.display, WDisplay::Inline)
                 .then_some(parent_style.padding_lengths().left)
         })
         .flatten()
         .unwrap_or(0.0);
-    rect.x = containing_block.x - fragmented_inline_start_padding + cursor_x;
-    rect.y = containing_block.y + cursor_y;
+    if matches!(
+        style.display,
+        WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem
+    ) {
+        // A block-level static-position placeholder splits its inline parent.
+        // Its block starts after the preceding line box, at the containing
+        // block's inline start rather than after the inline fragment itself.
+        rect.x = containing_block.x;
+        rect.y = containing_block.y + cursor_y + line_height;
+    } else {
+        rect.x = containing_block.x - fragmented_inline_start_padding + cursor_x;
+        rect.y = containing_block.y + cursor_y;
+    }
     Some(rect)
 }
 
@@ -3202,6 +3239,46 @@ mod tests {
         assert_eq!(layout[1].0.width, 0.0);
         assert_eq!(layout[1].0.height, 200.0);
         assert_eq!(layout[2].0.y, 200.0);
+    }
+
+    #[test]
+    fn block_static_position_follows_a_decorated_inline_fragment() {
+        let absolute = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Absolute,
+                width: WDim::Px(100.0),
+                height: WDim::Px(100.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let inline = Component::boxed(
+            Style {
+                display: WDisp::Inline,
+                line_height: 6.25,
+                margin: w3cos_std::style::Edges {
+                    left: WSpacing::Px(-100.0),
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                border_left_width: Some(100.0),
+                ..Style::default()
+            },
+            vec![absolute, Component::text("X", Style::default())],
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                height: WDim::Px(100.0),
+                ..Style::default()
+            },
+            vec![inline],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[2].0.x, 0.0);
+        assert_eq!(layout[2].0.y, 100.0);
     }
 
     #[test]
