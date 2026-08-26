@@ -49,8 +49,8 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
     let mut nodes = layout_cache
         .iter()
         .filter_map(|&(rect, index)| {
-            let node = flat.get(index)?;
-            Some((index, rect, node.kind, node.style))
+            let node = artifact.nodes.get(index)?;
+            Some((index, rect, &node.kind, &node.style))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
     nodes.sort_by_key(|(index, _, _, _)| artifact.z_order[*index]);
@@ -67,7 +67,7 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
             &scroll_info,
             &HashMap::new(),
             None,
-            w3cos_std::color::Color::WHITE,
+            artifact.canvas_background,
             Some(&artifact),
             None,
             1.0,

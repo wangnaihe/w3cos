@@ -3320,15 +3320,7 @@ impl App {
         // behind translucent system UI such as the rounded iOS keyboard. Use
         // the root (or its document-element child) instead of exposing the
         // renderer's historical dark debug clear color.
-        let canvas_background = flat
-            .first()
-            .filter(|node| node.style.background.a > 0)
-            .or_else(|| {
-                flat.iter()
-                    .find(|node| node.parent == Some(0) && node.style.background.a > 0)
-            })
-            .map(|node| node.style.background)
-            .unwrap_or(Color::WHITE);
+        let canvas_background = self.paint_artifact.canvas_background;
 
         // A CSS transform establishes a transformed subtree, so animated
         // translation must affect descendants as well as the panel box.
@@ -3697,15 +3689,7 @@ impl App {
 
         let now = Instant::now();
         let flat = self.paint_artifact.nodes.as_slice();
-        let canvas_background = flat
-            .first()
-            .filter(|node| node.style.background.a > 0)
-            .or_else(|| {
-                flat.iter()
-                    .find(|node| node.parent == Some(0) && node.style.background.a > 0)
-            })
-            .map(|node| node.style.background)
-            .unwrap_or(Color::WHITE);
+        let canvas_background = self.paint_artifact.canvas_background;
 
         let mut style_overrides = animated_style_overrides(flat, &self.animations, now);
         if !direct_skia_present && let Some(hover_idx) = self.hovered_index {

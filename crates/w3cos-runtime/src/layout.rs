@@ -6,9 +6,9 @@ use taffy::prelude::*;
 use w3cos_std::component::EventAction;
 use w3cos_std::style::{
     AlignItems as WAlign, AlignSelf as WAlignSelf, BoxSizing as WBoxSizing, Dimension as WDim,
-    Display as WDisplay, FlexDirection as WDir, FlexWrap as WWrap, JustifyContent as WJustify,
-    Overflow as WOverflow, Position as WPos, Spacing as WSpacing, WhiteSpace as WWhiteSpace,
-    WordBreak as WWordBreak,
+    Display as WDisplay, EdgeLengths, FlexDirection as WDir, FlexWrap as WWrap,
+    JustifyContent as WJustify, Overflow as WOverflow, Position as WPos, Spacing as WSpacing,
+    WhiteSpace as WWhiteSpace, WordBreak as WWordBreak,
 };
 use w3cos_std::{Component, ComponentKind};
 
@@ -836,6 +836,11 @@ impl LayoutEngine {
         }
 
         let root_node = self.root_node.unwrap();
+        let root_margins = root_used_margins(
+            flat.first().map(|entry| entry.style),
+            viewport_w,
+            viewport_h,
+        );
         let space = Size {
             width: AvailableSpace::Definite(viewport_w),
             height: AvailableSpace::Definite(viewport_h),
@@ -865,14 +870,14 @@ impl LayoutEngine {
                 .map_or(viewport_w, |layout| layout.size.width),
             viewport_w,
             viewport_h,
-        );
+        ) + root_margins.left;
 
         collect_layouts_fast(
             flat,
             &self.tree,
             root_node,
             root_x,
-            0.0,
+            root_margins.top,
             viewport_w,
             viewport_h,
             initial_containing_block,
@@ -938,6 +943,11 @@ pub fn compute_with_scroll(
         viewport_h,
         viewport_w,
     )?;
+    let root_margins = root_used_margins(
+        flat.first().map(|entry| entry.style),
+        viewport_w,
+        viewport_h,
+    );
     let space = Size {
         width: AvailableSpace::Definite(viewport_w),
         height: AvailableSpace::Definite(viewport_h),
@@ -964,14 +974,14 @@ pub fn compute_with_scroll(
             .map_or(viewport_w, |layout| layout.size.width),
         viewport_w,
         viewport_h,
-    );
+    ) + root_margins.left;
 
     collect_layouts_fast(
         &flat,
         &tree,
         root_node,
         root_x,
-        0.0,
+        root_margins.top,
         viewport_w,
         viewport_h,
         initial_containing_block,
@@ -1057,6 +1067,36 @@ fn root_auto_margin_offset(
         remaining / 2.0
     } else {
         remaining
+    }
+}
+
+fn root_used_margins(
+    style: Option<&w3cos_std::style::Style>,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> EdgeLengths {
+    let Some(style) = style else {
+        return EdgeLengths {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        };
+    };
+    let resolve = |spacing: WSpacing| match spacing {
+        WSpacing::Percent(value) => viewport_w * value / 100.0,
+        WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
+        WSpacing::Em(value) => value * style.font_size,
+        WSpacing::Vw(value) => value * viewport_w / 100.0,
+        WSpacing::Vh(value) => value * viewport_h / 100.0,
+        WSpacing::Auto => 0.0,
+        other => other.resolve(&w3cos_std::safe_area::current()),
+    };
+    EdgeLengths {
+        top: resolve(style.margin.top),
+        right: resolve(style.margin.right),
+        bottom: resolve(style.margin.bottom),
+        left: resolve(style.margin.left),
     }
 }
 
@@ -2716,6 +2756,22 @@ mod tests {
         let l = compute(&Component::text("R", s()), 800.0, 600.0).unwrap();
         assert_eq!(l[0].0.x, 0.0);
         assert_eq!(l[0].0.y, 0.0);
+    }
+
+    #[test]
+    fn root_margins_offset_and_reduce_the_initial_layout_space() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                margin: w3cos_std::style::Edges::all(10.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[0].0.x, 10.0);
+        assert_eq!(layout[0].0.y, 10.0);
+        assert_eq!(layout[0].0.width, 780.0);
     }
 
     #[test]

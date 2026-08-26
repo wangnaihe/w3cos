@@ -4,6 +4,7 @@
 //! compositor consumption. The artifact owns immutable snapshots so scrolling
 //! and raster scheduling never need to walk the application component tree.
 
+use w3cos_std::color::Color;
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::{Overflow, Position, Style, Transform2D};
 
@@ -153,9 +154,11 @@ pub struct PaintChunk {
     pub z_order: i32,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PaintArtifact {
     pub nodes: Vec<PaintNode>,
+    pub canvas_background: Color,
+    pub canvas_background_source: Option<usize>,
     pub display_items: Vec<DisplayItem>,
     pub chunks: Vec<PaintChunk>,
     pub properties: PropertyTrees,
@@ -166,19 +169,54 @@ pub struct PaintArtifact {
     pub generation: u64,
 }
 
+impl Default for PaintArtifact {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            canvas_background: Color::WHITE,
+            canvas_background_source: None,
+            display_items: Vec::new(),
+            chunks: Vec::new(),
+            properties: PropertyTrees::default(),
+            node_properties: Vec::new(),
+            z_order: Vec::new(),
+            sticky_owner: Vec::new(),
+            rect_by_index: Vec::new(),
+            generation: 0,
+        }
+    }
+}
+
 impl PaintArtifact {
     pub fn build(
         nodes: impl IntoIterator<Item = PaintNode>,
         layout_cache: &[(LayoutRect, usize)],
         generation: u64,
     ) -> Self {
-        let nodes: Vec<_> = nodes.into_iter().collect();
+        let mut nodes: Vec<_> = nodes.into_iter().collect();
+        let canvas_background_source = nodes
+            .first()
+            .filter(|node| node.style.background.a > 0)
+            .map(|_| 0)
+            .or_else(|| {
+                nodes
+                    .iter()
+                    .position(|node| node.parent == Some(0) && node.style.background.a > 0)
+            });
+        let canvas_background = canvas_background_source
+            .map(|index| nodes[index].style.background)
+            .unwrap_or(Color::WHITE);
+        if let Some(index) = canvas_background_source {
+            nodes[index].style.background = Color::TRANSPARENT;
+        }
         let mut artifact = Self {
             rect_by_index: vec![None; nodes.len()],
             node_properties: vec![PaintProperties::default(); nodes.len()],
             z_order: vec![0; nodes.len()],
             sticky_owner: vec![None; nodes.len()],
             nodes,
+            canvas_background,
+            canvas_background_source,
             generation,
             ..Self::default()
         };
@@ -289,6 +327,26 @@ mod tests {
             width: 320.0,
             height: 80.0,
         }
+    }
+
+    #[test]
+    fn propagates_root_background_to_the_canvas_without_repainting_the_root_box() {
+        let mut style = Style::default();
+        style.background = Color::rgb(255, 255, 0);
+        let artifact = PaintArtifact::build(
+            [PaintNode {
+                kind: ComponentKind::Column,
+                style,
+                parent: None,
+                sticky_counter_signal: None,
+            }],
+            &[(rect(0.0), 0)],
+            1,
+        );
+
+        assert_eq!(artifact.canvas_background, Color::rgb(255, 255, 0));
+        assert_eq!(artifact.canvas_background_source, Some(0));
+        assert_eq!(artifact.nodes[0].style.background, Color::TRANSPARENT);
     }
 
     #[test]
