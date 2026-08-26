@@ -781,11 +781,7 @@ fn parse_length(value: &str) -> Length {
             .map(|value| Length::Percent(value / 100.0))
             .unwrap_or(Length::Auto)
     } else {
-        value
-            .strip_suffix("px")
-            .unwrap_or(value)
-            .trim()
-            .parse::<f32>()
+        w3cos_std::style::parse_absolute_length_px(value)
             .map(Length::Px)
             .unwrap_or(Length::Auto)
     }
@@ -942,12 +938,7 @@ fn position_offset(value: &str, free_space: f32) -> f32 {
             .parse::<f32>()
             .map(|value| free_space * value / 100.0)
             .unwrap_or(0.0),
-        value => value
-            .strip_suffix("px")
-            .unwrap_or(value)
-            .trim()
-            .parse::<f32>()
-            .unwrap_or(0.0),
+        value => w3cos_std::style::parse_absolute_length_px(value).unwrap_or(0.0),
     }
 }
 
@@ -1134,6 +1125,20 @@ mod tests {
         assert_eq!(
             resolve_position("bottom 25% left 5px", area, 50.0, 20.0),
             (15.0, 80.0)
+        );
+    }
+
+    #[test]
+    fn absolute_units_are_resolved_for_two_axis_background_positions() {
+        let area = LayoutRect {
+            x: 8.0,
+            y: 12.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        assert_eq!(
+            resolve_position("0.5in 0.5in", area, 15.0, 15.0),
+            (56.0, 60.0)
         );
     }
 
