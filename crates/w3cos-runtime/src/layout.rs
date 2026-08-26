@@ -1212,6 +1212,27 @@ fn build_taffy_tree(
     let child_containing_width =
         component_content_width(&comp.style, containing_width, viewport_w, viewport_h);
     if comp.style.display == WDisplay::Inline
+        && matches!(comp.style.position, WPos::Absolute | WPos::Fixed)
+    {
+        // Absolutely positioned inline boxes are blockified for their used
+        // box. Preserve authored dimensions even though the semantic display
+        // remains inline for hypothetical static-position calculations.
+        style.size = Size {
+            width: to_taffy_dim(
+                comp.style.width,
+                comp.style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+            height: to_taffy_dim(
+                comp.style.height,
+                comp.style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+        };
+    }
+    if comp.style.display == WDisplay::Inline
         && matches!(
             parent_display,
             Some(WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid)
@@ -1855,7 +1876,22 @@ fn inline_absolute_static_rect(
         }
         let sibling_index = tree.get_node_context(sibling).copied()?;
         let sibling_info = flat.get(sibling_index)?;
+        if matches!(sibling_info.style.display, WDisplay::None) {
+            continue;
+        }
         if matches!(sibling_info.style.position, WPos::Absolute | WPos::Fixed) {
+            continue;
+        }
+        let layout = tree.layout(sibling).ok()?;
+        if matches!(
+            sibling_info.style.display,
+            WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem
+        ) {
+            cursor_x = 0.0;
+            cursor_y = layout.location.y + layout.size.height;
+            line_height = 0.0;
+            has_meaningful_inline_predecessor = false;
+            crossed_forced_line_break = false;
             continue;
         }
         if !matches!(
@@ -1864,7 +1900,6 @@ fn inline_absolute_static_rect(
         ) {
             return None;
         }
-        let layout = tree.layout(sibling).ok()?;
         let (width, height, meaningful) = match sibling_info.kind {
             ComponentKind::Text { content } => {
                 if content == "\u{2028}" {
@@ -3072,6 +3107,70 @@ mod tests {
         let layout = compute(&root, 800.0, 600.0).unwrap();
         assert_eq!(layout[5].0.x, 0.0);
         assert_eq!(layout[5].0.y, 19.2);
+    }
+
+    #[test]
+    fn auto_inset_absolute_inline_joins_the_anonymous_line_after_a_block() {
+        let absolute = Component::boxed(
+            Style {
+                display: WDisp::Inline,
+                position: WPos::Absolute,
+                width: WDim::Px(100.0),
+                height: WDim::Px(150.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(50.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::InlineBlock,
+                        width: WDim::Px(100.0),
+                        height: WDim::Px(150.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::None,
+                        height: WDim::Px(100.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                absolute,
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let absolute = layout
+            .iter()
+            .find_map(|(rect, index)| (*index == 4).then_some(*rect))
+            .expect("absolute layout");
+        assert_eq!(
+            absolute,
+            LayoutRect {
+                x: 100.0,
+                y: 50.0,
+                width: 100.0,
+                height: 150.0,
+            }
+        );
     }
 
     #[test]
