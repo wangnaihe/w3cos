@@ -1200,6 +1200,23 @@ fn build_taffy_tree(
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    if comp.style.display == WDisplay::TableRow
+        && matches!(
+            parent_display,
+            Some(
+                WDisplay::Table
+                    | WDisplay::InlineTable
+                    | WDisplay::TableRowGroup
+                    | WDisplay::TableHeaderGroup
+                    | WDisplay::TableFooterGroup
+            )
+        )
+    {
+        // CSS tables distribute a definite table height through their rows.
+        // Flex growth only consumes positive free space, so auto-height tables
+        // retain their intrinsic row heights while definite tables stretch.
+        style.flex_grow = 1.0;
+    }
     if matches!(
         &comp.kind,
         ComponentKind::Text { content } if content == "\u{2028}"
@@ -2266,7 +2283,13 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
                 height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
             },
         ),
-        WDisplay::InlineTable | WDisplay::TableRow => (
+        WDisplay::InlineTable
+        | WDisplay::Table
+        | WDisplay::TableRow
+        | WDisplay::TableRowGroup
+        | WDisplay::TableHeaderGroup
+        | WDisplay::TableFooterGroup
+        | WDisplay::TableCell => (
             taffy::Display::Flex,
             s.flex_grow,
             s.flex_shrink,
@@ -2275,13 +2298,8 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
                 height: to_taffy_dim(s.height, s.font_size, viewport_w, viewport_h),
             },
         ),
-        WDisplay::Table
-        | WDisplay::TableRowGroup
-        | WDisplay::TableHeaderGroup
-        | WDisplay::TableFooterGroup
-        | WDisplay::TableColumnGroup
+        WDisplay::TableColumnGroup
         | WDisplay::TableColumn
-        | WDisplay::TableCell
         | WDisplay::TableCaption
         | WDisplay::ListItem => (
             taffy::Display::Block,
@@ -2347,13 +2365,21 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             (_, WDir::RowReverse) => FlexDirection::RowReverse,
             (_, WDir::ColumnReverse) => FlexDirection::ColumnReverse,
         },
-        justify_content: Some(match s.justify_content {
-            WJustify::FlexStart => JustifyContent::FlexStart,
-            WJustify::FlexEnd => JustifyContent::FlexEnd,
-            WJustify::Center => JustifyContent::Center,
-            WJustify::SpaceBetween => JustifyContent::SpaceBetween,
-            WJustify::SpaceAround => JustifyContent::SpaceAround,
-            WJustify::SpaceEvenly => JustifyContent::SpaceEvenly,
+        justify_content: Some(if s.display == WDisplay::TableCell {
+            match s.align_self {
+                WAlignSelf::FlexEnd => JustifyContent::FlexEnd,
+                WAlignSelf::Center => JustifyContent::Center,
+                _ => JustifyContent::FlexStart,
+            }
+        } else {
+            match s.justify_content {
+                WJustify::FlexStart => JustifyContent::FlexStart,
+                WJustify::FlexEnd => JustifyContent::FlexEnd,
+                WJustify::Center => JustifyContent::Center,
+                WJustify::SpaceBetween => JustifyContent::SpaceBetween,
+                WJustify::SpaceAround => JustifyContent::SpaceAround,
+                WJustify::SpaceEvenly => JustifyContent::SpaceEvenly,
+            }
         }),
         align_items: Some(match s.align_items {
             WAlign::FlexStart => AlignItems::FlexStart,
@@ -2362,7 +2388,11 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             WAlign::Stretch => AlignItems::Stretch,
             WAlign::Baseline => AlignItems::Baseline,
         }),
-        align_self: to_taffy_align_self(s.align_self),
+        align_self: if s.display == WDisplay::TableCell {
+            Some(AlignSelf::Stretch)
+        } else {
+            to_taffy_align_self(s.align_self)
+        },
         justify_items: Some(match s.justify_items {
             WAlign::FlexStart => AlignItems::FlexStart,
             WAlign::FlexEnd => AlignItems::FlexEnd,
@@ -4800,6 +4830,56 @@ mod tests {
         assert!(
             final_cell.x + final_cell.width <= table.x + table.width + 0.01,
             "the table max-content width must include cell borders: table={table:?}, final_cell={final_cell:?}"
+        );
+    }
+
+    #[test]
+    fn definite_table_height_stretches_rows_and_bottom_aligns_cell_content() {
+        let image = Component::image(
+            "stripe.png",
+            Style {
+                display: WDisp::InlineBlock,
+                width: WDim::Percent(100.0),
+                height: WDim::Px(15.0),
+                ..Style::default()
+            },
+        );
+        let cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                width: WDim::Px(200.0),
+                border_width: 3.0,
+                align_self: WAlignSelf::FlexEnd,
+                ..Style::default()
+            },
+            vec![image],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                height: WDim::Px(206.0),
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![cell],
+            )],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let table_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let row_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let cell_rect = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let image_rect = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!(table_rect.height, 206.0);
+        assert_eq!(row_rect.height, 206.0);
+        assert_eq!(cell_rect.height, 206.0);
+        assert_eq!(
+            image_rect.y + image_rect.height,
+            cell_rect.y + cell_rect.height - 3.0
         );
     }
 
