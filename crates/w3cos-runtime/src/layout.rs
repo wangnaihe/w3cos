@@ -1254,6 +1254,24 @@ fn build_taffy_tree(
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    if comp.style.display == WDisplay::InlineBlock
+        && comp.children.iter().any(|child| {
+            matches!(
+                child.style.display,
+                WDisplay::Block
+                    | WDisplay::Flex
+                    | WDisplay::Grid
+                    | WDisplay::Table
+                    | WDisplay::ListItem
+            )
+        })
+    {
+        // An inline-block establishes an inline-level outer box but its
+        // normal-flow block children still participate in a block formatting
+        // context. DOM lowering may retain a Row component kind, so restore
+        // the inner block axis here without changing its outer display.
+        style.flex_direction = FlexDirection::Column;
+    }
     if comp.style.display == WDisplay::TableRow
         && matches!(
             parent_display,
@@ -5089,6 +5107,35 @@ mod tests {
         assert_eq!(first.width, 96.0);
         assert_eq!(second.width, 96.0);
         assert_eq!(second.x, first.x + first.width);
+    }
+
+    #[test]
+    fn inline_block_stacks_direct_block_children() {
+        let child = |label| {
+            Component::text(
+                label,
+                Style {
+                    display: WDisp::Block,
+                    height: WDim::Px(48.0),
+                    ..Style::default()
+                },
+            )
+        };
+        let inline_block = Component::row(
+            Style {
+                display: WDisp::InlineBlock,
+                width: WDim::Px(96.0),
+                ..Style::default()
+            },
+            vec![child("a"), child("b")],
+        );
+
+        let layout = compute(&inline_block, 800.0, 600.0).unwrap();
+        let parent = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let first = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!((parent.width, parent.height), (96.0, 96.0));
+        assert_eq!(second.y, first.y + first.height);
     }
 
     #[test]
