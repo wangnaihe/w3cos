@@ -353,7 +353,43 @@ fn load_and_render(url: &str, timeout: Duration, width: u32, height: u32) -> Res
     // Keep the navigation loader alive until the frame has been captured. Its
     // owned stylesheet/font/resource state is intentionally released on Drop.
     let _document = load_document(url, timeout, width, height)?;
+    wait_for_reftest_ready(timeout)?;
     w3cos_runtime::headless::render_document_rgba(width, height)
+}
+
+fn reftest_is_waiting() -> bool {
+    let document = w3cos_runtime::jsdom::document_value();
+    let root = document.get_property("documentElement");
+    if root.is_null() || root.is_undefined() {
+        return false;
+    }
+    root.get_property("classList")
+        .call_method(
+            "contains",
+            vec![w3cos_core::Value::string("reftest-wait")],
+        )
+        .to_bool()
+}
+
+fn wait_for_reftest_ready(timeout: Duration) -> Result<()> {
+    if !reftest_is_waiting() {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        w3cos_runtime::jsdom::drain_microtasks();
+        w3cos_runtime::jsdom::tick_timers();
+        w3cos_runtime::jsdom::run_animation_frame();
+        w3cos_runtime::jsdom::drain_microtasks();
+        if !reftest_is_waiting() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("reftest timed out waiting for the reftest-wait class to be removed");
+        }
+        thread::sleep(HEADLESS_FRAME_INTERVAL);
+    }
 }
 
 fn load_document(url: &str, timeout: Duration, width: u32, height: u32) -> Result<DocumentLoader> {

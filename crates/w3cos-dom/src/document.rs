@@ -2287,6 +2287,18 @@ impl Document {
                 return w3cos_std::Component::column(style, vec![]);
             }
             NodeType::Element | NodeType::Document | NodeType::DocumentFragment => {
+                if tag.eq_ignore_ascii_case("br") {
+                    // Preserve the forced-break semantics in portable IR. A
+                    // zero-sized marker paints nothing but lets inline static
+                    // positioning distinguish a new line from an empty span.
+                    style.display = w3cos_std::style::Display::Inline;
+                    style.width = w3cos_std::style::Dimension::Px(0.0);
+                    style.height = w3cos_std::style::Dimension::Px(0.0);
+                    return self.attach_native_host(
+                        id,
+                        w3cos_std::Component::text("\u{2028}", style),
+                    );
+                }
                 if tag == "svg" {
                     let (attribute_width, attribute_height) = self.svg_root_size(id);
                     let width = match style.width {

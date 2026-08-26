@@ -1848,6 +1848,7 @@ fn inline_absolute_static_rect(
     let mut cursor_y = 0.0_f32;
     let mut line_height = 0.0_f32;
     let mut has_meaningful_inline_predecessor = false;
+    let mut crossed_forced_line_break = false;
     for sibling in siblings {
         if sibling == node {
             break;
@@ -1866,6 +1867,21 @@ fn inline_absolute_static_rect(
         let layout = tree.layout(sibling).ok()?;
         let (width, height, meaningful) = match sibling_info.kind {
             ComponentKind::Text { content } => {
+                if content == "\u{2028}" {
+                    cursor_x = 0.0;
+                    cursor_y += line_height.max(
+                        sibling_info.style.font_size * sibling_info.style.line_height,
+                    );
+                    line_height = 0.0;
+                    crossed_forced_line_break = true;
+                    continue;
+                }
+                if crossed_forced_line_break
+                    && cursor_x == 0.0
+                    && content.chars().all(char::is_whitespace)
+                {
+                    continue;
+                }
                 let (width, height) = text_intrinsic_size(content, sibling_info.style);
                 (
                     width,
@@ -1887,7 +1903,16 @@ fn inline_absolute_static_rect(
     if !has_meaningful_inline_predecessor {
         return None;
     }
-    rect.x = containing_block.x + cursor_x;
+    let fragmented_inline_start_padding = crossed_forced_line_break
+        .then(|| {
+            let parent_index = tree.get_node_context(parent).copied()?;
+            let parent_style = flat.get(parent_index)?.style;
+            matches!(parent_style.display, WDisplay::Inline)
+                .then_some(parent_style.padding_lengths().left)
+        })
+        .flatten()
+        .unwrap_or(0.0);
+    rect.x = containing_block.x - fragmented_inline_start_padding + cursor_x;
     rect.y = containing_block.y + cursor_y;
     Some(rect)
 }
@@ -2995,6 +3020,58 @@ mod tests {
         let layout = compute(&root, 800.0, 600.0).unwrap();
         assert_eq!(layout[2].0.x - layout[0].0.x - 1.0, expected_x);
         assert_eq!(layout[2].0.y - layout[0].0.y - 1.0, 0.0);
+    }
+
+    #[test]
+    fn auto_inset_absolute_inline_uses_the_line_after_a_forced_break() {
+        let inline_style = Style {
+            display: WDisp::Inline,
+            font_size: 16.0,
+            line_height: 1.2,
+            ..Style::default()
+        };
+        let mut break_style = inline_style.clone();
+        break_style.width = WDim::Px(0.0);
+        break_style.height = WDim::Px(0.0);
+        let absolute = Component::text(
+            "Line 2",
+            Style {
+                display: WDisp::Inline,
+                position: WPos::Absolute,
+                padding: w3cos_std::style::Edges {
+                    left: WSpacing::Px(100.0),
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..inline_style.clone()
+            },
+        );
+        let outer = Component::boxed(
+            Style {
+                display: WDisp::Inline,
+                padding: w3cos_std::style::Edges {
+                    left: WSpacing::Px(100.0),
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                ..inline_style.clone()
+            },
+            vec![
+                Component::text("Line 1", inline_style.clone()),
+                Component::text("\u{2028}", break_style),
+                Component::text(" ", inline_style),
+                absolute,
+            ],
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![outer],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[5].0.x, 0.0);
+        assert_eq!(layout[5].0.y, 19.2);
     }
 
     #[test]
