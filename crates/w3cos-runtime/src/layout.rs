@@ -2360,6 +2360,13 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             WPos::Absolute | WPos::Fixed => taffy::Position::Absolute,
         },
         flex_direction: match (s.display, s.flex_direction) {
+            (
+                WDisplay::Table
+                | WDisplay::TableRowGroup
+                | WDisplay::TableHeaderGroup
+                | WDisplay::TableFooterGroup,
+                _,
+            ) => FlexDirection::Column,
             (WDisplay::TableRow, _) | (_, WDir::Row) => FlexDirection::Row,
             (_, WDir::Column) => FlexDirection::Column,
             (_, WDir::RowReverse) => FlexDirection::RowReverse,
@@ -4881,6 +4888,48 @@ mod tests {
             image_rect.y + image_rect.height,
             cell_rect.y + cell_rect.height - 3.0
         );
+    }
+
+    #[test]
+    fn table_row_group_stacks_rows_and_stretches_to_table_width() {
+        let row = || {
+            Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![Component::text(
+                    "cell",
+                    Style {
+                        display: WDisp::TableCell,
+                        height: WDim::Px(48.0),
+                        ..Style::default()
+                    },
+                )],
+            )
+        };
+        let group = Component::row(
+            Style {
+                display: WDisp::TableRowGroup,
+                ..Style::default()
+            },
+            vec![row(), row()],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                width: WDim::Px(96.0),
+                ..Style::default()
+            },
+            vec![group],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let group = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let first_row = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let second_row = layout.iter().find(|(_, index)| *index == 4).unwrap().0;
+        assert_eq!((group.width, group.height), (96.0, 96.0));
+        assert_eq!(second_row.y, first_row.y + first_row.height);
     }
 
     #[test]
