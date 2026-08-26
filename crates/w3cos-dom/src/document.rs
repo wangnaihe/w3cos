@@ -1916,14 +1916,44 @@ impl Document {
                 match child.node_type {
                     NodeType::Text if is_collapsible_whitespace(*child_id) => None,
                     NodeType::Text => Some(true),
-                    NodeType::Element => Some(matches!(
-                        self.computed_style(*child_id, &child_ancestors, Some(parent_style))
-                            .display,
-                        Display::Inline
-                            | Display::InlineBlock
-                            | Display::InlineFlex
-                            | Display::InlineTable
-                    )),
+                    NodeType::Element => {
+                        let child_style =
+                            self.computed_style(*child_id, &child_ancestors, Some(parent_style));
+                        let mut participates = matches!(
+                            child_style.display,
+                            Display::Inline
+                                | Display::InlineBlock
+                                | Display::InlineFlex
+                                | Display::InlineTable
+                        );
+                        if child_style.display == Display::Inline {
+                            let mut grandchild_ancestors = child_ancestors.clone();
+                            grandchild_ancestors.push(self.selector_context(*child_id));
+                            let contains_in_flow_block = self.children_ids(*child_id).iter().any(
+                                |grandchild_id| {
+                                    let grandchild = self.get_node(*grandchild_id);
+                                    if grandchild.node_type != NodeType::Element {
+                                        return false;
+                                    }
+                                    let style = self.computed_style(
+                                        *grandchild_id,
+                                        &grandchild_ancestors,
+                                        Some(&child_style),
+                                    );
+                                    matches!(
+                                        style.display,
+                                        Display::Block | Display::Flex | Display::Grid
+                                    ) && !matches!(
+                                        style.position,
+                                        w3cos_std::style::Position::Absolute
+                                            | w3cos_std::style::Position::Fixed
+                                    )
+                                },
+                            );
+                            participates &= !contains_in_flow_block;
+                        }
+                        Some(participates)
+                    }
                     _ => None,
                 }
             })

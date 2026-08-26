@@ -22985,6 +22985,52 @@ try {
     }
 
     #[test]
+    fn block_in_inline_static_position_ignores_adjacent_collapsible_whitespace() {
+        setup();
+        set_viewport(320.0, 240.0);
+        let document = document_value();
+        let outer = create_in_body("div");
+        let outer_style = outer.get_property("style");
+        outer_style.set_property("position", Value::string("relative"));
+        outer_style.set_property("width", Value::string("100px"));
+        outer_style.set_property("height", Value::string("100px"));
+
+        let first_span = document.call_method("createElement", vec![Value::string("span")]);
+        let positioned_span = document.call_method("createElement", vec![Value::string("span")]);
+        let removed_block = document.call_method("createElement", vec![Value::string("div")]);
+        positioned_span.call_method("appendChild", vec![removed_block.clone()]);
+        first_span.call_method("appendChild", vec![positioned_span.clone()]);
+        outer.call_method("appendChild", vec![first_span]);
+        outer.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("\n  ")])],
+        );
+
+        let second_span = document.call_method("createElement", vec![Value::string("span")]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let target = document.call_method("createElement", vec![Value::string("div")]);
+        let target_style = target.get_property("style");
+        target_style.set_property("position", Value::string("absolute"));
+        target_style.set_property("width", Value::string("100%"));
+        target_style.set_property("height", Value::string("100%"));
+        block.call_method("appendChild", vec![target.clone()]);
+        second_span.call_method("appendChild", vec![block]);
+        outer.call_method("appendChild", vec![second_span]);
+
+        removed_block
+            .get_property("style")
+            .set_property("display", Value::string("none"));
+        positioned_span
+            .get_property("style")
+            .set_property("position", Value::string("relative"));
+
+        assert_eq!(target.get_property("offsetWidth").to_number(), 100.0);
+        assert_eq!(target.get_property("offsetHeight").to_number(), 100.0);
+        assert_eq!(target.get_property("offsetLeft").to_number(), 0.0);
+        assert_eq!(target.get_property("offsetTop").to_number(), 0.0);
+    }
+
+    #[test]
     fn pointer_capture_retargets_until_implicit_release() {
         setup();
         let first = create_in_body("div");
