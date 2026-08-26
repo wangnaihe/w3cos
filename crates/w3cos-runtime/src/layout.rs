@@ -1736,8 +1736,7 @@ fn collect_layouts_fast(
             scroll_ancestor[ctx] = current_scroll_container;
 
             if matches!(info.style.position, WPos::Fixed) {
-                rect =
-                    compute_fixed_rect(info.style, viewport_w, viewport_h, rect.width, rect.height);
+                rect = compute_fixed_rect(info.style, viewport_w, viewport_h, rect);
                 fixed_out.push((rect, ctx));
             } else {
                 if matches!(info.style.position, WPos::Absolute) {
@@ -2035,8 +2034,7 @@ fn compute_fixed_rect(
     style: &w3cos_std::style::Style,
     viewport_w: f32,
     viewport_h: f32,
-    width: f32,
-    height: f32,
+    fallback: LayoutRect,
 ) -> LayoutRect {
     let resolve_h = |d: WDim| {
         d.resolve(
@@ -2062,18 +2060,24 @@ fn compute_fixed_rect(
     let top = resolve_v(style.top);
     let bottom = resolve_v(style.bottom);
     let (width, height) = positioned_percentage_border_box_size(
-        style, viewport_w, viewport_h, viewport_w, viewport_h, width, height,
+        style,
+        viewport_w,
+        viewport_h,
+        viewport_w,
+        viewport_h,
+        fallback.width,
+        fallback.height,
     );
 
     let x = match (left, right) {
         (Some(l), _) => l,
         (None, Some(r)) => viewport_w - r - width,
-        (None, None) => 0.0,
+        (None, None) => fallback.x,
     };
     let y = match (top, bottom) {
         (Some(t), _) => t,
         (None, Some(b)) => viewport_h - b - height,
-        (None, None) => 0.0,
+        (None, None) => fallback.y,
     };
 
     LayoutRect {
@@ -3009,7 +3013,17 @@ mod tests {
         );
         assert_eq!(absolute, containing_block);
 
-        let fixed = compute_fixed_rect(&style, 800.0, 600.0, 0.0, 0.0);
+        let fixed = compute_fixed_rect(
+            &style,
+            800.0,
+            600.0,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
+        );
         assert_eq!((fixed.width, fixed.height), (800.0, 600.0));
 
         let content_box_with_border = Style {
@@ -3018,8 +3032,36 @@ mod tests {
             border_width: 10.0,
             ..style
         };
-        let fixed = compute_fixed_rect(&content_box_with_border, 800.0, 600.0, 0.0, 0.0);
+        let fixed = compute_fixed_rect(
+            &content_box_with_border,
+            800.0,
+            600.0,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
+        );
         assert_eq!((fixed.width, fixed.height), (420.0, 320.0));
+
+        let static_position = compute_fixed_rect(
+            &Style {
+                position: WPos::Fixed,
+                width: WDim::Px(50.0),
+                height: WDim::Px(50.0),
+                ..Style::default()
+            },
+            800.0,
+            600.0,
+            LayoutRect {
+                x: 58.0,
+                y: 101.2,
+                width: 50.0,
+                height: 50.0,
+            },
+        );
+        assert_eq!((static_position.x, static_position.y), (58.0, 101.2));
     }
 
     #[test]
