@@ -1244,6 +1244,16 @@ fn collect_header_init(init: &Value) -> HeaderList {
     if init.is_nullish() {
         return list;
     }
+    if let Some(entries) = init.as_array() {
+        for entry in entries.borrow().iter() {
+            header_append(
+                &list,
+                &entry.get_property("0").to_js_string(),
+                &entry.get_property("1").to_js_string(),
+            );
+        }
+        return list;
+    }
     let for_each = init.get_property("forEach");
     if for_each.is_function() {
         let collected = Rc::clone(&list);
@@ -1256,16 +1266,6 @@ fn collect_header_init(init: &Value) -> HeaderList {
                 Value::Undefined
             })],
         );
-        return list;
-    }
-    if let Some(entries) = init.as_array() {
-        for entry in entries.borrow().iter() {
-            header_append(
-                &list,
-                &entry.get_property("0").to_js_string(),
-                &entry.get_property("1").to_js_string(),
-            );
-        }
         return list;
     }
     if let Some(object) = init.as_object() {

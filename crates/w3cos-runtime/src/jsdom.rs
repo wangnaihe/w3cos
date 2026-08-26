@@ -19307,6 +19307,7 @@ pub fn reset_bridge() {
     SELECTION_VALUE.with(|value| {
         value.borrow_mut().take();
     });
+    w3cos_core::web::reset_realm();
     w3cos_core::page_arena::reset();
 }
 

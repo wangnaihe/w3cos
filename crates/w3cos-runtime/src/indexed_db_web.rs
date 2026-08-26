@@ -1245,8 +1245,8 @@ fn key_path_from_web(value: &Value, optional: bool) -> indexed_db::Result<String
             message: "A key path is required.".into(),
         });
     }
-    if let Value::String(path) = value {
-        let path = path.to_string();
+    if value.is_string() {
+        let path = value.to_js_string();
         return Ok(indexed_db::encode_key_path(Some(std::slice::from_ref(
             &path,
         ))));
@@ -1255,12 +1255,15 @@ fn key_path_from_web(value: &Value, optional: bool) -> indexed_db::Result<String
         let paths = paths
             .borrow()
             .iter()
-            .map(|path| match path {
-                Value::String(path) => Ok(path.to_string()),
-                _ => Err(IndexedDbError {
-                    name: "SyntaxError".into(),
-                    message: "Compound key paths must contain only strings.".into(),
-                }),
+            .map(|path| {
+                if path.is_string() {
+                    Ok(path.to_js_string())
+                } else {
+                    Err(IndexedDbError {
+                        name: "SyntaxError".into(),
+                        message: "Compound key paths must contain only strings.".into(),
+                    })
+                }
             })
             .collect::<indexed_db::Result<Vec<_>>>()?;
         if paths.is_empty() {
@@ -2862,8 +2865,9 @@ impl GraphCloneEncoder {
                 ]));
                 Ok(graph_reference(id))
             }
-            Value::Object(object) if w3cos_core::web::structured_error_name(value).is_some() => {
-                let identity = (1, Rc::as_ptr(object) as usize);
+            value if w3cos_core::web::structured_error_name(value).is_some() => {
+                let object = value.as_object().expect("structured Error object");
+                let identity = (1, object.identity());
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
                 }
@@ -2890,13 +2894,14 @@ impl GraphCloneEncoder {
                 ]));
                 Ok(graph_reference(id))
             }
-            Value::Object(object)
+            value
                 if w3cos_core::class::instance_of(
                     value,
                     &w3cos_core::web::dom_exception_class(),
                 ) =>
             {
-                let identity = (1, Rc::as_ptr(object) as usize);
+                let object = value.as_object().expect("DOMException object");
+                let identity = (1, object.identity());
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
                 }
@@ -2920,10 +2925,11 @@ impl GraphCloneEncoder {
                     ])));
                 Ok(graph_reference(id))
             }
-            Value::Object(object)
+            value
                 if w3cos_core::class::instance_of(value, &w3cos_core::web::image_data_class()) =>
             {
-                let identity = (1, Rc::as_ptr(object) as usize);
+                let object = value.as_object().expect("ImageData object");
+                let identity = (1, object.identity());
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
                 }
@@ -2949,10 +2955,9 @@ impl GraphCloneEncoder {
                 ]));
                 Ok(graph_reference(id))
             }
-            Value::Object(object)
-                if w3cos_core::collections::collection_snapshot(value).is_some() =>
-            {
-                let identity = (1, Rc::as_ptr(object) as usize);
+            value if w3cos_core::collections::collection_snapshot(value).is_some() => {
+                let object = value.as_object().expect("collection object");
+                let identity = (1, object.identity());
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
                 }
@@ -2990,7 +2995,7 @@ impl GraphCloneEncoder {
                 };
                 Ok(graph_reference(id))
             }
-            Value::Object(_)
+            value
                 if w3cos_core::bigint::get(value).is_some()
                     || value.get_property("__w3cos_date_milliseconds").is_number()
                     || w3cos_core::regexp::parts(value).is_some()
@@ -2998,10 +3003,12 @@ impl GraphCloneEncoder {
             {
                 value_to_json_inner(value, &mut std::collections::HashSet::new())
             }
-            Value::Object(object)
-                if !value.get_property("__w3cos_date_milliseconds").is_number() =>
+            value
+                if value.as_object().is_some()
+                    && !value.get_property("__w3cos_date_milliseconds").is_number() =>
             {
-                let identity = (1, Rc::as_ptr(object) as usize);
+                let object = value.as_object().expect("object");
+                let identity = (1, object.identity());
                 if let Some(id) = self.ids.get(&identity) {
                     return Ok(graph_reference(*id));
                 }
@@ -3069,28 +3076,28 @@ fn value_to_json_inner(
         value if value.as_number().is_some() => {
             let number = value.as_number().unwrap();
             serde_json::Number::from_f64(number)
-            .map(JsonValue::Number)
-            .map_or_else(
-                || {
-                    Ok(JsonValue::Object(serde_json::Map::from_iter([
-                        (CLONE_TAG.into(), JsonValue::String("number".into())),
-                        (
-                            "value".into(),
-                            JsonValue::String(
-                                if number.is_nan() {
-                                    "NaN"
-                                } else if number.is_sign_positive() {
-                                    "Infinity"
-                                } else {
-                                    "-Infinity"
-                                }
-                                .into(),
+                .map(JsonValue::Number)
+                .map_or_else(
+                    || {
+                        Ok(JsonValue::Object(serde_json::Map::from_iter([
+                            (CLONE_TAG.into(), JsonValue::String("number".into())),
+                            (
+                                "value".into(),
+                                JsonValue::String(
+                                    if number.is_nan() {
+                                        "NaN"
+                                    } else if number.is_sign_positive() {
+                                        "Infinity"
+                                    } else {
+                                        "-Infinity"
+                                    }
+                                    .into(),
+                                ),
                             ),
-                        ),
-                    ])))
-                },
-                Ok,
-            )
+                        ])))
+                    },
+                    Ok,
+                )
         }
         value if value.is_string() => Ok(JsonValue::String(value.to_js_string())),
         Value::String(value) => Ok(JsonValue::String(value.to_string())),

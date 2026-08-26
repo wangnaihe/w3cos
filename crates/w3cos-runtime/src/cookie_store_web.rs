@@ -1204,7 +1204,7 @@ fn delete_cookie(name: &str) {
 }
 
 fn option_name(value: &Value) -> Option<String> {
-    if matches!(value, Value::String(_)) {
+    if value.is_string() {
         Some(value.to_js_string())
     } else {
         let name = value.get_property("name");
@@ -1264,7 +1264,7 @@ pub fn cookie_store_value() -> Value {
             "set",
             Value::function(|_, args| {
                 let first = args.first().cloned().unwrap_or(Value::Undefined);
-                let (name, value) = if matches!(first, Value::String(_)) {
+                let (name, value) = if first.is_string() {
                     (
                         first.to_js_string(),
                         args.get(1)

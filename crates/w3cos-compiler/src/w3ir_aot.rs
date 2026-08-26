@@ -393,6 +393,8 @@ fn emit_f64_operand(plan: &EscapePlan, reaching: &HashMap<u32, f64>, register: u
         format!("{value:?}_f64")
     } else if let Some(slot) = num_slot(plan, register) {
         format!("self.num_regs[{slot}]")
+    } else if let Some(slot) = bool_slot(plan, register) {
+        format!("if self.bool_regs[{slot}] {{ 1.0_f64 }} else {{ 0.0_f64 }}")
     } else {
         format!("self.registers[{}].to_number()", val_index(plan, register))
     }
@@ -2858,9 +2860,7 @@ fn emit_instruction(
             value,
             strict,
         } => {
-            if *strict
-                && let Some(literal) = proven_strings.get(&key.0)
-            {
+            if *strict && let Some(literal) = proven_strings.get(&key.0) {
                 format!(
                     "w3cos_core::intrinsics::set_property_strict(&{}, &w3cos_core::Value::from({literal:?}), {});",
                     emit_boxed_value(plan, object.0),
@@ -3157,12 +3157,12 @@ fn emit_instruction(
                     emit_arguments_from(&mut uses, arguments)
                 );
                 emit_completion_match(
-                &expr,
-                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
-                exception_target,
-                mode,
-                plan,
-            )
+                    &expr,
+                    &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                    exception_target,
+                    mode,
+                    plan,
+                )
             }
         }
         Instruction::CallMethodWithArguments {
@@ -4237,7 +4237,9 @@ fn main() {{
             "local TDZ must not panic: {generated}"
         );
         assert!(
-            generated.contains("return Err(") || generated.contains("let __w3cos_exception = w3cos_core::intrinsics::reference_error"),
+            generated.contains("return Err(")
+                || generated
+                    .contains("let __w3cos_exception = w3cos_core::intrinsics::reference_error"),
             "local TDZ should propagate a Completion Err: {generated}"
         );
 

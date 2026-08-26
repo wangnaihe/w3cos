@@ -162,7 +162,7 @@ pub fn clipboard_item_class() -> Value {
         let class = realm_function(generation, move |_, args| {
             let input = args.first().cloned().unwrap_or_default();
             let entries = Rc::new(RefCell::new(HashMap::<String, Value>::new()));
-            if let Value::Object(object) = input {
+            if let Some(object) = input.as_object() {
                 let object = object.borrow();
                 for key in object.keys() {
                     let value = object.get_direct(&key);
@@ -735,7 +735,27 @@ mod tests {
                 Value::string("persisted clipboard"),
             )]))],
         );
+        assert_eq!(
+            old_item
+                .get_property("types")
+                .get_property("0")
+                .to_js_string(),
+            "text/plain"
+        );
+        assert_eq!(
+            old_item
+                .call_method("getType", vec![Value::string("text/plain")])
+                .call_method("text", vec![])
+                .to_js_string(),
+            "persisted clipboard"
+        );
         write_items(&Value::array(vec![old_item.clone()]));
+        CLIPBOARD_ITEMS.with(|items| {
+            let items = items.borrow();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].entries.len(), 1);
+            assert_eq!(items[0].entries[0].bytes, b"persisted clipboard");
+        });
 
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
@@ -772,6 +792,17 @@ mod tests {
             &new_item_class
         ));
         let restored_blob = restored_item.call_method("getType", vec![Value::string("text/plain")]);
+        assert_eq!(
+            restored_item
+                .get_property("types")
+                .get_property("0")
+                .to_js_string(),
+            "text/plain"
+        );
+        assert!(restored_item.get_property("getType").is_function());
+        assert!(restored_blob.is_object());
+        assert_eq!(restored_blob.get_property("size").to_number(), 19.0);
+        assert!(restored_blob.get_property("text").is_function());
         assert_eq!(
             restored_blob.call_method("text", vec![]).to_js_string(),
             "persisted clipboard"

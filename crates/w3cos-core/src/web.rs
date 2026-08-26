@@ -44,6 +44,27 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+/// Drop Web constructor caches before the page arena is reset for navigation.
+///
+/// These constructors are page-arena values; retaining their packed handles
+/// across a reset would make the next realm observe stale class objects.
+pub fn reset_realm() {
+    for class in [
+        &DOM_EXCEPTION_CLASS,
+        &IMAGE_DATA_CLASS,
+        &BLOB_CLASS,
+        &FILE_CLASS,
+        &TEXT_DECODER_CLASS,
+        &URL_CLASS,
+        &URL_SEARCH_PARAMS_CLASS,
+        &URL_PATTERN_CLASS,
+    ] {
+        class.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
 const BLOB_STATE_KEY: &str = "__w3cos_blob_id";
 
 #[derive(Clone)]
