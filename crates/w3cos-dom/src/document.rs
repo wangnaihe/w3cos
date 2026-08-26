@@ -2732,7 +2732,7 @@ impl Document {
                         | w3cos_std::style::Display::ListItem
                         | w3cos_std::style::Display::TableCell
                 ) {
-                    children = hoist_floats_into_block_formatting_context(children);
+                    children = hoist_floats_into_block_formatting_context(&style, children);
                 }
                 if style.display == w3cos_std::style::Display::Table {
                     // CSS table fixup has a semantic group order independent
@@ -4837,6 +4837,7 @@ fn table_row_from_misparented_children(
 }
 
 fn hoist_floats_into_block_formatting_context(
+    formatting_context_style: &w3cos_std::style::Style,
     children: Vec<w3cos_std::Component>,
 ) -> Vec<w3cos_std::Component> {
     fn contributes_in_flow_content(component: &w3cos_std::Component) -> bool {
@@ -4959,9 +4960,38 @@ fn hoist_floats_into_block_formatting_context(
         // A direct child is already owned by this formatting context. Only
         // extract floats nested inside inline descendants here; direct float
         // ordering is handled after blockification.
-        if let Some(child) = collect(child, false, &mut left, &mut right) {
+        if let Some(mut child) = collect(child, false, &mut left, &mut right) {
             let has_prior_in_flow = in_flow.iter().any(contributes_in_flow_content);
-            if direct_float == w3cos_std::style::Float::Right && has_prior_in_flow {
+            if direct_float == w3cos_std::style::Float::Left && has_prior_in_flow {
+                let preceding_line_height = in_flow
+                    .iter()
+                    .rev()
+                    .find(|component| {
+                        !matches!(
+                            component.style.position,
+                            w3cos_std::style::Position::Absolute
+                                | w3cos_std::style::Position::Fixed
+                        ) && matches!(
+                            component.style.display,
+                            w3cos_std::style::Display::Inline
+                                | w3cos_std::style::Display::InlineBlock
+                                | w3cos_std::style::Display::InlineFlex
+                                | w3cos_std::style::Display::InlineTable
+                        )
+                    })
+                    .map_or(0.0, |component| {
+                        component.style.font_size * component.style.line_height
+                    })
+                    .max(
+                        formatting_context_style.font_size
+                            * formatting_context_style.line_height,
+                    );
+                if let w3cos_std::style::Spacing::Px(margin_top) = child.style.margin.top {
+                    child.style.margin.top =
+                        w3cos_std::style::Spacing::Px(margin_top - preceding_line_height);
+                }
+                in_flow.push(child);
+            } else if direct_float == w3cos_std::style::Float::Right && has_prior_in_flow {
                 // A right float encountered after in-flow content cannot rise
                 // above the earlier line box. Keep later text in flow and
                 // place the float at this block's trailing float position.
@@ -5252,11 +5282,14 @@ mod image_component_tests {
             w3cos_std::Component::boxed(style, vec![])
         };
 
-        let fixed = hoist_floats_into_block_formatting_context(vec![
-            text("before "),
-            floating_box(Float::Right),
-            text(" after"),
-        ]);
+        let fixed = hoist_floats_into_block_formatting_context(
+            &w3cos_std::style::Style::default(),
+            vec![
+                text("before "),
+                floating_box(Float::Right),
+                text(" after"),
+            ],
+        );
         assert_eq!(fixed.len(), 2);
         assert!(matches!(
             fixed[0].kind,
@@ -5266,10 +5299,10 @@ mod image_component_tests {
         assert_eq!(fixed[1].style.display, Display::Block);
 
         let paragraph = w3cos_std::Component::boxed(w3cos_std::style::Style::default(), vec![]);
-        let fixed = hoist_floats_into_block_formatting_context(vec![
-            paragraph,
-            floating_box(Float::Left),
-        ]);
+        let fixed = hoist_floats_into_block_formatting_context(
+            &w3cos_std::style::Style::default(),
+            vec![paragraph, floating_box(Float::Left)],
+        );
         assert_eq!(fixed[0].style.float, Float::None);
         assert_eq!(fixed[1].style.float, Float::Left);
 
@@ -5279,12 +5312,34 @@ mod image_component_tests {
             inline_style,
             vec![text("nested"), floating_box(Float::Right)],
         );
-        let fixed = hoist_floats_into_block_formatting_context(vec![inline]);
+        let fixed = hoist_floats_into_block_formatting_context(
+            &w3cos_std::style::Style::default(),
+            vec![inline],
+        );
         assert_eq!(fixed.len(), 3);
         assert_eq!(fixed[0].style.float, Float::None);
         assert!(matches!(fixed[1].kind, ComponentKind::Text { ref content } if content == " "));
         assert_eq!(fixed[2].style.float, Float::Right);
         assert_eq!(fixed[2].style.display, Display::Block);
+
+        let mut line_style = w3cos_std::style::Style::default();
+        line_style.display = Display::Inline;
+        line_style.line_height = 1.25;
+        let line = w3cos_std::Component::text("\u{a0}", line_style);
+        let mut absolute_style = w3cos_std::style::Style::default();
+        absolute_style.position = w3cos_std::style::Position::Absolute;
+        let absolute = w3cos_std::Component::boxed(absolute_style, vec![]);
+        let mut float_style = w3cos_std::style::Style::default();
+        float_style.float = Float::Left;
+        float_style.margin.top = w3cos_std::style::Spacing::Px(20.0);
+        let left_float = w3cos_std::Component::boxed(float_style, vec![]);
+        let mut context_style = w3cos_std::style::Style::default();
+        context_style.line_height = 1.25;
+        let fixed = hoist_floats_into_block_formatting_context(
+            &context_style,
+            vec![line, absolute, left_float],
+        );
+        assert_eq!(fixed[2].style.margin.top, w3cos_std::style::Spacing::Px(0.0));
     }
 
     #[test]

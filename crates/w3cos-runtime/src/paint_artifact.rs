@@ -21,6 +21,19 @@ pub struct PaintNode {
     pub sticky_counter_signal: Option<usize>,
 }
 
+pub fn effective_z_order(style: &Style, inherited: i32) -> i32 {
+    if style.z_index != 0 {
+        style.z_index
+    } else if matches!(
+        style.position,
+        Position::Relative | Position::Absolute | Position::Fixed | Position::Sticky
+    ) {
+        inherited.saturating_add(1)
+    } else {
+        inherited
+    }
+}
+
 /// Rebuild paint nodes, cloning `Style` only for slots that actually changed.
 ///
 /// Returns the node list and the number of Style clones performed. A clean
@@ -242,11 +255,7 @@ impl PaintArtifact {
             .parent
             .and_then(|parent| self.z_order.get(parent).copied())
             .unwrap_or_default();
-        self.z_order[index] = if node.style.z_index == 0 {
-            inherited_z
-        } else {
-            node.style.z_index
-        };
+        self.z_order[index] = effective_z_order(&node.style, inherited_z);
         self.sticky_owner[index] = if matches!(node.style.position, Position::Sticky) {
             Some(index)
         } else {
@@ -427,6 +436,37 @@ mod tests {
 
         assert_eq!(artifact.sticky_owner, vec![None, Some(1), Some(1)]);
         assert_eq!(artifact.z_order, vec![0, 3, 3]);
+    }
+
+    #[test]
+    fn auto_positioned_subtree_paints_after_later_normal_flow_content() {
+        let root = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let mut absolute_style = Style::default();
+        absolute_style.position = Position::Absolute;
+        let absolute = PaintNode {
+            kind: ComponentKind::Column,
+            style: absolute_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let normal = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style::default(),
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            [root, absolute, normal],
+            &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2)],
+            1,
+        );
+
+        assert_eq!(artifact.z_order, vec![0, 1, 0]);
     }
 
     #[test]
