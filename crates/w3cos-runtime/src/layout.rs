@@ -1254,6 +1254,35 @@ fn build_taffy_tree(
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    let normal_flow_children = comp.children.iter().filter(|child| {
+        !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+            && child.style.display != WDisplay::None
+    });
+    let establishes_inline_formatting_context = matches!(comp.kind, ComponentKind::Row)
+        && comp.style.display == WDisplay::Block
+        && normal_flow_children.clone().next().is_some()
+        && normal_flow_children.clone().all(|child| {
+            matches!(
+                child.style.display,
+                WDisplay::Inline
+                    | WDisplay::InlineBlock
+                    | WDisplay::InlineFlex
+                    | WDisplay::InlineTable
+            )
+        });
+    if establishes_inline_formatting_context {
+        // A block whose normal-flow children are all inline-level establishes
+        // line boxes. Keep the inherited line-height strut even when a shorter
+        // replaced element is the only child, and let vertical-align map onto
+        // the row cross axis.
+        style.display = taffy::Display::Flex;
+        style.flex_direction = FlexDirection::Row;
+        style.flex_wrap = FlexWrap::Wrap;
+        style.align_items = Some(AlignItems::FlexStart);
+        if matches!(comp.style.min_height, WDim::Auto) {
+            style.min_size.height = Dimension::length(comp.style.font_size * comp.style.line_height);
+        }
+    }
     if comp.style.display == WDisplay::InlineBlock
         && comp.children.iter().any(|child| {
             matches!(
@@ -4556,6 +4585,39 @@ mod tests {
             "block text should have one 19.2px line plus 64px padding, got {}",
             text.height
         );
+    }
+
+    #[test]
+    fn block_inline_image_uses_line_height_strut_and_vertical_align() {
+        let image = Component::image(
+            "line-box.png",
+            Style {
+                display: WDisp::InlineBlock,
+                width: WDim::Px(96.0),
+                height: WDim::Px(15.0),
+                align_self: WAlignSelf::FlexEnd,
+                ..Style::default()
+            },
+        );
+        let layout = compute(
+            &Component::row(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(96.0),
+                    font_size: 16.0,
+                    line_height: 6.0,
+                    border_width: 3.0,
+                    ..Style::default()
+                },
+                vec![image],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        assert_eq!(layout[0].0.height, 102.0);
+        assert_eq!(layout[1].0.y, 84.0);
     }
 
     #[test]

@@ -890,10 +890,11 @@ fn render_node(
             draw_text_centered_in_rect(pixmap, rect, label, style, text_color, font, clip_mask);
         }
         ComponentKind::Image { src } => {
+            let content_rect = text_content_box(rect, style);
             if let Some(decoded) = crate::image_loader::get_or_load(src) {
                 draw_image_pixels(
                     pixmap,
-                    rect,
+                    content_rect,
                     decoded.width,
                     decoded.height,
                     &decoded.data,
@@ -908,7 +909,13 @@ fn render_node(
                 } else {
                     bg
                 };
-                draw_rect(pixmap, rect, placeholder_bg, style.border_radius, clip_mask);
+                draw_rect(
+                    pixmap,
+                    content_rect,
+                    placeholder_bg,
+                    style.border_radius,
+                    clip_mask,
+                );
                 let border_color = if style.border_width > 0.0 && style.border_color.a > 0 {
                     apply_opacity(style.border_color, opacity)
                 } else {

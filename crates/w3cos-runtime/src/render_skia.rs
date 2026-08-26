@@ -872,7 +872,9 @@ fn render_node(
             }
             canvas.restore_to_count(save);
         }
-        ComponentKind::Image { src } => draw_image(canvas, rect, src, style.opacity),
+        ComponentKind::Image { src } => {
+            draw_image(canvas, text_content_box(rect, style), src, style.opacity)
+        }
         ComponentKind::Canvas { .. } => draw_canvas(canvas, client_index, rect, style.opacity),
         ComponentKind::SvgPath {
             commands,
@@ -2399,6 +2401,57 @@ mod tests {
         assert!((pixels[1] as i16 - 20).abs() <= 2);
         assert!(pixels[2] >= 238);
         assert_eq!(pixels[3], 255);
+    }
+
+    #[test]
+    fn image_paints_inside_its_content_box() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 255]))
+            .save_with_format(file.path(), image::ImageFormat::Png)
+            .unwrap();
+
+        let kind = ComponentKind::Image {
+            src: file.path().to_string_lossy().into_owned(),
+        };
+        let style = Style {
+            padding: w3cos_std::style::Edges {
+                left: w3cos_std::style::Spacing::Px(2.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        };
+        let nodes = [(
+            3,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 3.0,
+                height: 1.0,
+            },
+            &kind,
+            &style,
+        )];
+        let font = test_font();
+        let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
+        let pixels = rasterizer
+            .render_frame(
+                3,
+                1,
+                &nodes,
+                &font,
+                &[],
+                &HashMap::new(),
+                None,
+                w3cos_std::color::Color::WHITE,
+                None,
+                None,
+                1.0,
+            )
+            .unwrap();
+
+        assert_eq!(&pixels[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&pixels[4..8], &[255, 255, 255, 255]);
+        assert_eq!(&pixels[8..12], &[0, 0, 255, 255]);
     }
 
     #[test]
