@@ -2289,11 +2289,13 @@ impl Document {
             NodeType::Element | NodeType::Document | NodeType::DocumentFragment => {
                 if tag.eq_ignore_ascii_case("br") {
                     // Preserve the forced-break semantics in portable IR. A
-                    // zero-sized marker paints nothing but lets inline static
-                    // positioning distinguish a new line from an empty span.
+                    // zero-width marker paints nothing but still establishes
+                    // the inherited line-height strut for following content.
                     style.display = w3cos_std::style::Display::Inline;
                     style.width = w3cos_std::style::Dimension::Px(0.0);
-                    style.height = w3cos_std::style::Dimension::Px(0.0);
+                    style.height = w3cos_std::style::Dimension::Px(
+                        style.font_size * style.line_height,
+                    );
                     return self.attach_native_host(
                         id,
                         w3cos_std::Component::text("\u{2028}", style),

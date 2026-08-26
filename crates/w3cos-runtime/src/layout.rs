@@ -1200,6 +1200,23 @@ fn build_taffy_tree(
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    if matches!(
+        &comp.kind,
+        ComponentKind::Text { content } if content == "\u{2028}"
+    ) {
+        // A <br> marker has no inline advance but does establish the inherited
+        // line-height strut. Generic inline sizing forces both axes to auto,
+        // so restore this semantic marker's explicit zero width and strut height.
+        style.size = Size {
+            width: Dimension::length(0.0),
+            height: to_taffy_dim(
+                comp.style.height,
+                comp.style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+        };
+    }
     // CSS resolves every percentage padding side against the containing
     // block's width. Taffy leaves vertical percentages unresolved when that
     // block has an indefinite height, so provide their pixel basis here.
@@ -3109,7 +3126,7 @@ mod tests {
         };
         let mut break_style = inline_style.clone();
         break_style.width = WDim::Px(0.0);
-        break_style.height = WDim::Px(0.0);
+        break_style.height = WDim::Px(19.2);
         let absolute = Component::text(
             "Line 2",
             Style {
@@ -3149,6 +3166,42 @@ mod tests {
         let layout = compute(&root, 800.0, 600.0).unwrap();
         assert_eq!(layout[5].0.x, 0.0);
         assert_eq!(layout[5].0.y, 19.2);
+    }
+
+    #[test]
+    fn standalone_forced_break_establishes_its_line_height_strut() {
+        let forced_break = Component::text(
+            "\u{2028}",
+            Style {
+                display: WDisp::Inline,
+                width: WDim::Px(0.0),
+                height: WDim::Px(200.0),
+                font_size: 16.0,
+                line_height: 12.5,
+                ..Style::default()
+            },
+        );
+        let following_block = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(200.0),
+                height: WDim::Px(200.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![forced_break, following_block],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[1].0.width, 0.0);
+        assert_eq!(layout[1].0.height, 200.0);
+        assert_eq!(layout[2].0.y, 200.0);
     }
 
     #[test]
