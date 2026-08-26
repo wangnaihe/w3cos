@@ -1272,6 +1272,22 @@ fn build_taffy_tree(
         // the inner block axis here without changing its outer display.
         style.flex_direction = FlexDirection::Column;
     }
+    if comp.style.display == WDisplay::InlineTable
+        && comp.children.iter().any(|child| {
+            matches!(
+                child.style.display,
+                WDisplay::TableRow
+                    | WDisplay::TableRowGroup
+                    | WDisplay::TableHeaderGroup
+                    | WDisplay::TableFooterGroup
+            )
+        })
+    {
+        // Preserve the legacy row-like fallback only for direct non-table
+        // inline content. Real table rows and row groups stack on the table's
+        // block axis just like they do in a block-level table.
+        style.flex_direction = FlexDirection::Column;
+    }
     if comp.style.display == WDisplay::TableRow
         && matches!(
             parent_display,
@@ -5135,6 +5151,35 @@ mod tests {
         let first = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!((parent.width, parent.height), (96.0, 96.0));
+        assert_eq!(second.y, first.y + first.height);
+    }
+
+    #[test]
+    fn inline_table_stacks_table_rows() {
+        let row = || {
+            Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    height: WDim::Px(48.0),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let inline_table = Component::row(
+            Style {
+                display: WDisp::InlineTable,
+                width: WDim::Px(96.0),
+                ..Style::default()
+            },
+            vec![row(), row()],
+        );
+
+        let layout = compute(&inline_table, 800.0, 600.0).unwrap();
+        let table = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let first = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert_eq!((table.width, table.height), (96.0, 96.0));
         assert_eq!(second.y, first.y + first.height);
     }
 
