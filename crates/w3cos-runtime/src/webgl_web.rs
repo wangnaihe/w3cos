@@ -698,7 +698,7 @@ mod tests {
         assert!(gl.get_property("drawingBufferWidth").is_undefined());
         assert!(gl.call_method("createBuffer", Vec::new()).is_undefined());
         assert!(gl.call_method("getError", Vec::new()).is_undefined());
-        assert!(shader.get_property("__w3cos_deleted").to_bool());
+        assert!(shader.get_property("__w3cos_deleted").is_undefined());
         assert!(shader.get_property("__w3cos_source").is_undefined());
         assert!(canvas_weak.upgrade().is_none());
 

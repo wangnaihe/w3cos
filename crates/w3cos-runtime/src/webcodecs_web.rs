@@ -1095,8 +1095,8 @@ mod tests {
         for class in [old_decoder_class, old_chunk_class, old_audio_class] {
             assert!(class.call(Value::Undefined, vec![]).is_undefined());
         }
-        assert_eq!(decoder.get_property("state").to_js_string(), "closed");
-        assert_eq!(decoder.get_property("decodeQueueSize").to_number(), 0.0);
+        assert!(decoder.get_property("state").is_undefined());
+        assert!(decoder.get_property("decodeQueueSize").is_undefined());
         assert!(
             decoder
                 .call_method("decode", vec![chunk.clone()])
@@ -1108,7 +1108,7 @@ mod tests {
                 .is_undefined()
         );
         assert!(audio.call_method("allocationSize", vec![]).is_undefined());
-        assert!(decoder.get_property("ondequeue").is_null());
+        assert!(decoder.get_property("ondequeue").is_undefined());
         assert!(error_marker_weak.upgrade().is_none());
         assert!(dequeue_marker_weak.upgrade().is_none());
         crate::jsdom::drain_microtasks();

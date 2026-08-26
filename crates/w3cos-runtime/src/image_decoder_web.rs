@@ -570,10 +570,7 @@ mod tests {
         );
         assert!(decoder.call_method("reset", Vec::new()).is_undefined());
         assert!(tracks.get_property("selectedIndex").is_undefined());
-        let retained_state = state.upgrade().unwrap();
-        assert!(retained_state.closed.get());
-        assert!(retained_state.frames.borrow().is_empty());
-        drop(retained_state);
+        assert!(state.upgrade().is_none());
         drop(decoder);
         assert!(state.upgrade().is_none());
     }

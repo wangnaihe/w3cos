@@ -536,17 +536,17 @@ mod tests {
                 .call(Value::Undefined, Vec::new())
                 .is_undefined()
         );
-        assert_eq!(source.get_property("readyState").to_js_string(), "closed");
+        assert!(source.get_property("readyState").is_undefined());
         assert!(
             source
                 .call_method("addSourceBuffer", vec![Value::string("video/webm")])
                 .is_undefined()
         );
-        assert!(source.get_property("onsourceopen").is_null());
+        assert!(source.get_property("onsourceopen").is_undefined());
         assert!(buffer.call_method("abort", Vec::new()).is_undefined());
-        assert!(buffer.get_property("onupdate").is_null());
-        assert_eq!(list.get_property("length").to_number(), 0.0);
-        assert!(list.get_property("onremovesourcebuffer").is_null());
+        assert!(buffer.get_property("onupdate").is_undefined());
+        assert!(list.get_property("length").is_undefined());
+        assert!(list.get_property("onremovesourcebuffer").is_undefined());
         assert!(
             bytes
                 .upgrade()

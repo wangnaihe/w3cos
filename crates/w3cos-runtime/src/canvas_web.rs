@@ -714,13 +714,7 @@ mod tests {
                 )
                 .is_undefined()
         );
-        assert_eq!(
-            gradient
-                .get_property("__w3cos_stops")
-                .get_property("length")
-                .to_u32(),
-            1
-        );
+        assert!(gradient.get_property("__w3cos_stops").is_undefined());
         assert!(
             offscreen
                 .call_method("getContext", vec![Value::string("2d")])
