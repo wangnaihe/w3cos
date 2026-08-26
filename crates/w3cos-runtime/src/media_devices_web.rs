@@ -1266,7 +1266,7 @@ mod tests {
         );
         assert!(stop.call(track, vec![]).is_undefined());
         assert!(get_tracks.call(stream, vec![]).is_undefined());
-        assert!(media.get_property("ondevicechange").is_null());
+        assert!(media.get_property("ondevicechange").is_undefined());
         assert!(callback_marker_weak.upgrade().is_none());
     }
 

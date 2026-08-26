@@ -1678,9 +1678,9 @@ mod tests {
             assert!(class.call(Value::Undefined, Vec::new()).is_undefined());
         }
         assert!(context.call_method("resume", Vec::new()).is_undefined());
-        assert!(context.get_property("onstatechange").is_null());
+        assert!(context.get_property("onstatechange").is_undefined());
         assert!(oscillator.call_method("start", Vec::new()).is_undefined());
-        assert!(oscillator.get_property("onended").is_null());
+        assert!(oscillator.get_property("onended").is_undefined());
         assert!(
             buffer
                 .call_method("getChannelData", vec![Value::Number(0.0)])

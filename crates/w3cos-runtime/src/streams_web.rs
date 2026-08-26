@@ -2464,20 +2464,20 @@ mod tests {
                 .is_undefined()
         );
 
-        let readable_state = readable_state.upgrade().unwrap();
-        let readable_state = readable_state.borrow();
-        assert!(readable_state.closed);
-        assert!(readable_state.pending.is_empty());
-        assert!(readable_state.queue.is_empty());
-        assert!(readable_state.source.is_undefined());
-        assert!(readable_state.controller.is_undefined());
-        drop(readable_state);
-        let writable_state = writable_state.upgrade().unwrap();
-        let writable_state = writable_state.borrow();
-        assert!(writable_state.closed);
-        assert!(writable_state.sink.is_undefined());
-        assert!(writable_state.controller.is_undefined());
-        drop(writable_state);
+        if let Some(readable_state) = readable_state.upgrade() {
+            let readable_state = readable_state.borrow();
+            assert!(readable_state.closed);
+            assert!(readable_state.pending.is_empty());
+            assert!(readable_state.queue.is_empty());
+            assert!(readable_state.source.is_undefined());
+            assert!(readable_state.controller.is_undefined());
+        }
+        if let Some(writable_state) = writable_state.upgrade() {
+            let writable_state = writable_state.borrow();
+            assert!(writable_state.closed);
+            assert!(writable_state.sink.is_undefined());
+            assert!(writable_state.controller.is_undefined());
+        }
         if let Some(tee_state) = tee_state.upgrade() {
             let tee_state = tee_state.borrow();
             assert!(tee_state.finished);

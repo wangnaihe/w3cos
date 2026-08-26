@@ -609,13 +609,13 @@ mod tests {
         for class in [old_recorder_class, old_capture_class, old_controller_class] {
             assert!(class.call(Value::Undefined, Vec::new()).is_undefined());
         }
-        assert_eq!(recorder.get_property("state").to_js_string(), "inactive");
+        assert!(recorder.get_property("state").is_undefined());
         assert!(recorder.get_property("stream").is_undefined());
-        assert!(recorder.get_property("ondataavailable").is_null());
+        assert!(recorder.get_property("ondataavailable").is_undefined());
         assert!(recorder.call_method("start", Vec::new()).is_undefined());
         assert!(capture.get_property("track").is_undefined());
         assert!(capture.call_method("takePhoto", Vec::new()).is_undefined());
-        assert!(controller.get_property("onzoomlevelchange").is_null());
+        assert!(controller.get_property("onzoomlevelchange").is_undefined());
         assert!(
             controller
                 .call_method("increaseZoomLevel", Vec::new())

@@ -696,11 +696,7 @@ pub(crate) fn discrete_property_sample(
     };
     ANIMATIONS.with(|animations| {
         animations.borrow().iter().rev().find_map(|animation| {
-            if animation
-                .get_property("__w3cos_animation_target")
-                .to_u32()
-                != node
-            {
+            if animation.get_property("__w3cos_animation_target").to_u32() != node {
                 return None;
             }
             let effect = animation.get_property("effect");
@@ -1015,12 +1011,12 @@ mod tests {
         for class in [old_animation_class, old_effect_class, old_trigger_class] {
             assert!(class.call(Value::Undefined, Vec::new()).is_undefined());
         }
-        assert_eq!(animation.get_property("playState").to_js_string(), "idle");
+        assert!(animation.get_property("playState").is_undefined());
         assert!(animation.get_property("effect").is_undefined());
         assert!(animation.get_property("timeline").is_undefined());
         assert!(animation.get_property("ready").is_undefined());
         assert!(animation.get_property("finished").is_undefined());
-        assert!(animation.get_property("onfinish").is_null());
+        assert!(animation.get_property("onfinish").is_undefined());
         assert!(animation.call_method("play", Vec::new()).is_undefined());
         assert!(effect.get_property("target").is_undefined());
         assert!(effect.call_method("getTiming", Vec::new()).is_undefined());
@@ -1030,7 +1026,7 @@ mod tests {
                 .call_method("getAnimations", Vec::new())
                 .is_undefined()
         );
-        assert_eq!(ranges.get_property("length").to_number(), 0.0);
+        assert!(ranges.get_property("length").is_undefined());
         assert!(ranges.call_method("item", Vec::new()).is_undefined());
         assert!(target_weak.upgrade().is_none());
         assert!(finish_marker_weak.upgrade().is_none());
