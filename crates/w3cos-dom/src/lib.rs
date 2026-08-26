@@ -2800,6 +2800,30 @@ mod tests {
     }
 
     #[test]
+    fn test_background_color_inherit_uses_parent_computed_color() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#wrapper", &[("background-color", "green")]);
+        crate::stylesheet::register_rule(
+            "#test",
+            &[("background-color", "red"), ("background-color", "inherit")],
+        );
+
+        let mut doc = Document::new();
+        let wrapper = doc.create_element("div");
+        wrapper.set_attribute(&mut doc, "id", "wrapper");
+        let test = doc.create_element("div");
+        test.set_attribute(&mut doc, "id", "test");
+        wrapper.append_child(&mut doc, test);
+        doc.body().append_child(&mut doc, wrapper);
+
+        assert_eq!(
+            doc.computed_style_for(test.id).background,
+            w3cos_std::Color::from_css("green").unwrap()
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_font_shorthand_survives_computed_style_inheritance() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("p", &[("font", "1em/1.25 serif")]);

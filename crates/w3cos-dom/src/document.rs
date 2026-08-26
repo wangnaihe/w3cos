@@ -968,6 +968,28 @@ impl Document {
                 )
                 .last()
         };
+        let declared_property_value = |properties: &[&str]| {
+            matched
+                .iter()
+                .filter(|(name, _, _)| {
+                    properties
+                        .iter()
+                        .any(|property| css_property_eq(name, property))
+                })
+                .map(|(name, value, _)| (name.as_str(), value.as_str()))
+                .chain(
+                    inline
+                        .inline_declarations
+                        .iter()
+                        .filter(|(name, _)| {
+                            properties
+                                .iter()
+                                .any(|property| css_property_eq(name, property))
+                        })
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                )
+                .last()
+        };
         if let Some(value) = declared_value(&["float", "cssFloat"]) {
             match value.trim().to_ascii_lowercase().as_str() {
                 "inherit" => {
@@ -993,6 +1015,23 @@ impl Document {
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("currentcolor"))
         {
             style.background = style.color;
+        }
+        if let Some((property, value)) =
+            declared_property_value(&["background", "background-color", "backgroundColor"])
+            && value.trim().eq_ignore_ascii_case("inherit")
+            && let Some(parent) = inherited
+        {
+            style.background = parent.background;
+            if css_property_eq(property, "background") {
+                style.background_image = parent.background_image.clone();
+                style.background_size = parent.background_size.clone();
+                style.background_position = parent.background_position.clone();
+                style.background_repeat = parent.background_repeat.clone();
+                style.background_origin = parent.background_origin.clone();
+                style.background_clip = parent.background_clip.clone();
+                style.background_attachment = parent.background_attachment.clone();
+                style.background_blend_mode = parent.background_blend_mode.clone();
+            }
         }
         if declared_value(&["border-color"])
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("currentcolor"))
