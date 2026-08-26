@@ -896,6 +896,8 @@ impl LayoutEngine {
             &mut scroll_ancestor,
         );
 
+        project_table_column_background_rects(&mut results, flat);
+
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
 
         results.extend(fixed_results);
@@ -1005,10 +1007,62 @@ pub fn compute_with_scroll(
         &mut scroll_ancestor,
     );
 
+    project_table_column_background_rects(&mut results, &flat);
+
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
 
     results.extend(fixed_results);
     Ok((results, scrollable, clip_only))
+}
+
+fn project_table_column_background_rects(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    let nearest_table = |index: usize| {
+        let mut parent = flat.get(index).and_then(|entry| entry.parent);
+        while let Some(index) = parent {
+            let entry = flat.get(index)?;
+            if matches!(entry.style.display, WDisplay::Table | WDisplay::InlineTable) {
+                return Some(index);
+            }
+            parent = entry.parent;
+        }
+        None
+    };
+    let mut row_bounds = HashMap::<usize, (f32, f32)>::new();
+    for (rect, index) in layouts.iter() {
+        if !matches!(
+            flat.get(*index).map(|entry| entry.style.display),
+            Some(WDisplay::TableRow)
+        ) {
+            continue;
+        }
+        let Some(table) = nearest_table(*index) else {
+            continue;
+        };
+        row_bounds
+            .entry(table)
+            .and_modify(|(top, bottom)| {
+                *top = top.min(rect.y);
+                *bottom = bottom.max(rect.y + rect.height);
+            })
+            .or_insert((rect.y, rect.y + rect.height));
+    }
+    for (rect, index) in layouts.iter_mut() {
+        if !matches!(
+            flat.get(*index).map(|entry| entry.style.display),
+            Some(WDisplay::TableColumnGroup | WDisplay::TableColumn)
+        ) {
+            continue;
+        }
+        let Some((top, bottom)) = nearest_table(*index).and_then(|table| row_bounds.get(&table))
+        else {
+            continue;
+        };
+        rect.y = *top;
+        rect.height = bottom - top;
+    }
 }
 
 fn extend_scroll_extents_from_descendants(
@@ -1216,6 +1270,18 @@ fn build_taffy_tree(
         // Flex growth only consumes positive free space, so auto-height tables
         // retain their intrinsic row heights while definite tables stretch.
         style.flex_grow = 1.0;
+    }
+    if comp.style.display == WDisplay::TableCell
+        && matches!(parent_display, Some(WDisplay::TableRow))
+        && matches!(comp.style.width, WDim::Auto)
+    {
+        // The table fallback represents a row as a flex row. Auto-width cells
+        // share the row's resolved inline size like table tracks; retaining
+        // each text leaf's intrinsic flex basis would cluster all columns at
+        // the row start instead.
+        style.flex_grow = 1.0;
+        style.flex_basis = Dimension::length(0.0);
+        style.min_size.width = Dimension::length(0.0);
     }
     if matches!(
         &comp.kind,
@@ -4930,6 +4996,99 @@ mod tests {
         let second_row = layout.iter().find(|(_, index)| *index == 4).unwrap().0;
         assert_eq!((group.width, group.height), (96.0, 96.0));
         assert_eq!(second_row.y, first_row.y + first_row.height);
+    }
+
+    #[test]
+    fn table_column_group_paints_over_rows_without_consuming_flow_height() {
+        let column_group = Component::row(
+            Style {
+                display: WDisp::TableColumnGroup,
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::TableColumn,
+                        ..Style::default()
+                    },
+                    vec![],
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::TableColumn,
+                        ..Style::default()
+                    },
+                    vec![],
+                ),
+            ],
+        );
+        let row = || {
+            Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::TableCell,
+                        height: WDim::Px(48.0),
+                        ..Style::default()
+                    },
+                    vec![],
+                )],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                width: WDim::Px(96.0),
+                ..Style::default()
+            },
+            vec![column_group, row(), row()],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let table = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let column_group = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let first_row = layout.iter().find(|(_, index)| *index == 4).unwrap().0;
+        assert_eq!((table.width, table.height), (96.0, 96.0));
+        assert_eq!(column_group, table);
+        assert_eq!(first_row.y, table.y);
+    }
+
+    #[test]
+    fn table_row_distributes_auto_cells_across_definite_width() {
+        let cell = |label| {
+            Component::text(
+                label,
+                Style {
+                    display: WDisp::TableCell,
+                    height: WDim::Px(48.0),
+                    ..Style::default()
+                },
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                width: WDim::Px(192.0),
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![cell("a"), cell("b")],
+            )],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let first = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let second = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!(first.width, 96.0);
+        assert_eq!(second.width, 96.0);
+        assert_eq!(second.x, first.x + first.width);
     }
 
     #[test]
