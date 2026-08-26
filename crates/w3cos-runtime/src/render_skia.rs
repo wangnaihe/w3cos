@@ -1628,7 +1628,7 @@ fn draw_background_image(
             // Skia's zero-radius RRect clip uses subtly different coverage
             // from a CSS rectangle. Use the rectangular primitive so raster
             // backgrounds and solid/image reference boxes share exact edges.
-            canvas.clip_rect(to_rect(clip.rect), None, Some(true));
+            canvas.clip_rect(to_rect(clip.rect), None, Some(false));
         }
         let blend_mode = match &layer {
             crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.blend_mode,
@@ -1917,6 +1917,46 @@ mod tests {
                 height: 4.0,
             },
             "fractional-image.png",
+            1.0,
+        );
+
+        let info = ImageInfo::new((8, 8), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 8 * 8 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 8 * 4, (0, 0)));
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .all(|pixel| { pixel == [255, 255, 255, 255] || pixel == [0, 128, 0, 255] })
+        );
+        crate::image_loader::clear_cache();
+    }
+
+    #[test]
+    fn raster_background_uses_crisp_clip_at_fractional_layout_coordinates() {
+        crate::image_loader::clear_cache();
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 128, 0, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::image_loader::decode_and_install("fractional-background.png", &bytes.into_inner())
+            .unwrap();
+
+        let mut surface = Surface::new_raster_n32_premul((8, 8)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        draw_background_image(
+            surface.canvas(),
+            LayoutRect {
+                x: 0.5,
+                y: 0.5,
+                width: 4.0,
+                height: 4.0,
+            },
+            0.0,
+            &Style {
+                background_image: Some("url(\"fractional-background.png\")".to_string()),
+                ..Style::default()
+            },
             1.0,
         );
 
