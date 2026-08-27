@@ -12,6 +12,7 @@ scss = ["grass"]
 [dependencies]
 w3cos-ir = { workspace = true }
 w3cos-std = { workspace = true }
+w3cos-dom = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

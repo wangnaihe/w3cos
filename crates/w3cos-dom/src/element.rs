@@ -27,7 +27,7 @@ impl Element {
 
     pub fn set_text_content(&self, doc: &mut Document, text: &str) {
         doc.get_node_mut(self.id).text_content = Some(text.to_string());
-        doc.mark_dirty(self.id);
+        doc.mark_text_dirty(self.id);
     }
 
     pub fn append_child(&self, doc: &mut Document, child: Element) {
@@ -76,7 +76,7 @@ impl Element {
                 doc.update_id_index(self.id, None, value);
             }
         }
-        doc.mark_dirty(self.id);
+        doc.mark_selector_dirty(self.id);
     }
 
     pub fn set_attribute_ns(
@@ -113,7 +113,7 @@ impl Element {
                 self.class_list_add(doc, class);
             }
         }
-        doc.mark_dirty(self.id);
+        doc.mark_selector_dirty(self.id);
     }
 
     pub fn get_attribute<'a>(&self, doc: &'a Document, name: &str) -> Option<&'a str> {
@@ -144,7 +144,7 @@ impl Element {
         }
         let node = doc.get_node_mut(self.id);
         node.remove_attribute(name);
-        doc.mark_dirty(self.id);
+        doc.mark_selector_dirty(self.id);
     }
 
     pub fn remove_attribute_ns(
@@ -157,7 +157,7 @@ impl Element {
             .get_node_mut(self.id)
             .remove_attribute_ns(namespace, local_name);
         if removed {
-            doc.mark_dirty(self.id);
+            doc.mark_selector_dirty(self.id);
         }
         removed
     }
@@ -168,7 +168,7 @@ impl Element {
         if !node.class_list.contains(&atom) {
             node.class_list.push(atom);
             doc.add_to_class_index(self.id, &atom);
-            doc.mark_dirty(self.id);
+            doc.mark_selector_dirty(self.id);
         }
     }
 
@@ -176,7 +176,7 @@ impl Element {
         let atom = Atom::intern(class);
         doc.get_node_mut(self.id).class_list.retain(|c| *c != atom);
         doc.remove_from_class_index(self.id, &atom);
-        doc.mark_dirty(self.id);
+        doc.mark_selector_dirty(self.id);
     }
 
     pub fn class_list_toggle(&self, doc: &mut Document, class: &str) -> bool {
@@ -201,7 +201,7 @@ impl Element {
     }
 
     pub fn style_mut<'a>(&self, doc: &'a mut Document) -> &'a mut CSSStyleDeclaration {
-        doc.mark_dirty(self.id);
+        doc.mark_inline_style_dirty(self.id);
         doc.get_style_mut(self.id)
     }
 
@@ -343,7 +343,7 @@ impl Element {
         } else {
             node.attributes.push((class_attr, name.to_string()));
         }
-        doc.mark_dirty(self.id);
+        doc.mark_selector_dirty(self.id);
     }
 
     /// `element.dataset` — returns all `data-*` attributes as key/value pairs.

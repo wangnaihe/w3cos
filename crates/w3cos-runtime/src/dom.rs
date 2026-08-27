@@ -68,7 +68,7 @@ pub fn create_element(tag: &str) -> u32 {
 
 pub fn set_html_element(node: u32, is_html_element: bool) {
     with_document_mut(|doc| {
-        doc.get_node_mut(NodeId::from_u32(node)).is_html_element = is_html_element;
+        doc.set_html_element(NodeId::from_u32(node), is_html_element);
     });
 }
 

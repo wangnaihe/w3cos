@@ -292,12 +292,11 @@ pub fn run_app_dom(setup: fn()) -> Result<()> {
 mod tests {
     #[test]
     fn stylesheet_registry_is_reexported_for_generated_bundles() {
-        // Generated esm_bundle.rs calls w3cos_runtime::stylesheet::register_rule.
+        // Generated esm_bundle.rs calls the re-exported precompiled path.
         crate::stylesheet::clear_rules();
-        crate::stylesheet::register_rule(
-            ".monaco-editor .find-widget",
-            &[("position", "absolute")],
-        );
+        let selectors =
+            crate::stylesheet::compile_selector_bytecode(".monaco-editor .find-widget").unwrap();
+        crate::stylesheet::register_compiled_rule(&selectors[0], &[("position", "absolute")]);
         let ancestors = [crate::stylesheet::SelectorContext::new(
             "div",
             None,

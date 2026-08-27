@@ -474,10 +474,21 @@ fn emit_register_styles(css_rules: &[crate::esm_css::CollectedRule]) -> String {
             .map(|(prop, value)| format!("({prop:?}, {value:?})"))
             .collect::<Vec<_>>()
             .join(", ");
-        out.push_str(&format!(
-            "    w3cos_runtime::stylesheet::register_rule({:?}, &[{declarations}]);\n",
-            rule.selector
-        ));
+        let Some(compiled_selectors) =
+            w3cos_dom::stylesheet::compile_selector_bytecode(&rule.selector)
+        else {
+            continue;
+        };
+        for bytecode in compiled_selectors {
+            let bytecode = bytecode
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "    w3cos_runtime::stylesheet::register_compiled_rule(&[{bytecode}], &[{declarations}]);\n"
+            ));
+        }
     }
     out.push_str("}\n\n");
     out
@@ -8609,7 +8620,7 @@ fn main() {
     }
 
     #[test]
-    fn emits_register_styles_rules_and_run_entry_calls_it_first() {
+    fn emits_precompiled_stylesheet_rules_and_run_entry_calls_it_first() {
         let bundle = EsmBundle::default();
         let rules = vec![
             crate::esm_css::CollectedRule {
@@ -8621,7 +8632,7 @@ fn main() {
                 media: None,
             },
             crate::esm_css::CollectedRule {
-                selector: ".quote\"test".to_string(),
+                selector: ".quote\\\"test".to_string(),
                 declarations: vec![("content".to_string(), "a\\b".to_string())],
                 media: None,
             },
@@ -8632,15 +8643,21 @@ fn main() {
             "missing register_styles: {code}"
         );
         assert!(
-            code.contains(
-                "w3cos_runtime::stylesheet::register_rule(\".monaco-editor .find-widget\", &[(\"position\", \"absolute\"), (\"width\", \"100%\")]);"
-            ),
-            "missing register_rule line: {code}"
+            code.contains("w3cos_runtime::stylesheet::register_compiled_rule(&["),
+            "missing precompiled selector registration: {code}"
         );
-        // Strings must be Rust-escaped.
         assert!(
-            code.contains("register_rule(\".quote\\\"test\", &[(\"content\", \"a\\\\b\")]);"),
-            "selector/value escaping wrong: {code}"
+            !code.contains("w3cos_runtime::stylesheet::register_rule("),
+            "static CSS must not be reparsed at application startup: {code}"
+        );
+        assert_eq!(
+            code.matches("stylesheet::register_compiled_rule(").count(),
+            2,
+            "both valid static selectors must be compiled: {code}"
+        );
+        assert!(
+            code.contains("&[(\"content\", \"a\\\\b\")]"),
+            "declaration escaping wrong: {code}"
         );
         // run_entry registers styles before running any app code.
         assert!(

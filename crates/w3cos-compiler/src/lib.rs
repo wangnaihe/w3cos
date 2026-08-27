@@ -1946,14 +1946,19 @@ export function main() {
             "missing register_styles: {bundle_rs}"
         );
         assert!(
-            bundle_rs.contains(
-                "w3cos_runtime::stylesheet::register_rule(\".app\", &[(\"color\", \"#ff0000\"), (\"width\", \"10px\")]);"
-            ),
-            "missing baked rule: {bundle_rs}"
+            bundle_rs.contains("w3cos_runtime::stylesheet::register_compiled_rule(&["),
+            "missing baked selector IR: {bundle_rs}"
+        );
+        assert_eq!(
+            bundle_rs
+                .matches("stylesheet::register_compiled_rule(")
+                .count(),
+            2,
+            "every static selector must be emitted exactly once: {bundle_rs}"
         );
         assert!(
-            bundle_rs.contains("register_rule(\".outer .inner\""),
-            "descendant selector text must survive: {bundle_rs}"
+            !bundle_rs.contains("stylesheet::register_rule("),
+            "static selector text must not survive into startup parsing: {bundle_rs}"
         );
         assert!(
             bundle_rs.contains("pub fn run_entry_async() -> w3cos_core::Value"),

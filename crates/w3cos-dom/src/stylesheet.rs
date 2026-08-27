@@ -1,9 +1,9 @@
 //! Runtime stylesheet registry + selector matcher.
 //!
 //! CSS imported by ESM modules (`import "./x.css"`) is parsed at compile time
-//! by `w3cos-compiler` and baked into the generated bundle as a sequence of
-//! [`register_rule`] calls. [`Document::to_component_tree`](crate::Document)
-//! then applies matching rules *before* inline styles (inline wins).
+//! by `w3cos-compiler` and baked into the generated bundle as precompiled
+//! selector bytecode. [`Document::to_component_tree`](crate::Document) then
+//! applies matching rules *before* inline styles (inline wins).
 //!
 //! Supported selectors:
 //! - `*`, `tag`, `.class`, `#id`
@@ -17,10 +17,18 @@
 //! required runtime state is represented. Generated `::before`/`::after`
 //! declarations are exposed separately for the component-tree bridge.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::{Document, NodeId, NodeType};
+
+mod rule_set;
+mod selector_bytecode;
+mod selector_filter;
+mod selector_parse_cache;
+
+use rule_set::RuleSet;
+use selector_filter::AncestorBloom;
 
 /// Ancestor-chain entry used for descendant/child combinator matching.
 #[derive(Debug, Clone, Default)]
@@ -354,10 +362,30 @@ struct Rule {
     /// Pseudo-elements participate in their own cascade and never style the
     /// originating element's principal box.
     pseudo_element: Option<String>,
+    /// Required features on the target's ancestor chain. This is only a
+    /// no-false-negative prefilter; the complete matcher remains authoritative.
+    ancestor_filter: AncestorBloom,
 }
 
 thread_local! {
-    static RULES: RefCell<Vec<Rule>> = const { RefCell::new(Vec::new()) };
+    static RULES: RefCell<RuleSet> = RefCell::new(RuleSet::default());
+    static STYLE_GENERATION: Cell<u64> = const { Cell::new(1) };
+}
+
+fn bump_generation() {
+    STYLE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
+}
+
+pub(crate) fn generation() -> u64 {
+    STYLE_GENERATION.with(Cell::get)
+}
+
+pub(crate) fn has_sibling_dependencies() -> bool {
+    RULES.with(|rules| rules.borrow().has_sibling_dependencies())
+}
+
+pub(crate) fn has_relational_dependencies() -> bool {
+    RULES.with(|rules| rules.borrow().has_relational_dependencies())
 }
 
 const CONTAINER_QUERY_MARKER: &str = "__w3cos_container_query";
@@ -384,22 +412,72 @@ fn register_rule_with_owner(owner: Option<u64>, selector: &str, declarations: &[
     if declarations.is_empty() {
         return;
     }
-    let parsed = split_selector_group(selector)
+    let Some(parsed) = parse_selector_list(selector) else {
+        return;
+    };
+    register_parsed_rules(owner, parsed, declarations);
+}
+
+fn parse_selector_list(
+    selector: &str,
+) -> Option<Vec<(Vec<CompoundSelector>, Vec<Combinator>, Option<String>)>> {
+    split_selector_group(selector)
         .into_iter()
         .map(|single| {
             let (single, pseudo_element) = strip_terminal_pseudo_element(&single);
-            parse_selector_chain(&single)
-                .map(|(chain, combinators)| (chain, combinators, pseudo_element))
+            parse_selector_chain_cached(&single).map(|parsed| {
+                (
+                    parsed.chain.clone(),
+                    parsed.combinators.clone(),
+                    pseudo_element,
+                )
+            })
         })
-        .collect::<Option<Vec<_>>>();
-    let Some(parsed) = parsed else {
+        .collect()
+}
+
+/// Compile one authored selector list into the versioned bytecode consumed by
+/// [`register_compiled_rule`]. Static ESM CSS uses this at W3COS build time;
+/// dynamic stylesheets continue to call [`register_rule`].
+pub fn compile_selector_bytecode(selector: &str) -> Option<Vec<Vec<u8>>> {
+    parse_selector_list(selector).map(|parsed| {
+        parsed
+            .into_iter()
+            .map(|(chain, combinators, pseudo_element)| {
+                selector_bytecode::encode(&chain, &combinators, pseudo_element.as_deref())
+            })
+            .collect()
+    })
+}
+
+/// Register a selector that was parsed and encoded by
+/// [`compile_selector_bytecode`] during AOT compilation.
+pub fn register_compiled_rule(bytecode: &[u8], declarations: &[(&str, &str)]) {
+    if declarations.is_empty() {
+        return;
+    }
+    let Some((chain, combinators, pseudo_element)) = selector_bytecode::decode(bytecode) else {
         return;
     };
-    RULES.with(|rules| {
+    register_parsed_rules(
+        None,
+        vec![(chain, combinators, pseudo_element)],
+        declarations,
+    );
+}
+
+fn register_parsed_rules(
+    owner: Option<u64>,
+    parsed: Vec<(Vec<CompoundSelector>, Vec<Combinator>, Option<String>)>,
+    declarations: &[(&str, &str)],
+) {
+    let added = RULES.with(|rules| {
         let mut rules = rules.borrow_mut();
+        let initial_len = rules.rules.len();
         for (chain, combinators, pseudo_element) in parsed {
             let specificity = chain.iter().map(CompoundSelector::specificity).sum();
-            let order = rules.len() as u32;
+            let ancestor_filter = AncestorBloom::for_rule(&chain, &combinators);
+            let order = rules.rules.len() as u32;
             rules.push(Rule {
                 chain,
                 combinators,
@@ -411,9 +489,14 @@ fn register_rule_with_owner(owner: Option<u64>, selector: &str, declarations: &[
                 order,
                 owner,
                 pseudo_element,
+                ancestor_filter,
             });
         }
+        rules.rules.len() != initial_len
     });
+    if added {
+        bump_generation();
+    }
 }
 
 fn strip_terminal_pseudo_element(selector: &str) -> (String, Option<String>) {
@@ -440,24 +523,39 @@ pub fn clear_owner(owner: u64) {
     // thread teardown after this registry has already been destroyed.
     // Cleanup is idempotent, so a late teardown must become a no-op instead
     // of panicking on TLS destruction order.
-    let _ = RULES.try_with(|rules| {
-        rules.borrow_mut().retain(|rule| rule.owner != Some(owner));
+    let removed = RULES.try_with(|rules| {
+        let mut rules = rules.borrow_mut();
+        let initial_len = rules.rules.len();
+        rules.rules.retain(|rule| rule.owner != Some(owner));
+        rules.rebuild_index();
+        rules.rules.len() != initial_len
     });
+    if matches!(removed, Ok(true)) {
+        bump_generation();
+    }
 }
 
 /// Remove all registered rules.
 pub fn clear_rules() {
-    RULES.with(|rules| rules.borrow_mut().clear());
+    let removed = RULES.with(|rules| {
+        let mut rules = rules.borrow_mut();
+        let removed = !rules.rules.is_empty();
+        *rules = RuleSet::default();
+        removed
+    });
+    if removed {
+        bump_generation();
+    }
 }
 
 /// Number of registered rules (after comma-group splitting).
 pub fn rule_count() -> usize {
-    RULES.with(|rules| rules.borrow().len())
+    RULES.with(|rules| rules.borrow().rules.len())
 }
 
 /// Whether any rules are registered — fast path for the DOM walk.
 pub fn has_rules() -> bool {
-    RULES.with(|rules| !rules.borrow().is_empty())
+    RULES.with(|rules| !rules.borrow().rules.is_empty())
 }
 
 /// Declarations of every rule matching the given element, ordered for
@@ -480,13 +578,17 @@ pub fn matching_declarations_for_context(
     ctx: &SelectorContext,
     ancestors: &[SelectorContext],
 ) -> Vec<(String, String, u32)> {
+    let ancestor_bloom = AncestorBloom::for_contexts(ancestors);
     RULES.with(|rules| {
         let rules = rules.borrow();
         let mut matched: Vec<&Rule> = rules
-            .iter()
+            .candidate_indices_for_context(ctx)
+            .into_iter()
+            .map(|index| &rules.rules[index])
             .filter(|rule| {
                 rule.pseudo_element.is_none()
                     && !rule_has_container_query(rule)
+                    && ancestor_bloom.might_contain(rule.ancestor_filter)
                     && rule_matches(rule, &ctx, ancestors)
             })
             .collect();
@@ -503,15 +605,38 @@ pub fn matching_declarations_for_context(
     })
 }
 
+#[cfg(test)]
+fn candidate_rule_count_for_context(ctx: &SelectorContext) -> usize {
+    RULES.with(|rules| rules.borrow().candidate_indices_for_context(ctx).len())
+}
+
+#[cfg(test)]
+fn ancestor_filtered_candidate_rule_count_for_context(
+    ctx: &SelectorContext,
+    ancestors: &[SelectorContext],
+) -> usize {
+    let ancestor_bloom = AncestorBloom::for_contexts(ancestors);
+    RULES.with(|rules| {
+        let rules = rules.borrow();
+        rules
+            .candidate_indices_for_context(ctx)
+            .into_iter()
+            .filter(|index| ancestor_bloom.might_contain(rules.rules[*index].ancestor_filter))
+            .count()
+    })
+}
+
 fn matched_property_value(
     rules: &[Rule],
     document: &Document,
     node: NodeId,
     property: &str,
 ) -> Option<String> {
+    let ancestor_bloom = AncestorBloom::for_node(document, node);
     let mut declarations = rules
         .iter()
         .filter(|rule| rule.pseudo_element.is_none() && !rule_has_container_query(rule))
+        .filter(|rule| ancestor_bloom.might_contain(rule.ancestor_filter))
         .filter(|rule| {
             matches_chain_node(
                 document,
@@ -621,12 +746,16 @@ pub fn matching_declarations_for_node(
     document: &Document,
     node: NodeId,
 ) -> Vec<(String, String, u32)> {
+    let ancestor_bloom = AncestorBloom::for_node(document, node);
     RULES.with(|rules| {
         let rules = rules.borrow();
         let mut matched: Vec<&Rule> = rules
-            .iter()
+            .candidate_indices_for_node(document, node)
+            .into_iter()
+            .map(|index| &rules.rules[index])
             .filter(|rule| {
                 rule.pseudo_element.is_none()
+                    && ancestor_bloom.might_contain(rule.ancestor_filter)
                     && matches_chain_node(
                         document,
                         node,
@@ -640,7 +769,9 @@ pub fn matching_declarations_for_node(
                         .declarations
                         .iter()
                         .filter(|(property, _)| property == CONTAINER_QUERY_MARKER)
-                        .all(|(_, query)| container_query_matches(&rules, document, node, query))
+                        .all(|(_, query)| {
+                            container_query_matches(&rules.rules, document, node, query)
+                        })
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
@@ -664,11 +795,15 @@ pub fn matching_pseudo_declarations_for_node(
     node: NodeId,
     pseudo_element: &str,
 ) -> Vec<(String, String, u32)> {
+    let ancestor_bloom = AncestorBloom::for_node(document, node);
     RULES.with(|rules| {
         let rules = rules.borrow();
         let mut matched: Vec<&Rule> = rules
-            .iter()
+            .candidate_indices_for_node(document, node)
+            .into_iter()
+            .map(|index| &rules.rules[index])
             .filter(|rule| rule.pseudo_element.as_deref() == Some(pseudo_element))
+            .filter(|rule| ancestor_bloom.might_contain(rule.ancestor_filter))
             .filter(|rule| {
                 matches_chain_node(
                     document,
@@ -682,7 +817,7 @@ pub fn matching_pseudo_declarations_for_node(
                     .declarations
                     .iter()
                     .filter(|(property, _)| property == CONTAINER_QUERY_MARKER)
-                    .all(|(_, query)| container_query_matches(&rules, document, node, query))
+                    .all(|(_, query)| container_query_matches(&rules.rules, document, node, query))
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
@@ -711,20 +846,13 @@ pub fn selector_matches_context(
     }
     let parsed = split_selector_group(selector)
         .into_iter()
-        .map(|single| parse_selector_chain(&single))
+        .map(|single| parse_selector_chain_cached(&single))
         .collect::<Option<Vec<_>>>()
         .ok_or(())?;
-    Ok(parsed.into_iter().any(|(chain, combinators)| {
-        let rule = Rule {
-            specificity: chain.iter().map(CompoundSelector::specificity).sum(),
-            chain,
-            combinators,
-            declarations: Vec::new(),
-            order: 0,
-            owner: None,
-            pseudo_element: None,
-        };
-        rule_matches(&rule, ctx, ancestors)
+    let ancestor_bloom = AncestorBloom::for_contexts(ancestors);
+    Ok(parsed.into_iter().any(|parsed| {
+        ancestor_bloom.might_contain(parsed.ancestor_filter)
+            && selector_chain_matches_context(&parsed.chain, &parsed.combinators, ctx, ancestors)
     }))
 }
 
@@ -755,16 +883,16 @@ pub fn selector_matches_node_with_target(
     }
     let parsed = split_selector_group(selector)
         .into_iter()
-        .map(|single| parse_selector_chain(&single))
+        .map(|single| parse_selector_chain_cached(&single))
         .collect::<Option<Vec<_>>>()
         .ok_or(())?;
-    Ok(parsed.into_iter().any(|(chain, combinators)| {
+    Ok(parsed.into_iter().any(|parsed| {
         matches_chain_node(
             document,
             node,
-            &chain,
-            &combinators,
-            chain.len() - 1,
+            &parsed.chain,
+            &parsed.combinators,
+            parsed.chain.len() - 1,
             target_id,
             None,
         )
@@ -788,16 +916,16 @@ pub fn selector_matches_node_relative_to_scope(
     }
     let parsed = split_selector_group(selector)
         .into_iter()
-        .map(|single| parse_selector_chain(&single))
+        .map(|single| parse_selector_chain_cached(&single))
         .collect::<Option<Vec<_>>>()
         .ok_or(())?;
-    Ok(parsed.into_iter().any(|(chain, combinators)| {
-        (0..chain.len()).any(|index| {
+    Ok(parsed.into_iter().any(|parsed| {
+        (0..parsed.chain.len()).any(|index| {
             matches_chain_node(
                 document,
                 node,
-                &chain,
-                &combinators,
+                &parsed.chain,
+                &parsed.combinators,
                 index,
                 target_id,
                 Some(scope),
@@ -1239,7 +1367,16 @@ fn selector_context_for_node(document: &Document, id: NodeId) -> SelectorContext
 }
 
 fn rule_matches(rule: &Rule, ctx: &SelectorContext, ancestors: &[SelectorContext]) -> bool {
-    let Some(subject) = rule.chain.last() else {
+    selector_chain_matches_context(&rule.chain, &rule.combinators, ctx, ancestors)
+}
+
+fn selector_chain_matches_context(
+    chain: &[CompoundSelector],
+    combinators: &[Combinator],
+    ctx: &SelectorContext,
+    ancestors: &[SelectorContext],
+) -> bool {
+    let Some(subject) = chain.last() else {
         return false;
     };
     if !subject.matches(ctx) {
@@ -1249,9 +1386,9 @@ fn rule_matches(rule: &Rule, ctx: &SelectorContext, ancestors: &[SelectorContext
     // (ancestors is ordered root..parent, nearest parent last).
     let mut current = ctx;
     let mut cursor = ancestors.len(); // next ancestor index to consider (exclusive)
-    for i in (0..rule.chain.len().saturating_sub(1)).rev() {
-        let compound = &rule.chain[i];
-        let combinator = rule.combinators[i];
+    for i in (0..chain.len().saturating_sub(1)).rev() {
+        let compound = &chain[i];
+        let combinator = combinators[i];
         match combinator {
             Combinator::Child => {
                 if cursor == 0 {
@@ -1563,6 +1700,12 @@ fn parse_selector_chain(selector: &str) -> Option<(Vec<CompoundSelector>, Vec<Co
     Some((chain, combinators))
 }
 
+fn parse_selector_chain_cached(
+    selector: &str,
+) -> Option<Rc<selector_parse_cache::ParsedSelectorChain>> {
+    selector_parse_cache::get_or_parse(selector, parse_selector_chain)
+}
+
 /// Parse one compound selector starting at `pos`. Returns the compound and
 /// the index just past it.
 fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, usize)> {
@@ -1872,6 +2015,149 @@ mod tests {
     }
 
     #[test]
+    fn candidate_index_skips_unrelated_subject_buckets() {
+        setup();
+        for index in 0..128 {
+            register_rule(&format!(".unrelated-{index}"), &[("unused", "true")]);
+        }
+        register_rule("#target", &[("id-hit", "true")]);
+        register_rule(".active", &[("class-hit", "true")]);
+        register_rule("[data-state]", &[("attribute-hit", "true")]);
+        register_rule("button", &[("tag-hit", "true")]);
+        register_rule("*", &[("universal-hit", "true")]);
+
+        let element = SelectorContext::new("button", Some("target"), &["active"])
+            .with_attributes(&[("data-state", "ready")]);
+        assert_eq!(rule_count(), 133);
+        assert_eq!(candidate_rule_count_for_context(&element), 5);
+        assert_eq!(matching_declarations_for_context(&element, &[]).len(), 5);
+    }
+
+    #[test]
+    fn ancestor_filter_skips_same_subject_rules_before_chain_matching() {
+        setup();
+        for _ in 0..128 {
+            register_rule(".missing .target", &[("unused", "true")]);
+        }
+        register_rule(".present .target", &[("matched", "true")]);
+
+        let element = SelectorContext::new("span", None, &["target"]);
+        let ancestors = [SelectorContext::new("div", None, &["present"])];
+        assert_eq!(candidate_rule_count_for_context(&element), 129);
+        assert_eq!(
+            ancestor_filtered_candidate_rule_count_for_context(&element, &ancestors),
+            1
+        );
+        assert_eq!(
+            matching_declarations_for_context(&element, &ancestors).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn selector_parse_cache_reuses_valid_and_invalid_results() {
+        selector_parse_cache::clear_for_test();
+        let target = SelectorContext::new("span", None, &["target"]);
+
+        assert_eq!(selector_matches_context(".target", &target, &[]), Ok(true));
+        assert_eq!(selector_matches_context(".target", &target, &[]), Ok(true));
+        assert_eq!(selector_matches_context("[data-x=", &target, &[]), Err(()));
+        assert_eq!(selector_matches_context("[data-x=", &target, &[]), Err(()));
+
+        assert_eq!(selector_parse_cache::parse_count_for_test(), 2);
+    }
+
+    #[test]
+    fn selector_parse_cache_is_bounded_and_evicts_the_least_recently_used_entry() {
+        selector_parse_cache::clear_for_test();
+        let target = SelectorContext::new("span", None, &[]);
+        for index in 0..selector_parse_cache::SELECTOR_PARSE_CACHE_CAPACITY {
+            let selector = format!(".item-{index}");
+            assert_eq!(selector_matches_context(&selector, &target, &[]), Ok(false));
+        }
+
+        assert_eq!(selector_matches_context(".item-0", &target, &[]), Ok(false));
+        assert_eq!(
+            selector_matches_context(".overflow", &target, &[]),
+            Ok(false)
+        );
+        assert_eq!(selector_matches_context(".item-1", &target, &[]), Ok(false));
+        assert_eq!(
+            selector_parse_cache::parse_count_for_test(),
+            selector_parse_cache::SELECTOR_PARSE_CACHE_CAPACITY + 2
+        );
+    }
+
+    #[test]
+    fn invalidation_dependencies_track_active_rules_and_owner_cleanup() {
+        setup();
+        assert!(!has_sibling_dependencies());
+        assert!(!has_relational_dependencies());
+
+        register_rule_for_owner(7, ".a + .b", &[("color", "red")]);
+        assert!(has_sibling_dependencies());
+        assert!(!has_relational_dependencies());
+
+        register_rule_for_owner(8, ".host:not(:has(.flag))", &[("color", "blue")]);
+        assert!(has_relational_dependencies());
+
+        clear_owner(8);
+        assert!(has_sibling_dependencies());
+        assert!(!has_relational_dependencies());
+        clear_owner(7);
+        assert!(!has_sibling_dependencies());
+    }
+
+    #[test]
+    fn any_namespace_type_selector_uses_the_local_tag_bucket() {
+        setup();
+        register_rule("*|rect", &[("fill", "red")]);
+        let element = SelectorContext::new("svg:rect", None, &[]).with_html_element(false);
+        assert_eq!(candidate_rule_count_for_context(&element), 1);
+        assert_eq!(matching_declarations_for_context(&element, &[]).len(), 1);
+    }
+
+    #[test]
+    fn compiled_selector_bytecode_preserves_the_dynamic_parser_ir() {
+        for selector in [
+            "section#main.card[data-role='USER' i] > span.item:first-child::before",
+            "[*|href][class~=active][lang|=en][data-id^=pre][data-id$=post][data-id*=middle]",
+            ":last-child:last-of-type:first-of-type:only-child:only-of-type:empty:root",
+            "a:link:visited:target:enabled:disabled:checked:dir(rtl):lang(en)",
+            "div:has(> button):not(.hidden):nth-child(2n+1):nth-last-child(2):nth-of-type(odd):nth-last-of-type(even)",
+        ] {
+            let parsed = parse_selector_list(selector).expect("dynamic parser accepts selector");
+            let bytecodes =
+                compile_selector_bytecode(selector).expect("AOT compiler accepts selector");
+            assert_eq!(parsed.len(), bytecodes.len());
+            for (expected, bytecode) in parsed.iter().zip(bytecodes) {
+                let decoded = selector_bytecode::decode(&bytecode).expect("bytecode decodes");
+                assert_eq!(format!("{expected:?}"), format!("{decoded:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_rules_share_registration_and_fail_closed_on_invalid_bytecode() {
+        setup();
+        let bytecodes = compile_selector_bytecode(".active, #target").unwrap();
+        for bytecode in bytecodes {
+            register_compiled_rule(&bytecode, &[("color", "red")]);
+        }
+        register_compiled_rule(&[255, 0, 0], &[("invalid", "true")]);
+
+        assert_eq!(rule_count(), 2);
+        assert_eq!(
+            matching_declarations("div", None, &["active"], &[]).len(),
+            1
+        );
+        assert_eq!(
+            matching_declarations("div", Some("target"), &[], &[]).len(),
+            1
+        );
+    }
+
+    #[test]
     fn matches_compound() {
         setup();
         register_rule("div.item.active", &[("color", "red")]);
@@ -1979,17 +2265,17 @@ mod tests {
             .with_attributes(&[("data-role", "assistant")]);
 
         assert!(rule_matches(
-            &RULES.with(|rules| rules.borrow()[0].clone()),
+            &RULES.with(|rules| rules.borrow().rules[0].clone()),
             &disabled,
             &[]
         ));
         assert!(rule_matches(
-            &RULES.with(|rules| rules.borrow()[1].clone()),
+            &RULES.with(|rules| rules.borrow().rules[1].clone()),
             &user,
             &[]
         ));
         assert!(!rule_matches(
-            &RULES.with(|rules| rules.borrow()[1].clone()),
+            &RULES.with(|rules| rules.borrow().rules[1].clone()),
             &assistant,
             &[]
         ));
@@ -2078,6 +2364,24 @@ mod tests {
         assert_eq!(matching_declarations_for_context(&b, &[])[0].1, "red");
         assert_eq!(matching_declarations_for_context(&c, &[])[0].1, "blue");
         assert_eq!(rule_count(), 2);
+    }
+
+    #[test]
+    fn ancestor_filter_stops_at_sibling_edges_without_false_negatives() {
+        setup();
+        register_rule(".a + .b > .target", &[("color", "red")]);
+        let a = ctx("div", None, &["a"]);
+        let parent = ctx("div", None, &["b"]).with_previous_siblings(vec![a]);
+        let target = ctx("span", None, &["target"]);
+
+        assert_eq!(
+            ancestor_filtered_candidate_rule_count_for_context(&target, &[parent.clone()]),
+            1
+        );
+        assert_eq!(
+            matching_declarations_for_context(&target, &[parent])[0].1,
+            "red"
+        );
     }
 
     #[test]

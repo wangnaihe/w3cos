@@ -30,7 +30,7 @@ use std::path::Path;
 use crate::css_values;
 use crate::esm_resolver::{EsmResolver, ModuleGraph, is_asset_import};
 
-/// A single flat rule ready for `register_rule` codegen.
+/// A single flat rule ready for compiled-selector registration codegen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectedRule {
     /// Single (non-comma) selector, full text including combinators.

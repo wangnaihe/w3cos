@@ -1,3 +1,6 @@
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -20,6 +23,13 @@ struct CounterSnapshot {
 enum GeneratedContentItem {
     Text(String),
     Image(String),
+}
+
+struct CachedComputedStyle {
+    node_revision: u64,
+    stylesheet_generation: u64,
+    inherited_style: Option<w3cos_std::style::Style>,
+    style: w3cos_std::style::Style,
 }
 
 fn push_generated_text(items: &mut Vec<GeneratedContentItem>, text: &str) {
@@ -104,6 +114,13 @@ pub struct Document {
     scroll_offsets: Vec<(f32, f32)>,
     free_list: Vec<u32>,
     dirty: Vec<NodeId>,
+    style_revision_clock: u64,
+    style_revisions: Vec<u64>,
+    computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
+    #[cfg(test)]
+    computed_style_cache_hits: Cell<usize>,
+    #[cfg(test)]
+    computed_style_cache_misses: Cell<usize>,
     pub(crate) events: EventRegistry,
     body_id: NodeId,
     // Fast lookup indexes
@@ -131,6 +148,13 @@ impl Document {
             scroll_offsets: Vec::new(),
             free_list: Vec::new(),
             dirty: Vec::new(),
+            style_revision_clock: 0,
+            style_revisions: Vec::new(),
+            computed_style_cache: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            computed_style_cache_hits: Cell::new(0),
+            #[cfg(test)]
+            computed_style_cache_misses: Cell::new(0),
             events: EventRegistry::new(),
             body_id: NodeId(0),
             id_index: HashMap::new(),
@@ -218,7 +242,19 @@ impl Document {
     }
 
     pub fn set_html_document(&mut self, html_document: bool) {
+        if self.html_document == html_document {
+            return;
+        }
         self.html_document = html_document;
+        self.mark_dirty(NodeId::ROOT);
+    }
+
+    pub fn set_html_element(&mut self, id: NodeId, is_html_element: bool) {
+        if self.get_node(id).is_html_element == is_html_element {
+            return;
+        }
+        self.get_node_mut(id).is_html_element = is_html_element;
+        self.mark_selector_dirty(id);
     }
 
     pub fn is_html_document(&self) -> bool {
@@ -292,6 +328,7 @@ impl Document {
         if self.insertion_would_create_cycle(parent, child) {
             return;
         }
+        let old_parent = self.get_node(child).parent;
         self.unlink_from_parent(child);
 
         let parent_last = self.get_node(parent).last_child;
@@ -308,6 +345,11 @@ impl Document {
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
 
+        if let Some(old_parent) = old_parent
+            && old_parent != parent
+        {
+            self.mark_dirty(old_parent);
+        }
         self.mark_dirty(parent);
     }
 
@@ -399,6 +441,7 @@ impl Document {
         if self.insertion_would_create_cycle(parent, new_child) {
             return;
         }
+        let old_parent = self.get_node(new_child).parent;
         self.unlink_from_parent(new_child);
 
         let ref_prev = self.get_node(ref_child).prev_sibling;
@@ -414,6 +457,11 @@ impl Document {
             self.get_node_mut(parent).first_child = Some(new_child);
         }
 
+        if let Some(old_parent) = old_parent
+            && old_parent != parent
+        {
+            self.mark_dirty(old_parent);
+        }
         self.mark_dirty(parent);
     }
 
@@ -457,6 +505,8 @@ impl Document {
     fn alloc_node(&mut self, mut node: DomNode) -> NodeId {
         let initial_style =
             CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
+        self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        let style_revision = self.style_revision_clock;
         let id = if let Some(slot) = self.free_list.pop() {
             node.id = NodeId(slot);
             let idx = slot as usize;
@@ -464,6 +514,7 @@ impl Document {
             self.styles[idx] = initial_style;
             self.layout_rects[idx] = DOMRect::zero();
             self.scroll_offsets[idx] = (0.0, 0.0);
+            self.style_revisions[idx] = style_revision;
             NodeId(slot)
         } else {
             let id = NodeId(self.nodes.len() as u32);
@@ -473,6 +524,7 @@ impl Document {
             self.styles.push(initial_style);
             self.layout_rects.push(DOMRect::zero());
             self.scroll_offsets.push((0.0, 0.0));
+            self.style_revisions.push(style_revision);
             // Update tag index
             self.tag_index.entry(tag).or_default().push(id);
             id
@@ -537,6 +589,8 @@ impl Document {
 
     /// Free a node slot for reuse. Does NOT unlink from tree — call remove_child first.
     pub fn free_node(&mut self, id: NodeId) {
+        self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        self.style_revisions[id.0 as usize] = self.style_revision_clock;
         self.image_render_sources.remove(&id);
         if let Some(node) = &self.nodes[id.0 as usize] {
             let tag = node.tag;
@@ -574,9 +628,16 @@ impl Document {
     /// arena needs an explicit sweep so framework adapters can release host
     /// subtrees without leaking slots or selector indexes.
     pub fn remove_node(&mut self, id: NodeId) {
+        if let Some(parent) = self.get_node(id).parent {
+            self.mark_dirty(parent);
+        }
+        self.remove_node_inner(id);
+    }
+
+    fn remove_node_inner(&mut self, id: NodeId) {
         let children = self.children_ids(id);
         for child in children {
-            self.remove_node(child);
+            self.remove_node_inner(child);
         }
         self.unlink_from_parent(id);
         self.events.remove_all(id);
@@ -601,7 +662,7 @@ impl Document {
         } else {
             self.image_render_sources.remove(&id);
         }
-        self.mark_dirty(id);
+        self.record_layout_dirty(id);
     }
 
     pub fn get_node_mut(&mut self, id: NodeId) -> &mut DomNode {
@@ -647,6 +708,49 @@ impl Document {
     /// (or document root) and marks that scope dirty — not the whole tree.
     /// This enables incremental re-layout of only affected subtrees.
     pub fn mark_dirty(&mut self, id: NodeId) {
+        let invalidation_root = if stylesheet::has_relational_dependencies() {
+            NodeId::ROOT
+        } else {
+            id
+        };
+        self.invalidate_style_subtree(invalidation_root);
+        self.record_layout_dirty(id);
+    }
+
+    /// Invalidate selectors whose subject, ancestor chain, or preceding
+    /// siblings can observe a class/id/attribute mutation.
+    pub(crate) fn mark_selector_dirty(&mut self, id: NodeId) {
+        let invalidation_root = if stylesheet::has_relational_dependencies() {
+            NodeId::ROOT
+        } else if stylesheet::has_sibling_dependencies() {
+            self.get_node(id).parent.unwrap_or(id)
+        } else {
+            id
+        };
+        self.invalidate_style_subtree(invalidation_root);
+        self.record_layout_dirty(id);
+    }
+
+    /// Inline declarations cannot change selector matching, but inherited
+    /// values and custom properties require the complete descendant subtree.
+    pub(crate) fn mark_inline_style_dirty(&mut self, id: NodeId) {
+        self.invalidate_style_subtree(id);
+        self.record_layout_dirty(id);
+    }
+
+    /// Text mutations can change the parent's `:empty` state. Relational
+    /// selectors such as `:has()` conservatively fall back to document scope.
+    pub(crate) fn mark_text_dirty(&mut self, id: NodeId) {
+        let invalidation_root = if stylesheet::has_relational_dependencies() {
+            NodeId::ROOT
+        } else {
+            self.get_node(id).parent.unwrap_or(id)
+        };
+        self.invalidate_style_subtree(invalidation_root);
+        self.record_layout_dirty(id);
+    }
+
+    fn record_layout_dirty(&mut self, id: NodeId) {
         let scope = self.find_layout_scope(id);
         if !self.dirty.contains(&scope) {
             self.dirty.push(scope);
@@ -677,6 +781,23 @@ impl Document {
 
     pub fn is_dirty(&self) -> bool {
         !self.dirty.is_empty()
+    }
+
+    fn invalidate_style_subtree(&mut self, root: NodeId) {
+        self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        let revision = self.style_revision_clock;
+        let mut pending = vec![root];
+        while let Some(id) = pending.pop() {
+            if self
+                .nodes
+                .get(id.0 as usize)
+                .is_none_or(|node| node.is_none())
+            {
+                continue;
+            }
+            self.style_revisions[id.0 as usize] = revision;
+            pending.extend(self.children_ids(id));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -862,6 +983,22 @@ impl Document {
         _ancestors: &[stylesheet::SelectorContext],
         inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::style::Style {
+        let node_revision = self.style_revisions[id.0 as usize];
+        let stylesheet_generation = stylesheet::generation();
+        if let Some(cached) = self.computed_style_cache.borrow().get(&id)
+            && cached.node_revision == node_revision
+            && cached.stylesheet_generation == stylesheet_generation
+            && cached.inherited_style.as_ref() == inherited
+        {
+            #[cfg(test)]
+            self.computed_style_cache_hits
+                .set(self.computed_style_cache_hits.get() + 1);
+            return cached.style.clone();
+        }
+        #[cfg(test)]
+        self.computed_style_cache_misses
+            .set(self.computed_style_cache_misses.get() + 1);
+
         let inline = &self.styles[id.0 as usize];
         let node = self.get_node(id);
         let matched = if stylesheet::has_rules() && node.node_type == NodeType::Element {
@@ -1108,7 +1245,37 @@ impl Document {
             // Resolve it only after text color inheritance has completed.
             style.border_color = style.color;
         }
+        self.computed_style_cache.borrow_mut().insert(
+            id,
+            CachedComputedStyle {
+                node_revision,
+                stylesheet_generation,
+                inherited_style: inherited.cloned(),
+                style: style.clone(),
+            },
+        );
         style
+    }
+
+    #[cfg(test)]
+    fn computed_style_cache_stats(&self) -> (usize, usize) {
+        (
+            self.computed_style_cache_hits.get(),
+            self.computed_style_cache_misses.get(),
+        )
+    }
+
+    #[cfg(test)]
+    fn computed_style_cache_is_current(&self, id: NodeId) -> bool {
+        let node_revision = self.style_revisions[id.0 as usize];
+        let stylesheet_generation = stylesheet::generation();
+        self.computed_style_cache
+            .borrow()
+            .get(&id)
+            .is_some_and(|entry| {
+                entry.node_revision == node_revision
+                    && entry.stylesheet_generation == stylesheet_generation
+            })
     }
 
     /// Resolve stylesheet rules, ancestor selectors, user-agent defaults, and
@@ -4163,7 +4330,7 @@ impl Document {
             }
         }
 
-        self.mark_dirty(target_id);
+        self.mark_text_dirty(target_id);
 
         // Fire W3C InputEvent (bubbles, not cancelable per spec)
         let mut input_event = Event::new(EventType::Input, editable_id);
@@ -4211,7 +4378,7 @@ impl Document {
                 let text = node.text_content.get_or_insert_with(String::new);
                 text.push_str(data);
             }
-            self.mark_dirty(target_id);
+            self.mark_text_dirty(target_id);
 
             let mut input_event = Event::new(EventType::Input, editable_id);
             input_event.bubbles = true;
@@ -5561,6 +5728,216 @@ mod details_component_tests {
         let text = descendant_text(&tree);
         assert!(text.contains("Completed actions"));
         assert!(text.contains("Hidden history event"));
+    }
+}
+
+#[cfg(test)]
+mod computed_style_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_reuses_styles_and_observes_dom_and_stylesheet_version_fences() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".active", &[("color", "red")]);
+
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        target.class_list_add(&mut document, "active");
+        document.body().append_child(&mut document, target);
+
+        assert_eq!(
+            document.computed_style_for(target.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        let after_first = document.computed_style_cache_stats();
+        assert_eq!(
+            document.computed_style_for(target.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        let after_second = document.computed_style_cache_stats();
+        assert_eq!(after_second.1, after_first.1);
+        assert!(after_second.0 > after_first.0);
+
+        target.class_list_remove(&mut document, "active");
+        assert_ne!(
+            document.computed_style_for(target.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        let after_dom_mutation = document.computed_style_cache_stats();
+        assert!(after_dom_mutation.1 > after_second.1);
+
+        crate::stylesheet::register_rule("#target", &[("font-size", "31px")]);
+        assert_eq!(document.computed_style_for(target.id).font_size, 31.0);
+        let after_stylesheet_mutation = document.computed_style_cache_stats();
+        assert!(after_stylesheet_mutation.1 > after_dom_mutation.1);
+
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn unrelated_branches_keep_their_cached_styles_on_local_selector_mutation() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let left = document.create_element("section");
+        let leaf = document.create_element("span");
+        left.append_child(&mut document, leaf);
+        let right = document.create_element("aside");
+        document.body().append_child(&mut document, left);
+        document.body().append_child(&mut document, right);
+
+        document.computed_style_for(right.id);
+        assert!(document.computed_style_cache_is_current(right.id));
+        leaf.class_list_add(&mut document, "changed");
+
+        assert!(document.computed_style_cache_is_current(right.id));
+    }
+
+    #[test]
+    fn inherited_style_mutation_invalidates_the_descendant_subtree() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        let child = document.create_element("span");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        document.computed_style_for(child.id);
+        assert!(document.computed_style_cache_is_current(child.id));
+        parent.style_mut(&mut document).set_property("color", "red");
+
+        assert!(!document.computed_style_cache_is_current(child.id));
+        assert_eq!(
+            document.computed_style_for(child.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn sibling_selector_dependency_invalidates_the_parent_subtree() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".trigger + .peer", &[("color", "red")]);
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        let trigger = document.create_element("span");
+        let peer = document.create_element("span");
+        peer.class_list_add(&mut document, "peer");
+        parent.append_child(&mut document, trigger);
+        parent.append_child(&mut document, peer);
+        document.body().append_child(&mut document, parent);
+
+        document.computed_style_for(peer.id);
+        assert!(document.computed_style_cache_is_current(peer.id));
+        trigger.class_list_add(&mut document, "trigger");
+
+        assert!(!document.computed_style_cache_is_current(peer.id));
+        assert_eq!(
+            document.computed_style_for(peer.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn has_dependency_falls_back_to_document_scope_without_stale_ancestors() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".host:has(.flag)", &[("color", "red")]);
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        host.class_list_add(&mut document, "host");
+        let child = document.create_element("span");
+        host.append_child(&mut document, child);
+        document.body().append_child(&mut document, host);
+
+        document.computed_style_for(host.id);
+        assert!(document.computed_style_cache_is_current(host.id));
+        child.class_list_add(&mut document, "flag");
+
+        assert!(!document.computed_style_cache_is_current(host.id));
+        assert_eq!(
+            document.computed_style_for(host.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn recycled_node_ids_never_reuse_the_previous_nodes_cached_style() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".old", &[("color", "red")]);
+        let mut document = Document::new();
+        let old = document.create_element("div");
+        old.class_list_add(&mut document, "old");
+        document.body().append_child(&mut document, old);
+        assert_eq!(
+            document.computed_style_for(old.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+
+        document.remove_node(old.id);
+        let replacement = document.create_element("div");
+        assert_eq!(replacement.id, old.id);
+        assert!(!document.computed_style_cache_is_current(replacement.id));
+        assert_ne!(
+            document.computed_style_for(replacement.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn moving_a_node_invalidates_structural_styles_in_its_old_parent() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".item:last-child", &[("color", "red")]);
+        let mut document = Document::new();
+        let old_parent = document.create_element("div");
+        let new_parent = document.create_element("div");
+        let first = document.create_element("span");
+        first.class_list_add(&mut document, "item");
+        let second = document.create_element("span");
+        second.class_list_add(&mut document, "item");
+        old_parent.append_child(&mut document, first);
+        old_parent.append_child(&mut document, second);
+        document.body().append_child(&mut document, old_parent);
+        document.body().append_child(&mut document, new_parent);
+
+        assert_ne!(
+            document.computed_style_for(first.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        new_parent.append_child(&mut document, second);
+
+        assert!(!document.computed_style_cache_is_current(first.id));
+        assert_eq!(
+            document.computed_style_for(first.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn text_mutation_invalidates_the_parents_empty_pseudo_class() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".box:empty", &[("color", "red")]);
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.class_list_add(&mut document, "box");
+        let text = document.create_text_node("content");
+        parent.append_child(&mut document, text);
+        document.body().append_child(&mut document, parent);
+
+        assert_ne!(
+            document.computed_style_for(parent.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        text.set_text_content(&mut document, "");
+
+        assert!(!document.computed_style_cache_is_current(parent.id));
+        assert_eq!(
+            document.computed_style_for(parent.id).color,
+            w3cos_std::Color::rgb(255, 0, 0)
+        );
+        crate::stylesheet::clear_rules();
     }
 }
 
