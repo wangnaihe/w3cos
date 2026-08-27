@@ -226,6 +226,9 @@ impl PaintArtifact {
                         && (node.style.background.a > 0 || has_background_image(&node.style))
                 })
             });
+        let root_rect = layout_cache
+            .iter()
+            .find_map(|(rect, index)| (*index == 0).then_some(*rect));
         let canvas_background_style = canvas_background_source.map(|index| {
             let mut style = nodes[index].style.clone();
             if index != 0 {
@@ -238,12 +241,19 @@ impl PaintArtifact {
                 if style
                     .background_position
                     .as_deref()
-                    .is_none_or(|position| position.trim().is_empty() || position.trim() == "0% 0%")
+                    .is_none_or(|position| {
+                        matches!(
+                            position.trim().to_ascii_lowercase().as_str(),
+                            "" | "0% 0%" | "top left" | "left top"
+                        )
+                    })
                 {
                     // A propagated body background uses the document element's
-                    // visible inner border edge as its canvas positioning origin.
-                    let x = (root.border_left_width.unwrap_or(root.border_width) - 1.0).max(0.0);
-                    let y = (root.border_top_width.unwrap_or(root.border_width) - 1.0).max(0.0);
+                    // padding edge as its canvas positioning origin.
+                    let root_x = root_rect.map_or(0.0, |rect| rect.x);
+                    let root_y = root_rect.map_or(0.0, |rect| rect.y);
+                    let x = root_x + root.border_left_width.unwrap_or(root.border_width);
+                    let y = root_y + root.border_top_width.unwrap_or(root.border_width);
                     style.background_position = Some(format!("{x}px {y}px"));
                 }
             }
@@ -406,18 +416,35 @@ mod tests {
         };
         let mut body_style = Style::default();
         body_style.background_image = Some("url(square-white.png)".into());
+        body_style.background_position = Some("top left".into());
         let body = PaintNode {
             kind: ComponentKind::Column,
             style: body_style,
             parent: Some(0),
             sticky_counter_signal: None,
         };
-        let artifact = PaintArtifact::build([root, body], &[(rect(0.0), 0), (rect(0.0), 1)], 1);
+        let artifact = PaintArtifact::build(
+            [root, body],
+            &[
+                (
+                    LayoutRect {
+                        x: 16.0,
+                        ..rect(16.0)
+                    },
+                    0,
+                ),
+                (rect(0.0), 1),
+            ],
+            1,
+        );
 
         assert_eq!(artifact.canvas_background_source, Some(1));
         let canvas_style = artifact.canvas_background_style.as_ref().unwrap();
         assert_eq!(canvas_style.border_width, 0.0);
-        assert_eq!(canvas_style.background_position.as_deref(), Some("2px 2px"));
+        assert_eq!(
+            canvas_style.background_position.as_deref(),
+            Some("19px 19px")
+        );
         assert!(artifact.nodes[1].style.background_image.is_none());
     }
 
