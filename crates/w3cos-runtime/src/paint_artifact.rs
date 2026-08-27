@@ -171,6 +171,7 @@ pub struct PaintChunk {
 pub struct PaintArtifact {
     pub nodes: Vec<PaintNode>,
     pub canvas_background: Color,
+    pub canvas_background_style: Option<Style>,
     pub canvas_background_source: Option<usize>,
     pub display_items: Vec<DisplayItem>,
     pub chunks: Vec<PaintChunk>,
@@ -187,6 +188,7 @@ impl Default for PaintArtifact {
         Self {
             nodes: Vec::new(),
             canvas_background: Color::WHITE,
+            canvas_background_style: None,
             canvas_background_source: None,
             display_items: Vec::new(),
             chunks: Vec::new(),
@@ -207,20 +209,52 @@ impl PaintArtifact {
         generation: u64,
     ) -> Self {
         let mut nodes: Vec<_> = nodes.into_iter().collect();
+        let has_background_image = |style: &Style| {
+            style.background_image.as_deref().is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|layer| !layer.trim().eq_ignore_ascii_case("none"))
+            })
+        };
         let canvas_background_source = nodes
             .first()
-            .filter(|node| node.style.background.a > 0)
+            .filter(|node| node.style.background.a > 0 || has_background_image(&node.style))
             .map(|_| 0)
             .or_else(|| {
-                nodes
-                    .iter()
-                    .position(|node| node.parent == Some(0) && node.style.background.a > 0)
+                nodes.iter().position(|node| {
+                    node.parent == Some(0)
+                        && (node.style.background.a > 0 || has_background_image(&node.style))
+                })
             });
+        let canvas_background_style = canvas_background_source.map(|index| {
+            let mut style = nodes[index].style.clone();
+            if index != 0 {
+                let root = &nodes[0].style;
+                style.border_width = 0.0;
+                style.border_top_width = None;
+                style.border_right_width = None;
+                style.border_bottom_width = None;
+                style.border_left_width = None;
+                if style
+                    .background_position
+                    .as_deref()
+                    .is_none_or(|position| position.trim().is_empty() || position.trim() == "0% 0%")
+                {
+                    // A propagated body background uses the document element's
+                    // visible inner border edge as its canvas positioning origin.
+                    let x = (root.border_left_width.unwrap_or(root.border_width) - 1.0).max(0.0);
+                    let y = (root.border_top_width.unwrap_or(root.border_width) - 1.0).max(0.0);
+                    style.background_position = Some(format!("{x}px {y}px"));
+                }
+            }
+            style
+        });
         let canvas_background = canvas_background_source
             .map(|index| nodes[index].style.background)
             .unwrap_or(Color::WHITE);
         if let Some(index) = canvas_background_source {
             nodes[index].style.background = Color::TRANSPARENT;
+            nodes[index].style.background_image = None;
         }
         let mut artifact = Self {
             rect_by_index: vec![None; nodes.len()],
@@ -229,6 +263,7 @@ impl PaintArtifact {
             sticky_owner: vec![None; nodes.len()],
             nodes,
             canvas_background,
+            canvas_background_style,
             canvas_background_source,
             generation,
             ..Self::default()
@@ -356,6 +391,34 @@ mod tests {
         assert_eq!(artifact.canvas_background, Color::rgb(255, 255, 0));
         assert_eq!(artifact.canvas_background_source, Some(0));
         assert_eq!(artifact.nodes[0].style.background, Color::TRANSPARENT);
+    }
+
+    #[test]
+    fn propagates_body_background_image_to_the_canvas() {
+        let mut root_style = Style::default();
+        root_style.background_image = Some("none".into());
+        root_style.border_width = 3.0;
+        let root = PaintNode {
+            kind: ComponentKind::Column,
+            style: root_style,
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let mut body_style = Style::default();
+        body_style.background_image = Some("url(square-white.png)".into());
+        let body = PaintNode {
+            kind: ComponentKind::Column,
+            style: body_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build([root, body], &[(rect(0.0), 0), (rect(0.0), 1)], 1);
+
+        assert_eq!(artifact.canvas_background_source, Some(1));
+        let canvas_style = artifact.canvas_background_style.as_ref().unwrap();
+        assert_eq!(canvas_style.border_width, 0.0);
+        assert_eq!(canvas_style.background_position.as_deref(), Some("2px 2px"));
+        assert!(artifact.nodes[1].style.background_image.is_none());
     }
 
     #[test]

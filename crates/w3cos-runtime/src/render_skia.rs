@@ -283,6 +283,7 @@ fn paint_display_list(
     // the canvas background, then opacity / transform / scroll.
     if bake_compositor_props {
         canvas.clear(to_skia_color(frame.background, 1.0));
+        paint_canvas_background_image(canvas, frame.artifact, frame.scale_factor);
     }
     let mut active_filters = Vec::new();
     for &(idx, rect, kind, style) in frame.nodes {
@@ -512,6 +513,7 @@ fn composite_skia_layers(
     scale_factor: f32,
 ) {
     canvas.clear(to_skia_color(background, 1.0));
+    paint_canvas_background_image(canvas, Some(artifact), scale_factor);
     for (layer, picture) in layers.iter().zip(pictures) {
         let (_, _, clip) = layer_scroll_translation(layer, scroll_info);
         let matrix = compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale_factor);
@@ -528,6 +530,40 @@ fn composite_skia_layers(
         canvas.draw_picture(picture, Some(&matrix), None);
         canvas.restore_to_count(save);
     }
+}
+
+fn paint_canvas_background_image(
+    canvas: &Canvas,
+    artifact: Option<&PaintArtifact>,
+    scale_factor: f32,
+) {
+    let Some(style) = artifact
+        .and_then(|artifact| artifact.canvas_background_style.as_ref())
+        .filter(|style| style.background_image.is_some())
+    else {
+        return;
+    };
+    let scale_factor = if scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let image_info = canvas.image_info();
+    let save = canvas.save();
+    canvas.scale((scale_factor, scale_factor));
+    draw_background_image(
+        canvas,
+        LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: image_info.width() as f32 / scale_factor,
+            height: image_info.height() as f32 / scale_factor,
+        },
+        0.0,
+        style,
+        1.0,
+    );
+    canvas.restore_to_count(save);
 }
 
 #[cfg(target_os = "ios")]
