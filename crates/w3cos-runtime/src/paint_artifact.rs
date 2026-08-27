@@ -281,6 +281,7 @@ impl PaintArtifact {
         });
         let canvas_background = canvas_background_source
             .map(|index| nodes[index].style.background)
+            .filter(|color| color.a > 0)
             .unwrap_or(Color::WHITE);
         let canvas_background_positioning_rect = canvas_background_source
             .filter(|index| *index == 0)
@@ -471,6 +472,7 @@ mod tests {
         );
 
         assert_eq!(artifact.canvas_background_source, Some(1));
+        assert_eq!(artifact.canvas_background, Color::WHITE);
         assert_eq!(artifact.canvas_background_positioning_rect, None);
         let canvas_style = artifact.canvas_background_style.as_ref().unwrap();
         assert_eq!(canvas_style.border_width, 0.0);

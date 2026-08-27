@@ -370,8 +370,14 @@ fn layer_geometry(
         }
     }
     let position = layer_value(style.background_position.as_deref(), index, "0% 0%");
-    let (position_x, position_y) =
-        resolve_position(position, positioning_area, width, height, style.font_size);
+    let (position_x, position_y) = resolve_position_with_ex(
+        position,
+        positioning_area,
+        width,
+        height,
+        style.font_size,
+        style_ex_size(style),
+    );
     let xs = axis_tiles(
         positioning_area.x,
         positioning_area.width,
@@ -939,10 +945,21 @@ fn resolve_position(
     height: f32,
     font_size: f32,
 ) -> (f32, f32) {
+    resolve_position_with_ex(value, area, width, height, font_size, font_size * 0.5)
+}
+
+fn resolve_position_with_ex(
+    value: &str,
+    area: LayoutRect,
+    width: f32,
+    height: f32,
+    font_size: f32,
+    ex_size: f32,
+) -> (f32, f32) {
     let normalized = value.trim().to_ascii_lowercase();
     let parts = normalized.split_ascii_whitespace().collect::<Vec<_>>();
     if parts.len() >= 3 {
-        let (x, y) = parse_edge_position(&parts, font_size);
+        let (x, y) = parse_edge_position(&parts, font_size, ex_size);
         return (
             area.x + resolve_axis_position(x, area.width - width),
             area.y + resolve_axis_position(y, area.height - height),
@@ -958,8 +975,8 @@ fn resolve_position(
         [first, second, ..] => (*first, *second),
     };
     (
-        area.x + position_offset(x, area.width - width, font_size),
-        area.y + position_offset(y, area.height - height, font_size),
+        area.x + position_offset(x, area.width - width, font_size, ex_size),
+        area.y + position_offset(y, area.height - height, font_size, ex_size),
     )
 }
 
@@ -976,7 +993,11 @@ struct AxisPosition {
     offset: Length,
 }
 
-fn parse_edge_position(parts: &[&str], font_size: f32) -> (AxisPosition, AxisPosition) {
+fn parse_edge_position(
+    parts: &[&str],
+    font_size: f32,
+    ex_size: f32,
+) -> (AxisPosition, AxisPosition) {
     let center = AxisPosition {
         edge: AxisEdge::Center,
         offset: Length::Px(0.0),
@@ -989,7 +1010,7 @@ fn parse_edge_position(parts: &[&str], font_size: f32) -> (AxisPosition, AxisPos
         let offset = parts
             .get(index + 1)
             .filter(|value| !is_position_keyword(value))
-            .map(|value| parse_position_length(value, font_size))
+            .map(|value| parse_position_length(value, font_size, ex_size))
             .unwrap_or(Length::Px(0.0));
         let consumed_offset = parts
             .get(index + 1)
@@ -1044,7 +1065,7 @@ fn resolve_axis_position(position: AxisPosition, free_space: f32) -> f32 {
     }
 }
 
-fn position_offset(value: &str, free_space: f32, font_size: f32) -> f32 {
+fn position_offset(value: &str, free_space: f32, font_size: f32, ex_size: f32) -> f32 {
     match value.trim().to_ascii_lowercase().as_str() {
         "left" | "top" => 0.0,
         "center" => free_space * 0.5,
@@ -1054,7 +1075,7 @@ fn position_offset(value: &str, free_space: f32, font_size: f32) -> f32 {
             .parse::<f32>()
             .map(|value| free_space * value / 100.0)
             .unwrap_or(0.0),
-        value => match parse_position_length(value, font_size) {
+        value => match parse_position_length(value, font_size, ex_size) {
             Length::Px(value) => value,
             Length::Percent(value) => free_space * value,
             Length::Auto => 0.0,
@@ -1062,7 +1083,7 @@ fn position_offset(value: &str, free_space: f32, font_size: f32) -> f32 {
     }
 }
 
-fn parse_position_length(value: &str, font_size: f32) -> Length {
+fn parse_position_length(value: &str, font_size: f32, ex_size: f32) -> Length {
     let value = value.trim();
     if let Some(value) = value.strip_suffix("rem") {
         return value
@@ -1078,7 +1099,36 @@ fn parse_position_length(value: &str, font_size: f32) -> Length {
             .map(|value| Length::Px(value * font_size))
             .unwrap_or(Length::Auto);
     }
+    if let Some(value) = value.strip_suffix("ex") {
+        return value
+            .trim()
+            .parse::<f32>()
+            .map(|value| Length::Px(value * ex_size))
+            .unwrap_or(Length::Auto);
+    }
     parse_length(value)
+}
+
+fn style_ex_size(style: &Style) -> f32 {
+    #[cfg(feature = "skia")]
+    if let Some(typeface) = crate::font_face::FontRegistry::global()
+        .resolve_style(style)
+        .and_then(|font| font.skia_typeface())
+    {
+        let (_, metrics) = skia_safe::Font::new(typeface, style.font_size).metrics();
+        if metrics.x_height > 0.0 {
+            return metrics.x_height;
+        }
+    }
+
+    let ahem = style.font_family.as_deref().is_some_and(|family| {
+        family.split(',').any(|name| {
+            name.trim()
+                .trim_matches(['"', '\''])
+                .eq_ignore_ascii_case("ahem")
+        })
+    });
+    style.font_size * if ahem { 0.8 } else { 0.5 }
 }
 
 fn axis_tiles(
@@ -1311,6 +1361,10 @@ mod tests {
         assert_eq!(
             resolve_position("1.5rem 0", area, 64.0, 64.0, 20.0),
             (32.0, 12.0)
+        );
+        assert_eq!(
+            resolve_position_with_ex("0 6.25ex", area, 1.0, 1.0, 40.0, 32.0),
+            (8.0, 212.0)
         );
     }
 

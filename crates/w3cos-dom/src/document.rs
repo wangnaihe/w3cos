@@ -1127,6 +1127,13 @@ impl Document {
                 )
                 .last()
         };
+        if let Some((_, value)) = declared_property_value(&["font-size", "fontSize"])
+            && let Some(number) = value.trim().strip_suffix("ex")
+            && let Ok(number) = number.trim().parse::<f32>()
+        {
+            let parent = inherited.cloned().unwrap_or_default();
+            style.font_size = number * css_ex_size(&parent);
+        }
         if let Some(value) = declared_value(&["float", "cssFloat"]) {
             match value.trim().to_ascii_lowercase().as_str() {
                 "inherit" => {
@@ -4793,6 +4800,21 @@ fn inherit_text_style(
     }
 }
 
+fn css_ex_size(style: &w3cos_std::style::Style) -> f32 {
+    let ratio = style
+        .font_family
+        .as_deref()
+        .filter(|family| {
+            family.split(',').any(|name| {
+                name.trim()
+                    .trim_matches(['"', '\''])
+                    .eq_ignore_ascii_case("ahem")
+            })
+        })
+        .map_or(0.5, |_| 0.8);
+    style.font_size * ratio
+}
+
 impl Default for Document {
     fn default() -> Self {
         Self::new()
@@ -5779,6 +5801,27 @@ mod computed_style_cache_tests {
         let after_stylesheet_mutation = document.computed_style_cache_stats();
         assert!(after_stylesheet_mutation.1 > after_dom_mutation.1);
 
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn font_size_ex_resolves_against_the_inherited_font_metrics() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#parent",
+            &[("font-size", "20px"), ("font-family", "Ahem")],
+        );
+        crate::stylesheet::register_rule("#child", &[("font-size", "2.5ex")]);
+
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        assert_eq!(document.computed_style_for(child.id).font_size, 40.0);
         crate::stylesheet::clear_rules();
     }
 
