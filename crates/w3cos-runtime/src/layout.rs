@@ -1704,10 +1704,10 @@ fn build_taffy_tree(
         }
         tree.new_leaf_with_context(leaf_style, my_idx)
     } else {
-        let owned_table_tracks = matches!(
+        let owned_table_tracks = (matches!(
             comp.style.display,
             WDisplay::Table | WDisplay::InlineTable
-        )
+        ) && matches!(comp.style.width, WDim::Auto))
         .then(|| table_track_widths(comp));
         let active_table_tracks = owned_table_tracks
             .as_deref()
