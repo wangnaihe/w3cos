@@ -837,6 +837,23 @@ impl Edges {
             left: self.left.resolve(insets),
         }
     }
+
+    fn resolve_lengths_with_font_size(
+        &self,
+        insets: &SafeAreaInsets,
+        font_size: f32,
+    ) -> EdgeLengths {
+        let resolve = |value: Spacing| match value {
+            Spacing::Em(value) => value * font_size,
+            other => other.resolve(insets),
+        };
+        EdgeLengths {
+            top: resolve(self.top),
+            right: resolve(self.right),
+            bottom: resolve(self.bottom),
+            left: resolve(self.left),
+        }
+    }
 }
 
 impl Style {
@@ -852,11 +869,13 @@ impl Style {
     }
 
     pub fn padding_lengths(&self) -> EdgeLengths {
-        self.padding.resolve_lengths(&crate::safe_area::current())
+        self.padding
+            .resolve_lengths_with_font_size(&crate::safe_area::current(), self.font_size)
     }
 
     pub fn margin_lengths(&self) -> EdgeLengths {
-        self.margin.resolve_lengths(&crate::safe_area::current())
+        self.margin
+            .resolve_lengths_with_font_size(&crate::safe_area::current(), self.font_size)
     }
 
     pub fn resolved_overflow_x(&self) -> Overflow {
@@ -865,6 +884,41 @@ impl Style {
 
     pub fn resolved_overflow_y(&self) -> Overflow {
         self.overflow_y.unwrap_or(self.overflow)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Edges, Spacing, Style};
+
+    #[test]
+    fn style_edge_lengths_resolve_em_against_local_font_size() {
+        let style = Style {
+            font_size: 28.0,
+            padding: Edges {
+                top: Spacing::Em(1.0),
+                right: Spacing::Em(0.5),
+                bottom: Spacing::Em(2.0),
+                left: Spacing::Px(3.0),
+            },
+            margin: Edges {
+                top: Spacing::Em(1.0),
+                right: Spacing::Px(0.0),
+                bottom: Spacing::Px(0.0),
+                left: Spacing::Em(0.5),
+            },
+            ..Style::default()
+        };
+
+        let padding = style.padding_lengths();
+        assert_eq!(padding.top, 28.0);
+        assert_eq!(padding.right, 14.0);
+        assert_eq!(padding.bottom, 56.0);
+        assert_eq!(padding.left, 3.0);
+
+        let margin = style.margin_lengths();
+        assert_eq!(margin.top, 28.0);
+        assert_eq!(margin.left, 14.0);
     }
 }
 
