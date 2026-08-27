@@ -932,12 +932,19 @@ impl StreamingDocumentParser {
         document_url: &str,
     ) -> Result<Self> {
         let document = crate::jsdom::document_value();
-        let html = crate::jsdom::node_id_of(&document.get_property("documentElement"))
-            .ok_or_else(|| anyhow!("live document has no documentElement"))?;
-        let head = crate::jsdom::node_id_of(&document.get_property("head"))
-            .ok_or_else(|| anyhow!("live document has no head"))?;
-        let body = crate::jsdom::node_id_of(&document.get_property("body"))
-            .ok_or_else(|| anyhow!("live document has no body"))?;
+        let (html, head, body) =
+            if document.get_property("contentType").to_js_string() == "application/xhtml+xml" {
+                crate::jsdom::parser_document_shell_ids()
+            } else {
+                (
+                    crate::jsdom::node_id_of(&document.get_property("documentElement"))
+                        .ok_or_else(|| anyhow!("live document has no documentElement"))?,
+                    crate::jsdom::node_id_of(&document.get_property("head"))
+                        .ok_or_else(|| anyhow!("live document has no head"))?,
+                    crate::jsdom::node_id_of(&document.get_property("body"))
+                        .ok_or_else(|| anyhow!("live document has no body"))?,
+                )
+            };
         Ok(Self {
             script_host,
             document_url: document_url.to_string(),

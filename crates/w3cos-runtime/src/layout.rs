@@ -1934,7 +1934,9 @@ fn collect_layouts_fast(
             }
 
             if !matches!(info.style.position, WPos::Static) {
-                descendant_containing_block = rect;
+                descendant_containing_block = positioned_descendant_containing_block(
+                    flat, tree, node, rect,
+                );
             }
 
             let overflow_x = info.style.resolved_overflow_x();
@@ -2012,6 +2014,66 @@ fn collect_layouts_fast(
     }
 }
 
+fn positioned_descendant_containing_block(
+    flat: &[FlatNodeInfo<'_>],
+    tree: &TaffyTree<usize>,
+    node: NodeId,
+    rect: LayoutRect,
+) -> LayoutRect {
+    let Some(index) = tree.get_node_context(node).copied() else {
+        return rect;
+    };
+    let Some(info) = flat.get(index) else {
+        return rect;
+    };
+    if !matches!(info.style.display, WDisplay::Inline) {
+        return rect;
+    }
+
+    let Ok(children) = tree.children(node) else {
+        return rect;
+    };
+    let mut has_block_split = false;
+    let mut current_fragment_width = 0.0_f32;
+    let mut widest_fragment = 0.0_f32;
+    for child in children {
+        let Some(child_index) = tree.get_node_context(child).copied() else {
+            continue;
+        };
+        let Some(child_info) = flat.get(child_index) else {
+            continue;
+        };
+        if matches!(child_info.style.display, WDisplay::None)
+            || matches!(child_info.style.position, WPos::Absolute | WPos::Fixed)
+        {
+            continue;
+        }
+        if matches!(
+            child_info.style.display,
+            WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem
+        ) {
+            has_block_split = true;
+            widest_fragment = widest_fragment.max(current_fragment_width);
+            current_fragment_width = 0.0;
+            continue;
+        }
+        let Ok(layout) = tree.layout(child) else {
+            continue;
+        };
+        current_fragment_width += layout.size.width;
+    }
+    widest_fragment = widest_fragment.max(current_fragment_width);
+
+    if has_block_split && widest_fragment > 0.0 && widest_fragment < rect.width {
+        LayoutRect {
+            width: widest_fragment,
+            ..rect
+        }
+    } else {
+        rect
+    }
+}
+
 fn inline_absolute_static_rect(
     flat: &[FlatNodeInfo<'_>],
     tree: &TaffyTree<usize>,
@@ -2038,24 +2100,29 @@ fn inline_absolute_static_rect(
     let parent_border_left = parent_style
         .border_left_width
         .unwrap_or(parent_style.border_width);
-    let inline_start_is_meaningful = [
-        parent_margin.left,
-        parent_padding.left,
-        parent_border_left,
-        parent_margin.top,
-        parent_margin.bottom,
-        parent_padding.top,
-        parent_padding.bottom,
-        parent_style
-            .border_top_width
-            .unwrap_or(parent_style.border_width),
-        parent_style
-            .border_bottom_width
-            .unwrap_or(parent_style.border_width),
-    ]
-    .into_iter()
-    .any(|value| value.abs() > f32::EPSILON);
-    let mut cursor_x = parent_margin.left + parent_padding.left + parent_border_left;
+    let inline_start_is_meaningful = matches!(parent_style.display, WDisplay::Inline)
+        && [
+            parent_margin.left,
+            parent_padding.left,
+            parent_border_left,
+            parent_margin.top,
+            parent_margin.bottom,
+            parent_padding.top,
+            parent_padding.bottom,
+            parent_style
+                .border_top_width
+                .unwrap_or(parent_style.border_width),
+            parent_style
+                .border_bottom_width
+                .unwrap_or(parent_style.border_width),
+        ]
+        .into_iter()
+        .any(|value| value.abs() > f32::EPSILON);
+    let mut cursor_x = if matches!(parent_style.display, WDisplay::Inline) {
+        parent_margin.left + parent_padding.left + parent_border_left
+    } else {
+        0.0
+    };
     let mut cursor_y = 0.0_f32;
     let mut line_height = if inline_start_is_meaningful {
         parent_style.font_size * parent_style.line_height
@@ -2063,6 +2130,7 @@ fn inline_absolute_static_rect(
         0.0
     };
     let mut has_meaningful_inline_predecessor = inline_start_is_meaningful;
+    let mut has_in_flow_predecessor = false;
     let mut crossed_forced_line_break = false;
     for sibling in siblings {
         if sibling == node {
@@ -2076,13 +2144,16 @@ fn inline_absolute_static_rect(
         if matches!(sibling_info.style.position, WPos::Absolute | WPos::Fixed) {
             continue;
         }
+        has_in_flow_predecessor = true;
         let layout = tree.layout(sibling).ok()?;
         if matches!(
             sibling_info.style.display,
             WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem
         ) {
             cursor_x = 0.0;
-            cursor_y = layout.location.y + layout.size.height;
+            cursor_y = layout.location.y
+                + layout.size.height
+                + sibling_info.style.margin_lengths().bottom;
             line_height = 0.0;
             has_meaningful_inline_predecessor = false;
             crossed_forced_line_break = false;
@@ -2130,7 +2201,14 @@ fn inline_absolute_static_rect(
         has_meaningful_inline_predecessor |= meaningful;
     }
     if !has_meaningful_inline_predecessor {
-        return None;
+        if matches!(parent_style.display, WDisplay::Block) && !has_in_flow_predecessor {
+            rect.x = containing_block.x;
+            rect.y = containing_block.y;
+            return Some(rect);
+        }
+        if !matches!(parent_style.display, WDisplay::Block) {
+            return None;
+        }
     }
     let fragmented_inline_start_padding = crossed_forced_line_break
         .then(|| {
@@ -2325,7 +2403,31 @@ fn positioned_percentage_border_box_size(
         viewport_w,
         viewport_h,
     );
-    let width = if matches!(style.width, WDim::Percent(_)) {
+    let width = if matches!(style.width, WDim::Auto)
+        && let (Some(left), Some(right)) = (
+            style.left.resolve(
+                containing_width,
+                ROOT_FONT_SIZE,
+                style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+            style.right.resolve(
+                containing_width,
+                ROOT_FONT_SIZE,
+                style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+        )
+    {
+        (containing_width
+            - left
+            - right
+            - resolve_spacing(style.margin.left, containing_width)
+            - resolve_spacing(style.margin.right, containing_width))
+        .max(0.0)
+    } else if matches!(style.width, WDim::Percent(_)) {
         let width = content_width.unwrap_or(fallback_width);
         if style.box_sizing == WBoxSizing::ContentBox {
             width
@@ -2339,7 +2441,31 @@ fn positioned_percentage_border_box_size(
     } else {
         fallback_width
     };
-    let height = if matches!(style.height, WDim::Percent(_)) {
+    let height = if matches!(style.height, WDim::Auto)
+        && let (Some(top), Some(bottom)) = (
+            style.top.resolve(
+                containing_height,
+                ROOT_FONT_SIZE,
+                style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+            style.bottom.resolve(
+                containing_height,
+                ROOT_FONT_SIZE,
+                style.font_size,
+                viewport_w,
+                viewport_h,
+            ),
+        )
+    {
+        (containing_height
+            - top
+            - bottom
+            - resolve_spacing(style.margin.top, containing_width)
+            - resolve_spacing(style.margin.bottom, containing_width))
+        .max(0.0)
+    } else if matches!(style.height, WDim::Percent(_)) {
         let height = content_height.unwrap_or(fallback_height);
         if style.box_sizing == WBoxSizing::ContentBox {
             height
@@ -3286,6 +3412,44 @@ mod tests {
             },
         );
         assert_eq!((static_position.x, static_position.y), (58.0, 101.2));
+    }
+
+    #[test]
+    fn absolute_auto_size_stretches_between_opposing_insets() {
+        let style = Style {
+            position: WPos::Absolute,
+            top: WDim::Px(10.0),
+            right: WDim::Px(30.0),
+            bottom: WDim::Px(10.0),
+            left: WDim::Px(10.0),
+            ..Style::default()
+        };
+        let containing_block = LayoutRect {
+            x: 16.0,
+            y: 51.0,
+            width: 120.0,
+            height: 120.0,
+        };
+        assert_eq!(
+            compute_absolute_rect(
+                &style,
+                containing_block,
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
+                800.0,
+                600.0,
+            ),
+            LayoutRect {
+                x: 26.0,
+                y: 61.0,
+                width: 80.0,
+                height: 100.0,
+            }
+        );
     }
 
     #[test]

@@ -551,7 +551,7 @@ fn paint_canvas_background_image(
     let image_info = canvas.image_info();
     let save = canvas.save();
     canvas.scale((scale_factor, scale_factor));
-    draw_background_image(
+    draw_canvas_background_image(
         canvas,
         LayoutRect {
             x: 0.0,
@@ -561,6 +561,7 @@ fn paint_canvas_background_image(
         },
         0.0,
         style,
+        artifact.and_then(|artifact| artifact.canvas_background_positioning_rect),
         1.0,
     );
     canvas.restore_to_count(save);
@@ -1069,6 +1070,7 @@ fn draw_canvas(canvas: &Canvas, client_index: usize, rect: LayoutRect, opacity: 
         height: snapshot.height,
         intrinsic_width: snapshot.width,
         intrinsic_height: snapshot.height,
+        svg_intrinsic_size: None,
         data: snapshot.pixels,
     };
     draw_decoded_image(canvas, rect, &decoded, opacity, true);
@@ -1646,11 +1648,39 @@ fn draw_background_image(
     style: &Style,
     opacity: f32,
 ) {
+    draw_background_layers(
+        canvas,
+        crate::background_image::background_paint_layers(style, rect),
+        opacity,
+    );
+}
+
+fn draw_canvas_background_image(
+    canvas: &Canvas,
+    canvas_rect: LayoutRect,
+    _radius: f32,
+    style: &Style,
+    positioning_area: Option<LayoutRect>,
+    opacity: f32,
+) {
+    draw_background_layers(
+        canvas,
+        crate::background_image::canvas_background_paint_layers(
+            style,
+            canvas_rect,
+            positioning_area,
+        ),
+        opacity,
+    );
+}
+
+fn draw_background_layers(
+    canvas: &Canvas,
+    layers: Vec<crate::background_image::BackgroundPaintLayer>,
+    opacity: f32,
+) {
     // CSS paints the first listed background on top of the following layers.
-    for layer in crate::background_image::background_paint_layers(style, rect)
-        .into_iter()
-        .rev()
-    {
+    for layer in layers.into_iter().rev() {
         let clip = match &layer {
             crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.clip,
             crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.geometry.clip,

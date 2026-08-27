@@ -263,7 +263,7 @@ impl CSSStyleDeclaration {
             "background-image" | "backgroundImage" => {
                 if value.trim().eq_ignore_ascii_case("none") {
                     self.inner.background_image = None;
-                } else if value.contains("gradient(") || value.contains("url(") {
+                } else if w3cos_std::background::is_valid_image_list(value) {
                     self.inner.background_image = Some(value.trim().to_string());
                 }
             }

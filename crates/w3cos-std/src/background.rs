@@ -95,6 +95,28 @@ pub fn parse_shorthand(value: &str) -> BackgroundShorthand {
     result
 }
 
+pub fn is_valid_image_list(value: &str) -> bool {
+    let layers = split_top_level(value, ',');
+    !layers.is_empty()
+        && layers.into_iter().all(|layer| {
+            let tokens = split_tokens(layer);
+            if tokens.len() != 1 {
+                return false;
+            }
+            let token = tokens[0].trim().to_ascii_lowercase();
+            token == "none"
+                || [
+                    "url(",
+                    "linear-gradient(",
+                    "radial-gradient(",
+                    "repeating-linear-gradient(",
+                    "repeating-radial-gradient(",
+                ]
+                .into_iter()
+                .any(|prefix| token.starts_with(prefix) && token.ends_with(')'))
+        })
+}
+
 pub fn split_top_level(value: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0_i32;
@@ -238,5 +260,13 @@ mod tests {
         assert!(parsed.images[0].starts_with("repeating-linear-gradient("));
         assert!(parsed.images[1].starts_with("repeating-radial-gradient("));
         assert_eq!(parsed.attachments, ["fixed", "local"]);
+    }
+
+    #[test]
+    fn background_image_longhand_rejects_shorthand_tokens() {
+        assert!(is_valid_image_list("url('tile.png'), none"));
+        assert!(is_valid_image_list("linear-gradient(red, blue)"));
+        assert!(!is_valid_image_list("url('tile.png') repeat"));
+        assert!(!is_valid_image_list("red"));
     }
 }

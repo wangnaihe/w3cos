@@ -2833,6 +2833,13 @@ impl App {
             &mut self.virtual_lists,
             &mut self.scroll_offsets,
         );
+        let canvas_body_index = flat.iter().position(|node| {
+            matches!(
+                node.on_click,
+                EventAction::NativeHost { id, .. }
+                    if *id == u64::from(crate::dom::body_id())
+            )
+        });
         if virtual_heights_changed && measurement_pass < 2 {
             // Dynamic rows are first laid out with the virtualizer's estimate.
             // Re-materialize spacers and recompute layout before presenting
@@ -2869,8 +2876,12 @@ impl App {
                     }),
             )
         };
-        self.paint_artifact =
-            PaintArtifact::build(paint_nodes, &self.layout_cache, self.layout_generation + 1);
+        self.paint_artifact = PaintArtifact::build_with_body_background(
+            paint_nodes,
+            &self.layout_cache,
+            self.layout_generation + 1,
+            canvas_body_index,
+        );
         for (scroll_index, correction) in virtual_anchor_corrections {
             self.queue_scroll_damage(scroll_index, correction);
         }

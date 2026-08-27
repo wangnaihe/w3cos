@@ -1099,7 +1099,11 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
             style.background_blend_mode = Some("normal".to_string());
         }
         "background-color" => style.background = Some(value.to_string()),
-        "background-image" => style.background_image = Some(value.to_string()),
+        "background-image" => {
+            if w3cos_std::background::is_valid_image_list(value) {
+                style.background_image = Some(value.to_string());
+            }
+        }
         "background-size" => style.background_size = Some(value.to_string()),
         "background-position" => style.background_position = Some(value.to_string()),
         "background-repeat" => style.background_repeat = Some(value.to_string()),

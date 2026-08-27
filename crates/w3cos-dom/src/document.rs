@@ -2734,14 +2734,21 @@ impl Document {
                 let block_in_inline = style.display == w3cos_std::style::Display::Inline
                     && child_ids.iter().any(|child_id| {
                         let child = self.get_node(*child_id);
-                        child.node_type == NodeType::Element
-                            && matches!(
-                                self.computed_style(*child_id, ancestors, Some(&style))
-                                    .display,
-                                w3cos_std::style::Display::Block
-                                    | w3cos_std::style::Display::Flex
-                                    | w3cos_std::style::Display::Grid
-                            )
+                        if child.node_type != NodeType::Element {
+                            return false;
+                        }
+                        let child_style =
+                            self.computed_style(*child_id, ancestors, Some(&style));
+                        matches!(
+                            child_style.display,
+                            w3cos_std::style::Display::Block
+                                | w3cos_std::style::Display::Flex
+                                | w3cos_std::style::Display::Grid
+                        ) && !matches!(
+                            child_style.position,
+                            w3cos_std::style::Position::Absolute
+                                | w3cos_std::style::Position::Fixed
+                        )
                     });
                 if block_in_inline {
                     // CSS block-in-inline layout splits the inline around the

@@ -104,6 +104,13 @@ enum Length {
 }
 
 #[derive(Clone, Copy)]
+struct IntrinsicSize {
+    width: Length,
+    height: Length,
+    ratio: Option<f32>,
+}
+
+#[derive(Clone, Copy)]
 enum Repeat {
     Repeat,
     NoRepeat,
@@ -114,6 +121,14 @@ enum Repeat {
 pub(crate) fn raster_background_layers(
     style: &Style,
     border_box: LayoutRect,
+) -> Vec<RasterBackgroundLayer> {
+    raster_background_layers_with_positioning_area(style, border_box, None)
+}
+
+fn raster_background_layers_with_positioning_area(
+    style: &Style,
+    border_box: LayoutRect,
+    positioning_area: Option<LayoutRect>,
 ) -> Vec<RasterBackgroundLayer> {
     let Some(images) = style.background_image.as_deref() else {
         return Vec::new();
@@ -127,15 +142,20 @@ pub(crate) fn raster_background_layers(
                 .into_iter()
                 .next()?;
             let decoded = crate::image_loader::get_or_load(&source)?;
-            let geometry = layer_geometry(
-                style,
-                border_box,
-                index,
-                Some((
-                    decoded.intrinsic_width as f32,
-                    decoded.intrinsic_height as f32,
-                )),
-            )?;
+            let intrinsic = decoded.svg_intrinsic_size.map_or(
+                IntrinsicSize {
+                    width: Length::Px(decoded.intrinsic_width as f32),
+                    height: Length::Px(decoded.intrinsic_height as f32),
+                    ratio: Some(decoded.intrinsic_width as f32 / decoded.intrinsic_height as f32),
+                },
+                |svg| IntrinsicSize {
+                    width: svg_intrinsic_length(svg.width),
+                    height: svg_intrinsic_length(svg.height),
+                    ratio: svg.ratio,
+                },
+            );
+            let geometry =
+                layer_geometry(style, border_box, index, Some(intrinsic), positioning_area)?;
             Some(RasterBackgroundLayer {
                 layer_index: index,
                 source,
@@ -151,6 +171,14 @@ pub(crate) fn gradient_background_layers(
     style: &Style,
     border_box: LayoutRect,
 ) -> Vec<GradientBackgroundLayer> {
+    gradient_background_layers_with_positioning_area(style, border_box, None)
+}
+
+fn gradient_background_layers_with_positioning_area(
+    style: &Style,
+    border_box: LayoutRect,
+    positioning_area: Option<LayoutRect>,
+) -> Vec<GradientBackgroundLayer> {
     let Some(images) = style.background_image.as_deref() else {
         return Vec::new();
     };
@@ -159,7 +187,7 @@ pub(crate) fn gradient_background_layers(
         .enumerate()
         .filter_map(|(index, layer)| {
             let (kind, stops) = parse_gradient(layer)?;
-            let geometry = layer_geometry(style, border_box, index, None)?;
+            let geometry = layer_geometry(style, border_box, index, None, positioning_area)?;
             Some(GradientBackgroundLayer {
                 layer_index: index,
                 kind,
@@ -184,6 +212,29 @@ pub(crate) fn background_paint_layers(
                 .map(BackgroundPaintLayer::Gradient),
         )
         .collect::<Vec<_>>();
+    layers.sort_by_key(BackgroundPaintLayer::layer_index);
+    layers
+}
+
+pub(crate) fn canvas_background_paint_layers(
+    style: &Style,
+    canvas_box: LayoutRect,
+    positioning_area: Option<LayoutRect>,
+) -> Vec<BackgroundPaintLayer> {
+    let mut layers =
+        raster_background_layers_with_positioning_area(style, canvas_box, positioning_area)
+            .into_iter()
+            .map(BackgroundPaintLayer::Raster)
+            .chain(
+                gradient_background_layers_with_positioning_area(
+                    style,
+                    canvas_box,
+                    positioning_area,
+                )
+                .into_iter()
+                .map(BackgroundPaintLayer::Gradient),
+            )
+            .collect::<Vec<_>>();
     layers.sort_by_key(BackgroundPaintLayer::layer_index);
     layers
 }
@@ -255,11 +306,13 @@ fn layer_geometry(
     style: &Style,
     border_box: LayoutRect,
     index: usize,
-    intrinsic: Option<(f32, f32)>,
+    intrinsic: Option<IntrinsicSize>,
+    positioning_override: Option<LayoutRect>,
 ) -> Option<BackgroundGeometry> {
     let origin = layer_value(style.background_origin.as_deref(), index, "padding-box");
     let clip_value = layer_value(style.background_clip.as_deref(), index, "border-box");
-    let mut positioning_area = background_box(style, border_box, parse_box(origin));
+    let mut positioning_area = positioning_override
+        .unwrap_or_else(|| background_box(style, border_box, parse_box(origin)));
     if layer_value(style.background_attachment.as_deref(), index, "scroll")
         .eq_ignore_ascii_case("fixed")
     {
@@ -284,7 +337,14 @@ fn layer_geometry(
     }
     let size = layer_value(style.background_size.as_deref(), index, "auto");
     let (auto_width, auto_height) = auto_size_axes(size);
-    let intrinsic_ratio = intrinsic.map(|(width, height)| width / height.max(1.0));
+    let intrinsic_ratio = intrinsic.and_then(|intrinsic| {
+        intrinsic.ratio.or_else(|| {
+            resolve_length(intrinsic.width, positioning_area.width)
+                .zip(resolve_length(intrinsic.height, positioning_area.height))
+                .filter(|(width, height)| *width > 0.0 && *height > 0.0)
+                .map(|(width, height)| width / height)
+        })
+    });
     let (mut width, mut height) = resolve_size(size, positioning_area, intrinsic);
     if width <= 0.0 || height <= 0.0 {
         return None;
@@ -310,7 +370,8 @@ fn layer_geometry(
         }
     }
     let position = layer_value(style.background_position.as_deref(), index, "0% 0%");
-    let (position_x, position_y) = resolve_position(position, positioning_area, width, height);
+    let (position_x, position_y) =
+        resolve_position(position, positioning_area, width, height, style.font_size);
     let xs = axis_tiles(
         positioning_area.x,
         positioning_area.width,
@@ -470,19 +531,32 @@ fn background_radius(style: &Style, kind: BoxKind) -> f32 {
     (style.border_radius - inset).max(0.0)
 }
 
-fn resolve_size(value: &str, area: LayoutRect, intrinsic: Option<(f32, f32)>) -> (f32, f32) {
-    let (intrinsic_width, intrinsic_height) = intrinsic.unwrap_or((area.width, area.height));
-    let intrinsic_width = intrinsic_width.max(1.0);
-    let intrinsic_height = intrinsic_height.max(1.0);
-    let ratio = intrinsic_width / intrinsic_height;
+fn resolve_size(value: &str, area: LayoutRect, intrinsic: Option<IntrinsicSize>) -> (f32, f32) {
+    let intrinsic = intrinsic.unwrap_or(IntrinsicSize {
+        width: Length::Auto,
+        height: Length::Auto,
+        ratio: None,
+    });
+    let intrinsic_width = resolve_length(intrinsic.width, area.width);
+    let intrinsic_height = resolve_length(intrinsic.height, area.height);
+    let ratio = intrinsic.ratio.or_else(|| {
+        intrinsic_width
+            .zip(intrinsic_height)
+            .filter(|(width, height)| *width > 0.0 && *height > 0.0)
+            .map(|(width, height)| width / height)
+    });
     match value.trim().to_ascii_lowercase().as_str() {
         "cover" => {
-            let scale = (area.width / intrinsic_width).max(area.height / intrinsic_height);
-            return (intrinsic_width * scale, intrinsic_height * scale);
+            if let Some(ratio) = ratio {
+                return size_for_ratio(area, ratio, true);
+            }
+            return (area.width, area.height);
         }
         "contain" => {
-            let scale = (area.width / intrinsic_width).min(area.height / intrinsic_height);
-            return (intrinsic_width * scale, intrinsic_height * scale);
+            if let Some(ratio) = ratio {
+                return size_for_ratio(area, ratio, false);
+            }
+            return (area.width, area.height);
         }
         _ => {}
     }
@@ -494,11 +568,46 @@ fn resolve_size(value: &str, area: LayoutRect, intrinsic: Option<(f32, f32)>) ->
         resolve_length(height, area.height),
     ) {
         (Some(width), Some(height)) => (width, height),
-        (Some(width), None) if intrinsic.is_some() => (width, width / ratio),
-        (Some(width), None) => (width, area.height),
-        (None, Some(height)) if intrinsic.is_some() => (height * ratio, height),
-        (None, Some(height)) => (area.width, height),
-        (None, None) => (intrinsic_width, intrinsic_height),
+        (Some(width), None) => ratio
+            .map(|ratio| (width, width / ratio))
+            .or_else(|| intrinsic_height.map(|height| (width, height)))
+            .unwrap_or((width, area.height)),
+        (None, Some(height)) => ratio
+            .map(|ratio| (height * ratio, height))
+            .or_else(|| intrinsic_width.map(|width| (width, height)))
+            .unwrap_or((area.width, height)),
+        (None, None) => match (intrinsic_width, intrinsic_height, ratio) {
+            (Some(width), Some(height), _) => (width, height),
+            (Some(width), None, Some(ratio)) => (width, width / ratio),
+            (None, Some(height), Some(ratio)) => (height * ratio, height),
+            (Some(width), None, None) => (width, area.height),
+            (None, Some(height), None) => (area.width, height),
+            (None, None, Some(ratio)) => size_for_ratio(area, ratio, false),
+            (None, None, None) => (area.width, area.height),
+        },
+    }
+}
+
+fn size_for_ratio(area: LayoutRect, ratio: f32, cover: bool) -> (f32, f32) {
+    let ratio = ratio.max(f32::EPSILON);
+    let width_from_height = area.height * ratio;
+    let choose_width = if cover {
+        width_from_height >= area.width
+    } else {
+        width_from_height <= area.width
+    };
+    if choose_width {
+        (width_from_height, area.height)
+    } else {
+        (area.width, area.width / ratio)
+    }
+}
+
+fn svg_intrinsic_length(value: crate::image_loader::SvgIntrinsicLength) -> Length {
+    match value {
+        crate::image_loader::SvgIntrinsicLength::Auto => Length::Auto,
+        crate::image_loader::SvgIntrinsicLength::Px(value) => Length::Px(value),
+        crate::image_loader::SvgIntrinsicLength::Percent(value) => Length::Percent(value),
     }
 }
 
@@ -823,11 +932,17 @@ fn round_tile_size(area: f32, tile: f32) -> f32 {
     area / count
 }
 
-fn resolve_position(value: &str, area: LayoutRect, width: f32, height: f32) -> (f32, f32) {
+fn resolve_position(
+    value: &str,
+    area: LayoutRect,
+    width: f32,
+    height: f32,
+    font_size: f32,
+) -> (f32, f32) {
     let normalized = value.trim().to_ascii_lowercase();
     let parts = normalized.split_ascii_whitespace().collect::<Vec<_>>();
     if parts.len() >= 3 {
-        let (x, y) = parse_edge_position(&parts);
+        let (x, y) = parse_edge_position(&parts, font_size);
         return (
             area.x + resolve_axis_position(x, area.width - width),
             area.y + resolve_axis_position(y, area.height - height),
@@ -843,8 +958,8 @@ fn resolve_position(value: &str, area: LayoutRect, width: f32, height: f32) -> (
         [first, second, ..] => (*first, *second),
     };
     (
-        area.x + position_offset(x, area.width - width),
-        area.y + position_offset(y, area.height - height),
+        area.x + position_offset(x, area.width - width, font_size),
+        area.y + position_offset(y, area.height - height, font_size),
     )
 }
 
@@ -861,7 +976,7 @@ struct AxisPosition {
     offset: Length,
 }
 
-fn parse_edge_position(parts: &[&str]) -> (AxisPosition, AxisPosition) {
+fn parse_edge_position(parts: &[&str], font_size: f32) -> (AxisPosition, AxisPosition) {
     let center = AxisPosition {
         edge: AxisEdge::Center,
         offset: Length::Px(0.0),
@@ -874,7 +989,7 @@ fn parse_edge_position(parts: &[&str]) -> (AxisPosition, AxisPosition) {
         let offset = parts
             .get(index + 1)
             .filter(|value| !is_position_keyword(value))
-            .map(|value| parse_length(value))
+            .map(|value| parse_position_length(value, font_size))
             .unwrap_or(Length::Px(0.0));
         let consumed_offset = parts
             .get(index + 1)
@@ -929,7 +1044,7 @@ fn resolve_axis_position(position: AxisPosition, free_space: f32) -> f32 {
     }
 }
 
-fn position_offset(value: &str, free_space: f32) -> f32 {
+fn position_offset(value: &str, free_space: f32, font_size: f32) -> f32 {
     match value.trim().to_ascii_lowercase().as_str() {
         "left" | "top" => 0.0,
         "center" => free_space * 0.5,
@@ -939,8 +1054,31 @@ fn position_offset(value: &str, free_space: f32) -> f32 {
             .parse::<f32>()
             .map(|value| free_space * value / 100.0)
             .unwrap_or(0.0),
-        value => w3cos_std::style::parse_absolute_length_px(value).unwrap_or(0.0),
+        value => match parse_position_length(value, font_size) {
+            Length::Px(value) => value,
+            Length::Percent(value) => free_space * value,
+            Length::Auto => 0.0,
+        },
     }
+}
+
+fn parse_position_length(value: &str, font_size: f32) -> Length {
+    let value = value.trim();
+    if let Some(value) = value.strip_suffix("rem") {
+        return value
+            .trim()
+            .parse::<f32>()
+            .map(|value| Length::Px(value * 16.0))
+            .unwrap_or(Length::Auto);
+    }
+    if let Some(value) = value.strip_suffix("em") {
+        return value
+            .trim()
+            .parse::<f32>()
+            .map(|value| Length::Px(value * font_size))
+            .unwrap_or(Length::Auto);
+    }
+    parse_length(value)
 }
 
 fn axis_tiles(
@@ -1120,11 +1258,11 @@ mod tests {
             height: 100.0,
         };
         assert_eq!(
-            resolve_position("right 30px bottom 10px", area, 50.0, 20.0),
+            resolve_position("right 30px bottom 10px", area, 50.0, 20.0, 16.0),
             (130.0, 90.0)
         );
         assert_eq!(
-            resolve_position("bottom 25% left 5px", area, 50.0, 20.0),
+            resolve_position("bottom 25% left 5px", area, 50.0, 20.0, 16.0),
             (15.0, 80.0)
         );
     }
@@ -1139,7 +1277,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_position("center left", area, 96.0, 96.0),
+            resolve_position("center left", area, 96.0, 96.0, 16.0),
             (8.0, 147.0)
         );
     }
@@ -1153,9 +1291,72 @@ mod tests {
             height: 100.0,
         };
         assert_eq!(
-            resolve_position("0.5in 0.5in", area, 15.0, 15.0),
+            resolve_position("0.5in 0.5in", area, 15.0, 15.0, 16.0),
             (56.0, 60.0)
         );
+    }
+
+    #[test]
+    fn font_relative_units_are_resolved_for_background_positions() {
+        let area = LayoutRect {
+            x: 8.0,
+            y: 12.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        assert_eq!(
+            resolve_position("1em 0", area, 64.0, 64.0, 16.0),
+            (24.0, 12.0)
+        );
+        assert_eq!(
+            resolve_position("1.5rem 0", area, 64.0, 64.0, 20.0),
+            (32.0, 12.0)
+        );
+    }
+
+    #[test]
+    fn svg_auto_background_size_uses_intrinsic_dimension_semantics() {
+        let area = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 80.0,
+            height: 100.0,
+        };
+        let auto = Length::Auto;
+        assert_eq!(
+            resolve_size(
+                "auto",
+                area,
+                Some(IntrinsicSize {
+                    width: auto,
+                    height: auto,
+                    ratio: None,
+                }),
+            ),
+            (80.0, 100.0)
+        );
+        let portrait = resolve_size(
+            "auto",
+            area,
+            Some(IntrinsicSize {
+                width: auto,
+                height: auto,
+                ratio: Some(4.0 / 6.0),
+            }),
+        );
+        assert!((portrait.0 - 100.0 * 4.0 / 6.0).abs() < 0.001);
+        assert_eq!(portrait.1, 100.0);
+        let percentages = resolve_size(
+            "auto",
+            area,
+            Some(IntrinsicSize {
+                width: Length::Percent(0.4),
+                height: Length::Percent(0.6),
+                ratio: None,
+            }),
+        );
+        assert!((percentages.0 - 32.0).abs() < 0.001);
+        assert!((percentages.1 - 60.0).abs() < 0.001);
     }
 
     #[test]

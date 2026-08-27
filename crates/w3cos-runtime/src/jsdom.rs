@@ -6541,7 +6541,14 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
             .into_iter()
             .collect();
     };
-    let artifact = crate::paint_artifact::PaintArtifact::build(
+    let body_index = flat.iter().position(|entry| {
+        matches!(
+            entry.on_click,
+            w3cos_std::EventAction::NativeHost { id, .. }
+                if *id == u64::from(dom::body_id())
+        )
+    });
+    let artifact = crate::paint_artifact::PaintArtifact::build_with_body_background(
         flat.iter().map(|entry| crate::paint_artifact::PaintNode {
             kind: entry.kind.clone(),
             style: entry.style.clone(),
@@ -6550,6 +6557,7 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
         }),
         &layouts,
         1,
+        body_index,
     );
 
     let mut hits = layouts
@@ -14845,6 +14853,19 @@ fn ensure_html_structure() {
     HEAD_ID.with(|h| *h.borrow_mut() = Some(head));
 }
 
+/// Return the parser-owned HTML shell without routing through the live
+/// `Document` getters. XHTML getters intentionally stay null until matching
+/// elements exist, while the feature-neutral tree builder still needs stable
+/// insertion targets before it consumes the first source token.
+pub(crate) fn parser_document_shell_ids() -> (u32, u32, u32) {
+    ensure_html_structure();
+    (
+        HTML_ID.with(|html| html.borrow().expect("HTML parser shell was created")),
+        HEAD_ID.with(|head| head.borrow().expect("HTML parser shell was created")),
+        dom::body_id(),
+    )
+}
+
 fn traversal_root(value: &Value) -> Option<u32> {
     node_id_of(value).or_else(|| (value == &document_value()).then_some(0))
 }
@@ -20523,11 +20544,14 @@ mod tests {
         let child = document_value().call_method("createElement", vec![Value::string("b")]);
         div.call_method("appendChild", vec![child]);
         div.set_property("textContent", Value::string("only-text"));
+        let child_nodes = div.get_property("childNodes");
+        assert_eq!(child_nodes.get_property("length").to_number(), 1.0);
         assert_eq!(
-            div.get_property("childNodes")
-                .get_property("length")
+            child_nodes
+                .get_property("0")
+                .get_property("nodeType")
                 .to_number(),
-            0.0
+            3.0
         );
         assert_eq!(div.get_property("textContent").to_js_string(), "only-text");
     }
@@ -22980,7 +23004,10 @@ try {
                 .call_method("getBoundingClientRect", Vec::new())
                 .get_property("x")
                 .to_number(),
-            8.0
+            outer
+                .call_method("getBoundingClientRect", Vec::new())
+                .get_property("x")
+                .to_number()
         );
     }
 
@@ -23028,6 +23055,105 @@ try {
         assert_eq!(target.get_property("offsetHeight").to_number(), 100.0);
         assert_eq!(target.get_property("offsetLeft").to_number(), 0.0);
         assert_eq!(target.get_property("offsetTop").to_number(), 0.0);
+    }
+
+    #[test]
+    fn absolute_percentage_width_uses_the_fragmented_positioned_inline() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        let element = |tag: &str| document.call_method("createElement", vec![Value::string(tag)]);
+        let set_box = |node: &Value, display: &str, width: f64, height: f64| {
+            let style = node.get_property("style");
+            style.set_property("display", Value::string(display));
+            style.set_property("width", Value::string(&format!("{width}px")));
+            style.set_property("height", Value::string(&format!("{height}px")));
+        };
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("height", Value::string("200px"));
+        let outer_inline = element("span");
+        outer_inline
+            .get_property("style")
+            .set_property("position", Value::string("relative"));
+        outer.call_method("appendChild", vec![outer_inline.clone()]);
+
+        let leading = element("div");
+        set_box(&leading, "inline-block", 200.0, 1.0);
+        outer_inline.call_method("appendChild", vec![leading]);
+        outer_inline.call_method("appendChild", vec![element("br")]);
+
+        let containing_inline = element("span");
+        containing_inline
+            .get_property("style")
+            .set_property("position", Value::string("relative"));
+        outer_inline.call_method("appendChild", vec![containing_inline.clone()]);
+        let before = element("div");
+        set_box(&before, "inline-block", 100.0, 1.0);
+        containing_inline.call_method("appendChild", vec![before.clone()]);
+
+        let inline = element("span");
+        let block = element("div");
+        let nested_block = element("div");
+        let target = element("div");
+        let target_style = target.get_property("style");
+        target_style.set_property("position", Value::string("absolute"));
+        target_style.set_property("width", Value::string("100%"));
+        target_style.set_property("height", Value::string("100px"));
+        nested_block.call_method("appendChild", vec![target.clone()]);
+        block.call_method("appendChild", vec![nested_block]);
+        inline.call_method("appendChild", vec![block]);
+        containing_inline.call_method("appendChild", vec![inline]);
+
+        let after = element("div");
+        set_box(&after, "inline-block", 100.0, 1.0);
+        containing_inline.call_method("appendChild", vec![after.clone()]);
+
+        assert_eq!(before.get_property("offsetWidth").to_number(), 100.0);
+        assert_eq!(after.get_property("offsetWidth").to_number(), 100.0);
+        assert_eq!(target.get_property("offsetWidth").to_number(), 100.0);
+    }
+
+    #[test]
+    fn block_static_position_follows_a_decorated_dom_inline_fragment() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        let wrapper = create_in_body("div");
+        let wrapper_style = wrapper.get_property("style");
+        wrapper_style.set_property("width", Value::string("100px"));
+        wrapper_style.set_property("height", Value::string("100px"));
+        wrapper_style.set_property("overflow", Value::string("hidden"));
+
+        let inline = document.call_method("createElement", vec![Value::string("span")]);
+        let inline_style = inline.get_property("style");
+        inline_style.set_property("lineHeight", Value::string("100px"));
+        inline_style.set_property("borderLeft", Value::string("100px solid transparent"));
+        inline_style.set_property("marginLeft", Value::string("-100px"));
+        wrapper.call_method("appendChild", vec![inline.clone()]);
+
+        let target = document.call_method("createElement", vec![Value::string("div")]);
+        let target_style = target.get_property("style");
+        target_style.set_property("position", Value::string("absolute"));
+        target_style.set_property("width", Value::string("100px"));
+        target_style.set_property("height", Value::string("100px"));
+        inline.call_method("appendChild", vec![target.clone()]);
+        inline.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("X")])],
+        );
+
+        let wrapper_top = wrapper
+            .call_method("getBoundingClientRect", Vec::new())
+            .get_property("top")
+            .to_number();
+        let target_top = target
+            .call_method("getBoundingClientRect", Vec::new())
+            .get_property("top")
+            .to_number();
+        assert_eq!(target_top - wrapper_top, 100.0);
     }
 
     #[test]
@@ -25999,6 +26125,7 @@ try {
                 w3cos_dom::DOMRect::new(10.0, 250.0, 180.0, 40.0),
             );
         });
+        dom::clear_document_dirty();
         assert_eq!(container.get_property("clientWidth").to_number(), 100.0);
         assert_eq!(container.get_property("clientHeight").to_number(), 100.0);
         assert_eq!(container.get_property("scrollWidth").to_number(), 180.0);

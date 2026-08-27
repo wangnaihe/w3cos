@@ -35,7 +35,14 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
             }
         }
     }
-    let artifact = PaintArtifact::build(
+    let body_index = flat.iter().position(|node| {
+        matches!(
+            node.on_click,
+            w3cos_std::EventAction::NativeHost { id, .. }
+                if *id == u64::from(crate::dom::body_id())
+        )
+    });
+    let artifact = PaintArtifact::build_with_body_background(
         flat.iter().map(|node| PaintNode {
             kind: node.kind.clone(),
             style: node.style.clone(),
@@ -44,6 +51,7 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
         }),
         &layout_cache,
         1,
+        body_index,
     );
 
     let mut nodes = layout_cache

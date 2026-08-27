@@ -1311,6 +1311,7 @@ fn compose_tiles(
         height,
         intrinsic_width: width,
         intrinsic_height: height,
+        svg_intrinsic_size: None,
         data: Arc::new(rgba),
     })
 }

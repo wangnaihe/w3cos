@@ -699,10 +699,8 @@ pub fn bounding_rect(node: u32) -> w3cos_dom::DOMRect {
 pub fn to_component_tree() -> w3cos_std::Component {
     let mut tree = with_document(|doc| doc.to_component_tree());
     #[cfg(feature = "dynamic-js")]
-    {
-        crate::jsdom::graft_shadow_component_subtrees(&mut tree);
-        crate::jsdom::graft_frame_component_subtrees(&mut tree);
-    }
+    crate::jsdom::graft_shadow_component_subtrees(&mut tree);
+    crate::jsdom::graft_frame_component_subtrees(&mut tree);
     tree
 }
 

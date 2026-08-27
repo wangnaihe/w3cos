@@ -17,7 +17,25 @@ pub struct DecodedImage {
     pub intrinsic_width: u32,
     /// Density-corrected CSS intrinsic height used by layout and DOM APIs.
     pub intrinsic_height: u32,
+    /// SVG preserves CSS intrinsic sizing separately from the raster surface.
+    /// Missing and percentage root dimensions must not be replaced by usvg's
+    /// fallback pixel size when resolving `background-size: auto`.
+    pub(crate) svg_intrinsic_size: Option<SvgIntrinsicSize>,
     pub data: Arc<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SvgIntrinsicSize {
+    pub width: SvgIntrinsicLength,
+    pub height: SvgIntrinsicLength,
+    pub ratio: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SvgIntrinsicLength {
+    Auto,
+    Px(f32),
+    Percent(f32),
 }
 
 impl DecodedImage {
@@ -144,6 +162,7 @@ pub(crate) fn decode_and_install(src: &str, bytes: &[u8]) -> Result<DecodedImage
             height,
             intrinsic_width: width,
             intrinsic_height: height,
+            svg_intrinsic_size: None,
             data: Arc::clone(&animation_frames[0].data),
         };
         ANIMATIONS.with(|animations| {
@@ -171,6 +190,7 @@ pub(crate) fn decode_and_install(src: &str, bytes: &[u8]) -> Result<DecodedImage
         height: rgba.height(),
         intrinsic_width: rgba.width(),
         intrinsic_height: rgba.height(),
+        svg_intrinsic_size: None,
         data: Arc::new(rgba.into_raw()),
     };
     install_decoded_bytes(src, decoded.clone(), fingerprint);
@@ -200,8 +220,10 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
 }
 
 fn decode_svg(bytes: &[u8]) -> Result<DecodedImage, String> {
+    let intrinsic_size = parse_svg_intrinsic_size(bytes);
+    let normalized_bytes = complete_svg_intrinsic_axis(bytes, intrinsic_size);
     let options = resvg::usvg::Options::default();
-    let tree = resvg::usvg::Tree::from_data(bytes, &options)
+    let tree = resvg::usvg::Tree::from_data(&normalized_bytes, &options)
         .map_err(|error| format!("invalid SVG image document: {error}"))?;
     let size = tree.size();
     let width = size.width().ceil().clamp(1.0, 16_384.0) as u32;
@@ -220,8 +242,103 @@ fn decode_svg(bytes: &[u8]) -> Result<DecodedImage, String> {
         height,
         intrinsic_width: width,
         intrinsic_height: height,
+        svg_intrinsic_size: Some(intrinsic_size),
         data: Arc::new(rgba),
     })
+}
+
+fn complete_svg_intrinsic_axis(bytes: &[u8], size: SvgIntrinsicSize) -> std::borrow::Cow<'_, [u8]> {
+    let missing_attribute = match (size.width, size.height, size.ratio) {
+        (SvgIntrinsicLength::Px(width), SvgIntrinsicLength::Auto, Some(ratio)) if ratio > 0.0 => {
+            Some(format!(" height=\"{}\"", width / ratio))
+        }
+        (SvgIntrinsicLength::Auto, SvgIntrinsicLength::Px(height), Some(ratio)) if ratio > 0.0 => {
+            Some(format!(" width=\"{}\"", height * ratio))
+        }
+        _ => None,
+    };
+    let Some(attribute) = missing_attribute else {
+        return std::borrow::Cow::Borrowed(bytes);
+    };
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return std::borrow::Cow::Borrowed(bytes);
+    };
+    let Some(svg_start) = source.find("<svg") else {
+        return std::borrow::Cow::Borrowed(bytes);
+    };
+    let insertion = svg_start + "<svg".len();
+    let mut normalized = String::with_capacity(source.len() + attribute.len());
+    normalized.push_str(&source[..insertion]);
+    normalized.push_str(&attribute);
+    normalized.push_str(&source[insertion..]);
+    std::borrow::Cow::Owned(normalized.into_bytes())
+}
+
+fn parse_svg_intrinsic_size(bytes: &[u8]) -> SvgIntrinsicSize {
+    let mut reader = quick_xml::Reader::from_reader(bytes);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(element))
+            | Ok(quick_xml::events::Event::Empty(element))
+                if element.local_name().as_ref() == b"svg" =>
+            {
+                let mut width = SvgIntrinsicLength::Auto;
+                let mut height = SvgIntrinsicLength::Auto;
+                let mut ratio = None;
+                for attribute in element.attributes().flatten() {
+                    let Ok(name) = std::str::from_utf8(attribute.key.as_ref()) else {
+                        continue;
+                    };
+                    let Ok(value) = attribute.decode_and_unescape_value(reader.decoder()) else {
+                        continue;
+                    };
+                    match name {
+                        "width" => width = parse_svg_intrinsic_length(&value),
+                        "height" => height = parse_svg_intrinsic_length(&value),
+                        "viewBox" => {
+                            let values = value
+                                .split(|character: char| {
+                                    character.is_ascii_whitespace() || character == ','
+                                })
+                                .filter(|value| !value.is_empty())
+                                .filter_map(|value| value.parse::<f32>().ok())
+                                .collect::<Vec<_>>();
+                            if values.len() == 4 && values[2] > 0.0 && values[3] > 0.0 {
+                                ratio = Some(values[2] / values[3]);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return SvgIntrinsicSize {
+                    width,
+                    height,
+                    ratio,
+                };
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    SvgIntrinsicSize {
+        width: SvgIntrinsicLength::Auto,
+        height: SvgIntrinsicLength::Auto,
+        ratio: None,
+    }
+}
+
+fn parse_svg_intrinsic_length(value: &str) -> SvgIntrinsicLength {
+    let value = value.trim();
+    if let Some(percent) = value.strip_suffix('%') {
+        return percent
+            .trim()
+            .parse::<f32>()
+            .map(|value| SvgIntrinsicLength::Percent(value / 100.0))
+            .unwrap_or(SvgIntrinsicLength::Auto);
+    }
+    w3cos_std::style::parse_absolute_length_px(value)
+        .map(SvgIntrinsicLength::Px)
+        .unwrap_or(SvgIntrinsicLength::Auto)
 }
 
 fn unpremultiply_rgba(rgba: &mut [u8]) {
@@ -270,6 +387,7 @@ fn current_animation_frame(src: &str) -> Option<DecodedImage> {
             height: animation.height,
             intrinsic_width: animation.width,
             intrinsic_height: animation.height,
+            svg_intrinsic_size: None,
             data: Arc::clone(&frame.data),
         })
     })
@@ -547,6 +665,38 @@ mod tests {
         assert_eq!((decoded.width, decoded.height), (12, 7));
         assert_eq!(dimensions("icon.svg"), Some((12, 7)));
         assert!(decoded.data.iter().any(|channel| *channel != 0));
+    }
+
+    #[test]
+    fn svg_intrinsic_metadata_preserves_auto_percent_and_view_box_ratio() {
+        let size = parse_svg_intrinsic_size(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40%" viewBox="0 0 4 6"/>"#,
+        );
+        assert_eq!(size.width, SvgIntrinsicLength::Percent(0.4));
+        assert_eq!(size.height, SvgIntrinsicLength::Auto);
+        assert_eq!(size.ratio, Some(4.0 / 6.0));
+
+        let size = parse_svg_intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#);
+        assert_eq!(size.width, SvgIntrinsicLength::Auto);
+        assert_eq!(size.height, SvgIntrinsicLength::Auto);
+        assert_eq!(size.ratio, None);
+    }
+
+    #[test]
+    fn svg_view_box_with_one_intrinsic_axis_fills_its_raster_surface() {
+        let decoded = decode_svg(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" viewBox="0 0 4 6"><rect width="100%" height="100%" fill="green"/></svg>"#,
+        )
+        .unwrap();
+        assert_eq!((decoded.width, decoded.height), (40, 60));
+        assert!(decoded.data.chunks_exact(4).all(|pixel| pixel[3] == 255));
+
+        let decoded = decode_svg(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" height="60" viewBox="0 0 4 6"><rect width="100%" height="100%" fill="green"/></svg>"#,
+        )
+        .unwrap();
+        assert_eq!((decoded.width, decoded.height), (40, 60));
+        assert!(decoded.data.chunks_exact(4).all(|pixel| pixel[3] == 255));
     }
 
     #[test]
