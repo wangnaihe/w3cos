@@ -1336,9 +1336,20 @@ fn build_taffy_tree(
             .and_then(|column| inherited_table_tracks?.get(column))
             .copied()
     {
-        style.size.width = Dimension::length(width);
-        style.box_sizing = BoxSizing::BorderBox;
-        style.flex_basis = Dimension::length(width);
+        let padding = comp.style.padding_lengths();
+        let horizontal_inner_edges = padding.left
+            + padding.right
+            + comp
+                .style
+                .border_left_width
+                .unwrap_or(comp.style.border_width)
+            + comp
+                .style
+                .border_right_width
+                .unwrap_or(comp.style.border_width);
+        let content_width = (width - horizontal_inner_edges).max(0.0);
+        style.size.width = Dimension::length(content_width);
+        style.flex_basis = Dimension::length(content_width);
         style.flex_grow = 0.0;
         style.flex_shrink = 0.0;
     }
@@ -5467,6 +5478,46 @@ mod tests {
         assert_eq!((table.width, table.height), (120.0, 120.0));
         assert_eq!(group, table);
         assert_eq!((bottom_right.x, bottom_right.y), (60.0, 60.0));
+    }
+
+    #[test]
+    fn table_track_width_does_not_change_cell_height_box_sizing() {
+        let cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                width: WDim::Px(60.0),
+                height: WDim::Px(60.0),
+                border_bottom_width: Some(60.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let row = Component::row(
+            Style {
+                display: WDisp::TableRow,
+                ..Style::default()
+            },
+            vec![cell],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                ..Style::default()
+            },
+            vec![row],
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(800.0),
+                ..Style::default()
+            },
+            vec![table],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let cell = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!((cell.width, cell.height), (60.0, 120.0));
     }
 
     #[test]
