@@ -41,6 +41,11 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
 
     match local_name {
         "body" => style.margin = Edges::all(8.0),
+        "table" => {
+            style.border_spacing_x = 2.0;
+            style.border_spacing_y = 2.0;
+        }
+        "td" | "th" => style.padding = Edges::all(1.0),
         "button" => {
             style.box_sizing = BoxSizing::BorderBox;
             style.background = Color::rgb(239, 239, 239);
@@ -127,8 +132,17 @@ mod tests {
         );
         assert_eq!(html_default_style("tr").display, Display::TableRow);
         assert_eq!(html_default_style("td").display, Display::TableCell);
+        assert_eq!(html_default_style("td").padding, Edges::all(1.0));
+        assert_eq!(html_default_style("th").padding, Edges::all(1.0));
         assert_eq!(html_default_style("script").display, Display::None);
         assert_eq!(html_default_style("style").display, Display::None);
         assert_eq!(html_default_style("head").display, Display::None);
+    }
+
+    #[test]
+    fn table_uses_the_html_default_border_spacing() {
+        let table = html_default_style("table");
+        assert_eq!(table.border_spacing_x, 2.0);
+        assert_eq!(table.border_spacing_y, 2.0);
     }
 }

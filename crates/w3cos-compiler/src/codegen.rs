@@ -655,6 +655,12 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     if let Some(gap) = s.column_gap {
         fields.push(format!("column_gap: Some({gap}_f32)"));
     }
+    if let Some(spacing) = s.border_spacing_x {
+        fields.push(format!("border_spacing_x: {spacing}_f32"));
+    }
+    if let Some(spacing) = s.border_spacing_y {
+        fields.push(format!("border_spacing_y: {spacing}_f32"));
+    }
     if let Some(padding) = gen_padding_edges(s) {
         fields.push(padding);
     }
@@ -1391,6 +1397,10 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     }
     if let Some(gap) = style.column_gap {
         out.push_str(&sp("column-gap", &format!("{gap}px")));
+    }
+    if let Some(x) = style.border_spacing_x {
+        let y = style.border_spacing_y.unwrap_or(x);
+        out.push_str(&sp("border-spacing", &format!("{x}px {y}px")));
     }
     if let Some(css) = dom_edge_shorthand_css(
         style.padding,

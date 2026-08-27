@@ -157,11 +157,7 @@ fn component_max_content_width(component: &Component) -> f32 {
             WDisplay::Table
             | WDisplay::TableRowGroup
             | WDisplay::TableHeaderGroup
-            | WDisplay::TableFooterGroup => component
-                .children
-                .iter()
-                .map(child_width)
-                .fold(0.0_f32, f32::max),
+            | WDisplay::TableFooterGroup => table_track_max_content_width(component),
             WDisplay::InlineTable
                 if component.children.iter().any(|child| {
                     matches!(
@@ -212,7 +208,16 @@ fn component_max_content_width(component: &Component) -> f32 {
             .style
             .border_right_width
             .unwrap_or(component.style.border_width);
-    let horizontal_inner_edges = padding.left + padding.right + border_width;
+    let table_outer_spacing = if matches!(
+        component.style.display,
+        WDisplay::Table | WDisplay::InlineTable
+    ) {
+        component.style.border_spacing_x * 2.0
+    } else {
+        0.0
+    };
+    let horizontal_inner_edges =
+        padding.left + padding.right + border_width + table_outer_spacing;
     let border_box_width = match (specified_width, component.style.box_sizing) {
         (Some(width), WBoxSizing::BorderBox) => width,
         (Some(width), WBoxSizing::ContentBox) => width + horizontal_inner_edges,
@@ -225,6 +230,48 @@ fn component_max_content_width(component: &Component) -> f32 {
         margin.left + margin.right
     };
     border_box_width + horizontal_margin
+}
+
+fn table_track_max_content_width(component: &Component) -> f32 {
+    let tracks = table_track_widths(component);
+    if tracks.is_empty() {
+        return component
+            .children
+            .iter()
+            .map(component_max_content_width)
+            .fold(0.0_f32, f32::max);
+    }
+    let gap = component.style.border_spacing_x;
+    tracks.iter().sum::<f32>() + gap * tracks.len().saturating_sub(1) as f32
+}
+
+fn table_track_widths(component: &Component) -> Vec<f32> {
+    fn collect_rows(component: &Component, tracks: &mut Vec<f32>) {
+        if component.style.display == WDisplay::TableRow {
+            for (column, cell) in component.children.iter().enumerate() {
+                if column >= tracks.len() {
+                    tracks.push(0.0);
+                }
+                tracks[column] = tracks[column].max(component_max_content_width(cell));
+            }
+            return;
+        }
+        for child in &component.children {
+            if matches!(
+                child.style.display,
+                WDisplay::TableRow
+                    | WDisplay::TableRowGroup
+                    | WDisplay::TableHeaderGroup
+                    | WDisplay::TableFooterGroup
+            ) {
+                collect_rows(child, tracks);
+            }
+        }
+    }
+
+    let mut tracks = Vec::new();
+    collect_rows(component, &mut tracks);
+    tracks
 }
 
 fn shrink_to_fit_used_width(component: &Component) -> f32 {
@@ -831,6 +878,9 @@ impl LayoutEngine {
                 viewport_w,
                 viewport_h,
                 viewport_w,
+                None,
+                None,
+                None,
             )?);
             self.tree_valid = true;
         }
@@ -949,6 +999,9 @@ pub fn compute_with_scroll(
         viewport_w,
         viewport_h,
         viewport_w,
+        None,
+        None,
+        None,
     )?;
     let root_margins = root_used_margins(
         flat.first().map(|entry| entry.style),
@@ -1249,11 +1302,46 @@ fn build_taffy_tree(
     viewport_w: f32,
     viewport_h: f32,
     containing_width: f32,
+    inherited_table_tracks: Option<&[f32]>,
+    table_column: Option<usize>,
+    inherited_border_spacing: Option<(f32, f32)>,
 ) -> Result<NodeId, taffy::TaffyError> {
     let my_idx = *idx;
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    let own_border_spacing = matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable)
+        .then_some((comp.style.border_spacing_x, comp.style.border_spacing_y));
+    let active_border_spacing = own_border_spacing.or(inherited_border_spacing);
+    if matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable) {
+        let padding = comp.style.padding_lengths();
+        style.padding = Rect {
+            top: LengthPercentage::length(padding.top + comp.style.border_spacing_y),
+            right: LengthPercentage::length(padding.right + comp.style.border_spacing_x),
+            bottom: LengthPercentage::length(padding.bottom + comp.style.border_spacing_y),
+            left: LengthPercentage::length(padding.left + comp.style.border_spacing_x),
+        };
+    } else if let Some((spacing_x, spacing_y)) = active_border_spacing {
+        if comp.style.display == WDisplay::TableRow {
+            style.gap.width = LengthPercentage::length(spacing_x);
+        } else if matches!(
+            comp.style.display,
+            WDisplay::TableRowGroup | WDisplay::TableHeaderGroup | WDisplay::TableFooterGroup
+        ) {
+            style.gap.height = LengthPercentage::length(spacing_y);
+        }
+    }
+    if comp.style.display == WDisplay::TableCell
+        && let Some(width) = table_column
+            .and_then(|column| inherited_table_tracks?.get(column))
+            .copied()
+    {
+        style.size.width = Dimension::length(width);
+        style.box_sizing = BoxSizing::BorderBox;
+        style.flex_basis = Dimension::length(width);
+        style.flex_grow = 0.0;
+        style.flex_shrink = 0.0;
+    }
     let normal_flow_children = comp.children.iter().filter(|child| {
         !matches!(child.style.position, WPos::Absolute | WPos::Fixed)
             && child.style.display != WDisplay::None
@@ -1337,6 +1425,9 @@ fn build_taffy_tree(
     if comp.style.display == WDisplay::TableCell
         && matches!(parent_display, Some(WDisplay::TableRow))
         && matches!(comp.style.width, WDim::Auto)
+        && table_column
+            .and_then(|column| inherited_table_tracks?.get(column))
+            .is_none()
     {
         // The table fallback represents a row as a flex row. Auto-width cells
         // share the row's resolved inline size like table tracks; retaining
@@ -1602,6 +1693,15 @@ fn build_taffy_tree(
         }
         tree.new_leaf_with_context(leaf_style, my_idx)
     } else {
+        let owned_table_tracks = matches!(
+            comp.style.display,
+            WDisplay::Table | WDisplay::InlineTable
+        )
+        .then(|| table_track_widths(comp));
+        let active_table_tracks = owned_table_tracks
+            .as_deref()
+            .filter(|tracks| !tracks.is_empty())
+            .or(inherited_table_tracks);
         let mut child_nodes: Vec<(i32, usize, NodeId)> = comp
             .children
             .iter()
@@ -1617,6 +1717,9 @@ fn build_taffy_tree(
                     viewport_w,
                     viewport_h,
                     child_containing_width,
+                    active_table_tracks,
+                    (comp.style.display == WDisplay::TableRow).then_some(source_index),
+                    active_border_spacing,
                 )?;
                 Ok((c.style.order, source_index, node))
             })
@@ -1723,6 +1826,12 @@ fn build_taffy_tree(
                     )))
         {
             style.size.width = Dimension::length(shrink_to_fit_used_width(comp));
+            if matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable) {
+                // `shrink_to_fit_used_width` returns the table border box.
+                // Keep table padding, borders, and outer border spacing inside
+                // that resolved width instead of adding them a second time.
+                style.box_sizing = BoxSizing::BorderBox;
+            }
             if comp.style.display == WDisplay::Table {
                 // CSS auto table layout shrink-wraps up to the available
                 // containing-block width. An unconstrained max-content width
@@ -5295,6 +5404,69 @@ mod tests {
         let second_row = layout.iter().find(|(_, index)| *index == 4).unwrap().0;
         assert_eq!((group.width, group.height), (96.0, 96.0));
         assert_eq!(second_row.y, first_row.y + first_row.height);
+    }
+
+    #[test]
+    fn auto_table_row_group_uses_all_cell_border_tracks() {
+        let cell = |top: f32, right: f32, bottom: f32, left: f32| {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    border_top_width: Some(top),
+                    border_right_width: Some(right),
+                    border_bottom_width: Some(bottom),
+                    border_left_width: Some(left),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let group = Component::boxed(
+            Style {
+                display: WDisp::TableRowGroup,
+                ..Style::default()
+            },
+            vec![
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![cell(60.0, 0.0, 0.0, 0.0), cell(0.0, 60.0, 0.0, 0.0)],
+                ),
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![cell(0.0, 0.0, 60.0, 60.0), cell(0.0, 0.0, 60.0, 0.0)],
+                ),
+            ],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                ..Style::default()
+            },
+            vec![group],
+        );
+
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(800.0),
+                ..Style::default()
+            },
+            vec![table],
+        );
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let table = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let group = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let bottom_right = layout.iter().find(|(_, index)| *index == 8).unwrap().0;
+
+        assert_eq!((table.width, table.height), (120.0, 120.0));
+        assert_eq!(group, table);
+        assert_eq!((bottom_right.x, bottom_right.y), (60.0, 60.0));
     }
 
     #[test]

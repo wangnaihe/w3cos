@@ -77,6 +77,17 @@ impl CSSStyleDeclaration {
             }
             "row-gap" | "rowGap" => self.inner.row_gap = parse_px(value),
             "column-gap" | "columnGap" => self.inner.column_gap = parse_px(value),
+            "border-spacing" | "borderSpacing" => {
+                let values: Vec<f32> = split_css_whitespace(value)
+                    .into_iter()
+                    .filter_map(|part| parse_px(&part))
+                    .filter(|value| *value >= 0.0)
+                    .collect();
+                if let Some(x) = values.first().copied() {
+                    self.inner.border_spacing_x = x;
+                    self.inner.border_spacing_y = values.get(1).copied().unwrap_or(x);
+                }
+            }
             "padding" => {
                 if let Some(edges) = parse_padding_shorthand(value) {
                     self.inner.padding = edges
@@ -573,6 +584,10 @@ impl CSSStyleDeclaration {
                 Display::None => "none".to_string(),
             },
             "position" => format!("{:?}", self.inner.position).to_lowercase(),
+            "border-spacing" | "borderSpacing" => format!(
+                "{}px {}px",
+                self.inner.border_spacing_x, self.inner.border_spacing_y
+            ),
             "float" | "cssFloat" => match self.inner.float {
                 Float::None => "none".to_string(),
                 Float::Left => "left".to_string(),
@@ -2223,6 +2238,7 @@ mod tests {
         declaration.set_property("box-sizing", "border-box");
         declaration.set_property("margin", "1rem auto 12px 5%");
         declaration.set_property("gap", "8px 16px");
+        declaration.set_property("border-spacing", "2px 4px");
         declaration.set_property("flex", "1 0%");
         declaration.set_property("overflow-x", "hidden");
         declaration.set_property("overflow-y", "auto");
@@ -2235,6 +2251,9 @@ mod tests {
         assert_eq!(declaration.inner.margin.left, Spacing::Percent(5.0));
         assert_eq!(declaration.inner.row_gap, Some(8.0));
         assert_eq!(declaration.inner.column_gap, Some(16.0));
+        assert_eq!(declaration.inner.border_spacing_x, 2.0);
+        assert_eq!(declaration.inner.border_spacing_y, 4.0);
+        assert_eq!(declaration.get_property("border-spacing"), "2px 4px");
         assert_eq!(declaration.inner.flex_grow, 1.0);
         assert_eq!(declaration.inner.flex_shrink, 1.0);
         assert_eq!(declaration.inner.flex_basis, Dimension::Percent(0.0));

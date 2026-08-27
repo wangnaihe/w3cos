@@ -97,6 +97,8 @@ pub struct StyleDecl {
     pub gap: Option<f32>,
     pub row_gap: Option<f32>,
     pub column_gap: Option<f32>,
+    pub border_spacing_x: Option<f32>,
+    pub border_spacing_y: Option<f32>,
     pub padding: Option<Spacing>,
     pub padding_top: Option<Spacing>,
     pub padding_right: Option<Spacing>,
@@ -1192,6 +1194,16 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                 "gap" => style.gap = val.parse().ok(),
                 "rowGap" | "row_gap" => style.row_gap = val.parse().ok(),
                 "columnGap" | "column_gap" => style.column_gap = val.parse().ok(),
+                "borderSpacing" | "border_spacing" => {
+                    let values: Vec<f32> = val
+                        .split_whitespace()
+                        .filter_map(|part| part.trim_end_matches("px").parse().ok())
+                        .collect();
+                    if let Some(x) = values.first().copied() {
+                        style.border_spacing_x = Some(x);
+                        style.border_spacing_y = Some(values.get(1).copied().unwrap_or(x));
+                    }
+                }
                 "padding" => style.padding = val.parse().ok().map(Spacing::Px),
                 "fontSize" | "font_size" => style.font_size = val.parse().ok(),
                 "fontWeight" | "font_weight" => style.font_weight = val.parse().ok(),

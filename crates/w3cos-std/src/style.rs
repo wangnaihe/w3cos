@@ -56,6 +56,10 @@ pub struct Style {
     pub row_gap: Option<f32>,
     #[serde(default)]
     pub column_gap: Option<f32>,
+    #[serde(default)]
+    pub border_spacing_x: f32,
+    #[serde(default)]
+    pub border_spacing_y: f32,
     pub padding: Edges,
     pub margin: Edges,
 
@@ -219,6 +223,8 @@ impl Default for Style {
             gap: 0.0,
             row_gap: None,
             column_gap: None,
+            border_spacing_x: 0.0,
+            border_spacing_y: 0.0,
             padding: Edges::ZERO,
             margin: Edges::ZERO,
             box_sizing: BoxSizing::ContentBox,
@@ -331,6 +337,8 @@ impl Style {
             gap,
             row_gap,
             column_gap,
+            border_spacing_x,
+            border_spacing_y,
             padding,
             margin,
             box_sizing,
@@ -425,6 +433,8 @@ impl Style {
             gap: gap_b,
             row_gap: row_gap_b,
             column_gap: column_gap_b,
+            border_spacing_x: border_spacing_x_b,
+            border_spacing_y: border_spacing_y_b,
             padding: padding_b,
             margin: margin_b,
             box_sizing: box_sizing_b,
@@ -517,6 +527,8 @@ impl Style {
             && gap == gap_b
             && row_gap == row_gap_b
             && column_gap == column_gap_b
+            && border_spacing_x == border_spacing_x_b
+            && border_spacing_y == border_spacing_y_b
             && padding == padding_b
             && margin == margin_b
             && box_sizing == box_sizing_b

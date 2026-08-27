@@ -323,6 +323,10 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     px!(s.gap, "gap");
     px!(s.row_gap, "row-gap");
     px!(s.column_gap, "column-gap");
+    if let Some(x) = s.border_spacing_x {
+        let y = s.border_spacing_y.unwrap_or(x);
+        parts.push(format!("border-spacing:{x}px {y}px"));
+    }
     if let Some(p) = padding_css(s) {
         parts.push(p);
     }

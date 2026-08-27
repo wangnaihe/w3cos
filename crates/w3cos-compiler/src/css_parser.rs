@@ -1038,6 +1038,13 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         }
         "row-gap" => style.row_gap = css_parse_px(value),
         "column-gap" => style.column_gap = css_parse_px(value),
+        "border-spacing" => {
+            let values: Vec<f32> = value.split_whitespace().filter_map(css_parse_px).collect();
+            if let Some(x) = values.first().copied() {
+                style.border_spacing_x = Some(x);
+                style.border_spacing_y = Some(values.get(1).copied().unwrap_or(x));
+            }
+        }
         "padding" => apply_padding_shorthand(style, value),
         "padding-top" => {
             if let Some(value) = css_parse_padding_spacing(value) {
@@ -1711,7 +1718,7 @@ mod tests {
     #[test]
     fn parse_modern_box_model_shorthands() {
         let sheet = parse_css(
-            ".card { box-sizing: border-box; margin: 1rem auto 12px 5%; gap: 8px 16px; overflow-y: auto; flex: 1 1 0%; grid-template-columns: 1fr 1fr; grid-column: 1 / -1; justify-self: end; border-bottom: 3px solid #1677ff; }",
+            ".card { box-sizing: border-box; margin: 1rem auto 12px 5%; gap: 8px 16px; border-spacing: 2px 4px; overflow-y: auto; flex: 1 1 0%; grid-template-columns: 1fr 1fr; grid-column: 1 / -1; justify-self: end; border-bottom: 3px solid #1677ff; }",
         );
         let style = &sheet.rules[0].style;
 
@@ -1722,6 +1729,8 @@ mod tests {
         assert_eq!(style.margin_left, Some(Spacing::Percent(5.0)));
         assert_eq!(style.row_gap, Some(8.0));
         assert_eq!(style.column_gap, Some(16.0));
+        assert_eq!(style.border_spacing_x, Some(2.0));
+        assert_eq!(style.border_spacing_y, Some(4.0));
         assert_eq!(style.overflow_y.as_deref(), Some("auto"));
         assert_eq!(style.flex_grow, Some(1.0));
         assert_eq!(style.flex_shrink, Some(1.0));

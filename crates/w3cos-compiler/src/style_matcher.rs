@@ -146,6 +146,8 @@ pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
         gap,
         row_gap,
         column_gap,
+        border_spacing_x,
+        border_spacing_y,
         padding,
         padding_top,
         padding_right,
