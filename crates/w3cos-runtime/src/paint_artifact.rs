@@ -231,31 +231,37 @@ impl PaintArtifact {
             .find_map(|(rect, index)| (*index == 0).then_some(*rect));
         let canvas_background_style = canvas_background_source.map(|index| {
             let mut style = nodes[index].style.clone();
-            if index != 0 {
-                let root = &nodes[0].style;
-                style.border_width = 0.0;
-                style.border_top_width = None;
-                style.border_right_width = None;
-                style.border_bottom_width = None;
-                style.border_left_width = None;
-                if style
-                    .background_position
-                    .as_deref()
-                    .is_none_or(|position| {
-                        matches!(
-                            position.trim().to_ascii_lowercase().as_str(),
-                            "" | "0% 0%" | "top left" | "left top"
-                        )
-                    })
-                {
+            let root = &nodes[0].style;
+            let root_border_x = root.border_left_width.unwrap_or(root.border_width);
+            let root_border_y = root.border_top_width.unwrap_or(root.border_width);
+            style.border_width = 0.0;
+            style.border_top_width = None;
+            style.border_right_width = None;
+            style.border_bottom_width = None;
+            style.border_left_width = None;
+            if style
+                .background_position
+                .as_deref()
+                .is_none_or(|position| {
+                    matches!(
+                        position.trim().to_ascii_lowercase().as_str(),
+                        "" | "0% 0%" | "top left" | "left top"
+                    )
+                })
+            {
+                let (x, y) = if index == 0 {
+                    // Root backgrounds cover the canvas from the visible
+                    // inner border edge rather than retaining the root box.
+                    ((root_border_x - 1.0).max(0.0), (root_border_y - 1.0).max(0.0))
+                } else {
                     // A propagated body background uses the document element's
                     // padding edge as its canvas positioning origin.
-                    let root_x = root_rect.map_or(0.0, |rect| rect.x);
-                    let root_y = root_rect.map_or(0.0, |rect| rect.y);
-                    let x = root_x + root.border_left_width.unwrap_or(root.border_width);
-                    let y = root_y + root.border_top_width.unwrap_or(root.border_width);
-                    style.background_position = Some(format!("{x}px {y}px"));
-                }
+                    (
+                        root_rect.map_or(0.0, |rect| rect.x) + root_border_x,
+                        root_rect.map_or(0.0, |rect| rect.y) + root_border_y,
+                    )
+                };
+                style.background_position = Some(format!("{x}px {y}px"));
             }
             style
         });
@@ -387,6 +393,8 @@ mod tests {
     fn propagates_root_background_to_the_canvas_without_repainting_the_root_box() {
         let mut style = Style::default();
         style.background = Color::rgb(255, 255, 0);
+        style.background_image = Some("url(square-white.png)".into());
+        style.border_width = 3.0;
         let artifact = PaintArtifact::build(
             [PaintNode {
                 kind: ComponentKind::Column,
@@ -400,7 +408,11 @@ mod tests {
 
         assert_eq!(artifact.canvas_background, Color::rgb(255, 255, 0));
         assert_eq!(artifact.canvas_background_source, Some(0));
+        let canvas_style = artifact.canvas_background_style.as_ref().unwrap();
+        assert_eq!(canvas_style.border_width, 0.0);
+        assert_eq!(canvas_style.background_position.as_deref(), Some("2px 2px"));
         assert_eq!(artifact.nodes[0].style.background, Color::TRANSPARENT);
+        assert!(artifact.nodes[0].style.background_image.is_none());
     }
 
     #[test]
