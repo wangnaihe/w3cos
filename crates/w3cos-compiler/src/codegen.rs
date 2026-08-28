@@ -899,10 +899,12 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     }
     if let Some(ref ta) = s.text_align {
         let variant = match ta.as_str() {
+            "start" => "TextAlign::Start",
+            "end" => "TextAlign::End",
             "center" => "TextAlign::Center",
             "right" => "TextAlign::Right",
             "justify" => "TextAlign::Justify",
-            _ => "TextAlign::Left",
+            _ => "TextAlign::Start",
         };
         fields.push(format!("text_align: {variant}"));
     }

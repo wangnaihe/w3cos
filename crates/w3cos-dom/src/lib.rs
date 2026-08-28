@@ -2965,6 +2965,18 @@ mod tests {
     }
 
     #[test]
+    fn invalid_white_space_declaration_does_not_override_valid_value() {
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("white-space", "pre");
+        style.set_property("white-space", "pre-lines");
+
+        assert_eq!(
+            style.inner.white_space,
+            w3cos_std::style::WhiteSpace::Pre
+        );
+    }
+
+    #[test]
     fn test_css_set_property_width_height() {
         let mut style = CSSStyleDeclaration::new();
         style.set_property("width", "100px");

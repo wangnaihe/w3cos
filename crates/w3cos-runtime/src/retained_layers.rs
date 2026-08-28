@@ -389,6 +389,7 @@ fn hash_paint_style(style: &Style, hasher: &mut impl Hasher) {
     std::mem::discriminant(&style.white_space).hash(hasher);
     style.line_height.to_bits().hash(hasher);
     style.letter_spacing.to_bits().hash(hasher);
+    style.word_spacing.to_bits().hash(hasher);
     std::mem::discriminant(&style.text_decoration).hash(hasher);
     style.outline_width.to_bits().hash(hasher);
 }

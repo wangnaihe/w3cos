@@ -9,3 +9,5 @@ description = "W3C DOM API implementation for W3C OS — compiled to native code
 w3cos-std = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
+unicode-bidi = { workspace = true }
+unicode-bidi-mirroring = { workspace = true }

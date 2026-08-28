@@ -204,6 +204,16 @@ impl Default for PaintArtifact {
     }
 }
 
+fn background_position_uses_relative_basis(position: &str) -> bool {
+    position.split_ascii_whitespace().any(|token| {
+        token.contains('%')
+            || matches!(
+                token.to_ascii_lowercase().as_str(),
+                "center" | "right" | "bottom"
+            )
+    })
+}
+
 impl PaintArtifact {
     pub fn build(
         nodes: impl IntoIterator<Item = PaintNode>,
@@ -244,11 +254,29 @@ impl PaintArtifact {
         let root_rect = layout_cache
             .iter()
             .find_map(|(rect, index)| (*index == 0).then_some(*rect));
+        let root_style = &nodes[0].style;
+        let root_borders = (
+            root_style
+                .border_left_width
+                .unwrap_or(root_style.border_width),
+            root_style
+                .border_top_width
+                .unwrap_or(root_style.border_width),
+            root_style
+                .border_right_width
+                .unwrap_or(root_style.border_width),
+            root_style
+                .border_bottom_width
+                .unwrap_or(root_style.border_width),
+        );
+        let root_positioning_rect = root_rect.map(|rect| LayoutRect {
+            x: rect.x + root_borders.0,
+            y: rect.y + root_borders.1,
+            width: (rect.width - root_borders.0 - root_borders.2).max(0.0),
+            height: (rect.height - root_borders.1 - root_borders.3).max(0.0),
+        });
         let canvas_background_style = canvas_background_source.map(|index| {
             let mut style = nodes[index].style.clone();
-            let root = &nodes[0].style;
-            let root_border_x = root.border_left_width.unwrap_or(root.border_width);
-            let root_border_y = root.border_top_width.unwrap_or(root.border_width);
             style.border_width = 0.0;
             style.border_top_width = None;
             style.border_right_width = None;
@@ -261,18 +289,14 @@ impl PaintArtifact {
                 )
             }) {
                 let (x, y) = if index == 0 {
-                    // Root backgrounds cover the canvas from the visible
-                    // inner border edge rather than retaining the root box.
-                    (
-                        (root_border_x - 1.0).max(0.0),
-                        (root_border_y - 1.0).max(0.0),
-                    )
+                    // The positioning override already is the root padding box.
+                    (0.0, 0.0)
                 } else {
                     // A propagated body background uses the document element's
                     // padding edge as its canvas positioning origin.
                     (
-                        root_rect.map_or(0.0, |rect| rect.x) + root_border_x,
-                        root_rect.map_or(0.0, |rect| rect.y) + root_border_y,
+                        root_positioning_rect.map_or(0.0, |rect| rect.x),
+                        root_positioning_rect.map_or(0.0, |rect| rect.y),
                     )
                 };
                 style.background_position = Some(format!("{x}px {y}px"));
@@ -283,9 +307,20 @@ impl PaintArtifact {
             .map(|index| nodes[index].style.background)
             .filter(|color| color.a > 0)
             .unwrap_or(Color::WHITE);
+        // CSS paints a propagated body background on the canvas as if it
+        // were specified on the root element. Relative positions need the
+        // root box as their percentage basis; absolute positions have already
+        // been converted to canvas coordinates above.
         let canvas_background_positioning_rect = canvas_background_source
-            .filter(|index| *index == 0)
-            .and(root_rect);
+            .filter(|index| {
+                *index == 0
+                    || nodes[*index]
+                        .style
+                        .background_position
+                        .as_deref()
+                        .is_some_and(background_position_uses_relative_basis)
+            })
+            .and(root_positioning_rect);
         if let Some(index) = canvas_background_source {
             nodes[index].style.background = Color::TRANSPARENT;
             nodes[index].style.background_image = None;
@@ -427,10 +462,18 @@ mod tests {
 
         assert_eq!(artifact.canvas_background, Color::rgb(255, 255, 0));
         assert_eq!(artifact.canvas_background_source, Some(0));
-        assert_eq!(artifact.canvas_background_positioning_rect, Some(rect(0.0)));
+        assert_eq!(
+            artifact.canvas_background_positioning_rect,
+            Some(LayoutRect {
+                x: 3.0,
+                y: 3.0,
+                width: 314.0,
+                height: 74.0,
+            })
+        );
         let canvas_style = artifact.canvas_background_style.as_ref().unwrap();
         assert_eq!(canvas_style.border_width, 0.0);
-        assert_eq!(canvas_style.background_position.as_deref(), Some("2px 2px"));
+        assert_eq!(canvas_style.background_position.as_deref(), Some("0px 0px"));
         assert_eq!(artifact.nodes[0].style.background, Color::TRANSPARENT);
         assert!(artifact.nodes[0].style.background_image.is_none());
     }
@@ -481,6 +524,37 @@ mod tests {
             Some("19px 19px")
         );
         assert!(artifact.nodes[1].style.background_image.is_none());
+    }
+
+    #[test]
+    fn propagated_body_percentage_position_uses_the_root_box() {
+        let root = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let mut body_style = Style::default();
+        body_style.background_image = Some("url(square-purple.png)".into());
+        body_style.background_position = Some("50% 50%".into());
+        let body = PaintNode {
+            kind: ComponentKind::Column,
+            style: body_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let root_rect = LayoutRect {
+            x: 16.0,
+            ..rect(16.0)
+        };
+        let artifact = PaintArtifact::build_with_body_background(
+            [root, body],
+            &[(root_rect, 0), (rect(0.0), 1)],
+            1,
+            Some(1),
+        );
+
+        assert_eq!(artifact.canvas_background_positioning_rect, Some(root_rect));
     }
 
     #[test]

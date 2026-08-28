@@ -746,7 +746,7 @@ impl FontRegistry {
         let mut bottom = f32::MIN;
         let mut saw_ink = false;
 
-        let render_text = crate::text_layout::font_render_text(text);
+        let render_text = crate::text_layout::font_render_text(text, style.direction);
         for character in render_text.chars() {
             let character = crate::text_layout::font_glyph_character(character);
             let selected = self

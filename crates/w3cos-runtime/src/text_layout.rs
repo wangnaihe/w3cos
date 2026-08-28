@@ -10,6 +10,7 @@ use w3cos_std::style::{Display, Style, WhiteSpace};
 
 const TEXT_PAINT_CACHE_CAPACITY: usize = 4096;
 const FORCED_LINE_BREAK: char = '\u{2028}';
+const PARAGRAPH_SEPARATOR: char = '\u{2029}';
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TextPaintKey {
@@ -66,7 +67,7 @@ fn normalized_segment_breaks(text: &str) -> String {
                 }
                 output.push('\n');
             }
-            '\u{000c}' => output.push('\n'),
+            '\u{000c}' | PARAGRAPH_SEPARATOR => output.push('\n'),
             _ => output.push(character),
         }
     }
@@ -307,6 +308,13 @@ where
         current.push(ch);
         if had_content && run_width(&current) > max_width {
             current.pop();
+            if ch == ' ' {
+                // A collapsible separator that selects the soft wrap point
+                // is consumed by that break; it must not become indentation
+                // on the following line. NBSP is intentionally excluded.
+                flush(&mut lines, &mut current);
+                continue;
+            }
             if may_not_start_line(ch) {
                 if let Some(last) = current.pop() {
                     flush(&mut lines, &mut current);
@@ -371,18 +379,35 @@ pub(crate) fn font_glyph_character(character: char) -> char {
     }
 }
 
-pub(crate) fn font_render_text(text: &str) -> Cow<'_, str> {
+pub(crate) fn font_render_text(
+    text: &str,
+    direction: w3cos_std::style::TextDirection,
+) -> Cow<'_, str> {
     if text.is_ascii() {
         return Cow::Borrowed(text);
     }
 
-    let bidi = unicode_bidi::BidiInfo::new(text, None);
-    let visual = bidi.paragraphs.first().map_or_else(
-        || Cow::Borrowed(text),
-        |paragraph| bidi.reorder_line(paragraph, paragraph.range.clone()),
-    );
-    let rendered = visual
-        .chars()
+    let paragraph_level = match direction {
+        w3cos_std::style::TextDirection::Ltr => unicode_bidi::Level::ltr(),
+        w3cos_std::style::TextDirection::Rtl => unicode_bidi::Level::rtl(),
+    };
+    let bidi = unicode_bidi::BidiInfo::new(text, Some(paragraph_level));
+    let logical = text.chars().collect::<Vec<_>>();
+    let Some(paragraph) = bidi.paragraphs.first() else {
+        return Cow::Borrowed(text);
+    };
+    let levels = bidi.reordered_levels_per_char(paragraph, paragraph.range.clone());
+    let visual_order = unicode_bidi::BidiInfo::reorder_visual(&levels);
+    let rendered = visual_order
+        .into_iter()
+        .map(|index| {
+            let character = logical[index];
+            if levels[index].is_rtl() {
+                unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character)
+            } else {
+                character
+            }
+        })
         .filter(|character| !is_bidi_format_control(*character))
         .map(font_glyph_character)
         .collect::<String>();
@@ -915,6 +940,16 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_collapsible_space_is_consumed_by_the_soft_wrap() {
+        let lines = wrap_text_with_run_width("1 2 3 4", 6.0, WhiteSpace::Normal, |text| {
+            text.chars()
+                .map(|character| if character == ' ' { 4.0 } else { 1.0 })
+                .sum()
+        });
+        assert_eq!(lines, vec!["1 2", "3 4"]);
+    }
+
+    #[test]
     fn css_white_space_modes_prepare_generated_text_before_shaping() {
         let source = "This text\n\tshould   be";
         assert_eq!(
@@ -956,8 +991,45 @@ mod tests {
 
     #[test]
     fn explicit_bidi_overrides_are_reordered_before_font_rendering() {
-        assert_eq!(font_render_text("\u{202e}elbadaer"), "readable");
-        assert_eq!(font_render_text("\u{202e}d c \u{202d}ab\u{202c}"), "ab c d");
+        assert_eq!(
+            font_render_text("\u{202e}elbadaer", w3cos_std::style::TextDirection::Ltr),
+            "readable"
+        );
+        assert_eq!(
+            font_render_text(
+                "\u{202e}d c \u{202d}ab\u{202c}",
+                w3cos_std::style::TextDirection::Ltr,
+            ),
+            "ab c d"
+        );
+    }
+
+    #[test]
+    fn css_paragraph_direction_controls_natural_bidi_and_mirroring() {
+        assert_eq!(
+            font_render_text(
+                "c d (א a b)",
+                w3cos_std::style::TextDirection::Rtl,
+            ),
+            font_render_text(
+                "(a b א) c d",
+                w3cos_std::style::TextDirection::Ltr,
+            )
+        );
+    }
+
+    #[test]
+    fn rlm_neutral_sequence_matches_its_ltr_override_control() {
+        assert_eq!(
+            font_render_text(
+                "\u{200f}\u{00a0} + - × ÷ א",
+                w3cos_std::style::TextDirection::Ltr,
+            ),
+            font_render_text(
+                "\u{202d}א ÷ × - + \u{00a0}\u{202c}",
+                w3cos_std::style::TextDirection::Ltr,
+            )
+        );
     }
 
     #[test]
@@ -1007,6 +1079,19 @@ mod tests {
                 });
             assert_eq!(lines, vec!["first", "second"]);
         }
+    }
+
+    #[test]
+    fn unicode_paragraph_separator_starts_a_new_preformatted_line() {
+        assert_eq!(
+            wrap_text_with_run_width(
+                "first\u{2029}second",
+                1000.0,
+                WhiteSpace::Pre,
+                |text| text.len() as f32,
+            ),
+            vec!["first", "second"]
+        );
     }
 
     #[test]

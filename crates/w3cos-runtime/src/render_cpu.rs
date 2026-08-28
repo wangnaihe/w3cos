@@ -1318,14 +1318,26 @@ fn draw_text_ink_in_box(
     let x = match align {
         TextAlign::Right => box_rect.x + box_rect.width - ink.width - ink.left,
         TextAlign::Center => box_rect.x + (box_rect.width - ink.width) * 0.5 - ink.left,
-        TextAlign::Left | TextAlign::Justify => box_rect.x - ink.left,
+        TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
+            box_rect.x - ink.left
+        }
     };
     let y = box_rect.y + (box_rect.height - ink.height) * 0.5 - ink.top;
     draw_text_line(pixmap, x, y, text, font_size, color, font, style, clip_mask);
 }
 
 fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
-    match style.text_align {
+    if style.display == w3cos_std::style::Display::Inline {
+        return TextAlign::Left;
+    }
+    let text_align = match (style.text_align, style.direction) {
+        (TextAlign::Start, w3cos_std::style::TextDirection::Ltr)
+        | (TextAlign::End, w3cos_std::style::TextDirection::Rtl) => TextAlign::Left,
+        (TextAlign::Start, w3cos_std::style::TextDirection::Rtl)
+        | (TextAlign::End, w3cos_std::style::TextDirection::Ltr) => TextAlign::Right,
+        (align, _) => align,
+    };
+    match text_align {
         TextAlign::Center | TextAlign::Right => style.text_align,
         TextAlign::Left
             if matches!(
@@ -1335,7 +1347,7 @@ fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
         {
             TextAlign::Center
         }
-        TextAlign::Left | TextAlign::Justify => TextAlign::Left,
+        TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => TextAlign::Left,
     }
 }
 
@@ -1407,7 +1419,9 @@ fn draw_text_in_rect(
         let x = match align {
             TextAlign::Right => content.x + content.width - ink.width - ink.left,
             TextAlign::Center => content.x + (content.width - ink.width) * 0.5 - ink.left,
-            TextAlign::Left | TextAlign::Justify => content.x - ink.left,
+            TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
+                content.x - ink.left
+            }
         };
         let y = block_top + i as f32 * line_h;
         draw_text_line(
@@ -1478,7 +1492,7 @@ fn draw_text_line(
 
     GLYPH_RASTER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let render_text = text_layout::font_render_text(text);
+        let render_text = text_layout::font_render_text(text, style.direction);
         for ch in render_text.chars() {
             let registered = crate::font_face::FontRegistry::global()
                 .resolve_style_for_character(style, ch)

@@ -173,10 +173,14 @@ impl Component {
     }
 
     pub fn row(style: Style, children: Vec<Component>) -> Self {
+        let flex_direction = match style.flex_direction {
+            crate::style::FlexDirection::RowReverse => crate::style::FlexDirection::RowReverse,
+            _ => crate::style::FlexDirection::Row,
+        };
         Self {
             kind: ComponentKind::Row,
             style: Style {
-                flex_direction: crate::style::FlexDirection::Row,
+                flex_direction,
                 ..style
             },
             children,
@@ -356,5 +360,24 @@ impl Component {
             on_click: EventAction::None,
             sticky_counter_signal: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Component;
+    use crate::style::{FlexDirection, Style};
+
+    #[test]
+    fn row_component_preserves_an_explicit_reverse_axis() {
+        let row = Component::row(
+            Style {
+                flex_direction: FlexDirection::RowReverse,
+                ..Style::default()
+            },
+            vec![],
+        );
+
+        assert_eq!(row.style.flex_direction, FlexDirection::RowReverse);
     }
 }

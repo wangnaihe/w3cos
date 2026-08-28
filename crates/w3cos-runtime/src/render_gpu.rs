@@ -1209,7 +1209,17 @@ fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
 }
 
 fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
-    match style.text_align {
+    if style.display == w3cos_std::style::Display::Inline {
+        return TextAlign::Left;
+    }
+    let text_align = match (style.text_align, style.direction) {
+        (TextAlign::Start, w3cos_std::style::TextDirection::Ltr)
+        | (TextAlign::End, w3cos_std::style::TextDirection::Rtl) => TextAlign::Left,
+        (TextAlign::Start, w3cos_std::style::TextDirection::Rtl)
+        | (TextAlign::End, w3cos_std::style::TextDirection::Ltr) => TextAlign::Right,
+        (align, _) => align,
+    };
+    match text_align {
         TextAlign::Center | TextAlign::Right => style.text_align,
         TextAlign::Left
             if matches!(
@@ -1219,7 +1229,7 @@ fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
         {
             TextAlign::Center
         }
-        TextAlign::Left | TextAlign::Justify => TextAlign::Left,
+        TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => TextAlign::Left,
     }
 }
 
@@ -1281,7 +1291,9 @@ fn draw_text_in_rect(
         let x = match align {
             TextAlign::Right => content.x + content.width - ink.width - ink.left,
             TextAlign::Center => content.x + (content.width - ink.width) * 0.5 - ink.left,
-            TextAlign::Left | TextAlign::Justify => content.x - ink.left,
+            TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
+                content.x - ink.left
+            }
         };
         let y = if lines.len() == 1 {
             content.y + (content.height - ink.height).max(0.0) * 0.5 - ink.top

@@ -370,6 +370,31 @@ mod tests {
         assert_eq!(flavor.get_property("prefix"), Value::string("p"));
     }
 
+    #[test]
+    fn xhtml_parser_resolves_html_named_character_references() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::dom::set_html_document(false);
+        crate::jsdom::set_document_content_type("application/xhtml+xml");
+        let mut parser = StreamingXmlDocumentParser::from_started_navigation(
+            Rc::new(InertParserScriptHost),
+            "https://example.test/entities.xhtml",
+        );
+        parser
+            .write(
+                "<html xmlns='http://www.w3.org/1999/xhtml'><head/><body>&times;&divide;&nbsp;</body></html>",
+            )
+            .unwrap();
+        assert_eq!(parser.finish().unwrap(), DocumentParseProgress::Complete);
+
+        assert_eq!(
+            crate::jsdom::document_value()
+                .get_property("body")
+                .get_property("textContent"),
+            Value::string("×÷\u{a0}")
+        );
+    }
+
     #[cfg(feature = "dynamic-js")]
     #[test]
     fn xhtml_parser_executes_inline_scripts_in_the_document_realm() {

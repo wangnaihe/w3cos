@@ -859,7 +859,9 @@ impl Document {
             .get_node(id)
             .parent
             .map(|parent| self.computed_style_for(parent));
-        self.node_to_component(id, &mut ancestors, inherited.as_ref())
+        let mut component = self.node_to_component(id, &mut ancestors, inherited.as_ref());
+        reorder_explicit_bidi_inline_rows(&mut component);
+        component
     }
 
     fn attach_native_host(
@@ -1072,14 +1074,25 @@ impl Document {
 
         if let Some(parent) = inherited {
             let declares = |property: &str| {
+                let winning_author_value = matched
+                        .iter()
+                        .filter(|(name, _, _)| css_property_eq(name, property))
+                        .map(|(_, value, _)| value.as_str())
+                        .chain(
+                            inline
+                                .inline_declarations
+                                .iter()
+                                .filter(|(name, _)| css_property_eq(name, property))
+                                .map(|(_, value)| value.as_str()),
+                        )
+                        .last();
                 (css_property_eq(property, "color") && body_text_hint.is_some())
-                    || matched
-                        .iter()
-                        .any(|(name, _, _)| css_property_eq(name, property))
-                    || inline
-                        .inline_declarations
-                        .iter()
-                        .any(|(name, _)| css_property_eq(name, property))
+                    || winning_author_value.is_some_and(|value| {
+                        !matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "inherit" | "unset"
+                        )
+                    })
             };
             inherit_text_style(&mut style, parent, &node.tag.as_str(), declares);
         }
@@ -1127,12 +1140,34 @@ impl Document {
                 )
                 .last()
         };
-        if let Some((_, value)) = declared_property_value(&["font-size", "fontSize"])
-            && let Some(number) = value.trim().strip_suffix("ex")
-            && let Ok(number) = number.trim().parse::<f32>()
-        {
+        if let Some((_, value)) = declared_property_value(&["font-size", "fontSize"]) {
             let parent = inherited.cloned().unwrap_or_default();
-            style.font_size = number * css_ex_size(&parent);
+            let value = value.trim();
+            let relative_size = value
+                .strip_suffix("rem")
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * 16.0)
+                .or_else(|| {
+                    value
+                        .strip_suffix("em")
+                        .and_then(|number| number.trim().parse::<f32>().ok())
+                        .map(|number| number * parent.font_size)
+                })
+                .or_else(|| {
+                    value
+                        .strip_suffix("ex")
+                        .and_then(|number| number.trim().parse::<f32>().ok())
+                        .map(|number| number * css_ex_size(&parent))
+                })
+                .or_else(|| {
+                    value
+                        .strip_suffix('%')
+                        .and_then(|number| number.trim().parse::<f32>().ok())
+                        .map(|number| number * parent.font_size / 100.0)
+                });
+            if let Some(relative_size) = relative_size {
+                style.font_size = relative_size;
+            }
         }
         if let Some(value) = declared_value(&["float", "cssFloat"]) {
             match value.trim().to_ascii_lowercase().as_str() {
@@ -1178,6 +1213,16 @@ impl Document {
             }
         }
         if let Some(parent) = inherited {
+            if declared_property_value(&["direction"])
+                .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
+            {
+                style.direction = parent.direction;
+            }
+            if declared_property_value(&["unicode-bidi", "unicodeBidi"])
+                .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
+            {
+                style.unicode_bidi = parent.unicode_bidi;
+            }
             let inherits_background_longhand = |property: &str| {
                 declared_property_value(&["background", property]).is_some_and(
                     |(declared_property, value)| {
@@ -1210,6 +1255,87 @@ impl Document {
             if inherits_background_longhand("background-blend-mode") {
                 style.background_blend_mode = parent.background_blend_mode.clone();
             }
+            if declared_property_value(&["border"])
+                .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
+            {
+                style.border_width = parent.border_width;
+                style.border_color = parent.border_color;
+                style.border_top_width = parent.border_top_width;
+                style.border_right_width = parent.border_right_width;
+                style.border_bottom_width = parent.border_bottom_width;
+                style.border_left_width = parent.border_left_width;
+                style.border_top_color = parent.border_top_color;
+                style.border_right_color = parent.border_right_color;
+                style.border_bottom_color = parent.border_bottom_color;
+                style.border_left_color = parent.border_left_color;
+            }
+        }
+        let last_border_declaration = |properties: &[&str]| {
+            matched
+                .iter()
+                .filter(|(name, _, _)| {
+                    properties
+                        .iter()
+                        .any(|property| css_property_eq(name, property))
+                })
+                .map(|(_, value, _)| value.as_str())
+                .chain(
+                    inline
+                        .inline_declarations
+                        .iter()
+                        .filter(|(name, _)| {
+                            properties
+                                .iter()
+                                .any(|property| css_property_eq(name, property))
+                        })
+                        .map(|(_, value)| value.as_str()),
+                )
+                .last()
+        };
+        if let Some(width) = last_border_declaration(&["border", "border-width"])
+            .and_then(|value| relative_border_width_px(value, &style))
+        {
+            style.border_width = width;
+        }
+        let relative_side_width = |properties: &[&str]| {
+            last_border_declaration(properties)
+                .and_then(|value| relative_border_width_px(value, &style))
+        };
+        let top_width = relative_side_width(&[
+            "border",
+            "border-width",
+            "border-top",
+            "border-top-width",
+        ]);
+        let right_width = relative_side_width(&[
+            "border",
+            "border-width",
+            "border-right",
+            "border-right-width",
+        ]);
+        let bottom_width = relative_side_width(&[
+            "border",
+            "border-width",
+            "border-bottom",
+            "border-bottom-width",
+        ]);
+        let left_width = relative_side_width(&[
+            "border",
+            "border-width",
+            "border-left",
+            "border-left-width",
+        ]);
+        if let Some(width) = top_width {
+            style.border_top_width = Some(width);
+        }
+        if let Some(width) = right_width {
+            style.border_right_width = Some(width);
+        }
+        if let Some(width) = bottom_width {
+            style.border_bottom_width = Some(width);
+        }
+        if let Some(width) = left_width {
+            style.border_left_width = Some(width);
         }
         if declared_value(&["border-color"])
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("currentcolor"))
@@ -2338,6 +2464,7 @@ impl Document {
                 && style.font_style == parent_style.font_style
                 && style.line_height == parent_style.line_height
                 && style.letter_spacing == parent_style.letter_spacing
+                && style.word_spacing == parent_style.word_spacing
                 && style.text_decoration == parent_style.text_decoration
                 && style.white_space == parent_style.white_space
         };
@@ -2354,6 +2481,7 @@ impl Document {
                 && component.style.font_style == parent_style.font_style
                 && component.style.line_height == parent_style.line_height
                 && component.style.letter_spacing == parent_style.letter_spacing
+                && component.style.word_spacing == parent_style.word_spacing
                 && component.style.text_decoration == parent_style.text_decoration
                 && component.style.white_space == parent_style.white_space;
             if let w3cos_std::ComponentKind::Text { content } = &component.kind {
@@ -2460,6 +2588,7 @@ impl Document {
                 || component.style.font_style != parent_style.font_style
                 || component.style.line_height != parent_style.line_height
                 || component.style.letter_spacing != parent_style.letter_spacing
+                || component.style.word_spacing != parent_style.word_spacing
                 || component.style.text_decoration != parent_style.text_decoration
                 || component.style.white_space != parent_style.white_space
             {
@@ -2638,6 +2767,8 @@ impl Document {
                                 && component.style.line_height == generated[0].style.line_height
                                 && component.style.letter_spacing
                                     == generated[0].style.letter_spacing
+                                && component.style.word_spacing
+                                    == generated[0].style.word_spacing
                                 && component.style.text_decoration
                                     == generated[0].style.text_decoration
                         })
@@ -2659,6 +2790,7 @@ impl Document {
                         style.font_style = generated_style.font_style;
                         style.line_height = generated_style.line_height;
                         style.letter_spacing = generated_style.letter_spacing;
+                        style.word_spacing = generated_style.word_spacing;
                         style.text_decoration = generated_style.text_decoration;
                         return self
                             .attach_native_host(id, w3cos_std::Component::text(content, style));
@@ -2690,7 +2822,12 @@ impl Document {
                 {
                     let child = self.get_node(child_ids[0]);
                     if child.node_type == NodeType::Text {
-                        let text = child.text_content.as_deref().unwrap_or("");
+                        let text = self.rendered_text_content(
+                            &child_ids,
+                            0,
+                            ancestors,
+                            &style,
+                        );
                         let component = match tag.as_str() {
                             "button" => w3cos_std::Component::button(text, style),
                             _ => w3cos_std::Component::text(text, style),
@@ -3066,6 +3203,36 @@ impl Document {
                         anonymous_inline_formatting_context = true;
                     }
                 }
+                if matches!(
+                    style.display,
+                    w3cos_std::style::Display::Block
+                        | w3cos_std::style::Display::InlineBlock
+                        | w3cos_std::style::Display::TableCell
+                        | w3cos_std::style::Display::TableCaption
+                )
+                    && children.len() == 1
+                    && matches!(
+                        children[0].style.display,
+                        w3cos_std::style::Display::Inline
+                            | w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::InlineFlex
+                            | w3cos_std::style::Display::InlineTable
+                    )
+                    && (!matches!(style.width, w3cos_std::style::Dimension::Auto)
+                        || style.direction == w3cos_std::style::TextDirection::Rtl
+                        || matches!(
+                            style.unicode_bidi,
+                            w3cos_std::style::UnicodeBidi::BidiOverride
+                                | w3cos_std::style::UnicodeBidi::IsolateOverride
+                        ))
+                {
+                    // A block still establishes an anonymous line box when
+                    // it contains one retained inline fragment. This occurs
+                    // for bidi/decorated spans that cannot be folded into the
+                    // principal text leaf; without the line box, logical
+                    // `text-align:start` has no containing width to align in.
+                    anonymous_inline_formatting_context = true;
+                }
                 if has_generated_content
                     && !self.events.has_listeners(id)
                     && principal_box_can_merge_generated_inline_text(&style)
@@ -3218,6 +3385,25 @@ impl Document {
                 // lower that visual box as flex-row while retaining the DOM
                 // children and their independently styled paint nodes.
                 if nowrap_inline_formatting_context || anonymous_inline_formatting_context {
+                    if anonymous_inline_formatting_context
+                        && children.len() == 1
+                        && matches!(children[0].kind, w3cos_std::ComponentKind::Text { .. })
+                        && matches!(
+                            style.white_space,
+                            w3cos_std::style::WhiteSpace::Normal
+                                | w3cos_std::style::WhiteSpace::PreLine
+                        )
+                        && !matches!(style.width, w3cos_std::style::Dimension::Auto)
+                    {
+                        // A text run in a fixed-width block is not an atomic
+                        // flex item: its line box uses the block content width
+                        // and wraps internally. Pass that width constraint to
+                        // the portable text leaf instead of retaining its
+                        // unconstrained max-content width.
+                        children[0].style.width = w3cos_std::style::Dimension::Percent(100.0);
+                        children[0].style.min_width = w3cos_std::style::Dimension::Px(0.0);
+                        children[0].style.flex_shrink = 1.0;
+                    }
                     let has_negative_horizontal_margin = children.iter().any(|child| {
                         let is_negative = |spacing| {
                             matches!(
@@ -3338,6 +3524,25 @@ impl Document {
                         let mut line_style = w3cos_std::style::Style::default();
                         line_style.display = w3cos_std::style::Display::Flex;
                         line_style.flex_direction = w3cos_std::style::FlexDirection::Row;
+                        line_style.width = w3cos_std::style::Dimension::Percent(100.0);
+                        line_style.direction = style.direction;
+                        line_style.unicode_bidi = style.unicode_bidi;
+                        line_style.text_align = style.text_align;
+                        line_style.justify_content = match (style.text_align, style.direction) {
+                            (w3cos_std::style::TextAlign::Right, _)
+                            | (
+                                w3cos_std::style::TextAlign::Start,
+                                w3cos_std::style::TextDirection::Rtl,
+                            )
+                            | (
+                                w3cos_std::style::TextAlign::End,
+                                w3cos_std::style::TextDirection::Ltr,
+                            ) => w3cos_std::style::JustifyContent::FlexEnd,
+                            (w3cos_std::style::TextAlign::Center, _) => {
+                                w3cos_std::style::JustifyContent::Center
+                            }
+                            _ => w3cos_std::style::JustifyContent::FlexStart,
+                        };
                         line_style.align_items = if uses_inline_strut_wrappers {
                             w3cos_std::style::AlignItems::FlexStart
                         } else {
@@ -3345,7 +3550,15 @@ impl Document {
                         };
                         children = vec![w3cos_std::Component::row(line_style, children)];
                     } else if style.display == w3cos_std::style::Display::TableRow {
-                        style.flex_direction = w3cos_std::style::FlexDirection::Row;
+                        let table_direction = inherited.map_or(style.direction, |style| style.direction);
+                        style.flex_direction = match table_direction {
+                            w3cos_std::style::TextDirection::Ltr => {
+                                w3cos_std::style::FlexDirection::Row
+                            }
+                            w3cos_std::style::TextDirection::Rtl => {
+                                w3cos_std::style::FlexDirection::RowReverse
+                            }
+                        };
                         style.align_items = if uses_inline_strut_wrappers {
                             w3cos_std::style::AlignItems::FlexStart
                         } else {
@@ -3380,9 +3593,50 @@ impl Document {
                             style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
                         }
                     }
+                    style.justify_content = match (style.text_align, style.direction) {
+                        (w3cos_std::style::TextAlign::Right, _)
+                        | (
+                            w3cos_std::style::TextAlign::Start,
+                            w3cos_std::style::TextDirection::Rtl,
+                        )
+                        | (
+                            w3cos_std::style::TextAlign::End,
+                            w3cos_std::style::TextDirection::Ltr,
+                        ) => {
+                            w3cos_std::style::JustifyContent::FlexEnd
+                        }
+                        (w3cos_std::style::TextAlign::Center, _) => {
+                            w3cos_std::style::JustifyContent::Center
+                        }
+                        (w3cos_std::style::TextAlign::Left, _)
+                        | (w3cos_std::style::TextAlign::Justify, _)
+                        | (
+                            w3cos_std::style::TextAlign::Start,
+                            w3cos_std::style::TextDirection::Ltr,
+                        )
+                        | (
+                            w3cos_std::style::TextAlign::End,
+                            w3cos_std::style::TextDirection::Rtl,
+                        ) => style.justify_content,
+                    };
                 }
 
                 normalize_css_table_internal_used_style(&mut style);
+                if style.display == w3cos_std::style::Display::TableRow {
+                    // CSS `direction` on a table row does not itself reorder
+                    // columns. Column order follows the containing table (or
+                    // row-group) direction, which arrives as the inherited
+                    // principal-box style here.
+                    let table_direction = inherited.map_or(style.direction, |style| style.direction);
+                    style.flex_direction = match table_direction {
+                        w3cos_std::style::TextDirection::Ltr => {
+                            w3cos_std::style::FlexDirection::Row
+                        }
+                        w3cos_std::style::TextDirection::Rtl => {
+                            w3cos_std::style::FlexDirection::RowReverse
+                        }
+                    };
+                }
 
                 let is_row = matches!(
                     style.flex_direction,
@@ -3434,7 +3688,11 @@ impl Document {
                                 );
                             }
                         }
-                        w3cos_std::Component::column(style, children)
+                        if is_row {
+                            w3cos_std::Component::row(style, children)
+                        } else {
+                            w3cos_std::Component::column(style, children)
+                        }
                     }
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                         if let Some(text) = &node.text_content {
@@ -4789,6 +5047,12 @@ fn inherit_text_style(
     if !declares("letter-spacing") {
         style.letter_spacing = parent.letter_spacing;
     }
+    if !declares("word-spacing") {
+        style.word_spacing = parent.word_spacing;
+    }
+    if !declares("border-collapse") {
+        style.border_collapse = parent.border_collapse;
+    }
     if !declares("text-align") {
         style.text_align = parent.text_align;
     }
@@ -4797,6 +5061,9 @@ fn inherit_text_style(
     }
     if !declares("word-break") && !declares("overflow-wrap") && !declares("word-wrap") {
         style.word_break = parent.word_break;
+    }
+    if !declares("direction") {
+        style.direction = parent.direction;
     }
 }
 
@@ -4951,6 +5218,669 @@ fn split_css_tokens(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
+    if let w3cos_std::ComponentKind::Text { content } = &mut component.kind
+        && content.contains('\u{2028}')
+        && component.style.unicode_bidi == w3cos_std::style::UnicodeBidi::Normal
+        && (component.style.direction == w3cos_std::style::TextDirection::Rtl
+            || content.chars().any(|character| {
+                matches!(
+                    unicode_bidi::bidi_class(character),
+                    unicode_bidi::BidiClass::R
+                        | unicode_bidi::BidiClass::AL
+                        | unicode_bidi::BidiClass::AN
+                )
+            }))
+    {
+        use unicode_bidi::{BidiInfo, Level};
+
+        let paragraph_level = match component.style.direction {
+            w3cos_std::style::TextDirection::Ltr => Level::ltr(),
+            w3cos_std::style::TextDirection::Rtl => Level::rtl(),
+        };
+        let bidi = BidiInfo::new(content, Some(paragraph_level));
+        if let Some(paragraph) = bidi.paragraphs.first() {
+            let mut visual_lines = Vec::new();
+            let mut line_start = 0;
+            let line_ranges = content
+                .char_indices()
+                .filter_map(|(offset, character)| {
+                    (character == '\u{2028}').then_some(offset)
+                })
+                .chain(std::iter::once(content.len()))
+                .map(|line_end| {
+                    let range = line_start..line_end;
+                    line_start = line_end
+                        + content[line_end..]
+                            .chars()
+                            .next()
+                            .filter(|character| *character == '\u{2028}')
+                            .map_or(0, char::len_utf8);
+                    range
+                });
+            for range in line_ranges {
+                let logical = content[range.clone()].chars().collect::<Vec<_>>();
+                let char_start = content[..range.start].chars().count();
+                let char_end = char_start + logical.len();
+                let paragraph_levels = bidi.reordered_levels_per_char(paragraph, range);
+                let levels = &paragraph_levels[char_start..char_end];
+                let visual = BidiInfo::reorder_visual(levels)
+                    .into_iter()
+                    .map(|index| {
+                        let character = logical[index];
+                        if levels[index].is_rtl() {
+                            unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character)
+                        } else {
+                            character
+                        }
+                    })
+                    .collect::<String>();
+                visual_lines.push(visual);
+            }
+            *content = visual_lines.join("\n");
+            component.style.direction = w3cos_std::style::TextDirection::Ltr;
+        }
+    }
+    if let w3cos_std::ComponentKind::Text { content } = &mut component.kind
+        && component.style.direction == w3cos_std::style::TextDirection::Rtl
+        && matches!(
+            component.style.unicode_bidi,
+            w3cos_std::style::UnicodeBidi::BidiOverride
+                | w3cos_std::style::UnicodeBidi::IsolateOverride
+        )
+    {
+        *content = content
+            .chars()
+            .rev()
+            .map(|character| {
+                unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character)
+            })
+            .collect();
+        component.style.text_align = match (
+            component.style.text_align,
+            component.style.direction,
+        ) {
+            (w3cos_std::style::TextAlign::Start, w3cos_std::style::TextDirection::Rtl)
+            | (w3cos_std::style::TextAlign::End, w3cos_std::style::TextDirection::Ltr) => {
+                w3cos_std::style::TextAlign::Right
+            }
+            (w3cos_std::style::TextAlign::Start, w3cos_std::style::TextDirection::Ltr)
+            | (w3cos_std::style::TextAlign::End, w3cos_std::style::TextDirection::Rtl) => {
+                w3cos_std::style::TextAlign::Left
+            }
+            (align, _) => align,
+        };
+        // The leaf now contains visual-order text. Do not feed the consumed
+        // override into the font backend a second time; normalizing these two
+        // fields also allows otherwise identical adjacent inline fragments to
+        // shape as one browser text run.
+        component.style.direction = w3cos_std::style::TextDirection::Ltr;
+        component.style.unicode_bidi = w3cos_std::style::UnicodeBidi::Normal;
+        return;
+    }
+    let reordered = reorder_explicit_bidi_children(component);
+    if !reordered {
+        for child in &mut component.children {
+            reorder_explicit_bidi_inline_rows(child);
+        }
+    }
+    coalesce_passive_inline_text_children(component);
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'
+            | '\u{202b}'
+            | '\u{202c}'
+            | '\u{202d}'
+            | '\u{202e}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
+    )
+}
+
+fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool {
+    use unicode_bidi::BidiInfo;
+    use w3cos_std::component::ComponentKind;
+    use w3cos_std::style::{
+        BoxSizing, Dimension, Display, FlexWrap, Spacing, TextDirection, UnicodeBidi, WhiteSpace,
+    };
+
+    let bidi_control_for = |style: &w3cos_std::style::Style| {
+        match (style.direction, style.unicode_bidi) {
+            (TextDirection::Rtl, UnicodeBidi::BidiOverride | UnicodeBidi::IsolateOverride) => {
+                Some(('\u{202e}', '\u{202c}'))
+            }
+            (TextDirection::Ltr, UnicodeBidi::BidiOverride | UnicodeBidi::IsolateOverride) => {
+                Some(('\u{202d}', '\u{202c}'))
+            }
+            (TextDirection::Rtl, UnicodeBidi::Embed) => Some(('\u{202b}', '\u{202c}')),
+            (TextDirection::Ltr, UnicodeBidi::Embed) => Some(('\u{202a}', '\u{202c}')),
+            _ => None,
+        }
+    };
+    let style_bidi_control = bidi_control_for(&component.style);
+    if (component.children.len() < 2 && style_bidi_control.is_none())
+        || !matches!(component.style.flex_direction, w3cos_std::style::FlexDirection::Row)
+    {
+        return false;
+    }
+
+    struct InlineUnit {
+        content: String,
+        component: w3cos_std::Component,
+        wrapper: Option<(w3cos_std::Component, w3cos_std::style::Style)>,
+        leading_ahem_wrapper: bool,
+    }
+
+    let mut units = Vec::with_capacity(component.children.len());
+    for child in &component.children {
+        let (content, source, wrapper, leading_ahem_wrapper) = match &child.kind {
+            ComponentKind::Text { content } if child.children.is_empty() => {
+                (content.clone(), child.clone(), None, false)
+            }
+            ComponentKind::Row | ComponentKind::Box
+                if matches!(child.style.display, Display::Inline | Display::InlineFlex)
+                    && child.children.len() == 1 =>
+            {
+                let text = &child.children[0];
+                let ComponentKind::Text { content } = &text.kind else {
+                    return false;
+                };
+                if !text.children.is_empty() {
+                    return false;
+                }
+                let leading_ahem_wrapper = units.iter().all(|unit: &InlineUnit| {
+                    unit.content
+                        .chars()
+                        .all(|character| is_css_whitespace(character) || is_bidi_control(character))
+                }) && child.style.font_family.as_deref().is_some_and(|families| {
+                    families.split(',').any(|family| {
+                        family
+                            .trim()
+                            .trim_matches(['"', '\''])
+                            .eq_ignore_ascii_case("ahem")
+                    })
+                });
+                let mut source = child.clone();
+                source.kind = ComponentKind::Text {
+                    content: String::new(),
+                };
+                source.children.clear();
+                (
+                    content.clone(),
+                    source,
+                    Some((child.clone(), text.style.clone())),
+                    leading_ahem_wrapper,
+                )
+            }
+            _ => return false,
+        };
+        units.push(InlineUnit {
+            content,
+            component: source,
+            wrapper,
+            leading_ahem_wrapper,
+        });
+    }
+
+    let mut text = String::new();
+    let mut logical = Vec::new();
+    if let Some((control, _)) = style_bidi_control {
+        text.push(control);
+        logical.push((control, 0));
+    }
+    for (unit_index, unit) in units.iter().enumerate() {
+        let unit_bidi_control = bidi_control_for(&unit.component.style);
+        if let Some((control, _)) = unit_bidi_control {
+            text.push(control);
+            logical.push((control, unit_index));
+        }
+        text.push_str(&unit.content);
+        logical.extend(unit.content.chars().map(|character| (character, unit_index)));
+        if let Some((_, control)) = unit_bidi_control {
+            text.push(control);
+            logical.push((control, unit_index));
+        }
+    }
+    if let Some((_, control)) = style_bidi_control {
+        text.push(control);
+        logical.push((control, units.len().saturating_sub(1)));
+    }
+    if !logical.iter().any(|(character, _)| {
+        matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'
+                | '\u{202b}'
+                | '\u{202c}'
+                | '\u{202d}'
+                | '\u{202e}'
+                | '\u{2066}'
+                | '\u{2067}'
+                | '\u{2068}'
+                | '\u{2069}'
+        )
+    }) {
+        return false;
+    }
+
+    let paragraph_level = match component.style.direction {
+        TextDirection::Ltr => unicode_bidi::Level::ltr(),
+        TextDirection::Rtl => unicode_bidi::Level::rtl(),
+    };
+    let bidi = BidiInfo::new(&text, Some(paragraph_level));
+    let Some(paragraph) = bidi.paragraphs.first() else {
+        return false;
+    };
+    let levels = bidi.reordered_levels_per_char(paragraph, paragraph.range.clone());
+    if levels.len() != logical.len() {
+        return false;
+    }
+    let is_control = is_bidi_control;
+
+    let wrapping_width = if component.style.flex_wrap != FlexWrap::NoWrap
+        && !matches!(component.style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre)
+    {
+        let width = match component.style.width {
+            Dimension::Px(width) => Some(width),
+            Dimension::Em(width) => Some(width * component.style.font_size),
+            Dimension::Rem(width) => Some(width * 16.0),
+            _ => None,
+        };
+        width.map(|mut width| {
+            if component.style.box_sizing == BoxSizing::BorderBox {
+                let padding = component.style.padding_lengths();
+                width -= padding.left
+                    + padding.right
+                    + component
+                        .style
+                        .border_left_width
+                        .unwrap_or(component.style.border_width)
+                    + component
+                        .style
+                        .border_right_width
+                        .unwrap_or(component.style.border_width);
+            }
+            width.max(0.0)
+        })
+    } else {
+        None
+    };
+    let estimated_line_ranges = |width: f32| {
+        let mut advances = logical
+            .iter()
+            .map(|(character, unit_index)| {
+                if is_control(*character) {
+                    return 0.0;
+                }
+                let style = &units[*unit_index].component.style;
+                let ahem = style.font_family.as_deref().is_some_and(|families| {
+                    families.split(',').any(|family| {
+                        family
+                            .trim()
+                            .trim_matches(['"', '\''])
+                            .eq_ignore_ascii_case("ahem")
+                    })
+                });
+                let ratio = if ahem {
+                    1.0
+                } else if character.is_ascii_whitespace() {
+                    0.3335
+                } else if character.is_ascii_uppercase() {
+                    0.67
+                } else if character.is_ascii_lowercase() || character.is_ascii_digit() {
+                    0.56
+                } else {
+                    0.6
+                };
+                style.font_size * ratio
+            })
+            .collect::<Vec<_>>();
+        for (unit_index, unit) in units.iter().enumerate() {
+            let positions = logical
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (character, source))| {
+                    (*source == unit_index && !is_control(*character)).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let (Some(first), Some(last)) = (positions.first(), positions.last()) else {
+                continue;
+            };
+            let padding = unit.component.style.padding_lengths();
+            let margin = unit.component.style.margin_lengths();
+            advances[*first] += padding.left
+                + margin.left
+                + unit
+                    .component
+                    .style
+                    .border_left_width
+                    .unwrap_or(unit.component.style.border_width);
+            advances[*last] += padding.right
+                + margin.right
+                + unit
+                    .component
+                    .style
+                    .border_right_width
+                    .unwrap_or(unit.component.style.border_width);
+        }
+
+        let words = logical
+            .iter()
+            .enumerate()
+            .fold(Vec::<std::ops::Range<usize>>::new(), |mut words, (index, (ch, _))| {
+                if ch.is_whitespace() {
+                    return words;
+                }
+                if let Some(last) = words.last_mut()
+                    && last.end == index
+                {
+                    last.end += 1;
+                } else {
+                    words.push(index..index + 1);
+                }
+                words
+            });
+        if words.is_empty() {
+            return vec![0..logical.len()];
+        }
+        let mut ranges = Vec::new();
+        let mut line_start = words[0].start;
+        let mut line_end = words[0].end;
+        let mut line_width = advances[words[0].clone()].iter().sum::<f32>();
+        for word in words.into_iter().skip(1) {
+            let candidate_width = advances[line_end..word.end].iter().sum::<f32>();
+            if line_width + candidate_width > width {
+                ranges.push(line_start..line_end);
+                line_start = word.start;
+                line_width = advances[word.clone()].iter().sum::<f32>();
+            } else {
+                line_width += candidate_width;
+            }
+            line_end = word.end;
+        }
+        ranges.push(line_start..line_end);
+        ranges
+    };
+    let line_ranges = wrapping_width
+        .filter(|width| *width > 0.0)
+        .map(estimated_line_ranges)
+        .filter(|ranges| ranges.len() > 1)
+        .unwrap_or_else(|| vec![0..logical.len()]);
+
+    let mut fragments: Vec<(usize, usize, String)> = Vec::new();
+    for (line_index, range) in line_ranges.iter().enumerate() {
+        let visual_order = BidiInfo::reorder_visual(&levels[range.clone()]);
+        for relative_index in visual_order {
+            let logical_index = range.start + relative_index;
+            let (mut character, unit_index) = logical[logical_index];
+            if is_control(character) {
+                continue;
+            }
+            if levels[logical_index].is_rtl() {
+                character = unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character);
+            }
+            if let Some((last_line, last_unit, content)) = fragments.last_mut()
+                && *last_line == line_index
+                && *last_unit == unit_index
+            {
+                content.push(character);
+            } else {
+                fragments.push((line_index, unit_index, character.to_string()));
+            }
+        }
+    }
+
+    let mut fragment_positions = vec![Vec::new(); units.len()];
+    for (position, (_, unit_index, _)) in fragments.iter().enumerate() {
+        fragment_positions[*unit_index].push(position);
+    }
+    struct VisualFragment {
+        line_index: usize,
+        unit_index: usize,
+        first: bool,
+        last: bool,
+        component: w3cos_std::Component,
+    }
+
+    let mut visual_fragments = fragments
+        .into_iter()
+        .enumerate()
+        .map(|(position, (line_index, unit_index, content))| {
+            let positions = &fragment_positions[unit_index];
+            let first = positions.first() == Some(&position);
+            let last = positions.last() == Some(&position);
+            let mut fragment = units[unit_index].component.clone();
+            fragment.kind = ComponentKind::Text { content };
+            fragment.style.direction = TextDirection::Ltr;
+            fragment.style.unicode_bidi = UnicodeBidi::Normal;
+            let has_left_edge = fragment
+                .style
+                .border_left_width
+                .unwrap_or(fragment.style.border_width)
+                > 0.0
+                || fragment.style.padding.left != Spacing::Px(0.0)
+                || fragment.style.margin.left != Spacing::Px(0.0);
+            let has_right_edge = fragment
+                .style
+                .border_right_width
+                .unwrap_or(fragment.style.border_width)
+                > 0.0
+                || fragment.style.padding.right != Spacing::Px(0.0)
+                || fragment.style.margin.right != Spacing::Px(0.0);
+            if !first && has_left_edge {
+                fragment.style.border_left_width = Some(0.0);
+                fragment.style.padding.left = Spacing::Px(0.0);
+                fragment.style.margin.left = Spacing::Px(0.0);
+            }
+            if !last && has_right_edge {
+                fragment.style.border_right_width = Some(0.0);
+                fragment.style.padding.right = Spacing::Px(0.0);
+                fragment.style.margin.right = Spacing::Px(0.0);
+            }
+            VisualFragment {
+                line_index,
+                unit_index,
+                first,
+                last,
+                component: fragment,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let anonymous_space = units
+        .iter()
+        .find(|unit| principal_box_can_merge_generated_inline_text(&unit.component.style))
+        .map(|unit| {
+            let mut space = unit.component.clone();
+            space.kind = ComponentKind::Text {
+                content: " ".to_string(),
+            };
+            space.children.clear();
+            space.on_click = w3cos_std::EventAction::None;
+            // Bidi controls have already been consumed into visual-order
+            // fragments. Keep synthesized boundary whitespace in that same
+            // normalized direction so otherwise identical text can be shaped
+            // as one browser run instead of introducing artificial kerning
+            // boundaries at each embedded inline edge.
+            space.style.direction = TextDirection::Ltr;
+            space.style.unicode_bidi = UnicodeBidi::Normal;
+            space
+        });
+    let mut edge_whitespace = Vec::with_capacity(visual_fragments.len());
+    for fragment in &mut visual_fragments {
+        let ComponentKind::Text { content } = &mut fragment.component.kind else {
+            edge_whitespace.push((false, false));
+            continue;
+        };
+        let leading = content.chars().next().is_some_and(is_css_whitespace);
+        let trailing = content.chars().next_back().is_some_and(is_css_whitespace);
+        if leading || trailing {
+            *content = content.trim_matches(is_css_whitespace).to_string();
+        }
+        edge_whitespace.push((leading, trailing));
+    }
+
+    let mut normalized: Vec<w3cos_std::Component> =
+        Vec::with_capacity(visual_fragments.len() * 2);
+    let mut previous_line = None;
+    for (index, mut fragment) in visual_fragments.into_iter().enumerate() {
+        let starts_new_line =
+            previous_line.is_some_and(|previous| previous != fragment.line_index);
+        if index > 0 && !starts_new_line {
+            let boundary_has_space = edge_whitespace[index - 1].1 || edge_whitespace[index].0;
+            let left_owns_space = normalized.last().is_some_and(|previous| {
+                matches!(
+                    &previous.kind,
+                    ComponentKind::Text { content }
+                        if content.chars().next_back().is_some_and(is_css_whitespace)
+                )
+            });
+            let right_owns_space = matches!(
+                &fragment.component.kind,
+                ComponentKind::Text { content }
+                    if content.chars().next().is_some_and(is_css_whitespace)
+            );
+            let continuation_wrapper_owns_space = boundary_has_space
+                && !fragment.first
+                && units[fragment.unit_index].leading_ahem_wrapper;
+            if continuation_wrapper_owns_space {
+                if let ComponentKind::Text { content } = &mut fragment.component.kind {
+                    content.insert(0, '\u{00a0}');
+                }
+            } else if boundary_has_space
+                && !left_owns_space
+                && !right_owns_space
+                && let Some(space) = &anonymous_space
+            {
+                normalized.push(space.clone());
+            }
+        }
+        let preserve_wrapper = units[fragment.unit_index].wrapper.is_some()
+            && (units[fragment.unit_index].leading_ahem_wrapper
+                || (fragment.line_index > 0 && fragment.last));
+        if preserve_wrapper
+            && let Some((wrapper_source, inner_style)) = &units[fragment.unit_index].wrapper
+            && let ComponentKind::Text { content } = &fragment.component.kind
+        {
+            let mut wrapper = wrapper_source.clone();
+            wrapper.style = fragment.component.style.clone();
+            wrapper.children = vec![w3cos_std::Component::text(
+                content.clone(),
+                inner_style.clone(),
+            )];
+            fragment.component = wrapper;
+        }
+        if !matches!(&fragment.component.kind, ComponentKind::Text { content } if content.is_empty())
+        {
+            normalized.push(fragment.component);
+        }
+        previous_line = Some(fragment.line_index);
+    }
+    component.children = normalized;
+    true
+}
+
+fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
+    use w3cos_std::component::ComponentKind;
+
+    let passive_host = |action: &w3cos_std::EventAction| {
+        matches!(
+            action,
+            w3cos_std::EventAction::None
+                | w3cos_std::EventAction::NativeHost {
+                    click: false,
+                    scroll: false,
+                    input: false,
+                    focus: false,
+                    keyboard: false,
+                    submit: false,
+                    wheel: false,
+                    ..
+                }
+        )
+    };
+    let children = std::mem::take(&mut component.children);
+    let mut coalesced: Vec<w3cos_std::Component> = Vec::with_capacity(children.len());
+    for mut fragment in children {
+        loop {
+            if !matches!(
+                &fragment.kind,
+                ComponentKind::Row | ComponentKind::Box
+            ) || !matches!(
+                fragment.style.display,
+                w3cos_std::style::Display::Inline
+                    | w3cos_std::style::Display::InlineFlex
+            ) || fragment.children.len() != 1
+                || !passive_host(&fragment.on_click)
+                || !principal_box_can_merge_generated_inline_text(&fragment.style)
+                || !matches!(&fragment.children[0].kind, ComponentKind::Text { .. })
+            {
+                break;
+            }
+            fragment = fragment.children.remove(0);
+        }
+        let merged = coalesced.last_mut().is_some_and(|previous| {
+            if previous.style != fragment.style
+                || !passive_host(&previous.on_click)
+                || !passive_host(&fragment.on_click)
+                || !principal_box_can_merge_generated_inline_text(&previous.style)
+            {
+                return false;
+            }
+            let ComponentKind::Text {
+                content: previous_content,
+            } = &mut previous.kind
+            else {
+                return false;
+            };
+            let ComponentKind::Text { content } = &mut fragment.kind else {
+                return false;
+            };
+            previous_content.push_str(content);
+            previous.on_click = w3cos_std::EventAction::None;
+            true
+        });
+        if !merged {
+            coalesced.push(fragment);
+        }
+    }
+    component.children = coalesced;
+}
+
+fn relative_border_width_px(value: &str, style: &w3cos_std::style::Style) -> Option<f32> {
+    split_css_tokens(value).into_iter().find_map(|token| {
+        let token = token.to_ascii_lowercase();
+        if let Some(number) = token.strip_suffix("rem") {
+            return number.trim().parse::<f32>().ok().map(|value| value * 16.0);
+        }
+        if let Some(number) = token.strip_suffix("em") {
+            return number
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .map(|value| value * style.font_size);
+        }
+        if let Some(number) = token.strip_suffix("ex") {
+            return number
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .map(|value| value * css_ex_size(style));
+        }
+        None
+    })
+}
+
 fn normalize_css_table_internal_used_style(style: &mut w3cos_std::style::Style) {
     use w3cos_std::style::Display;
 
@@ -4980,7 +5910,7 @@ fn normalize_css_table_internal_used_style(style: &mut w3cos_std::style::Style) 
             | Display::TableColumnGroup
             | Display::TableColumn
     );
-    if ignores_padding_and_border {
+    if ignores_padding_and_border && !style.border_collapse {
         // In the default separated-border model, row/row-group/column boxes
         // neither consume padding nor paint borders. Cells retain both.
         style.padding = w3cos_std::style::Edges::ZERO;
@@ -4989,6 +5919,24 @@ fn normalize_css_table_internal_used_style(style: &mut w3cos_std::style::Style) 
         style.border_right_width = None;
         style.border_bottom_width = None;
         style.border_left_width = None;
+    }
+}
+
+#[cfg(test)]
+mod collapsed_table_border_tests {
+    use super::normalize_css_table_internal_used_style;
+    use w3cos_std::style::{Display, Style};
+
+    #[test]
+    fn collapsed_table_row_group_retains_its_border() {
+        let mut style = Style {
+            display: Display::TableRowGroup,
+            border_collapse: true,
+            border_width: 4.0,
+            ..Style::default()
+        };
+        normalize_css_table_internal_used_style(&mut style);
+        assert_eq!(style.border_width, 4.0);
     }
 }
 
@@ -5059,7 +6007,10 @@ fn anonymous_table_row(
     if used_height > 0.0 {
         row_style.height = w3cos_std::style::Dimension::Px(used_height);
     }
-    row_style.flex_direction = w3cos_std::style::FlexDirection::Row;
+    row_style.flex_direction = match row_style.direction {
+        w3cos_std::style::TextDirection::Ltr => w3cos_std::style::FlexDirection::Row,
+        w3cos_std::style::TextDirection::Rtl => w3cos_std::style::FlexDirection::RowReverse,
+    };
     row_style.align_items = w3cos_std::style::AlignItems::Stretch;
     w3cos_std::Component::row(row_style, cells)
 }
@@ -5200,6 +6151,7 @@ fn hoist_floats_into_block_formatting_context(
                     strut_style.font_style = component.style.font_style;
                     strut_style.line_height = component.style.line_height;
                     strut_style.letter_spacing = component.style.letter_spacing;
+                    strut_style.word_spacing = component.style.word_spacing;
                     strut_style.white_space = component.style.white_space;
                     right.push(w3cos_std::Component::text(" ", strut_style));
                     component.style.display = w3cos_std::style::Display::Block;
@@ -5706,6 +6658,516 @@ mod image_component_tests {
         assert_eq!(host.style.align_self, AlignSelf::FlexEnd);
         crate::stylesheet::clear_rules();
     }
+
+    #[test]
+    fn single_text_child_fast_path_collapses_css_whitespace() {
+        let mut document = Document::new();
+        let paragraph = document.create_element("p");
+        let text = document.create_text_node(
+            " In the middle of the rectangle, there\nshould be one line.\n\n",
+        );
+        paragraph.append_child(&mut document, text);
+        document.body().append_child(&mut document, paragraph);
+
+        let tree = document.to_component_tree();
+        assert!(matches!(
+            tree.children[0].kind,
+            ComponentKind::Text { ref content }
+                if content == "In the middle of the rectangle, there should be one line."
+        ), "unexpected component: {:?}", tree.children[0]);
+    }
+
+    #[test]
+    fn paragraph_with_mixed_inline_children_uses_the_computed_line_axis() {
+        let mut document = Document::new();
+        let paragraph = document.create_element("p");
+        let before = document.create_text_node("before ");
+        paragraph.append_child(&mut document, before);
+        let strong = document.create_element("strong");
+        strong.set_text_content(&mut document, "after");
+        paragraph.append_child(&mut document, strong);
+        document.body().append_child(&mut document, paragraph);
+
+        let tree = document.to_component_tree();
+        assert!(matches!(tree.children[0].kind, ComponentKind::Row));
+        assert_eq!(tree.children[0].style.flex_direction, w3cos_std::style::FlexDirection::Row);
+    }
+
+    #[test]
+    fn right_aligned_mixed_inline_content_aligns_the_anonymous_line() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("p", &[("text-align", "right")]);
+        crate::stylesheet::register_rule("span", &[("margin-right", "2em")]);
+        let mut document = Document::new();
+        let paragraph = document.create_element("p");
+        let before = document.create_text_node("before ");
+        paragraph.append_child(&mut document, before);
+        let span = document.create_element("span");
+        span.set_text_content(&mut document, "after");
+        paragraph.append_child(&mut document, span);
+        document.body().append_child(&mut document, paragraph);
+
+        let tree = document.to_component_tree();
+
+        assert_eq!(
+            tree.children[0].style.justify_content,
+            w3cos_std::style::JustifyContent::FlexEnd
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn single_retained_inline_fragment_keeps_the_block_line_alignment_context() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "div",
+            &[("direction", "rtl"), ("unicode-bidi", "bidi-override")],
+        );
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        let text = document.create_text_node(".d c b a");
+        block.append_child(&mut document, text);
+        document.body().append_child(&mut document, block);
+
+        let tree = document.to_component_tree();
+        let line = &tree.children[0];
+
+        assert_eq!(line.style.display, Display::Flex);
+        assert_eq!(
+            line.style.justify_content,
+            w3cos_std::style::JustifyContent::FlexEnd
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn fixed_width_block_constrains_its_single_wrapping_text_line() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "div",
+            &[("width", "150px"), ("word-spacing", "75px")],
+        );
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        let text = document.create_text_node("1 2 3 4");
+        block.append_child(&mut document, text);
+        document.body().append_child(&mut document, block);
+
+        let tree = document.to_component_tree();
+        let line = &tree.children[0];
+        assert_eq!(line.style.display, Display::Flex);
+        assert_eq!(
+            line.children[0].style.width,
+            w3cos_std::style::Dimension::Percent(100.0)
+        );
+        assert_eq!(
+            line.children[0].style.min_width,
+            w3cos_std::style::Dimension::Px(0.0)
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn rtl_inline_block_aligns_its_single_text_line_to_the_inline_end() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "div",
+            &[
+                ("display", "inline-block"),
+                ("direction", "rtl"),
+                ("width", "100px"),
+                ("background", "orange"),
+            ],
+        );
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        let text = document.create_text_node("X");
+        host.append_child(&mut document, text);
+        document.body().append_child(&mut document, host);
+
+        let tree = document.to_component_tree();
+        let host = &tree.children[0];
+        assert_eq!(host.style.display, Display::InlineFlex);
+        assert_eq!(
+            host.style.justify_content,
+            w3cos_std::style::JustifyContent::FlexEnd
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn rtl_anonymous_table_row_places_its_first_cell_on_the_right() {
+        let mut table_style = w3cos_std::style::Style::default();
+        table_style.direction = w3cos_std::style::TextDirection::Rtl;
+        let row = anonymous_table_row(
+            &table_style,
+            vec![
+                w3cos_std::Component::boxed(w3cos_std::style::Style::default(), vec![]),
+                w3cos_std::Component::boxed(w3cos_std::style::Style::default(), vec![]),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            row.style.flex_direction,
+            w3cos_std::style::FlexDirection::RowReverse
+        );
+    }
+
+    #[test]
+    fn rtl_authored_table_row_reverses_cells_and_cell_line_fills_its_box() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#table",
+            &[("display", "table"), ("direction", "rtl")],
+        );
+        crate::stylesheet::register_rule("#row", &[("display", "table-row")]);
+        crate::stylesheet::register_rule("#cell", &[("display", "table-cell")]);
+        let mut document = Document::new();
+        let table = document.create_element("div");
+        table.set_attribute(&mut document, "id", "table");
+        let row = document.create_element("div");
+        row.set_attribute(&mut document, "id", "row");
+        let cell = document.create_element("div");
+        cell.set_attribute(&mut document, "id", "cell");
+        let text = document.create_text_node("X");
+        cell.append_child(&mut document, text);
+        row.append_child(&mut document, cell);
+        table.append_child(&mut document, row);
+        document.body().append_child(&mut document, table);
+
+        let tree = document.to_component_tree();
+        let table = &tree.children[0];
+        let row = &table.children[0];
+        let cell = &row.children[0];
+        let line = &cell.children[0];
+        assert_eq!(row.style.flex_direction, w3cos_std::style::FlexDirection::RowReverse);
+        assert_eq!(line.style.width, w3cos_std::style::Dimension::Percent(100.0));
+        assert_eq!(
+            line.style.justify_content,
+            w3cos_std::style::JustifyContent::FlexEnd
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn direction_declared_on_table_row_does_not_reorder_columns() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#table", &[("display", "table")]);
+        crate::stylesheet::register_rule(
+            "#row",
+            &[("display", "table-row"), ("direction", "rtl")],
+        );
+        crate::stylesheet::register_rule(".cell", &[("display", "table-cell")]);
+        let mut document = Document::new();
+        let table = document.create_element("div");
+        table.set_attribute(&mut document, "id", "table");
+        let row = document.create_element("div");
+        row.set_attribute(&mut document, "id", "row");
+        for _ in 0..2 {
+            let cell = document.create_element("div");
+            cell.set_attribute(&mut document, "class", "cell");
+            row.append_child(&mut document, cell);
+        }
+        table.append_child(&mut document, row);
+        document.body().append_child(&mut document, table);
+
+        let tree = document.to_component_tree();
+        assert_eq!(
+            tree.children[0].children[0].style.flex_direction,
+            w3cos_std::style::FlexDirection::Row
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn explicit_bidi_overrides_reorder_across_inline_box_boundaries() {
+        let text = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            w3cos_std::Component::text(content, style)
+        };
+        let boxed = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            style.border_width = 3.0;
+            style.border_left_width = Some(3.0);
+            style.border_right_width = Some(3.0);
+            w3cos_std::Component::row(style, vec![text(content)])
+        };
+        let mut line = w3cos_std::Component::row(
+            w3cos_std::style::Style::default(),
+            vec![
+                text("a\u{202e}l\u{202d}"),
+                boxed("c\u{202e}j\u{202d}e\u{202e}"),
+                text("h\u{202d}g\u{202c}f"),
+                boxed("\u{202c}i\u{202c}d\u{202c}k\u{202c}b"),
+                text("\u{202c}m"),
+            ],
+        );
+
+        reorder_explicit_bidi_inline_rows(&mut line);
+        let visual = line
+            .children
+            .iter()
+            .filter_map(|child| match &child.kind {
+                ComponentKind::Text { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(visual, "abcdefghijklm");
+        assert!(line.children.iter().any(|child| {
+            matches!(child.kind, ComponentKind::Text { ref content } if content == "fgh")
+        }));
+        let aqua_fragments = line
+            .children
+            .iter()
+            .filter(|child| child.style.border_width == 3.0)
+            .collect::<Vec<_>>();
+        assert_eq!(aqua_fragments.len(), 7);
+        assert_eq!(aqua_fragments[0].style.border_left_width, Some(3.0));
+        assert_eq!(aqua_fragments[1].style.border_left_width, Some(3.0));
+        assert_eq!(aqua_fragments[2].style.border_left_width, Some(0.0));
+    }
+
+    #[test]
+    fn explicit_bidi_moves_collapsed_spaces_outside_decorated_fragments() {
+        let plain = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::InlineBlock;
+            w3cos_std::Component::text(content, style)
+        };
+        let decorated = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            style.border_width = 3.0;
+            w3cos_std::Component::row(style, vec![plain(content)])
+        };
+        let mut line = w3cos_std::Component::row(
+            w3cos_std::style::Style::default(),
+            vec![
+                decorated(" aaa bbb ccc \u{202e} lll kkk jjj "),
+                plain(" iii hhh ggg "),
+                decorated(" fff eee ddd \u{202c} mmm nnn ooo "),
+            ],
+        );
+
+        reorder_explicit_bidi_inline_rows(&mut line);
+
+        assert!(line.children.iter().filter(|child| child.style.border_width > 0.0).all(
+            |child| matches!(
+                &child.kind,
+                ComponentKind::Text { content }
+                    if content == content.trim_matches(is_css_whitespace)
+            )
+        ));
+        assert!(line.children.iter().any(|child| matches!(
+            &child.kind,
+            ComponentKind::Text { content } if content == " " && child.style.border_width == 0.0
+        )));
+    }
+
+    #[test]
+    fn explicit_bidi_reorders_each_estimated_wrapped_line_independently() {
+        let plain = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            w3cos_std::Component::text(content, style)
+        };
+        let decorated = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            style.padding.left = w3cos_std::style::Spacing::Px(16.0);
+            style.padding.right = w3cos_std::style::Spacing::Px(16.0);
+            style.border_width = 2.0;
+            w3cos_std::Component::row(style, vec![plain(content)])
+        };
+        let mut line_style = w3cos_std::style::Style::default();
+        line_style.width = w3cos_std::style::Dimension::Em(17.0);
+        line_style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
+        let mut line = w3cos_std::Component::row(
+            line_style,
+            vec![
+                decorated("AAABBBCCC\u{202e}IIIHHHGGG"),
+                plain("FFFEEEDDD LLLKKKJJJ\u{202c}MMMNNNOOO"),
+            ],
+        );
+
+        reorder_explicit_bidi_inline_rows(&mut line);
+        let visual = line.children.iter().fold(String::new(), |mut visual, child| {
+            if let ComponentKind::Text { content } = &child.kind {
+                visual.push_str(content);
+            }
+            visual
+        });
+        assert_eq!(
+            visual,
+            "AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO"
+        );
+    }
+
+    #[test]
+    fn css_bidi_override_reorders_block_inline_content() {
+        let mut style = w3cos_std::style::Style::default();
+        style.flex_direction = w3cos_std::style::FlexDirection::Row;
+        style.direction = w3cos_std::style::TextDirection::Rtl;
+        style.unicode_bidi = w3cos_std::style::UnicodeBidi::BidiOverride;
+        let mut inline_style = w3cos_std::style::Style::default();
+        inline_style.display = Display::Inline;
+        let mut line = w3cos_std::Component::row(
+            style,
+            vec![
+                w3cos_std::Component::text("dnoceS", inline_style.clone()),
+                w3cos_std::Component::text(" tsriF", inline_style),
+            ],
+        );
+
+        reorder_explicit_bidi_inline_rows(&mut line);
+
+        let visual = if let ComponentKind::Text { content } = &line.kind {
+            content.clone()
+        } else {
+            line.children.iter().fold(String::new(), |mut visual, child| {
+                if let ComponentKind::Text { content } = &child.kind {
+                    visual.push_str(content);
+                }
+                visual
+            })
+        };
+        assert_eq!(visual, "First Second");
+    }
+
+    #[test]
+    fn css_bidi_override_reorders_a_single_inline_text_child() {
+        let mut style = w3cos_std::style::Style::default();
+        style.display = Display::Inline;
+        style.direction = w3cos_std::style::TextDirection::Rtl;
+        style.unicode_bidi = w3cos_std::style::UnicodeBidi::BidiOverride;
+        let mut inline = w3cos_std::Component::text("dnoceS", style);
+
+        reorder_explicit_bidi_inline_rows(&mut inline);
+
+        assert!(matches!(
+            &inline.kind,
+            ComponentKind::Text { content } if content == "Second"
+        ));
+        assert_eq!(
+            inline.style.direction,
+            w3cos_std::style::TextDirection::Ltr
+        );
+        assert_eq!(
+            inline.style.unicode_bidi,
+            w3cos_std::style::UnicodeBidi::Normal
+        );
+        assert_eq!(
+            inline.style.text_align,
+            w3cos_std::style::TextAlign::Right,
+            "logical start must remain the RTL inline end after consuming the override"
+        );
+    }
+
+    #[test]
+    fn unicode_line_separator_keeps_one_bidi_paragraph_across_visual_lines() {
+        let mut line = w3cos_std::Component::text(
+            "א + - × ÷ \u{a0}\u{2028}\u{a0} + - × ÷ ת",
+            w3cos_std::style::Style::default(),
+        );
+
+        reorder_explicit_bidi_inline_rows(&mut line);
+
+        assert!(matches!(
+            &line.kind,
+            w3cos_std::ComponentKind::Text { content }
+                if content == "\u{a0} ÷ × - + א\nת ÷ × - + \u{a0}"
+        ));
+        assert_eq!(
+            line.style.direction,
+            w3cos_std::style::TextDirection::Ltr
+        );
+    }
+
+    #[test]
+    fn nested_bidi_overrides_shape_as_one_passive_inline_run() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".rtol",
+            &[("direction", "rtl"), ("unicode-bidi", "bidi-override")],
+        );
+        crate::stylesheet::register_rule(
+            ".ltor",
+            &[("direction", "ltr"), ("unicode-bidi", "bidi-override")],
+        );
+        let mut document = Document::new();
+        let paragraph = document.create_element("p");
+        let outer = document.create_element("span");
+        outer.set_attribute(&mut document, "class", "rtol");
+        let outer_before = document.create_text_node("ba");
+        outer.append_child(&mut document, outer_before);
+        let inner = document.create_element("span");
+        inner.set_attribute(&mut document, "class", "ltor");
+        let inner_text = document.create_text_node("ad");
+        inner.append_child(&mut document, inner_text);
+        outer.append_child(&mut document, inner);
+        let outer_after = document.create_text_node("eR");
+        outer.append_child(&mut document, outer_after);
+        paragraph.append_child(&mut document, outer);
+        let paragraph_after = document.create_text_node("le");
+        paragraph.append_child(&mut document, paragraph_after);
+        document.body().append_child(&mut document, paragraph);
+
+        fn text_runs(component: &w3cos_std::Component, runs: &mut Vec<String>) {
+            if let ComponentKind::Text { content } = &component.kind {
+                runs.push(content.clone());
+            }
+            for child in &component.children {
+                text_runs(child, runs);
+            }
+        }
+        let tree = document.to_component_tree();
+        let mut runs = Vec::new();
+        text_runs(&tree, &mut runs);
+
+        assert_eq!(runs, vec!["Readable"]);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn rtl_embed_reorders_surrounding_ltr_runs_as_one_paragraph() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[("direction", "rtl")]);
+        crate::stylesheet::register_rule("span", &[("unicode-bidi", "embed")]);
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        let before = document.create_text_node("IJ K ");
+        block.append_child(&mut document, before);
+        let embedded = document.create_element("span");
+        let embedded_text = document.create_text_node("DEF GH");
+        embedded.append_child(&mut document, embedded_text);
+        block.append_child(&mut document, embedded);
+        let after = document.create_text_node(" AB C");
+        block.append_child(&mut document, after);
+        document.body().append_child(&mut document, block);
+
+        fn collect_text(component: &w3cos_std::Component, output: &mut String) {
+            if let ComponentKind::Text { content } = &component.kind {
+                output.push_str(content);
+            }
+            for child in &component.children {
+                collect_text(child, output);
+            }
+        }
+        let tree = document.to_component_tree();
+        let mut visual = String::new();
+        collect_text(&tree.children[0], &mut visual);
+        assert_eq!(visual, "AB C DEF GH IJ K");
+        assert_eq!(
+            tree.children[0].children.len(),
+            1,
+            "the visually reordered paragraph must shape as one text run: {:#?}",
+            tree.children[0].children
+        );
+        crate::stylesheet::clear_rules();
+    }
 }
 
 #[cfg(test)]
@@ -5822,6 +7284,98 @@ mod computed_style_cache_tests {
         document.body().append_child(&mut document, parent);
 
         assert_eq!(document.computed_style_for(child.id).font_size, 40.0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn relative_font_size_is_preserved_on_the_principal_box() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#target",
+            &[("font-size", "2.5em"), ("width", "17em"), ("height", "1em")],
+        );
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+
+        let style = document.computed_style_for(target.id);
+        assert_eq!(style.font_size, 40.0);
+        assert_eq!(style.width, w3cos_std::style::Dimension::Em(17.0));
+        assert_eq!(style.height, w3cos_std::style::Dimension::Em(1.0));
+
+        let tree = document.to_component_tree();
+        let principal = &tree.children[0];
+        assert_eq!(principal.style.font_size, 40.0);
+        assert_eq!(principal.style.width, w3cos_std::style::Dimension::Em(17.0));
+        assert_eq!(principal.style.height, w3cos_std::style::Dimension::Em(1.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn unicode_bidi_inherit_uses_the_parent_computed_value() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("unicode-bidi", "bidi-override")]);
+        crate::stylesheet::register_rule("#child", &[("unicode-bidi", "inherit")]);
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        assert_eq!(
+            document.computed_style_for(child.id).unicode_bidi,
+            w3cos_std::style::UnicodeBidi::BidiOverride
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn relative_border_width_resolves_against_the_computed_font_size() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#target",
+            &[("font-size", "20px"), ("border", "1em solid blue")],
+        );
+
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+
+        let style = document.computed_style_for(target.id);
+        assert_eq!(style.border_width, 20.0);
+        assert_eq!(style.border_top_width, Some(20.0));
+        assert_eq!(style.border_right_width, Some(20.0));
+        assert_eq!(style.border_bottom_width, Some(20.0));
+        assert_eq!(style.border_left_width, Some(20.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn border_shorthand_inherit_copies_the_parent_used_border() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#parent",
+            &[("border", "1em solid lime"), ("font-size", "20px")],
+        );
+        crate::stylesheet::register_rule("#child", &[("border", "inherit")]);
+
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        let parent_style = document.computed_style_for(parent.id);
+        let child_style = document.computed_style_for(child.id);
+        assert_eq!(child_style.border_width, parent_style.border_width);
+        assert_eq!(child_style.border_top_width, parent_style.border_top_width);
+        assert_eq!(child_style.border_color, parent_style.border_color);
         crate::stylesheet::clear_rules();
     }
 

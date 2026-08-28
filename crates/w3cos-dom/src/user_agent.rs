@@ -12,9 +12,9 @@ use w3cos_std::style::{BoxSizing, Display, Edges, FlexDirection, FontStyle, Spac
 /// Call this before author styles so stylesheet and inline declarations keep
 /// their normal precedence over the user-agent origin.
 pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
-    let vertical_margin = |style: &mut Style, value: f32| {
-        style.margin.top = Spacing::Px(value);
-        style.margin.bottom = Spacing::Px(value);
+    let vertical_margin = |style: &mut Style, em: f32| {
+        style.margin.top = Spacing::Em(em);
+        style.margin.bottom = Spacing::Em(em);
     };
 
     // CSS initial value. `Style::default()` remains column-oriented for native
@@ -69,19 +69,19 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
         "h1" => {
             style.font_size *= 2.0;
             style.font_weight = 700;
-            vertical_margin(style, style.font_size * 0.67);
+            vertical_margin(style, 0.67);
         }
         "h2" => {
             style.font_size *= 1.5;
             style.font_weight = 700;
-            vertical_margin(style, style.font_size * 0.83);
+            vertical_margin(style, 0.83);
         }
         "h3" => {
             style.font_size *= 1.17;
             style.font_weight = 700;
-            vertical_margin(style, style.font_size);
+            vertical_margin(style, 1.0);
         }
-        "p" => vertical_margin(style, style.font_size),
+        "p" => vertical_margin(style, 1.0),
         "b" | "strong" => style.font_weight = 700,
         "em" | "i" => style.font_style = FontStyle::Italic,
         _ => {}
@@ -117,6 +117,8 @@ mod tests {
         assert_eq!(html_default_style("div").display, Display::Block);
         assert_eq!(html_default_style("div").flex_direction, FlexDirection::Row);
         assert_eq!(html_default_style("body").margin, Edges::all(8.0));
+        assert_eq!(html_default_style("p").margin.top, Spacing::Em(1.0));
+        assert_eq!(html_default_style("p").margin.bottom, Spacing::Em(1.0));
         assert_eq!(html_default_style("span").display, Display::Inline);
         assert_eq!(html_default_style("br").display, Display::Inline);
         assert_eq!(html_default_style("img").display, Display::InlineBlock);

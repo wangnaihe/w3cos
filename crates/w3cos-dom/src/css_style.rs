@@ -2,7 +2,7 @@ use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
     AlignItems, BoxSizing, Contain, Dimension, Display, Edges, FlexDirection, FlexWrap, Float,
-    JustifyContent, Overflow, Position, Spacing, Style, WillChange,
+    JustifyContent, Overflow, Position, Spacing, Style, TextDirection, UnicodeBidi, WillChange,
 };
 
 /// CSSStyleDeclaration — the `element.style` property.
@@ -87,6 +87,9 @@ impl CSSStyleDeclaration {
                     self.inner.border_spacing_x = x;
                     self.inner.border_spacing_y = values.get(1).copied().unwrap_or(x);
                 }
+            }
+            "border-collapse" | "borderCollapse" => {
+                self.inner.border_collapse = value.trim().eq_ignore_ascii_case("collapse");
             }
             "padding" => {
                 if let Some(edges) = parse_padding_shorthand(value) {
@@ -334,8 +337,12 @@ impl CSSStyleDeclaration {
                 }
             }
             "border-width" | "borderWidth" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.border_width = v
+                if let Some([top, right, bottom, left]) = parse_border_width_edges(value) {
+                    self.inner.border_width = top;
+                    self.inner.border_top_width = Some(top);
+                    self.inner.border_right_width = Some(right);
+                    self.inner.border_bottom_width = Some(bottom);
+                    self.inner.border_left_width = Some(left);
                 }
             }
             "border-top-width" | "borderTopWidth" => self.inner.border_top_width = parse_px(value),
@@ -349,12 +356,17 @@ impl CSSStyleDeclaration {
                 self.inner.border_left_width = parse_px(value)
             }
             "border-style" | "borderStyle" => {
-                if let Some(visible) = parse_border_style_visibility(value) {
-                    self.inner.border_width = if visible {
-                        self.declared_uniform_border_width().unwrap_or(3.0)
+                if let Some(edges) = parse_border_style_edges(value) {
+                    let width = self.declared_uniform_border_width().unwrap_or(3.0);
+                    self.inner.border_width = if edges.into_iter().any(|visible| visible) {
+                        width
                     } else {
                         0.0
                     };
+                    self.inner.border_top_width = Some(if edges[0] { width } else { 0.0 });
+                    self.inner.border_right_width = Some(if edges[1] { width } else { 0.0 });
+                    self.inner.border_bottom_width = Some(if edges[2] { width } else { 0.0 });
+                    self.inner.border_left_width = Some(if edges[3] { width } else { 0.0 });
                 }
             }
             "border-inline-width" | "borderInlineWidth" => {
@@ -370,8 +382,12 @@ impl CSSStyleDeclaration {
                 }
             }
             "border-color" | "borderColor" => {
-                if let Some(color) = Color::from_css(value) {
-                    self.inner.border_color = color
+                if let Some([top, right, bottom, left]) = parse_border_color_edges(value) {
+                    self.inner.border_color = top;
+                    self.inner.border_top_color = Some(top);
+                    self.inner.border_right_color = Some(right);
+                    self.inner.border_bottom_color = Some(bottom);
+                    self.inner.border_left_color = Some(left);
                 }
             }
             "border-top-color" | "borderTopColor" => {
@@ -468,7 +484,11 @@ impl CSSStyleDeclaration {
 
             // Text properties
             "text-align" | "textAlign" => self.inner.text_align = parse_text_align(value),
-            "white-space" | "whiteSpace" => self.inner.white_space = parse_white_space(value),
+            "white-space" | "whiteSpace" => {
+                if let Some(white_space) = parse_white_space(value) {
+                    self.inner.white_space = white_space;
+                }
+            }
             "line-height" | "lineHeight" => {
                 let value = value.trim();
                 if let Some(px) = value.strip_suffix("px").and_then(|v| v.parse::<f32>().ok()) {
@@ -480,6 +500,25 @@ impl CSSStyleDeclaration {
             "letter-spacing" | "letterSpacing" => {
                 if let Some(v) = parse_px(value) {
                     self.inner.letter_spacing = v;
+                }
+            }
+            "word-spacing" | "wordSpacing" => {
+                let value = value.trim();
+                let spacing = if value.eq_ignore_ascii_case("normal") {
+                    Some(0.0)
+                } else if let Some(number) = value.strip_suffix("rem") {
+                    number.trim().parse::<f32>().ok().map(|number| number * 16.0)
+                } else if let Some(number) = value.strip_suffix("em") {
+                    number
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .map(|number| number * self.inner.font_size)
+                } else {
+                    parse_px(value)
+                };
+                if let Some(spacing) = spacing {
+                    self.inner.word_spacing = spacing;
                 }
             }
             "text-decoration" | "textDecoration" => {
@@ -494,6 +533,23 @@ impl CSSStyleDeclaration {
             }
             "font-style" | "fontStyle" => self.inner.font_style = parse_font_style(value),
             "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
+            "direction" => {
+                self.inner.direction = if value.trim().eq_ignore_ascii_case("rtl") {
+                    TextDirection::Rtl
+                } else {
+                    TextDirection::Ltr
+                };
+            }
+            "unicode-bidi" | "unicodeBidi" => {
+                self.inner.unicode_bidi = match value.trim().to_ascii_lowercase().as_str() {
+                    "embed" => UnicodeBidi::Embed,
+                    "bidi-override" => UnicodeBidi::BidiOverride,
+                    "isolate" => UnicodeBidi::Isolate,
+                    "isolate-override" => UnicodeBidi::IsolateOverride,
+                    "plaintext" => UnicodeBidi::Plaintext,
+                    _ => UnicodeBidi::Normal,
+                };
+            }
             "overflow-wrap" | "overflowWrap" | "word-wrap" | "wordWrap" => {
                 self.inner.word_break = parse_overflow_wrap(value)
             }
@@ -1232,6 +1288,48 @@ fn parse_border_style_visibility(value: &str) -> Option<bool> {
     Some(visible)
 }
 
+fn parse_border_style_edges(value: &str) -> Option<[bool; 4]> {
+    let values = split_css_whitespace(value)
+        .into_iter()
+        .map(|value| parse_border_style_visibility(&value))
+        .collect::<Option<Vec<_>>>()?;
+    match values.as_slice() {
+        [all] => Some([*all; 4]),
+        [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
+        [top, horizontal, bottom] => Some([*top, *horizontal, *bottom, *horizontal]),
+        [top, right, bottom, left] => Some([*top, *right, *bottom, *left]),
+        _ => None,
+    }
+}
+
+fn parse_border_width_edges(value: &str) -> Option<[f32; 4]> {
+    let values = split_css_whitespace(value)
+        .into_iter()
+        .map(|value| parse_px(&value))
+        .collect::<Option<Vec<_>>>()?;
+    match values.as_slice() {
+        [all] => Some([*all; 4]),
+        [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
+        [top, horizontal, bottom] => Some([*top, *horizontal, *bottom, *horizontal]),
+        [top, right, bottom, left] => Some([*top, *right, *bottom, *left]),
+        _ => None,
+    }
+}
+
+fn parse_border_color_edges(value: &str) -> Option<[Color; 4]> {
+    let values = split_css_whitespace(value)
+        .into_iter()
+        .map(|value| Color::from_css(&value))
+        .collect::<Option<Vec<_>>>()?;
+    match values.as_slice() {
+        [all] => Some([*all; 4]),
+        [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
+        [top, horizontal, bottom] => Some([*top, *horizontal, *bottom, *horizontal]),
+        [top, right, bottom, left] => Some([*top, *right, *bottom, *left]),
+        _ => None,
+    }
+}
+
 fn expand_border_radius(values: &[f32]) -> Option<[f32; 4]> {
     match values {
         [all] => Some([*all; 4]),
@@ -1385,23 +1483,25 @@ fn extract_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 fn parse_text_align(value: &str) -> w3cos_std::style::TextAlign {
     use w3cos_std::style::TextAlign;
     match value.trim() {
+        "start" => TextAlign::Start,
+        "end" => TextAlign::End,
         "left" => TextAlign::Left,
         "right" => TextAlign::Right,
         "center" => TextAlign::Center,
         "justify" => TextAlign::Justify,
-        _ => TextAlign::Left,
+        _ => TextAlign::Start,
     }
 }
 
-fn parse_white_space(value: &str) -> w3cos_std::style::WhiteSpace {
+fn parse_white_space(value: &str) -> Option<w3cos_std::style::WhiteSpace> {
     use w3cos_std::style::WhiteSpace;
     match value.trim() {
-        "normal" => WhiteSpace::Normal,
-        "nowrap" => WhiteSpace::NoWrap,
-        "pre" => WhiteSpace::Pre,
-        "pre-wrap" => WhiteSpace::PreWrap,
-        "pre-line" => WhiteSpace::PreLine,
-        _ => WhiteSpace::Normal,
+        "normal" => Some(WhiteSpace::Normal),
+        "nowrap" => Some(WhiteSpace::NoWrap),
+        "pre" => Some(WhiteSpace::Pre),
+        "pre-wrap" => Some(WhiteSpace::PreWrap),
+        "pre-line" => Some(WhiteSpace::PreLine),
+        _ => None,
     }
 }
 
@@ -2039,6 +2139,41 @@ mod tests {
     }
 
     #[test]
+    fn multi_value_border_style_resolves_each_physical_edge() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-style", "solid none solid solid");
+
+        assert_eq!(declaration.inner.border_top_width, Some(3.0));
+        assert_eq!(declaration.inner.border_right_width, Some(0.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(3.0));
+        assert_eq!(declaration.inner.border_left_width, Some(3.0));
+    }
+
+    #[test]
+    fn multi_value_border_color_resolves_each_physical_edge() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-color", "orange purple teal yellow");
+
+        assert_eq!(declaration.inner.border_top_color, Some(Color::rgb(255, 165, 0)));
+        assert_eq!(declaration.inner.border_right_color, Some(Color::rgb(128, 0, 128)));
+        assert_eq!(declaration.inner.border_bottom_color, Some(Color::rgb(0, 128, 128)));
+        assert_eq!(declaration.inner.border_left_color, Some(Color::rgb(255, 255, 0)));
+    }
+
+    #[test]
+    fn border_width_overrides_provisional_border_style_edge_widths() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-style", "solid");
+        declaration.set_property("border-width", "5px");
+
+        assert_eq!(declaration.inner.border_width, 5.0);
+        assert_eq!(declaration.inner.border_top_width, Some(5.0));
+        assert_eq!(declaration.inner.border_right_width, Some(5.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(5.0));
+        assert_eq!(declaration.inner.border_left_width, Some(5.0));
+    }
+
+    #[test]
     fn multi_value_border_radius_preserves_css_corner_order() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("border-radius", "4px 16px 16px");
@@ -2159,6 +2294,14 @@ mod tests {
         declaration.set_property("padding-bottom", "-2px");
         declaration.set_property("padding", "1px -3px");
         assert_eq!(declaration.inner.padding, Edges::all(4.0));
+    }
+
+    #[test]
+    fn word_spacing_em_resolves_against_the_computed_font_size() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "25px");
+        declaration.set_property("word-spacing", "3em");
+        assert_eq!(declaration.to_style().word_spacing, 75.0);
     }
 
     #[test]

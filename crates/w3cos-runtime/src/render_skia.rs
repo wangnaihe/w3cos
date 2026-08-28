@@ -16,7 +16,7 @@ use skia_safe::{
 };
 use w3cos_std::SvgPathCommand;
 use w3cos_std::component::ComponentKind;
-use w3cos_std::style::{JustifyContent, Style, TextAlign, Transform2D};
+use w3cos_std::style::{Display, JustifyContent, Style, TextAlign, Transform2D};
 
 use crate::filter::{FilterChain, FilterOp, parse_css_filter};
 use crate::layout::LayoutRect;
@@ -1306,8 +1306,10 @@ fn draw_text_in_rect(
             Some(style),
         );
         let line_height = style.font_size * style.line_height;
-        let x = aligned_text_x(content, effective_text_align(style), ink.left, ink.width);
-        let top = content.y + (content.height - line_height).max(0.0) * 0.5;
+        let advance = measure_skia_text_advance(&layout.lines[0], typeface, style);
+        let x = aligned_text_x(content, effective_text_align(style), ink.left, advance);
+        let top = content.y
+            + text_vertical_offset(style, content.height, line_height);
         draw_text_line(
             canvas,
             x,
@@ -1325,7 +1327,8 @@ fn draw_text_in_rect(
         return;
     }
     let line_height = style.font_size * style.line_height;
-    let top = content.y + (content.height - layout.lines.len() as f32 * line_height).max(0.0) * 0.5;
+    let text_height = layout.lines.len() as f32 * line_height;
+    let top = content.y + text_vertical_offset(style, content.height, text_height);
     for (index, line) in layout.lines.iter().enumerate() {
         let ink = measure_skia_text_ink_bounds(
             line,
@@ -1334,7 +1337,8 @@ fn draw_text_in_rect(
             style.font_weight,
             Some(style),
         );
-        let x = aligned_text_x(content, effective_text_align(style), ink.left, ink.width);
+        let advance = measure_skia_text_advance(line, typeface, style);
+        let x = aligned_text_x(content, effective_text_align(style), ink.left, advance);
         draw_text_line(
             canvas,
             x,
@@ -1349,6 +1353,14 @@ fn draw_text_in_rect(
     }
     if let Some(save) = clip_save {
         canvas.restore_to_count(save);
+    }
+}
+
+fn text_vertical_offset(style: &Style, content_height: f32, text_height: f32) -> f32 {
+    if style.display == Display::Block && style.justify_content != JustifyContent::Center {
+        0.0
+    } else {
+        (content_height - text_height).max(0.0) * 0.5
     }
 }
 
@@ -1384,21 +1396,37 @@ fn draw_centered_text(
 }
 
 fn effective_text_align(style: &Style) -> TextAlign {
+    // `text-align` positions an inline formatting context inside its block
+    // container; it does not realign every inherited inline fragment inside
+    // its own margin box. The DOM lowering represents those fragments as
+    // Text leaves, so keep their glyphs at the content-box start and let the
+    // anonymous line row perform the authored alignment.
+    if style.display == Display::Inline {
+        return TextAlign::Left;
+    }
     // DOM text content is lowered into the host Text component instead of an
     // anonymous flex child. Preserve the browser behavior of centering that
     // anonymous child when the host itself is a centered flex container.
     if matches!(style.justify_content, JustifyContent::Center) {
         TextAlign::Center
     } else {
-        style.text_align
+        match (style.text_align, style.direction) {
+            (TextAlign::Start, w3cos_std::style::TextDirection::Ltr)
+            | (TextAlign::End, w3cos_std::style::TextDirection::Rtl) => TextAlign::Left,
+            (TextAlign::Start, w3cos_std::style::TextDirection::Rtl)
+            | (TextAlign::End, w3cos_std::style::TextDirection::Ltr) => TextAlign::Right,
+            (align, _) => align,
+        }
     }
 }
 
-fn aligned_text_x(rect: LayoutRect, align: TextAlign, ink_left: f32, ink_width: f32) -> f32 {
+fn aligned_text_x(rect: LayoutRect, align: TextAlign, ink_left: f32, advance_width: f32) -> f32 {
     match align {
-        TextAlign::Right => rect.x + rect.width - ink_width - ink_left,
-        TextAlign::Center => rect.x + (rect.width - ink_width) * 0.5 - ink_left,
-        TextAlign::Left | TextAlign::Justify => rect.x - ink_left,
+        TextAlign::Right => rect.x + rect.width - advance_width - ink_left,
+        TextAlign::Center => rect.x + (rect.width - advance_width) * 0.5 - ink_left,
+        TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
+            rect.x - ink_left
+        }
     }
 }
 
@@ -1414,8 +1442,31 @@ fn draw_text_line(
     style: &Style,
 ) -> f32 {
     let paint = color_paint(color, opacity);
+    if style_uses_ahem(style) {
+        let mut cursor_x = x;
+        let snapped_top = top.round();
+        let render_text = text_layout::font_render_text(text, style.direction);
+        for character in render_text.chars() {
+            if !character.is_whitespace() {
+                canvas.draw_rect(
+                    Rect::from_xywh(
+                        cursor_x.round(),
+                        snapped_top,
+                        font_size.round(),
+                        font_size.round(),
+                    ),
+                    &paint,
+                );
+            }
+            cursor_x += font_size;
+            if character.is_whitespace() {
+                cursor_x += style.word_spacing;
+            }
+        }
+        return cursor_x - x;
+    }
     let mut cursor_x = x;
-    let font_text = text_layout::font_render_text(text);
+    let font_text = text_layout::font_render_text(text, style.direction);
     for run in css_font_runs(font_text.as_ref(), typeface, style) {
         let font = Font::new(run.typeface, font_size);
         canvas.draw_str(run.text, (cursor_x, top + font_size), &font, &paint);
@@ -1431,6 +1482,35 @@ fn measure_skia_text_ink_bounds(
     font_weight: u16,
     style: Option<&Style>,
 ) -> text_layout::InkBounds {
+    if style.is_some_and(style_uses_ahem) {
+        let style = style.expect("Ahem style checked above");
+        let render_text = text_layout::font_render_text(
+            text,
+            style.direction,
+        );
+        let mut cursor = 0.0_f32;
+        let mut left = None::<f32>;
+        let mut right = 0.0_f32;
+        for character in render_text.chars() {
+            if !character.is_whitespace() {
+                left.get_or_insert(cursor);
+                right = cursor + font_size;
+            }
+            cursor += font_size;
+            if character.is_whitespace() {
+                cursor += style.word_spacing;
+            }
+        }
+        return match left {
+            Some(left) => text_layout::InkBounds {
+                left,
+                top: 0.0,
+                width: right - left,
+                height: font_size,
+            },
+            _ => text_layout::InkBounds::empty(),
+        };
+    }
     let mut cursor_x = 0.0_f32;
     let mut left = f32::MAX;
     let mut top = f32::MAX;
@@ -1438,7 +1518,12 @@ fn measure_skia_text_ink_bounds(
     let mut bottom = f32::MIN;
     let mut saw_ink = false;
 
-    let font_text = text_layout::font_render_text(text);
+    let font_text = text_layout::font_render_text(
+        text,
+        style.map_or(w3cos_std::style::TextDirection::Ltr, |style| {
+            style.direction
+        }),
+    );
     let runs = style.map_or_else(
         || fallback_font_runs(font_text.as_ref(), typeface, font_weight),
         |style| css_font_runs(font_text.as_ref(), typeface, style),
@@ -1469,15 +1554,35 @@ fn measure_skia_text_ink_bounds(
 }
 
 fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> f32 {
-    let font_text = text_layout::font_render_text(text);
-    css_font_runs(font_text.as_ref(), typeface, style)
+    let render_text = text_layout::font_render_text(text, style.direction);
+    let word_spacing = render_text
+        .chars()
+        .filter(|character| character.is_whitespace())
+        .count() as f32
+        * style.word_spacing;
+    if style_uses_ahem(style) {
+        return render_text.chars().count() as f32 * style.font_size + word_spacing;
+    }
+    css_font_runs(render_text.as_ref(), typeface, style)
         .into_iter()
         .map(|run| {
             Font::new(run.typeface, style.font_size)
                 .measure_str(run.text, None)
                 .0
         })
-        .sum()
+        .sum::<f32>()
+        + word_spacing
+}
+
+fn style_uses_ahem(style: &Style) -> bool {
+    style.font_family.as_deref().is_some_and(|families| {
+        families.split(',').any(|family| {
+            family
+                .trim()
+                .trim_matches(['"', '\''])
+                .eq_ignore_ascii_case("ahem")
+        })
+    })
 }
 
 pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f32, f32) {
@@ -1627,13 +1732,16 @@ fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16)
 }
 
 fn text_content_box(rect: LayoutRect, style: &Style) -> LayoutRect {
-    let border = style.border_width;
+    let border_top = style.border_top_width.unwrap_or(style.border_width);
+    let border_right = style.border_right_width.unwrap_or(style.border_width);
+    let border_bottom = style.border_bottom_width.unwrap_or(style.border_width);
+    let border_left = style.border_left_width.unwrap_or(style.border_width);
     let padding = style.padding_lengths();
     LayoutRect {
-        x: rect.x + padding.left + border,
-        y: rect.y + padding.top + border,
-        width: (rect.width - padding.left - padding.right - border * 2.0).max(1.0),
-        height: (rect.height - padding.top - padding.bottom - border * 2.0).max(0.0),
+        x: rect.x + padding.left + border_left,
+        y: rect.y + padding.top + border_top,
+        width: (rect.width - padding.left - padding.right - border_left - border_right).max(1.0),
+        height: (rect.height - padding.top - padding.bottom - border_top - border_bottom).max(0.0),
     }
 }
 
@@ -1909,6 +2017,21 @@ mod tests {
     }
 
     #[test]
+    fn inherited_text_align_does_not_realign_an_inline_fragment() {
+        let mut style = Style::default();
+        style.display = Display::Inline;
+        style.text_align = TextAlign::Right;
+        assert_eq!(effective_text_align(&style), TextAlign::Left);
+    }
+
+    #[test]
+    fn logical_start_alignment_follows_rtl_direction() {
+        let mut style = Style::default();
+        style.direction = w3cos_std::style::TextDirection::Rtl;
+        assert_eq!(effective_text_align(&style), TextAlign::Right);
+    }
+
+    #[test]
     fn text_with_background_still_paints_inside_css_padding() {
         let style = Style {
             background: w3cos_std::color::Color::WHITE,
@@ -1930,6 +2053,32 @@ mod tests {
         assert_eq!(content.y, 42.0);
         assert_eq!(content.width, 170.0);
         assert_eq!(content.height, 56.0);
+    }
+
+    #[test]
+    fn text_content_box_uses_each_resolved_border_edge() {
+        let style = Style {
+            border_top_width: Some(30.0),
+            border_right_width: Some(4.0),
+            border_bottom_width: Some(6.0),
+            border_left_width: Some(8.0),
+            padding: w3cos_std::style::Edges::all(10.0),
+            ..Style::default()
+        };
+        let content = text_content_box(
+            LayoutRect {
+                x: 0.0,
+                y: 20.0,
+                width: 200.0,
+                height: 100.0,
+            },
+            &style,
+        );
+
+        assert_eq!(content.x, 18.0);
+        assert_eq!(content.y, 60.0);
+        assert_eq!(content.width, 168.0);
+        assert_eq!(content.height, 44.0);
     }
 
     #[test]
@@ -2141,6 +2290,68 @@ mod tests {
         assert_eq!(
             &single_pixels[..64 * 19 * 4],
             &multiline_pixels[..64 * 19 * 4]
+        );
+    }
+
+    #[test]
+    fn block_text_starts_at_the_content_box_top_unless_explicitly_centered() {
+        let block = Style {
+            display: Display::Block,
+            ..Style::default()
+        };
+        assert_eq!(text_vertical_offset(&block, 84.0, 19.2), 0.0);
+
+        let centered = Style {
+            display: Display::Block,
+            justify_content: JustifyContent::Center,
+            ..Style::default()
+        };
+        assert!((text_vertical_offset(&centered, 84.0, 19.2) - 32.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_alignment_uses_the_inline_advance_not_the_ink_width() {
+        let rect = LayoutRect {
+            x: 10.0,
+            y: 0.0,
+            width: 100.0,
+            height: 20.0,
+        };
+        assert_eq!(aligned_text_x(rect, TextAlign::Right, 1.0, 40.0), 69.0);
+        assert_eq!(aligned_text_x(rect, TextAlign::Center, 1.0, 40.0), 39.0);
+        assert_eq!(aligned_text_x(rect, TextAlign::Left, 1.0, 40.0), 9.0);
+    }
+
+    #[test]
+    fn ahem_text_uses_one_square_em_per_character() {
+        let typeface = FontMgr::default()
+            .new_from_data(TEST_FONT, None)
+            .expect("Skia test typeface");
+        let style = Style {
+            font_family: Some("Ahem".to_string()),
+            font_size: 20.0,
+            ..Style::default()
+        };
+
+        assert_eq!(measure_skia_text_advance(" A ", &typeface, &style), 60.0);
+        let spaced = Style {
+            word_spacing: 30.0,
+            ..style.clone()
+        };
+        assert_eq!(measure_skia_text_advance("A A", &typeface, &spaced), 90.0);
+        assert_eq!(
+            measure_skia_text_advance("\u{202e} A \u{202c}", &typeface, &style),
+            60.0,
+            "bidi formatting controls affect order but consume no Ahem cell"
+        );
+        assert_eq!(
+            measure_skia_text_ink_bounds(" A ", 20.0, &typeface, 400, Some(&style)),
+            text_layout::InkBounds {
+                left: 20.0,
+                top: 0.0,
+                width: 20.0,
+                height: 20.0,
+            }
         );
     }
 

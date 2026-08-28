@@ -60,6 +60,8 @@ pub struct Style {
     pub border_spacing_x: f32,
     #[serde(default)]
     pub border_spacing_y: f32,
+    #[serde(default)]
+    pub border_collapse: bool,
     pub padding: Edges,
     pub margin: Edges,
 
@@ -145,11 +147,17 @@ pub struct Style {
     pub white_space: WhiteSpace,
     pub line_height: f32,
     pub letter_spacing: f32,
+    #[serde(default)]
+    pub word_spacing: f32,
     pub text_decoration: TextDecoration,
     pub text_overflow: TextOverflow,
     pub font_family: Option<String>,
     pub font_style: FontStyle,
     pub word_break: WordBreak,
+    #[serde(default)]
+    pub direction: TextDirection,
+    #[serde(default)]
+    pub unicode_bidi: UnicodeBidi,
 
     // CSS Custom Properties (#34)
     pub custom_properties: Option<std::collections::HashMap<String, String>>,
@@ -225,6 +233,7 @@ impl Default for Style {
             column_gap: None,
             border_spacing_x: 0.0,
             border_spacing_y: 0.0,
+            border_collapse: false,
             padding: Edges::ZERO,
             margin: Edges::ZERO,
             box_sizing: BoxSizing::ContentBox,
@@ -268,15 +277,18 @@ impl Default for Style {
             border_bottom_color: None,
             border_left_color: None,
             opacity: 1.0,
-            text_align: TextAlign::Left,
+            text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
             line_height: 1.2,
             letter_spacing: 0.0,
+            word_spacing: 0.0,
             text_decoration: TextDecoration::None,
             text_overflow: TextOverflow::Clip,
             font_family: None,
             font_style: FontStyle::Normal,
             word_break: WordBreak::Normal,
+            direction: TextDirection::Ltr,
+            unicode_bidi: UnicodeBidi::Normal,
             custom_properties: None,
             contain: Contain::None,
             will_change: WillChange::default(),
@@ -339,6 +351,7 @@ impl Style {
             column_gap,
             border_spacing_x,
             border_spacing_y,
+            border_collapse,
             padding,
             margin,
             box_sizing,
@@ -386,11 +399,14 @@ impl Style {
             white_space,
             line_height,
             letter_spacing,
+            word_spacing,
             text_decoration,
             text_overflow,
             font_family,
             font_style,
             word_break,
+            direction,
+            unicode_bidi,
             custom_properties,
             contain,
             will_change,
@@ -435,6 +451,7 @@ impl Style {
             column_gap: column_gap_b,
             border_spacing_x: border_spacing_x_b,
             border_spacing_y: border_spacing_y_b,
+            border_collapse: border_collapse_b,
             padding: padding_b,
             margin: margin_b,
             box_sizing: box_sizing_b,
@@ -482,11 +499,14 @@ impl Style {
             white_space: white_space_b,
             line_height: line_height_b,
             letter_spacing: letter_spacing_b,
+            word_spacing: word_spacing_b,
             text_decoration: text_decoration_b,
             text_overflow: text_overflow_b,
             font_family: font_family_b,
             font_style: font_style_b,
             word_break: word_break_b,
+            direction: direction_b,
+            unicode_bidi: unicode_bidi_b,
             custom_properties: custom_properties_b,
             contain: contain_b,
             will_change: will_change_b,
@@ -529,6 +549,7 @@ impl Style {
             && column_gap == column_gap_b
             && border_spacing_x == border_spacing_x_b
             && border_spacing_y == border_spacing_y_b
+            && border_collapse == border_collapse_b
             && padding == padding_b
             && margin == margin_b
             && box_sizing == box_sizing_b
@@ -576,11 +597,14 @@ impl Style {
             && white_space == white_space_b
             && line_height == line_height_b
             && letter_spacing == letter_spacing_b
+            && word_spacing == word_spacing_b
             && text_decoration == text_decoration_b
             && text_overflow == text_overflow_b
             && font_family == font_family_b
             && font_style == font_style_b
             && word_break == word_break_b
+            && direction == direction_b
+            && unicode_bidi == unicode_bidi_b
             && custom_properties == custom_properties_b
             && contain == contain_b
             && will_change == will_change_b
@@ -1022,6 +1046,8 @@ impl Contain {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum TextAlign {
     #[default]
+    Start,
+    End,
     Left,
     Center,
     Right,
@@ -1069,6 +1095,24 @@ pub enum WordBreak {
     BreakAll,
     BreakWord,
     KeepAll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TextDirection {
+    #[default]
+    Ltr,
+    Rtl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UnicodeBidi {
+    #[default]
+    Normal,
+    Embed,
+    BidiOverride,
+    Isolate,
+    IsolateOverride,
+    Plaintext,
 }
 
 // --- CSS Animation (#11) ---

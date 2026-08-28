@@ -44,6 +44,7 @@ w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
 parley = { workspace = true }
 unicode-bidi = { workspace = true }
+unicode-bidi-mirroring = { workspace = true }
 fontdue = { workspace = true }
 fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 anyhow = { workspace = true }
@@ -55,6 +56,7 @@ resvg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 quick-xml = { workspace = true }
+html-escape = { workspace = true }
 libc = "0.2"
 getrandom = "0.3"
 tempfile = { workspace = true }

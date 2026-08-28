@@ -6,7 +6,7 @@ use taffy::prelude::*;
 use w3cos_std::component::EventAction;
 use w3cos_std::style::{
     AlignItems as WAlign, AlignSelf as WAlignSelf, BoxSizing as WBoxSizing, Dimension as WDim,
-    Display as WDisplay, EdgeLengths, FlexDirection as WDir, FlexWrap as WWrap,
+    Display as WDisplay, EdgeLengths, FlexDirection as WDir, FlexWrap as WWrap, Float as WFloat,
     JustifyContent as WJustify, Overflow as WOverflow, Position as WPos, Spacing as WSpacing,
     WhiteSpace as WWhiteSpace, WordBreak as WWordBreak,
 };
@@ -179,6 +179,35 @@ fn component_max_content_width(component: &Component) -> f32 {
                 let children = component.children.iter().map(child_width).sum::<f32>();
                 children + component.style.gap * component.children.len().saturating_sub(1) as f32
             }
+            WDisplay::Block | WDisplay::ListItem => {
+                // A block formatting context contributes the widest generated
+                // line/block row. Consecutive inline-level and floating boxes
+                // can share a row; an in-flow block boundary flushes that row.
+                // Summing every child made vertically stacked blocks twice as
+                // wide and also joined anonymous text across block boundaries.
+                let mut widest = 0.0_f32;
+                let mut inline_row = 0.0_f32;
+                for child in &component.children {
+                    if matches!(child.style.position, WPos::Absolute | WPos::Fixed) {
+                        continue;
+                    }
+                    let shares_inline_row = child.style.float != WFloat::None
+                        || matches!(
+                            child.style.display,
+                            WDisplay::Inline
+                                | WDisplay::InlineBlock
+                                | WDisplay::InlineFlex
+                                | WDisplay::InlineTable
+                        );
+                    if shares_inline_row {
+                        inline_row += child_width(child);
+                    } else {
+                        widest = widest.max(inline_row).max(child_width(child));
+                        inline_row = 0.0;
+                    }
+                }
+                widest.max(inline_row)
+            }
             _ => match component.style.flex_direction {
                 WDir::Row | WDir::RowReverse => {
                     let children = component.children.iter().map(child_width).sum::<f32>();
@@ -234,15 +263,24 @@ fn component_max_content_width(component: &Component) -> f32 {
 
 fn table_track_max_content_width(component: &Component) -> f32 {
     let tracks = table_track_widths(component);
+    let caption_width = component
+        .children
+        .iter()
+        .filter(|child| child.style.display == WDisplay::TableCaption)
+        .map(component_max_content_width)
+        .fold(0.0_f32, f32::max);
     if tracks.is_empty() {
-        return component
+        return caption_width.max(
+            component
             .children
             .iter()
+            .filter(|child| child.style.display != WDisplay::TableCaption)
             .map(component_max_content_width)
-            .fold(0.0_f32, f32::max);
+            .fold(0.0_f32, f32::max),
+        );
     }
     let gap = component.style.border_spacing_x;
-    tracks.iter().sum::<f32>() + gap * tracks.len().saturating_sub(1) as f32
+    caption_width.max(tracks.iter().sum::<f32>() + gap * tracks.len().saturating_sub(1) as f32)
 }
 
 fn table_track_widths(component: &Component) -> Vec<f32> {
@@ -276,10 +314,16 @@ fn table_track_widths(component: &Component) -> Vec<f32> {
 
 fn shrink_to_fit_used_width(component: &Component) -> f32 {
     let outer_width = component_max_content_width(component);
-    if matches!(
-        component.style.display,
-        WDisplay::Inline | WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
-    ) {
+    if component.style.float != WFloat::None
+        || matches!(
+            component.style.display,
+            WDisplay::Inline
+                | WDisplay::InlineBlock
+                | WDisplay::InlineFlex
+                | WDisplay::InlineTable
+                | WDisplay::Table
+        )
+    {
         // Taffy applies an inline-level box's margins separately. Its assigned
         // width is the border box, so do not make the painted background span
         // the margin. Table max-content aggregation still needs outer widths.
@@ -875,6 +919,7 @@ impl LayoutEngine {
                 None,
                 None,
                 None,
+                None,
                 viewport_w,
                 viewport_h,
                 viewport_w,
@@ -993,6 +1038,7 @@ pub fn compute_with_scroll(
         &mut tree,
         root,
         &mut node_index,
+        None,
         None,
         None,
         None,
@@ -1299,6 +1345,7 @@ fn build_taffy_tree(
     parent_direction: Option<WDir>,
     parent_display: Option<WDisplay>,
     parent_align_items: Option<WAlign>,
+    parent_font_size: Option<f32>,
     viewport_w: f32,
     viewport_h: f32,
     containing_width: f32,
@@ -1310,6 +1357,25 @@ fn build_taffy_tree(
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    if comp.style.display == WDisplay::Table
+        && let Some(wrapper_font_size) = parent_font_size
+    {
+        // A block-level CSS table is laid out inside an anonymous table
+        // wrapper. Its block-axis margin metrics belong to the parent block
+        // formatting context; inline-axis margins remain table-grid metrics.
+        style.margin.top = to_taffy_margin(
+            comp.style.margin.top,
+            wrapper_font_size,
+            viewport_w,
+            viewport_h,
+        );
+        style.margin.bottom = to_taffy_margin(
+            comp.style.margin.bottom,
+            wrapper_font_size,
+            viewport_w,
+            viewport_h,
+        );
+    }
     let own_border_spacing = matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable)
         .then_some((comp.style.border_spacing_x, comp.style.border_spacing_y));
     let active_border_spacing = own_border_spacing.or(inherited_border_spacing);
@@ -1725,6 +1791,7 @@ fn build_taffy_tree(
                     Some(comp.style.flex_direction),
                     Some(comp.style.display),
                     Some(comp.style.align_items),
+                    Some(comp.style.font_size),
                     viewport_w,
                     viewport_h,
                     child_containing_width,
@@ -1821,14 +1888,15 @@ fn build_taffy_tree(
             child_nodes.splice(0..2, [group]);
         }
         if matches!(comp.style.width, WDim::Auto)
-            && matches!(
-                comp.style.display,
-                WDisplay::Inline
-                    | WDisplay::InlineBlock
-                    | WDisplay::InlineFlex
-                    | WDisplay::InlineTable
-                    | WDisplay::Table
-            )
+            && (comp.style.float != WFloat::None
+                || matches!(
+                    comp.style.display,
+                    WDisplay::Inline
+                        | WDisplay::InlineBlock
+                        | WDisplay::InlineFlex
+                        | WDisplay::InlineTable
+                        | WDisplay::Table
+                ))
             && (matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid))
                 || (matches!(parent_display, Some(WDisplay::Flex))
                     && matches!(
@@ -1837,12 +1905,10 @@ fn build_taffy_tree(
                     )))
         {
             style.size.width = Dimension::length(shrink_to_fit_used_width(comp));
-            if matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable) {
-                // `shrink_to_fit_used_width` returns the table border box.
-                // Keep table padding, borders, and outer border spacing inside
-                // that resolved width instead of adding them a second time.
-                style.box_sizing = BoxSizing::BorderBox;
-            }
+            // `shrink_to_fit_used_width` returns the principal border box.
+            // Keep padding, borders, and table outer border spacing inside the
+            // resolved width instead of adding them a second time.
+            style.box_sizing = BoxSizing::BorderBox;
             if comp.style.display == WDisplay::Table {
                 // CSS auto table layout shrink-wraps up to the available
                 // containing-block width. An unconstrained max-content width
@@ -2719,6 +2785,17 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             bottom: LengthPercentageAuto::length(0.0),
             left: LengthPercentageAuto::length(0.0),
         }
+    } else if s.display == WDisplay::Inline {
+        // Vertical margins do not participate in the line box of a
+        // non-replaced inline box. Keep the authored horizontal margins for
+        // line fitting, but do not let Taffy's flex fallback move the inline
+        // down or enlarge the line.
+        Rect {
+            top: LengthPercentageAuto::length(0.0),
+            right: to_taffy_margin(s.margin.right, s.font_size, viewport_w, viewport_h),
+            bottom: LengthPercentageAuto::length(0.0),
+            left: to_taffy_margin(s.margin.left, s.font_size, viewport_w, viewport_h),
+        }
     } else {
         Rect {
             top: to_taffy_margin(s.margin.top, s.font_size, viewport_w, viewport_h),
@@ -2746,6 +2823,7 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
                 | WDisplay::TableFooterGroup,
                 _,
             ) => FlexDirection::Column,
+            (WDisplay::TableRow, WDir::RowReverse) => FlexDirection::RowReverse,
             (WDisplay::TableRow, _) | (_, WDir::Row) => FlexDirection::Row,
             (_, WDir::Column) => FlexDirection::Column,
             (_, WDir::RowReverse) => FlexDirection::RowReverse,
@@ -5326,6 +5404,95 @@ mod tests {
     }
 
     #[test]
+    fn empty_table_grid_still_uses_its_caption_max_content_width() {
+        let caption = Component::boxed(
+            Style {
+                display: WDisp::TableCaption,
+                ..Style::default()
+            },
+            vec![Component::text("PASS PASS", Style::default())],
+        );
+        let empty_cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                ..Style::default()
+            },
+            vec![],
+        );
+        let row = Component::row(
+            Style {
+                display: WDisp::TableRow,
+                ..Style::default()
+            },
+            vec![empty_cell],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                ..Style::default()
+            },
+            vec![caption.clone(), row],
+        );
+
+        assert_eq!(
+            table_track_max_content_width(&table),
+            component_max_content_width(&caption)
+        );
+    }
+
+    #[test]
+    fn block_table_wrapper_em_margins_use_the_parent_font() {
+        let em_margin = |value| w3cos_std::style::Edges {
+            top: WSpacing::Em(value),
+            right: WSpacing::Em(value),
+            bottom: WSpacing::Em(value),
+            left: WSpacing::Em(value),
+        };
+        let float_margin = w3cos_std::style::Edges {
+            top: WSpacing::Em(0.5),
+            right: WSpacing::Em(1.0),
+            bottom: WSpacing::Em(0.5),
+            left: WSpacing::Em(1.0),
+        };
+        let child = |display, float, margin| {
+            Component::boxed(
+                Style {
+                    display,
+                    float,
+                    font_size: 32.0,
+                    margin,
+                    ..Style::default()
+                },
+                vec![Component::text("same", Style::default())],
+            )
+        };
+        let layout_for = |child| {
+            let root = Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(800.0),
+                    font_size: 16.0,
+                    ..Style::default()
+                },
+                vec![child],
+            );
+            compute(&root, 800.0, 600.0)
+                .unwrap()
+                .into_iter()
+                .find(|(_, index)| *index == 1)
+                .unwrap()
+                .0
+        };
+
+        let table = layout_for(child(WDisp::Table, WFloat::None, em_margin(1.0)));
+        let floating = layout_for(child(WDisp::Block, WFloat::Left, float_margin));
+        assert_eq!(table.y, 16.0);
+        assert_eq!(table.y, floating.y);
+        assert_eq!(table.x, 32.0);
+        assert_eq!(table.x, floating.x);
+    }
+
+    #[test]
     fn definite_table_height_stretches_rows_and_bottom_aligns_cell_content() {
         let image = Component::image(
             "stripe.png",
@@ -5807,6 +5974,142 @@ mod tests {
             shrink_to_fit_used_width(&margined),
             "margins sit outside an auto shrink-to-fit box"
         );
+    }
+
+    #[test]
+    fn block_max_content_uses_widest_stacked_block_child() {
+        let block_child = |content| {
+            Component::boxed(
+                Style {
+                    display: WDisp::Flex,
+                    ..Style::default()
+                },
+                vec![Component::text(content, Style::default())],
+            )
+        };
+        let first = block_child("first row");
+        let second = block_child("a longer second row");
+        let expected = component_max_content_width(&first)
+            .max(component_max_content_width(&second));
+        let block = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![first, second],
+        );
+
+        assert_eq!(component_max_content_width(&block), expected);
+
+        let before = Component::text("short", Style::default());
+        let boundary = block_child("the widest block row");
+        let after = Component::text("tail", Style::default());
+        let expected = component_max_content_width(&before)
+            .max(component_max_content_width(&boundary))
+            .max(component_max_content_width(&after));
+        let mixed = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                ..Style::default()
+            },
+            vec![before, boundary, after],
+        );
+        assert_eq!(
+            component_max_content_width(&mixed),
+            expected,
+            "a block boundary splits the anonymous inline rows on both sides"
+        );
+    }
+
+    #[test]
+    fn table_row_preserves_rtl_column_axis_in_taffy() {
+        let style = to_taffy_style(
+            &Style {
+                display: WDisp::TableRow,
+                flex_direction: WDir::RowReverse,
+                ..Style::default()
+            },
+            800.0,
+            600.0,
+        );
+
+        assert_eq!(style.flex_direction, FlexDirection::RowReverse);
+    }
+
+    #[test]
+    fn shrink_to_fit_width_excludes_table_and_float_margins() {
+        let child = || Component::text("inline", Style::default());
+        let shrink_width = |display, float| {
+            shrink_to_fit_used_width(&Component::boxed(
+                Style {
+                    display,
+                    float,
+                    margin: w3cos_std::style::Edges::all(10.0),
+                    ..Style::default()
+                },
+                vec![child()],
+            ))
+        };
+
+        assert_eq!(
+            shrink_width(WDisp::Table, WFloat::None),
+            shrink_width(WDisp::Table, WFloat::Left),
+            "table and float margins both stay outside the shrink-to-fit border box"
+        );
+        assert_eq!(
+            shrink_width(WDisp::Block, WFloat::Left),
+            shrink_width(WDisp::Inline, WFloat::None),
+            "a blockified float uses the same intrinsic border-box width as inline content"
+        );
+    }
+
+    #[test]
+    fn auto_width_float_shrink_wraps_in_a_block_container() {
+        let floating = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                float: WFloat::Left,
+                margin: w3cos_std::style::Edges::all(10.0),
+                padding: w3cos_std::style::Edges::all(12.0),
+                border_width: 3.0,
+                ..Style::default()
+            },
+            vec![Component::text("float", Style::default())],
+        );
+        let expected_width = shrink_to_fit_used_width(&floating);
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(800.0),
+                ..Style::default()
+            },
+            vec![floating],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let floating = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert!(
+            (floating.width - expected_width).abs() < 0.01,
+            "an auto-width float must use its intrinsic border box exactly: expected={expected_width}, actual={floating:?}"
+        );
+    }
+
+    #[test]
+    fn non_replaced_inline_ignores_vertical_margins_in_line_layout() {
+        let style = to_taffy_style(
+            &Style {
+                display: WDisp::Inline,
+                margin: w3cos_std::style::Edges::all(16.0),
+                ..Style::default()
+            },
+            800.0,
+            600.0,
+        );
+
+        assert_eq!(style.margin.top, LengthPercentageAuto::length(0.0));
+        assert_eq!(style.margin.bottom, LengthPercentageAuto::length(0.0));
+        assert_eq!(style.margin.left, LengthPercentageAuto::length(16.0));
+        assert_eq!(style.margin.right, LengthPercentageAuto::length(16.0));
     }
 
     #[test]

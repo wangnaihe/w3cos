@@ -3176,42 +3176,11 @@ fn replace_all_children(node: u32, replacement: impl FnOnce()) {
 }
 
 pub(crate) fn decode_html_entities(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(amp) = rest.find('&') {
-        output.push_str(&rest[..amp]);
-        rest = &rest[amp..];
-        let Some(semi) = rest.find(';') else {
-            output.push_str(rest);
-            return output;
-        };
-        let entity = &rest[1..semi];
-        let decoded = match entity {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            "nbsp" => Some('\u{a0}'),
-            _ if entity.starts_with("#x") || entity.starts_with("#X") => {
-                u32::from_str_radix(&entity[2..], 16)
-                    .ok()
-                    .and_then(char::from_u32)
-            }
-            _ if entity.starts_with('#') => {
-                entity[1..].parse::<u32>().ok().and_then(char::from_u32)
-            }
-            _ => None,
-        };
-        if let Some(ch) = decoded {
-            output.push(ch);
-        } else {
-            output.push_str(&rest[..=semi]);
-        }
-        rest = &rest[semi + 1..];
-    }
-    output.push_str(rest);
-    output
+    // HTML and XHTML documents use the complete HTML named-character table,
+    // not only XML's five predefined entities. Keeping this decoder shared by
+    // both parsers prevents XHTML references such as `&times;` and `&divide;`
+    // from disappearing at `GeneralRef` boundaries before layout and bidi.
+    html_escape::decode_html_entities(input).into_owned()
 }
 
 pub(crate) fn html_tag_end(input: &str) -> Option<usize> {

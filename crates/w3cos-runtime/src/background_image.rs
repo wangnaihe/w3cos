@@ -1222,6 +1222,41 @@ mod tests {
     }
 
     #[test]
+    fn canvas_negative_em_position_can_move_a_root_tile_to_the_viewport_origin() {
+        crate::image_loader::clear_cache();
+        install_image("diamond.png", 10, 10);
+        let style = Style {
+            background_image: Some("url(diamond.png)".to_string()),
+            background_position: Some("-2em -2em".to_string()),
+            background_repeat: Some("no-repeat".to_string()),
+            font_size: 16.0,
+            ..Style::default()
+        };
+        let layers = canvas_background_paint_layers(
+            &style,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            Some(LayoutRect {
+                x: 32.0,
+                y: 32.0,
+                width: 736.0,
+                height: 200.0,
+            }),
+        );
+
+        assert_eq!(layers.len(), 1);
+        let BackgroundPaintLayer::Raster(layer) = &layers[0] else {
+            panic!("expected raster layer");
+        };
+        assert_eq!(layer.tiles[0].x, 0.0);
+        assert_eq!(layer.tiles[0].y, 0.0);
+    }
+
+    #[test]
     fn repeat_and_content_clip_use_box_model_edges() {
         crate::image_loader::clear_cache();
         install_image("tile.png", 10, 10);
