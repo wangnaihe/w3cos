@@ -497,6 +497,60 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
 }
 
 const COLLAPSED_BORDER_SUPPRESSED: &str = "--w3cos-internal-collapsed-border-suppressed";
+const COLLAPSED_BORDER_BOTTOM_EXTENSION: &str =
+    "--w3cos-internal-collapsed-border-bottom-extension";
+
+fn extend_collapsed_borders_across_empty_rows(
+    nodes: &mut [PaintNode],
+    rect_by_index: &[Option<LayoutRect>],
+) {
+    fn row_cells(nodes: &[PaintNode], row: usize) -> Vec<usize> {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.parent == Some(row) && node.style.display == Display::TableCell)
+            .map(|(index, _)| index)
+            .collect()
+    }
+    let rows = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.style.display == Display::TableRow && node.style.border_collapse)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for rows in rows.windows(3) {
+        let top_cells = row_cells(nodes, rows[0]);
+        let empty_cells = row_cells(nodes, rows[1]);
+        let bottom_cells = row_cells(nodes, rows[2]);
+        if top_cells.is_empty() || !empty_cells.is_empty() || bottom_cells.is_empty() {
+            continue;
+        }
+        let extension = rect_by_index
+            .get(rows[1])
+            .and_then(|rect| *rect)
+            .map_or(0.0, |rect| rect.height.max(0.0));
+        if extension == 0.0 {
+            continue;
+        }
+        for cell in top_cells {
+            let bottom_width = nodes[cell]
+                .style
+                .border_bottom_width
+                .unwrap_or(nodes[cell].style.border_width);
+            let extension = extension.min(bottom_width);
+            if extension > 0.0 {
+                nodes[cell]
+                    .style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        COLLAPSED_BORDER_BOTTOM_EXTENSION.to_string(),
+                        extension.to_string(),
+                    );
+            }
+        }
+    }
+}
 
 pub(crate) fn border_edge_paint_rects(
     style: &Style,
@@ -514,6 +568,13 @@ pub(crate) fn border_edge_paint_rects(
     let right = if suppressed("right") { widths[1] } else { 0.0 };
     let bottom = if suppressed("bottom") { widths[2] } else { 0.0 };
     let left = if suppressed("left") { widths[3] } else { 0.0 };
+    let bottom_extension = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get(COLLAPSED_BORDER_BOTTOM_EXTENSION))
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(0.0);
     [
         LayoutRect {
             x: rect.x + left,
@@ -531,7 +592,7 @@ pub(crate) fn border_edge_paint_rects(
             x: rect.x + left,
             y: rect.y + rect.height - widths[2],
             width: (rect.width - left - right).max(0.0),
-            height: widths[2],
+            height: widths[2] + bottom_extension,
         },
         LayoutRect {
             x: rect.x,
@@ -719,11 +780,18 @@ impl PaintArtifact {
             nodes[index].style.background = Color::TRANSPARENT;
             nodes[index].style.background_image = None;
         }
+        let mut rect_by_index = vec![None; nodes.len()];
+        for &(rect, index) in layout_cache {
+            if let Some(slot) = rect_by_index.get_mut(index) {
+                *slot = Some(rect);
+            }
+        }
         suppress_improper_nested_table_part_backgrounds(&mut nodes);
         suppress_hidden_empty_cell_paint(&mut nodes);
         resolve_collapsed_cell_border_conflicts(&mut nodes);
+        extend_collapsed_borders_across_empty_rows(&mut nodes, &rect_by_index);
         let mut artifact = Self {
-            rect_by_index: vec![None; nodes.len()],
+            rect_by_index,
             node_properties: vec![PaintProperties::default(); nodes.len()],
             z_order: vec![0; nodes.len()],
             sticky_owner: vec![None; nodes.len()],
@@ -735,11 +803,6 @@ impl PaintArtifact {
             generation,
             ..Self::default()
         };
-        for &(rect, index) in layout_cache {
-            if let Some(slot) = artifact.rect_by_index.get_mut(index) {
-                *slot = Some(rect);
-            }
-        }
         annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);
 
         for index in 0..artifact.nodes.len() {

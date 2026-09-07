@@ -675,6 +675,32 @@ fn collapsed_table_part_block_edge_width(component: &Component, edge: usize) -> 
         .unwrap_or(own)
 }
 
+fn collapsed_empty_row_overlap(
+    component: &Component,
+    boundary_width: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<f32> {
+    if component.style.display != WDisplay::TableRow
+        || component
+            .children
+            .iter()
+            .any(|child| child.style.display == WDisplay::TableCell)
+    {
+        return None;
+    }
+    let height = match component.style.height {
+        WDim::Auto => 0.0,
+        WDim::Px(value) => value,
+        WDim::Percent(_) => return None,
+        WDim::Rem(value) => value * ROOT_FONT_SIZE,
+        WDim::Em(value) => value * component.style.font_size,
+        WDim::Vw(value) => value * viewport_w / 100.0,
+        WDim::Vh(value) => value * viewport_h / 100.0,
+    };
+    Some(height.max(0.0).min(boundary_width))
+}
+
 fn shrink_to_fit_used_width(component: &Component) -> f32 {
     let outer_width = component_max_content_width(component);
     if component.style.float != WFloat::None
@@ -2509,10 +2535,12 @@ fn build_taffy_tree(
                             )
                         })
                 {
+                    let boundary_width = collapsed_table_part_block_edge_width(c, 2)
+                        .max(collapsed_table_part_block_edge_width(next, 0));
                     collapsed_overlap = Some((
                         false,
-                        collapsed_table_part_block_edge_width(c, 2)
-                            .max(collapsed_table_part_block_edge_width(next, 0)),
+                        collapsed_empty_row_overlap(c, boundary_width, viewport_w, viewport_h)
+                            .unwrap_or(boundary_width),
                     ));
                 }
                 if let Some((inline, overlap)) = collapsed_overlap
@@ -4088,6 +4116,65 @@ mod tests {
         let layout = compute(&table, 800.0, 600.0).unwrap();
         let rect = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!((rect(0).width, rect(2).width, rect(4).x), (180.0, 60.0, 40.0));
+    }
+
+    #[test]
+    fn collapsed_empty_row_only_absorbs_its_own_height() {
+        let populated_row = || {
+            Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::TableCell,
+                        border_collapse: true,
+                        border_width: 10.0,
+                        padding: w3cos_std::style::Edges::ZERO,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            width: WDim::Px(10.0),
+                            height: WDim::Px(10.0),
+                            ..Style::default()
+                        },
+                        vec![],
+                    )],
+                )],
+            )
+        };
+        let empty_row = Component::row(
+            Style {
+                display: WDisp::TableRow,
+                border_collapse: true,
+                height: WDim::Px(2.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                border_collapse: true,
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::TableRowGroup,
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                vec![populated_row(), empty_row, populated_row()],
+            )],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!((rect(2).y, rect(5).y, rect(6).y), (0.0, 20.0, 20.0));
+        assert_eq!(rect(0).height, 50.0);
     }
 
     #[test]
