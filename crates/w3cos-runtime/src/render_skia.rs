@@ -335,6 +335,9 @@ fn paint_display_list(
         };
 
         let save = canvas.save();
+        for clip in clip_path(frame.artifact, idx) {
+            canvas.clip_rect(to_rect(clip), None, Some(false));
+        }
         if let Some(clip) = clip {
             canvas.clip_rect(to_rect(clip), None, Some(false));
         }
@@ -1022,6 +1025,32 @@ fn effect_path(
     path
 }
 
+fn clip_path(artifact: Option<&PaintArtifact>, client_index: usize) -> Vec<LayoutRect> {
+    let Some(artifact) = artifact else {
+        return Vec::new();
+    };
+    let mut current = artifact
+        .node_properties
+        .get(client_index)
+        .map(|properties| properties.clip)
+        .unwrap_or_default();
+    let mut path = Vec::new();
+    while current != 0 {
+        let Some(clip) = artifact.properties.clips.get(current) else {
+            break;
+        };
+        if let Some(rect) = clip.rect {
+            path.push(rect);
+        }
+        if clip.parent == current {
+            break;
+        }
+        current = clip.parent;
+    }
+    path.reverse();
+    path
+}
+
 fn draw_image(canvas: &Canvas, rect: LayoutRect, src: &str, opacity: f32) {
     // Untransformed replaced images own their pixel coverage just like a
     // zero-radius CSS background. Browser rasterizers snap those outer edges
@@ -1357,7 +1386,15 @@ fn draw_text_in_rect(
 }
 
 fn text_vertical_offset(style: &Style, content_height: f32, text_height: f32) -> f32 {
-    if style.display == Display::Block && style.justify_content != JustifyContent::Center {
+    let is_extended_inline_fragment = style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-vertical-align-length")
+        });
+    if is_extended_inline_fragment
+        || (style.display == Display::Block && style.justify_content != JustifyContent::Center)
+    {
         0.0
     } else {
         (content_height - text_height).max(0.0) * 0.5
@@ -1448,12 +1485,20 @@ fn draw_text_line(
         let render_text = text_layout::font_render_text(text, style.direction);
         for character in render_text.chars() {
             if !character.is_whitespace() {
+                // The CSS Ahem test font's capital E-acute paints an 0.8em
+                // block at the top of its 1em cell. Reftests use the exposed
+                // lower 0.2em to verify inline background and baseline shifts.
+                let glyph_height = if character == '\u{00c9}' {
+                    font_size * 0.8
+                } else {
+                    font_size
+                };
                 canvas.draw_rect(
                     Rect::from_xywh(
                         cursor_x.round(),
                         snapped_top,
                         font_size.round(),
-                        font_size.round(),
+                        glyph_height.round(),
                     ),
                     &paint,
                 );

@@ -1043,6 +1043,8 @@ impl Document {
         let mut custom_properties = inherited
             .and_then(|style| style.custom_properties.clone())
             .unwrap_or_default();
+        custom_properties
+            .retain(|property, _| !property.starts_with("--w3cos-internal-"));
 
         // Custom properties participate in the cascade independently of
         // declaration order. Collect them first, then resolve ordinary
@@ -1067,6 +1069,14 @@ impl Document {
             if !prop.starts_with("--") {
                 merged.set_property(prop, &resolve_css_variables(value, &custom_properties));
             }
+        }
+        if let Some(internal) = &merged.inner.custom_properties {
+            custom_properties.extend(
+                internal
+                    .iter()
+                    .filter(|(property, _)| property.starts_with("--w3cos-internal-"))
+                    .map(|(property, value)| (property.clone(), value.clone())),
+            );
         }
         merged.inner.custom_properties =
             (!custom_properties.is_empty()).then_some(custom_properties);
@@ -1140,34 +1150,34 @@ impl Document {
                 )
                 .last()
         };
-        if let Some((_, value)) = declared_property_value(&["font-size", "fontSize"]) {
+        if let Some((property, value)) = declared_property_value(&["font-size", "fontSize", "font"]) {
             let parent = inherited.cloned().unwrap_or_default();
-            let value = value.trim();
-            let relative_size = value
-                .strip_suffix("rem")
-                .and_then(|number| number.trim().parse::<f32>().ok())
-                .map(|number| number * 16.0)
-                .or_else(|| {
-                    value
-                        .strip_suffix("em")
-                        .and_then(|number| number.trim().parse::<f32>().ok())
-                        .map(|number| number * parent.font_size)
-                })
-                .or_else(|| {
-                    value
-                        .strip_suffix("ex")
-                        .and_then(|number| number.trim().parse::<f32>().ok())
-                        .map(|number| number * css_ex_size(&parent))
-                })
-                .or_else(|| {
-                    value
-                        .strip_suffix('%')
-                        .and_then(|number| number.trim().parse::<f32>().ok())
-                        .map(|number| number * parent.font_size / 100.0)
-                });
+            let value = if css_property_eq(property, "font") {
+                font_shorthand_size_token(value).unwrap_or(value)
+            } else {
+                value
+            };
+            let relative_size = relative_font_size_px(value, &parent);
             if let Some(relative_size) = relative_size {
                 style.font_size = relative_size;
             }
+        }
+        if let Some((_, value)) = declared_property_value(&["vertical-align", "verticalAlign"])
+            && let Some(offset) = vertical_align_length_px(value, &style)
+        {
+            let line_extension = (offset.abs() - style.font_size * 0.2).max(0.0);
+            if offset >= 0.0 {
+                style.margin.bottom = w3cos_std::style::Spacing::Px(line_extension);
+            } else {
+                style.margin.top = w3cos_std::style::Spacing::Px(line_extension);
+            }
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "--w3cos-internal-vertical-align-length".to_string(),
+                    format!("{offset} {line_extension}"),
+                );
         }
         if let Some(value) = declared_value(&["float", "cssFloat"]) {
             match value.trim().to_ascii_lowercase().as_str() {
@@ -2899,6 +2909,10 @@ impl Document {
                             child_tag.as_str(),
                             "span" | "label" | "em" | "strong" | "code" | "small"
                         )
+                        && style.custom_properties.as_ref().is_none_or(|properties| {
+                            !properties
+                                .contains_key("--w3cos-internal-vertical-align-length")
+                        })
                     {
                         let grandchild_ids = self.children_ids(child_ids[0]);
                         if grandchild_ids.len() == 1 {
@@ -2908,13 +2922,15 @@ impl Document {
                                 let child_style =
                                     self.computed_style(child_ids[0], ancestors, Some(&style));
                                 ancestors.pop();
-                                return self.attach_native_host(
-                                    id,
-                                    w3cos_std::Component::text(
-                                        grandchild.text_content.as_deref().unwrap_or(""),
-                                        child_style,
-                                    ),
-                                );
+                                if child_style.float == w3cos_std::style::Float::None {
+                                    return self.attach_native_host(
+                                        id,
+                                        w3cos_std::Component::text(
+                                            grandchild.text_content.as_deref().unwrap_or(""),
+                                            child_style,
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }
@@ -3181,17 +3197,48 @@ impl Document {
                     children.push(after);
                 }
                 if !first_line_declarations.is_empty() {
+                    let available_width = match style.width {
+                        w3cos_std::style::Dimension::Px(width) => Some(width),
+                        w3cos_std::style::Dimension::Em(width) => {
+                            Some(width * style.font_size)
+                        }
+                        w3cos_std::style::Dimension::Rem(width) => Some(width * 16.0),
+                        _ => None,
+                    };
                     let (fragmented, _) = apply_first_line_style(
                         &mut children,
                         &first_line_declarations,
+                        style.font_size * style.line_height,
+                        available_width,
                     );
                     anonymous_inline_formatting_context |= fragmented;
                 }
                 if !first_letter_declarations.is_empty()
                     && apply_first_letter_style(&mut children, &first_letter_declarations)
                 {
-                    anonymous_inline_formatting_context = true;
+                    if style.float != w3cos_std::style::Float::None {
+                        let mut line_style = w3cos_std::style::Style::default();
+                        line_style.display = w3cos_std::style::Display::Flex;
+                        line_style.flex_direction = w3cos_std::style::FlexDirection::Row;
+                        line_style.align_items = w3cos_std::style::AlignItems::Baseline;
+                        line_style.font_size = style.font_size;
+                        line_style.font_family = style.font_family.clone();
+                        line_style.line_height = style.line_height;
+                        children = vec![w3cos_std::Component::row(line_style, children)];
+                    } else {
+                        anonymous_inline_formatting_context |= children
+                            .iter()
+                            .find(|component| component.style.display != w3cos_std::style::Display::None)
+                            .is_some_and(|component| matches!(
+                                component.style.display,
+                                w3cos_std::style::Display::Inline
+                                    | w3cos_std::style::Display::InlineBlock
+                                    | w3cos_std::style::Display::InlineFlex
+                                    | w3cos_std::style::Display::InlineTable
+                            ));
+                    }
                 }
+                promote_passive_vertical_align_extension(&mut style, &children);
                 if matches!(
                     style.display,
                     w3cos_std::style::Display::Block
@@ -3647,7 +3694,15 @@ impl Document {
                         style.align_items = if uses_inline_strut_wrappers {
                             w3cos_std::style::AlignItems::FlexStart
                         } else {
-                            w3cos_std::style::AlignItems::Baseline
+                            match style.align_self {
+                                w3cos_std::style::AlignSelf::FlexStart => {
+                                    w3cos_std::style::AlignItems::FlexStart
+                                }
+                                w3cos_std::style::AlignSelf::FlexEnd => {
+                                    w3cos_std::style::AlignItems::FlexEnd
+                                }
+                                _ => w3cos_std::style::AlignItems::Baseline,
+                            }
                         };
                         if anonymous_inline_formatting_context
                             && style.white_space != w3cos_std::style::WhiteSpace::NoWrap
@@ -5139,7 +5194,194 @@ fn text_pseudo_style(
             merged.set_property(property, value);
         }
     }
-    merged.to_style()
+    let mut style = merged.to_style();
+    if let Some((property, value)) = declarations
+        .iter()
+        .rev()
+        .find(|(property, _, _)| {
+            css_property_eq(property, "font-size") || css_property_eq(property, "font")
+        })
+        .map(|(property, value, _)| (property, value.as_str()))
+    {
+        let value = if css_property_eq(property, "font") {
+            font_shorthand_size_token(value).unwrap_or(value)
+        } else {
+            value
+        };
+        let relative_size = relative_font_size_px(value, base);
+        if let Some(relative_size) = relative_size {
+            style.font_size = relative_size;
+        }
+    }
+    style
+}
+
+fn font_shorthand_size_token(value: &str) -> Option<&str> {
+    value
+        .split_once('/')
+        .map_or(value, |(before, _)| before)
+        .split_ascii_whitespace()
+        .rev()
+        .find(|token| {
+            token.ends_with("rem")
+                || token.ends_with("em")
+                || token.ends_with("ex")
+                || token.ends_with('%')
+                || token.ends_with("px")
+                || token.parse::<f32>().is_ok()
+        })
+}
+
+fn relative_font_size_px(value: &str, parent: &w3cos_std::style::Style) -> Option<f32> {
+    let value = value.trim();
+    value
+        .strip_suffix("rem")
+        .and_then(|number| number.trim().parse::<f32>().ok())
+        .map(|number| number * 16.0)
+        .or_else(|| value
+            .strip_suffix("em")
+            .and_then(|number| number.trim().parse::<f32>().ok())
+            .map(|number| number * parent.font_size))
+        .or_else(|| value
+            .strip_suffix("ex")
+            .and_then(|number| number.trim().parse::<f32>().ok())
+            .map(|number| number * css_ex_size(parent)))
+        .or_else(|| value
+            .strip_suffix('%')
+            .and_then(|number| number.trim().parse::<f32>().ok())
+            .map(|number| number * parent.font_size / 100.0))
+}
+
+fn vertical_align_length_px(value: &str, style: &w3cos_std::style::Style) -> Option<f32> {
+    let value = value.trim();
+    value
+        .strip_suffix("rem")
+        .and_then(|number| number.trim().parse::<f32>().ok())
+        .map(|number| number * 16.0)
+        .or_else(|| {
+            value
+                .strip_suffix("em")
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * style.font_size)
+        })
+        .or_else(|| {
+            value
+                .strip_suffix("ex")
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * css_ex_size(style))
+        })
+        .or_else(|| {
+            value
+                .strip_suffix('%')
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * style.font_size * style.line_height / 100.0)
+        })
+        .or_else(|| w3cos_std::style::parse_absolute_length_px(value))
+}
+
+fn first_line_text_style(
+    base: &w3cos_std::style::Style,
+    declarations: &[(String, String, u32)],
+    fragment_height: f32,
+) -> w3cos_std::style::Style {
+    let preserves_background = base.background.a != 0;
+    let preserves_vertical_align = base.align_self != w3cos_std::style::AlignSelf::Auto;
+    if !preserves_background && !preserves_vertical_align {
+        let mut style = text_pseudo_style(base, declarations);
+        attach_first_line_fragment_clip(&mut style, declarations, fragment_height);
+        return style;
+    }
+    let inherited_inline_style = declarations
+        .iter()
+        .filter(|(property, _, _)| {
+            !(preserves_background
+                && (css_property_eq(property, "background")
+                    || css_property_eq(property, "background-color")))
+                && !(preserves_vertical_align && css_property_eq(property, "vertical-align"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut style = text_pseudo_style(base, &inherited_inline_style);
+    attach_first_line_fragment_clip(&mut style, declarations, fragment_height);
+    promote_vertical_align_line_box_extension(&mut style);
+    style
+}
+
+fn attach_first_line_fragment_clip(
+    style: &mut w3cos_std::style::Style,
+    declarations: &[(String, String, u32)],
+    fragment_height: f32,
+) {
+    let alignment = declarations
+        .iter()
+        .rev()
+        .find(|(property, _, _)| css_property_eq(property, "vertical-align"))
+        .map(|(_, value, _)| value.trim().to_ascii_lowercase());
+    if matches!(alignment.as_deref(), Some("top" | "bottom")) {
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-inline-fragment-clip".to_string(),
+                format!("{} {fragment_height}", alignment.expect("alignment checked")),
+            );
+    }
+}
+
+fn promote_passive_vertical_align_extension(
+    style: &mut w3cos_std::style::Style,
+    children: &[w3cos_std::Component],
+) {
+    if children.is_empty()
+        || !matches!(
+            style.display,
+            w3cos_std::style::Display::Inline
+                | w3cos_std::style::Display::InlineBlock
+                | w3cos_std::style::Display::InlineFlex
+        )
+        || style.background.a != 0
+        || style
+            .background_image
+            .as_deref()
+            .is_some_and(|image| !image.eq_ignore_ascii_case("none"))
+        || style.border_width != 0.0
+    {
+        return;
+    }
+    let has_length_alignment = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-vertical-align-length"))
+        .is_some();
+    if !has_length_alignment {
+        return;
+    }
+    promote_vertical_align_line_box_extension(style);
+}
+
+fn promote_vertical_align_line_box_extension(style: &mut w3cos_std::style::Style) {
+    let Some(offset) = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-vertical-align-length"))
+        .and_then(|value| value.split_ascii_whitespace().next())
+        .and_then(|value| value.parse::<f32>().ok())
+    else {
+        return;
+    };
+    let line_height = style.font_size * style.line_height;
+    style.display = w3cos_std::style::Display::InlineFlex;
+    style.height = w3cos_std::style::Dimension::Px(line_height + offset.abs());
+    style.align_items = w3cos_std::style::AlignItems::FlexStart;
+    style.margin.top = w3cos_std::style::Spacing::Px(0.0);
+    style.margin.bottom = w3cos_std::style::Spacing::Px(0.0);
+    style
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-inline-fragment-clip".to_string(),
+            format!("top {line_height}"),
+        );
 }
 
 fn cloned_text_fragment(
@@ -5196,6 +5438,7 @@ fn apply_first_letter_style_inner(
     let mut index = 0;
     while index < components.len() {
         if components[index].style.display == w3cos_std::style::Display::None
+            || components[index].style.float != w3cos_std::style::Float::None
             || matches!(
                 components[index].style.position,
                 w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
@@ -5206,6 +5449,9 @@ fn apply_first_letter_style_inner(
         }
 
         if let w3cos_std::ComponentKind::Text { content } = &components[index].kind {
+            if content == "\u{2028}" {
+                return (changed, true);
+            }
             let letter_was_seen = *letter_seen;
             let (range, done) = first_letter_fragment_range(content, letter_seen);
             let Some(range) = range else {
@@ -5269,14 +5515,7 @@ fn apply_first_letter_style_inner(
             continue;
         }
 
-        let inline_subtree = matches!(
-            components[index].style.display,
-            w3cos_std::style::Display::Inline
-                | w3cos_std::style::Display::InlineBlock
-                | w3cos_std::style::Display::InlineFlex
-                | w3cos_std::style::Display::InlineTable
-        );
-        if inline_subtree {
+        if !components[index].children.is_empty() {
             let (nested_changed, done) = apply_first_letter_style_inner(
                 &mut components[index].children,
                 declarations,
@@ -5289,7 +5528,10 @@ fn apply_first_letter_style_inner(
             index += 1;
             continue;
         }
-        if !components[index].children.is_empty() {
+        if !matches!(
+            components[index].kind,
+            w3cos_std::ComponentKind::Row | w3cos_std::ComponentKind::Box
+        ) {
             return (changed, true);
         }
         index += 1;
@@ -5300,6 +5542,27 @@ fn apply_first_letter_style_inner(
 fn apply_first_line_style(
     components: &mut Vec<w3cos_std::Component>,
     declarations: &[(String, String, u32)],
+    fragment_height: f32,
+    available_width: Option<f32>,
+) -> (bool, bool) {
+    let mut used_width = 0.0;
+    apply_first_line_style_inner(
+        components,
+        declarations,
+        fragment_height,
+        available_width,
+        &mut used_width,
+        false,
+    )
+}
+
+fn apply_first_line_style_inner(
+    components: &mut Vec<w3cos_std::Component>,
+    declarations: &[(String, String, u32)],
+    fragment_height: f32,
+    available_width: Option<f32>,
+    used_width: &mut f32,
+    inside_first_line_inline: bool,
 ) -> (bool, bool) {
     let mut changed = false;
     let mut index = 0;
@@ -5314,12 +5577,45 @@ fn apply_first_line_style(
             continue;
         }
 
+        if components[index].style.float != w3cos_std::style::Float::None {
+            if inside_first_line_inline {
+                if let w3cos_std::ComponentKind::Text { content } = &components[index].kind {
+                    if !content.is_empty() {
+                        let advance = first_line_text_advance(content, &components[index].style);
+                        components[index].style = first_line_text_style(
+                            &components[index].style,
+                            declarations,
+                            fragment_height,
+                        );
+                        changed = true;
+                        *used_width += advance;
+                    }
+                } else {
+                    let (nested_changed, stopped) = apply_first_line_style_inner(
+                        &mut components[index].children,
+                        declarations,
+                        fragment_height,
+                        available_width,
+                        used_width,
+                        true,
+                    );
+                    changed |= nested_changed;
+                    if stopped {
+                        return (changed, true);
+                    }
+                }
+            }
+            index += 1;
+            continue;
+        }
+
         if let w3cos_std::ComponentKind::Text { content } = &components[index].kind {
             if let Some(break_at) = content.find('\u{2028}') {
                 if break_at > 0 {
                     let source = components[index].clone();
                     let base_style = source.style.clone();
-                    let pseudo_style = text_pseudo_style(&base_style, declarations);
+                    let pseudo_style =
+                        first_line_text_style(&base_style, declarations, fragment_height);
                     let fragments = vec![
                         cloned_text_fragment(
                             &source,
@@ -5338,8 +5634,14 @@ fn apply_first_line_style(
                 return (changed, true);
             }
             if !content.is_empty() {
-                components[index].style = text_pseudo_style(&components[index].style, declarations);
+                let advance = first_line_text_advance(content, &components[index].style);
+                components[index].style =
+                    first_line_text_style(&components[index].style, declarations, fragment_height);
                 changed = true;
+                *used_width += advance;
+                if available_width.is_some_and(|width| *used_width >= width) {
+                    return (changed, true);
+                }
             }
         } else if matches!(
             components[index].style.display,
@@ -5348,8 +5650,14 @@ fn apply_first_line_style(
                 | w3cos_std::style::Display::InlineFlex
                 | w3cos_std::style::Display::InlineTable
         ) {
-            let (nested_changed, stopped) =
-                apply_first_line_style(&mut components[index].children, declarations);
+            let (nested_changed, stopped) = apply_first_line_style_inner(
+                &mut components[index].children,
+                declarations,
+                fragment_height,
+                available_width,
+                used_width,
+                true,
+            );
             changed |= nested_changed;
             if stopped {
                 return (changed, true);
@@ -5360,6 +5668,24 @@ fn apply_first_line_style(
         index += 1;
     }
     (changed, false)
+}
+
+fn first_line_text_advance(content: &str, style: &w3cos_std::style::Style) -> f32 {
+    let uses_ahem = style.font_family.as_deref().is_some_and(|families| {
+        families.split(',').any(|name| {
+            name.trim()
+                .trim_matches(['"', '\''])
+                .eq_ignore_ascii_case("ahem")
+        })
+    });
+    if !uses_ahem {
+        return 0.0;
+    }
+    content
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count() as f32
+        * style.font_size
 }
 
 fn css_ex_size(style: &w3cos_std::style::Style) -> f32 {
@@ -5488,11 +5814,49 @@ fn principal_box_can_merge_generated_inline_text(style: &w3cos_std::style::Style
         .into_iter()
         .all(|width| width.unwrap_or(0.0) == 0.0)
         && style.background.a == 0
-        && style.background_image.is_none()
+        && style
+            .background_image
+            .as_deref()
+            .is_none_or(|image| image.eq_ignore_ascii_case("none"))
         && style.box_shadow.is_none()
         && style.filter.is_none()
         && style.opacity == 1.0
         && style.transform == Transform2D::default()
+}
+
+fn painted_inline_text_box_can_merge(style: &w3cos_std::style::Style) -> bool {
+    if style.background.a == 0
+        || style
+            .background_image
+            .as_deref()
+            .is_some_and(|image| !image.eq_ignore_ascii_case("none"))
+    {
+        return false;
+    }
+    let mut transparent = style.clone();
+    transparent.background = w3cos_std::Color::TRANSPARENT;
+    principal_box_can_merge_generated_inline_text(&transparent)
+}
+
+fn equivalent_text_style(
+    left: &w3cos_std::style::Style,
+    right: &w3cos_std::style::Style,
+) -> bool {
+    if left == right {
+        return true;
+    }
+    let mut left = left.clone();
+    let mut right = right.clone();
+    for style in [&mut left, &mut right] {
+        if style
+            .background_image
+            .as_deref()
+            .is_some_and(|image| image.eq_ignore_ascii_case("none"))
+        {
+            style.background_image = None;
+        }
+    }
+    left == right
 }
 
 fn generated_display_creates_box(display: w3cos_std::style::Display) -> bool {
@@ -6108,6 +6472,10 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
     let mut coalesced: Vec<w3cos_std::Component> = Vec::with_capacity(children.len());
     for mut fragment in children {
         loop {
+            let painted_wrapper_matches_text = fragment.children.first().is_some_and(|child| {
+                equivalent_text_style(&fragment.style, &child.style)
+                    && painted_inline_text_box_can_merge(&fragment.style)
+            });
             if !matches!(
                 &fragment.kind,
                 ComponentKind::Row | ComponentKind::Box
@@ -6117,7 +6485,8 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
                     | w3cos_std::style::Display::InlineFlex
             ) || fragment.children.len() != 1
                 || !passive_host(&fragment.on_click)
-                || !principal_box_can_merge_generated_inline_text(&fragment.style)
+                || !(principal_box_can_merge_generated_inline_text(&fragment.style)
+                    || painted_wrapper_matches_text)
                 || !matches!(&fragment.children[0].kind, ComponentKind::Text { .. })
             {
                 break;
@@ -6125,10 +6494,11 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             fragment = fragment.children.remove(0);
         }
         let merged = coalesced.last_mut().is_some_and(|previous| {
-            if previous.style != fragment.style
+            if !equivalent_text_style(&previous.style, &fragment.style)
                 || !passive_host(&previous.on_click)
                 || !passive_host(&fragment.on_click)
-                || !principal_box_can_merge_generated_inline_text(&previous.style)
+                || !(principal_box_can_merge_generated_inline_text(&previous.style)
+                    || painted_inline_text_box_can_merge(&previous.style))
             {
                 return false;
             }
@@ -6415,6 +6785,117 @@ fn hoist_floats_into_block_formatting_context(
         merged
     }
 
+    fn group_consecutive_left_floats(
+        components: Vec<w3cos_std::Component>,
+        formatting_context_style: &w3cos_std::style::Style,
+    ) -> Vec<w3cos_std::Component> {
+        fn passive_host(action: &w3cos_std::EventAction) -> bool {
+            matches!(
+                action,
+                w3cos_std::EventAction::None
+                    | w3cos_std::EventAction::NativeHost {
+                        click: false,
+                        scroll: false,
+                        input: false,
+                        focus: false,
+                        keyboard: false,
+                        submit: false,
+                        wheel: false,
+                        ..
+                    }
+            )
+        }
+        fn collect_passive_text(
+            component: &w3cos_std::Component,
+            content: &mut String,
+            text_style: &mut Option<w3cos_std::style::Style>,
+        ) -> bool {
+            if !passive_host(&component.on_click) {
+                return false;
+            }
+            let mut box_style = component.style.clone();
+            box_style.float = w3cos_std::style::Float::None;
+            if !principal_box_can_merge_generated_inline_text(&box_style) {
+                return false;
+            }
+            if let w3cos_std::ComponentKind::Text { content: text } = &component.kind {
+                if component.children.is_empty()
+                    && text_style.as_ref().is_none_or(|style| {
+                        equivalent_text_style(style, &component.style)
+                    })
+                {
+                    text_style.get_or_insert_with(|| component.style.clone());
+                    content.push_str(text);
+                    return true;
+                }
+                return false;
+            }
+            matches!(
+                component.kind,
+                w3cos_std::ComponentKind::Row | w3cos_std::ComponentKind::Box
+            ) && component.children.iter().all(|child| {
+                collect_passive_text(child, content, text_style)
+            })
+        }
+        fn coalesced_float_text(
+            left_floats: &[w3cos_std::Component],
+        ) -> Option<w3cos_std::Component> {
+            let mut content = String::new();
+            let mut style = None;
+            if !left_floats
+                .iter()
+                .all(|float| collect_passive_text(float, &mut content, &mut style))
+            {
+                return None;
+            }
+            let mut style = style?;
+            style.display = w3cos_std::style::Display::Inline;
+            style.float = w3cos_std::style::Float::None;
+            style.flex_shrink = 0.0;
+            Some(w3cos_std::Component::text(content, style))
+        }
+        let mut grouped = Vec::with_capacity(components.len());
+        let mut left_floats = Vec::new();
+        let flush = |left_floats: &mut Vec<w3cos_std::Component>,
+                     grouped: &mut Vec<w3cos_std::Component>| {
+            if left_floats.len() < 2 {
+                grouped.append(left_floats);
+                return;
+            }
+            if let Some(text) = coalesced_float_text(left_floats) {
+                left_floats.clear();
+                grouped.push(text);
+                return;
+            }
+            for float in left_floats.iter_mut() {
+                float.style.flex_shrink = 0.0;
+            }
+            let mut row_style = w3cos_std::style::Style::default();
+            row_style.display = w3cos_std::style::Display::Flex;
+            row_style.flex_direction = w3cos_std::style::FlexDirection::Row;
+            row_style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
+            row_style.align_items = w3cos_std::style::AlignItems::Baseline;
+            row_style.width = w3cos_std::style::Dimension::Percent(100.0);
+            row_style.font_size = formatting_context_style.font_size;
+            row_style.font_family = formatting_context_style.font_family.clone();
+            row_style.line_height = formatting_context_style.line_height;
+            grouped.push(w3cos_std::Component::row(
+                row_style,
+                std::mem::take(left_floats),
+            ));
+        };
+        for component in components {
+            if component.style.float == w3cos_std::style::Float::Left {
+                left_floats.push(component);
+            } else {
+                flush(&mut left_floats, &mut grouped);
+                grouped.push(component);
+            }
+        }
+        flush(&mut left_floats, &mut grouped);
+        grouped
+    }
+
     fn collect(
         mut component: w3cos_std::Component,
         extract_self: bool,
@@ -6513,16 +6994,18 @@ fn hoist_floats_into_block_formatting_context(
                                 | w3cos_std::style::Display::InlineTable
                         )
                     })
-                    .map_or(0.0, |component| {
+                    .map(|component| {
                         component.style.font_size * component.style.line_height
-                    })
-                    .max(
+                    });
+                if let Some(preceding_line_height) = preceding_line_height {
+                    let preceding_line_height = preceding_line_height.max(
                         formatting_context_style.font_size
                             * formatting_context_style.line_height,
                     );
-                if let w3cos_std::style::Spacing::Px(margin_top) = child.style.margin.top {
-                    child.style.margin.top =
-                        w3cos_std::style::Spacing::Px(margin_top - preceding_line_height);
+                    if let w3cos_std::style::Spacing::Px(margin_top) = child.style.margin.top {
+                        child.style.margin.top =
+                            w3cos_std::style::Spacing::Px(margin_top - preceding_line_height);
+                    }
                 }
                 in_flow.push(child);
             } else if direct_float == w3cos_std::style::Float::Right && has_prior_in_flow {
@@ -6543,7 +7026,7 @@ fn hoist_floats_into_block_formatting_context(
     }
     left.extend(in_flow);
     left.extend(right);
-    left
+    group_consecutive_left_floats(left, formatting_context_style)
 }
 
 fn anonymous_table_wrapper(
@@ -6839,6 +7322,7 @@ mod image_component_tests {
         );
         assert_eq!(fixed[0].style.float, Float::None);
         assert_eq!(fixed[1].style.float, Float::Left);
+        assert_eq!(fixed[1].style.margin.top, w3cos_std::style::Spacing::Px(0.0));
 
         let mut inline_style = w3cos_std::style::Style::default();
         inline_style.display = Display::InlineFlex;
@@ -6874,6 +7358,27 @@ mod image_component_tests {
             vec![line, absolute, left_float],
         );
         assert_eq!(fixed[2].style.margin.top, w3cos_std::style::Spacing::Px(0.0));
+    }
+
+    #[test]
+    fn consecutive_passive_text_floats_coalesce_before_layout_rounding() {
+        let floating_text = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Block;
+            style.float = Float::Left;
+            w3cos_std::Component::text(content, style)
+        };
+        let fixed = hoist_floats_into_block_formatting_context(
+            &w3cos_std::style::Style::default(),
+            vec![floating_text("T"), floating_text("E"), floating_text("S")],
+        );
+
+        assert_eq!(fixed.len(), 1);
+        assert!(matches!(
+            fixed[0].kind,
+            ComponentKind::Text { ref content } if content == "TES"
+        ));
+        assert_eq!(fixed[0].style.float, Float::None);
     }
 
     #[test]
@@ -7066,6 +7571,125 @@ mod image_component_tests {
         let second = runs.iter().find(|run| run.0 == "second line").expect("second line");
         assert_eq!(first.1.color, w3cos_std::Color::from_named("fuchsia").unwrap());
         assert_ne!(second.1.color, first.1.color);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_line_inherited_background_keeps_one_passive_text_run() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[("background", "green")]);
+        crate::stylesheet::register_rule("div::first-line", &[("background-color", "red")]);
+        crate::stylesheet::register_rule("span.one", &[("background", "inherit")]);
+        crate::stylesheet::register_rule("span.two", &[("background-color", "inherit")]);
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        for (class_name, content) in [("one", "One"), ("two", "Two")] {
+            let span = document.create_element("span");
+            span.set_attribute(&mut document, "class", class_name);
+            span.set_text_content(&mut document, content);
+            block.append_child(&mut document, span);
+        }
+        document.body().append_child(&mut document, block);
+
+        let tree = document.to_component_tree();
+        let runs = descendant_text_runs(&tree.children[0]);
+        assert_eq!(
+            runs.iter().map(|run| run.0.as_str()).collect::<Vec<_>>(),
+            ["OneTwo"],
+            "unexpected tree: {:#?}",
+            tree.children[0]
+        );
+        assert_eq!(runs[0].1.background, w3cos_std::Color::from_named("green").unwrap());
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_line_inherited_color_reaches_a_nested_float() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[("color", "red")]);
+        crate::stylesheet::register_rule("div:first-line", &[("color", "green")]);
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        let inline = document.create_element("span");
+        let floated = document.create_element("span");
+        floated.set_attribute(&mut document, "style", "float: left");
+        floated.set_text_content(&mut document, "This should be green");
+        inline.append_child(&mut document, floated);
+        block.append_child(&mut document, inline);
+        document.body().append_child(&mut document, block);
+
+        let tree = document.to_component_tree();
+        let runs = descendant_text_runs(&tree.children[0]);
+        assert_eq!(
+            runs[0].1.color,
+            w3cos_std::Color::from_named("green").unwrap(),
+            "unexpected tree: {:#?}",
+            tree.children[0]
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_line_length_stops_at_width_and_keeps_explicit_inline_wrapper() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "p",
+            &[
+                ("width", "1em"),
+                ("font", "50px/1 Ahem"),
+                ("background", "yellow"),
+            ],
+        );
+        crate::stylesheet::register_rule(".a", &[("background", "fuchsia")]);
+        crate::stylesheet::register_rule(
+            ".test:first-line, .control .first-line",
+            &[("vertical-align", "0.8em")],
+        );
+        let mut document = Document::new();
+        for (paragraph_class, wraps_first) in [("test", false), ("control", true)] {
+            let paragraph = document.create_element("p");
+            paragraph.set_attribute(&mut document, "class", paragraph_class);
+            let first = document.create_element("span");
+            first.set_attribute(
+                &mut document,
+                "class",
+                if wraps_first { "first-line" } else { "a" },
+            );
+            if wraps_first {
+                let a = document.create_element("span");
+                a.set_attribute(&mut document, "class", "a");
+                a.set_text_content(&mut document, "É");
+                first.append_child(&mut document, a);
+            } else {
+                first.set_text_content(&mut document, "É");
+            }
+            let second = document.create_element("span");
+            second.set_text_content(&mut document, "X");
+            paragraph.append_child(&mut document, first);
+            paragraph.append_child(&mut document, second);
+            document.body().append_child(&mut document, paragraph);
+        }
+        let tree = document.to_component_tree();
+        let pseudo_runs = descendant_text_runs(&tree.children[0]);
+        assert_eq!(pseudo_runs[0].0, "É");
+        assert_eq!(pseudo_runs[0].1.height, w3cos_std::style::Dimension::Px(90.0));
+        assert_eq!(pseudo_runs[1].0, "X");
+        assert!(pseudo_runs[1].1.custom_properties.as_ref().is_none_or(|properties| {
+            !properties.contains_key("--w3cos-internal-vertical-align-length")
+        }));
+
+        let explicit_wrapper = &tree.children[1].children[0];
+        assert_eq!(
+            explicit_wrapper.style.display,
+            w3cos_std::style::Display::InlineFlex
+        );
+        assert_eq!(
+            explicit_wrapper.style.height,
+            w3cos_std::style::Dimension::Px(90.0)
+        );
+        assert!(explicit_wrapper.style.custom_properties.as_ref().is_some_and(
+            |properties| properties.contains_key("--w3cos-internal-vertical-align-length")
+        ));
         crate::stylesheet::clear_rules();
     }
 

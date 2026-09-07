@@ -573,11 +573,30 @@ impl CSSStyleDeclaration {
             }
             "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
             "vertical-align" | "verticalAlign" => {
-                self.inner.align_self = match value.trim() {
-                    "top" | "text-top" => w3cos_std::style::AlignSelf::FlexStart,
-                    "bottom" | "text-bottom" => w3cos_std::style::AlignSelf::FlexEnd,
-                    "middle" => w3cos_std::style::AlignSelf::Center,
-                    _ => w3cos_std::style::AlignSelf::Baseline,
+                let value = value.trim();
+                if let Some(offset) = parse_vertical_align_length(value, &self.inner) {
+                    self.inner.align_self = w3cos_std::style::AlignSelf::Baseline;
+                    let baseline_descent = self.inner.font_size * 0.2;
+                    let line_extension = (offset.abs() - baseline_descent).max(0.0);
+                    if offset >= 0.0 {
+                        self.inner.margin.bottom = Spacing::Px(line_extension);
+                    } else {
+                        self.inner.margin.top = Spacing::Px(line_extension);
+                    }
+                    self.inner
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            "--w3cos-internal-vertical-align-length".to_string(),
+                            format!("{offset} {line_extension}"),
+                        );
+                } else {
+                    self.inner.align_self = match value {
+                        "top" | "text-top" => w3cos_std::style::AlignSelf::FlexStart,
+                        "bottom" | "text-bottom" => w3cos_std::style::AlignSelf::FlexEnd,
+                        "middle" => w3cos_std::style::AlignSelf::Center,
+                        _ => w3cos_std::style::AlignSelf::Baseline,
+                    }
                 }
             }
             "align-content" | "alignContent" => {
@@ -1739,6 +1758,32 @@ fn parse_visibility(value: &str) -> w3cos_std::style::Visibility {
     }
 }
 
+fn parse_vertical_align_length(value: &str, style: &Style) -> Option<f32> {
+    value
+        .strip_suffix("rem")
+        .and_then(|number| number.trim().parse::<f32>().ok())
+        .map(|number| number * 16.0)
+        .or_else(|| {
+            value
+                .strip_suffix("em")
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * style.font_size)
+        })
+        .or_else(|| {
+            value
+                .strip_suffix("ex")
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * style.font_size * 0.5)
+        })
+        .or_else(|| {
+            value
+                .strip_suffix('%')
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * style.font_size * style.line_height / 100.0)
+        })
+        .or_else(|| parse_px(value))
+}
+
 fn parse_align_self(value: &str) -> w3cos_std::style::AlignSelf {
     use w3cos_std::style::AlignSelf;
     match value.trim() {
@@ -2041,6 +2086,16 @@ mod tests {
             assert_eq!(declaration.inner.align_self, expected);
             assert_eq!(declaration.get_property("vertical-align"), value);
         }
+    }
+
+    #[test]
+    fn vertical_align_length_extends_the_baseline_side_of_the_line_box() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.inner.font_size = 50.0;
+        declaration.set_property("vertical-align", "0.8em");
+
+        assert_eq!(declaration.inner.align_self, w3cos_std::style::AlignSelf::Baseline);
+        assert_eq!(declaration.inner.margin.bottom, Spacing::Px(30.0));
     }
 
     #[test]

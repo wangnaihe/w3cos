@@ -214,6 +214,49 @@ fn background_position_uses_relative_basis(position: &str) -> bool {
     })
 }
 
+fn inline_fragment_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
+    let internal_clip = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-inline-fragment-clip"))
+        .and_then(|value| {
+            let mut parts = value.split_ascii_whitespace();
+            let alignment = parts.next()?;
+            let height = parts.next()?.parse::<f32>().ok()?;
+            Some((alignment, height))
+        });
+    let (alignment, height) = internal_clip.or_else(|| {
+        if !matches!(
+            style.display,
+            w3cos_std::style::Display::Inline
+                | w3cos_std::style::Display::InlineBlock
+                | w3cos_std::style::Display::InlineFlex
+        ) {
+            return None;
+        }
+        let alignment = match style.align_self {
+            w3cos_std::style::AlignSelf::FlexStart => "top",
+            w3cos_std::style::AlignSelf::FlexEnd => "bottom",
+            _ => return None,
+        };
+        Some((alignment, style.font_size * style.line_height))
+    })?;
+    let height = height.clamp(0.0, rect.height);
+    if height >= rect.height {
+        return None;
+    }
+    Some(LayoutRect {
+        x: rect.x,
+        y: if alignment.eq_ignore_ascii_case("bottom") {
+            rect.y + rect.height - height
+        } else {
+            rect.y
+        },
+        width: rect.width,
+        height,
+    })
+}
+
 impl PaintArtifact {
     pub fn build(
         nodes: impl IntoIterator<Item = PaintNode>,
@@ -390,6 +433,16 @@ impl PaintArtifact {
                 rect: self.rect_by_index[index],
             });
         }
+        if let Some(rect) = self.rect_by_index[index]
+            && let Some(fragment_clip) = inline_fragment_clip_rect(&node.style, rect)
+        {
+            let parent = properties.clip;
+            properties.clip = self.properties.clips.len();
+            self.properties.clips.push(ClipNode {
+                parent,
+                rect: Some(fragment_clip),
+            });
+        }
         if node.style.opacity < 0.999 || node.style.filter.is_some() {
             properties.effect = self.properties.effects.len();
             self.properties.effects.push(EffectNode {
@@ -441,6 +494,61 @@ mod tests {
             width: 320.0,
             height: 80.0,
         }
+    }
+
+    #[test]
+    fn inline_fragment_clip_keeps_layout_rect_and_clips_only_paint() {
+        let mut style = Style::default();
+        style.display = w3cos_std::style::Display::InlineFlex;
+        style.font_size = 20.0;
+        style.line_height = 1.0;
+        style.align_self = w3cos_std::style::AlignSelf::FlexEnd;
+        let layout = LayoutRect {
+            x: 12.0,
+            y: 40.0,
+            width: 100.0,
+            height: 80.0,
+        };
+
+        assert_eq!(
+            inline_fragment_clip_rect(&style, layout),
+            Some(LayoutRect {
+                x: 12.0,
+                y: 100.0,
+                width: 100.0,
+                height: 20.0,
+            })
+        );
+    }
+
+    #[test]
+    fn first_line_internal_clip_uses_the_originating_line_height() {
+        let mut style = Style::default();
+        style.display = w3cos_std::style::Display::Inline;
+        style.font_size = 100.0;
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-inline-fragment-clip".to_string(),
+                "top 60".to_string(),
+            );
+        let layout = LayoutRect {
+            x: 0.0,
+            y: 10.0,
+            width: 80.0,
+            height: 100.0,
+        };
+
+        assert_eq!(
+            inline_fragment_clip_rect(&style, layout),
+            Some(LayoutRect {
+                x: 0.0,
+                y: 10.0,
+                width: 80.0,
+                height: 60.0,
+            })
+        );
     }
 
     #[test]
