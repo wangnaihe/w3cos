@@ -1140,6 +1140,7 @@ fn close_css_value_at_eof(value: &str) -> String {
     let mut delimiters = Vec::new();
     let bytes = value.as_bytes();
     let mut pos = 0usize;
+    let mut url_eof_closure = None;
     while pos < value.len() {
         let character = value[pos..].chars().next().expect("character boundary");
         if escaped {
@@ -1160,7 +1161,11 @@ fn close_css_value_at_eof(value: &str) -> String {
             continue;
         }
         if pos + 4 <= bytes.len() && bytes[pos..pos + 4].eq_ignore_ascii_case(b"url(") {
-            pos = css_url_token_end(bytes, pos + 4);
+            let token_start = pos + 4;
+            pos = css_url_token_end(bytes, token_start);
+            if pos == bytes.len() && bytes.last() != Some(&b')') {
+                url_eof_closure = css_url_eof_closure(&bytes[token_start..]);
+            }
             continue;
         }
         match character {
@@ -1179,7 +1184,57 @@ fn close_css_value_at_eof(value: &str) -> String {
         closed.push(active_quote);
     }
     closed.extend(delimiters.into_iter().rev());
+    if let Some(closure) = url_eof_closure {
+        closed.push_str(closure);
+    }
     closed
+}
+
+fn css_url_eof_closure(mut bytes: &[u8]) -> Option<&'static str> {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    let Some(&first) = bytes.first() else {
+        return Some(")");
+    };
+    if matches!(first, b'\'' | b'"') {
+        let quote = first;
+        let mut escaped = false;
+        for (index, &byte) in bytes[1..].iter().enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if byte == b'\\' {
+                escaped = true;
+                continue;
+            }
+            if matches!(byte, b'\n' | b'\r' | b'\x0c') {
+                return None;
+            }
+            if byte == quote {
+                return bytes[index + 2..]
+                    .iter()
+                    .all(u8::is_ascii_whitespace)
+                    .then_some(")");
+            }
+        }
+        return Some(if quote == b'"' { "\")" } else { "')" });
+    }
+
+    let mut escaped = false;
+    for &byte in bytes {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+        } else if matches!(byte, b'\'' | b'"' | b'(' | b'\0'..=b'\x08' | b'\x0b' | b'\x0e'..=b'\x1f' | b'\x7f') {
+            return None;
+        }
+    }
+    Some(")")
 }
 
 fn split_top_level(s: &str, sep: u8) -> Vec<String> {
@@ -1520,6 +1575,14 @@ mod tests {
     fn eof_closes_functions_strings_and_import_rules() {
         assert_eq!(close_css_value_at_eof("rgb(0, 128, 0"), "rgb(0, 128, 0)");
         assert_eq!(close_css_value_at_eof("\"Filler Text"), "\"Filler Text\"");
+        assert_eq!(
+            close_css_value_at_eof("url(\"support/swatch-green.png"),
+            "url(\"support/swatch-green.png\")"
+        );
+        assert_eq!(
+            close_css_value_at_eof("url(support/swatch-green.png"),
+            "url(support/swatch-green.png)"
+        );
 
         let declaration = parse_css_source("div { color: rgb(0, 128, 0", "eof.css");
         assert_eq!(declaration.rules[0].declarations[0].1, "rgb(0, 128, 0)");
