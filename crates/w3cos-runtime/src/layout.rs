@@ -1950,6 +1950,65 @@ fn build_taffy_tree(
             style.gap.height = LengthPercentage::length(spacing_y);
         }
     }
+    let table_cell_padding = comp.style.padding_lengths();
+    let uses_ua_table_cell_padding = comp.style.display == WDisplay::TableCell
+        && comp
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-table-cell-ua-padding")
+            });
+    let absolute_dimension = |dimension: WDim| match dimension {
+        WDim::Px(value) => Some(value),
+        WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
+        WDim::Em(value) => Some(value * comp.style.font_size),
+        WDim::Vw(value) => Some(value * viewport_w / 100.0),
+        WDim::Vh(value) => Some(value * viewport_h / 100.0),
+        WDim::Auto | WDim::Percent(_) => None,
+    };
+    let absorbs_ua_inline_padding = uses_ua_table_cell_padding
+        && absolute_dimension(comp.style.width).is_some();
+    let absorbs_ua_block_padding = uses_ua_table_cell_padding
+        && absolute_dimension(comp.style.height).is_some();
+    if absorbs_ua_inline_padding || absorbs_ua_block_padding {
+        // A table-cell's CSS width/height participates in table sizing as its
+        // minimum box size. Normalize the UA's 1px padding into definite
+        // dimensions so equivalent legacy cellpadding=0 references produce
+        // the same anonymous content box without changing the outer cell.
+        if let Some(width) = absolute_dimension(comp.style.width) {
+            style.size.width = Dimension::length(
+                width + table_cell_padding.left + table_cell_padding.right,
+            );
+        }
+        if let Some(height) = absolute_dimension(comp.style.height) {
+            style.size.height = Dimension::length(
+                height + table_cell_padding.top + table_cell_padding.bottom,
+            );
+        }
+        style.padding = Rect {
+            top: LengthPercentage::length(if absorbs_ua_block_padding {
+                0.0
+            } else {
+                table_cell_padding.top
+            }),
+            right: LengthPercentage::length(if absorbs_ua_inline_padding {
+                0.0
+            } else {
+                table_cell_padding.right
+            }),
+            bottom: LengthPercentage::length(if absorbs_ua_block_padding {
+                0.0
+            } else {
+                table_cell_padding.bottom
+            }),
+            left: LengthPercentage::length(if absorbs_ua_inline_padding {
+                0.0
+            } else {
+                table_cell_padding.left
+            }),
+        };
+    }
     if comp.style.display == WDisplay::TableCell
         && table_column == Some(0)
         && let Some(track) = inherited_collapsed_single_track
@@ -1963,7 +2022,12 @@ fn build_taffy_tree(
             .style
             .border_right_width
             .unwrap_or(comp.style.border_width);
-        let content_width = (border_box_width - left - right).max(0.0);
+        let padding_width = if absorbs_ua_inline_padding {
+            0.0
+        } else {
+            table_cell_padding.left + table_cell_padding.right
+        };
+        let content_width = (border_box_width - left - right - padding_width).max(0.0);
         style.size.width = Dimension::length(content_width);
         style.flex_basis = Dimension::length(content_width);
         style.flex_grow = 0.0;
@@ -1978,7 +2042,6 @@ fn build_taffy_tree(
             style.box_sizing = BoxSizing::BorderBox;
             width
         } else {
-            let padding = comp.style.padding_lengths();
             let left_border = comp
                 .style
                 .border_left_width
@@ -1987,8 +2050,12 @@ fn build_taffy_tree(
                 .style
                 .border_right_width
                 .unwrap_or(comp.style.border_width);
-            let horizontal_inner_edges = padding.left
-                + padding.right
+            let horizontal_padding = if absorbs_ua_inline_padding {
+                0.0
+            } else {
+                table_cell_padding.left + table_cell_padding.right
+            };
+            let horizontal_inner_edges = horizontal_padding
                 + if comp.style.border_collapse {
                     (left_border + right_border) / 2.0
                 } else {

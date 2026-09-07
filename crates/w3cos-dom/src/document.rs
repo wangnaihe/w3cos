@@ -2690,6 +2690,28 @@ impl Document {
         let mut style = self.computed_style(id, ancestors, inherited);
         let tag = node.tag.as_str();
         self.apply_svg_presentation_style(id, &tag, &mut style);
+        if tag.as_str() == "table" {
+            let author_declares_border_spacing = self.styles[id.0 as usize]
+                .inline_declarations
+                .iter()
+                .any(|(property, _)| property == "border-spacing")
+                || stylesheet::matching_declarations_for_node(self, id)
+                    .iter()
+                    .any(|(property, _, _)| property == "border-spacing");
+            if !author_declares_border_spacing
+                && let Some(cell_spacing) = node
+                    .attributes
+                    .iter()
+                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case("cellspacing"))
+                    .and_then(|(_, value)| value.trim().parse::<f32>().ok())
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+            {
+                // The legacy HTML cellspacing attribute is a presentational
+                // hint below author CSS, just like cellpadding.
+                style.border_spacing_x = cell_spacing;
+                style.border_spacing_y = cell_spacing;
+            }
+        }
         if matches!(tag.as_str(), "td" | "th") {
             let author_declares_padding = self.styles[id.0 as usize]
                 .inline_declarations
@@ -2699,6 +2721,7 @@ impl Document {
                     .iter()
                     .any(|(property, _, _)| property.starts_with("padding"));
             if !author_declares_padding {
+                let mut presentational_padding = false;
                 let mut ancestor = node.parent;
                 while let Some(ancestor_id) = ancestor {
                     let ancestor_node = self.get_node(ancestor_id);
@@ -2714,10 +2737,20 @@ impl Document {
                             // presentational hint below author CSS. Apply it
                             // only when the cell has no authored padding.
                             style.padding = w3cos_std::style::Edges::all(cell_padding);
+                            presentational_padding = true;
                         }
                         break;
                     }
                     ancestor = ancestor_node.parent;
+                }
+                if !presentational_padding {
+                    style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            "--w3cos-internal-table-cell-ua-padding".to_string(),
+                            "1".to_string(),
+                        );
                 }
             }
         }
@@ -8084,6 +8117,25 @@ mod image_component_tests {
             tree.children[0].children[0].children[0].style.padding,
             w3cos_std::style::Edges::all(7.0)
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn table_cellspacing_overrides_ua_spacing_but_not_author_spacing() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let table = document.create_element("table");
+        table.set_attribute(&mut document, "cellspacing", "0");
+        document.body().append_child(&mut document, table);
+
+        let tree = document.to_component_tree();
+        assert_eq!(tree.children[0].style.border_spacing_x, 0.0);
+        assert_eq!(tree.children[0].style.border_spacing_y, 0.0);
+
+        crate::stylesheet::register_rule("table", &[("border-spacing", "7px")]);
+        let tree = document.to_component_tree();
+        assert_eq!(tree.children[0].style.border_spacing_x, 7.0);
+        assert_eq!(tree.children[0].style.border_spacing_y, 7.0);
         crate::stylesheet::clear_rules();
     }
 
