@@ -91,6 +91,9 @@ impl CSSStyleDeclaration {
             "border-collapse" | "borderCollapse" => {
                 self.inner.border_collapse = value.trim().eq_ignore_ascii_case("collapse");
             }
+            "table-layout" | "tableLayout" => {
+                self.inner.table_layout_fixed = value.trim().eq_ignore_ascii_case("fixed");
+            }
             "empty-cells" | "emptyCells" => {
                 self.inner.empty_cells_hide = value.trim().eq_ignore_ascii_case("hide");
             }
@@ -700,6 +703,13 @@ impl CSSStyleDeclaration {
                     "collapse".to_string()
                 } else {
                     "separate".to_string()
+                }
+            }
+            "table-layout" | "tableLayout" => {
+                if self.inner.table_layout_fixed {
+                    "fixed".to_string()
+                } else {
+                    "auto".to_string()
                 }
             }
             "empty-cells" | "emptyCells" => {

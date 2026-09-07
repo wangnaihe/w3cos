@@ -2690,6 +2690,37 @@ impl Document {
         let mut style = self.computed_style(id, ancestors, inherited);
         let tag = node.tag.as_str();
         self.apply_svg_presentation_style(id, &tag, &mut style);
+        if matches!(tag.as_str(), "td" | "th") {
+            let author_declares_padding = self.styles[id.0 as usize]
+                .inline_declarations
+                .iter()
+                .any(|(property, _)| property.starts_with("padding"))
+                || stylesheet::matching_declarations_for_node(self, id)
+                    .iter()
+                    .any(|(property, _, _)| property.starts_with("padding"));
+            if !author_declares_padding {
+                let mut ancestor = node.parent;
+                while let Some(ancestor_id) = ancestor {
+                    let ancestor_node = self.get_node(ancestor_id);
+                    if ancestor_node.tag.as_str() == "table" {
+                        if let Some(cell_padding) = ancestor_node
+                            .attributes
+                            .iter()
+                            .find(|(name, _)| name.as_str().eq_ignore_ascii_case("cellpadding"))
+                            .and_then(|(_, value)| value.trim().parse::<f32>().ok())
+                            .filter(|value| value.is_finite() && *value >= 0.0)
+                        {
+                            // The legacy HTML cellpadding attribute is a
+                            // presentational hint below author CSS. Apply it
+                            // only when the cell has no authored padding.
+                            style.padding = w3cos_std::style::Edges::all(cell_padding);
+                        }
+                        break;
+                    }
+                    ancestor = ancestor_node.parent;
+                }
+            }
+        }
 
         match node.node_type {
             NodeType::Text | NodeType::CdataSection | NodeType::ProcessingInstruction => {
@@ -6574,6 +6605,9 @@ fn relative_border_width_px(value: &str, style: &w3cos_std::style::Style) -> Opt
 fn normalize_css_table_internal_used_style(style: &mut w3cos_std::style::Style) {
     use w3cos_std::style::Display;
 
+    if !matches!(style.display, Display::Table | Display::InlineTable) {
+        style.table_layout_fixed = false;
+    }
     if style.display != Display::TableCell {
         // `empty-cells` is inherited as a computed value but affects only a
         // table-cell's used paint style. Keeping it on unrelated component
@@ -8022,6 +8056,33 @@ mod image_component_tests {
         assert_eq!(
             line.style.justify_content,
             w3cos_std::style::JustifyContent::FlexEnd
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn table_cellpadding_overrides_ua_padding_but_not_author_padding() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let table = document.create_element("table");
+        table.set_attribute(&mut document, "cellpadding", "0");
+        let row = document.create_element("tr");
+        let cell = document.create_element("td");
+        row.append_child(&mut document, cell);
+        table.append_child(&mut document, row);
+        document.body().append_child(&mut document, table);
+
+        let tree = document.to_component_tree();
+        assert_eq!(
+            tree.children[0].children[0].children[0].style.padding,
+            w3cos_std::style::Edges::ZERO
+        );
+
+        crate::stylesheet::register_rule("td", &[("padding", "7px")]);
+        let tree = document.to_component_tree();
+        assert_eq!(
+            tree.children[0].children[0].children[0].style.padding,
+            w3cos_std::style::Edges::all(7.0)
         );
         crate::stylesheet::clear_rules();
     }

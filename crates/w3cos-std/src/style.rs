@@ -63,6 +63,8 @@ pub struct Style {
     #[serde(default)]
     pub border_collapse: bool,
     #[serde(default)]
+    pub table_layout_fixed: bool,
+    #[serde(default)]
     pub empty_cells_hide: bool,
     #[serde(default)]
     pub caption_side_bottom: bool,
@@ -238,6 +240,7 @@ impl Default for Style {
             border_spacing_x: 0.0,
             border_spacing_y: 0.0,
             border_collapse: false,
+            table_layout_fixed: false,
             empty_cells_hide: false,
             caption_side_bottom: false,
             padding: Edges::ZERO,
@@ -358,6 +361,7 @@ impl Style {
             border_spacing_x,
             border_spacing_y,
             border_collapse,
+            table_layout_fixed,
             empty_cells_hide,
             caption_side_bottom,
             padding,
@@ -460,6 +464,7 @@ impl Style {
             border_spacing_x: border_spacing_x_b,
             border_spacing_y: border_spacing_y_b,
             border_collapse: border_collapse_b,
+            table_layout_fixed: table_layout_fixed_b,
             empty_cells_hide: empty_cells_hide_b,
             caption_side_bottom: caption_side_bottom_b,
             padding: padding_b,
@@ -560,6 +565,7 @@ impl Style {
             && border_spacing_x == border_spacing_x_b
             && border_spacing_y == border_spacing_y_b
             && border_collapse == border_collapse_b
+            && table_layout_fixed == table_layout_fixed_b
             && empty_cells_hide == empty_cells_hide_b
             && caption_side_bottom == caption_side_bottom_b
             && padding == padding_b
