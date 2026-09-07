@@ -8,7 +8,7 @@ use w3cos_std::style::{
     AlignItems as WAlign, AlignSelf as WAlignSelf, BoxSizing as WBoxSizing, Dimension as WDim,
     Display as WDisplay, EdgeLengths, FlexDirection as WDir, FlexWrap as WWrap, Float as WFloat,
     JustifyContent as WJustify, Overflow as WOverflow, Position as WPos, Spacing as WSpacing,
-    WhiteSpace as WWhiteSpace, WordBreak as WWordBreak,
+    Visibility as WVisibility, WhiteSpace as WWhiteSpace, WordBreak as WWordBreak,
 };
 use w3cos_std::{Component, ComponentKind};
 
@@ -420,14 +420,36 @@ fn table_track_widths(component: &Component) -> Vec<f32> {
                     | WDisplay::TableRowGroup
                     | WDisplay::TableHeaderGroup
                     | WDisplay::TableFooterGroup
+                    | WDisplay::TableColumnGroup
             ) {
                 collect_rows(child, tracks, collapsed);
             }
         }
     }
 
+    fn collect_collapsed_columns(component: &Component, columns: &mut Vec<bool>) {
+        if component.style.display == WDisplay::TableColumn {
+            columns.push(component.style.visibility == WVisibility::Collapse);
+            return;
+        }
+        for child in &component.children {
+            if child.style.display == WDisplay::TableColumnGroup {
+                collect_collapsed_columns(child, columns);
+            } else if child.style.display == WDisplay::TableColumn {
+                columns.push(child.style.visibility == WVisibility::Collapse);
+            }
+        }
+    }
+
     let mut tracks = Vec::new();
     collect_rows(component, &mut tracks, component.style.border_collapse);
+    let mut collapsed_columns = Vec::new();
+    collect_collapsed_columns(component, &mut collapsed_columns);
+    for (column, collapsed) in collapsed_columns.into_iter().enumerate() {
+        if collapsed && let Some(track) = tracks.get_mut(column) {
+            *track = -0.0;
+        }
+    }
     tracks
 }
 
@@ -454,6 +476,7 @@ fn collapsed_table_outer_inline_halves(component: &Component) -> f32 {
                     | WDisplay::TableRowGroup
                     | WDisplay::TableHeaderGroup
                     | WDisplay::TableFooterGroup
+                    | WDisplay::TableColumnGroup
             ) {
                 collect(child, left, right);
             }
@@ -681,6 +704,11 @@ fn collapsed_empty_row_overlap(
     viewport_w: f32,
     viewport_h: f32,
 ) -> Option<f32> {
+    if component.style.display == WDisplay::TableRow
+        && component.style.visibility == WVisibility::Collapse
+    {
+        return Some(0.0);
+    }
     if component.style.display != WDisplay::TableRow
         || component
             .children
@@ -1385,6 +1413,7 @@ impl LayoutEngine {
 
         project_fixed_table_cell_rects(&mut results, root);
         project_table_column_background_rects(&mut results, flat);
+        project_collapsed_table_row_rects(&mut results, flat);
 
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
 
@@ -1504,11 +1533,77 @@ pub fn compute_with_scroll(
 
     project_fixed_table_cell_rects(&mut results, root);
     project_table_column_background_rects(&mut results, &flat);
+    project_collapsed_table_row_rects(&mut results, &flat);
 
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
 
     results.extend(fixed_results);
     Ok((results, scrollable, clip_only))
+}
+
+fn project_collapsed_table_row_rects(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    let rects = layouts
+        .iter()
+        .map(|(rect, index)| (*index, *rect))
+        .collect::<HashMap<_, _>>();
+    let is_descendant_of = |mut index: usize, ancestor: usize| {
+        while let Some(parent) = flat.get(index).and_then(|node| node.parent) {
+            if parent == ancestor {
+                return true;
+            }
+            index = parent;
+        }
+        false
+    };
+    for container in 0..flat.len() {
+        if !matches!(
+            flat[container].style.display,
+            WDisplay::Table
+                | WDisplay::InlineTable
+                | WDisplay::TableRowGroup
+                | WDisplay::TableHeaderGroup
+                | WDisplay::TableFooterGroup
+        ) {
+            continue;
+        }
+        let rows = flat
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| {
+                node.style.display == WDisplay::TableRow
+                    && is_descendant_of(*index, container)
+            })
+            .collect::<Vec<_>>();
+        if !rows
+            .iter()
+            .any(|(_, row)| row.style.visibility == WVisibility::Collapse)
+        {
+            continue;
+        }
+        let mut visible_bounds: Option<(f32, f32)> = None;
+        for (index, row) in rows {
+            if row.style.visibility == WVisibility::Collapse {
+                continue;
+            }
+            let Some(rect) = rects.get(&index) else {
+                continue;
+            };
+            visible_bounds = Some(match visible_bounds {
+                Some((top, bottom)) => (top.min(rect.y), bottom.max(rect.y + rect.height)),
+                None => (rect.y, rect.y + rect.height),
+            });
+        }
+        let Some((top, bottom)) = visible_bounds else {
+            continue;
+        };
+        if let Some((rect, _)) = layouts.iter_mut().find(|(_, index)| *index == container) {
+            rect.y = top;
+            rect.height = (bottom - top).max(0.0);
+        }
+    }
 }
 
 fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Component) {
@@ -1871,6 +1966,22 @@ fn build_taffy_tree(
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
     let owns_table_layout = matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable);
+    if comp.style.visibility == WVisibility::Collapse
+        && matches!(comp.style.display, WDisplay::TableRow | WDisplay::TableCell)
+    {
+        if comp.style.display == WDisplay::TableRow {
+            // Collapsed rows still participate in intrinsic table sizing and
+            // border conflict collection, but generate no used row track.
+            style.display = taffy::Display::None;
+        }
+        style.size.height = Dimension::length(0.0);
+        style.min_size.height = Dimension::length(0.0);
+        style.max_size.height = Dimension::length(0.0);
+        style.padding.top = LengthPercentage::length(0.0);
+        style.padding.bottom = LengthPercentage::length(0.0);
+        style.border.top = LengthPercentage::length(0.0);
+        style.border.bottom = LengthPercentage::length(0.0);
+    }
     let active_fixed_table_layout = if owns_table_layout {
         comp.style.table_layout_fixed
     } else {
@@ -2064,7 +2175,17 @@ fn build_taffy_tree(
             .and_then(|column| inherited_table_tracks?.get(column))
             .copied()
     {
-        let used_width = if active_fixed_table_layout {
+        let collapsed_column = width == 0.0 && width.is_sign_negative();
+        let used_width = if collapsed_column {
+            style.box_sizing = BoxSizing::BorderBox;
+            style.min_size.width = Dimension::length(0.0);
+            style.max_size.width = Dimension::length(0.0);
+            style.padding.left = LengthPercentage::length(0.0);
+            style.padding.right = LengthPercentage::length(0.0);
+            style.border.left = LengthPercentage::length(0.0);
+            style.border.right = LengthPercentage::length(0.0);
+            0.0
+        } else if active_fixed_table_layout {
             style.box_sizing = BoxSizing::BorderBox;
             width
         } else {
@@ -2503,9 +2624,19 @@ fn build_taffy_tree(
                         .iter()
                         .find(|next| next.style.display == WDisplay::TableCell)
                 {
+                    let collapsed_column = active_table_tracks
+                        .and_then(|tracks| tracks.get(source_index))
+                        .is_some_and(|width| *width == 0.0 && width.is_sign_negative())
+                        || active_table_tracks
+                            .and_then(|tracks| tracks.get(source_index + 1))
+                            .is_some_and(|width| *width == 0.0 && width.is_sign_negative());
                     collapsed_overlap = Some((
                         true,
-                        table_cell_edge_width(c, 1).max(table_cell_edge_width(next, 3)),
+                        if collapsed_column {
+                            0.0
+                        } else {
+                            table_cell_edge_width(c, 1).max(table_cell_edge_width(next, 3))
+                        },
                     ));
                 } else if comp.style.border_collapse
                     && matches!(

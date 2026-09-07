@@ -6,7 +6,7 @@
 
 use w3cos_std::color::Color;
 use w3cos_std::component::ComponentKind;
-use w3cos_std::style::{Display, Overflow, Position, Style, Transform2D};
+use w3cos_std::style::{Display, Overflow, Position, Style, Transform2D, Visibility};
 
 use crate::layout::LayoutRect;
 
@@ -314,6 +314,79 @@ fn suppress_hidden_empty_cell_paint(nodes: &mut [PaintNode]) {
     }
 }
 
+fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
+    fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
+        let mut parent = nodes[index].parent;
+        while let Some(parent_index) = parent {
+            if matches!(nodes[parent_index].style.display, Display::Table | Display::InlineTable) {
+                return Some(parent_index);
+            }
+            parent = nodes[parent_index].parent;
+        }
+        None
+    }
+    let tables = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| matches!(node.style.display, Display::Table | Display::InlineTable))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for table in tables {
+        let collapsed_columns = nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| {
+                node.style.display == Display::TableColumn
+                    && nearest_table(nodes, *index) == Some(table)
+            })
+            .map(|(_, node)| node.style.visibility == Visibility::Collapse)
+            .collect::<Vec<_>>();
+        if !collapsed_columns.iter().any(|collapsed| *collapsed) {
+            continue;
+        }
+        let rows = nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| {
+                node.style.display == Display::TableRow
+                    && nearest_table(nodes, *index) == Some(table)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for row in rows {
+            let cells = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| {
+                    node.parent == Some(row) && node.style.display == Display::TableCell
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            for (column, cell) in cells.into_iter().enumerate() {
+                if collapsed_columns.get(column).copied().unwrap_or(false) {
+                    nodes[cell].style.visibility = Visibility::Collapse;
+                }
+            }
+        }
+    }
+    let collapsed_rows = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.style.display == Display::TableRow
+                && node.style.visibility == Visibility::Collapse
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for row in collapsed_rows {
+        for node in nodes.iter_mut().filter(|node| {
+            node.parent == Some(row) && node.style.display == Display::TableCell
+        }) {
+            node.style.visibility = Visibility::Collapse;
+        }
+    }
+}
+
 fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
     use w3cos_std::style::TextDirection;
 
@@ -396,7 +469,11 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             let right = pair[1];
             let left_edge = edge(&nodes[left].style, 1);
             let right_edge = edge(&nodes[right].style, 3);
-            let left_wins = if left_edge.0 > right_edge.0 {
+            let left_collapsed = nodes[left].style.visibility == Visibility::Collapse;
+            let right_collapsed = nodes[right].style.visibility == Visibility::Collapse;
+            let left_wins = if left_collapsed != right_collapsed {
+                !left_collapsed
+            } else if left_edge.0 > right_edge.0 {
                 true
             } else if right_edge.0 > left_edge.0 {
                 false
@@ -438,15 +515,34 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             .copied()
             .filter(|row| nearest_table(nodes, *row) == Some(table))
             .collect::<Vec<_>>();
-        let Some(first_row) = table_rows.first().copied() else {
+        let visible_rows = table_rows
+            .iter()
+            .copied()
+            .filter(|row| nodes[*row].style.visibility != Visibility::Collapse)
+            .collect::<Vec<_>>();
+        let boundary_rows = if visible_rows.is_empty() {
+            &table_rows
+        } else {
+            &visible_rows
+        };
+        let Some(first_row) = boundary_rows.first().copied() else {
             continue;
         };
-        let last_row = table_rows.last().copied().unwrap_or(first_row);
+        let last_row = boundary_rows.last().copied().unwrap_or(first_row);
         let mut boundary_cells = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        boundary_cells[0] = row_cells(nodes, first_row);
-        boundary_cells[2] = row_cells(nodes, last_row);
-        for row in table_rows {
-            let cells = row_cells(nodes, row);
+        boundary_cells[0] = row_cells(nodes, first_row)
+            .into_iter()
+            .filter(|cell| nodes[*cell].style.visibility != Visibility::Collapse)
+            .collect();
+        boundary_cells[2] = row_cells(nodes, last_row)
+            .into_iter()
+            .filter(|cell| nodes[*cell].style.visibility != Visibility::Collapse)
+            .collect();
+        for row in boundary_rows {
+            let cells = row_cells(nodes, *row)
+                .into_iter()
+                .filter(|cell| nodes[*cell].style.visibility != Visibility::Collapse)
+                .collect::<Vec<_>>();
             if let Some(first) = cells.first() {
                 boundary_cells[3].push(*first);
             }
@@ -480,7 +576,9 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         for (top, bottom) in top_cells.into_iter().zip(bottom_cells) {
             let top_edge = edge(&nodes[top].style, 2);
             let bottom_edge = edge(&nodes[bottom].style, 0);
-            if bottom_edge.0 > top_edge.0 {
+            let top_collapsed = nodes[top].style.visibility == Visibility::Collapse;
+            let bottom_collapsed = nodes[bottom].style.visibility == Visibility::Collapse;
+            if (top_collapsed && !bottom_collapsed) || bottom_edge.0 > top_edge.0 {
                 suppress_edge(&mut nodes[top].style, 2, bottom_edge.0);
                 set_edge(
                     &mut nodes[bottom].style,
@@ -788,6 +886,7 @@ impl PaintArtifact {
         }
         suppress_improper_nested_table_part_backgrounds(&mut nodes);
         suppress_hidden_empty_cell_paint(&mut nodes);
+        project_collapsed_table_tracks_to_cells(&mut nodes);
         resolve_collapsed_cell_border_conflicts(&mut nodes);
         extend_collapsed_borders_across_empty_rows(&mut nodes, &rect_by_index);
         let mut artifact = Self {
@@ -893,6 +992,10 @@ impl PaintArtifact {
             });
         }
         self.node_properties[index] = properties;
+
+        if node.style.visibility != Visibility::Visible {
+            return;
+        }
 
         let Some(bounds) = self.rect_by_index[index] else {
             return;
@@ -1051,6 +1154,36 @@ mod tests {
         assert_eq!(nodes[1].style.border_right_color, Some(start_color));
         assert_eq!(nodes[2].style.border_left_width, Some(20.0));
         assert_eq!(nodes[2].style.border_left_color, Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn collapsed_row_projects_visibility_to_its_cells() {
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableRow,
+                    visibility: Visibility::Collapse,
+                    ..Style::default()
+                },
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableCell,
+                    visibility: Visibility::Visible,
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+        ];
+
+        project_collapsed_table_tracks_to_cells(&mut nodes);
+
+        assert_eq!(nodes[1].style.visibility, Visibility::Collapse);
     }
 
     #[test]
