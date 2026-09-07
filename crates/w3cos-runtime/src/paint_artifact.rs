@@ -41,9 +41,7 @@ pub fn effective_z_order(style: &Style, inherited: i32) -> i32 {
 /// allocation and reports 0 clones.
 pub fn reuse_or_clone_paint_nodes<'a>(
     existing: Vec<PaintNode>,
-    incoming: impl IntoIterator<
-        Item = (&'a ComponentKind, &'a Style, Option<usize>, Option<usize>),
-    >,
+    incoming: impl IntoIterator<Item = (&'a ComponentKind, &'a Style, Option<usize>, Option<usize>)>,
 ) -> (Vec<PaintNode>, usize) {
     let incoming: Vec<_> = incoming.into_iter().collect();
     if existing.len() != incoming.len() {
@@ -401,9 +399,22 @@ impl PaintArtifact {
             .unwrap_or_default();
         let inherited_z = node
             .parent
-            .and_then(|parent| self.z_order.get(parent).copied())
+            .and_then(|parent| {
+                if self.nodes[parent].parent.is_none() {
+                    Some(0)
+                } else {
+                    self.z_order.get(parent).copied()
+                }
+            })
             .unwrap_or_default();
-        self.z_order[index] = effective_z_order(&node.style, inherited_z);
+        // The root box establishes the root stacking context. Its own
+        // background and border paint below every descendant, including a
+        // positioned descendant with a negative z-index.
+        self.z_order[index] = if node.parent.is_none() {
+            i32::MIN
+        } else {
+            effective_z_order(&node.style, inherited_z)
+        };
         self.sticky_owner[index] = if matches!(node.style.position, Position::Sticky) {
             Some(index)
         } else {
@@ -587,6 +598,37 @@ mod tests {
     }
 
     #[test]
+    fn root_sentinel_does_not_raise_negative_descendants_above_normal_flow() {
+        let root = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let mut negative_style = Style::default();
+        negative_style.position = Position::Absolute;
+        negative_style.z_index = -1;
+        let negative = PaintNode {
+            kind: ComponentKind::Box,
+            style: negative_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let normal = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style::default(),
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            [root, negative, normal],
+            &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2)],
+            1,
+        );
+        assert_eq!(artifact.z_order, [i32::MIN, -1, 0]);
+    }
+
+    #[test]
     fn propagates_body_background_image_to_the_canvas() {
         let mut root_style = Style::default();
         root_style.background_image = Some("none".into());
@@ -742,7 +784,7 @@ mod tests {
             PaintArtifact::build(nodes, &[(rect(0.0), 0), (rect(0.0), 1), (rect(20.0), 2)], 1);
 
         assert_eq!(artifact.sticky_owner, vec![None, Some(1), Some(1)]);
-        assert_eq!(artifact.z_order, vec![0, 3, 3]);
+        assert_eq!(artifact.z_order, vec![i32::MIN, 3, 3]);
     }
 
     #[test]
@@ -773,7 +815,7 @@ mod tests {
             1,
         );
 
-        assert_eq!(artifact.z_order, vec![0, 1, 0]);
+        assert_eq!(artifact.z_order, vec![i32::MIN, i32::MIN + 1, i32::MIN]);
     }
 
     #[test]

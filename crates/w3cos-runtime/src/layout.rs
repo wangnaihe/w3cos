@@ -245,8 +245,7 @@ fn component_max_content_width(component: &Component) -> f32 {
     } else {
         0.0
     };
-    let horizontal_inner_edges =
-        padding.left + padding.right + border_width + table_outer_spacing;
+    let horizontal_inner_edges = padding.left + padding.right + border_width + table_outer_spacing;
     let border_box_width = match (specified_width, component.style.box_sizing) {
         (Some(width), WBoxSizing::BorderBox) => width,
         (Some(width), WBoxSizing::ContentBox) => width + horizontal_inner_edges,
@@ -272,11 +271,11 @@ fn table_track_max_content_width(component: &Component) -> f32 {
     if tracks.is_empty() {
         return caption_width.max(
             component
-            .children
-            .iter()
-            .filter(|child| child.style.display != WDisplay::TableCaption)
-            .map(component_max_content_width)
-            .fold(0.0_f32, f32::max),
+                .children
+                .iter()
+                .filter(|child| child.style.display != WDisplay::TableCaption)
+                .map(component_max_content_width)
+                .fold(0.0_f32, f32::max),
         );
     }
     let gap = component.style.border_spacing_x;
@@ -925,6 +924,7 @@ impl LayoutEngine {
                 viewport_w,
                 None,
                 None,
+                false,
                 None,
             )?);
             self.tree_valid = true;
@@ -1047,6 +1047,7 @@ pub fn compute_with_scroll(
         viewport_w,
         None,
         None,
+        false,
         None,
     )?;
     let root_margins = root_used_margins(
@@ -1351,6 +1352,7 @@ fn build_taffy_tree(
     containing_width: f32,
     inherited_table_tracks: Option<&[f32]>,
     table_column: Option<usize>,
+    parent_table_height_definite: bool,
     inherited_border_spacing: Option<(f32, f32)>,
 ) -> Result<NodeId, taffy::TaffyError> {
     let my_idx = *idx;
@@ -1445,7 +1447,8 @@ fn build_taffy_tree(
         style.flex_wrap = FlexWrap::Wrap;
         style.align_items = Some(AlignItems::FlexStart);
         if matches!(comp.style.min_height, WDim::Auto) {
-            style.min_size.height = Dimension::length(comp.style.font_size * comp.style.line_height);
+            style.min_size.height =
+                Dimension::length(comp.style.font_size * comp.style.line_height);
         }
     }
     if comp.style.display == WDisplay::InlineBlock
@@ -1483,6 +1486,7 @@ fn build_taffy_tree(
         style.flex_direction = FlexDirection::Column;
     }
     if comp.style.display == WDisplay::TableRow
+        && parent_table_height_definite
         && matches!(
             parent_display,
             Some(
@@ -1770,11 +1774,10 @@ fn build_taffy_tree(
         }
         tree.new_leaf_with_context(leaf_style, my_idx)
     } else {
-        let owned_table_tracks = (matches!(
-            comp.style.display,
-            WDisplay::Table | WDisplay::InlineTable
-        ) && matches!(comp.style.width, WDim::Auto))
-        .then(|| table_track_widths(comp));
+        let owned_table_tracks =
+            (matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable)
+                && matches!(comp.style.width, WDim::Auto))
+            .then(|| table_track_widths(comp));
         let active_table_tracks = owned_table_tracks
             .as_deref()
             .filter(|tracks| !tracks.is_empty())
@@ -1797,62 +1800,64 @@ fn build_taffy_tree(
                     child_containing_width,
                     active_table_tracks,
                     (comp.style.display == WDisplay::TableRow).then_some(source_index),
+                    matches!(
+                        comp.style.display,
+                        WDisplay::Table
+                            | WDisplay::InlineTable
+                            | WDisplay::TableRowGroup
+                            | WDisplay::TableHeaderGroup
+                            | WDisplay::TableFooterGroup
+                    ) && !matches!(comp.style.height, WDim::Auto),
                     active_border_spacing,
                 )?;
                 Ok((c.style.order, source_index, node))
             })
             .collect::<Result<_, _>>()?;
         child_nodes.sort_by_key(|(order, source_index, _)| (*order, *source_index));
-        let rescue_overwide_first_pair = if comp.style.flex_wrap == WWrap::Wrap
-            && child_nodes.len() >= 2
-        {
-            let first = &comp.children[child_nodes[0].1];
-            let second = &comp.children[child_nodes[1].1];
-            let anonymous_line_item = |component: &Component| {
-                matches!(component.kind, ComponentKind::Box)
-                    && component.children.len() == 1
-                    && component.style.display == WDisplay::InlineFlex
-                    && matches!(component.style.min_height, WDim::Px(_))
-            };
-            let first_width = component_max_content_width(first);
-            let second_width = component_max_content_width(second);
-            let second_strictly_reduces_line = second.children.first().is_some_and(|inner| {
-                if inner
-                    .style
-                    .font_family
-                    .as_deref()
-                    .is_some_and(|family| family.eq_ignore_ascii_case("ahem"))
-                    && let ComponentKind::Text { content } = &inner.kind
-                    && let WSpacing::Em(left) = inner.style.margin.left
-                {
-                    // Ahem defines every character cell as exactly 1ch. Keep
-                    // the zero-outer-width boundary distinct from a strictly
-                    // negative following box; only the latter can rescue an
-                    // overwide first item without a line break.
-                    -left > content.chars().count() as f32
+        let rescue_overwide_first_pair =
+            if comp.style.flex_wrap == WWrap::Wrap && child_nodes.len() >= 2 {
+                let first = &comp.children[child_nodes[0].1];
+                let second = &comp.children[child_nodes[1].1];
+                let anonymous_line_item = |component: &Component| {
+                    matches!(component.kind, ComponentKind::Box)
+                        && component.children.len() == 1
+                        && component.style.display == WDisplay::InlineFlex
+                        && matches!(component.style.min_height, WDim::Px(_))
+                };
+                let first_width = component_max_content_width(first);
+                let second_width = component_max_content_width(second);
+                let second_strictly_reduces_line = second.children.first().is_some_and(|inner| {
+                    if inner
+                        .style
+                        .font_family
+                        .as_deref()
+                        .is_some_and(|family| family.eq_ignore_ascii_case("ahem"))
+                        && let ComponentKind::Text { content } = &inner.kind
+                        && let WSpacing::Em(left) = inner.style.margin.left
+                    {
+                        // Ahem defines every character cell as exactly 1ch. Keep
+                        // the zero-outer-width boundary distinct from a strictly
+                        // negative following box; only the latter can rescue an
+                        // overwide first item without a line break.
+                        -left > content.chars().count() as f32
+                    } else {
+                        second_width < -0.01
+                    }
+                });
+                let line_width = if matches!(comp.style.width, WDim::Auto) {
+                    shrink_to_fit_used_width(comp)
                 } else {
-                    second_width < -0.01
-                }
-            });
-            let line_width = if matches!(comp.style.width, WDim::Auto) {
-                shrink_to_fit_used_width(comp)
+                    component_content_width(&comp.style, containing_width, viewport_w, viewport_h)
+                };
+                (anonymous_line_item(first)
+                    && anonymous_line_item(second)
+                    && second_strictly_reduces_line
+                    && first_width > line_width + 0.01
+                    && first_width + second_width <= line_width + 0.01)
+                    .then_some((first_width + second_width).max(0.0))
             } else {
-                component_content_width(
-                    &comp.style,
-                    containing_width,
-                    viewport_w,
-                    viewport_h,
-                )
+                None
             };
-            (anonymous_line_item(first)
-                && anonymous_line_item(second)
-                && second_strictly_reduces_line
-                && first_width > line_width + 0.01
-                && first_width + second_width <= line_width + 0.01)
-                .then_some((first_width + second_width).max(0.0))
-        } else {
-            None
-        };
         let mut child_nodes: Vec<NodeId> =
             child_nodes.into_iter().map(|(_, _, node)| node).collect();
         if let Some(group_width) = rescue_overwide_first_pair {
@@ -2120,9 +2125,8 @@ fn collect_layouts_fast(
             }
 
             if !matches!(info.style.position, WPos::Static) {
-                descendant_containing_block = positioned_descendant_containing_block(
-                    flat, tree, node, rect,
-                );
+                descendant_containing_block =
+                    positioned_descendant_containing_block(flat, tree, node, rect);
             }
 
             let overflow_x = info.style.resolved_overflow_x();
@@ -2337,9 +2341,8 @@ fn inline_absolute_static_rect(
             WDisplay::Block | WDisplay::Flex | WDisplay::Grid | WDisplay::ListItem
         ) {
             cursor_x = 0.0;
-            cursor_y = layout.location.y
-                + layout.size.height
-                + sibling_info.style.margin_lengths().bottom;
+            cursor_y =
+                layout.location.y + layout.size.height + sibling_info.style.margin_lengths().bottom;
             line_height = 0.0;
             has_meaningful_inline_predecessor = false;
             crossed_forced_line_break = false;
@@ -2355,9 +2358,8 @@ fn inline_absolute_static_rect(
             ComponentKind::Text { content } => {
                 if content == "\u{2028}" {
                     cursor_x = 0.0;
-                    cursor_y += line_height.max(
-                        sibling_info.style.font_size * sibling_info.style.line_height,
-                    );
+                    cursor_y += line_height
+                        .max(sibling_info.style.font_size * sibling_info.style.line_height);
                     line_height = 0.0;
                     crossed_forced_line_break = true;
                     continue;
@@ -2605,8 +2607,7 @@ fn positioned_percentage_border_box_size(
                 viewport_w,
                 viewport_h,
             ),
-        )
-    {
+        ) {
         (containing_width
             - left
             - right
@@ -2643,8 +2644,7 @@ fn positioned_percentage_border_box_size(
                 viewport_w,
                 viewport_h,
             ),
-        )
-    {
+        ) {
         (containing_height
             - top
             - bottom
@@ -4007,7 +4007,11 @@ mod tests {
     fn anonymous_inline_line_items_preserve_negative_margin_wrapping() {
         use w3cos_dom::{Document, stylesheet};
 
-        fn image(document: &mut Document, width_class: &str, margin_class: Option<&str>) -> w3cos_dom::Element {
+        fn image(
+            document: &mut Document,
+            width_class: &str,
+            margin_class: Option<&str>,
+        ) -> w3cos_dom::Element {
             let image = document.create_element("img");
             image.class_list_add(document, width_class);
             if let Some(margin_class) = margin_class {
@@ -4934,7 +4938,10 @@ mod tests {
                     height: WDim::Px(600.0),
                     ..Style::default()
                 },
-                vec![Component::text("There should be one line.", text_style.clone())],
+                vec![Component::text(
+                    "There should be one line.",
+                    text_style.clone(),
+                )],
             ),
             800.0,
             600.0,
@@ -5989,8 +5996,8 @@ mod tests {
         };
         let first = block_child("first row");
         let second = block_child("a longer second row");
-        let expected = component_max_content_width(&first)
-            .max(component_max_content_width(&second));
+        let expected =
+            component_max_content_width(&first).max(component_max_content_width(&second));
         let block = Component::boxed(
             Style {
                 display: WDisp::Block,

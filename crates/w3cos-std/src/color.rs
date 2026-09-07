@@ -91,7 +91,7 @@ impl Color {
             .and_then(|value| value.strip_suffix(')'))
         {
             let channels = arguments.split(',').map(str::trim).collect::<Vec<_>>();
-            return (channels.len() == 3).then(|| {
+            return (channels.len() == 3 && rgb_channels_use_one_unit(&channels)).then(|| {
                 Some(Self::rgb(
                     parse_css_rgb_channel(channels[0])?,
                     parse_css_rgb_channel(channels[1])?,
@@ -104,7 +104,7 @@ impl Color {
             .and_then(|value| value.strip_suffix(')'))
         {
             let channels = arguments.split(',').map(str::trim).collect::<Vec<_>>();
-            return (channels.len() == 4).then(|| {
+            return (channels.len() == 4 && rgb_channels_use_one_unit(&channels[..3])).then(|| {
                 Some(Self::rgba(
                     parse_css_rgb_channel(channels[0])?,
                     parse_css_rgb_channel(channels[1])?,
@@ -123,6 +123,12 @@ impl Color {
     pub fn to_u32(self) -> u32 {
         (self.a as u32) << 24 | (self.r as u32) << 16 | (self.g as u32) << 8 | self.b as u32
     }
+}
+
+fn rgb_channels_use_one_unit(channels: &[&str]) -> bool {
+    channels
+        .first()
+        .is_none_or(|first| channels.iter().all(|channel| channel.ends_with('%') == first.ends_with('%')))
 }
 
 fn parse_css_rgb_channel(value: &str) -> Option<u8> {

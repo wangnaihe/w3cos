@@ -2,6 +2,7 @@ use crate::Color;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackgroundShorthand {
+    pub valid: bool,
     pub color: Option<Color>,
     pub images: Vec<String>,
     pub sizes: Vec<String>,
@@ -14,6 +15,7 @@ pub struct BackgroundShorthand {
 
 pub fn parse_shorthand(value: &str) -> BackgroundShorthand {
     let mut result = BackgroundShorthand {
+        valid: true,
         color: None,
         images: Vec::new(),
         sizes: Vec::new(),
@@ -36,14 +38,10 @@ pub fn parse_shorthand(value: &str) -> BackgroundShorthand {
             let lower = token.to_ascii_lowercase();
             if token == "/" {
                 after_slash = true;
-            } else if lower == "none"
-                || lower.starts_with("url(")
-                || lower.starts_with("linear-gradient(")
-                || lower.starts_with("radial-gradient(")
-                || lower.starts_with("repeating-linear-gradient(")
-                || lower.starts_with("repeating-radial-gradient(")
-            {
+            } else if lower == "none" {
                 image = token;
+            } else if let Some(normalized) = normalize_background_image_token(&token) {
+                image = normalized;
             } else if matches!(lower.as_str(), "scroll" | "fixed" | "local") {
                 attachment = lower;
             } else if matches!(
@@ -55,10 +53,12 @@ pub fn parse_shorthand(value: &str) -> BackgroundShorthand {
                 boxes.push(token);
             } else if let Some(color) = Color::from_css(&token) {
                 result.color = Some(color);
-            } else if after_slash {
+            } else if after_slash && is_background_size_token(&token) {
                 size.push(token);
-            } else {
+            } else if is_background_position_token(&token) {
                 position.push(token);
+            } else {
+                result.valid = false;
             }
         }
         result.images.push(image);
@@ -95,6 +95,121 @@ pub fn parse_shorthand(value: &str) -> BackgroundShorthand {
     result
 }
 
+fn is_background_image_token(token: &str) -> bool {
+    normalize_background_image_token(token).is_some()
+}
+
+fn normalize_background_image_token(token: &str) -> Option<String> {
+    let Some(open) = token.find('(') else {
+        return None;
+    };
+    let function = css_unescape_identifier(token[..open].trim()).to_ascii_lowercase();
+    if function == "url" {
+        if !token.ends_with(')') {
+            return None;
+        }
+        let Some(inner) = token.get(open + 1..token.len() - 1) else {
+            return None;
+        };
+        let inner = inner.trim();
+        if let Some(quote) = inner.chars().next().filter(|ch| matches!(ch, '\'' | '"')) {
+            return (inner.len() >= 2 && inner.ends_with(quote)).then(|| format!("url({inner})"));
+        }
+        let mut escaped = false;
+        for ch in inner.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+            } else if ch.is_whitespace() || matches!(ch, '\'' | '"' | '(' | ')') {
+                return None;
+            }
+        }
+        return (!escaped).then(|| format!("url({inner})"));
+    }
+    (matches!(
+        function.as_str(),
+        "linear-gradient"
+            | "radial-gradient"
+            | "repeating-linear-gradient"
+            | "repeating-radial-gradient"
+    ) && token.ends_with(')'))
+    .then(|| format!("{function}{}", &token[open..]))
+}
+
+fn css_unescape_identifier(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut pos = 0;
+    while pos < chars.len() {
+        if chars[pos] != '\\' || pos + 1 == chars.len() {
+            output.push(chars[pos]);
+            pos += 1;
+            continue;
+        }
+        pos += 1;
+        if chars[pos].is_ascii_hexdigit() {
+            let start = pos;
+            while pos < chars.len() && pos < start + 6 && chars[pos].is_ascii_hexdigit() {
+                pos += 1;
+            }
+            let digits = chars[start..pos].iter().collect::<String>();
+            output.push(
+                u32::from_str_radix(&digits, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('\u{fffd}'),
+            );
+            if pos < chars.len() && chars[pos].is_whitespace() {
+                pos += 1;
+            }
+        } else if !matches!(chars[pos], '\n' | '\r' | '\u{000c}') {
+            output.push(chars[pos]);
+            pos += 1;
+        }
+    }
+    output
+}
+
+fn is_background_position_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "left" | "right" | "top" | "bottom" | "center"
+    ) || is_background_length(token)
+}
+
+fn is_background_size_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "auto" | "cover" | "contain"
+    ) || is_background_length(token)
+}
+
+fn is_background_length(token: &str) -> bool {
+    let token = token.trim().to_ascii_lowercase();
+    if token == "0"
+        || token.starts_with("calc(")
+        || token.starts_with("min(")
+        || token.starts_with("max(")
+        || token.starts_with("clamp(")
+        || token.starts_with("var(")
+    {
+        return true;
+    }
+    [
+        "%", "px", "em", "rem", "ex", "ch", "vw", "vh", "vmin", "vmax", "cm", "mm", "q", "in",
+        "pt", "pc",
+    ]
+    .into_iter()
+    .any(|unit| {
+        token
+            .strip_suffix(unit)
+            .is_some_and(|number| number.trim().parse::<f32>().is_ok())
+    })
+}
+
 pub fn is_valid_image_list(value: &str) -> bool {
     let layers = split_top_level(value, ',');
     !layers.is_empty()
@@ -104,16 +219,7 @@ pub fn is_valid_image_list(value: &str) -> bool {
                 return false;
             }
             let token = tokens[0].trim().to_ascii_lowercase();
-            token == "none"
-                || [
-                    "url(",
-                    "linear-gradient(",
-                    "radial-gradient(",
-                    "repeating-linear-gradient(",
-                    "repeating-radial-gradient(",
-                ]
-                .into_iter()
-                .any(|prefix| token.starts_with(prefix) && token.ends_with(')'))
+            token == "none" || is_background_image_token(&tokens[0])
         })
 }
 
@@ -161,16 +267,27 @@ fn split_tokens(value: &str) -> Vec<String> {
     let mut current = String::new();
     let mut depth = 0_u32;
     let mut quote = None;
-    let mut escaped = false;
-    for ch in value.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
+    let mut characters = value.chars().peekable();
+    while let Some(ch) = characters.next() {
         if ch == '\\' {
             current.push(ch);
-            escaped = true;
+            if characters.peek().is_some_and(char::is_ascii_hexdigit) {
+                for _ in 0..6 {
+                    let Some(next) = characters.peek().copied() else {
+                        break;
+                    };
+                    if !next.is_ascii_hexdigit() {
+                        break;
+                    }
+                    current.push(next);
+                    characters.next();
+                }
+                if characters.peek().is_some_and(|next| next.is_whitespace()) {
+                    characters.next();
+                }
+            } else if let Some(next) = characters.next() {
+                current.push(next);
+            }
             continue;
         }
         if let Some(active) = quote {
@@ -268,5 +385,20 @@ mod tests {
         assert!(is_valid_image_list("linear-gradient(red, blue)"));
         assert!(!is_valid_image_list("url('tile.png') repeat"));
         assert!(!is_valid_image_list("red"));
+    }
+
+    #[test]
+    fn invalid_background_tokens_do_not_form_a_shorthand() {
+        assert!(!parse_shorthand("\"red\"").valid);
+        assert!(!parse_shorthand("red;").valid);
+        assert!(!parse_shorthand("\\0020red").valid);
+        assert!(!parse_shorthand("red url( { test )").valid);
+        assert!(parse_shorthand("green center / cover no-repeat").valid);
+        let escaped_url = parse_shorthand(r#"red U\r\4c ("green.png")"#);
+        assert!(escaped_url.valid);
+        assert_eq!(escaped_url.images, [r#"url("green.png")"#]);
+        let bracket_url = parse_shorthand("url([) green");
+        assert!(bracket_url.valid);
+        assert_eq!(bracket_url.color, Color::from_css("green"));
     }
 }

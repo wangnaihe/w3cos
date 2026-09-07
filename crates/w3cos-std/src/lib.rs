@@ -167,6 +167,7 @@ mod tests {
         );
         assert_eq!(Color::from_css("#00000"), None);
         assert_eq!(Color::from_css("#00g"), None);
+        assert_eq!(Color::from_css("rgb(100%, 0, 0)"), None);
     }
 
     #[test]

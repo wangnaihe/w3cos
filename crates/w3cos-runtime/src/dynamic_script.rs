@@ -423,7 +423,7 @@ struct PendingStylesheetFetch {
     cache_key: crate::browser_http_cache::CacheKey,
     request_headers: HashMap<String, String>,
     cached_response: Option<PersistentHttpSource>,
-    task: crate::fetch::TextFetchTask,
+    task: crate::fetch::BinaryFetchTask,
 }
 
 struct StylesheetGraphLoad {
@@ -456,6 +456,7 @@ struct StylesheetFetchAction {
     ancestry: Vec<String>,
     referrer_source: String,
     integrity: String,
+    fallback_encoding: Option<String>,
 }
 
 enum StylesheetGraphAction {
@@ -1348,6 +1349,50 @@ fn decode_document_bytes_with_encoding(
     let encoding_name = decoder.encoding_name();
     let decoded = decoder.decode(&bytes[bom_bytes..], true)?;
     Ok((decoded, encoding_name))
+}
+
+fn decode_stylesheet_bytes(
+    bytes: &[u8],
+    content_type: &str,
+    fallback_encoding: Option<&str>,
+) -> Result<(String, String)> {
+    let (encoding, bom_bytes) = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        (encoding_rs::UTF_8, 3)
+    } else if bytes.starts_with(&[0xff, 0xfe]) {
+        (encoding_rs::UTF_16LE, 2)
+    } else if bytes.starts_with(&[0xfe, 0xff]) {
+        (encoding_rs::UTF_16BE, 2)
+    } else if let Some(charset) = content_type_charset(content_type) {
+        (encoding_for_label(&charset)?, 0)
+    } else if let Some(charset) = sniff_stylesheet_charset(bytes) {
+        (encoding_for_label(&charset)?, 0)
+    } else if let Some(charset) = fallback_encoding {
+        (encoding_for_label(charset)?, 0)
+    } else {
+        (encoding_rs::UTF_8, 0)
+    };
+    let mut decoder = DocumentByteDecoder::new(encoding);
+    let encoding_name = decoder.encoding_name().to_string();
+    decoder
+        .decode(&bytes[bom_bytes..], true)
+        .map(|source| (source, encoding_name))
+}
+
+fn sniff_stylesheet_charset(bytes: &[u8]) -> Option<String> {
+    const PREFIX: &[u8] = b"@charset \"";
+    let rest = bytes.strip_prefix(PREFIX)?;
+    let end = rest.windows(2).position(|window| window == b"\";")?;
+    let label = std::str::from_utf8(&rest[..end]).ok()?;
+    Some(label.to_ascii_lowercase())
+}
+
+fn document_stylesheet_encoding() -> Option<String> {
+    let encoding = crate::jsdom::document_value().get_property("characterSet");
+    if encoding.is_null() || encoding.is_undefined() {
+        return None;
+    }
+    let label = encoding.to_js_string();
+    (!label.trim().is_empty()).then_some(label)
 }
 
 #[cfg(test)]
@@ -4536,6 +4581,7 @@ impl ScriptLoader {
             })
             .collect();
         let mut actions = VecDeque::new();
+        let fallback_encoding = document_stylesheet_encoding();
         actions.push_back(StylesheetGraphAction::Append {
             source,
             base_url: document_url.to_string(),
@@ -4562,6 +4608,7 @@ impl ScriptLoader {
                 ancestry: Vec::new(),
                 referrer_source: document_url.to_string(),
                 integrity: String::new(),
+                fallback_encoding: fallback_encoding.clone(),
             }));
         }
         crate::font_loading_web::begin_font_readiness();
@@ -4634,6 +4681,16 @@ impl ScriptLoader {
         let integrity = element
             .call_method("getAttribute", vec![Value::string("integrity")])
             .to_js_string();
+        let link_charset = element
+            .call_method("getAttribute", vec![Value::string("charset")]);
+        let fallback_encoding = if link_charset.is_null() || link_charset.is_undefined() {
+            document_stylesheet_encoding()
+        } else {
+            let label = link_charset.to_js_string();
+            (!label.trim().is_empty())
+                .then_some(label)
+                .or_else(document_stylesheet_encoding)
+        };
         let mut actions = VecDeque::new();
         actions.push_back(StylesheetGraphAction::Fetch(StylesheetFetchAction {
             url: url.to_string(),
@@ -4645,6 +4702,7 @@ impl ScriptLoader {
             integrity: (integrity != "null")
                 .then_some(integrity)
                 .unwrap_or_default(),
+            fallback_encoding,
         }));
         crate::font_loading_web::begin_font_readiness();
         self.advance_stylesheet_graph(StylesheetGraphLoad {
@@ -5270,7 +5328,7 @@ impl ScriptLoader {
                 None
             }
         };
-        let task = crate::fetch::fetch_script_text_async(
+        let task = crate::fetch::fetch_script_bytes_async(
             &action.url,
             options,
             graph.request_origin.clone(),
@@ -5341,7 +5399,7 @@ impl ScriptLoader {
             let response = match result {
                 Err(error) => Err(error),
                 Ok(response) => self
-                    .apply_http_revalidation(response, fetch.cached_response.clone())
+                    .apply_binary_http_revalidation(response, fetch.cached_response.clone())
                     .map_err(|error| error.to_string())
                     .and_then(|response| (|| {
                     for (url, cookie) in &response.set_cookies {
@@ -5392,7 +5450,7 @@ impl ScriptLoader {
                         .map(|url| url.origin().ascii_serialization())
                         .unwrap_or_default();
                     check_integrity_metadata(
-                        response.body.as_bytes(),
+                        &response.body,
                         &fetch.action.integrity,
                         response_origin == fetch.graph.request_origin || fetch.graph.cors_enabled,
                     )
@@ -5400,7 +5458,13 @@ impl ScriptLoader {
                     if !response.redirected && response.url == fetch.request_url {
                         self.store_stylesheet_http_source(&fetch, &response);
                     }
-                    Ok(response)
+                    let (source, source_encoding) = decode_stylesheet_bytes(
+                        &response.body,
+                        content_type,
+                        fetch.action.fallback_encoding.as_deref(),
+                    )
+                        .map_err(|error| format!("stylesheet decode failed for {}: {error}", response.url))?;
+                    Ok((response, source, source_encoding))
                 })()),
             };
             let PendingStylesheetFetch {
@@ -5429,6 +5493,7 @@ impl ScriptLoader {
                     continue;
                 }
             };
+            let (response, source, source_encoding) = response;
             if !action.root
                 && action
                     .ancestry
@@ -5467,7 +5532,18 @@ impl ScriptLoader {
             if action.root {
                 graph.root_href = Some(response.url.clone());
             }
-            let parsed = w3cos_compiler::esm_css::parse_css_source(&response.body, &response.url);
+            let parsed = w3cos_compiler::esm_css::parse_css_source(&source, &response.url);
+            if parsed.rules.is_empty()
+                && parsed.imports.is_empty()
+                && parsed.font_faces.is_empty()
+            {
+                // A stylesheet decoded under a contradictory BOM can become
+                // arbitrary Unicode punctuation. Do not concatenate an
+                // entirely unparseable child sheet into its referring sheet,
+                // where unmatched braces could swallow otherwise valid rules.
+                self.advance_stylesheet_graph(graph);
+                continue;
+            }
             let font_faces = parsed
                 .font_faces
                 .into_iter()
@@ -5485,7 +5561,7 @@ impl ScriptLoader {
             let mut ancestry = action.ancestry;
             ancestry.push(response.url.clone());
             graph.actions.push_front(StylesheetGraphAction::Append {
-                source: response.body,
+                source,
                 base_url: response.url.clone(),
                 media: action.media.clone(),
                 font_faces,
@@ -5516,6 +5592,7 @@ impl ScriptLoader {
                         ancestry: ancestry.clone(),
                         referrer_source: response.url.clone(),
                         integrity: String::new(),
+                        fallback_encoding: Some(source_encoding.clone()),
                     }));
             }
             self.advance_stylesheet_graph(graph);
@@ -5713,7 +5790,7 @@ impl ScriptLoader {
     fn store_stylesheet_http_source(
         &self,
         fetch: &PendingStylesheetFetch,
-        response: &crate::fetch::FetchTextResponse,
+        response: &crate::fetch::FetchBinaryResponse,
     ) {
         let cached = crate::browser_http_cache::CachedResponse::from_network(
             &fetch.cache_key,
@@ -5721,7 +5798,7 @@ impl ScriptLoader {
             response.status,
             response.status_text.clone(),
             response.headers.clone(),
-            response.body.as_bytes().to_vec(),
+            response.body.clone(),
         );
         let result = crate::browser_http_cache::store(
             &self.browser_http_cache_policy(),
@@ -17519,6 +17596,24 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         assert_eq!(bom, 2);
         assert_eq!(utf16.decode(&[0x3d, 0xd8], false).unwrap(), "");
         assert_eq!(utf16.decode(&[0x00, 0xde], true).unwrap(), "\u{1f600}");
+    }
+
+    #[test]
+    fn stylesheet_charset_decoder_honors_at_charset_without_transport_charset() {
+        let source = decode_stylesheet_bytes(
+            b"@charset \"shift-JIS\";\n.\x95\xbd\x98\x61 { color: green; }",
+            "text/css",
+            None,
+        )
+        .unwrap()
+        .0;
+        assert!(source.contains(".平和"), "decoded stylesheet: {source:?}");
+        let parsed = w3cos_compiler::esm_css::parse_css_source(&source, "encoded.css");
+        assert!(
+            parsed.rules.iter().any(|rule| rule.selector == ".平和"),
+            "parsed rules: {:?}",
+            parsed.rules
+        );
     }
 
     #[test]

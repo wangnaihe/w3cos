@@ -118,7 +118,10 @@ impl CSSStyleDeclaration {
             }
             "padding-inline" | "paddingInline" => {
                 let values = split_css_whitespace(value);
-                if let Some(start) = values.first().and_then(|value| parse_padding_spacing(value)) {
+                if let Some(start) = values
+                    .first()
+                    .and_then(|value| parse_padding_spacing(value))
+                {
                     let end = values
                         .get(1)
                         .and_then(|value| parse_padding_spacing(value))
@@ -139,7 +142,10 @@ impl CSSStyleDeclaration {
             }
             "padding-block" | "paddingBlock" => {
                 let values = split_css_whitespace(value);
-                if let Some(start) = values.first().and_then(|value| parse_padding_spacing(value)) {
+                if let Some(start) = values
+                    .first()
+                    .and_then(|value| parse_padding_spacing(value))
+                {
                     let end = values
                         .get(1)
                         .and_then(|value| parse_padding_spacing(value))
@@ -217,22 +223,38 @@ impl CSSStyleDeclaration {
                 if let Some((width, max_width)) = parse_min_percent_and_fixed(value) {
                     self.inner.width = width;
                     self.inner.max_width = max_width;
-                } else {
-                    self.inner.width = parse_dimension(value);
+                } else if let Some(width) = parse_dimension_checked(value) {
+                    self.inner.width = width;
                 }
             }
             "height" => {
                 if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
                     self.inner.height = height;
                     self.inner.max_height = max_height;
-                } else {
-                    self.inner.height = parse_dimension(value);
+                } else if let Some(height) = parse_dimension_checked(value) {
+                    self.inner.height = height;
                 }
             }
-            "min-width" | "minWidth" => self.inner.min_width = parse_dimension(value),
-            "min-height" | "minHeight" => self.inner.min_height = parse_dimension(value),
-            "max-width" | "maxWidth" => self.inner.max_width = parse_dimension(value),
-            "max-height" | "maxHeight" => self.inner.max_height = parse_dimension(value),
+            "min-width" | "minWidth" => {
+                if let Some(value) = parse_dimension_checked(value) {
+                    self.inner.min_width = value;
+                }
+            }
+            "min-height" | "minHeight" => {
+                if let Some(value) = parse_dimension_checked(value) {
+                    self.inner.min_height = value;
+                }
+            }
+            "max-width" | "maxWidth" => {
+                if let Some(value) = parse_dimension_checked(value) {
+                    self.inner.max_width = value;
+                }
+            }
+            "max-height" | "maxHeight" => {
+                if let Some(value) = parse_dimension_checked(value) {
+                    self.inner.max_height = value;
+                }
+            }
 
             "top" => self.inner.top = parse_dimension(value),
             "right" => self.inner.right = parse_dimension(value),
@@ -507,7 +529,11 @@ impl CSSStyleDeclaration {
                 let spacing = if value.eq_ignore_ascii_case("normal") {
                     Some(0.0)
                 } else if let Some(number) = value.strip_suffix("rem") {
-                    number.trim().parse::<f32>().ok().map(|number| number * 16.0)
+                    number
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .map(|number| number * 16.0)
                 } else if let Some(number) = value.strip_suffix("em") {
                     number
                         .trim()
@@ -813,6 +839,9 @@ fn css_background_value(value: &str, initial: &str) -> Option<String> {
 
 fn apply_background_shorthand(style: &mut Style, value: &str) {
     let parsed = w3cos_std::background::parse_shorthand(value);
+    if !parsed.valid {
+        return;
+    }
     style.background = parsed.color.unwrap_or(Color::TRANSPARENT);
     style.background_image = Some(parsed.images.join(", "));
     style.background_size = css_background_value(&parsed.sizes.join(", "), "auto");
@@ -887,7 +916,10 @@ fn parse_padding_spacing(value: &str) -> Option<Spacing> {
         | Spacing::Em(value)
         | Spacing::Vw(value)
         | Spacing::Vh(value)
-            if value < 0.0 => None,
+            if value < 0.0 =>
+        {
+            None
+        }
         Spacing::Auto => None,
         _ => Some(spacing),
     }
@@ -1178,29 +1210,33 @@ fn parse_overflow(value: &str) -> Overflow {
 }
 
 fn parse_dimension(value: &str) -> Dimension {
+    parse_dimension_checked(value).unwrap_or(Dimension::Auto)
+}
+
+fn parse_dimension_checked(value: &str) -> Option<Dimension> {
     let v = value.trim();
     if v == "auto" {
-        return Dimension::Auto;
+        return Some(Dimension::Auto);
     }
     if let Some(n) = v.strip_suffix("rem")
         && let Ok(n) = n.trim().parse()
     {
-        return Dimension::Rem(n);
+        return Some(Dimension::Rem(n));
     }
     if let Some(n) = v.strip_suffix("ch")
         && let Ok(n) = n.trim().parse()
     {
-        return Dimension::Em(n);
+        return Some(Dimension::Em(n));
     }
     if let Some(n) = v.strip_suffix("em")
         && let Ok(n) = n.trim().parse()
     {
-        return Dimension::Em(n);
+        return Some(Dimension::Em(n));
     }
     if let Some(n) = v.strip_suffix("vw")
         && let Ok(n) = n.trim().parse()
     {
-        return Dimension::Vw(n);
+        return Some(Dimension::Vw(n));
     }
     if let Some(n) = v
         .strip_suffix("dvh")
@@ -1209,17 +1245,17 @@ fn parse_dimension(value: &str) -> Dimension {
         .or_else(|| v.strip_suffix("vh"))
         && let Ok(n) = n.trim().parse()
     {
-        return Dimension::Vh(n);
+        return Some(Dimension::Vh(n));
     }
     if let Some(n) = v.strip_suffix('%')
         && let Ok(n) = n.trim().parse()
     {
-        return Dimension::Percent(n);
+        return Some(Dimension::Percent(n));
     }
     if let Some(px) = parse_px(v) {
-        return Dimension::Px(px);
+        return Some(Dimension::Px(px));
     }
-    Dimension::Auto
+    None
 }
 
 /// Resolve the common responsive `min(100%, <fixed-length>)` shape into the
@@ -1559,11 +1595,14 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
         .split_once('/')
         .map_or((value, None), |(before, after)| (before, Some(after)));
     let before_parts = split_css_whitespace(before_line_height);
-    let Some((size_index, size)) = before_parts
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, value)| parse_font_size(value, style.font_size).map(|size| (index, size)))
+    let Some((size_index, size)) =
+        before_parts
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, value)| {
+                parse_font_size(value, style.font_size).map(|size| (index, size))
+            })
     else {
         return;
     };
@@ -1603,7 +1642,11 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
 fn parse_font_size(value: &str, inherited_size: f32) -> Option<f32> {
     let value = value.trim();
     if let Some(number) = value.strip_suffix("rem") {
-        return number.trim().parse::<f32>().ok().map(|number| number * 16.0);
+        return number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|number| number * 16.0);
     }
     if let Some(number) = value.strip_suffix("em") {
         return number
@@ -1628,7 +1671,11 @@ fn parse_font_line_height(value: &str, font_size: f32) -> Option<f32> {
         return Some(1.2);
     }
     if let Some(number) = value.strip_suffix('%') {
-        return number.trim().parse::<f32>().ok().map(|number| number / 100.0);
+        return number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|number| number / 100.0);
     }
     if let Ok(number) = value.parse::<f32>() {
         return Some(number.max(0.0));
@@ -2094,7 +2141,10 @@ mod tests {
         declaration.inner.font_size = 50.0;
         declaration.set_property("vertical-align", "0.8em");
 
-        assert_eq!(declaration.inner.align_self, w3cos_std::style::AlignSelf::Baseline);
+        assert_eq!(
+            declaration.inner.align_self,
+            w3cos_std::style::AlignSelf::Baseline
+        );
         assert_eq!(declaration.inner.margin.bottom, Spacing::Px(30.0));
     }
 
@@ -2209,10 +2259,22 @@ mod tests {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("border-color", "orange purple teal yellow");
 
-        assert_eq!(declaration.inner.border_top_color, Some(Color::rgb(255, 165, 0)));
-        assert_eq!(declaration.inner.border_right_color, Some(Color::rgb(128, 0, 128)));
-        assert_eq!(declaration.inner.border_bottom_color, Some(Color::rgb(0, 128, 128)));
-        assert_eq!(declaration.inner.border_left_color, Some(Color::rgb(255, 255, 0)));
+        assert_eq!(
+            declaration.inner.border_top_color,
+            Some(Color::rgb(255, 165, 0))
+        );
+        assert_eq!(
+            declaration.inner.border_right_color,
+            Some(Color::rgb(128, 0, 128))
+        );
+        assert_eq!(
+            declaration.inner.border_bottom_color,
+            Some(Color::rgb(0, 128, 128))
+        );
+        assert_eq!(
+            declaration.inner.border_left_color,
+            Some(Color::rgb(255, 255, 0))
+        );
     }
 
     #[test]
@@ -2500,6 +2562,27 @@ mod tests {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("height", "100dvh");
         assert_eq!(declaration.inner.height, Dimension::Vh(100.0));
+    }
+
+    #[test]
+    fn invalid_width_and_background_preserve_prior_declarations() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("width", "10em");
+        declaration.set_property("background", "green");
+        declaration.set_property("width", "\"auto\"");
+        declaration.set_property("background", "\"red\"");
+
+        assert_eq!(declaration.inner.width, Dimension::Em(10.0));
+        assert_eq!(
+            declaration.inner.background,
+            Color::from_css("green").unwrap()
+        );
+
+        declaration.set_property("background", "url([) green");
+        assert_eq!(
+            declaration.inner.background,
+            Color::from_css("green").unwrap()
+        );
     }
 }
 #[test]

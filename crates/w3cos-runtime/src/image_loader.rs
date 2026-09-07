@@ -513,6 +513,9 @@ pub(crate) fn css_image_urls(value: &str) -> Vec<String> {
                 if ch == active {
                     quote = None;
                 }
+            } else if ch == '\\' {
+                end = (end + 2).min(bytes.len());
+                continue;
             } else if ch == '\'' || ch == '"' {
                 quote = Some(ch);
             } else if ch == ')' {
@@ -532,8 +535,10 @@ pub(crate) fn css_image_urls(value: &str) -> Vec<String> {
         } else {
             raw
         };
-        if !source.is_empty() {
-            urls.push(source.replace("\\\"", "\"").replace("\\'", "'"));
+        if !source.is_empty()
+            && let Some(source) = w3cos_dom::stylesheet::css_unescape(source)
+        {
+            urls.push(source);
         }
         cursor = end + 1;
     }
@@ -708,6 +713,10 @@ mod tests {
             vec!["images/a.png", "icons/b.webp"]
         );
         assert!(css_image_urls("none").is_empty());
+        assert_eq!(
+            css_image_urls(r"url(support/\'green\ block.png)"),
+            vec!["support/'green block.png"]
+        );
     }
 
     #[test]

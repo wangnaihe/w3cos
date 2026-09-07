@@ -601,15 +601,23 @@ pub fn matching_declarations_for_context(
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
-        let mut out = Vec::new();
+        let mut normal = Vec::new();
+        let mut important = Vec::new();
         for rule in matched {
             for (prop, value) in &rule.declarations {
                 if prop != CONTAINER_QUERY_MARKER {
-                    out.push((prop.clone(), value.clone(), rule.specificity));
+                    let (value, is_important) = declaration_value_and_importance(value);
+                    let declaration = (prop.clone(), value.to_string(), rule.specificity);
+                    if is_important {
+                        important.push(declaration);
+                    } else {
+                        normal.push(declaration);
+                    }
                 }
             }
         }
-        out
+        normal.extend(important);
+        normal
     })
 }
 
@@ -661,11 +669,15 @@ fn matched_property_value(
                 .iter()
                 .rev()
                 .find(|(name, _)| name.eq_ignore_ascii_case(property))
-                .map(|(_, value)| (rule.specificity, rule.order, value.clone()))
+                .map(|(_, value)| {
+                    let (value, important) = declaration_value_and_importance(value);
+                    (important, rule.specificity, rule.order, value.to_string())
+                })
         })
         .collect::<Vec<_>>();
-    declarations.sort_by_key(|(specificity, order, _)| (*specificity, *order));
-    declarations.pop().map(|(_, _, value)| value)
+    declarations
+        .sort_by_key(|(important, specificity, order, _)| (*important, *specificity, *order));
+    declarations.pop().map(|(_, _, _, value)| value)
 }
 
 fn css_length_px(value: &str) -> Option<f32> {
@@ -783,15 +795,23 @@ pub fn matching_declarations_for_node(
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
-        let mut out = Vec::new();
+        let mut normal = Vec::new();
+        let mut important = Vec::new();
         for rule in matched {
             for (prop, value) in &rule.declarations {
                 if prop != CONTAINER_QUERY_MARKER {
-                    out.push((prop.clone(), value.clone(), rule.specificity));
+                    let (value, is_important) = declaration_value_and_importance(value);
+                    let declaration = (prop.clone(), value.to_string(), rule.specificity);
+                    if is_important {
+                        important.push(declaration);
+                    } else {
+                        normal.push(declaration);
+                    }
                 }
             }
         }
-        out
+        normal.extend(important);
+        normal
     })
 }
 
@@ -829,16 +849,36 @@ pub fn matching_pseudo_declarations_for_node(
             })
             .collect();
         matched.sort_by_key(|rule| (rule.specificity, rule.order));
-        let mut out = Vec::new();
+        let mut normal = Vec::new();
+        let mut important = Vec::new();
         for rule in matched {
             for (property, value) in &rule.declarations {
                 if property != CONTAINER_QUERY_MARKER {
-                    out.push((property.clone(), value.clone(), rule.specificity));
+                    let (value, is_important) = declaration_value_and_importance(value);
+                    let declaration = (property.clone(), value.to_string(), rule.specificity);
+                    if is_important {
+                        important.push(declaration);
+                    } else {
+                        normal.push(declaration);
+                    }
                 }
             }
         }
-        out
+        normal.extend(important);
+        normal
     })
+}
+
+fn declaration_value_and_importance(value: &str) -> (&str, bool) {
+    let value = value.trim();
+    let Some(marker) = value.rfind('!') else {
+        return (value, false);
+    };
+    if value[marker + 1..].trim().eq_ignore_ascii_case("important") {
+        (value[..marker].trim_end(), true)
+    } else {
+        (value, false)
+    }
 }
 
 /// Parse and match an authored selector list without registering a stylesheet
@@ -1250,7 +1290,18 @@ fn node_language(document: &Document, mut node: NodeId) -> Option<String> {
         }) {
             return Some(language.clone());
         }
-        node = current.parent?;
+        let Some(parent) = current.parent else {
+            return document
+                .query_selector_all("meta")
+                .into_iter()
+                .find(|meta| {
+                    meta.get_attribute(document, "http-equiv")
+                        .is_some_and(|value| value.eq_ignore_ascii_case("content-language"))
+                })
+                .and_then(|meta| meta.get_attribute(document, "content").map(str::to_string))
+                .filter(|language| !language.trim().is_empty());
+        };
+        node = parent;
     }
 }
 
@@ -1301,7 +1352,7 @@ fn matches_nth_position(
 fn parse_an_plus_b(expression: &str) -> Option<(i64, i64)> {
     let expression = expression
         .chars()
-        .filter(|character| !character.is_whitespace())
+        .filter(|character| !is_css_whitespace(*character))
         .collect::<String>()
         .to_ascii_lowercase();
     match expression.as_str() {
@@ -1456,7 +1507,11 @@ fn compound_matches_ctx(compound: &CompoundSelector, ctx: &SelectorContext) -> b
 /// particular NBSP and EM SPACE are valid identifier code points and must not
 /// be removed from selectors.
 pub fn trim_css_whitespace(value: &str) -> &str {
-    value.trim_matches(|character| matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000c}'))
+    value.trim_matches(is_css_whitespace)
+}
+
+fn is_css_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000c}')
 }
 
 /// Split a selector group on top-level commas (paren/bracket aware).
@@ -1511,7 +1566,7 @@ fn consume_css_escape(chars: &[char], pos: usize) -> Option<(char, usize)> {
             digits.push(chars[end]);
             end += 1;
         }
-        if end < chars.len() && chars[end].is_whitespace() {
+        if end < chars.len() && is_css_whitespace(chars[end]) {
             let whitespace = chars[end];
             end += 1;
             if whitespace == '\r' && chars.get(end) == Some(&'\n') {
@@ -1583,6 +1638,12 @@ fn parse_complete_css_identifier(value: &str) -> Option<String> {
     (end == chars.len()).then_some(identifier)
 }
 
+/// Decode a value only when its complete token shape is a CSS identifier.
+/// This preserves strings, functions, and delimiters for their own parsers.
+pub fn css_unescape_identifier(value: &str) -> Option<String> {
+    parse_complete_css_identifier(value)
+}
+
 /// Parse a complete `#id` selector through the same CSS identifier consumer
 /// used by the authored selector engine. Callers can then use indexed DOM id
 /// lookup without maintaining a second escape implementation.
@@ -1590,7 +1651,7 @@ pub fn parse_simple_id_selector(selector: &str) -> Option<String> {
     parse_complete_css_identifier(selector.strip_prefix('#')?)
 }
 
-pub(crate) fn css_unescape(value: &str) -> Option<String> {
+pub fn css_unescape(value: &str) -> Option<String> {
     let chars = value.chars().collect::<Vec<_>>();
     let mut output = String::new();
     let mut pos = 0usize;
@@ -1643,7 +1704,7 @@ fn parse_selector_chain(selector: &str) -> Option<(Vec<CompoundSelector>, Vec<Co
 
     while pos < chars.len() {
         let ch = chars[pos];
-        if ch.is_whitespace() {
+        if is_css_whitespace(ch) {
             saw_space = true;
             pos += 1;
             continue;
@@ -1813,7 +1874,10 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                 while pos < chars.len() && is_ident_char(chars[pos]) {
                     pos += 1;
                 }
-                let name = chars[start..pos].iter().collect::<String>();
+                let name = chars[start..pos]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase();
                 // Optional parenthesized argument, e.g. `:nth-child(2n+1)`.
                 let has_arguments = pos < chars.len() && chars[pos] == '(';
                 let mut argument = String::new();
@@ -1875,9 +1939,9 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                         false,
                         "after" | "backdrop" | "before" | "first-letter" | "first-line" | "marker"
                         | "placeholder" | "selection",
-                    ) => compound.unsupported = true,
+                    ) => return None,
                     (false, false, "after" | "before" | "first-letter" | "first-line") => {
-                        compound.unsupported = true
+                        return None;
                     }
                     (true, true, "slotted") if !argument.is_empty() => compound.unsupported = true,
                     (false, true, "dir") => {
@@ -1888,6 +1952,10 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                         compound.pseudo_classes.push(PseudoClass::Dir(direction))
                     }
                     (false, true, "lang") => {
+                        let argument = trim_css_whitespace(&argument).to_string();
+                        if argument.is_empty() {
+                            return None;
+                        }
                         compound.pseudo_classes.push(PseudoClass::Lang(argument))
                     }
                     (false, true, "has") => {
@@ -2363,8 +2431,14 @@ mod tests {
         assert_eq!(rule_count(), 3);
         RULES.with(|rules| {
             let rules = rules.borrow();
-            assert_eq!(rules.rules[0].pseudo_element.as_deref(), Some("::first-line"));
-            assert_eq!(rules.rules[1].pseudo_element.as_deref(), Some("::first-letter"));
+            assert_eq!(
+                rules.rules[0].pseudo_element.as_deref(),
+                Some("::first-line")
+            );
+            assert_eq!(
+                rules.rules[1].pseudo_element.as_deref(),
+                Some("::first-letter")
+            );
             assert_eq!(rules.rules[2].pseudo_element.as_deref(), Some("::after"));
             assert_eq!(rules.rules[2].chain[0].tag.as_deref(), None);
         });
@@ -2378,6 +2452,28 @@ mod tests {
         assert_eq!(matching_declarations("span", None, &["a"], &[]).len(), 1);
         assert_eq!(matching_declarations("div", None, &["b"], &[]).len(), 1);
         assert_eq!(matching_declarations("p", Some("c"), &[], &[]).len(), 1);
+    }
+
+    #[test]
+    fn invalid_selector_member_invalidates_the_complete_list() {
+        setup();
+        for selector in [
+            "p:first-line p, #target",
+            "p:first-line[id=target], #target",
+            ":lang(), #target",
+            "p:unknown-pseudo, #target",
+        ] {
+            register_rule(selector, &[("color", "red")]);
+        }
+        assert_eq!(rule_count(), 0);
+    }
+
+    #[test]
+    fn pseudo_class_names_are_ascii_case_insensitive() {
+        setup();
+        register_rule("div:fiRsT-cHiLd", &[("color", "green")]);
+        let element = SelectorContext::new("div", None, &[]).with_tree_state(true, false);
+        assert_eq!(matching_declarations_for_context(&element, &[]).len(), 1);
     }
 
     #[test]
@@ -2491,6 +2587,38 @@ mod tests {
         let xhtml = html.clone().with_html_document(false);
         assert_eq!(matching_declarations_for_context(&html, &[]).len(), 1);
         assert!(matching_declarations_for_context(&xhtml, &[]).is_empty());
+    }
+
+    #[test]
+    fn content_language_meta_supplies_the_document_language() {
+        setup();
+        register_rule("div:lang(fr)", &[("color", "green")]);
+        let mut document = Document::new();
+        let meta = document.create_element("meta");
+        meta.set_attribute(&mut document, "http-equiv", "content-language");
+        meta.set_attribute(&mut document, "content", "fr");
+        document.append_child(document.body().id, meta.id);
+        let target = document.create_element("div");
+        document.append_child(document.body().id, target.id);
+
+        assert_eq!(
+            matching_declarations_for_node(&document, target.id).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn important_declarations_apply_after_more_specific_normal_declarations() {
+        setup();
+        register_rule("*", &[("color", "white ! important")]);
+        register_rule("p", &[("color", "red")]);
+        let element = SelectorContext::new("p", None, &[]);
+        let declarations = matching_declarations_for_context(&element, &[]);
+
+        assert_eq!(
+            declarations.last().map(|(_, value, _)| value.as_str()),
+            Some("white")
+        );
     }
 
     #[test]

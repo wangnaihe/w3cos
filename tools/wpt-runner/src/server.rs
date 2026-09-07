@@ -205,7 +205,15 @@ fn serve_connection(mut stream: TcpStream, root: &Path) -> Result<()> {
     }
     let body = std::fs::read(&file)
         .with_context(|| format!("failed to read WPT resource {}", file.display()))?;
-    write_response(&mut stream, method, 200, content_type(&file), &body)
+    let headers = sidecar_headers(&file)?;
+    write_response_with_headers(
+        &mut stream,
+        method,
+        200,
+        content_type(&file),
+        &body,
+        &headers,
+    )
 }
 
 fn write_response(
@@ -215,6 +223,17 @@ fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
+    write_response_with_headers(stream, method, status, content_type, body, &[])
+}
+
+fn write_response_with_headers(
+    stream: &mut TcpStream,
+    method: &str,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(String, String)],
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -222,9 +241,27 @@ fn write_response(
         405 => "Method Not Allowed",
         _ => "Error",
     };
+    write!(stream, "HTTP/1.1 {status} {reason}\r\n")
+        .context("failed to write WPT response status")?;
+    if !extra_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+    {
+        write!(stream, "Content-Type: {content_type}\r\n")
+            .context("failed to write WPT content type")?;
+    }
+    for (name, value) in extra_headers {
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("connection")
+        {
+            continue;
+        }
+        write!(stream, "{name}: {value}\r\n")
+            .context("failed to write WPT sidecar header")?;
+    }
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .context("failed to write WPT response headers")?;
@@ -234,6 +271,39 @@ fn write_response(
             .context("failed to write WPT response body")?;
     }
     Ok(())
+}
+
+fn sidecar_headers(file: &Path) -> Result<Vec<(String, String)>> {
+    let mut sidecar_name = file.as_os_str().to_os_string();
+    sidecar_name.push(".headers");
+    let sidecar = PathBuf::from(sidecar_name);
+    if !sidecar.is_file() {
+        return Ok(Vec::new());
+    }
+    let source = std::fs::read_to_string(&sidecar)
+        .with_context(|| format!("failed to read WPT headers sidecar {}", sidecar.display()))?;
+    let mut headers = Vec::new();
+    for line in source.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || value.contains(['\r', '\n'])
+        {
+            continue;
+        }
+        headers.push((name.to_string(), value.to_string()));
+    }
+    Ok(headers)
 }
 
 fn safe_relative_path(target: &str) -> Result<PathBuf> {
@@ -311,10 +381,10 @@ fn content_type(path: &Path) -> &'static str {
         .to_ascii_lowercase()
         .as_str()
     {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "xht" | "xhtml" => "application/xhtml+xml; charset=utf-8",
+        "html" | "htm" => "text/html",
+        "xht" | "xhtml" => "application/xhtml+xml",
         "js" | "mjs" => "text/javascript; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
+        "css" => "text/css",
         "txt" => "text/plain; charset=utf-8",
         "json" => "application/json",
         "xml" => "application/xml",
@@ -376,6 +446,23 @@ mod tests {
     }
 
     #[test]
+    fn serves_resource_headers_from_wpt_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("encoded.css"), b"body {}").unwrap();
+        std::fs::write(
+            directory.path().join("encoded.css.headers"),
+            "Content-Type: text/css; charset=Shift_JIS\nX-Test: sidecar\n",
+        )
+        .unwrap();
+        let server = StaticServer::start(directory.path().to_path_buf()).unwrap();
+
+        let response = http_get_raw(&server.url_for("encoded.css"));
+        assert!(response.contains("Content-Type: text/css; charset=Shift_JIS\r\n"));
+        assert!(!response.contains("Content-Type: text/css; charset=utf-8\r\n"));
+        assert!(response.contains("X-Test: sidecar\r\n"));
+    }
+
+    #[test]
     fn executes_the_character_set_fixture_without_a_python_runtime() {
         let directory = tempfile::tempdir().unwrap();
         let server = StaticServer::start(directory.path().to_path_buf()).unwrap();
@@ -390,6 +477,14 @@ mod tests {
     }
 
     fn http_get(url: &str) -> String {
+        http_get_raw(url)
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap()
+            .to_string()
+    }
+
+    fn http_get_raw(url: &str) -> String {
         let suffix = url.strip_prefix("http://").unwrap();
         let separator = suffix.find('/').unwrap();
         let address = &suffix[..separator];
@@ -402,6 +497,6 @@ mod tests {
         .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
-        response.split("\r\n\r\n").nth(1).unwrap().to_string()
+        response
     }
 }

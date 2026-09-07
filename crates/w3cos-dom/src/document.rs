@@ -1043,8 +1043,7 @@ impl Document {
         let mut custom_properties = inherited
             .and_then(|style| style.custom_properties.clone())
             .unwrap_or_default();
-        custom_properties
-            .retain(|property, _| !property.starts_with("--w3cos-internal-"));
+        custom_properties.retain(|property, _| !property.starts_with("--w3cos-internal-"));
 
         // Custom properties participate in the cascade independently of
         // declaration order. Collect them first, then resolve ordinary
@@ -1085,17 +1084,23 @@ impl Document {
         if let Some(parent) = inherited {
             let declares = |property: &str| {
                 let winning_author_value = matched
-                        .iter()
-                        .filter(|(name, _, _)| css_property_eq(name, property))
-                        .map(|(_, value, _)| value.as_str())
-                        .chain(
-                            inline
-                                .inline_declarations
-                                .iter()
-                                .filter(|(name, _)| css_property_eq(name, property))
-                                .map(|(_, value)| value.as_str()),
-                        )
-                        .last();
+                    .iter()
+                    .filter(|(name, value, _)| {
+                        css_property_eq(name, property)
+                            && declaration_value_is_valid(property, value)
+                    })
+                    .map(|(_, value, _)| value.as_str())
+                    .chain(
+                        inline
+                            .inline_declarations
+                            .iter()
+                            .filter(|(name, value)| {
+                                css_property_eq(name, property)
+                                    && declaration_value_is_valid(property, value)
+                            })
+                            .map(|(_, value)| value.as_str()),
+                    )
+                    .last();
                 (css_property_eq(property, "color") && body_text_hint.is_some())
                     || winning_author_value.is_some_and(|value| {
                         !matches!(
@@ -1150,7 +1155,8 @@ impl Document {
                 )
                 .last()
         };
-        if let Some((property, value)) = declared_property_value(&["font-size", "fontSize", "font"]) {
+        if let Some((property, value)) = declared_property_value(&["font-size", "fontSize", "font"])
+        {
             let parent = inherited.cloned().unwrap_or_default();
             let value = if css_property_eq(property, "font") {
                 font_shorthand_size_token(value).unwrap_or(value)
@@ -1311,12 +1317,8 @@ impl Document {
             last_border_declaration(properties)
                 .and_then(|value| relative_border_width_px(value, &style))
         };
-        let top_width = relative_side_width(&[
-            "border",
-            "border-width",
-            "border-top",
-            "border-top-width",
-        ]);
+        let top_width =
+            relative_side_width(&["border", "border-width", "border-top", "border-top-width"]);
         let right_width = relative_side_width(&[
             "border",
             "border-width",
@@ -1329,12 +1331,8 @@ impl Document {
             "border-bottom",
             "border-bottom-width",
         ]);
-        let left_width = relative_side_width(&[
-            "border",
-            "border-width",
-            "border-left",
-            "border-left-width",
-        ]);
+        let left_width =
+            relative_side_width(&["border", "border-width", "border-left", "border-left-width"]);
         if let Some(width) = top_width {
             style.border_top_width = Some(width);
         }
@@ -2338,8 +2336,8 @@ impl Document {
                         if child_style.display == Display::Inline {
                             let mut grandchild_ancestors = child_ancestors.clone();
                             grandchild_ancestors.push(self.selector_context(*child_id));
-                            let contains_in_flow_block = self.children_ids(*child_id).iter().any(
-                                |grandchild_id| {
+                            let contains_in_flow_block =
+                                self.children_ids(*child_id).iter().any(|grandchild_id| {
                                     let grandchild = self.get_node(*grandchild_id);
                                     if grandchild.node_type != NodeType::Element {
                                         return false;
@@ -2357,8 +2355,7 @@ impl Document {
                                         w3cos_std::style::Position::Absolute
                                             | w3cos_std::style::Position::Fixed
                                     )
-                                },
-                            );
+                                });
                             participates &= !contains_in_flow_block;
                         }
                         Some(participates)
@@ -2705,13 +2702,10 @@ impl Document {
                     // the inherited line-height strut for following content.
                     style.display = w3cos_std::style::Display::Inline;
                     style.width = w3cos_std::style::Dimension::Px(0.0);
-                    style.height = w3cos_std::style::Dimension::Px(
-                        style.font_size * style.line_height,
-                    );
-                    return self.attach_native_host(
-                        id,
-                        w3cos_std::Component::text("\u{2028}", style),
-                    );
+                    style.height =
+                        w3cos_std::style::Dimension::Px(style.font_size * style.line_height);
+                    return self
+                        .attach_native_host(id, w3cos_std::Component::text("\u{2028}", style));
                 }
                 if tag == "svg" {
                     let (attribute_width, attribute_height) = self.svg_root_size(id);
@@ -2768,18 +2762,18 @@ impl Document {
                         | w3cos_std::style::Display::TableCaption
                 );
                 let first_line_declarations = supports_text_pseudos
-                    .then(|| stylesheet::matching_pseudo_declarations_for_node(
-                        self,
-                        id,
-                        "::first-line",
-                    ))
+                    .then(|| {
+                        stylesheet::matching_pseudo_declarations_for_node(self, id, "::first-line")
+                    })
                     .unwrap_or_default();
                 let first_letter_declarations = supports_text_pseudos
-                    .then(|| stylesheet::matching_pseudo_declarations_for_node(
-                        self,
-                        id,
-                        "::first-letter",
-                    ))
+                    .then(|| {
+                        stylesheet::matching_pseudo_declarations_for_node(
+                            self,
+                            id,
+                            "::first-letter",
+                        )
+                    })
                     .unwrap_or_default();
                 if tag == "details"
                     && !node
@@ -2825,8 +2819,7 @@ impl Document {
                                 && component.style.line_height == generated[0].style.line_height
                                 && component.style.letter_spacing
                                     == generated[0].style.letter_spacing
-                                && component.style.word_spacing
-                                    == generated[0].style.word_spacing
+                                && component.style.word_spacing == generated[0].style.word_spacing
                                 && component.style.text_decoration
                                     == generated[0].style.text_decoration
                         })
@@ -2882,12 +2875,7 @@ impl Document {
                 {
                     let child = self.get_node(child_ids[0]);
                     if child.node_type == NodeType::Text {
-                        let text = self.rendered_text_content(
-                            &child_ids,
-                            0,
-                            ancestors,
-                            &style,
-                        );
+                        let text = self.rendered_text_content(&child_ids, 0, ancestors, &style);
                         let component = match tag.as_str() {
                             "button" => w3cos_std::Component::button(text, style),
                             _ => w3cos_std::Component::text(text, style),
@@ -2910,8 +2898,7 @@ impl Document {
                             "span" | "label" | "em" | "strong" | "code" | "small"
                         )
                         && style.custom_properties.as_ref().is_none_or(|properties| {
-                            !properties
-                                .contains_key("--w3cos-internal-vertical-align-length")
+                            !properties.contains_key("--w3cos-internal-vertical-align-length")
                         })
                     {
                         let grandchild_ids = self.children_ids(child_ids[0]);
@@ -2947,8 +2934,7 @@ impl Document {
                         if child.node_type != NodeType::Element {
                             return false;
                         }
-                        let child_style =
-                            self.computed_style(*child_id, ancestors, Some(&style));
+                        let child_style = self.computed_style(*child_id, ancestors, Some(&style));
                         matches!(
                             child_style.display,
                             w3cos_std::style::Display::Block
@@ -2988,19 +2974,18 @@ impl Document {
                     && rendered_child_ids.len() >= 2
                     && rendered_child_ids.iter().all(|child_id| {
                         let child = self.get_node(*child_id);
-                        child.node_type != NodeType::Element
-                            || {
-                                let child_style =
-                                    self.computed_style(*child_id, ancestors, Some(&style));
-                                child_style.float == w3cos_std::style::Float::None
-                                    && matches!(
-                                        child_style.display,
-                                        w3cos_std::style::Display::Inline
-                                            | w3cos_std::style::Display::InlineBlock
-                                            | w3cos_std::style::Display::InlineFlex
-                                            | w3cos_std::style::Display::InlineTable
-                                    )
-                            }
+                        child.node_type != NodeType::Element || {
+                            let child_style =
+                                self.computed_style(*child_id, ancestors, Some(&style));
+                            child_style.float == w3cos_std::style::Float::None
+                                && matches!(
+                                    child_style.display,
+                                    w3cos_std::style::Display::Inline
+                                        | w3cos_std::style::Display::InlineBlock
+                                        | w3cos_std::style::Display::InlineFlex
+                                        | w3cos_std::style::Display::InlineTable
+                                )
+                        }
                     });
                 let mut children =
                     self.child_components(&rendered_child_ids, &child_ids, ancestors, &style);
@@ -3199,9 +3184,7 @@ impl Document {
                 if !first_line_declarations.is_empty() {
                     let available_width = match style.width {
                         w3cos_std::style::Dimension::Px(width) => Some(width),
-                        w3cos_std::style::Dimension::Em(width) => {
-                            Some(width * style.font_size)
-                        }
+                        w3cos_std::style::Dimension::Em(width) => Some(width * style.font_size),
                         w3cos_std::style::Dimension::Rem(width) => Some(width * 16.0),
                         _ => None,
                     };
@@ -3228,14 +3211,18 @@ impl Document {
                     } else {
                         anonymous_inline_formatting_context |= children
                             .iter()
-                            .find(|component| component.style.display != w3cos_std::style::Display::None)
-                            .is_some_and(|component| matches!(
-                                component.style.display,
-                                w3cos_std::style::Display::Inline
-                                    | w3cos_std::style::Display::InlineBlock
-                                    | w3cos_std::style::Display::InlineFlex
-                                    | w3cos_std::style::Display::InlineTable
-                            ));
+                            .find(|component| {
+                                component.style.display != w3cos_std::style::Display::None
+                            })
+                            .is_some_and(|component| {
+                                matches!(
+                                    component.style.display,
+                                    w3cos_std::style::Display::Inline
+                                        | w3cos_std::style::Display::InlineBlock
+                                        | w3cos_std::style::Display::InlineFlex
+                                        | w3cos_std::style::Display::InlineTable
+                                )
+                            });
                     }
                 }
                 promote_passive_vertical_align_extension(&mut style, &children);
@@ -3318,8 +3305,7 @@ impl Document {
                         | w3cos_std::style::Display::InlineBlock
                         | w3cos_std::style::Display::TableCell
                         | w3cos_std::style::Display::TableCaption
-                )
-                    && children.len() == 1
+                ) && children.len() == 1
                     && matches!(
                         children[0].style.display,
                         w3cos_std::style::Display::Inline
@@ -3585,14 +3571,11 @@ impl Document {
                                     ) => w3cos_std::style::Dimension::Rem(width + left + right),
                                     _ => child.style.width,
                                 };
-                                let mut line_item_style =
-                                    w3cos_std::style::Style::default();
-                                line_item_style.display =
-                                    w3cos_std::style::Display::InlineFlex;
+                                let mut line_item_style = w3cos_std::style::Style::default();
+                                line_item_style.display = w3cos_std::style::Display::InlineFlex;
                                 line_item_style.flex_direction =
                                     w3cos_std::style::FlexDirection::Row;
-                                line_item_style.align_items =
-                                    w3cos_std::style::AlignItems::FlexEnd;
+                                line_item_style.align_items = w3cos_std::style::AlignItems::FlexEnd;
                                 line_item_style.flex_shrink = 0.0;
                                 line_item_style.font_size = child.style.font_size;
                                 line_item_style.font_family = child.style.font_family.clone();
@@ -3659,7 +3642,8 @@ impl Document {
                         };
                         children = vec![w3cos_std::Component::row(line_style, children)];
                     } else if style.display == w3cos_std::style::Display::TableRow {
-                        let table_direction = inherited.map_or(style.direction, |style| style.direction);
+                        let table_direction =
+                            inherited.map_or(style.direction, |style| style.direction);
                         style.flex_direction = match table_direction {
                             w3cos_std::style::TextDirection::Ltr => {
                                 w3cos_std::style::FlexDirection::Row
@@ -3719,9 +3703,7 @@ impl Document {
                         | (
                             w3cos_std::style::TextAlign::End,
                             w3cos_std::style::TextDirection::Ltr,
-                        ) => {
-                            w3cos_std::style::JustifyContent::FlexEnd
-                        }
+                        ) => w3cos_std::style::JustifyContent::FlexEnd,
                         (w3cos_std::style::TextAlign::Center, _) => {
                             w3cos_std::style::JustifyContent::Center
                         }
@@ -3744,7 +3726,8 @@ impl Document {
                     // columns. Column order follows the containing table (or
                     // row-group) direction, which arrives as the inherited
                     // principal-box style here.
-                    let table_direction = inherited.map_or(style.direction, |style| style.direction);
+                    let table_direction =
+                        inherited.map_or(style.direction, |style| style.direction);
                     style.flex_direction = match table_direction {
                         w3cos_std::style::TextDirection::Ltr => {
                             w3cos_std::style::FlexDirection::Row
@@ -5130,6 +5113,18 @@ fn format_counter_value(value: i32, style: &str) -> String {
     }
 }
 
+fn declaration_value_is_valid(property: &str, value: &str) -> bool {
+    if css_property_eq(property, "color") {
+        let value = value.trim();
+        return w3cos_std::Color::from_css(value).is_some()
+            || matches!(
+                value.to_ascii_lowercase().as_str(),
+                "currentcolor" | "inherit" | "initial" | "revert" | "revert-layer" | "unset"
+            );
+    }
+    true
+}
+
 fn inherit_text_style(
     style: &mut w3cos_std::style::Style,
     parent: &w3cos_std::style::Style,
@@ -5145,11 +5140,7 @@ fn inherit_text_style(
     if !declares("font-size") && !declares("font") && !form_control && !heading {
         style.font_size = parent.font_size;
     }
-    if !declares("font-weight")
-        && !declares("font")
-        && !heading
-        && !matches!(tag, "b" | "strong")
-    {
+    if !declares("font-weight") && !declares("font") && !heading && !matches!(tag, "b" | "strong") {
         style.font_weight = parent.font_weight;
     }
     if !declares("font-family") && !declares("font") {
@@ -5238,18 +5229,24 @@ fn relative_font_size_px(value: &str, parent: &w3cos_std::style::Style) -> Optio
         .strip_suffix("rem")
         .and_then(|number| number.trim().parse::<f32>().ok())
         .map(|number| number * 16.0)
-        .or_else(|| value
-            .strip_suffix("em")
-            .and_then(|number| number.trim().parse::<f32>().ok())
-            .map(|number| number * parent.font_size))
-        .or_else(|| value
-            .strip_suffix("ex")
-            .and_then(|number| number.trim().parse::<f32>().ok())
-            .map(|number| number * css_ex_size(parent)))
-        .or_else(|| value
-            .strip_suffix('%')
-            .and_then(|number| number.trim().parse::<f32>().ok())
-            .map(|number| number * parent.font_size / 100.0))
+        .or_else(|| {
+            value
+                .strip_suffix("em")
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * parent.font_size)
+        })
+        .or_else(|| {
+            value
+                .strip_suffix("ex")
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * css_ex_size(parent))
+        })
+        .or_else(|| {
+            value
+                .strip_suffix('%')
+                .and_then(|number| number.trim().parse::<f32>().ok())
+                .map(|number| number * parent.font_size / 100.0)
+        })
 }
 
 fn vertical_align_length_px(value: &str, style: &w3cos_std::style::Style) -> Option<f32> {
@@ -5323,7 +5320,10 @@ fn attach_first_line_fragment_clip(
             .get_or_insert_with(Default::default)
             .insert(
                 "--w3cos-internal-inline-fragment-clip".to_string(),
-                format!("{} {fragment_height}", alignment.expect("alignment checked")),
+                format!(
+                    "{} {fragment_height}",
+                    alignment.expect("alignment checked")
+                ),
             );
     }
 }
@@ -5413,7 +5413,10 @@ fn first_letter_fragment_range(
             start = Some(index);
         }
         if *letter_seen && (character.is_alphanumeric() || character.is_whitespace()) {
-            return (Some(start.expect("first-letter fragment")..end.expect("fragment end")), true);
+            return (
+                Some(start.expect("first-letter fragment")..end.expect("fragment end")),
+                true,
+            );
         }
         end = Some(index + character.len_utf8());
         *letter_seen |= character.is_alphanumeric();
@@ -5622,11 +5625,7 @@ fn apply_first_line_style_inner(
                             content[..break_at].to_string(),
                             pseudo_style,
                         ),
-                        cloned_text_fragment(
-                            &source,
-                            content[break_at..].to_string(),
-                            base_style,
-                        ),
+                        cloned_text_fragment(&source, content[break_at..].to_string(), base_style),
                     ];
                     components.splice(index..=index, fragments);
                     changed = true;
@@ -5838,10 +5837,7 @@ fn painted_inline_text_box_can_merge(style: &w3cos_std::style::Style) -> bool {
     principal_box_can_merge_generated_inline_text(&transparent)
 }
 
-fn equivalent_text_style(
-    left: &w3cos_std::style::Style,
-    right: &w3cos_std::style::Style,
-) -> bool {
+fn equivalent_text_style(left: &w3cos_std::style::Style, right: &w3cos_std::style::Style) -> bool {
     if left == right {
         return true;
     }
@@ -5903,9 +5899,7 @@ fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
             let mut line_start = 0;
             let line_ranges = content
                 .char_indices()
-                .filter_map(|(offset, character)| {
-                    (character == '\u{2028}').then_some(offset)
-                })
+                .filter_map(|(offset, character)| (character == '\u{2028}').then_some(offset))
                 .chain(std::iter::once(content.len()))
                 .map(|line_end| {
                     let range = line_start..line_end;
@@ -5951,14 +5945,9 @@ fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
         *content = content
             .chars()
             .rev()
-            .map(|character| {
-                unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character)
-            })
+            .map(|character| unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character))
             .collect();
-        component.style.text_align = match (
-            component.style.text_align,
-            component.style.direction,
-        ) {
+        component.style.text_align = match (component.style.text_align, component.style.direction) {
             (w3cos_std::style::TextAlign::Start, w3cos_std::style::TextDirection::Rtl)
             | (w3cos_std::style::TextAlign::End, w3cos_std::style::TextDirection::Ltr) => {
                 w3cos_std::style::TextAlign::Right
@@ -6011,8 +6000,8 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         BoxSizing, Dimension, Display, FlexWrap, Spacing, TextDirection, UnicodeBidi, WhiteSpace,
     };
 
-    let bidi_control_for = |style: &w3cos_std::style::Style| {
-        match (style.direction, style.unicode_bidi) {
+    let bidi_control_for =
+        |style: &w3cos_std::style::Style| match (style.direction, style.unicode_bidi) {
             (TextDirection::Rtl, UnicodeBidi::BidiOverride | UnicodeBidi::IsolateOverride) => {
                 Some(('\u{202e}', '\u{202c}'))
             }
@@ -6022,11 +6011,13 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             (TextDirection::Rtl, UnicodeBidi::Embed) => Some(('\u{202b}', '\u{202c}')),
             (TextDirection::Ltr, UnicodeBidi::Embed) => Some(('\u{202a}', '\u{202c}')),
             _ => None,
-        }
-    };
+        };
     let style_bidi_control = bidi_control_for(&component.style);
     if (component.children.len() < 2 && style_bidi_control.is_none())
-        || !matches!(component.style.flex_direction, w3cos_std::style::FlexDirection::Row)
+        || !matches!(
+            component.style.flex_direction,
+            w3cos_std::style::FlexDirection::Row
+        )
     {
         return false;
     }
@@ -6055,18 +6046,19 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
                 if !text.children.is_empty() {
                     return false;
                 }
-                let leading_ahem_wrapper = units.iter().all(|unit: &InlineUnit| {
-                    unit.content
-                        .chars()
-                        .all(|character| is_css_whitespace(character) || is_bidi_control(character))
-                }) && child.style.font_family.as_deref().is_some_and(|families| {
-                    families.split(',').any(|family| {
-                        family
-                            .trim()
-                            .trim_matches(['"', '\''])
-                            .eq_ignore_ascii_case("ahem")
-                    })
-                });
+                let leading_ahem_wrapper =
+                    units.iter().all(|unit: &InlineUnit| {
+                        unit.content.chars().all(|character| {
+                            is_css_whitespace(character) || is_bidi_control(character)
+                        })
+                    }) && child.style.font_family.as_deref().is_some_and(|families| {
+                        families.split(',').any(|family| {
+                            family
+                                .trim()
+                                .trim_matches(['"', '\''])
+                                .eq_ignore_ascii_case("ahem")
+                        })
+                    });
                 let mut source = child.clone();
                 source.kind = ComponentKind::Text {
                     content: String::new(),
@@ -6102,7 +6094,11 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             logical.push((control, unit_index));
         }
         text.push_str(&unit.content);
-        logical.extend(unit.content.chars().map(|character| (character, unit_index)));
+        logical.extend(
+            unit.content
+                .chars()
+                .map(|character| (character, unit_index)),
+        );
         if let Some((_, control)) = unit_bidi_control {
             text.push(control);
             logical.push((control, unit_index));
@@ -6147,8 +6143,10 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     let is_control = is_bidi_control;
 
     let wrapping_width = if component.style.flex_wrap != FlexWrap::NoWrap
-        && !matches!(component.style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre)
-    {
+        && !matches!(
+            component.style.white_space,
+            WhiteSpace::NoWrap | WhiteSpace::Pre
+        ) {
         let width = match component.style.width {
             Dimension::Px(width) => Some(width),
             Dimension::Em(width) => Some(width * component.style.font_size),
@@ -6233,10 +6231,9 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
                     .unwrap_or(unit.component.style.border_width);
         }
 
-        let words = logical
-            .iter()
-            .enumerate()
-            .fold(Vec::<std::ops::Range<usize>>::new(), |mut words, (index, (ch, _))| {
+        let words = logical.iter().enumerate().fold(
+            Vec::<std::ops::Range<usize>>::new(),
+            |mut words, (index, (ch, _))| {
                 if ch.is_whitespace() {
                     return words;
                 }
@@ -6248,7 +6245,8 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
                     words.push(index..index + 1);
                 }
                 words
-            });
+            },
+        );
         if words.is_empty() {
             return vec![0..logical.len()];
         }
@@ -6389,12 +6387,10 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         edge_whitespace.push((leading, trailing));
     }
 
-    let mut normalized: Vec<w3cos_std::Component> =
-        Vec::with_capacity(visual_fragments.len() * 2);
+    let mut normalized: Vec<w3cos_std::Component> = Vec::with_capacity(visual_fragments.len() * 2);
     let mut previous_line = None;
     for (index, mut fragment) in visual_fragments.into_iter().enumerate() {
-        let starts_new_line =
-            previous_line.is_some_and(|previous| previous != fragment.line_index);
+        let starts_new_line = previous_line.is_some_and(|previous| previous != fragment.line_index);
         if index > 0 && !starts_new_line {
             let boundary_has_space = edge_whitespace[index - 1].1 || edge_whitespace[index].0;
             let left_owns_space = normalized.last().is_some_and(|previous| {
@@ -6476,14 +6472,12 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
                 equivalent_text_style(&fragment.style, &child.style)
                     && painted_inline_text_box_can_merge(&fragment.style)
             });
-            if !matches!(
-                &fragment.kind,
-                ComponentKind::Row | ComponentKind::Box
-            ) || !matches!(
-                fragment.style.display,
-                w3cos_std::style::Display::Inline
-                    | w3cos_std::style::Display::InlineFlex
-            ) || fragment.children.len() != 1
+            if !matches!(&fragment.kind, ComponentKind::Row | ComponentKind::Box)
+                || !matches!(
+                    fragment.style.display,
+                    w3cos_std::style::Display::Inline | w3cos_std::style::Display::InlineFlex
+                )
+                || fragment.children.len() != 1
                 || !passive_host(&fragment.on_click)
                 || !(principal_box_can_merge_generated_inline_text(&fragment.style)
                     || painted_wrapper_matches_text)
@@ -6820,9 +6814,9 @@ fn hoist_floats_into_block_formatting_context(
             }
             if let w3cos_std::ComponentKind::Text { content: text } = &component.kind {
                 if component.children.is_empty()
-                    && text_style.as_ref().is_none_or(|style| {
-                        equivalent_text_style(style, &component.style)
-                    })
+                    && text_style
+                        .as_ref()
+                        .is_none_or(|style| equivalent_text_style(style, &component.style))
                 {
                     text_style.get_or_insert_with(|| component.style.clone());
                     content.push_str(text);
@@ -6833,9 +6827,10 @@ fn hoist_floats_into_block_formatting_context(
             matches!(
                 component.kind,
                 w3cos_std::ComponentKind::Row | w3cos_std::ComponentKind::Box
-            ) && component.children.iter().all(|child| {
-                collect_passive_text(child, content, text_style)
-            })
+            ) && component
+                .children
+                .iter()
+                .all(|child| collect_passive_text(child, content, text_style))
         }
         fn coalesced_float_text(
             left_floats: &[w3cos_std::Component],
@@ -6954,8 +6949,8 @@ fn hoist_floats_into_block_formatting_context(
             let mut has_prior_in_flow = false;
             let mut retained = Vec::new();
             for child in std::mem::take(&mut component.children) {
-                let extract_child = child.style.float != w3cos_std::style::Float::Right
-                    || has_prior_in_flow;
+                let extract_child =
+                    child.style.float != w3cos_std::style::Float::Right || has_prior_in_flow;
                 if let Some(child) = collect(child, extract_child, left, right) {
                     has_prior_in_flow |= contributes_in_flow_content(&child);
                     retained.push(child);
@@ -6994,13 +6989,10 @@ fn hoist_floats_into_block_formatting_context(
                                 | w3cos_std::style::Display::InlineTable
                         )
                     })
-                    .map(|component| {
-                        component.style.font_size * component.style.line_height
-                    });
+                    .map(|component| component.style.font_size * component.style.line_height);
                 if let Some(preceding_line_height) = preceding_line_height {
                     let preceding_line_height = preceding_line_height.max(
-                        formatting_context_style.font_size
-                            * formatting_context_style.line_height,
+                        formatting_context_style.font_size * formatting_context_style.line_height,
                     );
                     if let w3cos_std::style::Spacing::Px(margin_top) = child.style.margin.top {
                         child.style.margin.top =
@@ -7275,13 +7267,15 @@ mod image_component_tests {
         let tree = document.to_component_tree();
         assert_eq!(tree.children[0].style.flex_wrap, FlexWrap::Wrap);
         assert_eq!(tree.children[0].children.len(), 2);
-        assert!(tree.children[0]
-            .children
-            .iter()
-            .all(|item| item.style.flex_shrink == 0.0
-                && item.style.min_height == Dimension::Px(19.2)
-                && item.children.len() == 1
-                && item.children[0].style.flex_shrink == 0.0));
+        assert!(
+            tree.children[0]
+                .children
+                .iter()
+                .all(|item| item.style.flex_shrink == 0.0
+                    && item.style.min_height == Dimension::Px(19.2)
+                    && item.children.len() == 1
+                    && item.children[0].style.flex_shrink == 0.0)
+        );
         crate::stylesheet::clear_rules();
     }
 
@@ -7301,11 +7295,7 @@ mod image_component_tests {
 
         let fixed = hoist_floats_into_block_formatting_context(
             &w3cos_std::style::Style::default(),
-            vec![
-                text("before "),
-                floating_box(Float::Right),
-                text(" after"),
-            ],
+            vec![text("before "), floating_box(Float::Right), text(" after")],
         );
         assert_eq!(fixed.len(), 2);
         assert!(matches!(
@@ -7322,7 +7312,10 @@ mod image_component_tests {
         );
         assert_eq!(fixed[0].style.float, Float::None);
         assert_eq!(fixed[1].style.float, Float::Left);
-        assert_eq!(fixed[1].style.margin.top, w3cos_std::style::Spacing::Px(0.0));
+        assert_eq!(
+            fixed[1].style.margin.top,
+            w3cos_std::style::Spacing::Px(0.0)
+        );
 
         let mut inline_style = w3cos_std::style::Style::default();
         inline_style.display = Display::InlineFlex;
@@ -7357,7 +7350,10 @@ mod image_component_tests {
             &context_style,
             vec![line, absolute, left_float],
         );
-        assert_eq!(fixed[2].style.margin.top, w3cos_std::style::Spacing::Px(0.0));
+        assert_eq!(
+            fixed[2].style.margin.top,
+            w3cos_std::style::Spacing::Px(0.0)
+        );
     }
 
     #[test]
@@ -7463,21 +7459,26 @@ mod image_component_tests {
     fn single_text_child_fast_path_collapses_css_whitespace() {
         let mut document = Document::new();
         let paragraph = document.create_element("p");
-        let text = document.create_text_node(
-            " In the middle of the rectangle, there\nshould be one line.\n\n",
-        );
+        let text = document
+            .create_text_node(" In the middle of the rectangle, there\nshould be one line.\n\n");
         paragraph.append_child(&mut document, text);
         document.body().append_child(&mut document, paragraph);
 
         let tree = document.to_component_tree();
-        assert!(matches!(
-            tree.children[0].kind,
-            ComponentKind::Text { ref content }
-                if content == "In the middle of the rectangle, there should be one line."
-        ), "unexpected component: {:?}", tree.children[0]);
+        assert!(
+            matches!(
+                tree.children[0].kind,
+                ComponentKind::Text { ref content }
+                    if content == "In the middle of the rectangle, there should be one line."
+            ),
+            "unexpected component: {:?}",
+            tree.children[0]
+        );
     }
 
-    fn descendant_text_runs(component: &w3cos_std::Component) -> Vec<(String, w3cos_std::style::Style)> {
+    fn descendant_text_runs(
+        component: &w3cos_std::Component,
+    ) -> Vec<(String, w3cos_std::style::Style)> {
         fn collect(
             component: &w3cos_std::Component,
             runs: &mut Vec<(String, w3cos_std::style::Style)>,
@@ -7507,8 +7508,14 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let runs = descendant_text_runs(&tree.children[0]);
-        assert_eq!(runs.iter().map(|run| run.0.as_str()).collect::<Vec<_>>(), ["T", "his is text"]);
-        assert_eq!(runs[0].1.color, w3cos_std::Color::from_named("green").unwrap());
+        assert_eq!(
+            runs.iter().map(|run| run.0.as_str()).collect::<Vec<_>>(),
+            ["T", "his is text"]
+        );
+        assert_eq!(
+            runs[0].1.color,
+            w3cos_std::Color::from_named("green").unwrap()
+        );
         assert_ne!(runs[1].1.color, runs[0].1.color);
         crate::stylesheet::clear_rules();
     }
@@ -7524,7 +7531,10 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let runs = descendant_text_runs(&tree.children[0]);
-        assert_eq!(runs.iter().map(|run| run.0.as_str()).collect::<Vec<_>>(), ["F", "iller Text"]);
+        assert_eq!(
+            runs.iter().map(|run| run.0.as_str()).collect::<Vec<_>>(),
+            ["F", "iller Text"]
+        );
         assert_eq!(runs[0].1.font_size, 98.0);
         assert_ne!(runs[1].1.font_size, 98.0);
         crate::stylesheet::clear_rules();
@@ -7547,7 +7557,10 @@ mod image_component_tests {
         let tree = document.to_component_tree();
         let runs = descendant_text_runs(&tree.children[0]);
         let pass = runs.iter().position(|run| run.0 == "P").expect("split P");
-        assert_eq!(runs[pass].1.color, w3cos_std::Color::from_named("green").unwrap());
+        assert_eq!(
+            runs[pass].1.color,
+            w3cos_std::Color::from_named("green").unwrap()
+        );
         crate::stylesheet::clear_rules();
     }
 
@@ -7567,9 +7580,18 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         let runs = descendant_text_runs(&tree.children[0]);
-        let first = runs.iter().find(|run| run.0 == "first line").expect("first line");
-        let second = runs.iter().find(|run| run.0 == "second line").expect("second line");
-        assert_eq!(first.1.color, w3cos_std::Color::from_named("fuchsia").unwrap());
+        let first = runs
+            .iter()
+            .find(|run| run.0 == "first line")
+            .expect("first line");
+        let second = runs
+            .iter()
+            .find(|run| run.0 == "second line")
+            .expect("second line");
+        assert_eq!(
+            first.1.color,
+            w3cos_std::Color::from_named("fuchsia").unwrap()
+        );
         assert_ne!(second.1.color, first.1.color);
         crate::stylesheet::clear_rules();
     }
@@ -7599,7 +7621,10 @@ mod image_component_tests {
             "unexpected tree: {:#?}",
             tree.children[0]
         );
-        assert_eq!(runs[0].1.background, w3cos_std::Color::from_named("green").unwrap());
+        assert_eq!(
+            runs[0].1.background,
+            w3cos_std::Color::from_named("green").unwrap()
+        );
         crate::stylesheet::clear_rules();
     }
 
@@ -7672,11 +7697,20 @@ mod image_component_tests {
         let tree = document.to_component_tree();
         let pseudo_runs = descendant_text_runs(&tree.children[0]);
         assert_eq!(pseudo_runs[0].0, "É");
-        assert_eq!(pseudo_runs[0].1.height, w3cos_std::style::Dimension::Px(90.0));
+        assert_eq!(
+            pseudo_runs[0].1.height,
+            w3cos_std::style::Dimension::Px(90.0)
+        );
         assert_eq!(pseudo_runs[1].0, "X");
-        assert!(pseudo_runs[1].1.custom_properties.as_ref().is_none_or(|properties| {
-            !properties.contains_key("--w3cos-internal-vertical-align-length")
-        }));
+        assert!(
+            pseudo_runs[1]
+                .1
+                .custom_properties
+                .as_ref()
+                .is_none_or(|properties| {
+                    !properties.contains_key("--w3cos-internal-vertical-align-length")
+                })
+        );
 
         let explicit_wrapper = &tree.children[1].children[0];
         assert_eq!(
@@ -7687,9 +7721,15 @@ mod image_component_tests {
             explicit_wrapper.style.height,
             w3cos_std::style::Dimension::Px(90.0)
         );
-        assert!(explicit_wrapper.style.custom_properties.as_ref().is_some_and(
-            |properties| properties.contains_key("--w3cos-internal-vertical-align-length")
-        ));
+        assert!(
+            explicit_wrapper
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(
+                    |properties| properties.contains_key("--w3cos-internal-vertical-align-length")
+                )
+        );
         crate::stylesheet::clear_rules();
     }
 
@@ -7730,7 +7770,10 @@ mod image_component_tests {
 
         let tree = document.to_component_tree();
         assert!(matches!(tree.children[0].kind, ComponentKind::Row));
-        assert_eq!(tree.children[0].style.flex_direction, w3cos_std::style::FlexDirection::Row);
+        assert_eq!(
+            tree.children[0].style.flex_direction,
+            w3cos_std::style::FlexDirection::Row
+        );
     }
 
     #[test]
@@ -7783,10 +7826,7 @@ mod image_component_tests {
     #[test]
     fn fixed_width_block_constrains_its_single_wrapping_text_line() {
         crate::stylesheet::clear_rules();
-        crate::stylesheet::register_rule(
-            "div",
-            &[("width", "150px"), ("word-spacing", "75px")],
-        );
+        crate::stylesheet::register_rule("div", &[("width", "150px"), ("word-spacing", "75px")]);
         let mut document = Document::new();
         let block = document.create_element("div");
         let text = document.create_text_node("1 2 3 4");
@@ -7857,10 +7897,7 @@ mod image_component_tests {
     #[test]
     fn rtl_authored_table_row_reverses_cells_and_cell_line_fills_its_box() {
         crate::stylesheet::clear_rules();
-        crate::stylesheet::register_rule(
-            "#table",
-            &[("display", "table"), ("direction", "rtl")],
-        );
+        crate::stylesheet::register_rule("#table", &[("display", "table"), ("direction", "rtl")]);
         crate::stylesheet::register_rule("#row", &[("display", "table-row")]);
         crate::stylesheet::register_rule("#cell", &[("display", "table-cell")]);
         let mut document = Document::new();
@@ -7881,8 +7918,14 @@ mod image_component_tests {
         let row = &table.children[0];
         let cell = &row.children[0];
         let line = &cell.children[0];
-        assert_eq!(row.style.flex_direction, w3cos_std::style::FlexDirection::RowReverse);
-        assert_eq!(line.style.width, w3cos_std::style::Dimension::Percent(100.0));
+        assert_eq!(
+            row.style.flex_direction,
+            w3cos_std::style::FlexDirection::RowReverse
+        );
+        assert_eq!(
+            line.style.width,
+            w3cos_std::style::Dimension::Percent(100.0)
+        );
         assert_eq!(
             line.style.justify_content,
             w3cos_std::style::JustifyContent::FlexEnd
@@ -7894,10 +7937,7 @@ mod image_component_tests {
     fn direction_declared_on_table_row_does_not_reorder_columns() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("#table", &[("display", "table")]);
-        crate::stylesheet::register_rule(
-            "#row",
-            &[("display", "table-row"), ("direction", "rtl")],
-        );
+        crate::stylesheet::register_rule("#row", &[("display", "table-row"), ("direction", "rtl")]);
         crate::stylesheet::register_rule(".cell", &[("display", "table-cell")]);
         let mut document = Document::new();
         let table = document.create_element("div");
@@ -7994,13 +8034,16 @@ mod image_component_tests {
 
         reorder_explicit_bidi_inline_rows(&mut line);
 
-        assert!(line.children.iter().filter(|child| child.style.border_width > 0.0).all(
-            |child| matches!(
-                &child.kind,
-                ComponentKind::Text { content }
-                    if content == content.trim_matches(is_css_whitespace)
-            )
-        ));
+        assert!(
+            line.children
+                .iter()
+                .filter(|child| child.style.border_width > 0.0)
+                .all(|child| matches!(
+                    &child.kind,
+                    ComponentKind::Text { content }
+                        if content == content.trim_matches(is_css_whitespace)
+                ))
+        );
         assert!(line.children.iter().any(|child| matches!(
             &child.kind,
             ComponentKind::Text { content } if content == " " && child.style.border_width == 0.0
@@ -8034,16 +8077,16 @@ mod image_component_tests {
         );
 
         reorder_explicit_bidi_inline_rows(&mut line);
-        let visual = line.children.iter().fold(String::new(), |mut visual, child| {
-            if let ComponentKind::Text { content } = &child.kind {
-                visual.push_str(content);
-            }
-            visual
-        });
-        assert_eq!(
-            visual,
-            "AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO"
-        );
+        let visual = line
+            .children
+            .iter()
+            .fold(String::new(), |mut visual, child| {
+                if let ComponentKind::Text { content } = &child.kind {
+                    visual.push_str(content);
+                }
+                visual
+            });
+        assert_eq!(visual, "AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO");
     }
 
     #[test]
@@ -8067,12 +8110,14 @@ mod image_component_tests {
         let visual = if let ComponentKind::Text { content } = &line.kind {
             content.clone()
         } else {
-            line.children.iter().fold(String::new(), |mut visual, child| {
-                if let ComponentKind::Text { content } = &child.kind {
-                    visual.push_str(content);
-                }
-                visual
-            })
+            line.children
+                .iter()
+                .fold(String::new(), |mut visual, child| {
+                    if let ComponentKind::Text { content } = &child.kind {
+                        visual.push_str(content);
+                    }
+                    visual
+                })
         };
         assert_eq!(visual, "First Second");
     }
@@ -8091,10 +8136,7 @@ mod image_component_tests {
             &inline.kind,
             ComponentKind::Text { content } if content == "Second"
         ));
-        assert_eq!(
-            inline.style.direction,
-            w3cos_std::style::TextDirection::Ltr
-        );
+        assert_eq!(inline.style.direction, w3cos_std::style::TextDirection::Ltr);
         assert_eq!(
             inline.style.unicode_bidi,
             w3cos_std::style::UnicodeBidi::Normal
@@ -8120,10 +8162,7 @@ mod image_component_tests {
             w3cos_std::ComponentKind::Text { content }
                 if content == "\u{a0} ÷ × - + א\nת ÷ × - + \u{a0}"
         ));
-        assert_eq!(
-            line.style.direction,
-            w3cos_std::style::TextDirection::Ltr
-        );
+        assert_eq!(line.style.direction, w3cos_std::style::TextDirection::Ltr);
     }
 
     #[test]
@@ -8391,6 +8430,31 @@ mod computed_style_cache_tests {
         assert_eq!(style.border_right_width, Some(20.0));
         assert_eq!(style.border_bottom_width, Some(20.0));
         assert_eq!(style.border_left_width, Some(20.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn later_same_specificity_rule_and_declaration_win_after_invalid_background() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "p",
+            &[
+                ("color", "red"),
+                ("border", "solid red"),
+                ("background", "red url( { test )"),
+                ("border", "solid green"),
+            ],
+        );
+        crate::stylesheet::register_rule("p", &[("color", "green")]);
+
+        let mut document = Document::new();
+        let target = document.create_element("p");
+        document.body().append_child(&mut document, target);
+
+        let style = document.computed_style_for(target.id);
+        let green = w3cos_std::Color::from_css("green").unwrap();
+        assert_eq!(style.color, green);
+        assert_eq!(style.border_color, green);
         crate::stylesheet::clear_rules();
     }
 

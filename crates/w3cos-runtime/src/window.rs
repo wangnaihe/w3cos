@@ -4386,8 +4386,11 @@ impl App {
             let mut paint_z = vec![0; flat.len()];
             for (idx, node) in flat.iter().enumerate() {
                 let inherited = node.parent.map(|parent| paint_z[parent]).unwrap_or(0);
-                paint_z[idx] =
-                    crate::paint_artifact::effective_z_order(&node.style, inherited);
+                paint_z[idx] = if node.parent.is_none() {
+                    i32::MIN
+                } else {
+                    crate::paint_artifact::effective_z_order(&node.style, inherited)
+                };
             }
             // At the same stacking level, prefer a real control over a broad
             // delegated-event host. Frameworks attach pointer listeners to
@@ -4551,7 +4554,11 @@ impl App {
         let mut paint_z = vec![0; flat.len()];
         for (idx, node) in flat.iter().enumerate() {
             let inherited = node.parent.map(|parent| paint_z[parent]).unwrap_or(0);
-            paint_z[idx] = crate::paint_artifact::effective_z_order(&node.style, inherited);
+            paint_z[idx] = if node.parent.is_none() {
+                i32::MIN
+            } else {
+                crate::paint_artifact::effective_z_order(&node.style, inherited)
+            };
         }
         let overlay_blockers: Vec<(usize, LayoutRect)> = self
             .layout_cache

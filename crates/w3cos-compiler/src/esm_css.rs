@@ -269,9 +269,35 @@ fn finish_raw_rules(
 }
 
 fn selector_list_is_syntactically_valid(selectors: &str) -> bool {
-    split_selector_group(selectors)
-        .iter()
-        .all(|selector| selector_is_syntactically_valid(selector))
+    selector_list_has_no_empty_members(selectors)
+        && split_selector_group(selectors)
+            .iter()
+            .all(|selector| selector_is_syntactically_valid(selector))
+        && w3cos_dom::stylesheet::compile_selector_bytecode(selectors).is_some()
+}
+
+fn selector_list_has_no_empty_members(selectors: &str) -> bool {
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut member_has_content = false;
+    for character in selectors.chars() {
+        match character {
+            '(' => paren += 1,
+            ')' => paren -= 1,
+            '[' => bracket += 1,
+            ']' => bracket -= 1,
+            ',' if paren == 0 && bracket == 0 => {
+                if !member_has_content {
+                    return false;
+                }
+                member_has_content = false;
+                continue;
+            }
+            _ => {}
+        }
+        member_has_content |= !character.is_whitespace();
+    }
+    member_has_content
 }
 
 fn selector_is_syntactically_valid(selector: &str) -> bool {
@@ -340,7 +366,11 @@ fn parse_css_raw(
     imports: &mut Vec<StylesheetImport>,
     font_faces: &mut Vec<StylesheetFontFace>,
 ) -> Vec<RawRule> {
-    let source = strip_block_comments(source);
+    // A decoded UTF BOM is an encoding signature, not part of the first
+    // selector or at-rule. Keeping U+FEFF here turns `.class` into a type
+    // selector followed by a class selector and silently prevents matching.
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let source = strip_cdo_cdc(&strip_block_comments(source));
     let open = source.matches('{').count();
     let close = source.matches('}').count();
     if open != close {
@@ -393,7 +423,7 @@ fn parse_block_into(
             break;
         }
 
-        if bytes[pos] == b'@' {
+        if bytes[pos] == b'@' && starts_at_keyword(bytes, pos) {
             let (next, keeps_imports_open) = parse_at_rule(
                 &source,
                 pos,
@@ -412,10 +442,7 @@ fn parse_block_into(
 
         // Normal rule: selectors { declarations }
         let selector_start = pos;
-        while pos < bytes.len() && bytes[pos] != b'{' {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
+        let Some(block_start) = find_rule_block_start(bytes, pos) else {
             let tail = source[selector_start..].trim();
             if !tail.is_empty() {
                 push_warning(
@@ -424,7 +451,8 @@ fn parse_block_into(
                 );
             }
             break;
-        }
+        };
+        pos = block_start;
         let selector_str = source[selector_start..pos].trim();
         pos += 1;
 
@@ -440,7 +468,9 @@ fn parse_block_into(
             );
         }
         if !selector_str.is_empty() {
-            imports_allowed = false;
+            if selector_list_is_syntactically_valid(selector_str) {
+                imports_allowed = false;
+            }
             let declarations = parse_declarations_raw(block_str);
             rules.push(RawRule {
                 selectors: selector_str.to_string(),
@@ -452,6 +482,52 @@ fn parse_block_into(
             break;
         }
     }
+}
+
+fn find_rule_block_start(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    let mut delimiters = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if escaped {
+            escaped = false;
+            pos += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            pos += 1;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                quote = None;
+            }
+            pos += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            pos += 1;
+            continue;
+        }
+        if pos + 4 <= bytes.len() && bytes[pos..pos + 4].eq_ignore_ascii_case(b"url(") {
+            pos = css_url_token_end(bytes, pos + 4);
+            continue;
+        }
+        match byte {
+            b'{' if delimiters.is_empty() => return Some(pos),
+            b'(' => delimiters.push(b')'),
+            b'[' => delimiters.push(b']'),
+            b')' | b']' if delimiters.last() == Some(&byte) => {
+                delimiters.pop();
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    None
 }
 
 fn parse_at_rule(
@@ -472,20 +548,24 @@ fn parse_at_rule(
     while pos < bytes.len() && (bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'-') {
         pos += 1;
     }
-    let keyword = &source[kw_start..pos];
+    let keyword = source[kw_start..pos].to_ascii_lowercase();
 
-    // Find the end of the at-rule prelude: first ';' or '{'.
-    let mut scan = pos;
-    while scan < bytes.len() && bytes[scan] != b';' && bytes[scan] != b'{' {
-        scan += 1;
-    }
-    if scan >= bytes.len() {
-        return (scan, false);
-    }
+    // Find the first top-level ';' or '{'. Delimiters inside strings and
+    // nested simple blocks belong to the at-rule prelude and do not terminate
+    // it, including during error recovery for unknown at-rules.
+    let Some(scan) = find_at_rule_terminator(bytes, pos) else {
+        if keyword == "import" && imports_allowed {
+            let prelude = close_css_value_at_eof(source[pos..].trim());
+            if let Some(import) = parse_import_prelude(&prelude) {
+                imports.push(import);
+            }
+        }
+        return (bytes.len(), true);
+    };
     let prelude = source[pos..scan].trim().to_string();
 
     if bytes[scan] == b';' {
-        if keyword.eq_ignore_ascii_case("import") && imports_allowed {
+        if keyword == "import" && imports_allowed {
             if let Some(import) = parse_import_prelude(&prelude) {
                 imports.push(import);
             } else {
@@ -495,17 +575,14 @@ fn parse_at_rule(
                 );
             }
         }
-        return (
-            scan + 1,
-            keyword.eq_ignore_ascii_case("import") || keyword.eq_ignore_ascii_case("charset"),
-        );
+        return (scan + 1, true);
     }
 
     // At-rule with a block.
     pos = scan + 1;
     let (block_str, advance, _terminated) = extract_brace_content(&source[pos..]);
     pos += advance;
-    match keyword {
+    match keyword.as_str() {
         "media" => {
             let combined = media
                 .map(|parent| format!("({parent}) and ({prelude})"))
@@ -551,6 +628,65 @@ fn parse_at_rule(
         _ => {}
     }
     (pos, false)
+}
+
+fn find_at_rule_terminator(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    let mut delimiters = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if escaped {
+            escaped = false;
+            pos += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            pos += 1;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                quote = None;
+            }
+            pos += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            pos += 1;
+            continue;
+        }
+        match byte {
+            b';' if delimiters.is_empty() => return Some(pos),
+            b'{' if delimiters.is_empty() => return Some(pos),
+            b'(' => delimiters.push(b')'),
+            b'[' => delimiters.push(b']'),
+            b'{' => delimiters.push(b'}'),
+            b')' | b']' | b'}' if delimiters.last() == Some(&byte) => {
+                delimiters.pop();
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn starts_at_keyword(bytes: &[u8], at: usize) -> bool {
+    let Some(first) = bytes.get(at + 1).copied() else {
+        return false;
+    };
+    if first.is_ascii_alphabetic() || first == b'_' || first >= 0x80 || first == b'\\' {
+        return true;
+    }
+    if first != b'-' {
+        return false;
+    }
+    bytes.get(at + 2).is_some_and(|next| {
+        next.is_ascii_alphabetic() || matches!(*next, b'-' | b'_' | b'\\') || *next >= 0x80
+    })
 }
 
 fn parse_import_prelude(prelude: &str) -> Option<StylesheetImport> {
@@ -661,33 +797,93 @@ fn parse_css_function<'a>(source: &'a str, name: &str) -> Option<(String, &'a st
 /// Returns (content, bytes_consumed, terminated).
 fn extract_brace_content(s: &str) -> (&str, usize, bool) {
     let bytes = s.as_bytes();
-    let mut depth = 1i32;
+    let mut delimiters = vec![b'}'];
+    let mut quote = None;
+    let mut escaped = false;
     let mut pos = 0;
-    while pos < bytes.len() && depth > 0 {
-        if bytes[pos] == b'{' {
-            depth += 1;
-        }
-        if bytes[pos] == b'}' {
-            depth -= 1;
-        }
-        if depth > 0 {
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if escaped {
+            escaped = false;
             pos += 1;
+            continue;
         }
+        if byte == b'\\' {
+            escaped = true;
+            pos += 1;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                quote = None;
+            }
+            pos += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            pos += 1;
+            continue;
+        }
+        if pos + 4 <= bytes.len() && bytes[pos..pos + 4].eq_ignore_ascii_case(b"url(") {
+            pos = css_url_token_end(bytes, pos + 4);
+            continue;
+        }
+        match byte {
+            b'{' => delimiters.push(b'}'),
+            b'(' => delimiters.push(b')'),
+            b'[' => delimiters.push(b']'),
+            b'}' | b')' | b']' if delimiters.last() == Some(&byte) => {
+                delimiters.pop();
+                if delimiters.is_empty() {
+                    return (&s[..pos], pos + 1, true);
+                }
+            }
+            _ => {}
+        }
+        pos += 1;
     }
-    let terminated = pos < bytes.len();
-    let content = &s[..pos];
-    let consumed = if terminated { pos + 1 } else { pos };
-    (content, consumed, terminated)
+    (s, s.len(), false)
 }
 
 /// Strip `/* ... */` comments. (`//` is NOT a CSS comment — stripping it
 /// would corrupt `url(...)` values.)
 fn strip_block_comments(source: &str) -> String {
-    let mut result = String::with_capacity(source.len());
+    let mut result = Vec::with_capacity(source.len());
     let bytes = source.as_bytes();
     let mut i = 0;
+    let mut quote = None;
+    let mut url_depth = 0usize;
     while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            result.extend_from_slice(&bytes[i..i + 2]);
+            i += 2;
+        } else if let Some(active_quote) = quote {
+            result.push(bytes[i]);
+            if bytes[i] == active_quote {
+                quote = None;
+            }
+            i += 1;
+        } else if matches!(bytes[i], b'\'' | b'"') {
+            quote = Some(bytes[i]);
+            result.push(bytes[i]);
+            i += 1;
+        } else if url_depth == 0
+            && bytes[i..].len() >= 4
+            && bytes[i..i + 4].eq_ignore_ascii_case(b"url(")
+        {
+            result.extend_from_slice(&bytes[i..i + 4]);
+            url_depth = 1;
+            i += 4;
+        } else if url_depth > 0 {
+            result.push(bytes[i]);
+            match bytes[i] {
+                b'(' => url_depth += 1,
+                b')' => url_depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
             i += 2;
             while i + 1 < bytes.len() {
                 if bytes[i] == b'*' && bytes[i + 1] == b'/' {
@@ -696,9 +892,56 @@ fn strip_block_comments(source: &str) -> String {
                 }
                 i += 1;
             }
+            if result.last().is_none_or(|byte| !byte.is_ascii_whitespace()) {
+                result.push(b' ');
+            }
         } else {
-            result.push(bytes[i] as char);
+            result.push(bytes[i]);
             i += 1;
+        }
+    }
+    String::from_utf8(result).expect("comment stripping preserves valid UTF-8 boundaries")
+}
+
+fn strip_cdo_cdc(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut remaining = source;
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some(character) = remaining.chars().next() {
+        if escaped {
+            result.push(character);
+            escaped = false;
+            remaining = &remaining[character.len_utf8()..];
+            continue;
+        }
+        if character == '\\' {
+            result.push(character);
+            escaped = true;
+            remaining = &remaining[character.len_utf8()..];
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            result.push(character);
+            if character == active_quote {
+                quote = None;
+            }
+            remaining = &remaining[character.len_utf8()..];
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            result.push(character);
+            remaining = &remaining[character.len_utf8()..];
+        } else if remaining.starts_with("<!--") {
+            result.push(' ');
+            remaining = &remaining[4..];
+        } else if remaining.starts_with("-->") {
+            result.push(' ');
+            remaining = &remaining[3..];
+        } else {
+            result.push(character);
+            remaining = &remaining[character.len_utf8()..];
         }
     }
     result
@@ -708,18 +951,47 @@ fn strip_block_comments(source: &str) -> String {
 /// and `var(--x, a; b)` values survive), then on the first top-level `:`.
 fn parse_declarations_raw(block: &str) -> Vec<(String, String)> {
     let mut declarations = Vec::new();
-    for segment in split_top_level(block, b';') {
+    let segments = split_top_level(block, b';')
+        .into_iter()
+        .flat_map(|segment| {
+            recover_trailing_declaration(&segment)
+                .map(|(prefix, suffix)| vec![prefix, suffix])
+                .unwrap_or_else(|| vec![segment])
+        })
+        .collect::<Vec<_>>();
+    for segment in segments {
         let segment = segment.trim();
         if segment.is_empty() {
             continue;
         }
-        let mut depth = 0i32;
+        let mut delimiters = Vec::new();
+        let mut quote = None;
+        let mut escaped = false;
         let mut colon = None;
         for (i, ch) in segment.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if let Some(active_quote) = quote {
+                if ch == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
             match ch {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                ':' if depth == 0 => {
+                '\'' | '"' => quote = Some(ch),
+                '(' => delimiters.push(')'),
+                '[' => delimiters.push(']'),
+                '{' => delimiters.push('}'),
+                ')' | ']' | '}' if delimiters.last() == Some(&ch) => {
+                    delimiters.pop();
+                }
+                ':' if delimiters.is_empty() => {
                     colon = Some(i);
                     break;
                 }
@@ -729,56 +1001,282 @@ fn parse_declarations_raw(block: &str) -> Vec<(String, String)> {
         let Some(colon) = colon else {
             continue; // not a `prop: value` pair — tolerated, skipped
         };
-        let prop = segment[..colon].trim();
-        let value = segment[colon + 1..].trim();
-        // `!important` is parsed but treated as a normal declaration in v1.
-        let value = value.trim_end_matches("!important").trim();
-        if !prop.is_empty() && !value.is_empty() {
-            declarations.push((prop.to_string(), value.to_string()));
+        let raw_property = segment[..colon].trim();
+        let Some(prop) =
+            w3cos_dom::stylesheet::css_unescape_identifier(raw_property).or_else(|| {
+                // A malformed declaration may contain a balanced at-rule block.
+                // Once that block closes, a following identifier starts a new
+                // declaration even without an intervening semicolon.
+                raw_property.rsplit_once('}').and_then(|(_, suffix)| {
+                    w3cos_dom::stylesheet::css_unescape_identifier(suffix.trim())
+                })
+            })
+        else {
+            continue;
+        };
+        let prop = prop.to_ascii_lowercase();
+        let raw_value = close_css_value_at_eof(segment[colon + 1..].trim());
+        // Escapes that decode to CSS whitespace remain part of an identifier
+        // token; they must not turn into surrounding whitespace that a later
+        // value parser trims away (for example `red\9` is not the `red`
+        // keyword). Keep those spellings escaped until a token-aware value
+        // parser can consume them.
+        let value = if contains_escaped_css_whitespace(&raw_value) {
+            raw_value
+        } else {
+            w3cos_dom::stylesheet::css_unescape_identifier(&raw_value).unwrap_or(raw_value)
+        };
+        if !prop.is_empty() && !value.is_empty() && declaration_priority_is_valid(&value) {
+            declarations.push((prop, value));
         }
     }
     declarations
 }
 
-fn split_top_level(s: &str, sep: u8) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0i32;
-    let mut bracket_depth = 0i32;
+fn recover_trailing_declaration(segment: &str) -> Option<(String, String)> {
+    if !has_unmatched_closing_delimiter(segment) {
+        return None;
+    }
+    for (line_start, _) in segment.match_indices('\n').rev() {
+        let suffix = segment[line_start + 1..].trim();
+        let Some(colon) = suffix.find(':') else {
+            continue;
+        };
+        if w3cos_dom::stylesheet::css_unescape_identifier(suffix[..colon].trim()).is_some()
+            && !suffix[colon + 1..].trim().is_empty()
+        {
+            return Some((segment[..line_start].to_string(), suffix.to_string()));
+        }
+    }
+    None
+}
+
+fn has_unmatched_closing_delimiter(value: &str) -> bool {
+    let mut delimiters = Vec::new();
     let mut quote = None;
     let mut escaped = false;
-    for ch in s.chars() {
+    for character in value.chars() {
         if escaped {
-            current.push(ch);
             escaped = false;
             continue;
         }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
         if let Some(active_quote) = quote {
-            current.push(ch);
+            if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '(' => delimiters.push(')'),
+            '[' => delimiters.push(']'),
+            '{' => delimiters.push('}'),
+            ')' | ']' | '}' if delimiters.last() == Some(&character) => {
+                delimiters.pop();
+            }
+            ')' | ']' | '}' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn contains_escaped_css_whitespace(value: &str) -> bool {
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut pos = 0usize;
+    while pos < characters.len() {
+        if characters[pos] != '\\' {
+            pos += 1;
+            continue;
+        }
+        let Some(next) = characters.get(pos + 1).copied() else {
+            break;
+        };
+        if matches!(next, '\n' | '\r' | '\u{000c}') {
+            return true;
+        }
+        if next.is_ascii_hexdigit() {
+            let mut end = pos + 1;
+            while end < characters.len() && end < pos + 7 && characters[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            let digits = characters[pos + 1..end].iter().collect::<String>();
+            if u32::from_str_radix(&digits, 16)
+                .ok()
+                .and_then(char::from_u32)
+                .is_some_and(|character| {
+                    matches!(
+                        character,
+                        '\t' | '\n' | '\u{000b}' | '\u{000c}' | '\r' | ' '
+                    )
+                })
+            {
+                return true;
+            }
+            pos = end;
+        } else {
+            pos += 2;
+        }
+    }
+    false
+}
+
+fn declaration_priority_is_valid(value: &str) -> bool {
+    value
+        .rfind('!')
+        .is_none_or(|marker| value[marker + 1..].trim().eq_ignore_ascii_case("important"))
+}
+
+fn close_css_value_at_eof(value: &str) -> String {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut delimiters = Vec::new();
+    let bytes = value.as_bytes();
+    let mut pos = 0usize;
+    while pos < value.len() {
+        let character = value[pos..].chars().next().expect("character boundary");
+        if escaped {
+            escaped = false;
+            pos += character.len_utf8();
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            pos += character.len_utf8();
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            }
+            pos += character.len_utf8();
+            continue;
+        }
+        if pos + 4 <= bytes.len() && bytes[pos..pos + 4].eq_ignore_ascii_case(b"url(") {
+            pos = css_url_token_end(bytes, pos + 4);
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => delimiters.push(')'),
+            '[' => delimiters.push(']'),
+            ')' | ']' if delimiters.last() == Some(&character) => {
+                delimiters.pop();
+            }
+            _ => {}
+        }
+        pos += character.len_utf8();
+    }
+    let mut closed = value.to_string();
+    if let Some(active_quote) = quote {
+        closed.push(active_quote);
+    }
+    closed.extend(delimiters.into_iter().rev());
+    closed
+}
+
+fn split_top_level(s: &str, sep: u8) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut delimiters = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let ch = bytes[pos] as char;
+        if escaped {
+            escaped = false;
+            pos += 1;
+            continue;
+        }
+        if let Some(active_quote) = quote {
             if ch == '\\' {
                 escaped = true;
             } else if ch == active_quote {
                 quote = None;
             }
+            pos += 1;
+            continue;
+        }
+        if pos + 4 <= bytes.len() && bytes[pos..pos + 4].eq_ignore_ascii_case(b"url(") {
+            pos = css_url_token_end(bytes, pos + 4);
             continue;
         }
         match ch {
             '\'' | '"' => quote = Some(ch),
             '\\' => escaped = true,
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            '[' => bracket_depth += 1,
-            ']' => bracket_depth -= 1,
+            '(' => delimiters.push(')'),
+            '[' => delimiters.push(']'),
+            '{' => delimiters.push('}'),
+            ')' | ']' | '}' if delimiters.last() == Some(&ch) => {
+                delimiters.pop();
+            }
             _ => {}
         }
-        if ch == sep as char && depth == 0 && bracket_depth == 0 {
-            parts.push(std::mem::take(&mut current));
-        } else {
-            current.push(ch);
+        if ch == sep as char && delimiters.is_empty() {
+            parts.push(s[start..pos].to_string());
+            start = pos + 1;
         }
+        pos += 1;
     }
-    parts.push(current);
+    parts.push(s[start..].to_string());
     parts
+}
+
+fn css_url_token_end(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    let mut delimiters = vec![b')'];
+    let mut quote = None;
+    let mut structured = false;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte == b'\\' && pos + 1 < bytes.len() {
+            pos += 2;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                quote = None;
+            } else if matches!(byte, b'\n' | b'\r' | b'\x0c') {
+                // A bad string token ends at a newline, but the surrounding
+                // url( function remains open and continues consuming values.
+                quote = None;
+            }
+            pos += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            if !structured {
+                structured = true;
+            }
+            quote = Some(byte);
+            pos += 1;
+            continue;
+        }
+        if byte == b'(' {
+            structured = true;
+            delimiters.push(b')');
+        } else if structured && byte == b'{' {
+            delimiters.push(b'}');
+        } else if matches!(byte, b')' | b'}') && delimiters.last() == Some(&byte) {
+            delimiters.pop();
+            if delimiters.is_empty() {
+                return pos + 1;
+            }
+        }
+        pos += 1;
+    }
+    pos
 }
 
 /// Split a selector group on top-level commas (paren/bracket aware).
@@ -916,7 +1414,13 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let end = s
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= max)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &s[..end])
     }
 }
 
@@ -925,12 +1429,154 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diagnostic_truncation_preserves_utf8_boundaries() {
+        assert_eq!(truncate("平和 selector", 2), "...");
+        assert_eq!(truncate("平和 selector", 3), "平...");
+    }
+
+    #[test]
+    fn brace_extraction_ignores_strings_escapes_and_nested_delimiters() {
+        for source in [
+            r#"\} color: red; } trailing"#,
+            r#"content: "}"; } trailing"#,
+            r#"value: ( } ); color: red; } trailing"#,
+            r#"value: [ } ]; color: red; } trailing"#,
+        ] {
+            let (block, consumed, terminated) = extract_brace_content(source);
+            assert!(terminated, "source: {source}");
+            assert!(block.contains("color: red") || block.contains("content"));
+            assert_eq!(&source[consumed..], " trailing");
+        }
+    }
+
+    #[test]
+    fn escaped_comment_opener_does_not_start_a_comment() {
+        assert_eq!(
+            strip_block_comments(r"\/*;color: green;*/"),
+            r"\/*;color: green;*/"
+        );
+        assert_eq!(strip_block_comments("a/* hidden */b"), "a b");
+    }
+
+    #[test]
     fn invalid_selector_member_discards_complete_css_rule() {
         let sheet = parse_css_source(
-            "[1digit], div { color: red; } [title~=], p.valid { color: red; }",
+            "[1digit], div { color: red; } [title~=], p.valid { color: red; } body,,main { color: red; }",
             "invalid.css",
         );
         assert!(sheet.rules.is_empty());
+    }
+
+    #[test]
+    fn invalid_at_prefix_recovers_at_the_following_rule_block() {
+        for prefix in [
+            "@ import \"red.css\";",
+            "@1import \"red.css\";",
+            "@-1import \"red.css\";",
+        ] {
+            let source = format!("{prefix} div {{ color: red; }} * {{ color: green; }}");
+            let sheet = parse_css_source(&source, "invalid-at.css");
+            assert_eq!(
+                sheet
+                    .rules
+                    .iter()
+                    .map(|rule| rule.selector.as_str())
+                    .collect::<Vec<_>>(),
+                ["*"],
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_rules_do_not_close_the_leading_import_window() {
+        for source in [
+            "@bad-rule value; @import \"green.css\";",
+            "1badselector { bad: value; } @import \"green.css\";",
+        ] {
+            let sheet = parse_css_source(source, "import-recovery.css");
+            assert_eq!(sheet.imports.len(), 1, "source: {source}");
+            assert_eq!(sheet.imports[0].href, "green.css");
+        }
+    }
+
+    #[test]
+    fn unknown_at_rule_recovery_skips_nested_delimiters() {
+        let sheet = parse_css_source(
+            "@media all { @foo [; #bad { color: red; }] (; #bad { color: red; }); #good { color: green; } }",
+            "at-rule-recovery.css",
+        );
+        assert_eq!(
+            sheet
+                .rules
+                .iter()
+                .map(|rule| rule.selector.as_str())
+                .collect::<Vec<_>>(),
+            ["#good"]
+        );
+    }
+
+    #[test]
+    fn eof_closes_functions_strings_and_import_rules() {
+        assert_eq!(close_css_value_at_eof("rgb(0, 128, 0"), "rgb(0, 128, 0)");
+        assert_eq!(close_css_value_at_eof("\"Filler Text"), "\"Filler Text\"");
+
+        let declaration = parse_css_source("div { color: rgb(0, 128, 0", "eof.css");
+        assert_eq!(declaration.rules[0].declarations[0].1, "rgb(0, 128, 0)");
+        for source in [
+            "@import \"support/eof-green.css",
+            "@import \"support/eof-green.css\"",
+        ] {
+            let sheet = parse_css_source(source, "eof-import.css");
+            assert_eq!(sheet.imports.len(), 1, "source: {source}");
+            assert_eq!(sheet.imports[0].href, "support/eof-green.css");
+        }
+    }
+
+    #[test]
+    fn invalid_priority_tokens_discard_the_declaration() {
+        let sheet = parse_css_source(
+            "p { color: red ! fail; background: red ! important fail; width: 1px ! IMPORTANT; }",
+            "priority.css",
+        );
+        assert_eq!(
+            sheet.rules[0].declarations,
+            [("width".into(), "1px ! IMPORTANT".into())]
+        );
+    }
+
+    #[test]
+    fn nested_blocks_do_not_leak_declarations_into_the_parent_rule() {
+        let sheet = parse_css_source(
+            ".test { test { :nested; color: yellow; background: red; }: ignored; text-decoration: underline; }",
+            "nested-declaration.css",
+        );
+        assert!(
+            sheet.rules[0]
+                .declarations
+                .iter()
+                .all(|(property, _)| property != "color" && property != "background")
+        );
+        assert!(
+            sheet.rules[0]
+                .declarations
+                .iter()
+                .any(|(property, value)| property == "text-decoration" && value == "underline")
+        );
+    }
+
+    #[test]
+    fn malformed_at_rule_in_declarations_does_not_swallow_the_next_rule() {
+        let sheet = parse_css_source(
+            "#e { color: green; @foo [ color: red; } #e { color: red; } ] } #f { color: green; color: red @import \"red.css\"; }",
+            "declaration-at-rule.css",
+        );
+        let f = sheet
+            .rules
+            .iter()
+            .find(|rule| rule.selector == "#f")
+            .expect("#f rule survives malformed predecessor");
+        assert_eq!(f.declarations[0], ("color".into(), "green".into()));
     }
 
     #[test]
@@ -958,6 +1604,109 @@ mod tests {
                 ),
                 ("color".to_string(), "red".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn escaped_whitespace_does_not_become_trimmable_keyword_whitespace() {
+        let sheet = parse_css_source(
+            ".test { color: green; color: red\\9; background: \\0020red; }",
+            "test.css",
+        );
+        assert_eq!(
+            sheet.rules[0].declarations,
+            [
+                ("color".to_string(), "green".to_string()),
+                ("color".to_string(), "red\\9".to_string()),
+                ("background".to_string(), "\\0020red".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn declaration_recovery_resumes_after_balanced_malformed_blocks() {
+        let sheet = parse_css_source(
+            r#"p {
+                background: red;
+                color: green;
+                color: red ] ) test-token \
+                 [\]\5D ']' "]"; background: red; } p { color: red; } ]
+                 (\)\29 ')' ")"; background: red; } p { color: red; } )
+                 '\'; background: red; } p { color: red; }',
+                 "\"; background: red; } p { color: red; }' p { color: red; } "
+                background: white;
+            }"#,
+            "matching-brackets.css",
+        );
+        assert_eq!(
+            sheet.rules[0].declarations.last(),
+            Some(&("background".to_string(), "white".to_string()))
+        );
+    }
+
+    #[test]
+    fn bad_url_braces_do_not_capture_following_rules() {
+        let sheet = parse_css_source(
+            "p { color: red; border: solid red; background: red url( { test ); border: solid green; } p { color: green; }",
+            "bad-url.css",
+        );
+        assert_eq!(sheet.rules.len(), 2, "{:#?}", sheet.rules);
+        assert_eq!(
+            sheet.rules[0].declarations.last(),
+            Some(&("border".to_string(), "solid green".to_string()))
+        );
+        assert_eq!(
+            sheet.rules[1].declarations.last(),
+            Some(&("color".to_string(), "green".to_string()))
+        );
+    }
+
+    #[test]
+    fn bad_url_recovery_preserves_only_reachable_following_rules() {
+        let cases = [
+            (
+                "#three { background-color: green; } #foo { background: url(foo\"bar) }\n#three { background-color: red; }",
+                "#three",
+                "green",
+            ),
+            (
+                "#foo { background: url(foo\"bar) }\n) }\n#four { background-color: green; }",
+                "#four",
+                "green",
+            ),
+            (
+                "#twelve { background: url(}{\"\"{)}); background-color: green; }",
+                "#twelve",
+                "green",
+            ),
+            (
+                "#fourteen { background-color: green; } #foo { background: url(() }\n#fourteen { background-color: red; }",
+                "#fourteen",
+                "green",
+            ),
+        ];
+        for (source, selector, expected) in cases {
+            let sheet = parse_css_source(source, "bad-url-recovery.css");
+            let values = sheet
+                .rules
+                .iter()
+                .filter(|rule| rule.selector == selector)
+                .flat_map(|rule| rule.declarations.iter())
+                .filter(|(property, _)| property == "background-color")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                values,
+                [expected],
+                "source={source}\nrules={:#?}",
+                sheet.rules
+            );
+        }
+        let bracket_uri =
+            parse_css_source("#eleven { background: url([) green; }", "bracket-uri.css");
+        assert_eq!(
+            bracket_uri.rules[0].declarations,
+            [("background".to_string(), "url([) green".to_string())]
         );
     }
 
@@ -1377,5 +2126,21 @@ mod tests {
         assert!(selectors.contains(&".hc-black .monaco-select-box-dropdown-padding"));
         assert!(selectors.contains(&".hc-light .monaco-select-box-dropdown-padding"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn decoded_bom_does_not_prefix_the_first_unicode_selector() {
+        let sheet = parse_css_source(
+            "\u{feff}@charset \"UTF-8\"; .平和, #div2 { color: green; }",
+            "bom.css",
+        );
+        assert_eq!(
+            sheet
+                .rules
+                .iter()
+                .map(|rule| rule.selector.as_str())
+                .collect::<Vec<_>>(),
+            [".平和", "#div2"]
+        );
     }
 }
