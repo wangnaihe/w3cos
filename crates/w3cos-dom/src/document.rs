@@ -5154,28 +5154,45 @@ fn cloned_text_fragment(
     fragment
 }
 
-fn first_letter_byte_range(content: &str) -> Option<std::ops::Range<usize>> {
+fn first_letter_fragment_range(
+    content: &str,
+    letter_seen: &mut bool,
+) -> (Option<std::ops::Range<usize>>, bool) {
     let mut start = None;
     let mut end = None;
     for (index, character) in content.char_indices() {
         if start.is_none() {
-            if character.is_whitespace() {
+            if !*letter_seen && character.is_whitespace() {
                 continue;
+            }
+            if *letter_seen && (character.is_whitespace() || character.is_alphanumeric()) {
+                return (None, true);
             }
             start = Some(index);
         }
-        end = Some(index + character.len_utf8());
-        if character.is_alphanumeric() {
-            break;
+        if *letter_seen && (character.is_alphanumeric() || character.is_whitespace()) {
+            return (Some(start.expect("first-letter fragment")..end.expect("fragment end")), true);
         }
+        end = Some(index + character.len_utf8());
+        *letter_seen |= character.is_alphanumeric();
     }
-    Some(start?..end?)
+    (start.zip(end).map(|(start, end)| start..end), false)
 }
 
 fn apply_first_letter_style(
     components: &mut Vec<w3cos_std::Component>,
     declarations: &[(String, String, u32)],
 ) -> bool {
+    let mut letter_seen = false;
+    apply_first_letter_style_inner(components, declarations, &mut letter_seen).0
+}
+
+fn apply_first_letter_style_inner(
+    components: &mut Vec<w3cos_std::Component>,
+    declarations: &[(String, String, u32)],
+    letter_seen: &mut bool,
+) -> (bool, bool) {
+    let mut changed = false;
     let mut index = 0;
     while index < components.len() {
         if components[index].style.display == w3cos_std::style::Display::None
@@ -5189,7 +5206,26 @@ fn apply_first_letter_style(
         }
 
         if let w3cos_std::ComponentKind::Text { content } = &components[index].kind {
-            let Some(range) = first_letter_byte_range(content) else {
+            let letter_was_seen = *letter_seen;
+            let (range, done) = first_letter_fragment_range(content, letter_seen);
+            let Some(range) = range else {
+                if done {
+                    return (changed, true);
+                }
+                if !*letter_seen
+                    && content.chars().all(char::is_whitespace)
+                    && matches!(
+                        components[index].style.white_space,
+                        w3cos_std::style::WhiteSpace::Normal
+                            | w3cos_std::style::WhiteSpace::NoWrap
+                            | w3cos_std::style::WhiteSpace::PreLine
+                    )
+                {
+                    components[index].kind = w3cos_std::ComponentKind::Text {
+                        content: String::new(),
+                    };
+                    changed = true;
+                }
                 index += 1;
                 continue;
             };
@@ -5197,7 +5233,15 @@ fn apply_first_letter_style(
             let base_style = source.style.clone();
             let pseudo_style = text_pseudo_style(&base_style, declarations);
             let mut fragments = Vec::with_capacity(3);
-            if range.start > 0 {
+            let collapses_leading_whitespace = !letter_was_seen
+                && content[..range.start].chars().all(char::is_whitespace)
+                && matches!(
+                    base_style.white_space,
+                    w3cos_std::style::WhiteSpace::Normal
+                        | w3cos_std::style::WhiteSpace::NoWrap
+                        | w3cos_std::style::WhiteSpace::PreLine
+                );
+            if range.start > 0 && !collapses_leading_whitespace {
                 fragments.push(cloned_text_fragment(
                     &source,
                     content[..range.start].to_string(),
@@ -5217,25 +5261,40 @@ fn apply_first_letter_style(
                 ));
             }
             components.splice(index..=index, fragments);
-            return true;
+            changed = true;
+            if done {
+                return (changed, true);
+            }
+            index += 1;
+            continue;
         }
 
-        if matches!(
+        let inline_subtree = matches!(
             components[index].style.display,
             w3cos_std::style::Display::Inline
                 | w3cos_std::style::Display::InlineBlock
                 | w3cos_std::style::Display::InlineFlex
                 | w3cos_std::style::Display::InlineTable
-        ) && apply_first_letter_style(&mut components[index].children, declarations)
-        {
-            return true;
+        );
+        if inline_subtree {
+            let (nested_changed, done) = apply_first_letter_style_inner(
+                &mut components[index].children,
+                declarations,
+                letter_seen,
+            );
+            changed |= nested_changed;
+            if done {
+                return (changed, true);
+            }
+            index += 1;
+            continue;
         }
         if !components[index].children.is_empty() {
-            return false;
+            return (changed, true);
         }
         index += 1;
     }
-    false
+    (changed, false)
 }
 
 fn apply_first_line_style(
