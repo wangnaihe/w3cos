@@ -503,6 +503,10 @@ fn strip_terminal_pseudo_element(selector: &str) -> (String, Option<String>) {
     let selector = selector.trim_end();
     let lower = selector.to_ascii_lowercase();
     for (authored, canonical) in [
+        ("::first-letter", "::first-letter"),
+        ("::first-line", "::first-line"),
+        (":first-letter", "::first-letter"),
+        (":first-line", "::first-line"),
         ("::before", "::before"),
         ("::after", "::after"),
         (":before", "::before"),
@@ -510,7 +514,11 @@ fn strip_terminal_pseudo_element(selector: &str) -> (String, Option<String>) {
     ] {
         if lower.ends_with(authored) {
             let subject = &selector[..selector.len() - authored.len()];
-            return (subject.trim_end().to_string(), Some(canonical.to_string()));
+            let subject = subject.trim_end();
+            return (
+                if subject.is_empty() { "*" } else { subject }.to_string(),
+                Some(canonical.to_string()),
+            );
         }
     }
     (selector.to_string(), None)
@@ -2341,6 +2349,25 @@ mod tests {
         let element = SelectorContext::new("div", None, &[]);
         assert!(matching_declarations_for_context(&element, &[]).is_empty());
         assert_eq!(rule_count(), 4);
+    }
+
+    #[test]
+    fn first_line_and_first_letter_rules_remain_isolated_from_the_originating_element() {
+        setup();
+        register_rule("p:first-line", &[("color", "fuchsia")]);
+        register_rule("p::first-letter", &[("font-size", "98px")]);
+        register_rule(":after", &[("border", "3px solid green")]);
+
+        let element = SelectorContext::new("p", None, &[]);
+        assert!(matching_declarations_for_context(&element, &[]).is_empty());
+        assert_eq!(rule_count(), 3);
+        RULES.with(|rules| {
+            let rules = rules.borrow();
+            assert_eq!(rules.rules[0].pseudo_element.as_deref(), Some("::first-line"));
+            assert_eq!(rules.rules[1].pseudo_element.as_deref(), Some("::first-letter"));
+            assert_eq!(rules.rules[2].pseudo_element.as_deref(), Some("::after"));
+            assert_eq!(rules.rules[2].chain[0].tag.as_deref(), None);
+        });
     }
 
     #[test]

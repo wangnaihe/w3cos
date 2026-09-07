@@ -1456,8 +1456,15 @@ impl Document {
         pseudo_element: &str,
         origin_style: &w3cos_std::style::Style,
     ) -> Option<w3cos_std::Component> {
-        let declarations =
+        let mut declarations =
             stylesheet::matching_pseudo_declarations_for_node(self, id, pseudo_element);
+        if !declarations
+            .iter()
+            .any(|(property, _, _)| css_property_eq(property, "content"))
+            && let Some(content) = self.default_pseudo_content_value(id, pseudo_element)
+        {
+            declarations.push(("content".to_string(), content.to_string(), 0));
+        }
         let mut selected_content = None;
         for content_value in declarations
             .iter()
@@ -1795,6 +1802,25 @@ impl Document {
             .filter(|(property, _, _)| css_property_eq(property, "content"))
             .map(|(_, value, _)| value)
             .last()
+            .or_else(|| {
+                self.default_pseudo_content_value(id, pseudo_element)
+                    .map(str::to_string)
+            })
+    }
+
+    fn default_pseudo_content_value(
+        &self,
+        id: NodeId,
+        pseudo_element: &str,
+    ) -> Option<&'static str> {
+        if !self.get_node(id).tag.as_str().eq_ignore_ascii_case("q") {
+            return None;
+        }
+        match pseudo_element {
+            "::before" => Some("open-quote"),
+            "::after" => Some("close-quote"),
+            _ => None,
+        }
     }
 
     fn pseudo_generates_box(&self, id: NodeId, pseudo_element: &str) -> bool {
@@ -2723,6 +2749,28 @@ impl Document {
                 let mut child_ids = self.children_ids(id);
                 let mut before = self.generated_pseudo_component(id, "::before", &style);
                 let mut after = self.generated_pseudo_component(id, "::after", &style);
+                let supports_text_pseudos = matches!(
+                    style.display,
+                    w3cos_std::style::Display::Block
+                        | w3cos_std::style::Display::InlineBlock
+                        | w3cos_std::style::Display::ListItem
+                        | w3cos_std::style::Display::TableCell
+                        | w3cos_std::style::Display::TableCaption
+                );
+                let first_line_declarations = supports_text_pseudos
+                    .then(|| stylesheet::matching_pseudo_declarations_for_node(
+                        self,
+                        id,
+                        "::first-line",
+                    ))
+                    .unwrap_or_default();
+                let first_letter_declarations = supports_text_pseudos
+                    .then(|| stylesheet::matching_pseudo_declarations_for_node(
+                        self,
+                        id,
+                        "::first-letter",
+                    ))
+                    .unwrap_or_default();
                 if tag == "details"
                     && !node
                         .attributes
@@ -2819,6 +2867,8 @@ impl Document {
                 ) && child_ids.len() == 1
                     && before.is_none()
                     && after.is_none()
+                    && first_line_declarations.is_empty()
+                    && first_letter_declarations.is_empty()
                 {
                     let child = self.get_node(child_ids[0]);
                     if child.node_type == NodeType::Text {
@@ -3129,6 +3179,18 @@ impl Document {
                 }
                 if let Some(after) = after {
                     children.push(after);
+                }
+                if !first_line_declarations.is_empty() {
+                    let (fragmented, _) = apply_first_line_style(
+                        &mut children,
+                        &first_line_declarations,
+                    );
+                    anonymous_inline_formatting_context |= fragmented;
+                }
+                if !first_letter_declarations.is_empty()
+                    && apply_first_letter_style(&mut children, &first_letter_declarations)
+                {
+                    anonymous_inline_formatting_context = true;
                 }
                 if matches!(
                     style.display,
@@ -5067,6 +5129,180 @@ fn inherit_text_style(
     }
 }
 
+fn text_pseudo_style(
+    base: &w3cos_std::style::Style,
+    declarations: &[(String, String, u32)],
+) -> w3cos_std::style::Style {
+    let mut merged = CSSStyleDeclaration::from_style(base.clone());
+    for (property, value, _) in declarations {
+        if !css_property_eq(property, "content") {
+            merged.set_property(property, value);
+        }
+    }
+    merged.to_style()
+}
+
+fn cloned_text_fragment(
+    source: &w3cos_std::Component,
+    content: String,
+    style: w3cos_std::style::Style,
+) -> w3cos_std::Component {
+    let mut fragment = source.clone();
+    fragment.kind = w3cos_std::ComponentKind::Text { content };
+    fragment.style = style;
+    fragment.children.clear();
+    fragment
+}
+
+fn first_letter_byte_range(content: &str) -> Option<std::ops::Range<usize>> {
+    let mut start = None;
+    let mut end = None;
+    for (index, character) in content.char_indices() {
+        if start.is_none() {
+            if character.is_whitespace() {
+                continue;
+            }
+            start = Some(index);
+        }
+        end = Some(index + character.len_utf8());
+        if character.is_alphanumeric() {
+            break;
+        }
+    }
+    Some(start?..end?)
+}
+
+fn apply_first_letter_style(
+    components: &mut Vec<w3cos_std::Component>,
+    declarations: &[(String, String, u32)],
+) -> bool {
+    let mut index = 0;
+    while index < components.len() {
+        if components[index].style.display == w3cos_std::style::Display::None
+            || matches!(
+                components[index].style.position,
+                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+            )
+        {
+            index += 1;
+            continue;
+        }
+
+        if let w3cos_std::ComponentKind::Text { content } = &components[index].kind {
+            let Some(range) = first_letter_byte_range(content) else {
+                index += 1;
+                continue;
+            };
+            let source = components[index].clone();
+            let base_style = source.style.clone();
+            let pseudo_style = text_pseudo_style(&base_style, declarations);
+            let mut fragments = Vec::with_capacity(3);
+            if range.start > 0 {
+                fragments.push(cloned_text_fragment(
+                    &source,
+                    content[..range.start].to_string(),
+                    base_style.clone(),
+                ));
+            }
+            fragments.push(cloned_text_fragment(
+                &source,
+                content[range.clone()].to_string(),
+                pseudo_style,
+            ));
+            if range.end < content.len() {
+                fragments.push(cloned_text_fragment(
+                    &source,
+                    content[range.end..].to_string(),
+                    base_style,
+                ));
+            }
+            components.splice(index..=index, fragments);
+            return true;
+        }
+
+        if matches!(
+            components[index].style.display,
+            w3cos_std::style::Display::Inline
+                | w3cos_std::style::Display::InlineBlock
+                | w3cos_std::style::Display::InlineFlex
+                | w3cos_std::style::Display::InlineTable
+        ) && apply_first_letter_style(&mut components[index].children, declarations)
+        {
+            return true;
+        }
+        if !components[index].children.is_empty() {
+            return false;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn apply_first_line_style(
+    components: &mut Vec<w3cos_std::Component>,
+    declarations: &[(String, String, u32)],
+) -> (bool, bool) {
+    let mut changed = false;
+    let mut index = 0;
+    while index < components.len() {
+        if components[index].style.display == w3cos_std::style::Display::None
+            || matches!(
+                components[index].style.position,
+                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+            )
+        {
+            index += 1;
+            continue;
+        }
+
+        if let w3cos_std::ComponentKind::Text { content } = &components[index].kind {
+            if let Some(break_at) = content.find('\u{2028}') {
+                if break_at > 0 {
+                    let source = components[index].clone();
+                    let base_style = source.style.clone();
+                    let pseudo_style = text_pseudo_style(&base_style, declarations);
+                    let fragments = vec![
+                        cloned_text_fragment(
+                            &source,
+                            content[..break_at].to_string(),
+                            pseudo_style,
+                        ),
+                        cloned_text_fragment(
+                            &source,
+                            content[break_at..].to_string(),
+                            base_style,
+                        ),
+                    ];
+                    components.splice(index..=index, fragments);
+                    changed = true;
+                }
+                return (changed, true);
+            }
+            if !content.is_empty() {
+                components[index].style = text_pseudo_style(&components[index].style, declarations);
+                changed = true;
+            }
+        } else if matches!(
+            components[index].style.display,
+            w3cos_std::style::Display::Inline
+                | w3cos_std::style::Display::InlineBlock
+                | w3cos_std::style::Display::InlineFlex
+                | w3cos_std::style::Display::InlineTable
+        ) {
+            let (nested_changed, stopped) =
+                apply_first_line_style(&mut components[index].children, declarations);
+            changed |= nested_changed;
+            if stopped {
+                return (changed, true);
+            }
+        } else if !components[index].children.is_empty() {
+            return (changed, true);
+        }
+        index += 1;
+    }
+    (changed, false)
+}
+
 fn css_ex_size(style: &w3cos_std::style::Style) -> f32 {
     let ratio = style
         .font_family
@@ -6675,6 +6911,127 @@ mod image_component_tests {
             ComponentKind::Text { ref content }
                 if content == "In the middle of the rectangle, there should be one line."
         ), "unexpected component: {:?}", tree.children[0]);
+    }
+
+    fn descendant_text_runs(component: &w3cos_std::Component) -> Vec<(String, w3cos_std::style::Style)> {
+        fn collect(
+            component: &w3cos_std::Component,
+            runs: &mut Vec<(String, w3cos_std::style::Style)>,
+        ) {
+            if let ComponentKind::Text { content } = &component.kind {
+                runs.push((content.clone(), component.style.clone()));
+            }
+            for child in &component.children {
+                collect(child, runs);
+            }
+        }
+
+        let mut runs = Vec::new();
+        collect(component, &mut runs);
+        runs
+    }
+
+    #[test]
+    fn first_letter_splits_only_the_initial_typographic_unit() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("p::first-letter", &[("color", "green")]);
+        let mut document = Document::new();
+        let paragraph = document.create_element("p");
+        let text = document.create_text_node("This is text");
+        paragraph.append_child(&mut document, text);
+        document.body().append_child(&mut document, paragraph);
+
+        let tree = document.to_component_tree();
+        let runs = descendant_text_runs(&tree.children[0]);
+        assert_eq!(runs.iter().map(|run| run.0.as_str()).collect::<Vec<_>>(), ["T", "his is text"]);
+        assert_eq!(runs[0].1.color, w3cos_std::Color::from_named("green").unwrap());
+        assert_ne!(runs[1].1.color, runs[0].1.color);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_letter_applies_to_generated_before_content() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div::before", &[("content", "'Filler Text'")]);
+        crate::stylesheet::register_rule("div::first-letter", &[("font-size", "98px")]);
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        document.body().append_child(&mut document, block);
+
+        let tree = document.to_component_tree();
+        let runs = descendant_text_runs(&tree.children[0]);
+        assert_eq!(runs.iter().map(|run| run.0.as_str()).collect::<Vec<_>>(), ["F", "iller Text"]);
+        assert_eq!(runs[0].1.font_size, 98.0);
+        assert_ne!(runs[1].1.font_size, 98.0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_letter_skips_out_of_flow_content() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div::first-letter", &[("color", "green")]);
+        crate::stylesheet::register_rule("span", &[("position", "absolute")]);
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        let absolute = document.create_element("span");
+        absolute.set_text_content(&mut document, "F");
+        block.append_child(&mut document, absolute);
+        let text = document.create_text_node("PASS");
+        block.append_child(&mut document, text);
+        document.body().append_child(&mut document, block);
+
+        let tree = document.to_component_tree();
+        let runs = descendant_text_runs(&tree.children[0]);
+        let pass = runs.iter().position(|run| run.0 == "P").expect("split P");
+        assert_eq!(runs[pass].1.color, w3cos_std::Color::from_named("green").unwrap());
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_line_stops_at_a_forced_break() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("p::first-line", &[("color", "fuchsia")]);
+        let mut document = Document::new();
+        let paragraph = document.create_element("p");
+        let first = document.create_text_node("first line");
+        paragraph.append_child(&mut document, first);
+        let br = document.create_element("br");
+        paragraph.append_child(&mut document, br);
+        let second = document.create_text_node("second line");
+        paragraph.append_child(&mut document, second);
+        document.body().append_child(&mut document, paragraph);
+
+        let tree = document.to_component_tree();
+        let runs = descendant_text_runs(&tree.children[0]);
+        let first = runs.iter().find(|run| run.0 == "first line").expect("first line");
+        let second = runs.iter().find(|run| run.0 == "second line").expect("second line");
+        assert_eq!(first.1.color, w3cos_std::Color::from_named("fuchsia").unwrap());
+        assert_ne!(second.1.color, first.1.color);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn q_uses_generated_quote_content_and_authored_quote_pairs() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#custom", &[("quotes", "'<1>' '</1>'")]);
+        let mut document = Document::new();
+        let first = document.create_element("q");
+        let first_text = document.create_text_node("Foo");
+        first.append_child(&mut document, first_text);
+        document.body().append_child(&mut document, first);
+        let custom = document.create_element("q");
+        custom.set_attribute(&mut document, "id", "custom");
+        let custom_text = document.create_text_node("0");
+        custom.append_child(&mut document, custom_text);
+        document.body().append_child(&mut document, custom);
+
+        let tree = document.to_component_tree();
+        let rendered = descendant_text_runs(&tree)
+            .into_iter()
+            .map(|run| run.0)
+            .collect::<String>();
+        assert_eq!(rendered, "\"Foo\"<1>0</1>");
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
