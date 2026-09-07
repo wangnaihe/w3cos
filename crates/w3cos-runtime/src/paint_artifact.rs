@@ -6,7 +6,7 @@
 
 use w3cos_std::color::Color;
 use w3cos_std::component::ComponentKind;
-use w3cos_std::style::{Overflow, Position, Style, Transform2D};
+use w3cos_std::style::{Display, Overflow, Position, Style, Transform2D};
 
 use crate::layout::LayoutRect;
 
@@ -255,6 +255,131 @@ fn inline_fragment_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRe
     })
 }
 
+fn suppress_improper_nested_table_part_backgrounds(nodes: &mut [PaintNode]) {
+    for index in 0..nodes.len() {
+        if !matches!(
+            nodes[index].style.display,
+            Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+                | Display::TableRow
+                | Display::TableColumnGroup
+                | Display::TableColumn
+        ) {
+            continue;
+        }
+        let mut parent = nodes[index].parent;
+        let mut nested_in_cell = false;
+        while let Some(parent_index) = parent {
+            match nodes[parent_index].style.display {
+                Display::TableCell => {
+                    nested_in_cell = true;
+                    break;
+                }
+                Display::Table | Display::InlineTable => break,
+                _ => parent = nodes[parent_index].parent,
+            }
+        }
+        if nested_in_cell {
+            // CSS table fixup may place an improper internal table part inside
+            // an anonymous cell. Row/row-group/column backgrounds are table
+            // layer backgrounds, not independent box fills, so without cells
+            // of their own they contribute no painted area.
+            nodes[index].style.background = Color::TRANSPARENT;
+            nodes[index].style.background_image = None;
+        }
+    }
+}
+
+fn suppress_hidden_empty_cell_paint(nodes: &mut [PaintNode]) {
+    let has_child = nodes
+        .iter()
+        .filter_map(|node| node.parent)
+        .collect::<std::collections::HashSet<_>>();
+    for (index, node) in nodes.iter_mut().enumerate() {
+        if node.style.display != Display::TableCell
+            || node.style.border_collapse
+            || !node.style.empty_cells_hide
+            || has_child.contains(&index)
+        {
+            continue;
+        }
+        node.style.background = Color::TRANSPARENT;
+        node.style.background_image = None;
+        node.style.border_width = 0.0;
+        node.style.border_top_width = None;
+        node.style.border_right_width = None;
+        node.style.border_bottom_width = None;
+        node.style.border_left_width = None;
+    }
+}
+
+const TABLE_CAPTION_INSETS: &str = "--w3cos-internal-table-caption-insets";
+
+pub(crate) fn table_grid_paint_rect(style: &Style, mut rect: LayoutRect) -> LayoutRect {
+    let Some(value) = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get(TABLE_CAPTION_INSETS))
+    else {
+        return rect;
+    };
+    let mut parts = value.split_ascii_whitespace();
+    let Some(top) = parts.next().and_then(|value| value.parse::<f32>().ok()) else {
+        return rect;
+    };
+    let Some(bottom) = parts.next().and_then(|value| value.parse::<f32>().ok()) else {
+        return rect;
+    };
+    let scale_y = style.transform.scale_y;
+    let top = top * scale_y;
+    let bottom = bottom * scale_y;
+    rect.y += top;
+    rect.height = (rect.height - top - bottom).max(0.0);
+    rect
+}
+
+fn annotate_table_caption_paint_insets(
+    nodes: &mut [PaintNode],
+    rect_by_index: &[Option<LayoutRect>],
+) {
+    let mut insets = vec![(0.0_f32, 0.0_f32); nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        if node.style.display != Display::TableCaption {
+            continue;
+        }
+        let Some(parent) = node.parent else {
+            continue;
+        };
+        if !matches!(
+            nodes[parent].style.display,
+            Display::Table | Display::InlineTable
+        ) {
+            continue;
+        }
+        let height = rect_by_index
+            .get(index)
+            .copied()
+            .flatten()
+            .map_or(0.0, |rect| rect.height);
+        if node.style.caption_side_bottom {
+            insets[parent].1 += height;
+        } else {
+            insets[parent].0 += height;
+        }
+    }
+    for (index, (top, bottom)) in insets.into_iter().enumerate() {
+        if top <= 0.0 && bottom <= 0.0 {
+            continue;
+        }
+        nodes[index]
+            .style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(TABLE_CAPTION_INSETS.to_string(), format!("{top} {bottom}"));
+    }
+}
+
 impl PaintArtifact {
     pub fn build(
         nodes: impl IntoIterator<Item = PaintNode>,
@@ -366,6 +491,8 @@ impl PaintArtifact {
             nodes[index].style.background = Color::TRANSPARENT;
             nodes[index].style.background_image = None;
         }
+        suppress_improper_nested_table_part_backgrounds(&mut nodes);
+        suppress_hidden_empty_cell_paint(&mut nodes);
         let mut artifact = Self {
             rect_by_index: vec![None; nodes.len()],
             node_properties: vec![PaintProperties::default(); nodes.len()],
@@ -384,6 +511,7 @@ impl PaintArtifact {
                 *slot = Some(rect);
             }
         }
+        annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);
 
         for index in 0..artifact.nodes.len() {
             artifact.append_node(index);
@@ -529,6 +657,99 @@ mod tests {
                 width: 100.0,
                 height: 20.0,
             })
+        );
+    }
+
+    #[test]
+    fn improper_table_part_nested_in_cell_has_no_independent_background() {
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::Table,
+                    ..Style::default()
+                },
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableCell,
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableRowGroup,
+                    background: Color::rgb(255, 0, 0),
+                    ..Style::default()
+                },
+                parent: Some(1),
+                sticky_counter_signal: None,
+            },
+        ];
+        suppress_improper_nested_table_part_backgrounds(&mut nodes);
+        assert_eq!(nodes[2].style.background, Color::TRANSPARENT);
+    }
+
+    #[test]
+    fn empty_cells_hide_suppresses_separate_cell_background_and_border() {
+        let mut nodes = vec![PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                display: Display::TableCell,
+                empty_cells_hide: true,
+                background: Color::rgb(255, 0, 0),
+                border_width: 5.0,
+                ..Style::default()
+            },
+            parent: None,
+            sticky_counter_signal: None,
+        }];
+        suppress_hidden_empty_cell_paint(&mut nodes);
+        assert_eq!(nodes[0].style.background, Color::TRANSPARENT);
+        assert_eq!(nodes[0].style.border_width, 0.0);
+    }
+
+    #[test]
+    fn table_background_paint_rect_excludes_bottom_caption() {
+        let nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::Table,
+                    background: Color::rgb(0, 0, 255),
+                    ..Style::default()
+                },
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableCaption,
+                    caption_side_bottom: true,
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+        ];
+        let artifact = PaintArtifact::build(
+            nodes,
+            &[
+                (LayoutRect { x: 0.0, y: 0.0, width: 192.0, height: 115.0 }, 0),
+                (LayoutRect { x: 0.0, y: 96.0, width: 192.0, height: 19.0 }, 1),
+            ],
+            1,
+        );
+        assert_eq!(
+            table_grid_paint_rect(&artifact.nodes[0].style, artifact.rect_by_index[0].unwrap()),
+            LayoutRect { x: 0.0, y: 0.0, width: 192.0, height: 96.0 }
         );
     }
 

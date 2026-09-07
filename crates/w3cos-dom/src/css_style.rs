@@ -91,6 +91,12 @@ impl CSSStyleDeclaration {
             "border-collapse" | "borderCollapse" => {
                 self.inner.border_collapse = value.trim().eq_ignore_ascii_case("collapse");
             }
+            "empty-cells" | "emptyCells" => {
+                self.inner.empty_cells_hide = value.trim().eq_ignore_ascii_case("hide");
+            }
+            "caption-side" | "captionSide" => {
+                self.inner.caption_side_bottom = value.trim().eq_ignore_ascii_case("bottom");
+            }
             "padding" => {
                 if let Some(edges) = parse_padding_shorthand(value) {
                     self.inner.padding = edges
@@ -689,6 +695,27 @@ impl CSSStyleDeclaration {
                 "{}px {}px",
                 self.inner.border_spacing_x, self.inner.border_spacing_y
             ),
+            "border-collapse" | "borderCollapse" => {
+                if self.inner.border_collapse {
+                    "collapse".to_string()
+                } else {
+                    "separate".to_string()
+                }
+            }
+            "empty-cells" | "emptyCells" => {
+                if self.inner.empty_cells_hide {
+                    "hide".to_string()
+                } else {
+                    "show".to_string()
+                }
+            }
+            "caption-side" | "captionSide" => {
+                if self.inner.caption_side_bottom {
+                    "bottom".to_string()
+                } else {
+                    "top".to_string()
+                }
+            }
             "float" | "cssFloat" => match self.inner.float {
                 Float::None => "none".to_string(),
                 Float::Left => "left".to_string(),

@@ -1198,6 +1198,19 @@ impl Document {
                 _ => {}
             }
         }
+        if let Some(value) = declared_value(&["display"]) {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "inherit" => {
+                    style.display = inherited
+                        .map(|parent| parent.display)
+                        .unwrap_or(w3cos_std::style::Display::Inline);
+                }
+                "initial" | "unset" | "revert" | "revert-layer" => {
+                    style.display = w3cos_std::style::Display::Inline;
+                }
+                _ => {}
+            }
+        }
         if matches!(
             style.position,
             w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
@@ -2690,6 +2703,12 @@ impl Document {
                 } else {
                     w3cos_std::style::Display::Inline
                 };
+                // Text nodes inherit computed table properties from their
+                // element parent, but those properties do not apply to the
+                // anonymous inline box used by the component IR. Normalize
+                // after assigning the text node's used display so inherited
+                // `caption-side`/`empty-cells` do not split a text run.
+                normalize_css_table_internal_used_style(&mut style);
                 w3cos_std::Component::text(text, style)
             }
             NodeType::Comment | NodeType::DocumentType => {
@@ -3235,17 +3254,23 @@ impl Document {
                 ) {
                     children = hoist_floats_into_block_formatting_context(&style, children);
                 }
-                if style.display == w3cos_std::style::Display::Table {
+                if matches!(
+                    style.display,
+                    w3cos_std::style::Display::Table
+                        | w3cos_std::style::Display::InlineTable
+                ) {
                     // CSS table fixup has a semantic group order independent
                     // of DOM/pseudo source order: header groups precede row
                     // groups and footer groups follow them. Keep ordering
                     // stable within each group class.
                     children.sort_by_key(|component| match component.style.display {
-                        w3cos_std::style::Display::TableCaption => 0,
+                        w3cos_std::style::Display::TableCaption
+                            if !component.style.caption_side_bottom => 0,
                         w3cos_std::style::Display::TableColumnGroup
                         | w3cos_std::style::Display::TableColumn => 1,
                         w3cos_std::style::Display::TableHeaderGroup => 2,
                         w3cos_std::style::Display::TableFooterGroup => 4,
+                        w3cos_std::style::Display::TableCaption => 5,
                         _ => 3,
                     });
                 }
@@ -5161,6 +5186,12 @@ fn inherit_text_style(
     if !declares("border-collapse") {
         style.border_collapse = parent.border_collapse;
     }
+    if !declares("empty-cells") {
+        style.empty_cells_hide = parent.empty_cells_hide;
+    }
+    if !declares("caption-side") {
+        style.caption_side_bottom = parent.caption_side_bottom;
+    }
     if !declares("text-align") {
         style.text_align = parent.text_align;
     }
@@ -6543,6 +6574,18 @@ fn relative_border_width_px(value: &str, style: &w3cos_std::style::Style) -> Opt
 fn normalize_css_table_internal_used_style(style: &mut w3cos_std::style::Style) {
     use w3cos_std::style::Display;
 
+    if style.display != Display::TableCell {
+        // `empty-cells` is inherited as a computed value but affects only a
+        // table-cell's used paint style. Keeping it on unrelated component
+        // boxes would split otherwise identical inline runs.
+        style.empty_cells_hide = false;
+    }
+    if style.display != Display::TableCaption {
+        // Likewise, caption-side participates in inheritance through the DOM
+        // computed style, while only caption boxes need it after lowering.
+        style.caption_side_bottom = false;
+    }
+
     let ignores_margin = matches!(
         style.display,
         Display::TableRowGroup
@@ -7029,16 +7072,33 @@ fn anonymous_table_wrapper(
         .iter()
         .filter_map(|child| specified_table_cell_height(&child.style))
         .fold(0.0_f32, f32::max);
-    let row = table_row_from_misparented_children(
-        parent_style,
-        children,
-        (table_height > 0.0).then_some(table_height),
-    );
+    let mut top_captions = Vec::new();
+    let mut grid_children = Vec::new();
+    let mut bottom_captions = Vec::new();
+    for child in children {
+        if child.style.display == w3cos_std::style::Display::TableCaption {
+            if child.style.caption_side_bottom {
+                bottom_captions.push(child);
+            } else {
+                top_captions.push(child);
+            }
+        } else {
+            grid_children.push(child);
+        }
+    }
+    if !grid_children.is_empty() {
+        top_captions.push(table_row_from_misparented_children(
+            parent_style,
+            grid_children,
+            (table_height > 0.0).then_some(table_height),
+        ));
+    }
+    top_captions.extend(bottom_captions);
     let mut table_style = anonymous_table_style(w3cos_std::style::Display::Table, parent_style);
     if table_height > 0.0 {
         table_style.height = w3cos_std::style::Dimension::Px(table_height);
     }
-    w3cos_std::Component::boxed(table_style, vec![row])
+    w3cos_std::Component::boxed(table_style, top_captions)
 }
 
 fn fixup_css_table_children(
@@ -7104,9 +7164,9 @@ fn fixup_css_table_children(
             // full whitespace-aware table fixup; leave those unchanged until
             // they can be grouped without perturbing their inline baselines.
             if !children.is_empty()
-                && children
-                    .iter()
-                    .all(|child| child.style.display == Display::TableCell)
+                && children.iter().all(|child| {
+                    matches!(child.style.display, Display::TableCell | Display::TableCaption)
+                })
             {
                 vec![anonymous_table_wrapper(parent_style, children)]
             } else {
@@ -7892,6 +7952,39 @@ mod image_component_tests {
             row.style.flex_direction,
             w3cos_std::style::FlexDirection::RowReverse
         );
+    }
+
+    #[test]
+    fn anonymous_table_wrapper_orders_captions_around_its_grid() {
+        let parent_style = w3cos_std::style::Style::default();
+        let bottom_style = w3cos_std::style::Style {
+            display: Display::TableCaption,
+            caption_side_bottom: true,
+            ..w3cos_std::style::Style::default()
+        };
+        let top = w3cos_std::Component::boxed(
+            w3cos_std::style::Style {
+                display: Display::TableCaption,
+                ..w3cos_std::style::Style::default()
+            },
+            vec![],
+        );
+        let cell = w3cos_std::Component::boxed(
+            w3cos_std::style::Style {
+                display: Display::TableCell,
+                ..w3cos_std::style::Style::default()
+            },
+            vec![],
+        );
+        let bottom = w3cos_std::Component::boxed(bottom_style, vec![]);
+
+        let table = anonymous_table_wrapper(&parent_style, vec![bottom, cell, top]);
+
+        assert_eq!(table.style.display, Display::Table);
+        assert_eq!(table.children[0].style.display, Display::TableCaption);
+        assert_eq!(table.children[1].style.display, Display::TableRow);
+        assert_eq!(table.children[2].style.display, Display::TableCaption);
+        assert!(table.children[2].style.caption_side_bottom);
     }
 
     #[test]

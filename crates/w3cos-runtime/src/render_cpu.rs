@@ -720,6 +720,7 @@ fn render_node(
         width: rect.width * style.transform.scale_x,
         height: rect.height * style.transform.scale_y,
     };
+    let rect = crate::paint_artifact::table_grid_paint_rect(style, rect);
 
     // Box shadow (render before the element; shadows stay outside filtered layer)
     let css_filter = style.filter.as_deref().and_then(filter::parse_css_filter);

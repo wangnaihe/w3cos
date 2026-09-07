@@ -734,6 +734,7 @@ fn render_node(
         width: rect.width * transform.scale_x,
         height: rect.height * transform.scale_y,
     };
+    let rect = crate::paint_artifact::table_grid_paint_rect(style, rect);
     if transform.rotate_deg != 0.0 {
         canvas.rotate(
             transform.rotate_deg,
