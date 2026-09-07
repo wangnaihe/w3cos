@@ -314,6 +314,234 @@ fn suppress_hidden_empty_cell_paint(nodes: &mut [PaintNode]) {
     }
 }
 
+fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
+    use w3cos_std::style::TextDirection;
+
+    fn edge(style: &Style, side: usize) -> (f32, Color) {
+        let width = match side {
+            0 => style.border_top_width,
+            1 => style.border_right_width,
+            2 => style.border_bottom_width,
+            _ => style.border_left_width,
+        }
+        .unwrap_or(style.border_width);
+        let color = match side {
+            0 => style.border_top_color,
+            1 => style.border_right_color,
+            2 => style.border_bottom_color,
+            _ => style.border_left_color,
+        }
+        .unwrap_or_else(|| {
+            if style.border_color.a == 0 && width > 0.0 {
+                style.color
+            } else {
+                style.border_color
+            }
+        });
+        (width, color)
+    }
+    fn set_edge(style: &mut Style, side: usize, width: f32, color: Color) {
+        match side {
+            0 => {
+                style.border_top_width = Some(width);
+                style.border_top_color = Some(color);
+            }
+            1 => {
+                style.border_right_width = Some(width);
+                style.border_right_color = Some(color);
+            }
+            2 => {
+                style.border_bottom_width = Some(width);
+                style.border_bottom_color = Some(color);
+            }
+            _ => {
+                style.border_left_width = Some(width);
+                style.border_left_color = Some(color);
+            }
+        }
+    }
+    fn suppress_edge(style: &mut Style, side: usize, width: f32) {
+        const NAMES: [&str; 4] = ["top", "right", "bottom", "left"];
+        set_edge(style, side, width, Color::TRANSPARENT);
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .entry(COLLAPSED_BORDER_SUPPRESSED.to_string())
+            .and_modify(|value| {
+                value.push(' ');
+                value.push_str(NAMES[side]);
+            })
+            .or_insert_with(|| NAMES[side].to_string());
+    }
+
+    let rows = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.style.display == Display::TableRow && node.style.border_collapse)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    fn row_cells(nodes: &[PaintNode], row: usize) -> Vec<usize> {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.parent == Some(row) && node.style.display == Display::TableCell)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    }
+
+    for row in &rows {
+        let cells = row_cells(nodes, *row);
+        for pair in cells.windows(2) {
+            let left = pair[0];
+            let right = pair[1];
+            let left_edge = edge(&nodes[left].style, 1);
+            let right_edge = edge(&nodes[right].style, 3);
+            let left_wins = if left_edge.0 > right_edge.0 {
+                true
+            } else if right_edge.0 > left_edge.0 {
+                false
+            } else {
+                nodes[*row].style.direction != TextDirection::Rtl
+            };
+            if left_wins {
+                set_edge(&mut nodes[left].style, 1, left_edge.0, left_edge.1);
+                suppress_edge(&mut nodes[right].style, 3, left_edge.0);
+            } else {
+                suppress_edge(&mut nodes[left].style, 1, right_edge.0);
+                set_edge(&mut nodes[right].style, 3, right_edge.0, right_edge.1);
+            }
+        }
+    }
+
+    fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
+        let mut parent = nodes[index].parent;
+        while let Some(parent_index) = parent {
+            if matches!(nodes[parent_index].style.display, Display::Table | Display::InlineTable) {
+                return Some(parent_index);
+            }
+            parent = nodes[parent_index].parent;
+        }
+        None
+    }
+    let tables = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            matches!(node.style.display, Display::Table | Display::InlineTable)
+                && node.style.border_collapse
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for table in tables {
+        let table_rows = rows
+            .iter()
+            .copied()
+            .filter(|row| nearest_table(nodes, *row) == Some(table))
+            .collect::<Vec<_>>();
+        let Some(first_row) = table_rows.first().copied() else {
+            continue;
+        };
+        let last_row = table_rows.last().copied().unwrap_or(first_row);
+        let mut boundary_cells = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        boundary_cells[0] = row_cells(nodes, first_row);
+        boundary_cells[2] = row_cells(nodes, last_row);
+        for row in table_rows {
+            let cells = row_cells(nodes, row);
+            if let Some(first) = cells.first() {
+                boundary_cells[3].push(*first);
+            }
+            if let Some(last) = cells.last() {
+                boundary_cells[1].push(*last);
+            }
+        }
+        for side in 0..4 {
+            let table_edge = edge(&nodes[table].style, side);
+            for cell in &boundary_cells[side] {
+                let cell_edge = edge(&nodes[*cell].style, side);
+                let winner = if table_edge.0 > cell_edge.0 {
+                    table_edge
+                } else {
+                    cell_edge
+                };
+                set_edge(&mut nodes[*cell].style, side, winner.0, winner.1);
+            }
+            // Boundary cells paint the resolved collapsed edge on the grid.
+            // Leaving the table wrapper border active would inset and paint a
+            // second ring around that same edge.
+            set_edge(&mut nodes[table].style, side, 0.0, Color::TRANSPARENT);
+        }
+    }
+    for pair in rows.windows(2) {
+        if nearest_table(nodes, pair[0]) != nearest_table(nodes, pair[1]) {
+            continue;
+        }
+        let top_cells = row_cells(nodes, pair[0]);
+        let bottom_cells = row_cells(nodes, pair[1]);
+        for (top, bottom) in top_cells.into_iter().zip(bottom_cells) {
+            let top_edge = edge(&nodes[top].style, 2);
+            let bottom_edge = edge(&nodes[bottom].style, 0);
+            if bottom_edge.0 > top_edge.0 {
+                suppress_edge(&mut nodes[top].style, 2, bottom_edge.0);
+                set_edge(
+                    &mut nodes[bottom].style,
+                    0,
+                    bottom_edge.0,
+                    bottom_edge.1,
+                );
+            } else {
+                set_edge(&mut nodes[top].style, 2, top_edge.0, top_edge.1);
+                suppress_edge(&mut nodes[bottom].style, 0, top_edge.0);
+            }
+        }
+    }
+}
+
+const COLLAPSED_BORDER_SUPPRESSED: &str = "--w3cos-internal-collapsed-border-suppressed";
+
+pub(crate) fn border_edge_paint_rects(
+    style: &Style,
+    rect: LayoutRect,
+    widths: [f32; 4],
+) -> [LayoutRect; 4] {
+    let suppressed = |name: &str| {
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(COLLAPSED_BORDER_SUPPRESSED))
+            .is_some_and(|value| value.split_ascii_whitespace().any(|side| side == name))
+    };
+    let top = if suppressed("top") { widths[0] } else { 0.0 };
+    let right = if suppressed("right") { widths[1] } else { 0.0 };
+    let bottom = if suppressed("bottom") { widths[2] } else { 0.0 };
+    let left = if suppressed("left") { widths[3] } else { 0.0 };
+    [
+        LayoutRect {
+            x: rect.x + left,
+            y: rect.y,
+            width: (rect.width - left - right).max(0.0),
+            height: widths[0],
+        },
+        LayoutRect {
+            x: rect.x + rect.width - widths[1],
+            y: rect.y + top,
+            width: widths[1],
+            height: (rect.height - top - bottom).max(0.0),
+        },
+        LayoutRect {
+            x: rect.x + left,
+            y: rect.y + rect.height - widths[2],
+            width: (rect.width - left - right).max(0.0),
+            height: widths[2],
+        },
+        LayoutRect {
+            x: rect.x,
+            y: rect.y + top,
+            width: widths[3],
+            height: (rect.height - top - bottom).max(0.0),
+        },
+    ]
+}
+
 const TABLE_CAPTION_INSETS: &str = "--w3cos-internal-table-caption-insets";
 
 pub(crate) fn table_grid_paint_rect(style: &Style, mut rect: LayoutRect) -> LayoutRect {
@@ -493,6 +721,7 @@ impl PaintArtifact {
         }
         suppress_improper_nested_table_part_backgrounds(&mut nodes);
         suppress_hidden_empty_cell_paint(&mut nodes);
+        resolve_collapsed_cell_border_conflicts(&mut nodes);
         let mut artifact = Self {
             rect_by_index: vec![None; nodes.len()],
             node_properties: vec![PaintProperties::default(); nodes.len()],
@@ -713,6 +942,52 @@ mod tests {
         suppress_hidden_empty_cell_paint(&mut nodes);
         assert_eq!(nodes[0].style.background, Color::TRANSPARENT);
         assert_eq!(nodes[0].style.border_width, 0.0);
+    }
+
+    #[test]
+    fn collapsed_equal_inline_borders_prefer_the_start_cell() {
+        let start_color = Color::rgb(0, 128, 0);
+        let end_color = Color::rgb(255, 0, 0);
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableRow,
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableCell,
+                    border_right_width: Some(20.0),
+                    border_right_color: Some(start_color),
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableCell,
+                    border_left_width: Some(20.0),
+                    border_left_color: Some(end_color),
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+        ];
+
+        resolve_collapsed_cell_border_conflicts(&mut nodes);
+
+        assert_eq!(nodes[1].style.border_right_color, Some(start_color));
+        assert_eq!(nodes[2].style.border_left_width, Some(20.0));
+        assert_eq!(nodes[2].style.border_left_color, Some(Color::TRANSPARENT));
     }
 
     #[test]

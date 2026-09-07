@@ -842,32 +842,7 @@ fn render_node(
             style.border_bottom_color.unwrap_or(style.border_color),
             style.border_left_color.unwrap_or(style.border_color),
         ];
-        let edges = [
-            LayoutRect {
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: widths[0],
-            },
-            LayoutRect {
-                x: rect.x + rect.width - widths[1],
-                y: rect.y,
-                width: widths[1],
-                height: rect.height,
-            },
-            LayoutRect {
-                x: rect.x,
-                y: rect.y + rect.height - widths[2],
-                width: rect.width,
-                height: widths[2],
-            },
-            LayoutRect {
-                x: rect.x,
-                y: rect.y,
-                width: widths[3],
-                height: rect.height,
-            },
-        ];
+        let edges = crate::paint_artifact::border_edge_paint_rects(style, rect, widths);
         for ((edge, width), color) in edges.into_iter().zip(widths).zip(colors) {
             if width > 0.0 && color.a > 0 {
                 draw_rect(
