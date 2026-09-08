@@ -651,15 +651,19 @@ fn render_node(
 
     let color_chain = if in_layer { None } else { css_filter.as_ref() };
     let bg = node_color(style.background, opacity, color_chain);
-    let background_rect = crate::paint_artifact::box_background_paint_rect(style, rect);
-
-    if bg.a > 0 {
-        draw_rect(scene, background_rect, bg, style.border_radius, dpi);
-    }
-    for layer in crate::background_image::background_paint_layers(style, background_rect)
+    for background_rect in crate::paint_artifact::box_background_paint_rects(style, rect) {
+        if bg.a > 0 {
+            draw_rect(scene, background_rect, bg, style.border_radius, dpi);
+        }
+        for layer in crate::background_image::background_paint_layers_with_overrides(
+            style,
+            rect,
+            crate::paint_artifact::box_background_positioning_rect(style, rect),
+            Some(background_rect),
+        )
         .into_iter()
         .rev()
-    {
+        {
         let clip = match &layer {
             crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.clip,
             crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.geometry.clip,
@@ -693,7 +697,8 @@ fn render_node(
                 }
             }
         }
-        scene.pop_layer();
+            scene.pop_layer();
+        }
     }
 
     if style.border_width > 0.0 && style.border_color.a > 0 {

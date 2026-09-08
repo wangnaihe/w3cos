@@ -403,6 +403,138 @@ fn effective_table_border_spacing(style: &w3cos_std::style::Style) -> (f32, f32)
     }
 }
 
+fn collapsed_layout_edge_width(style: &w3cos_std::style::Style, side: usize) -> f32 {
+    match side {
+        0 => style.border_top_width,
+        1 => style.border_right_width,
+        2 => style.border_bottom_width,
+        _ => style.border_left_width,
+    }
+    .unwrap_or(style.border_width)
+}
+
+fn set_collapsed_layout_edge_width(
+    style: &mut w3cos_std::style::Style,
+    side: usize,
+    width: f32,
+) {
+    match side {
+        0 => style.border_top_width = Some(width),
+        1 => style.border_right_width = Some(width),
+        2 => style.border_bottom_width = Some(width),
+        _ => style.border_left_width = Some(width),
+    }
+}
+
+/// Resolve the widths of shared collapsed grid lines before handing the tree to
+/// Taffy. The paint tree keeps the authored styles so conflict ownership and
+/// colors are still resolved there; this layout-only clone gives both cells on
+/// a boundary the winning width. Without it, a one-sided border is omitted
+/// from one cell's border box and the negative overlap shortens every track.
+fn resolve_collapsed_table_layout_borders(root: &mut Component) {
+    fn collect_rows(component: &Component, rows: &mut Vec<Vec<[f32; 4]>>) {
+        if component.style.display == WDisplay::TableRow {
+            rows.push(
+                component
+                    .children
+                    .iter()
+                    .filter(|child| child.style.display == WDisplay::TableCell)
+                    .map(|cell| {
+                        [
+                            collapsed_layout_edge_width(&cell.style, 0),
+                            collapsed_layout_edge_width(&cell.style, 1),
+                            collapsed_layout_edge_width(&cell.style, 2),
+                            collapsed_layout_edge_width(&cell.style, 3),
+                        ]
+                    })
+                    .collect(),
+            );
+            return;
+        }
+        for child in &component.children {
+            if matches!(child.style.display, WDisplay::Table | WDisplay::InlineTable) {
+                continue;
+            }
+            collect_rows(child, rows);
+        }
+    }
+
+    fn apply_rows(component: &mut Component, rows: &mut impl Iterator<Item = Vec<[f32; 4]>>) {
+        if component.style.display == WDisplay::TableRow {
+            if let Some(edges) = rows.next() {
+                for (cell, widths) in component
+                    .children
+                    .iter_mut()
+                    .filter(|child| child.style.display == WDisplay::TableCell)
+                    .zip(edges)
+                {
+                    for (side, width) in widths.into_iter().enumerate() {
+                        set_collapsed_layout_edge_width(&mut cell.style, side, width);
+                    }
+                }
+            }
+            return;
+        }
+        for child in &mut component.children {
+            if matches!(child.style.display, WDisplay::Table | WDisplay::InlineTable) {
+                continue;
+            }
+            apply_rows(child, rows);
+        }
+    }
+
+    if matches!(root.style.display, WDisplay::Table | WDisplay::InlineTable)
+        && root.style.border_collapse
+    {
+        let mut rows = Vec::new();
+        collect_rows(root, &mut rows);
+        if !rows.is_empty() {
+            for row in &mut rows {
+                for column in 0..row.len().saturating_sub(1) {
+                    let boundary = row[column][1].max(row[column + 1][3]);
+                    row[column][1] = boundary;
+                    row[column + 1][3] = boundary;
+                }
+            }
+            for row_index in 0..rows.len().saturating_sub(1) {
+                let columns = rows[row_index].len().min(rows[row_index + 1].len());
+                for column in 0..columns {
+                    let boundary = rows[row_index][column][2]
+                        .max(rows[row_index + 1][column][0]);
+                    rows[row_index][column][2] = boundary;
+                    rows[row_index + 1][column][0] = boundary;
+                }
+            }
+
+            let table_top = collapsed_layout_edge_width(&root.style, 0);
+            let table_right = collapsed_layout_edge_width(&root.style, 1);
+            let table_bottom = collapsed_layout_edge_width(&root.style, 2);
+            let table_left = collapsed_layout_edge_width(&root.style, 3);
+            let last_row = rows.len() - 1;
+            for cell in &mut rows[0] {
+                cell[0] = cell[0].max(table_top);
+            }
+            for cell in &mut rows[last_row] {
+                cell[2] = cell[2].max(table_bottom);
+            }
+            for row in &mut rows {
+                if let Some(cell) = row.first_mut() {
+                    cell[3] = cell[3].max(table_left);
+                }
+                if let Some(cell) = row.last_mut() {
+                    cell[1] = cell[1].max(table_right);
+                }
+            }
+
+            apply_rows(root, &mut rows.into_iter());
+        }
+    }
+
+    for child in &mut root.children {
+        resolve_collapsed_table_layout_borders(child);
+    }
+}
+
 fn table_track_widths(component: &Component) -> Vec<f32> {
     fn collect_rows(component: &Component, tracks: &mut Vec<f32>, collapsed: bool) {
         if component.style.display == WDisplay::TableRow {
@@ -1458,9 +1590,11 @@ impl LayoutEngine {
         if !self.tree_valid {
             self.tree.clear();
             let mut idx = 0;
+            let mut layout_root = root.clone();
+            resolve_collapsed_table_layout_borders(&mut layout_root);
             self.root_node = Some(build_taffy_tree(
                 &mut self.tree,
-                root,
+                &layout_root,
                 &mut idx,
                 None,
                 None,
@@ -1544,6 +1678,8 @@ impl LayoutEngine {
         project_forced_break_lines(&mut results, root);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
+        align_table_cell_baselines(&mut results, flat);
+        align_empty_inline_table_baselines(&mut results, flat);
 
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
 
@@ -1582,13 +1718,15 @@ pub fn compute_with_scroll(
     Vec<(usize, LayoutRect)>,
 )> {
     let flat = pre_flatten(root);
+    let mut layout_root = root.clone();
+    resolve_collapsed_table_layout_borders(&mut layout_root);
     let mut tree: TaffyTree<usize> = TaffyTree::new();
     tree.disable_rounding();
     let mut node_index: usize = 0;
 
     let root_node = build_taffy_tree(
         &mut tree,
-        root,
+        &layout_root,
         &mut node_index,
         None,
         None,
@@ -1661,15 +1799,157 @@ pub fn compute_with_scroll(
         &mut scroll_ancestor,
     );
 
-    project_fixed_table_cell_rects(&mut results, root);
+    project_fixed_table_cell_rects(&mut results, &layout_root);
     project_forced_break_lines(&mut results, root);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
+    align_table_cell_baselines(&mut results, &flat);
+    align_empty_inline_table_baselines(&mut results, &flat);
 
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
 
     results.extend(fixed_results);
     Ok((results, scrollable, clip_only))
+}
+
+fn align_table_cell_baselines(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    fn descendant_of(flat: &[FlatNodeInfo<'_>], mut index: usize, ancestor: usize) -> bool {
+        while let Some(parent) = flat[index].parent {
+            if parent == ancestor {
+                return true;
+            }
+            index = parent;
+        }
+        false
+    }
+
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    for (row, _) in flat
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.style.display == WDisplay::TableRow)
+    {
+        let cells = flat
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.parent == Some(row)
+                    && node.style.display == WDisplay::TableCell
+                    && node.style.align_self == WAlignSelf::Baseline
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if cells.len() < 2 {
+            continue;
+        }
+        let baselines = cells
+            .iter()
+            .filter_map(|cell| {
+                let text = flat.iter().enumerate().find(|(index, node)| {
+                    descendant_of(flat, *index, *cell)
+                        && !matches!(node.style.position, WPos::Absolute | WPos::Fixed)
+                        && matches!(node.kind, ComponentKind::Text { content } if content.chars().any(|character| !character.is_whitespace()))
+                })?;
+                let rect = layouts[*positions.get(&text.0)?].0;
+                Some((*cell, rect.y))
+            })
+            .collect::<Vec<_>>();
+        let Some(target) = baselines.iter().map(|(_, baseline)| *baseline).reduce(f32::max) else {
+            continue;
+        };
+        for (cell, baseline) in baselines {
+            let delta = target - baseline;
+            if delta <= 0.0 {
+                continue;
+            }
+            for (rect, index) in layouts.iter_mut() {
+                if descendant_of(flat, *index, cell)
+                    && !matches!(flat[*index].style.position, WPos::Absolute | WPos::Fixed)
+                {
+                    rect.y += delta;
+                }
+            }
+        }
+    }
+}
+
+fn align_empty_inline_table_baselines(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    fn descendant_of(flat: &[FlatNodeInfo<'_>], mut index: usize, ancestor: usize) -> bool {
+        while let Some(parent) = flat[index].parent {
+            if parent == ancestor {
+                return true;
+            }
+            index = parent;
+        }
+        false
+    }
+
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    for table in 0..flat.len() {
+        if flat[table].style.display != WDisplay::InlineTable
+            || flat.iter().enumerate().any(|(index, node)| {
+                descendant_of(flat, index, table)
+                    && matches!(node.kind, ComponentKind::Text { content } if content.chars().any(|character| !character.is_whitespace()))
+            })
+        {
+            continue;
+        }
+        let Some(parent) = flat[table].parent else {
+            continue;
+        };
+        let Some(table_position) = positions.get(&table).copied() else {
+            continue;
+        };
+        let table_rect = layouts[table_position].0;
+        let target_baseline = (0..table)
+            .filter(|index| flat[*index].parent == Some(parent))
+            .filter(|index| {
+                matches!(
+                    flat[*index].style.display,
+                    WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
+                )
+            })
+            .filter_map(|index| positions.get(&index).map(|position| layouts[*position].0))
+            .map(|rect| rect.y + rect.height)
+            .reduce(f32::max);
+        let Some(target_baseline) = target_baseline else {
+            continue;
+        };
+        let delta = target_baseline - (table_rect.y + table_rect.height);
+        if delta == 0.0 {
+            continue;
+        }
+        for (rect, index) in layouts.iter_mut() {
+            if *index == table || descendant_of(flat, *index, table) {
+                rect.y += delta;
+            }
+        }
+        let child_bottom = layouts
+            .iter()
+            .filter(|(_, index)| flat[*index].parent == Some(parent))
+            .map(|(rect, _)| rect.y + rect.height)
+            .reduce(f32::max);
+        if let (Some(parent_position), Some(child_bottom)) =
+            (positions.get(&parent).copied(), child_bottom)
+        {
+            let parent_rect = &mut layouts[parent_position].0;
+            parent_rect.height = (child_bottom - parent_rect.y).max(0.0);
+        }
+    }
 }
 
 fn project_collapsed_table_row_rects(
@@ -2149,38 +2429,184 @@ fn project_table_column_background_rects(
         }
         None
     };
-    let mut row_bounds = HashMap::<usize, (f32, f32)>::new();
-    for (rect, index) in layouts.iter() {
+    let layout_rects = layouts
+        .iter()
+        .map(|(rect, index)| (*index, *rect))
+        .collect::<HashMap<_, _>>();
+    let union = |left: LayoutRect, right: LayoutRect| {
+        let x = left.x.min(right.x);
+        let y = left.y.min(right.y);
+        let max_x = (left.x + left.width).max(right.x + right.width);
+        let max_y = (left.y + left.height).max(right.y + right.height);
+        LayoutRect {
+            x,
+            y,
+            width: max_x - x,
+            height: max_y - y,
+        }
+    };
+    let mut table_columns = HashMap::<usize, Vec<LayoutRect>>::new();
+    let mut projected_rows = HashMap::<usize, LayoutRect>::new();
+    for (table, table_node) in flat.iter().enumerate().filter(|(_, node)| {
+        matches!(node.style.display, WDisplay::Table | WDisplay::InlineTable)
+    }) {
+        if !layout_rects.contains_key(&table) {
+            continue;
+        }
+        let mut rows = flat
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| {
+                node.style.display == WDisplay::TableRow
+                    && nearest_table(*index) == Some(table)
+                    && layout_rects.contains_key(index)
+            })
+            .map(|(index, _)| {
+                let cells = flat
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, node)| {
+                        node.parent == Some(index) && node.style.display == WDisplay::TableCell
+                    })
+                    .filter_map(|(cell, _)| {
+                        layout_rects.get(&cell).copied().map(|rect| (cell, rect))
+                    })
+                    .collect::<Vec<_>>();
+                (index, cells)
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|(left, _), (right, _)| {
+            layout_rects[left]
+                .y
+                .total_cmp(&layout_rects[right].y)
+                .then_with(|| left.cmp(right))
+        });
+        let column_count = rows.iter().map(|(_, cells)| cells.len()).max().unwrap_or(0);
+        if column_count == 0 {
+            continue;
+        }
+        let mut bounds = vec![None::<LayoutRect>; column_count];
+        for (row, (row_index, cells)) in rows.iter().enumerate() {
+            let mut row_bounds = None::<LayoutRect>;
+            for (column, (_, cell)) in cells.iter().enumerate() {
+                let left = if column == 0 {
+                    collapsed_layout_edge_width(table_node.style, 3) / 2.0
+                } else {
+                    let previous = cells[column - 1].1;
+                    (previous.x + previous.width - cell.x).max(0.0) / 2.0
+                };
+                let right = if column + 1 == cells.len() {
+                    collapsed_layout_edge_width(table_node.style, 1) / 2.0
+                } else {
+                    (cell.x + cell.width - cells[column + 1].1.x).max(0.0) / 2.0
+                };
+                let top = if row == 0 {
+                    collapsed_layout_edge_width(table_node.style, 0) / 2.0
+                } else {
+                    rows[row - 1]
+                        .1
+                        .get(column)
+                        .map_or(0.0, |(_, previous)| {
+                            (previous.y + previous.height - cell.y).max(0.0) / 2.0
+                        })
+                };
+                let bottom = if row + 1 == rows.len() {
+                    collapsed_layout_edge_width(table_node.style, 2) / 2.0
+                } else {
+                    rows[row + 1]
+                        .1
+                        .get(column)
+                        .map_or(0.0, |(_, next)| {
+                            (cell.y + cell.height - next.y).max(0.0) / 2.0
+                        })
+                };
+                let projected = if table_node.style.border_collapse {
+                    LayoutRect {
+                        x: cell.x + left,
+                        y: cell.y + top,
+                        width: (cell.width - left - right).max(0.0),
+                        height: (cell.height - top - bottom).max(0.0),
+                    }
+                } else {
+                    *cell
+                };
+                row_bounds = Some(row_bounds.map_or(projected, |rect| union(rect, projected)));
+                bounds[column] = Some(bounds[column].map_or(projected, |rect| union(rect, projected)));
+            }
+            if let Some(rect) = row_bounds {
+                projected_rows.insert(*row_index, rect);
+            }
+        }
+        table_columns.insert(table, bounds.into_iter().flatten().collect());
+    }
+
+    let mut projected = HashMap::<usize, LayoutRect>::new();
+    let mut next_column = HashMap::<usize, usize>::new();
+    for (index, node) in flat.iter().enumerate() {
+        if node.style.display != WDisplay::TableColumn {
+            continue;
+        }
+        let Some(table) = nearest_table(index) else {
+            continue;
+        };
+        let column = next_column.entry(table).or_default();
+        if let Some(rect) = table_columns.get(&table).and_then(|columns| columns.get(*column)) {
+            projected.insert(index, *rect);
+        }
+        *column += 1;
+    }
+    for (index, node) in flat.iter().enumerate() {
+        if node.style.display != WDisplay::TableColumnGroup {
+            continue;
+        }
+        let rect = projected
+            .iter()
+            .filter(|(column, _)| {
+                let mut parent = flat[**column].parent;
+                while let Some(candidate) = parent {
+                    if candidate == index {
+                        return true;
+                    }
+                    parent = flat[candidate].parent;
+                }
+                false
+            })
+            .map(|(_, rect)| *rect)
+            .reduce(union);
+        if let Some(rect) = rect {
+            projected.insert(index, rect);
+        }
+    }
+    projected.extend(projected_rows.iter().map(|(index, rect)| (*index, *rect)));
+    for (index, node) in flat.iter().enumerate() {
         if !matches!(
-            flat.get(*index).map(|entry| entry.style.display),
-            Some(WDisplay::TableRow)
+            node.style.display,
+            WDisplay::TableRowGroup | WDisplay::TableHeaderGroup | WDisplay::TableFooterGroup
         ) {
             continue;
         }
-        let Some(table) = nearest_table(*index) else {
-            continue;
-        };
-        row_bounds
-            .entry(table)
-            .and_modify(|(top, bottom)| {
-                *top = top.min(rect.y);
-                *bottom = bottom.max(rect.y + rect.height);
+        let rect = projected_rows
+            .iter()
+            .filter(|(row, _)| {
+                let mut parent = flat[**row].parent;
+                while let Some(candidate) = parent {
+                    if candidate == index {
+                        return true;
+                    }
+                    parent = flat[candidate].parent;
+                }
+                false
             })
-            .or_insert((rect.y, rect.y + rect.height));
+            .map(|(_, rect)| *rect)
+            .reduce(union);
+        if let Some(rect) = rect {
+            projected.insert(index, rect);
+        }
     }
     for (rect, index) in layouts.iter_mut() {
-        if !matches!(
-            flat.get(*index).map(|entry| entry.style.display),
-            Some(WDisplay::TableColumnGroup | WDisplay::TableColumn)
-        ) {
-            continue;
+        if let Some(projected) = projected.get(index) {
+            *rect = *projected;
         }
-        let Some((top, bottom)) = nearest_table(*index).and_then(|table| row_bounds.get(&table))
-        else {
-            continue;
-        };
-        rect.y = *top;
-        rect.height = bottom - top;
     }
 }
 
@@ -2365,7 +2791,7 @@ fn build_taffy_tree(
     parent_direction: Option<WDir>,
     parent_display: Option<WDisplay>,
     parent_align_items: Option<WAlign>,
-    parent_font_size: Option<f32>,
+    _parent_font_size: Option<f32>,
     viewport_w: f32,
     viewport_h: f32,
     containing_width: f32,
@@ -2381,6 +2807,12 @@ fn build_taffy_tree(
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
     let owns_table_layout = matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable);
+    if matches!(comp.style.display, WDisplay::TableColumnGroup | WDisplay::TableColumn) {
+        // Columns contribute track metadata and paint layers, not in-flow
+        // block-axis boxes. Keeping them as ordinary Taffy children inserts
+        // table `gap` slots before the first row in the separated model.
+        style.position = taffy::Position::Absolute;
+    }
     if comp.style.visibility == WVisibility::Collapse
         && matches!(
             comp.style.display,
@@ -2416,6 +2848,12 @@ fn build_taffy_tree(
     } else {
         inherited_fixed_table_layout
     };
+    if owns_table_layout && !matches!(comp.style.width, WDim::Auto) {
+        // CSS table width constrains the used principal table border box in
+        // both the fixed and automatic algorithms. A generic content-box
+        // percentage would add table borders outside the containing block.
+        style.box_sizing = BoxSizing::BorderBox;
+    }
     if owns_table_layout && comp.style.table_layout_fixed {
         // CSS table width is the used table border-box width in the fixed
         // algorithm. Taffy's generic content-box default would add the table
@@ -2504,25 +2942,6 @@ fn build_taffy_tree(
         // children. Their auto inline size fills the available cell content
         // width even when the cell uses baseline alignment for inline content.
         style.align_self = Some(AlignSelf::Stretch);
-    }
-    if comp.style.display == WDisplay::Table
-        && let Some(wrapper_font_size) = parent_font_size
-    {
-        // A block-level CSS table is laid out inside an anonymous table
-        // wrapper. Its block-axis margin metrics belong to the parent block
-        // formatting context; inline-axis margins remain table-grid metrics.
-        style.margin.top = to_taffy_margin(
-            comp.style.margin.top,
-            wrapper_font_size,
-            viewport_w,
-            viewport_h,
-        );
-        style.margin.bottom = to_taffy_margin(
-            comp.style.margin.bottom,
-            wrapper_font_size,
-            viewport_w,
-            viewport_h,
-        );
     }
     let own_border_spacing = matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable)
         .then(|| effective_table_border_spacing(&comp.style));

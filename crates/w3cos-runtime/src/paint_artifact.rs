@@ -314,6 +314,155 @@ fn suppress_hidden_empty_cell_paint(nodes: &mut [PaintNode]) {
     }
 }
 
+const TABLE_BACKGROUND_FRAGMENTS: &str = "--w3cos-internal-table-background-fragments";
+
+fn annotate_separated_table_background_fragments(
+    nodes: &mut [PaintNode],
+    rect_by_index: &[Option<LayoutRect>],
+) {
+    fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
+        let mut parent = nodes[index].parent;
+        while let Some(parent_index) = parent {
+            if matches!(nodes[parent_index].style.display, Display::Table | Display::InlineTable) {
+                return Some(parent_index);
+            }
+            parent = nodes[parent_index].parent;
+        }
+        None
+    }
+    fn column_span(style: &Style) -> usize {
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-table-column-span"))
+            .and_then(|span| span.parse::<usize>().ok())
+            .filter(|span| *span > 0)
+            .unwrap_or(1)
+            .min(1000)
+    }
+    fn descendant_of(nodes: &[PaintNode], mut index: usize, ancestor: usize) -> bool {
+        while let Some(parent) = nodes[index].parent {
+            if parent == ancestor {
+                return true;
+            }
+            index = parent;
+        }
+        false
+    }
+
+    let original_len = nodes.len();
+    for source in 0..original_len {
+        if !matches!(nodes[source].style.display, Display::TableColumnGroup | Display::TableColumn)
+            || (nodes[source].style.background.a == 0
+                && nodes[source].style.background_image.is_none())
+        {
+            continue;
+        }
+        let Some(table) = nearest_table(nodes, source) else {
+            continue;
+        };
+        let table_has_cells = (0..original_len).any(|index| {
+            nodes[index].style.display == Display::TableCell
+                && nearest_table(nodes, index) == Some(table)
+        });
+        if !table_has_cells {
+            nodes[source].style.background = Color::TRANSPARENT;
+            nodes[source].style.background_image = None;
+            continue;
+        }
+        if nodes[table].style.border_collapse {
+            continue;
+        }
+        let columns = (0..original_len)
+            .filter(|index| {
+                nodes[*index].style.display == Display::TableColumn
+                    && nearest_table(nodes, *index) == Some(table)
+            })
+            .collect::<Vec<_>>();
+        let covered = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                source == **column
+                    || (nodes[source].style.display == Display::TableColumnGroup
+                        && descendant_of(nodes, **column, source))
+            })
+            .map(|(column, _)| column)
+            .collect::<std::collections::HashSet<_>>();
+        if covered.is_empty() {
+            continue;
+        }
+        let rows = (0..original_len).filter(|index| {
+            nodes[*index].style.display == Display::TableRow
+                && nearest_table(nodes, *index) == Some(table)
+        }).collect::<Vec<_>>();
+        let mut fragments = Vec::new();
+        for row in rows {
+            let cells = (0..original_len)
+                .filter(|index| {
+                    nodes[*index].parent == Some(row)
+                        && nodes[*index].style.display == Display::TableCell
+                })
+                .collect::<Vec<_>>();
+            let mut column = 0usize;
+            for cell in cells {
+                let span = column_span(&nodes[cell].style);
+                if (column..column.saturating_add(span)).any(|index| covered.contains(&index))
+                    && let Some(rect) = rect_by_index.get(cell).copied().flatten()
+                {
+                    fragments.push(format!(
+                        "{} {} {} {}",
+                        rect.x, rect.y, rect.width, rect.height
+                    ));
+                }
+                column += span;
+            }
+        }
+        if !fragments.is_empty() {
+            nodes[source]
+                .style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(TABLE_BACKGROUND_FRAGMENTS.to_string(), fragments.join(";"));
+        }
+    }
+
+    for source in 0..original_len {
+        if !matches!(
+            nodes[source].style.display,
+            Display::TableRow
+                | Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+        ) || (nodes[source].style.background.a == 0
+            && nodes[source].style.background_image.is_none())
+        {
+            continue;
+        }
+        let Some(table) = nearest_table(nodes, source) else {
+            continue;
+        };
+        if nodes[table].style.border_collapse {
+            continue;
+        }
+        let fragments = (0..original_len)
+            .filter(|cell| {
+                nodes[*cell].style.display == Display::TableCell
+                    && descendant_of(nodes, *cell, source)
+            })
+            .filter_map(|cell| rect_by_index.get(cell).copied().flatten())
+            .map(|rect| format!("{} {} {} {}", rect.x, rect.y, rect.width, rect.height))
+            .collect::<Vec<_>>();
+        if !fragments.is_empty() {
+            nodes[source]
+                .style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(TABLE_BACKGROUND_FRAGMENTS.to_string(), fragments.join(";"));
+        }
+    }
+}
+
 fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
     fn column_span(style: &Style) -> usize {
         style
@@ -581,7 +730,7 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             // Boundary cells paint the resolved collapsed edge on the grid.
             // Leaving the table wrapper border active would inset and paint a
             // second ring around that same edge.
-            set_edge(&mut nodes[table].style, side, 0.0, Color::TRANSPARENT);
+            suppress_edge(&mut nodes[table].style, side, table_edge.0);
         }
     }
     for pair in rows.windows(2) {
@@ -721,6 +870,21 @@ fn collapsed_border_suppressed(style: &Style, name: &str) -> bool {
 }
 
 pub(crate) fn box_background_paint_rect(style: &Style, rect: LayoutRect) -> LayoutRect {
+    if style.border_collapse && style.display == Display::TableCell {
+        let top = style.border_top_width.unwrap_or(style.border_width) / 2.0;
+        let right = style.border_right_width.unwrap_or(style.border_width) / 2.0;
+        let bottom = style.border_bottom_width.unwrap_or(style.border_width) / 2.0;
+        let left = style.border_left_width.unwrap_or(style.border_width) / 2.0;
+        return LayoutRect {
+            x: rect.x + left,
+            y: rect.y + top,
+            width: (rect.width - left - right).max(0.0),
+            height: (rect.height - top - bottom).max(0.0),
+        };
+    }
+    if style.border_collapse && matches!(style.display, Display::Table | Display::InlineTable) {
+        return rect;
+    }
     let top = collapsed_border_suppressed(style, "top")
         .then(|| style.border_top_width.unwrap_or(style.border_width))
         .unwrap_or(0.0);
@@ -739,6 +903,54 @@ pub(crate) fn box_background_paint_rect(style: &Style, rect: LayoutRect) -> Layo
         width: (rect.width - left - right).max(0.0),
         height: (rect.height - top - bottom).max(0.0),
     }
+}
+
+pub(crate) fn box_background_paint_rects(style: &Style, rect: LayoutRect) -> Vec<LayoutRect> {
+    let Some(fragments) = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get(TABLE_BACKGROUND_FRAGMENTS))
+    else {
+        return vec![box_background_paint_rect(style, rect)];
+    };
+    let rects = fragments
+        .split(';')
+        .filter_map(|fragment| {
+            let mut values = fragment
+                .split_ascii_whitespace()
+                .filter_map(|value| value.parse::<f32>().ok());
+            Some(LayoutRect {
+                x: values.next()?,
+                y: values.next()?,
+                width: values.next()?.max(0.0),
+                height: values.next()?.max(0.0),
+            })
+        })
+        .collect::<Vec<_>>();
+    if rects.is_empty() {
+        vec![box_background_paint_rect(style, rect)]
+    } else {
+        rects
+    }
+}
+
+pub(crate) fn box_background_positioning_rect(
+    style: &Style,
+    rect: LayoutRect,
+) -> Option<LayoutRect> {
+    if !style.border_collapse || !matches!(style.display, Display::Table | Display::InlineTable) {
+        return None;
+    }
+    let top = style.border_top_width.unwrap_or(style.border_width) / 2.0;
+    let right = style.border_right_width.unwrap_or(style.border_width) / 2.0;
+    let bottom = style.border_bottom_width.unwrap_or(style.border_width) / 2.0;
+    let left = style.border_left_width.unwrap_or(style.border_width) / 2.0;
+    Some(LayoutRect {
+        x: rect.x + left,
+        y: rect.y + top,
+        width: (rect.width - left - right).max(0.0),
+        height: (rect.height - top - bottom).max(0.0),
+    })
 }
 
 const TABLE_CAPTION_INSETS: &str = "--w3cos-internal-table-caption-insets";
@@ -929,6 +1141,7 @@ impl PaintArtifact {
         project_collapsed_table_tracks_to_cells(&mut nodes);
         resolve_collapsed_cell_border_conflicts(&mut nodes);
         extend_collapsed_borders_across_empty_rows(&mut nodes, &rect_by_index);
+        annotate_separated_table_background_fragments(&mut nodes, &rect_by_index);
         let mut artifact = Self {
             rect_by_index,
             node_properties: vec![PaintProperties::default(); nodes.len()],
@@ -1256,6 +1469,37 @@ mod tests {
 
         assert_eq!(nodes[1].style.border_right_color, Some(Color::TRANSPARENT));
         assert_eq!(nodes[2].style.border_left_color, Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn collapsed_cell_background_uses_shared_border_halves() {
+        let style = Style {
+            display: Display::TableCell,
+            border_collapse: true,
+            border_top_width: Some(4.0),
+            border_right_width: Some(2.0),
+            border_bottom_width: Some(4.0),
+            border_left_width: Some(2.0),
+            ..Style::default()
+        };
+
+        assert_eq!(
+            box_background_paint_rect(
+                &style,
+                LayoutRect {
+                    x: 137.0,
+                    y: 53.0,
+                    width: 59.0,
+                    height: 23.0,
+                },
+            ),
+            LayoutRect {
+                x: 138.0,
+                y: 55.0,
+                width: 57.0,
+                height: 19.0,
+            }
+        );
     }
 
     #[test]

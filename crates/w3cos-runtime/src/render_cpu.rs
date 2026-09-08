@@ -769,45 +769,50 @@ fn render_node(
     let opacity = style.opacity;
     let color_chain = if in_layer { None } else { css_filter.as_ref() };
     let bg = node_color(style.background, opacity, color_chain);
-    let background_rect = crate::paint_artifact::box_background_paint_rect(style, rect);
-
-    if bg.a > 0 {
-        draw_rect(pixmap, background_rect, bg, style.border_radius, clip_mask);
-    }
-    for layer in crate::background_image::background_paint_layers(style, background_rect)
+    for background_rect in crate::paint_artifact::box_background_paint_rects(style, rect) {
+        if bg.a > 0 {
+            draw_rect(pixmap, background_rect, bg, style.border_radius, clip_mask);
+        }
+        for layer in crate::background_image::background_paint_layers_with_overrides(
+            style,
+            rect,
+            crate::paint_artifact::box_background_positioning_rect(style, rect),
+            Some(background_rect),
+        )
         .into_iter()
         .rev()
-    {
-        match layer {
-            crate::background_image::BackgroundPaintLayer::Raster(layer) => {
-                if let Some(decoded) = crate::image_loader::get_or_load(&layer.source) {
-                    for tile in layer.tiles {
-                        draw_image_pixels(
+        {
+            match layer {
+                crate::background_image::BackgroundPaintLayer::Raster(layer) => {
+                    if let Some(decoded) = crate::image_loader::get_or_load(&layer.source) {
+                        for tile in layer.tiles {
+                            draw_image_pixels(
+                                pixmap,
+                                tile,
+                                decoded.width,
+                                decoded.height,
+                                &decoded.data,
+                                opacity,
+                                clip_mask,
+                                Some(layer.clip),
+                                layer.blend_mode,
+                            );
+                        }
+                    }
+                }
+                crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
+                    for tile in layer.geometry.tiles {
+                        draw_gradient_pixels(
                             pixmap,
                             tile,
-                            decoded.width,
-                            decoded.height,
-                            &decoded.data,
+                            &layer.kind,
+                            &layer.stops,
                             opacity,
                             clip_mask,
-                            Some(layer.clip),
+                            layer.geometry.clip,
                             layer.blend_mode,
                         );
                     }
-                }
-            }
-            crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
-                for tile in layer.geometry.tiles {
-                    draw_gradient_pixels(
-                        pixmap,
-                        tile,
-                        &layer.kind,
-                        &layer.stops,
-                        opacity,
-                        clip_mask,
-                        layer.geometry.clip,
-                        layer.blend_mode,
-                    );
                 }
             }
         }

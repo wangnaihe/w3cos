@@ -1040,6 +1040,18 @@ impl Document {
         if let Some(value) = body_background_hint {
             merged.set_property("background-color", value);
         }
+        let direction_hint = (node.node_type == NodeType::Element)
+            .then(|| {
+                node.attributes
+                    .iter()
+                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case("dir"))
+                    .map(|(_, value)| value.trim().to_ascii_lowercase())
+            })
+            .flatten()
+            .filter(|value| matches!(value.as_str(), "ltr" | "rtl"));
+        if let Some(value) = &direction_hint {
+            merged.set_property("direction", value);
+        }
         let mut custom_properties = inherited
             .and_then(|style| style.custom_properties.clone())
             .unwrap_or_default();
@@ -1102,6 +1114,7 @@ impl Document {
                     )
                     .last();
                 (css_property_eq(property, "color") && body_text_hint.is_some())
+                    || (css_property_eq(property, "direction") && direction_hint.is_some())
                     || winning_author_value.is_some_and(|value| {
                         !matches!(
                             value.trim().to_ascii_lowercase().as_str(),
@@ -3491,7 +3504,8 @@ impl Document {
                             | w3cos_std::style::Display::InlineTable
                     )
                     && (!matches!(style.width, w3cos_std::style::Dimension::Auto)
-                        || style.direction == w3cos_std::style::TextDirection::Rtl
+                        || (style.direction == w3cos_std::style::TextDirection::Rtl
+                            && matches!(children[0].kind, w3cos_std::ComponentKind::Text { .. }))
                         || matches!(
                             style.unicode_bidi,
                             w3cos_std::style::UnicodeBidi::BidiOverride
@@ -6192,6 +6206,9 @@ fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
         }
     }
     coalesce_passive_inline_text_children(component);
+    if !reordered {
+        reorder_explicit_bidi_children(component);
+    }
 }
 
 fn is_bidi_control(character: char) -> bool {
@@ -6210,6 +6227,38 @@ fn is_bidi_control(character: char) -> bool {
             | '\u{2068}'
             | '\u{2069}'
     )
+}
+
+fn empty_inline_box_has_no_area(component: &w3cos_std::Component) -> bool {
+    use w3cos_std::component::ComponentKind;
+    use w3cos_std::style::{Dimension, Display};
+
+    fn subtree_is_empty(component: &w3cos_std::Component) -> bool {
+        match &component.kind {
+            ComponentKind::Text { content } => content.chars().all(is_css_whitespace),
+            ComponentKind::Row | ComponentKind::Box => {
+                component.children.iter().all(subtree_is_empty)
+            }
+            _ => false,
+        }
+    }
+
+    matches!(component.kind, ComponentKind::Row | ComponentKind::Box)
+        && subtree_is_empty(component)
+        && matches!(component.style.display, Display::Inline | Display::InlineFlex)
+        && component.style.width == Dimension::Auto
+        && component.style.height == Dimension::Auto
+        && component.style.padding == w3cos_std::style::Edges::ZERO
+        && component.style.margin == w3cos_std::style::Edges::ZERO
+        && component.style.border_width == 0.0
+        && [
+            component.style.border_top_width,
+            component.style.border_right_width,
+            component.style.border_bottom_width,
+            component.style.border_left_width,
+        ]
+        .into_iter()
+        .all(|width| width.unwrap_or(0.0) == 0.0)
 }
 
 fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool {
@@ -6232,12 +6281,10 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             _ => None,
         };
     let style_bidi_control = bidi_control_for(&component.style);
-    if (component.children.len() < 2 && style_bidi_control.is_none())
-        || !matches!(
-            component.style.flex_direction,
-            w3cos_std::style::FlexDirection::Row
-        )
-    {
+    component
+        .children
+        .retain(|child| !empty_inline_box_has_no_area(child));
+    if component.children.len() < 2 && style_bidi_control.is_none() {
         return false;
     }
 
@@ -6327,27 +6374,30 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         text.push(control);
         logical.push((control, units.len().saturating_sub(1)));
     }
-    if !logical.iter().any(|(character, _)| {
-        matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'
-                | '\u{202b}'
-                | '\u{202c}'
-                | '\u{202d}'
-                | '\u{202e}'
-                | '\u{2066}'
-                | '\u{2067}'
-                | '\u{2068}'
-                | '\u{2069}'
-        )
-    }) {
+    let paragraph_direction = if component.style.direction == TextDirection::Rtl
+        || units
+            .iter()
+            .any(|unit| unit.component.style.direction == TextDirection::Rtl)
+    {
+        TextDirection::Rtl
+    } else {
+        TextDirection::Ltr
+    };
+    let has_bidi_content = paragraph_direction == TextDirection::Rtl
+        || logical.iter().any(|(character, _)| {
+            is_bidi_control(*character)
+                || matches!(
+                    unicode_bidi::bidi_class(*character),
+                    unicode_bidi::BidiClass::R
+                        | unicode_bidi::BidiClass::AL
+                        | unicode_bidi::BidiClass::AN
+                )
+        });
+    if !has_bidi_content {
         return false;
     }
 
-    let paragraph_level = match component.style.direction {
+    let paragraph_level = match paragraph_direction {
         TextDirection::Ltr => unicode_bidi::Level::ltr(),
         TextDirection::Rtl => unicode_bidi::Level::rtl(),
     };
@@ -6661,6 +6711,19 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         previous_line = Some(fragment.line_index);
     }
     component.children = normalized;
+    component.style.justify_content = match (
+        component.style.text_align,
+        paragraph_direction,
+    ) {
+        (w3cos_std::style::TextAlign::Start, TextDirection::Rtl)
+        | (w3cos_std::style::TextAlign::End, TextDirection::Ltr) => {
+            w3cos_std::style::JustifyContent::FlexEnd
+        }
+        (w3cos_std::style::TextAlign::Center, _) => {
+            w3cos_std::style::JustifyContent::Center
+        }
+        _ => component.style.justify_content,
+    };
     true
 }
 
@@ -6814,18 +6877,38 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
         if fragment.style.display == w3cos_std::style::Display::None {
             continue;
         }
+        if empty_inline_box_has_no_area(&fragment) {
+            continue;
+        }
         let anonymous_block_table = fragment.style.display == w3cos_std::style::Display::Table;
         if let Some(mut text) = plain_anonymous_inline_table_text(&fragment) {
             if anonymous_block_table {
-                let has_previous = !coalesced.is_empty();
-                let has_following = child_displays[index + 1..]
+                let has_previous_inline = coalesced.last().is_some_and(|previous| {
+                    matches!(
+                        previous.style.display,
+                        w3cos_std::style::Display::Inline
+                            | w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::InlineFlex
+                            | w3cos_std::style::Display::InlineTable
+                    )
+                });
+                let has_following_inline = child_displays[index + 1..]
                     .iter()
-                    .any(|display| *display != w3cos_std::style::Display::None);
+                    .find(|display| **display != w3cos_std::style::Display::None)
+                    .is_some_and(|display| {
+                        matches!(
+                            display,
+                            w3cos_std::style::Display::Inline
+                                | w3cos_std::style::Display::InlineBlock
+                                | w3cos_std::style::Display::InlineFlex
+                                | w3cos_std::style::Display::InlineTable
+                        )
+                    });
                 if let ComponentKind::Text { content } = &mut text.kind {
-                    if has_previous {
+                    if has_previous_inline {
                         content.insert_str(0, "\u{2028} ");
                     }
-                    if has_following {
+                    if has_following_inline {
                         content.push('\u{2028}');
                     }
                 }
@@ -9498,6 +9581,36 @@ mod image_component_tests {
     }
 
     #[test]
+    fn ordinary_bidi_ignores_an_empty_painted_inline_box() {
+        let mut inline_style = w3cos_std::style::Style::default();
+        inline_style.display = Display::Inline;
+        let mut empty_style = inline_style.clone();
+        empty_style.background = w3cos_std::Color::WHITE;
+        let mut line = w3cos_std::Component::row(
+            w3cos_std::style::Style::default(),
+            vec![
+                w3cos_std::Component::text("א", inline_style.clone()),
+                w3cos_std::Component::row(empty_style, vec![]),
+                w3cos_std::Component::text("בג", inline_style),
+            ],
+        );
+
+        reorder_explicit_bidi_inline_rows(&mut line);
+
+        let visual = line.children.iter().fold(String::new(), |mut visual, child| {
+            if let ComponentKind::Text { content } = &child.kind {
+                visual.push_str(content);
+            }
+            visual
+        });
+        assert_eq!(visual, "גבא");
+        assert!(line.children.iter().all(|child| {
+            !matches!(child.kind, ComponentKind::Row | ComponentKind::Box)
+                || !child.children.is_empty()
+        }));
+    }
+
+    #[test]
     fn css_bidi_override_reorders_block_inline_content() {
         let mut style = w3cos_std::style::Style::default();
         style.flex_direction = w3cos_std::style::FlexDirection::Row;
@@ -9815,6 +9928,27 @@ mod computed_style_cache_tests {
         assert_eq!(
             document.computed_style_for(child.id).unicode_bidi,
             w3cos_std::style::UnicodeBidi::BidiOverride
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn html_dir_hint_sets_direction_but_author_css_can_override_it() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        target.set_attribute(&mut document, "dir", "rtl");
+        document.body().append_child(&mut document, target);
+
+        assert_eq!(
+            document.computed_style_for(target.id).direction,
+            w3cos_std::style::TextDirection::Rtl
+        );
+        crate::stylesheet::register_rule("#target", &[("direction", "ltr")]);
+        assert_eq!(
+            document.computed_style_for(target.id).direction,
+            w3cos_std::style::TextDirection::Ltr
         );
         crate::stylesheet::clear_rules();
     }

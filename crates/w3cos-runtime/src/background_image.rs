@@ -122,13 +122,14 @@ pub(crate) fn raster_background_layers(
     style: &Style,
     border_box: LayoutRect,
 ) -> Vec<RasterBackgroundLayer> {
-    raster_background_layers_with_positioning_area(style, border_box, None)
+    raster_background_layers_with_overrides(style, border_box, None, None)
 }
 
-fn raster_background_layers_with_positioning_area(
+fn raster_background_layers_with_overrides(
     style: &Style,
     border_box: LayoutRect,
     positioning_area: Option<LayoutRect>,
+    clip_override: Option<LayoutRect>,
 ) -> Vec<RasterBackgroundLayer> {
     let Some(images) = style.background_image.as_deref() else {
         return Vec::new();
@@ -154,8 +155,14 @@ fn raster_background_layers_with_positioning_area(
                     ratio: svg.ratio,
                 },
             );
-            let geometry =
-                layer_geometry(style, border_box, index, Some(intrinsic), positioning_area)?;
+            let geometry = layer_geometry(
+                style,
+                border_box,
+                index,
+                Some(intrinsic),
+                positioning_area,
+                clip_override,
+            )?;
             Some(RasterBackgroundLayer {
                 layer_index: index,
                 source,
@@ -171,13 +178,14 @@ pub(crate) fn gradient_background_layers(
     style: &Style,
     border_box: LayoutRect,
 ) -> Vec<GradientBackgroundLayer> {
-    gradient_background_layers_with_positioning_area(style, border_box, None)
+    gradient_background_layers_with_overrides(style, border_box, None, None)
 }
 
-fn gradient_background_layers_with_positioning_area(
+fn gradient_background_layers_with_overrides(
     style: &Style,
     border_box: LayoutRect,
     positioning_area: Option<LayoutRect>,
+    clip_override: Option<LayoutRect>,
 ) -> Vec<GradientBackgroundLayer> {
     let Some(images) = style.background_image.as_deref() else {
         return Vec::new();
@@ -187,7 +195,14 @@ fn gradient_background_layers_with_positioning_area(
         .enumerate()
         .filter_map(|(index, layer)| {
             let (kind, stops) = parse_gradient(layer)?;
-            let geometry = layer_geometry(style, border_box, index, None, positioning_area)?;
+            let geometry = layer_geometry(
+                style,
+                border_box,
+                index,
+                None,
+                positioning_area,
+                clip_override,
+            )?;
             Some(GradientBackgroundLayer {
                 layer_index: index,
                 kind,
@@ -203,11 +218,38 @@ pub(crate) fn background_paint_layers(
     style: &Style,
     border_box: LayoutRect,
 ) -> Vec<BackgroundPaintLayer> {
-    let mut layers = raster_background_layers(style, border_box)
+    background_paint_layers_with_positioning_area(style, border_box, None)
+}
+
+pub(crate) fn background_paint_layers_with_positioning_area(
+    style: &Style,
+    border_box: LayoutRect,
+    positioning_area: Option<LayoutRect>,
+) -> Vec<BackgroundPaintLayer> {
+    background_paint_layers_with_overrides(style, border_box, positioning_area, None)
+}
+
+pub(crate) fn background_paint_layers_with_overrides(
+    style: &Style,
+    border_box: LayoutRect,
+    positioning_area: Option<LayoutRect>,
+    clip_override: Option<LayoutRect>,
+) -> Vec<BackgroundPaintLayer> {
+    let mut layers = raster_background_layers_with_overrides(
+        style,
+        border_box,
+        positioning_area,
+        clip_override,
+    )
         .into_iter()
         .map(BackgroundPaintLayer::Raster)
         .chain(
-            gradient_background_layers(style, border_box)
+            gradient_background_layers_with_overrides(
+                style,
+                border_box,
+                positioning_area,
+                clip_override,
+            )
                 .into_iter()
                 .map(BackgroundPaintLayer::Gradient),
         )
@@ -222,14 +264,15 @@ pub(crate) fn canvas_background_paint_layers(
     positioning_area: Option<LayoutRect>,
 ) -> Vec<BackgroundPaintLayer> {
     let mut layers =
-        raster_background_layers_with_positioning_area(style, canvas_box, positioning_area)
+        raster_background_layers_with_overrides(style, canvas_box, positioning_area, None)
             .into_iter()
             .map(BackgroundPaintLayer::Raster)
             .chain(
-                gradient_background_layers_with_positioning_area(
+                gradient_background_layers_with_overrides(
                     style,
                     canvas_box,
                     positioning_area,
+                    None,
                 )
                 .into_iter()
                 .map(BackgroundPaintLayer::Gradient),
@@ -308,6 +351,7 @@ fn layer_geometry(
     index: usize,
     intrinsic: Option<IntrinsicSize>,
     positioning_override: Option<LayoutRect>,
+    clip_override: Option<LayoutRect>,
 ) -> Option<BackgroundGeometry> {
     let origin = layer_value(style.background_origin.as_deref(), index, "padding-box");
     let clip_value = layer_value(style.background_clip.as_deref(), index, "border-box");
@@ -324,6 +368,18 @@ fn layer_geometry(
     }
     let clip_kind = parse_box(clip_value);
     let clip_rect = background_box(style, border_box, clip_kind);
+    let clip_rect = clip_override.map_or(clip_rect, |limit| {
+        let x = clip_rect.x.max(limit.x);
+        let y = clip_rect.y.max(limit.y);
+        let right = (clip_rect.x + clip_rect.width).min(limit.x + limit.width);
+        let bottom = (clip_rect.y + clip_rect.height).min(limit.y + limit.height);
+        LayoutRect {
+            x,
+            y,
+            width: (right - x).max(0.0),
+            height: (bottom - y).max(0.0),
+        }
+    });
     let clip = BackgroundClip {
         rect: clip_rect,
         radius: background_radius(style, clip_kind),

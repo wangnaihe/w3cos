@@ -767,23 +767,25 @@ fn render_node(
     }
 
     let bg = style.background;
-    let background_rect = crate::paint_artifact::box_background_paint_rect(style, rect);
-    if bg.a > 0 {
-        draw_rounded_rect(
-            canvas,
-            background_rect,
-            style.border_corner_radii(),
-            &color_paint(bg, style.opacity),
-        );
-    }
-    if style.background_image.is_some() {
-        draw_background_image(
-            canvas,
-            background_rect,
-            style.border_radius,
-            style,
-            style.opacity,
-        );
+    for background_rect in crate::paint_artifact::box_background_paint_rects(style, rect) {
+        if bg.a > 0 {
+            draw_rounded_rect(
+                canvas,
+                background_rect,
+                style.border_corner_radii(),
+                &color_paint(bg, style.opacity),
+            );
+        }
+        if style.background_image.is_some() {
+            draw_background_image(
+                canvas,
+                background_rect,
+                rect,
+                style.border_radius,
+                style,
+                style.opacity,
+            );
+        }
     }
     let has_edge_border = style.border_top_width.is_some()
         || style.border_right_width.is_some()
@@ -1806,13 +1808,19 @@ fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
 fn draw_background_image(
     canvas: &Canvas,
     rect: LayoutRect,
+    positioning_area: LayoutRect,
     _radius: f32,
     style: &Style,
     opacity: f32,
 ) {
     draw_background_layers(
         canvas,
-        crate::background_image::background_paint_layers(style, rect),
+        crate::background_image::background_paint_layers_with_overrides(
+            style,
+            positioning_area,
+            crate::paint_artifact::box_background_positioning_rect(style, positioning_area),
+            Some(rect),
+        ),
         opacity,
     );
 }
@@ -2217,6 +2225,12 @@ mod tests {
         surface.canvas().clear(Color::WHITE);
         draw_background_image(
             surface.canvas(),
+            LayoutRect {
+                x: 0.5,
+                y: 0.5,
+                width: 4.0,
+                height: 4.0,
+            },
             LayoutRect {
                 x: 0.5,
                 y: 0.5,
