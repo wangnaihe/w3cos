@@ -107,35 +107,134 @@ fn count_nodes(comp: &Component) -> usize {
 }
 
 /// Leaf intrinsic size used by Taffy (must stay in sync with `build_taffy_tree`).
-fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) -> (f32, f32) {
+fn image_intrinsic_ratio(src: &str) -> Option<f32> {
+    use crate::image_loader::SvgIntrinsicLength;
+
+    if let Some(size) = crate::image_loader::svg_intrinsic_size(src) {
+        return match (size.width, size.height) {
+            (SvgIntrinsicLength::Px(width), SvgIntrinsicLength::Px(height)) if height > 0.0 => {
+                Some(width / height)
+            }
+            _ => size.ratio,
+        };
+    }
+    crate::image_loader::dimensions(src).and_then(|(width, height)| {
+        (width > 0 && height > 0).then_some(width as f32 / height as f32)
+    })
+}
+
+fn image_intrinsic_size(
+    src: &str,
+    style: &w3cos_std::style::Style,
+    containing_width: Option<f32>,
+) -> (f32, f32) {
+    use crate::image_loader::SvgIntrinsicLength;
+
+    let decoded = crate::image_loader::dimensions(src)
+        .map(|(width, height)| (width as f32, height as f32))
+        .unwrap_or_else(|| {
+            if crate::image_loader::is_reserved_browser_source(src) {
+                (0.0, 0.0)
+            } else {
+                (200.0, 200.0)
+            }
+        });
+    let metadata = crate::image_loader::svg_intrinsic_size(src);
+    let ratio = image_intrinsic_ratio(src);
+    let (intrinsic_width, intrinsic_height) = if let Some(size) = metadata {
+        let width = match size.width {
+            SvgIntrinsicLength::Px(value) => Some(value),
+            SvgIntrinsicLength::Auto | SvgIntrinsicLength::Percent(_) => None,
+        };
+        let height = match size.height {
+            SvgIntrinsicLength::Px(value) => Some(value),
+            SvgIntrinsicLength::Auto | SvgIntrinsicLength::Percent(_) => None,
+        };
+        match (width, height, ratio) {
+            (Some(width), Some(height), _) => (width, height),
+            (Some(width), None, Some(ratio)) if ratio > 0.0 => (width, width / ratio),
+            (None, Some(height), Some(ratio)) if ratio > 0.0 => (height * ratio, height),
+            (Some(width), None, _) => (width, 150.0),
+            (None, Some(height), _) => (300.0, height),
+            (None, None, Some(ratio)) if ratio > 0.0 => {
+                let width = containing_width.unwrap_or(300.0).min(300.0).max(0.0);
+                (width, width / ratio)
+            }
+            (None, None, _) => (300.0, 150.0),
+        }
+    } else {
+        decoded
+    };
+
+    let width = dim_to_px(style.width);
+    let height = dim_to_px(style.height);
+    let (mut used_width, mut used_height) = match (width, height, ratio) {
+        (Some(width), Some(height), _) => (width, height),
+        (Some(width), None, Some(ratio)) if ratio > 0.0 => (width, width / ratio),
+        (None, Some(height), Some(ratio)) if ratio > 0.0 => (height * ratio, height),
+        (Some(width), None, _) => (width, intrinsic_height),
+        (None, Some(height), _) => (intrinsic_width, height),
+        (None, None, _) => (intrinsic_width, intrinsic_height),
+    };
+
+    let px = |dimension| match dimension {
+        WDim::Px(value) => Some(value.max(0.0)),
+        _ => None,
+    };
+    let min_width = px(style.min_width);
+    let min_height = px(style.min_height);
+    let max_width = px(style.max_width);
+    let max_height = px(style.max_height);
+    if width.is_none()
+        && height.is_none()
+        && let Some(ratio) = ratio
+        && ratio > 0.0
+        && used_width > 0.0
+        && used_height > 0.0
+    {
+        let mut scale_min = 0.0_f32;
+        let mut scale_max = f32::INFINITY;
+        if let Some(value) = min_width {
+            scale_min = scale_min.max(value / used_width);
+        }
+        if let Some(value) = min_height {
+            scale_min = scale_min.max(value / used_height);
+        }
+        if let Some(value) = max_width {
+            scale_max = scale_max.min(value / used_width);
+        }
+        if let Some(value) = max_height {
+            scale_max = scale_max.min(value / used_height);
+        }
+        let scale = 1.0_f32.max(scale_min).min(scale_max);
+        used_width *= scale;
+        used_height *= scale;
+    } else {
+        if let Some(value) = min_width {
+            used_width = used_width.max(value);
+        }
+        if let Some(value) = max_width {
+            used_width = used_width.min(value);
+        }
+        if let Some(value) = min_height {
+            used_height = used_height.max(value);
+        }
+        if let Some(value) = max_height {
+            used_height = used_height.min(value);
+        }
+    }
+    (used_width, used_height)
+}
+
+fn leaf_intrinsic_size_with_containing(
+    kind: &ComponentKind,
+    style: &w3cos_std::style::Style,
+    containing_width: Option<f32>,
+) -> (f32, f32) {
     match kind {
         ComponentKind::Text { content } => text_intrinsic_size(content, style),
         ComponentKind::Button { label } => button_intrinsic_size(label, style),
-        ComponentKind::Image { src } => {
-            let (natural_width, natural_height) = crate::image_loader::dimensions(src)
-                .map(|(width, height)| (width as f32, height as f32))
-                .unwrap_or_else(|| {
-                    if crate::image_loader::is_reserved_browser_source(src) {
-                        (0.0, 0.0)
-                    } else {
-                        (200.0, 200.0)
-                    }
-                });
-            let width = dim_to_px(style.width);
-            let height = dim_to_px(style.height);
-            match (width, height) {
-                (Some(width), Some(height)) => (width, height),
-                (Some(width), None) if natural_width > 0.0 => {
-                    (width, natural_height * width / natural_width)
-                }
-                (None, Some(height)) if natural_height > 0.0 => {
-                    (natural_width * height / natural_height, height)
-                }
-                (Some(width), None) => (width, natural_height),
-                (None, Some(height)) => (natural_width, height),
-                (None, None) => (natural_width, natural_height),
-            }
-        }
+        ComponentKind::Image { src } => image_intrinsic_size(src, style, containing_width),
         ComponentKind::TextInput { .. } => {
             // Match the browser UA baseline for an `<input size="20">`
             // instead of imposing the former mobile-only 200×40 control.
@@ -146,6 +245,10 @@ fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) ->
         ComponentKind::SvgDocument { width, height, .. } => (*width as f32, *height as f32),
         _ => (0.0, 0.0),
     }
+}
+
+fn leaf_intrinsic_size(kind: &ComponentKind, style: &w3cos_std::style::Style) -> (f32, f32) {
+    leaf_intrinsic_size_with_containing(kind, style, None)
 }
 
 fn component_max_content_width(component: &Component) -> f32 {
@@ -1327,6 +1430,7 @@ fn leaf_taffy_size(
     style: &w3cos_std::style::Style,
     base: &taffy::Style,
     parent_display: Option<WDisplay>,
+    containing_width: f32,
 ) -> taffy::Size<Dimension> {
     // `display:inline` normally forces both axes to auto in `to_taffy_style`,
     // but replaced elements such as `<img>` still honor their CSS width and
@@ -1342,7 +1446,9 @@ fn leaf_taffy_size(
     } else if matches!(style.width, WDim::Auto) {
         match kind {
             ComponentKind::TextInput { .. } => {
-                Dimension::length(leaf_intrinsic_size(kind, style).0)
+                Dimension::length(
+                    leaf_intrinsic_size_with_containing(kind, style, Some(containing_width)).0,
+                )
             }
             _ => Dimension::auto(),
         }
@@ -1357,7 +1463,7 @@ fn leaf_taffy_size(
                 text_intrinsic_size_in_parent_for_taffy(content, style, parent_display).1
             }
             ComponentKind::Button { label } => button_intrinsic_size(label, style).1,
-            _ => leaf_intrinsic_size(kind, style).1,
+            _ => leaf_intrinsic_size_with_containing(kind, style, Some(containing_width)).1,
         };
         Dimension::length(h)
     } else {
@@ -3331,7 +3437,18 @@ fn build_taffy_tree(
     }
 
     if comp.children.is_empty() {
-        let size = leaf_taffy_size(&comp.kind, &comp.style, &style, parent_display);
+        if let ComponentKind::Image { src } = &comp.kind
+            && let Some(ratio) = image_intrinsic_ratio(src)
+        {
+            style.aspect_ratio = Some(ratio);
+        }
+        let size = leaf_taffy_size(
+            &comp.kind,
+            &comp.style,
+            &style,
+            parent_display,
+            containing_width,
+        );
         let inline_control_in_block =
             matches!(
                 comp.style.display,
@@ -3447,8 +3564,13 @@ fn build_taffy_tree(
                     (Dimension::length(w), Dimension::length(w))
                 }
                 ComponentKind::Image { .. } => {
-                    let w = leaf_intrinsic_size(&comp.kind, &comp.style).0;
-                    (Dimension::length(w), Dimension::length(w))
+                    let w = leaf_intrinsic_size_with_containing(
+                        &comp.kind,
+                        &comp.style,
+                        Some(containing_width),
+                    )
+                    .0;
+                    (Dimension::auto(), Dimension::length(w))
                 }
                 _ => (Dimension::auto(), size.width),
             }
@@ -3463,13 +3585,10 @@ fn build_taffy_tree(
                 ComponentKind::Button { label } => {
                     Dimension::length(button_intrinsic_size(label, &comp.style).1)
                 }
-                // Replaced elements keep their intrinsic cross-axis size when
-                // their CSS height is `auto`. Without this automatic minimum,
-                // a grid/flex parent can collapse an otherwise valid image to
-                // 0px before the paint pass ever gets a chance to decode it.
-                ComponentKind::Image { .. } => {
-                    Dimension::length(leaf_intrinsic_size(&comp.kind, &comp.style).1)
-                }
+                // The intrinsic height is already the preferred leaf size.
+                // Keeping it as an automatic minimum as well would override
+                // an authored `max-height` on a replaced element.
+                ComponentKind::Image { .. } => Dimension::auto(),
                 _ => Dimension::auto(),
             }
         } else {
@@ -6963,6 +7082,79 @@ mod tests {
         let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!((image.width, image.height), (4.0, 2.0));
         crate::image_loader::invalidate(source);
+    }
+
+    #[test]
+    fn svg_replaced_image_uses_css_intrinsic_metadata_instead_of_raster_fallback() {
+        let ratio_only = "browser-layout-ratio-only.svg";
+        crate::image_loader::decode_and_install(
+            ratio_only,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 500"/>"#,
+        )
+        .unwrap();
+        let kind = ComponentKind::Image {
+            src: ratio_only.to_string(),
+        };
+        assert_eq!(
+            leaf_intrinsic_size_with_containing(&kind, &Style::default(), Some(200.0)),
+            (200.0, 100.0)
+        );
+        assert_eq!(
+            leaf_intrinsic_size_with_containing(
+                &kind,
+                &Style {
+                    max_height: WDim::Px(20.0),
+                    ..Style::default()
+                },
+                Some(200.0),
+            ),
+            (40.0, 20.0)
+        );
+        let constrained = leaf_intrinsic_size_with_containing(
+                &kind,
+                &Style {
+                    min_width: WDim::Px(240.0),
+                    ..Style::default()
+                },
+                Some(200.0),
+            );
+        assert!((constrained.0 - 240.0).abs() < 0.001);
+        assert!((constrained.1 - 120.0).abs() < 0.001);
+
+        let explicit_axes = "browser-layout-explicit-axes.svg";
+        crate::image_loader::decode_and_install(
+            explicit_axes,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="50" height="25" viewBox="0 0 1000 1000"/>"#,
+        )
+        .unwrap();
+        let kind = ComponentKind::Image {
+            src: explicit_axes.to_string(),
+        };
+        assert_eq!(
+            leaf_intrinsic_size(
+                &kind,
+                &Style {
+                    height: WDim::Px(20.0),
+                    ..Style::default()
+                }
+            ),
+            (40.0, 20.0)
+        );
+
+        let height_only = "browser-layout-height-only.svg";
+        crate::image_loader::decode_and_install(
+            height_only,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" height="25"/>"#,
+        )
+        .unwrap();
+        let kind = ComponentKind::Image {
+            src: height_only.to_string(),
+        };
+        assert_eq!(leaf_intrinsic_size(&kind, &Style::default()), (300.0, 25.0));
+
+        crate::image_loader::invalidate(ratio_only);
+        crate::image_loader::invalidate(explicit_axes);
+        crate::image_loader::invalidate(height_only);
     }
 
     #[test]

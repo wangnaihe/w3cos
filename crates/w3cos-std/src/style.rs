@@ -26,6 +26,14 @@ pub fn parse_absolute_length_px(value: &str) -> Option<f32> {
     value.parse().ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CssClipRect {
+    pub top: Option<Dimension>,
+    pub right: Option<Dimension>,
+    pub bottom: Option<Dimension>,
+    pub left: Option<Dimension>,
+}
+
 /// CSS Modern Subset — Flexbox, Grid, Block, Inline, and positioning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Style {
@@ -83,6 +91,10 @@ pub struct Style {
 
     // Overflow
     pub overflow: Overflow,
+    /// CSS2 `clip: rect(...)` for absolutely positioned boxes. `None` means
+    /// `auto`; individual `None` sides represent the `auto` side keyword.
+    #[serde(default)]
+    pub clip: Option<CssClipRect>,
     #[serde(default)]
     pub overflow_x: Option<Overflow>,
     #[serde(default)]
@@ -257,6 +269,7 @@ impl Default for Style {
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             overflow: Overflow::Visible,
+            clip: None,
             overflow_x: None,
             overflow_y: None,
             overscroll_behavior: OverscrollBehavior::Auto,
@@ -380,6 +393,7 @@ impl Style {
             max_width,
             max_height,
             overflow,
+            clip,
             overflow_x,
             overflow_y,
             overscroll_behavior,
@@ -485,6 +499,7 @@ impl Style {
             max_width: max_width_b,
             max_height: max_height_b,
             overflow: overflow_b,
+            clip: clip_b,
             overflow_x: overflow_x_b,
             overflow_y: overflow_y_b,
             overscroll_behavior: overscroll_behavior_b,
@@ -588,6 +603,7 @@ impl Style {
             && max_width == max_width_b
             && max_height == max_height_b
             && overflow == overflow_b
+            && clip == clip_b
             && overflow_x == overflow_x_b
             && overflow_y == overflow_y_b
             && overscroll_behavior == overscroll_behavior_b

@@ -255,6 +255,32 @@ fn inline_fragment_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRe
     })
 }
 
+fn css2_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
+    if !matches!(style.position, Position::Absolute | Position::Fixed) {
+        return None;
+    }
+    let clip = style.clip?;
+    let resolve = |side: Option<w3cos_std::style::Dimension>, auto: f32| match side {
+        Some(w3cos_std::style::Dimension::Px(value)) => value,
+        Some(w3cos_std::style::Dimension::Rem(value)) => value * 16.0,
+        Some(w3cos_std::style::Dimension::Em(value)) => value * style.font_size,
+        Some(w3cos_std::style::Dimension::Vw(value)) => value * rect.width / 100.0,
+        Some(w3cos_std::style::Dimension::Vh(value)) => value * rect.height / 100.0,
+        Some(w3cos_std::style::Dimension::Percent(value)) => value * auto / 100.0,
+        Some(w3cos_std::style::Dimension::Auto) | None => auto,
+    };
+    let top = resolve(clip.top, 0.0);
+    let right = resolve(clip.right, rect.width);
+    let bottom = resolve(clip.bottom, rect.height);
+    let left = resolve(clip.left, 0.0);
+    Some(LayoutRect {
+        x: rect.x + left,
+        y: rect.y + top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    })
+}
+
 fn suppress_improper_nested_table_part_backgrounds(nodes: &mut [PaintNode]) {
     for index in 0..nodes.len() {
         if !matches!(
@@ -1217,6 +1243,16 @@ impl PaintArtifact {
             });
         }
         if let Some(rect) = self.rect_by_index[index]
+            && let Some(css_clip) = css2_clip_rect(&node.style, rect)
+        {
+            let parent = properties.clip;
+            properties.clip = self.properties.clips.len();
+            self.properties.clips.push(ClipNode {
+                parent,
+                rect: Some(css_clip),
+            });
+        }
+        if let Some(rect) = self.rect_by_index[index]
             && let Some(fragment_clip) = inline_fragment_clip_rect(&node.style, rect)
         {
             let parent = properties.clip;
@@ -1304,6 +1340,37 @@ mod tests {
                 y: 100.0,
                 width: 100.0,
                 height: 20.0,
+            })
+        );
+    }
+
+    #[test]
+    fn css2_clip_rect_uses_positioned_box_local_coordinates() {
+        let style = Style {
+            position: Position::Absolute,
+            clip: Some(w3cos_std::style::CssClipRect {
+                top: Some(w3cos_std::style::Dimension::Px(10.0)),
+                right: Some(w3cos_std::style::Dimension::Px(70.0)),
+                bottom: Some(w3cos_std::style::Dimension::Px(50.0)),
+                left: Some(w3cos_std::style::Dimension::Px(20.0)),
+            }),
+            ..Style::default()
+        };
+        assert_eq!(
+            css2_clip_rect(
+                &style,
+                LayoutRect {
+                    x: 100.0,
+                    y: 200.0,
+                    width: 90.0,
+                    height: 80.0,
+                }
+            ),
+            Some(LayoutRect {
+                x: 120.0,
+                y: 210.0,
+                width: 50.0,
+                height: 40.0,
             })
         );
     }

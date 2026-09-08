@@ -1,8 +1,9 @@
 use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
-    AlignItems, BoxSizing, Contain, Dimension, Display, Edges, FlexDirection, FlexWrap, Float,
-    JustifyContent, Overflow, Position, Spacing, Style, TextDirection, UnicodeBidi, WillChange,
+    AlignItems, BoxSizing, Contain, CssClipRect, Dimension, Display, Edges, FlexDirection,
+    FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style, TextDirection,
+    UnicodeBidi, WillChange,
 };
 
 /// CSSStyleDeclaration — the `element.style` property.
@@ -313,6 +314,11 @@ impl CSSStyleDeclaration {
             }
 
             "overflow" => self.inner.overflow = parse_overflow(value),
+            "clip" => {
+                if let Some(clip) = parse_clip(value) {
+                    self.inner.clip = clip;
+                }
+            }
             "overflow-x" | "overflowX" => self.inner.overflow_x = Some(parse_overflow(value)),
             "overflow-y" | "overflowY" => self.inner.overflow_y = Some(parse_overflow(value)),
             "overflow-anchor" | "overflowAnchor" => {
@@ -886,6 +892,22 @@ impl CSSStyleDeclaration {
             }
             "align-items" | "alignItems" => format!("{:?}", self.inner.align_items).to_lowercase(),
             "overflow" => format!("{:?}", self.inner.overflow).to_lowercase(),
+            "clip" => self.inner.clip.map_or_else(
+                || "auto".to_string(),
+                |clip| {
+                    let side = |value: Option<Dimension>| value.map_or_else(
+                        || "auto".to_string(),
+                        |value| dimension_to_css(&value),
+                    );
+                    format!(
+                        "rect({}, {}, {}, {})",
+                        side(clip.top),
+                        side(clip.right),
+                        side(clip.bottom),
+                        side(clip.left)
+                    )
+                },
+            ),
             "overflow-x" | "overflowX" => {
                 format!("{:?}", self.inner.resolved_overflow_x()).to_lowercase()
             }
@@ -1318,6 +1340,45 @@ fn parse_overflow(value: &str) -> Overflow {
         "auto" => Overflow::Auto,
         _ => Overflow::Visible,
     }
+}
+
+fn parse_clip(value: &str) -> Option<Option<CssClipRect>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Some(None);
+    }
+    let inner = value
+        .strip_prefix("rect(")
+        .and_then(|value| value.strip_suffix(')'))?;
+    let parts = inner
+        .split(|character: char| character == ',' || character.is_ascii_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return None;
+    }
+    let side = |part: &str| {
+        if part.eq_ignore_ascii_case("auto") {
+            Some(None)
+        } else if let Some(number) = part.strip_suffix("ex") {
+            number
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .map(|number| Some(Dimension::Em(number * 0.5)))
+        } else {
+            parse_dimension_checked(part).and_then(|dimension| match dimension {
+                Dimension::Auto | Dimension::Percent(_) => None,
+                dimension => Some(Some(dimension)),
+            })
+        }
+    };
+    Some(Some(CssClipRect {
+        top: side(parts[0])?,
+        right: side(parts[1])?,
+        bottom: side(parts[2])?,
+        left: side(parts[3])?,
+    }))
 }
 
 fn parse_dimension(value: &str) -> Dimension {
@@ -2816,6 +2877,25 @@ mod tests {
             assert_eq!(declaration.inner.text_transform, expected);
             assert_eq!(declaration.get_property("text-transform"), value);
         }
+    }
+
+    #[test]
+    fn css2_clip_rect_parses_absolute_units_and_auto_sides() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("clip", "rect(-0pt, 1in, auto, +0px)");
+        assert_eq!(
+            declaration.inner.clip,
+            Some(CssClipRect {
+                top: Some(Dimension::Px(-0.0)),
+                right: Some(Dimension::Px(96.0)),
+                bottom: None,
+                left: Some(Dimension::Px(0.0)),
+            })
+        );
+        assert_eq!(
+            declaration.get_property("clip"),
+            "rect(-0px, 96px, auto, 0px)"
+        );
     }
 }
 #[test]

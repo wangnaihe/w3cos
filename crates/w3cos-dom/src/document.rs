@@ -1224,6 +1224,17 @@ impl Document {
                 _ => {}
             }
         }
+        if let Some(value) = declared_value(&["clip"]) {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "inherit" => {
+                    style.clip = inherited.and_then(|parent| parent.clip);
+                }
+                "initial" | "unset" | "revert" | "revert-layer" => {
+                    style.clip = None;
+                }
+                _ => {}
+            }
+        }
         if matches!(
             style.position,
             w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
@@ -3621,6 +3632,7 @@ impl Document {
                     )
                     && (!matches!(style.width, w3cos_std::style::Dimension::Auto)
                         || style.text_indent != w3cos_std::style::Dimension::Px(0.0)
+                        || style.text_align != w3cos_std::style::TextAlign::Start
                         || (style.direction == w3cos_std::style::TextDirection::Rtl
                             && matches!(children[0].kind, w3cos_std::ComponentKind::Text { .. }))
                         || matches!(
@@ -3882,6 +3894,19 @@ impl Document {
                         children[0].style.width = w3cos_std::style::Dimension::Percent(100.0);
                         children[0].style.min_width = w3cos_std::style::Dimension::Px(0.0);
                         children[0].style.flex_shrink = 1.0;
+                    }
+                    if anonymous_inline_formatting_context {
+                        for child in &mut children {
+                            if matches!(
+                                child.style.display,
+                                w3cos_std::style::Display::InlineBlock
+                                    | w3cos_std::style::Display::InlineFlex
+                                    | w3cos_std::style::Display::InlineTable
+                            ) || matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
+                            {
+                                child.style.flex_shrink = 0.0;
+                            }
+                        }
                     }
                     let has_negative_horizontal_margin = children.iter().any(|child| {
                         let is_negative = |spacing| {
@@ -5583,6 +5608,9 @@ fn inherit_text_style(
     }
     if !declares("direction") {
         style.direction = parent.direction;
+    }
+    if !declares("visibility") {
+        style.visibility = parent.visibility;
     }
 }
 
@@ -10287,6 +10315,32 @@ mod computed_style_cache_tests {
         assert_eq!(
             document.computed_style_for(child.id).unicode_bidi,
             w3cos_std::style::UnicodeBidi::BidiOverride
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn visibility_inherits_but_an_explicit_visible_descendant_overrides_it() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("visibility", "hidden")]);
+        crate::stylesheet::register_rule("#visible", &[("visibility", "visible")]);
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let inherited = document.create_element("span");
+        let visible = document.create_element("span");
+        visible.set_attribute(&mut document, "id", "visible");
+        parent.append_child(&mut document, inherited);
+        parent.append_child(&mut document, visible);
+        document.body().append_child(&mut document, parent);
+
+        assert_eq!(
+            document.computed_style_for(inherited.id).visibility,
+            w3cos_std::style::Visibility::Hidden
+        );
+        assert_eq!(
+            document.computed_style_for(visible.id).visibility,
+            w3cos_std::style::Visibility::Visible
         );
         crate::stylesheet::clear_rules();
     }

@@ -419,6 +419,16 @@ pub(crate) fn dimensions(src: &str) -> Option<(u32, u32)> {
     })
 }
 
+pub(crate) fn svg_intrinsic_size(src: &str) -> Option<SvgIntrinsicSize> {
+    CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(src)
+            .and_then(Option::as_ref)
+            .and_then(|image| image.svg_intrinsic_size)
+    })
+}
+
 /// Whether the Browser loader owns this source but has no decoded intrinsic
 /// dimensions yet. This covers both an in-flight request and a terminally
 /// broken image, neither of which should fall back to the legacy 200x200
