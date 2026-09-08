@@ -2339,13 +2339,27 @@ impl Document {
                     NodeType::Element => {
                         let child_style =
                             self.computed_style(*child_id, &child_ancestors, Some(parent_style));
+                        if child_style.display == Display::None {
+                            return None;
+                        }
                         let mut participates = matches!(
                             child_style.display,
                             Display::Inline
                                 | Display::InlineBlock
                                 | Display::InlineFlex
                                 | Display::InlineTable
-                        );
+                        ) || (parent_style.display == Display::Inline
+                            && matches!(
+                                child_style.display,
+                                Display::TableCell
+                                    | Display::TableCaption
+                                    | Display::TableRow
+                                    | Display::TableRowGroup
+                                    | Display::TableHeaderGroup
+                                    | Display::TableFooterGroup
+                                    | Display::TableColumn
+                                    | Display::TableColumnGroup
+                            ));
                         if child_style.display == Display::Inline {
                             let mut grandchild_ancestors = child_ancestors.clone();
                             grandchild_ancestors.push(self.selector_context(*child_id));
@@ -2421,14 +2435,34 @@ impl Document {
             let sibling = self.get_node(sibling_id);
             match sibling.node_type {
                 NodeType::Text => Some(true),
-                NodeType::Element => Some(matches!(
-                    self.computed_style(sibling_id, ancestors, Some(parent_style))
-                        .display,
-                    Display::Inline
-                        | Display::InlineBlock
-                        | Display::InlineFlex
-                        | Display::InlineTable
-                )),
+                NodeType::Element => {
+                    let display = self
+                        .computed_style(sibling_id, ancestors, Some(parent_style))
+                        .display;
+                    if display == Display::None {
+                        return None;
+                    }
+                    Some(
+                        matches!(
+                            display,
+                            Display::Inline
+                                | Display::InlineBlock
+                                | Display::InlineFlex
+                                | Display::InlineTable
+                        ) || (parent_style.display == Display::Inline
+                            && matches!(
+                                display,
+                                Display::TableCell
+                                    | Display::TableCaption
+                                    | Display::TableRow
+                                    | Display::TableRowGroup
+                                    | Display::TableHeaderGroup
+                                    | Display::TableFooterGroup
+                                    | Display::TableColumn
+                                    | Display::TableColumnGroup
+                            )),
+                    )
+                }
                 _ => None,
             }
         };
@@ -2690,7 +2724,46 @@ impl Document {
         let mut style = self.computed_style(id, ancestors, inherited);
         let tag = node.tag.as_str();
         self.apply_svg_presentation_style(id, &tag, &mut style);
+        if let Some(source) = style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-border-spacing-source"))
+        {
+            let resolve = |token: &str| {
+                let token = token.trim().to_ascii_lowercase();
+                let value = if let Some(value) = token.strip_suffix("px") {
+                    value.parse::<f32>().ok()
+                } else if let Some(value) = token.strip_suffix("rem") {
+                    value.parse::<f32>().ok().map(|value| value * 16.0)
+                } else if let Some(value) = token.strip_suffix("em") {
+                    value
+                        .parse::<f32>()
+                        .ok()
+                        .map(|value| value * style.font_size)
+                } else if token == "0" {
+                    Some(0.0)
+                } else {
+                    None
+                };
+                value.filter(|value| value.is_finite() && *value >= 0.0)
+            };
+            let values = source
+                .split_ascii_whitespace()
+                .filter_map(resolve)
+                .collect::<Vec<_>>();
+            if let Some(x) = values.first().copied() {
+                style.border_spacing_x = x;
+                style.border_spacing_y = values.get(1).copied().unwrap_or(x);
+            }
+        }
         if tag.as_str() == "table" {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "--w3cos-internal-html-table-element".to_string(),
+                    "1".to_string(),
+                );
             let author_declares_border_spacing = self.styles[id.0 as usize]
                 .inline_declarations
                 .iter()
@@ -2713,6 +2786,21 @@ impl Document {
             }
         }
         if matches!(tag.as_str(), "td" | "th") {
+            if let Some(column_span) = node
+                .attributes
+                .iter()
+                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("colspan"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .filter(|span| *span > 1)
+            {
+                style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-table-column-span".to_string(),
+                        column_span.min(1000).to_string(),
+                    );
+            }
             let author_declares_padding = self.styles[id.0 as usize]
                 .inline_declarations
                 .iter()
@@ -3969,6 +4057,21 @@ impl Document {
                             })
                             .unwrap_or("");
                         let mut image_style = style;
+                        if image_style.display == w3cos_std::style::Display::TableCell {
+                            // CSS table-internal display values do not turn a
+                            // replaced element into a real table cell. Its
+                            // used value remains inline-level, and table fixup
+                            // wraps it together with adjacent inline content
+                            // in an anonymous cell.
+                            image_style.display = w3cos_std::style::Display::InlineBlock;
+                            image_style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(
+                                    "--w3cos-internal-replaced-table-cell".to_string(),
+                                    "1".to_string(),
+                                );
+                        }
                         if matches!(image_style.width, w3cos_std::style::Dimension::Auto)
                             && let Some(width) = node
                                 .attributes
@@ -5950,6 +6053,27 @@ fn equivalent_text_style(left: &w3cos_std::style::Style, right: &w3cos_std::styl
     left == right
 }
 
+fn equivalent_text_paint_style(
+    left: &w3cos_std::style::Style,
+    right: &w3cos_std::style::Style,
+) -> bool {
+    left.color == right.color
+        && left.font_size == right.font_size
+        && left.font_weight == right.font_weight
+        && left.font_family == right.font_family
+        && left.font_style == right.font_style
+        && left.white_space == right.white_space
+        && left.line_height == right.line_height
+        && left.letter_spacing == right.letter_spacing
+        && left.word_spacing == right.word_spacing
+        && left.text_decoration == right.text_decoration
+        && left.text_overflow == right.text_overflow
+        && left.word_break == right.word_break
+        && left.direction == right.direction
+        && left.unicode_bidi == right.unicode_bidi
+        && left.visibility == right.visibility
+}
+
 fn generated_display_creates_box(display: w3cos_std::style::Display) -> bool {
     !matches!(
         display,
@@ -6540,6 +6664,127 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     true
 }
 
+fn plain_anonymous_inline_table_text(
+    component: &w3cos_std::Component,
+) -> Option<w3cos_std::Component> {
+    use w3cos_std::component::ComponentKind;
+    use w3cos_std::style::{Dimension, Display, Edges, Position};
+
+    fn passive_host(action: &w3cos_std::EventAction) -> bool {
+        matches!(
+            action,
+            w3cos_std::EventAction::None
+                | w3cos_std::EventAction::NativeHost {
+                    click: false,
+                    scroll: false,
+                    input: false,
+                    focus: false,
+                    keyboard: false,
+                    submit: false,
+                    wheel: false,
+                    ..
+                }
+        )
+    }
+    fn collect(
+        component: &w3cos_std::Component,
+        content: &mut String,
+        text_style: &mut Option<w3cos_std::style::Style>,
+    ) -> bool {
+        if component.style.display == Display::None {
+            return true;
+        }
+        if let ComponentKind::Text { content: text } = &component.kind {
+            if !component.children.is_empty() {
+                return false;
+            }
+            if text.is_empty() {
+                return true;
+            }
+            if let Some(style) = text_style.as_ref()
+                && !equivalent_text_paint_style(style, &component.style)
+            {
+                let mut normalized_style = style.clone();
+                let mut normalized_component_style = component.style.clone();
+                normalized_style.white_space = w3cos_std::style::WhiteSpace::Normal;
+                normalized_component_style.white_space = w3cos_std::style::WhiteSpace::Normal;
+                if !equivalent_text_paint_style(&normalized_style, &normalized_component_style) {
+                    return false;
+                }
+            }
+            text_style.get_or_insert_with(|| component.style.clone());
+            content.push_str(text);
+            return true;
+        }
+        if !matches!(component.kind, ComponentKind::Row | ComponentKind::Box)
+            || !passive_host(&component.on_click)
+            || component.style.position != Position::Static
+            || component.style.background.a != 0
+            || component.style.background_image.is_some()
+            || component.style.border_width != 0.0
+            || component
+                .style
+                .border_top_width
+                .is_some_and(|width| width != 0.0)
+            || component
+                .style
+                .border_right_width
+                .is_some_and(|width| width != 0.0)
+            || component
+                .style
+                .border_bottom_width
+                .is_some_and(|width| width != 0.0)
+            || component
+                .style
+                .border_left_width
+                .is_some_and(|width| width != 0.0)
+            || component.style.padding != Edges::ZERO
+            || component.style.margin != Edges::ZERO
+            || component.style.width != Dimension::Auto
+            || component.style.height != Dimension::Auto
+            || component.style.gap != 0.0
+            || component.style.border_spacing_x != 0.0
+            || component.style.border_spacing_y != 0.0
+        {
+            return false;
+        }
+        component
+            .children
+            .iter()
+            .all(|child| collect(child, content, text_style))
+    }
+
+    if !matches!(component.style.display, Display::Table | Display::InlineTable)
+        || component
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-anonymous-table"))
+            .is_none_or(|value| value != "1")
+        || component.children.len() != 1
+        || component.children[0].style.display != Display::TableRow
+        || component.children[0].children.is_empty()
+        || component.children[0]
+            .children
+            .iter()
+            .any(|child| child.style.display != Display::TableCell)
+    {
+        return None;
+    }
+    let mut content = String::new();
+    let mut style = None;
+    if !collect(component, &mut content, &mut style) {
+        return None;
+    }
+    let mut style = style?;
+    if collapse_css_whitespace(&content, true, true) != content {
+        return None;
+    }
+    style.display = Display::Inline;
+    style.white_space = w3cos_std::style::WhiteSpace::Normal;
+    Some(w3cos_std::Component::text(content, style))
+}
+
 fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
     use w3cos_std::component::ComponentKind;
 
@@ -6560,8 +6805,33 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
         )
     };
     let children = std::mem::take(&mut component.children);
+    let child_displays = children
+        .iter()
+        .map(|child| child.style.display)
+        .collect::<Vec<_>>();
     let mut coalesced: Vec<w3cos_std::Component> = Vec::with_capacity(children.len());
-    for mut fragment in children {
+    for (index, mut fragment) in children.into_iter().enumerate() {
+        if fragment.style.display == w3cos_std::style::Display::None {
+            continue;
+        }
+        let anonymous_block_table = fragment.style.display == w3cos_std::style::Display::Table;
+        if let Some(mut text) = plain_anonymous_inline_table_text(&fragment) {
+            if anonymous_block_table {
+                let has_previous = !coalesced.is_empty();
+                let has_following = child_displays[index + 1..]
+                    .iter()
+                    .any(|display| *display != w3cos_std::style::Display::None);
+                if let ComponentKind::Text { content } = &mut text.kind {
+                    if has_previous {
+                        content.insert_str(0, "\u{2028} ");
+                    }
+                    if has_following {
+                        content.push('\u{2028}');
+                    }
+                }
+            }
+            fragment = text;
+        }
         loop {
             let painted_wrapper_matches_text = fragment.children.first().is_some_and(|child| {
                 equivalent_text_style(&fragment.style, &child.style)
@@ -6583,7 +6853,27 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             fragment = fragment.children.remove(0);
         }
         let merged = coalesced.last_mut().is_some_and(|previous| {
-            if !equivalent_text_style(&previous.style, &fragment.style)
+            let is_inline_text = |display| {
+                matches!(
+                    display,
+                    w3cos_std::style::Display::Inline
+                        | w3cos_std::style::Display::InlineBlock
+                        | w3cos_std::style::Display::InlineFlex
+                        | w3cos_std::style::Display::InlineTable
+                    )
+            };
+            let transparent_text_styles_match =
+                principal_box_can_merge_generated_inline_text(&previous.style)
+                    && principal_box_can_merge_generated_inline_text(&fragment.style)
+                    && previous.style.position == w3cos_std::style::Position::Static
+                    && fragment.style.position == w3cos_std::style::Position::Static
+                    && previous.style.float == w3cos_std::style::Float::None
+                    && fragment.style.float == w3cos_std::style::Float::None
+                    && equivalent_text_paint_style(&previous.style, &fragment.style);
+            if !is_inline_text(previous.style.display)
+                || !is_inline_text(fragment.style.display)
+                || (!equivalent_text_style(&previous.style, &fragment.style)
+                    && !transparent_text_styles_match)
                 || !passive_host(&previous.on_click)
                 || !passive_host(&fragment.on_click)
                 || !(principal_box_can_merge_generated_inline_text(&previous.style)
@@ -7153,19 +7443,134 @@ fn anonymous_table_wrapper(
             grid_children.push(child);
         }
     }
-    if !grid_children.is_empty() {
-        top_captions.push(table_row_from_misparented_children(
-            parent_style,
-            grid_children,
-            (table_height > 0.0).then_some(table_height),
-        ));
-    }
-    top_captions.extend(bottom_captions);
-    let mut table_style = anonymous_table_style(w3cos_std::style::Display::Table, parent_style);
+    grid_children.sort_by_key(|child| match child.style.display {
+        w3cos_std::style::Display::TableColumnGroup
+        | w3cos_std::style::Display::TableColumn => 0,
+        w3cos_std::style::Display::TableHeaderGroup => 1,
+        w3cos_std::style::Display::TableFooterGroup => 3,
+        _ => 2,
+    });
+    let anonymous_display = if matches!(
+        parent_style.display,
+        w3cos_std::style::Display::Inline
+            | w3cos_std::style::Display::InlineBlock
+            | w3cos_std::style::Display::InlineFlex
+    ) {
+        w3cos_std::style::Display::InlineTable
+    } else {
+        w3cos_std::style::Display::Table
+    };
+    let mut table_style = anonymous_table_style(anonymous_display, parent_style);
+    table_style
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-anonymous-table".to_string(),
+            "1".to_string(),
+        );
     if table_height > 0.0 {
         table_style.height = w3cos_std::style::Dimension::Px(table_height);
     }
+    if !grid_children.is_empty() {
+        if grid_children.iter().all(|child| {
+            child.style.display == w3cos_std::style::Display::TableCell
+        }) {
+            coalesce_plain_anonymous_table_cell_text(&mut grid_children);
+            top_captions.push(table_row_from_misparented_children(
+                parent_style,
+                grid_children,
+                (table_height > 0.0).then_some(table_height),
+            ));
+        } else {
+            top_captions.extend(fixup_css_table_children(&table_style, grid_children));
+        }
+    }
+    top_captions.extend(bottom_captions);
     w3cos_std::Component::boxed(table_style, top_captions)
+}
+
+fn coalesce_plain_anonymous_table_cell_text(cells: &mut [w3cos_std::Component]) {
+    use w3cos_std::style::{Dimension, Display, Edges, WhiteSpace};
+
+    let direct_text = |cell: &w3cos_std::Component| {
+        cell.children.is_empty()
+            && matches!(cell.kind, w3cos_std::ComponentKind::Text { .. })
+    };
+    let child_text = |cell: &w3cos_std::Component| {
+        cell.children.len() == 1
+            && cell.children[0].children.is_empty()
+            && matches!(cell.children[0].kind, w3cos_std::ComponentKind::Text { .. })
+    };
+    if cells.len() < 2
+        || cells.iter().any(|cell| {
+            cell.style.display != Display::TableCell
+                || cell.style.background.a != 0
+                || cell.style.background_image.is_some()
+                || cell.style.border_width != 0.0
+                || cell.style.border_top_width.is_some_and(|width| width != 0.0)
+                || cell.style.border_right_width.is_some_and(|width| width != 0.0)
+                || cell.style.border_bottom_width.is_some_and(|width| width != 0.0)
+                || cell.style.border_left_width.is_some_and(|width| width != 0.0)
+                || cell.style.padding != Edges::ZERO
+                || cell.style.margin != Edges::ZERO
+                || cell.style.width != Dimension::Auto
+                || cell.style.height != Dimension::Auto
+                || (!direct_text(cell) && !child_text(cell))
+        })
+        || cells
+            .iter()
+            .skip(1)
+            .any(|cell| direct_text(cell) != direct_text(&cells[0]))
+    {
+        return;
+    }
+
+    let normalized_text_style = |cell: &w3cos_std::Component| {
+        let mut style = if direct_text(cell) {
+            cell.style.clone()
+        } else {
+            cell.children[0].style.clone()
+        };
+        style.white_space = WhiteSpace::Normal;
+        style
+    };
+    let first_style = normalized_text_style(&cells[0]);
+    if cells
+        .iter()
+        .skip(1)
+        .any(|cell| normalized_text_style(cell) != first_style)
+    {
+        return;
+    }
+
+    let content = cells
+        .iter()
+        .filter_map(|cell| match if direct_text(cell) {
+            &cell.kind
+        } else {
+            &cell.children[0].kind
+        } {
+            w3cos_std::ComponentKind::Text { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    if direct_text(&cells[0]) {
+        cells[0].kind = w3cos_std::ComponentKind::Text { content };
+        cells[0].style.white_space = WhiteSpace::Normal;
+        for cell in &mut cells[1..] {
+            cell.kind = w3cos_std::ComponentKind::Text {
+                content: String::new(),
+            };
+        }
+    } else {
+        cells[0].children[0].kind = w3cos_std::ComponentKind::Text { content };
+        cells[0].children[0].style.white_space = WhiteSpace::Normal;
+        for cell in &mut cells[1..] {
+            cell.children[0].kind = w3cos_std::ComponentKind::Text {
+                content: String::new(),
+            };
+        }
+    }
 }
 
 fn fixup_css_table_children(
@@ -7179,15 +7584,51 @@ fn fixup_css_table_children(
             let mut cells = Vec::new();
             let mut anonymous_children = Vec::new();
             let mut anonymous_run_started = false;
+            let mut pending_whitespace = None;
 
             for child in children {
+                let starts_replaced_cell_run = child
+                    .style
+                    .custom_properties
+                    .as_ref()
+                    .and_then(|properties| {
+                        properties.get("--w3cos-internal-replaced-table-cell")
+                    })
+                    .is_some_and(|value| value == "1")
+                    && anonymous_run_started
+                    && !anonymous_children.is_empty()
+                    && anonymous_children.iter().all(collapsible_generated_whitespace);
+                if starts_replaced_cell_run {
+                    cells.push(anonymous_table_cell_from_children(
+                        parent_style,
+                        Vec::new(),
+                    ));
+                    pending_whitespace = None;
+                }
                 if child.style.display == Display::TableCell {
                     if anonymous_run_started {
+                        let follows_replaced_cell_run = anonymous_children.iter().any(|component| {
+                            component
+                                .style
+                                .custom_properties
+                                .as_ref()
+                                .and_then(|properties| {
+                                    properties.get("--w3cos-internal-replaced-table-cell")
+                                })
+                                .is_some_and(|value| value == "1")
+                        });
                         cells.push(anonymous_table_cell_from_children(
                             parent_style,
                             std::mem::take(&mut anonymous_children),
                         ));
+                        if follows_replaced_cell_run {
+                            cells.push(anonymous_table_cell_from_children(
+                                parent_style,
+                                Vec::new(),
+                            ));
+                        }
                         anonymous_run_started = false;
+                        pending_whitespace = None;
                     }
                     cells.push(child);
                     continue;
@@ -7199,9 +7640,27 @@ fn fixup_css_table_children(
                 // column sizing and inline baselines. Whitespace-only runs
                 // still establish a cell, but collapse inside it.
                 anonymous_run_started = true;
-                if !collapsible_generated_whitespace(&child) {
-                    anonymous_children.push(child);
+                if collapsible_generated_whitespace(&child) {
+                    if matches!(
+                        parent_style.white_space,
+                        w3cos_std::style::WhiteSpace::Pre
+                            | w3cos_std::style::WhiteSpace::PreWrap
+                    ) {
+                        anonymous_children.push(child);
+                        continue;
+                    }
+                    if !anonymous_children.is_empty() {
+                        pending_whitespace = Some(child);
+                    }
+                    continue;
                 }
+                if let Some(mut whitespace) = pending_whitespace.take() {
+                    whitespace.kind = w3cos_std::ComponentKind::Text {
+                        content: " ".to_string(),
+                    };
+                    anonymous_children.push(whitespace);
+                }
+                anonymous_children.push(child);
             }
 
             if anonymous_run_started {
@@ -7212,33 +7671,109 @@ fn fixup_css_table_children(
             }
             cells
         }
-        Display::Table | Display::InlineTable
-            if !children.is_empty()
-                && children
-                    .iter()
-                    .all(|child| child.style.display == Display::TableCell) =>
-        {
+        Display::Table | Display::InlineTable => {
             let containing_height = specified_table_cell_height(parent_style);
-            vec![anonymous_table_row(
-                parent_style,
-                children,
-                containing_height,
-            )]
-        }
-        _ => {
-            // A run made entirely from misparented cells establishes one
-            // anonymous table. Mixed inline/table-internal runs still need a
-            // full whitespace-aware table fixup; leave those unchanged until
-            // they can be grouped without perturbing their inline baselines.
-            if !children.is_empty()
-                && children.iter().all(|child| {
-                    matches!(child.style.display, Display::TableCell | Display::TableCaption)
-                })
-            {
-                vec![anonymous_table_wrapper(parent_style, children)]
-            } else {
-                children
+            let mut fixed = Vec::with_capacity(children.len());
+            let mut cells = Vec::new();
+            let flush_cells = |fixed: &mut Vec<w3cos_std::Component>,
+                               cells: &mut Vec<w3cos_std::Component>| {
+                if !cells.is_empty() {
+                    fixed.push(anonymous_table_row(
+                        parent_style,
+                        std::mem::take(cells),
+                        containing_height,
+                    ));
+                }
+            };
+            for child in children {
+                if child.style.display == Display::TableCell {
+                    cells.push(child);
+                } else {
+                    flush_cells(&mut fixed, &mut cells);
+                    fixed.push(child);
+                }
             }
+            flush_cells(&mut fixed, &mut cells);
+            fixed
+        }
+        Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => {
+            let mut fixed = Vec::with_capacity(children.len());
+            let mut improper = Vec::new();
+            let flush_improper = |fixed: &mut Vec<w3cos_std::Component>,
+                                  improper: &mut Vec<w3cos_std::Component>| {
+                if !improper.is_empty() {
+                    fixed.push(table_row_from_misparented_children(
+                        parent_style,
+                        std::mem::take(improper),
+                        None,
+                    ));
+                }
+            };
+            for child in children {
+                if child.style.display == Display::TableRow {
+                    flush_improper(&mut fixed, &mut improper);
+                    fixed.push(child);
+                } else {
+                    improper.push(child);
+                }
+            }
+            flush_improper(&mut fixed, &mut improper);
+            fixed
+        }
+        Display::TableColumnGroup => children,
+        _ => {
+            let is_table_internal = |display| {
+                matches!(
+                    display,
+                    Display::TableCell
+                        | Display::TableCaption
+                        | Display::TableRow
+                        | Display::TableRowGroup
+                        | Display::TableHeaderGroup
+                        | Display::TableFooterGroup
+                        | Display::TableColumn
+                        | Display::TableColumnGroup
+                )
+            };
+            let mut fixed = Vec::with_capacity(children.len());
+            let mut table_run = Vec::new();
+            let flush_table_run = |fixed: &mut Vec<w3cos_std::Component>,
+                                   table_run: &mut Vec<w3cos_std::Component>| {
+                if !table_run.is_empty() {
+                    fixed.push(anonymous_table_wrapper(
+                        parent_style,
+                        std::mem::take(table_run),
+                    ));
+                }
+            };
+            let table_internal = children
+                .iter()
+                .map(|child| is_table_internal(child.style.display))
+                .collect::<Vec<_>>();
+            for (index, child) in children.into_iter().enumerate() {
+                let table_fixup_whitespace = matches!(
+                    &child.kind,
+                    w3cos_std::ComponentKind::Text { content }
+                        if is_only_css_whitespace(content)
+                ) && child.children.is_empty()
+                    && child.style.display == Display::Inline;
+                if table_fixup_whitespace
+                    && index > 0
+                    && index + 1 < table_internal.len()
+                    && table_internal[index - 1]
+                    && table_internal[index + 1]
+                {
+                    continue;
+                }
+                if is_table_internal(child.style.display) {
+                    table_run.push(child);
+                } else {
+                    flush_table_run(&mut fixed, &mut table_run);
+                    fixed.push(child);
+                }
+            }
+            flush_table_run(&mut fixed, &mut table_run);
+            fixed
         }
     }
 }
@@ -8022,6 +8557,240 @@ mod image_component_tests {
     }
 
     #[test]
+    fn table_cell_text_is_not_coalesced_across_column_boundaries() {
+        let cell = |content| {
+            w3cos_std::Component::text(
+                content,
+                w3cos_std::style::Style {
+                    display: Display::TableCell,
+                    ..w3cos_std::style::Style::default()
+                },
+            )
+        };
+        let mut row = w3cos_std::Component::row(
+            w3cos_std::style::Style {
+                display: Display::TableRow,
+                ..w3cos_std::style::Style::default()
+            },
+            vec![cell("one"), cell("two"), cell("three")],
+        );
+
+        coalesce_passive_inline_text_children(&mut row);
+
+        assert_eq!(row.children.len(), 3);
+    }
+
+    #[test]
+    fn table_infers_a_row_for_leading_cells_before_a_row_group() {
+        let cell = || {
+            w3cos_std::Component::boxed(
+                w3cos_std::style::Style {
+                    display: Display::TableCell,
+                    ..w3cos_std::style::Style::default()
+                },
+                vec![],
+            )
+        };
+        let row_group = w3cos_std::Component::row(
+            w3cos_std::style::Style {
+                display: Display::TableRowGroup,
+                ..w3cos_std::style::Style::default()
+            },
+            vec![],
+        );
+        let table_style = w3cos_std::style::Style {
+            display: Display::Table,
+            ..w3cos_std::style::Style::default()
+        };
+
+        let fixed = fixup_css_table_children(
+            &table_style,
+            vec![cell(), cell(), cell(), row_group],
+        );
+
+        assert_eq!(fixed.len(), 2);
+        assert_eq!(fixed[0].style.display, Display::TableRow);
+        assert_eq!(fixed[0].children.len(), 3);
+        assert_eq!(fixed[1].style.display, Display::TableRowGroup);
+    }
+
+    #[test]
+    fn anonymous_table_wraps_leading_cells_and_existing_row_group_together() {
+        let cell = || {
+            w3cos_std::Component::boxed(
+                w3cos_std::style::Style {
+                    display: Display::TableCell,
+                    ..w3cos_std::style::Style::default()
+                },
+                vec![],
+            )
+        };
+        let row_group = w3cos_std::Component::row(
+            w3cos_std::style::Style {
+                display: Display::TableRowGroup,
+                ..w3cos_std::style::Style::default()
+            },
+            vec![],
+        );
+
+        let table = anonymous_table_wrapper(
+            &w3cos_std::style::Style::default(),
+            vec![cell(), cell(), cell(), row_group],
+        );
+
+        assert_eq!(table.style.display, Display::Table);
+        assert_eq!(table.children.len(), 2);
+        assert_eq!(table.children[0].style.display, Display::TableRow);
+        assert_eq!(table.children[0].children.len(), 3);
+        assert_eq!(table.children[1].style.display, Display::TableRowGroup);
+    }
+
+    #[test]
+    fn table_row_group_keeps_authored_rows_without_a_nested_table() {
+        let row = || {
+            w3cos_std::Component::row(
+                w3cos_std::style::Style {
+                    display: Display::TableRow,
+                    ..w3cos_std::style::Style::default()
+                },
+                vec![],
+            )
+        };
+        let group_style = w3cos_std::style::Style {
+            display: Display::TableRowGroup,
+            ..w3cos_std::style::Style::default()
+        };
+
+        let fixed = fixup_css_table_children(&group_style, vec![row(), row()]);
+
+        assert_eq!(fixed.len(), 2);
+        assert!(
+            fixed
+                .iter()
+                .all(|child| child.style.display == Display::TableRow)
+        );
+    }
+
+    #[test]
+    fn table_row_group_wraps_one_improper_child_run_in_one_row() {
+        let component = |display| {
+            w3cos_std::Component::boxed(
+                w3cos_std::style::Style {
+                    display,
+                    ..w3cos_std::style::Style::default()
+                },
+                vec![],
+            )
+        };
+        let group_style = w3cos_std::style::Style {
+            display: Display::TableRowGroup,
+            ..w3cos_std::style::Style::default()
+        };
+
+        let fixed = fixup_css_table_children(
+            &group_style,
+            vec![
+                component(Display::TableCell),
+                component(Display::Block),
+                component(Display::TableCell),
+            ],
+        );
+
+        assert_eq!(fixed.len(), 1);
+        assert_eq!(fixed[0].style.display, Display::TableRow);
+        assert_eq!(fixed[0].children.len(), 3);
+        assert!(
+            fixed[0]
+                .children
+                .iter()
+                .all(|child| child.style.display == Display::TableCell)
+        );
+    }
+
+    #[test]
+    fn anonymous_cell_preserves_one_internal_collapsed_space_between_inline_boxes() {
+        let text = |content: &str| {
+            w3cos_std::Component::text(
+                content,
+                w3cos_std::style::Style {
+                    display: Display::Inline,
+                    ..w3cos_std::style::Style::default()
+                },
+            )
+        };
+        let row_style = w3cos_std::style::Style {
+            display: Display::TableRow,
+            ..w3cos_std::style::Style::default()
+        };
+
+        let fixed = fixup_css_table_children(
+            &row_style,
+            vec![text("Row 1,"), text("\n  "), text("Col 1")],
+        );
+
+        assert_eq!(fixed.len(), 1);
+        let line = &fixed[0].children[0];
+        assert!(matches!(
+            &line.children[1].kind,
+            ComponentKind::Text { content } if content == " "
+        ));
+    }
+
+    #[test]
+    fn anonymous_table_orders_header_body_and_footer_groups() {
+        let group = |display| {
+            w3cos_std::Component::row(
+                w3cos_std::style::Style {
+                    display,
+                    ..w3cos_std::style::Style::default()
+                },
+                vec![],
+            )
+        };
+        let table = anonymous_table_wrapper(
+            &w3cos_std::style::Style::default(),
+            vec![
+                group(Display::TableRowGroup),
+                group(Display::TableFooterGroup),
+                group(Display::TableHeaderGroup),
+            ],
+        );
+
+        assert_eq!(table.children[0].style.display, Display::TableHeaderGroup);
+        assert_eq!(table.children[1].style.display, Display::TableRowGroup);
+        assert_eq!(table.children[2].style.display, Display::TableFooterGroup);
+    }
+
+    #[test]
+    fn block_child_splits_adjacent_anonymous_table_runs() {
+        let component = |display| {
+            w3cos_std::Component::boxed(
+                w3cos_std::style::Style {
+                    display,
+                    ..w3cos_std::style::Style::default()
+                },
+                vec![],
+            )
+        };
+        let fixed = fixup_css_table_children(
+            &w3cos_std::style::Style {
+                display: Display::Block,
+                ..w3cos_std::style::Style::default()
+            },
+            vec![
+                component(Display::TableRow),
+                component(Display::Block),
+                component(Display::TableRow),
+            ],
+        );
+
+        assert_eq!(fixed.len(), 3);
+        assert_eq!(fixed[0].style.display, Display::Table);
+        assert_eq!(fixed[1].style.display, Display::Block);
+        assert_eq!(fixed[2].style.display, Display::Table);
+    }
+
+    #[test]
     fn anonymous_table_wrapper_orders_captions_around_its_grid() {
         let parent_style = w3cos_std::style::Style::default();
         let bottom_style = w3cos_std::style::Style {
@@ -8136,6 +8905,439 @@ mod image_component_tests {
         let tree = document.to_component_tree();
         assert_eq!(tree.children[0].style.border_spacing_x, 7.0);
         assert_eq!(tree.children[0].style.border_spacing_y, 7.0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn border_spacing_em_resolves_against_final_computed_font_size() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#table",
+            &[
+                ("display", "table"),
+                ("border-spacing", "1em"),
+                ("font-size", "20px"),
+            ],
+        );
+        let mut document = Document::new();
+        let table = document.create_element("div");
+        table.set_attribute(&mut document, "id", "table");
+        document.body().append_child(&mut document, table);
+
+        let tree = document.to_component_tree();
+        assert_eq!(tree.children[0].style.border_spacing_x, 20.0);
+        assert_eq!(tree.children[0].style.border_spacing_y, 20.0);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn plain_anonymous_table_cells_share_one_text_shaping_run() {
+        let cell = |content: &str, white_space| {
+            let mut text_style = w3cos_std::style::Style::default();
+            text_style.display = Display::Inline;
+            text_style.white_space = white_space;
+            w3cos_std::Component::boxed(
+                w3cos_std::style::Style {
+                    display: Display::TableCell,
+                    ..w3cos_std::style::Style::default()
+                },
+                vec![w3cos_std::Component::text(content, text_style)],
+            )
+        };
+        let mut cells = vec![
+            cell("a", w3cos_std::style::WhiteSpace::Normal),
+            cell(" ", w3cos_std::style::WhiteSpace::Pre),
+            cell("bc", w3cos_std::style::WhiteSpace::Normal),
+            cell(" ", w3cos_std::style::WhiteSpace::Pre),
+            cell("d", w3cos_std::style::WhiteSpace::Normal),
+        ];
+
+        coalesce_plain_anonymous_table_cell_text(&mut cells);
+
+        assert!(matches!(
+            &cells[0].children[0].kind,
+            ComponentKind::Text { content } if content == "a bc d"
+        ));
+        assert!(cells[1..].iter().all(|cell| matches!(
+            &cell.children[0].kind,
+            ComponentKind::Text { content } if content.is_empty()
+        )));
+    }
+
+    #[test]
+    fn optimized_text_table_cells_share_one_text_shaping_run() {
+        let cell = |content: &str, white_space| {
+            let mut style = w3cos_std::style::Style {
+                display: Display::TableCell,
+                ..w3cos_std::style::Style::default()
+            };
+            style.white_space = white_space;
+            w3cos_std::Component::text(content, style)
+        };
+        let mut cells = vec![
+            cell("a", w3cos_std::style::WhiteSpace::Normal),
+            cell(" ", w3cos_std::style::WhiteSpace::Pre),
+            cell("bc", w3cos_std::style::WhiteSpace::Normal),
+            cell(" ", w3cos_std::style::WhiteSpace::Pre),
+            cell("d", w3cos_std::style::WhiteSpace::Normal),
+        ];
+
+        coalesce_plain_anonymous_table_cell_text(&mut cells);
+
+        assert!(matches!(
+            &cells[0].kind,
+            ComponentKind::Text { content } if content == "a bc d"
+        ));
+        assert!(cells[1..].iter().all(|cell| matches!(
+            &cell.kind,
+            ComponentKind::Text { content } if content.is_empty()
+        )));
+    }
+
+    #[test]
+    fn dynamically_inserted_anonymous_table_cell_joins_the_text_shaping_run() {
+        let mut document = Document::new();
+        let host = document.create_element("span");
+        host.set_attribute(&mut document, "style", "display: block");
+        let append_cell = |document: &mut Document,
+                           host: Element,
+                           content: &str,
+                           preserve_space: bool|
+         -> Element {
+            let cell = document.create_element("span");
+            cell.set_attribute(
+                document,
+                "style",
+                if preserve_space {
+                    "display: table-cell; white-space: pre"
+                } else {
+                    "display: table-cell"
+                },
+            );
+            cell.set_text_content(document, content);
+            host.append_child(document, cell);
+            cell
+        };
+        append_cell(&mut document, host, "a", false);
+        append_cell(&mut document, host, " ", true);
+        let insertion_point = append_cell(&mut document, host, " ", true);
+        append_cell(&mut document, host, "d", false);
+        let inserted = document.create_element("span");
+        inserted.set_attribute(&mut document, "style", "display: table-cell");
+        inserted.set_text_content(&mut document, "bc");
+        host.insert_before(&mut document, inserted, insertion_point);
+        document.body().append_child(&mut document, host);
+
+        fn collect_text(component: &w3cos_std::Component, output: &mut Vec<String>) {
+            if let ComponentKind::Text { content } = &component.kind
+                && !content.is_empty()
+            {
+                output.push(content.clone());
+            }
+            for child in &component.children {
+                collect_text(child, output);
+            }
+        }
+        let tree = document.to_component_tree();
+        let mut text_runs = Vec::new();
+        collect_text(&tree, &mut text_runs);
+        assert_eq!(text_runs, ["a bc d"]);
+    }
+
+    #[test]
+    fn inline_anonymous_table_run_preserves_collapsed_spaces_at_its_edges() {
+        let mut document = Document::new();
+        let host = document.create_element("span");
+        let append_span = |document: &mut Document,
+                           host: Element,
+                           content: &str,
+                           display: Option<&str>| {
+            let child = document.create_element("span");
+            if let Some(display) = display {
+                child.style_mut(document).set_property("display", display);
+            }
+            child.set_text_content(document, content);
+            host.append_child(document, child);
+        };
+        append_span(&mut document, host, "a", None);
+        let space = document.create_text_node("\n ");
+        host.append_child(&mut document, space);
+        append_span(&mut document, host, "b", Some("table-cell"));
+        let space = document.create_text_node("\n ");
+        host.append_child(&mut document, space);
+        append_span(&mut document, host, "c", Some("table-cell"));
+        let space = document.create_text_node("\n ");
+        host.append_child(&mut document, space);
+        append_span(&mut document, host, "d", None);
+        document.body().append_child(&mut document, host);
+
+        fn inspect(component: &w3cos_std::Component, text: &mut String, inline_table: &mut bool) {
+            *inline_table |= component.style.display == Display::InlineTable;
+            if let ComponentKind::Text { content } = &component.kind {
+                text.push_str(content);
+            }
+            for child in &component.children {
+                inspect(child, text, inline_table);
+            }
+        }
+        let tree = document.to_component_tree();
+        let mut text = String::new();
+        let mut inline_table = false;
+        inspect(&tree, &mut text, &mut inline_table);
+        assert_eq!(text, "a bc d");
+        assert!(!inline_table);
+    }
+
+    #[test]
+    fn block_anonymous_table_row_shares_one_text_shaping_run() {
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        let row = document.create_element("span");
+        row.set_attribute(
+            &mut document,
+            "style",
+            "display: table-row; white-space: pre",
+        );
+        let leading = document.create_element("span");
+        leading.set_attribute(&mut document, "style", "display: table-cell");
+        leading.set_text_content(&mut document, "a");
+        row.append_child(&mut document, leading);
+        let middle = document.create_text_node(" bc ");
+        row.append_child(&mut document, middle);
+        let trailing = document.create_element("span");
+        trailing.set_attribute(&mut document, "style", "display: table-cell");
+        trailing.set_text_content(&mut document, "d");
+        row.append_child(&mut document, trailing);
+        host.append_child(&mut document, row);
+        document.body().append_child(&mut document, host);
+
+        fn collect(component: &w3cos_std::Component, runs: &mut Vec<String>) {
+            if let ComponentKind::Text { content } = &component.kind
+                && !content.is_empty()
+            {
+                runs.push(content.clone());
+            }
+            for child in &component.children {
+                collect(child, runs);
+            }
+        }
+        let tree = document.to_component_tree();
+        let mut runs = Vec::new();
+        collect(&tree, &mut runs);
+        assert_eq!(runs, ["a bc d"]);
+    }
+
+    #[test]
+    fn preformatted_anonymous_cell_preserves_spaces_around_inline_content() {
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        let row = document.create_element("span");
+        row.set_attribute(
+            &mut document,
+            "style",
+            "display: table-row; white-space: pre",
+        );
+        let append = |document: &mut Document,
+                      row: Element,
+                      content: &str,
+                      display: Option<&str>| {
+            let child = document.create_element("span");
+            if let Some(display) = display {
+                child
+                    .style_mut(document)
+                    .set_property("display", display);
+            }
+            child.set_text_content(document, content);
+            row.append_child(document, child);
+        };
+        append(&mut document, row, "a", Some("table-cell"));
+        let leading_space = document.create_text_node(" ");
+        row.append_child(&mut document, leading_space);
+        append(&mut document, row, "bc", None);
+        let trailing_space = document.create_text_node(" ");
+        row.append_child(&mut document, trailing_space);
+        append(&mut document, row, "d", Some("table-cell"));
+        host.append_child(&mut document, row);
+        document.body().append_child(&mut document, host);
+
+        fn collect(component: &w3cos_std::Component, text: &mut String) {
+            if let ComponentKind::Text { content } = &component.kind {
+                text.push_str(content);
+            }
+            for child in &component.children {
+                collect(child, text);
+            }
+        }
+        let tree = document.to_component_tree();
+        let mut text = String::new();
+        collect(&tree, &mut text);
+        assert_eq!(text, "a bc d");
+    }
+
+    #[test]
+    fn hidden_script_text_is_not_revived_by_anonymous_table_flattening() {
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        let row = document.create_element("span");
+        row.set_attribute(
+            &mut document,
+            "style",
+            "display: table-row; white-space: pre",
+        );
+        let append_cell = |document: &mut Document, row: Element, content: &str| {
+            let cell = document.create_element("span");
+            cell.style_mut(document)
+                .set_property("display", "table-cell");
+            cell.set_text_content(document, content);
+            row.append_child(document, cell);
+        };
+        append_cell(&mut document, row, "a");
+        let leading_space = document.create_text_node(" ");
+        row.append_child(&mut document, leading_space);
+        let script = document.create_element("script");
+        script.set_text_content(&mut document, "document.body.offsetWidth");
+        row.append_child(&mut document, script);
+        let middle = document.create_text_node("bc");
+        row.append_child(&mut document, middle);
+        let script = document.create_element("script");
+        script.set_text_content(&mut document, "document.body.offsetWidth");
+        row.append_child(&mut document, script);
+        let trailing_space = document.create_text_node(" ");
+        row.append_child(&mut document, trailing_space);
+        append_cell(&mut document, row, "d");
+        host.append_child(&mut document, row);
+        document.body().append_child(&mut document, host);
+
+        fn collect(component: &w3cos_std::Component, text: &mut String) {
+            if component.style.display == Display::None {
+                return;
+            }
+            if let ComponentKind::Text { content } = &component.kind {
+                text.push_str(content);
+            }
+            for child in &component.children {
+                collect(child, text);
+            }
+        }
+        let tree = document.to_component_tree();
+        let mut text = String::new();
+        collect(&tree, &mut text);
+        assert_eq!(text, "abcd");
+    }
+
+    #[test]
+    fn hidden_script_does_not_split_adjacent_visible_text_runs() {
+        let mut document = Document::new();
+        let host = document.create_element("span");
+        let leading = document.create_text_node("a");
+        host.append_child(&mut document, leading);
+        let script = document.create_element("script");
+        script.set_text_content(&mut document, "document.body.offsetWidth");
+        host.append_child(&mut document, script);
+        let trailing = document.create_text_node(" b");
+        host.append_child(&mut document, trailing);
+        document.body().append_child(&mut document, host);
+
+        fn collect(component: &w3cos_std::Component, runs: &mut Vec<String>) {
+            if let ComponentKind::Text { content } = &component.kind
+                && !content.is_empty()
+            {
+                runs.push(content.clone());
+            }
+            for child in &component.children {
+                collect(child, runs);
+            }
+        }
+        let tree = document.to_component_tree();
+        let mut runs = Vec::new();
+        collect(&tree, &mut runs);
+        assert_eq!(runs, ["a b"]);
+    }
+
+    #[test]
+    fn replaced_image_cannot_establish_a_table_cell_box() {
+        let mut document = Document::new();
+        let table = document.create_element("div");
+        table.style_mut(&mut document).set_property("display", "table");
+        let row = document.create_element("div");
+        row.style_mut(&mut document)
+            .set_property("display", "table-row");
+        let image = document.create_element("img");
+        image
+            .style_mut(&mut document)
+            .set_property("display", "table-cell");
+        row.append_child(&mut document, image);
+        table.append_child(&mut document, row);
+        document.body().append_child(&mut document, table);
+
+        fn image_display(component: &w3cos_std::Component) -> Option<Display> {
+            if matches!(component.kind, ComponentKind::Image { .. }) {
+                return Some(component.style.display);
+            }
+            component.children.iter().find_map(image_display)
+        }
+        assert_eq!(
+            image_display(&document.to_component_tree()),
+            Some(Display::InlineBlock)
+        );
+    }
+
+    #[test]
+    fn block_anonymous_table_preserves_a_line_break_from_inline_siblings() {
+        let mut document = Document::new();
+        let above = document.create_text_node("above");
+        document.body().append_child(&mut document, above);
+        let cell = document.create_element("span");
+        cell.style_mut(&mut document)
+            .set_property("display", "table-cell");
+        cell.set_text_content(&mut document, "below");
+        document.body().append_child(&mut document, cell);
+
+        fn collect(component: &w3cos_std::Component, text: &mut String) {
+            if let ComponentKind::Text { content } = &component.kind {
+                text.push_str(content);
+            }
+            for child in &component.children {
+                collect(child, text);
+            }
+        }
+        let mut text = String::new();
+        collect(&document.to_component_tree(), &mut text);
+        assert_eq!(text, "above\u{2028} below");
+    }
+
+    #[test]
+    fn generated_after_text_joins_a_transparent_anonymous_inline_table_run() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#generated::after", &[("content", "' d'")]);
+        let mut document = Document::new();
+        let host = document.create_element("span");
+        host.set_attribute(&mut document, "id", "generated");
+        let prefix = document.create_text_node("a ");
+        host.append_child(&mut document, prefix);
+        for content in ["b", "c"] {
+            let cell = document.create_element("span");
+            cell.style_mut(&mut document)
+                .set_property("display", "table-cell");
+            cell.set_text_content(&mut document, content);
+            host.append_child(&mut document, cell);
+        }
+        document.body().append_child(&mut document, host);
+
+        fn collect(component: &w3cos_std::Component, runs: &mut Vec<String>) {
+            if let ComponentKind::Text { content } = &component.kind
+                && !content.is_empty()
+            {
+                runs.push(content.clone());
+            }
+            for child in &component.children {
+                collect(child, runs);
+            }
+        }
+        let tree = document.to_component_tree();
+        let mut runs = Vec::new();
+        collect(&tree, &mut runs);
+        assert_eq!(runs, ["a bc d"]);
         crate::stylesheet::clear_rules();
     }
 

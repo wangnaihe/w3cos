@@ -315,6 +315,16 @@ fn suppress_hidden_empty_cell_paint(nodes: &mut [PaintNode]) {
 }
 
 fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
+    fn column_span(style: &Style) -> usize {
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-table-column-span"))
+            .and_then(|span| span.parse::<usize>().ok())
+            .filter(|span| *span > 0)
+            .unwrap_or(1)
+            .min(1000)
+    }
     fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
         let mut parent = nodes[index].parent;
         while let Some(parent_index) = parent {
@@ -362,10 +372,23 @@ fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
                 })
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
-            for (column, cell) in cells.into_iter().enumerate() {
-                if collapsed_columns.get(column).copied().unwrap_or(false) {
+            let mut column: usize = 0;
+            for cell in cells {
+                let span = column_span(&nodes[cell].style);
+                let covered_columns = collapsed_columns
+                    .get(column..column.saturating_add(span))
+                    .unwrap_or_default();
+                let any_collapsed = covered_columns.iter().any(|collapsed| *collapsed);
+                let all_collapsed = !covered_columns.is_empty()
+                    && covered_columns.iter().all(|collapsed| *collapsed);
+                if all_collapsed {
                     nodes[cell].style.visibility = Visibility::Collapse;
+                    nodes[cell].style.overflow_x = Some(Overflow::Hidden);
+                    nodes[cell].style.overflow_y = Some(Overflow::Hidden);
+                } else if any_collapsed {
+                    nodes[cell].style.overflow_x = Some(Overflow::Hidden);
                 }
+                column = column.saturating_add(span);
             }
         }
     }
@@ -404,13 +427,7 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             2 => style.border_bottom_color,
             _ => style.border_left_color,
         }
-        .unwrap_or_else(|| {
-            if style.border_color.a == 0 && width > 0.0 {
-                style.color
-            } else {
-                style.border_color
-            }
-        });
+        .unwrap_or(style.border_color);
         (width, color)
     }
     fn set_edge(style: &mut Style, side: usize, width: f32, color: Color) {
@@ -655,13 +672,7 @@ pub(crate) fn border_edge_paint_rects(
     rect: LayoutRect,
     widths: [f32; 4],
 ) -> [LayoutRect; 4] {
-    let suppressed = |name: &str| {
-        style
-            .custom_properties
-            .as_ref()
-            .and_then(|properties| properties.get(COLLAPSED_BORDER_SUPPRESSED))
-            .is_some_and(|value| value.split_ascii_whitespace().any(|side| side == name))
-    };
+    let suppressed = |name: &str| collapsed_border_suppressed(style, name);
     let top = if suppressed("top") { widths[0] } else { 0.0 };
     let right = if suppressed("right") { widths[1] } else { 0.0 };
     let bottom = if suppressed("bottom") { widths[2] } else { 0.0 };
@@ -699,6 +710,35 @@ pub(crate) fn border_edge_paint_rects(
             height: (rect.height - top - bottom).max(0.0),
         },
     ]
+}
+
+fn collapsed_border_suppressed(style: &Style, name: &str) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get(COLLAPSED_BORDER_SUPPRESSED))
+        .is_some_and(|value| value.split_ascii_whitespace().any(|side| side == name))
+}
+
+pub(crate) fn box_background_paint_rect(style: &Style, rect: LayoutRect) -> LayoutRect {
+    let top = collapsed_border_suppressed(style, "top")
+        .then(|| style.border_top_width.unwrap_or(style.border_width))
+        .unwrap_or(0.0);
+    let right = collapsed_border_suppressed(style, "right")
+        .then(|| style.border_right_width.unwrap_or(style.border_width))
+        .unwrap_or(0.0);
+    let bottom = collapsed_border_suppressed(style, "bottom")
+        .then(|| style.border_bottom_width.unwrap_or(style.border_width))
+        .unwrap_or(0.0);
+    let left = collapsed_border_suppressed(style, "left")
+        .then(|| style.border_left_width.unwrap_or(style.border_width))
+        .unwrap_or(0.0);
+    LayoutRect {
+        x: rect.x + left,
+        y: rect.y + top,
+        width: (rect.width - left - right).max(0.0),
+        height: (rect.height - top - bottom).max(0.0),
+    }
 }
 
 const TABLE_CAPTION_INSETS: &str = "--w3cos-internal-table-caption-insets";
@@ -1154,6 +1194,68 @@ mod tests {
         assert_eq!(nodes[1].style.border_right_color, Some(start_color));
         assert_eq!(nodes[2].style.border_left_width, Some(20.0));
         assert_eq!(nodes[2].style.border_left_color, Some(Color::TRANSPARENT));
+        assert_eq!(
+            box_background_paint_rect(
+                &nodes[2].style,
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+            ),
+            LayoutRect {
+                x: 20.0,
+                y: 0.0,
+                width: 80.0,
+                height: 40.0,
+            }
+        );
+    }
+
+    #[test]
+    fn collapsed_explicit_transparent_border_remains_transparent() {
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableRow,
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableCell,
+                    color: Color::BLACK,
+                    border_right_width: Some(2.0),
+                    border_color: Color::TRANSPARENT,
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableCell,
+                    color: Color::BLACK,
+                    border_left_width: Some(2.0),
+                    border_color: Color::TRANSPARENT,
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+        ];
+
+        resolve_collapsed_cell_border_conflicts(&mut nodes);
+
+        assert_eq!(nodes[1].style.border_right_color, Some(Color::TRANSPARENT));
+        assert_eq!(nodes[2].style.border_left_color, Some(Color::TRANSPARENT));
     }
 
     #[test]
@@ -1184,6 +1286,47 @@ mod tests {
         project_collapsed_table_tracks_to_cells(&mut nodes);
 
         assert_eq!(nodes[1].style.visibility, Visibility::Collapse);
+    }
+
+    #[test]
+    fn collapsed_columns_clip_partial_spans_and_hide_full_cells() {
+        let node = |display, visibility, parent, span: Option<&str>| PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                display,
+                visibility,
+                custom_properties: span.map(|span| {
+                    std::collections::HashMap::from([(
+                        "--w3cos-internal-table-column-span".to_string(),
+                        span.to_string(),
+                    )])
+                }),
+                ..Style::default()
+            },
+            parent,
+            sticky_counter_signal: None,
+        };
+        let mut nodes = vec![
+            node(Display::Table, Visibility::Visible, None, None),
+            node(Display::TableColumn, Visibility::Visible, Some(0), None),
+            node(Display::TableColumn, Visibility::Collapse, Some(0), None),
+            node(Display::TableColumn, Visibility::Visible, Some(0), None),
+            node(Display::TableRow, Visibility::Visible, Some(0), None),
+            node(Display::TableCell, Visibility::Visible, Some(4), Some("2")),
+            node(Display::TableCell, Visibility::Visible, Some(4), None),
+            node(Display::TableRow, Visibility::Visible, Some(0), None),
+            node(Display::TableCell, Visibility::Visible, Some(7), None),
+            node(Display::TableCell, Visibility::Visible, Some(7), None),
+            node(Display::TableCell, Visibility::Visible, Some(7), None),
+        ];
+
+        project_collapsed_table_tracks_to_cells(&mut nodes);
+
+        assert_eq!(nodes[5].style.visibility, Visibility::Visible);
+        assert_eq!(nodes[5].style.overflow_x, Some(Overflow::Hidden));
+        assert_eq!(nodes[9].style.visibility, Visibility::Collapse);
+        assert_eq!(nodes[9].style.overflow_x, Some(Overflow::Hidden));
+        assert_eq!(nodes[9].style.overflow_y, Some(Overflow::Hidden));
     }
 
     #[test]

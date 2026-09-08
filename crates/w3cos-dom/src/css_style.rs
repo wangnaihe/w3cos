@@ -78,6 +78,13 @@ impl CSSStyleDeclaration {
             "row-gap" | "rowGap" => self.inner.row_gap = parse_px(value),
             "column-gap" | "columnGap" => self.inner.column_gap = parse_px(value),
             "border-spacing" | "borderSpacing" => {
+                self.inner
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-border-spacing-source".to_string(),
+                        value.trim().to_string(),
+                    );
                 let values: Vec<f32> = split_css_whitespace(value)
                     .into_iter()
                     .filter_map(|part| parse_px(&part))

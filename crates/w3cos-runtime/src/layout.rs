@@ -228,7 +228,13 @@ fn component_max_content_width(component: &Component) -> f32 {
         WDim::Rem(width) => Some(width * ROOT_FONT_SIZE),
         _ => None,
     };
-    let padding = component.style.padding_lengths();
+    let mut padding = component.style.padding_lengths();
+    if component.style.border_collapse
+        && matches!(component.style.display, WDisplay::Table | WDisplay::InlineTable)
+    {
+        padding.left = 0.0;
+        padding.right = 0.0;
+    }
     let border_width = if component.style.border_collapse
         && matches!(component.style.display, WDisplay::Table | WDisplay::InlineTable)
     {
@@ -294,7 +300,7 @@ fn table_track_max_content_width(component: &Component) -> f32 {
         0.0
     };
     caption_width.max(
-        tracks.iter().sum::<f32>()
+        tracks.iter().map(|width| width.max(0.0)).sum::<f32>()
             + gap * tracks.len().saturating_sub(1) as f32
             + collapsed_outer,
     )
@@ -400,16 +406,24 @@ fn effective_table_border_spacing(style: &w3cos_std::style::Style) -> (f32, f32)
 fn table_track_widths(component: &Component) -> Vec<f32> {
     fn collect_rows(component: &Component, tracks: &mut Vec<f32>, collapsed: bool) {
         if component.style.display == WDisplay::TableRow {
-            for (column, cell) in component.children.iter().enumerate() {
-                if column >= tracks.len() {
-                    tracks.push(0.0);
-                }
+            let mut column = 0;
+            for cell in component
+                .children
+                .iter()
+                .filter(|child| child.style.display == WDisplay::TableCell)
+            {
+                let span = table_cell_column_span(&cell.style);
+                tracks.resize(tracks.len().max(column + span), 0.0);
                 let mut width = component_max_content_width(cell);
                 if collapsed {
                     width -= (table_cell_edge_width(cell, 1) + table_cell_edge_width(cell, 3))
                         / 2.0;
                 }
-                tracks[column] = tracks[column].max(width.max(0.0));
+                let width_per_track = width.max(0.0) / span as f32;
+                for track in &mut tracks[column..column + span] {
+                    *track = track.max(width_per_track);
+                }
+                column += span;
             }
             return;
         }
@@ -447,10 +461,21 @@ fn table_track_widths(component: &Component) -> Vec<f32> {
     collect_collapsed_columns(component, &mut collapsed_columns);
     for (column, collapsed) in collapsed_columns.into_iter().enumerate() {
         if collapsed && let Some(track) = tracks.get_mut(column) {
-            *track = -0.0;
+            *track = -*track;
         }
     }
     tracks
+}
+
+fn table_cell_column_span(style: &w3cos_std::style::Style) -> usize {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-table-column-span"))
+        .and_then(|span| span.parse::<usize>().ok())
+        .filter(|span| *span > 0)
+        .unwrap_or(1)
+        .min(1000)
 }
 
 fn collapsed_table_outer_inline_halves(component: &Component) -> f32 {
@@ -488,11 +513,70 @@ fn collapsed_table_outer_inline_halves(component: &Component) -> f32 {
     left + right
 }
 
+fn collapsed_table_specified_rows_min_height(component: &Component) -> Option<f32> {
+    fn collect_rows<'a>(component: &'a Component, rows: &mut Vec<&'a Component>) {
+        if component.style.display == WDisplay::TableRow {
+            rows.push(component);
+            return;
+        }
+        for child in &component.children {
+            if matches!(
+                child.style.display,
+                WDisplay::TableRow
+                    | WDisplay::TableRowGroup
+                    | WDisplay::TableHeaderGroup
+                    | WDisplay::TableFooterGroup
+            ) {
+                collect_rows(child, rows);
+            }
+        }
+    }
+    fn absolute_height(component: &Component) -> Option<f32> {
+        match component.style.height {
+            WDim::Px(height) => Some(height),
+            WDim::Em(height) => Some(height * component.style.font_size),
+            WDim::Rem(height) => Some(height * ROOT_FONT_SIZE),
+            _ => None,
+        }
+    }
+
+    let mut rows = Vec::new();
+    collect_rows(component, &mut rows);
+    let row_height = rows
+        .iter()
+        .try_fold(0.0, |height, row| Some(height + absolute_height(row)?))?;
+    let first = rows.first()?;
+    let last = rows.last()?;
+    let top = first
+        .children
+        .iter()
+        .filter(|cell| cell.style.display == WDisplay::TableCell)
+        .map(|cell| table_cell_edge_width(cell, 0))
+        .fold(table_cell_edge_width(component, 0), f32::max)
+        / 2.0;
+    let bottom = last
+        .children
+        .iter()
+        .filter(|cell| cell.style.display == WDisplay::TableCell)
+        .map(|cell| table_cell_edge_width(cell, 2))
+        .fold(table_cell_edge_width(component, 2), f32::max)
+        / 2.0;
+    Some(row_height + top + bottom)
+}
+
 fn specified_border_box_width(style: &w3cos_std::style::Style) -> Option<f32> {
+    specified_border_box_width_with_basis(style, None)
+}
+
+fn specified_border_box_width_with_basis(
+    style: &w3cos_std::style::Style,
+    percentage_basis: Option<f32>,
+) -> Option<f32> {
     let width = match style.width {
         WDim::Px(width) => width,
         WDim::Em(width) => width * style.font_size,
         WDim::Rem(width) => width * ROOT_FONT_SIZE,
+        WDim::Percent(width) => percentage_basis? * width / 100.0,
         _ => return None,
     };
     if style.box_sizing == WBoxSizing::BorderBox {
@@ -513,17 +597,33 @@ fn specified_border_box_width(style: &w3cos_std::style::Style) -> Option<f32> {
     )
 }
 
-fn fixed_table_track_widths(component: &Component) -> Option<Vec<f32>> {
+fn fixed_table_track_widths(
+    component: &Component,
+    percentage_basis: Option<f32>,
+) -> Option<Vec<f32>> {
     if !component.style.table_layout_fixed {
         return None;
     }
-    let table_width = specified_border_box_width(&component.style)?;
+    // CSS table width participates in the table-width algorithm as the used
+    // table box width. Applying the ordinary content-box border expansion
+    // here would count the table borders twice when deriving the inner grid.
+    let table_width = match component.style.width {
+        WDim::Px(width) => width,
+        WDim::Em(width) => width * component.style.font_size,
+        WDim::Rem(width) => width * ROOT_FONT_SIZE,
+        WDim::Percent(width) => percentage_basis? * width / 100.0,
+        _ => return None,
+    }
+    .max(0.0);
 
-    fn collect_columns(component: &Component, columns: &mut Vec<Option<f32>>) {
+    fn collect_columns<'a>(
+        component: &'a Component,
+        columns: &mut Vec<Option<&'a w3cos_std::style::Style>>,
+    ) {
         for child in &component.children {
             match child.style.display {
                 WDisplay::TableColumn => {
-                    columns.push(specified_border_box_width(&child.style));
+                    columns.push(Some(&child.style));
                 }
                 WDisplay::TableColumnGroup => collect_columns(child, columns),
                 _ => {}
@@ -557,16 +657,11 @@ fn fixed_table_track_widths(component: &Component) -> Option<Vec<f32>> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let mut specified = Vec::new();
-    collect_columns(component, &mut specified);
-    specified.resize(specified.len().max(row_cells.len()), None);
-    if specified.is_empty() {
+    let mut column_styles = Vec::new();
+    collect_columns(component, &mut column_styles);
+    column_styles.resize(column_styles.len().max(row_cells.len()), None);
+    if column_styles.is_empty() {
         return None;
-    }
-    for (column, cell) in row_cells.into_iter().enumerate() {
-        if specified[column].is_none() {
-            specified[column] = specified_border_box_width(&cell.style);
-        }
     }
 
     let border_width = component
@@ -578,8 +673,34 @@ fn fixed_table_track_widths(component: &Component) -> Option<Vec<f32>> {
             .border_right_width
             .unwrap_or(component.style.border_width);
     let spacing = effective_table_border_spacing(&component.style).0;
-    let grid_width = (table_width - border_width - spacing * (specified.len() + 1) as f32)
-        .max(0.0);
+    let grid_width =
+        (table_width - border_width - spacing * (column_styles.len() + 1) as f32).max(0.0);
+    let mut specified = column_styles
+        .into_iter()
+        .map(|style| style.and_then(|style| specified_border_box_width_with_basis(style, Some(grid_width))))
+        .collect::<Vec<_>>();
+    for (column, cell) in row_cells.into_iter().enumerate() {
+        if specified[column].is_none() {
+            specified[column] =
+                specified_border_box_width_with_basis(&cell.style, Some(grid_width)).map(|width| {
+                if component.style.border_collapse
+                    && cell.style.box_sizing == WBoxSizing::ContentBox
+                {
+                    let left = cell
+                        .style
+                        .border_left_width
+                        .unwrap_or(cell.style.border_width);
+                    let right = cell
+                        .style
+                        .border_right_width
+                        .unwrap_or(cell.style.border_width);
+                    (width - (left + right) / 2.0).max(0.0)
+                } else {
+                    width
+                }
+                });
+        }
+    }
     let assigned = specified.iter().flatten().sum::<f32>();
     let automatic_count = specified.iter().filter(|width| width.is_none()).count();
     let automatic_width = if automatic_count == 0 {
@@ -593,6 +714,14 @@ fn fixed_table_track_widths(component: &Component) -> Option<Vec<f32>> {
             .map(|width| width.unwrap_or(automatic_width))
             .collect(),
     )
+}
+
+fn is_html_table_element(style: &w3cos_std::style::Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-html-table-element"))
+        .is_some_and(|value| value == "1")
 }
 
 fn table_caption_intrinsic_height(component: &Component) -> f32 {
@@ -1412,6 +1541,7 @@ impl LayoutEngine {
         );
 
         project_fixed_table_cell_rects(&mut results, root);
+        project_forced_break_lines(&mut results, root);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
 
@@ -1532,6 +1662,7 @@ pub fn compute_with_scroll(
     );
 
     project_fixed_table_cell_rects(&mut results, root);
+    project_forced_break_lines(&mut results, root);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
 
@@ -1632,6 +1763,7 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
         component_index: usize,
         tracks: &[f32],
         gap: f32,
+        collapsed: bool,
         layouts: &mut [(LayoutRect, usize)],
         layout_position: &HashMap<usize, usize>,
     ) {
@@ -1649,15 +1781,43 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                     if let Some(track) = tracks.get(column).copied()
                         && let Some(position) = layout_position.get(&child_index).copied()
                     {
-                        let delta = target_x - layouts[position].0.x;
-                        shift_subtree_x(
-                            layouts,
-                            layout_position,
-                            child_index,
-                            child_count,
-                            delta,
-                        );
-                        layouts[position].0.width = track;
+                        let left_half = if collapsed {
+                            table_cell_edge_width(child, 3) / 2.0
+                        } else {
+                            0.0
+                        };
+                        let right_half = if collapsed {
+                            table_cell_edge_width(child, 1) / 2.0
+                        } else {
+                            0.0
+                        };
+                        let paint_x = target_x - left_half;
+                        if collapsed {
+                            // The border box extends by the shared half-border,
+                            // while the content subtree moves with the grid
+                            // track and stays after the full painted border.
+                            let content_delta = target_x - layouts[position].0.x;
+                            if child_count > 1 {
+                                shift_subtree_x(
+                                    layouts,
+                                    layout_position,
+                                    child_index + 1,
+                                    child_count - 1,
+                                    content_delta,
+                                );
+                            }
+                            layouts[position].0.x = paint_x;
+                        } else {
+                            let delta = paint_x - layouts[position].0.x;
+                            shift_subtree_x(
+                                layouts,
+                                layout_position,
+                                child_index,
+                                child_count,
+                                delta,
+                            );
+                        }
+                        layouts[position].0.width = track + left_half + right_half;
                         target_x += track + gap;
                     }
                     column += 1;
@@ -1683,11 +1843,163 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                     child_index,
                     tracks,
                     gap,
+                    collapsed,
                     layouts,
                     layout_position,
                 );
             }
             child_index += count_nodes(child);
+        }
+    }
+
+    fn project_columns(
+        component: &Component,
+        component_index: usize,
+        tracks: &[f32],
+        gap: f32,
+        grid_start_x: f32,
+        column: &mut usize,
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+    ) {
+        let start_column = *column;
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            match child.style.display {
+                WDisplay::TableColumn => {
+                    if let Some(track) = tracks.get(*column).copied()
+                        && let Some(position) = layout_position.get(&child_index).copied()
+                    {
+                        layouts[position].0.x = grid_start_x
+                            + tracks[..*column].iter().sum::<f32>()
+                            + gap * *column as f32;
+                        layouts[position].0.width = track;
+                    }
+                    *column += 1;
+                }
+                WDisplay::TableColumnGroup => project_columns(
+                    child,
+                    child_index,
+                    tracks,
+                    gap,
+                    grid_start_x,
+                    column,
+                    layouts,
+                    layout_position,
+                ),
+                _ => {}
+            }
+            child_index += count_nodes(child);
+        }
+        if component.style.display == WDisplay::TableColumnGroup
+            && *column > start_column
+            && let Some(position) = layout_position.get(&component_index).copied()
+        {
+            layouts[position].0.x = grid_start_x
+                + tracks[..start_column].iter().sum::<f32>()
+                + gap * start_column as f32;
+            layouts[position].0.width = tracks[start_column..*column].iter().sum::<f32>()
+                + gap * (*column).saturating_sub(start_column + 1) as f32;
+        }
+    }
+
+    fn visit(
+        component: &Component,
+        component_index: usize,
+        containing_width: f32,
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+    ) {
+        if matches!(component.style.display, WDisplay::Table | WDisplay::InlineTable)
+            && let Some(tracks) = fixed_table_track_widths(component, Some(containing_width))
+        {
+            let gap = effective_table_border_spacing(&component.style).0;
+            project_rows(
+                component,
+                component_index,
+                &tracks,
+                gap,
+                component.style.border_collapse,
+                layouts,
+                layout_position,
+            );
+            if let Some(position) = layout_position.get(&component_index).copied() {
+                let border_left = component
+                    .style
+                    .border_left_width
+                    .unwrap_or(component.style.border_width);
+                let grid_start_x = layouts[position].0.x + border_left + gap;
+                let mut column = 0;
+                project_columns(
+                    component,
+                    component_index,
+                    &tracks,
+                    gap,
+                    grid_start_x,
+                    &mut column,
+                    layouts,
+                    layout_position,
+                );
+            }
+        }
+        let child_containing_width = layout_position
+            .get(&component_index)
+            .copied()
+            .map(|position| {
+                let padding = component.style.padding_lengths();
+                let horizontal_edges = padding.left
+                    + padding.right
+                    + component
+                        .style
+                        .border_left_width
+                        .unwrap_or(component.style.border_width)
+                    + component
+                        .style
+                        .border_right_width
+                        .unwrap_or(component.style.border_width);
+                (layouts[position].0.width - horizontal_edges).max(0.0)
+            })
+            .unwrap_or(containing_width);
+        let mut child_index = component_index + 1;
+        for child in &component.children {
+            visit(
+                child,
+                child_index,
+                child_containing_width,
+                layouts,
+                layout_position,
+            );
+            child_index += count_nodes(child);
+        }
+    }
+
+    let root_width = layout_position
+        .get(&0)
+        .copied()
+        .map_or(0.0, |position| layouts[position].0.width);
+    visit(root, 0, root_width, layouts, &layout_position);
+}
+
+fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+    let layout_position = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+
+    fn shift_subtree(
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+        start: usize,
+        count: usize,
+        delta_x: f32,
+        delta_y: f32,
+    ) {
+        for index in start..start + count {
+            if let Some(position) = layout_position.get(&index).copied() {
+                layouts[position].0.x += delta_x;
+                layouts[position].0.y += delta_y;
+            }
         }
     }
 
@@ -1697,23 +2009,126 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
         layouts: &mut [(LayoutRect, usize)],
         layout_position: &HashMap<usize, usize>,
     ) {
-        if matches!(component.style.display, WDisplay::Table | WDisplay::InlineTable)
-            && let Some(tracks) = fixed_table_track_widths(component)
-        {
-            project_rows(
-                component,
-                component_index,
-                &tracks,
-                effective_table_border_spacing(&component.style).0,
-                layouts,
-                layout_position,
-            );
-        }
         let mut child_index = component_index + 1;
         for child in &component.children {
             visit(child, child_index, layouts, layout_position);
             child_index += count_nodes(child);
         }
+
+        let Some(parent_position) = layout_position.get(&component_index).copied() else {
+            return;
+        };
+        let parent_rect = layouts[parent_position].0;
+        let padding = component.style.padding_lengths();
+        let line_start = parent_rect.x
+            + component
+                .style
+                .border_left_width
+                .unwrap_or(component.style.border_width)
+            + padding.left;
+        let mut line_top = None::<f32>;
+        let mut line_height = component.style.font_size * component.style.line_height;
+        let mut child_index = component_index + 1;
+        let children = component
+            .children
+            .iter()
+            .map(|child| {
+                let index = child_index;
+                child_index += count_nodes(child);
+                (child, index)
+            })
+            .collect::<Vec<_>>();
+        if !children.iter().any(|(child, _)| {
+            matches!(
+                &child.kind,
+                ComponentKind::Text { content } if content == "\u{2028}"
+            )
+        }) {
+            return;
+        }
+
+        for (position, (child, index)) in children.iter().enumerate() {
+            let is_break = matches!(
+                &child.kind,
+                ComponentKind::Text { content } if content == "\u{2028}"
+            );
+            if !is_break {
+                if let Some(layout) = layout_position
+                    .get(index)
+                    .copied()
+                    .map(|position| layouts[position].0)
+                {
+                    line_top.get_or_insert(layout.y);
+                    line_height = line_height.max(layout.height);
+                }
+                continue;
+            }
+            if let Some(layout) = layout_position
+                .get(index)
+                .copied()
+                .map(|position| layouts[position].0)
+            {
+                line_height = line_height.max(layout.height);
+            }
+            let Some((_, next_index)) = children.get(position + 1) else {
+                continue;
+            };
+            if !layout_position.contains_key(next_index) {
+                continue;
+            }
+            let target_y = line_top.unwrap_or(parent_rect.y) + line_height;
+            let mut cursor_x = line_start;
+            for (following, following_index) in children[position + 1..]
+                .iter()
+                .take_while(|(following, _)| {
+                    !matches!(
+                        &following.kind,
+                        ComponentKind::Text { content } if content == "\u{2028}"
+                    )
+                })
+            {
+                let Some(following_position) =
+                    layout_position.get(following_index).copied()
+                else {
+                    continue;
+                };
+                let margin = following.style.margin_lengths();
+                let margin_left = match following.style.margin.left {
+                    WSpacing::Percent(value) => parent_rect.width * value / 100.0,
+                    _ => margin.left,
+                };
+                let margin_right = match following.style.margin.right {
+                    WSpacing::Percent(value) => parent_rect.width * value / 100.0,
+                    _ => margin.right,
+                };
+                let following_rect = layouts[following_position].0;
+                let target_x = cursor_x + margin_left;
+                shift_subtree(
+                    layouts,
+                    layout_position,
+                    *following_index,
+                    count_nodes(following),
+                    target_x - following_rect.x,
+                    target_y - following_rect.y,
+                );
+                cursor_x = target_x + following_rect.width + margin_right;
+            }
+            line_top = Some(target_y);
+            line_height = component.style.font_size * component.style.line_height;
+        }
+
+        let descendant_bottom = children
+            .iter()
+            .filter_map(|(_, index)| {
+                layout_position
+                    .get(index)
+                    .copied()
+                    .map(|position| layouts[position].0)
+            })
+            .map(|rect| rect.y + rect.height)
+            .fold(parent_rect.y, f32::max);
+        let line_box_bottom = line_top.map_or(parent_rect.y, |top| top + line_height);
+        layouts[parent_position].0.height = descendant_bottom.max(line_box_bottom) - parent_rect.y;
     }
 
     visit(root, 0, layouts, &layout_position);
@@ -1967,11 +2382,25 @@ fn build_taffy_tree(
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
     let owns_table_layout = matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable);
     if comp.style.visibility == WVisibility::Collapse
-        && matches!(comp.style.display, WDisplay::TableRow | WDisplay::TableCell)
+        && matches!(
+            comp.style.display,
+            WDisplay::TableRow
+                | WDisplay::TableCell
+                | WDisplay::TableRowGroup
+                | WDisplay::TableHeaderGroup
+                | WDisplay::TableFooterGroup
+        )
     {
-        if comp.style.display == WDisplay::TableRow {
+        if matches!(
+            comp.style.display,
+            WDisplay::TableRow
+                | WDisplay::TableRowGroup
+                | WDisplay::TableHeaderGroup
+                | WDisplay::TableFooterGroup
+        ) {
             // Collapsed rows still participate in intrinsic table sizing and
-            // border conflict collection, but generate no used row track.
+            // border conflict collection, but rows and row groups generate no
+            // used block-axis track.
             style.display = taffy::Display::None;
         }
         style.size.height = Dimension::length(0.0);
@@ -1990,8 +2419,31 @@ fn build_taffy_tree(
     if owns_table_layout && comp.style.table_layout_fixed {
         // CSS table width is the used table border-box width in the fixed
         // algorithm. Taffy's generic content-box default would add the table
-        // border and outer border-spacing a second time.
+        // border and outer border-spacing a second time. Authored padding on
+        // a separate-border table still expands that used width.
         style.box_sizing = BoxSizing::BorderBox;
+        if !comp.style.border_collapse && !is_html_table_element(&comp.style) {
+            let padding = comp.style.padding_lengths();
+            let borders = comp
+                .style
+                .border_left_width
+                .unwrap_or(comp.style.border_width)
+                + comp
+                    .style
+                    .border_right_width
+                    .unwrap_or(comp.style.border_width);
+            if let Some(width) = comp.style.width.resolve(
+                    containing_width,
+                    ROOT_FONT_SIZE,
+                    comp.style.font_size,
+                    viewport_w,
+                    viewport_h,
+                )
+            {
+                style.size.width =
+                    Dimension::length(width + padding.left + padding.right + borders);
+            }
+        }
     }
     if owns_table_layout
         && comp.style.border_collapse
@@ -2016,6 +2468,13 @@ fn build_taffy_tree(
             bottom: LengthPercentage::length(0.0),
             left: LengthPercentage::length(0.0),
         };
+        if matches!(comp.style.height, WDim::Auto)
+            && let Some(min_height) = collapsed_table_specified_rows_min_height(comp)
+        {
+            style.min_size.height = Dimension::length(
+                min_height + table_caption_intrinsic_height(comp),
+            );
+        }
     }
     if owns_table_layout {
         let specified_height = match comp.style.height {
@@ -2071,12 +2530,33 @@ fn build_taffy_tree(
     if matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable) {
         let padding = comp.style.padding_lengths();
         let (spacing_x, spacing_y) = effective_table_border_spacing(&comp.style);
-        style.padding = Rect {
-            top: LengthPercentage::length(padding.top + spacing_y),
-            right: LengthPercentage::length(padding.right + spacing_x),
-            bottom: LengthPercentage::length(padding.bottom + spacing_y),
-            left: LengthPercentage::length(padding.left + spacing_x),
+        let padding_top = if comp.style.border_collapse {
+            0.0
+        } else {
+            padding.top
         };
+        let padding_right = if comp.style.border_collapse {
+            0.0
+        } else {
+            padding.right
+        };
+        let padding_bottom = if comp.style.border_collapse {
+            0.0
+        } else {
+            padding.bottom
+        };
+        let padding_left = if comp.style.border_collapse {
+            0.0
+        } else {
+            padding.left
+        };
+        style.padding = Rect {
+            top: LengthPercentage::length(padding_top + spacing_y),
+            right: LengthPercentage::length(padding_right + spacing_x),
+            bottom: LengthPercentage::length(padding_bottom + spacing_y),
+            left: LengthPercentage::length(padding_left + spacing_x),
+        };
+        style.gap.height = LengthPercentage::length(spacing_y);
     } else if let Some((spacing_x, spacing_y)) = active_border_spacing {
         if comp.style.display == WDisplay::TableRow {
             style.gap.width = LengthPercentage::length(spacing_x);
@@ -2108,6 +2588,31 @@ fn build_taffy_tree(
         && absolute_dimension(comp.style.width).is_some();
     let absorbs_ua_block_padding = uses_ua_table_cell_padding
         && absolute_dimension(comp.style.height).is_some();
+    let table_cell_span = table_cell_column_span(&comp.style);
+    let inherited_cell_tracks = if comp.style.display == WDisplay::TableCell {
+        table_column.and_then(|column| {
+            inherited_table_tracks?.get(column..column.saturating_add(table_cell_span))
+        })
+    } else {
+        None
+    };
+    let partially_collapsed_span = inherited_cell_tracks.is_some_and(|tracks| {
+        tracks.iter().any(|width| width.is_sign_negative())
+            && tracks.iter().any(|width| !width.is_sign_negative())
+    });
+    let collapsed_span_leading_width = inherited_cell_tracks.map_or(0.0, |tracks| {
+        tracks
+            .iter()
+            .take_while(|width| width.is_sign_negative())
+            .map(|width| width.abs())
+            .sum()
+    });
+    if partially_collapsed_span {
+        // A spanning cell remains in the grid when only part of its covered
+        // columns collapse. Clip the removed track's content rather than
+        // hiding the entire cell.
+        style.overflow.x = taffy::Overflow::Hidden;
+    }
     if absorbs_ua_inline_padding || absorbs_ua_block_padding {
         // A table-cell's CSS width/height participates in table sizing as its
         // minimum box size. Normalize the UA's 1px padding into definite
@@ -2171,11 +2676,13 @@ fn build_taffy_tree(
         style.flex_shrink = 0.0;
         style.inset.left = LengthPercentageAuto::length(offset);
     } else if comp.style.display == WDisplay::TableCell
-        && let Some(width) = table_column
-            .and_then(|column| inherited_table_tracks?.get(column))
-            .copied()
+        && let Some(tracks) = inherited_cell_tracks
     {
-        let collapsed_column = width == 0.0 && width.is_sign_negative();
+        let collapsed_column = tracks.iter().all(|width| width.is_sign_negative());
+        let width = tracks
+            .iter()
+            .filter(|width| !width.is_sign_negative())
+            .sum::<f32>();
         let used_width = if collapsed_column {
             style.box_sizing = BoxSizing::BorderBox;
             style.min_size.width = Dimension::length(0.0);
@@ -2187,6 +2694,25 @@ fn build_taffy_tree(
             0.0
         } else if active_fixed_table_layout {
             style.box_sizing = BoxSizing::BorderBox;
+            if comp.style.border_collapse {
+                // A collapsed cell owns only half of each shared grid-line
+                // border for layout. Keep the authored widths on the
+                // component for painting, but expose the shared halves to
+                // Taffy so the specified content width is not squeezed by
+                // both full borders.
+                style.border.left = LengthPercentage::length(
+                    comp.style
+                        .border_left_width
+                        .unwrap_or(comp.style.border_width)
+                        / 2.0,
+                );
+                style.border.right = LengthPercentage::length(
+                    comp.style
+                        .border_right_width
+                        .unwrap_or(comp.style.border_width)
+                        / 2.0,
+                );
+            }
             width
         } else {
             let left_border = comp
@@ -2568,12 +3094,69 @@ fn build_taffy_tree(
         }
         tree.new_leaf_with_context(leaf_style, my_idx)
     } else {
-        let fixed_table_tracks = fixed_table_track_widths(comp);
-        let auto_table_tracks = (matches!(
-            comp.style.display,
-            WDisplay::Table | WDisplay::InlineTable
-        ) && matches!(comp.style.width, WDim::Auto))
-        .then(|| table_track_widths(comp));
+        let fixed_table_tracks = fixed_table_track_widths(comp, Some(containing_width));
+        if owns_table_layout
+            && comp.style.table_layout_fixed
+            && !comp.style.border_collapse
+            && !is_html_table_element(&comp.style)
+            && let Some(tracks) = fixed_table_tracks.as_deref()
+        {
+            let padding = comp.style.padding_lengths();
+            let borders = comp
+                .style
+                .border_left_width
+                .unwrap_or(comp.style.border_width)
+                + comp
+                    .style
+                    .border_right_width
+                    .unwrap_or(comp.style.border_width);
+            let spacing = effective_table_border_spacing(&comp.style).0;
+            let minimum_grid = tracks.iter().sum::<f32>() + spacing * (tracks.len() + 1) as f32;
+            let minimum_outer =
+                minimum_grid + padding.left + padding.right + borders;
+            let declared_outer = comp
+                .style
+                .width
+                .resolve(
+                    containing_width,
+                    ROOT_FONT_SIZE,
+                    comp.style.font_size,
+                    viewport_w,
+                    viewport_h,
+                )
+                .unwrap_or(0.0)
+                + padding.left
+                + padding.right
+                + borders;
+            style.size.width = Dimension::length(minimum_outer.max(declared_outer));
+        }
+        let auto_table_tracks = (owns_table_layout && !comp.style.table_layout_fixed).then(|| {
+            let mut tracks = table_track_widths(comp);
+            if !tracks.is_empty()
+                && let Some(table_width) = comp.style.width.resolve(
+                    containing_width,
+                    ROOT_FONT_SIZE,
+                    comp.style.font_size,
+                    viewport_w,
+                    viewport_h,
+                )
+            {
+                let spacing = effective_table_border_spacing(&comp.style).0;
+                let grid_width =
+                    (table_width - spacing * (tracks.len() + 1) as f32).max(0.0);
+                let intrinsic_width = tracks.iter().map(|width| width.max(0.0)).sum::<f32>();
+                let visible_tracks = tracks.iter().filter(|track| !track.is_sign_negative()).count();
+                if grid_width > intrinsic_width && visible_tracks > 0 {
+                    let extra = (grid_width - intrinsic_width) / visible_tracks as f32;
+                    for track in &mut tracks {
+                        if !track.is_sign_negative() {
+                            *track += extra;
+                        }
+                    }
+                }
+            }
+            tracks
+        });
         let owned_table_tracks = fixed_table_tracks.or(auto_table_tracks);
         let owned_collapsed_single_track =
             (matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable)
@@ -2586,6 +3169,22 @@ fn build_taffy_tree(
             .as_deref()
             .filter(|tracks| !tracks.is_empty())
             .or(inherited_table_tracks);
+        let mut next_table_column = 0;
+        let child_table_columns = comp
+            .children
+            .iter()
+            .map(|child| {
+                if comp.style.display == WDisplay::TableRow
+                    && child.style.display == WDisplay::TableCell
+                {
+                    let column = next_table_column;
+                    next_table_column += table_cell_column_span(&child.style);
+                    Some(column)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         let mut child_nodes: Vec<(i32, usize, NodeId)> = comp
             .children
             .iter()
@@ -2605,7 +3204,7 @@ fn build_taffy_tree(
                     active_table_tracks,
                     active_fixed_table_layout,
                     active_collapsed_single_track,
-                    (comp.style.display == WDisplay::TableRow).then_some(source_index),
+                    child_table_columns[source_index],
                     matches!(
                         comp.style.display,
                         WDisplay::Table
@@ -2616,6 +3215,15 @@ fn build_taffy_tree(
                     ) && !matches!(comp.style.height, WDim::Auto),
                     active_border_spacing,
                 )?;
+                if comp.style.display == WDisplay::TableCell
+                    && source_index == 0
+                    && collapsed_span_leading_width > 0.0
+                {
+                    let mut child_style = tree.style(node)?.clone();
+                    child_style.margin.left =
+                        LengthPercentageAuto::length(-collapsed_span_leading_width);
+                    tree.set_style(node, child_style)?;
+                }
                 let mut collapsed_overlap = None;
                 if comp.style.border_collapse
                     && comp.style.display == WDisplay::TableRow
@@ -2624,12 +3232,14 @@ fn build_taffy_tree(
                         .iter()
                         .find(|next| next.style.display == WDisplay::TableCell)
                 {
+                    let column = child_table_columns[source_index].unwrap_or(source_index);
+                    let next_column = column + table_cell_column_span(&c.style);
                     let collapsed_column = active_table_tracks
-                        .and_then(|tracks| tracks.get(source_index))
-                        .is_some_and(|width| *width == 0.0 && width.is_sign_negative())
+                        .and_then(|tracks| tracks.get(next_column.saturating_sub(1)))
+                        .is_some_and(|width| width.is_sign_negative())
                         || active_table_tracks
-                            .and_then(|tracks| tracks.get(source_index + 1))
-                            .is_some_and(|width| *width == 0.0 && width.is_sign_negative());
+                            .and_then(|tracks| tracks.get(next_column))
+                            .is_some_and(|width| width.is_sign_negative());
                     collapsed_overlap = Some((
                         true,
                         if collapsed_column {
@@ -2639,14 +3249,22 @@ fn build_taffy_tree(
                         },
                     ));
                 } else if comp.style.border_collapse
-                    && matches!(
+                    && (matches!(
                         comp.style.display,
                         WDisplay::Table
                             | WDisplay::InlineTable
                             | WDisplay::TableRowGroup
                             | WDisplay::TableHeaderGroup
                             | WDisplay::TableFooterGroup
-                    )
+                    ) || (comp.style.display == WDisplay::Block
+                        && comp.children.iter().any(|child| {
+                            matches!(
+                                child.style.display,
+                                WDisplay::TableRowGroup
+                                    | WDisplay::TableHeaderGroup
+                                    | WDisplay::TableFooterGroup
+                            )
+                        })))
                     && matches!(
                         c.style.display,
                         WDisplay::TableRow
@@ -3655,7 +4273,7 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             },
         ),
     };
-    let margin = if s.display == WDisplay::TableCell {
+    let mut margin = if s.display == WDisplay::TableCell {
         // CSS table-cell boxes do not accept margins. Taffy's flex fallback
         // would otherwise add those margins to column and row sizing.
         Rect {
@@ -3683,6 +4301,12 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             left: to_taffy_margin(s.margin.left, s.font_size, viewport_w, viewport_h),
         }
     };
+    if s.float == WFloat::Right {
+        // Taffy's block fallback has no float placement algorithm. An auto
+        // start margin places the float's margin box against the inline end
+        // while preserving its participation in the containing block.
+        margin.left = LengthPercentageAuto::auto();
+    }
 
     Style {
         display,
@@ -4160,12 +4784,375 @@ mod tests {
             ],
         );
 
-        assert_eq!(fixed_table_track_widths(&table), Some(vec![100.0, 200.0, 100.0]));
+        assert_eq!(
+            fixed_table_track_widths(&table, None),
+            Some(vec![100.0, 200.0, 100.0])
+        );
         let layout = compute(&table, 800.0, 600.0).unwrap();
         let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
         assert_eq!((rect(5).x, rect(5).width), (0.0, 100.0));
         assert_eq!((rect(6).x, rect(6).width), (100.0, 200.0));
         assert_eq!((rect(7).x, rect(7).width), (300.0, 100.0));
+    }
+
+    #[test]
+    fn fixed_table_percentage_column_uses_inner_grid_width() {
+        let column = |width| {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableColumn,
+                    width,
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let cell = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                width: WDim::Px(422.0),
+                border_left_width: Some(6.0),
+                border_right_width: Some(6.0),
+                border_spacing_x: 2.0,
+                ..Style::default()
+            },
+            vec![
+                column(WDim::Auto),
+                column(WDim::Auto),
+                column(WDim::Percent(40.0)),
+                column(WDim::Auto),
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..Style::default()
+                    },
+                    vec![cell(), cell(), cell(), cell()],
+                ),
+            ],
+        );
+
+        assert_eq!(
+            fixed_table_track_widths(&table, None),
+            Some(vec![80.0, 80.0, 160.0, 80.0])
+        );
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+
+        assert_eq!((rect(3).x, rect(3).width), (172.0, 160.0));
+        assert_eq!((rect(8).x, rect(8).width), (172.0, 160.0));
+    }
+
+    #[test]
+    fn fixed_percentage_table_resolves_against_containing_block() {
+        let column = |width| {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableColumn,
+                    width,
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                width: WDim::Percent(80.0),
+                border_left_width: Some(11.0),
+                border_right_width: Some(11.0),
+                border_spacing_x: 18.0,
+                ..Style::default()
+            },
+            vec![
+                column(WDim::Percent(13.0)),
+                column(WDim::Px(100.0)),
+                column(WDim::Percent(31.0)),
+                column(WDim::Auto),
+            ],
+        );
+
+        assert_eq!(
+            fixed_table_track_widths(&table, Some(640.0)),
+            Some(vec![52.0, 100.0, 124.0, 124.0])
+        );
+    }
+
+    #[test]
+    fn fixed_separate_table_padding_expands_principal_box() {
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                width: WDim::Px(50.0),
+                padding: w3cos_std::style::Edges::all(25.0),
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::TableCell,
+                        height: WDim::Px(50.0),
+                        ..Style::default()
+                    },
+                    vec![],
+                )],
+            )],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let table_rect = layout.iter().find(|(_, item)| *item == 0).unwrap().0;
+        assert_eq!((table_rect.width, table_rect.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn separate_table_spaces_direct_rows_on_the_block_axis() {
+        let row = || {
+            Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    height: WDim::Px(40.0),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                width: WDim::Px(100.0),
+                padding: w3cos_std::style::Edges {
+                    top: WSpacing::Px(5.0),
+                    ..w3cos_std::style::Edges::ZERO
+                },
+                border_spacing_y: 5.0,
+                ..Style::default()
+            },
+            vec![row(), row()],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let table_rect = layout.iter().find(|(_, item)| *item == 0).unwrap().0;
+        assert_eq!(table_rect.height, 100.0);
+    }
+
+    #[test]
+    fn fixed_css_table_expands_to_column_and_spacing_minimum() {
+        let cell = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    width: WDim::Px(20.0),
+                    height: WDim::Px(20.0),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                table_layout_fixed: true,
+                width: WDim::Px(70.0),
+                border_spacing_x: 20.0,
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![cell(), cell()],
+            )],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let table_rect = layout.iter().find(|(_, item)| *item == 0).unwrap().0;
+        assert_eq!(table_rect.width, 100.0);
+    }
+
+    #[test]
+    fn automatic_table_layout_distributes_explicit_grid_width_to_tracks() {
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                width: WDim::Px(200.0),
+                border_left_width: Some(100.0),
+                border_right_width: Some(100.0),
+                padding: w3cos_std::style::Edges::xy(33.0, 0.0),
+                border_spacing_x: 52.0,
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::TableCell,
+                        height: WDim::Px(16.0),
+                        ..Style::default()
+                    },
+                    vec![],
+                )],
+            )],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let cell_rect = layout.iter().find(|(_, item)| *item == 2).unwrap().0;
+        assert_eq!(cell_rect.width, 96.0);
+    }
+
+    #[test]
+    fn collapsed_fixed_table_tracks_share_one_sided_cell_border() {
+        let column = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableColumn,
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let cell = |width, border_left_width| {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    border_collapse: true,
+                    width,
+                    padding: w3cos_std::style::Edges::xy(24.0, 0.0),
+                    border_left_width: Some(border_left_width),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                border_collapse: true,
+                table_layout_fixed: true,
+                width: WDim::Px(400.0),
+                ..Style::default()
+            },
+            vec![
+                column(),
+                column(),
+                column(),
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        border_collapse: true,
+                        ..Style::default()
+                    },
+                    vec![
+                        cell(WDim::Auto, 0.0),
+                        cell(WDim::Px(80.0), 72.0),
+                        cell(WDim::Auto, 0.0),
+                    ],
+                ),
+            ],
+        );
+
+        assert_eq!(
+            fixed_table_track_widths(&table, None),
+            Some(vec![118.0, 164.0, 118.0])
+        );
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+
+        assert_eq!((rect(6).x, rect(6).width), (82.0, 200.0));
+    }
+
+    #[test]
+    fn collapsed_fixed_table_uses_shared_border_halves_for_cell_content() {
+        let column = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableColumn,
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let empty_cell = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let tested_cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                border_collapse: true,
+                width: WDim::Px(80.0),
+                border_left_width: Some(60.0),
+                border_right_width: Some(60.0),
+                font_size: 20.0,
+                line_height: 1.2,
+                ..Style::default()
+            },
+            vec![Component::text(
+                "F01",
+                Style {
+                    font_size: 20.0,
+                    line_height: 1.2,
+                    ..Style::default()
+                },
+            )],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                border_collapse: true,
+                table_layout_fixed: true,
+                width: WDim::Px(400.0),
+                ..Style::default()
+            },
+            vec![
+                column(),
+                column(),
+                column(),
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        border_collapse: true,
+                        ..Style::default()
+                    },
+                    vec![empty_cell(), tested_cell, empty_cell()],
+                ),
+            ],
+        );
+
+        assert_eq!(
+            fixed_table_track_widths(&table, None),
+            Some(vec![130.0, 140.0, 130.0])
+        );
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+
+        assert_eq!((rect(6).x, rect(6).width, rect(6).height), (100.0, 200.0, 24.0));
+        assert_eq!((rect(7).x, rect(7).height), (160.0, 24.0));
     }
 
     #[test]
@@ -4306,6 +5293,50 @@ mod tests {
         let rect = |index| layout.iter().find(|(_, i)| *i == index).unwrap().0;
         assert_eq!((rect(2).y, rect(5).y, rect(6).y), (0.0, 20.0, 20.0));
         assert_eq!(rect(0).height, 50.0);
+    }
+
+    #[test]
+    fn collapsed_row_group_consumes_no_table_height() {
+        let group = |visibility| {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableRowGroup,
+                    visibility,
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        visibility,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::TableCell,
+                            visibility,
+                            width: WDim::Px(100.0),
+                            height: WDim::Px(100.0),
+                            ..Style::default()
+                        },
+                        vec![],
+                    )],
+                )],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                ..Style::default()
+            },
+            vec![
+                group(WVisibility::Collapse),
+                group(WVisibility::Visible),
+            ],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        assert_eq!((rect(0).height, rect(6).y, rect(6).height), (100.0, 0.0, 100.0));
     }
 
     #[test]
@@ -4842,6 +5873,57 @@ mod tests {
         assert_eq!(layout[1].0.width, 0.0);
         assert_eq!(layout[1].0.height, 200.0);
         assert_eq!(layout[2].0.y, 200.0);
+    }
+
+    #[test]
+    fn standalone_forced_break_moves_following_inline_box_to_next_line() {
+        let inline_box = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::InlineBlock,
+                    width: WDim::Px(52.0),
+                    height: WDim::Px(22.0),
+                    margin: w3cos_std::style::Edges {
+                        left: WSpacing::Px(44.0),
+                        ..w3cos_std::style::Edges::ZERO
+                    },
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let forced_break = Component::text(
+            "\u{2028}",
+            Style {
+                display: WDisp::Inline,
+                width: WDim::Px(0.0),
+                height: WDim::Px(26.0),
+                font_size: 22.0,
+                line_height: 26.0 / 22.0,
+                ..Style::default()
+            },
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                font_size: 22.0,
+                line_height: 26.0 / 22.0,
+                ..Style::default()
+            },
+            vec![inline_box(), forced_break, inline_box()],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+
+        assert_eq!((rect(1).x, rect(1).y), (44.0, 0.0));
+        assert_eq!(rect(3).x, 44.0);
+        assert!((rect(3).y - 26.0).abs() < 0.001);
+        assert!(
+            (rect(0).height - 52.0).abs() < 0.001,
+            "projected parent height was {}",
+            rect(0).height
+        );
     }
 
     #[test]
@@ -6737,6 +7819,133 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_table_ignores_authored_padding() {
+        let cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                border_collapse: true,
+                width: WDim::Px(100.0),
+                padding: w3cos_std::style::Edges::all(10.0),
+                border_width: 50.0,
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let row = Component::row(
+            Style {
+                display: WDisp::TableRow,
+                border_collapse: true,
+                ..Style::default()
+            },
+            vec![cell],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                border_collapse: true,
+                padding: w3cos_std::style::Edges::all(10.0),
+                ..Style::default()
+            },
+            vec![row],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let table_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let row_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+
+        assert_eq!(table_rect.x, row_rect.x);
+        assert_eq!(table_rect.width, row_rect.width);
+    }
+
+    #[test]
+    fn collapsed_table_adds_outer_half_border_to_specified_row_height() {
+        let cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                border_collapse: true,
+                border_top_width: Some(96.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let row = Component::row(
+            Style {
+                display: WDisp::TableRow,
+                border_collapse: true,
+                height: WDim::Px(96.0),
+                ..Style::default()
+            },
+            vec![cell],
+        );
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                border_collapse: true,
+                ..Style::default()
+            },
+            vec![row],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let table_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+
+        assert_eq!(table_rect.height, 144.0);
+    }
+
+    #[test]
+    fn anonymous_table_wrapper_collapses_section_boundaries() {
+        let group = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableRowGroup,
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        border_collapse: true,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(
+                        Style {
+                            display: WDisp::TableCell,
+                            border_collapse: true,
+                            height: WDim::Px(20.0),
+                            border_width: 8.0,
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    )],
+                )],
+            )
+        };
+        let wrapper = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                border_collapse: true,
+                ..Style::default()
+            },
+            vec![group(), group(), group()],
+        );
+
+        let layout = compute(&wrapper, 800.0, 600.0).unwrap();
+        let wrapper_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let group_rects = [1, 4, 7].map(|index| {
+            layout
+                .iter()
+                .find(|(_, candidate)| *candidate == index)
+                .unwrap()
+                .0
+        });
+
+        assert_eq!(
+            wrapper_rect.height,
+            group_rects.iter().map(|rect| rect.height).sum::<f32>() - 16.0
+        );
+    }
+
+    #[test]
     fn collapsed_single_column_centers_unequal_borders_on_grid_lines() {
         let cell = |left: f32, right: f32, content_width: Option<f32>| {
             Component::boxed(
@@ -7309,6 +8518,34 @@ mod tests {
             (floating.width - expected_width).abs() < 0.01,
             "an auto-width float must use its intrinsic border box exactly: expected={expected_width}, actual={floating:?}"
         );
+    }
+
+    #[test]
+    fn right_float_aligns_to_the_containing_block_end() {
+        let floating = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                float: WFloat::Right,
+                width: WDim::Px(50.0),
+                height: WDim::Px(20.0),
+                ..Style::default()
+            },
+            Vec::new(),
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(100.0),
+                ..Style::default()
+            },
+            vec![floating],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let root_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let float_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+
+        assert_eq!(float_rect.x, root_rect.x + 50.0);
     }
 
     #[test]

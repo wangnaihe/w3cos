@@ -651,11 +651,12 @@ fn render_node(
 
     let color_chain = if in_layer { None } else { css_filter.as_ref() };
     let bg = node_color(style.background, opacity, color_chain);
+    let background_rect = crate::paint_artifact::box_background_paint_rect(style, rect);
 
     if bg.a > 0 {
-        draw_rect(scene, rect, bg, style.border_radius, dpi);
+        draw_rect(scene, background_rect, bg, style.border_radius, dpi);
     }
-    for layer in crate::background_image::background_paint_layers(style, rect)
+    for layer in crate::background_image::background_paint_layers(style, background_rect)
         .into_iter()
         .rev()
     {

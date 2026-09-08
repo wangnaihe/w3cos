@@ -767,16 +767,23 @@ fn render_node(
     }
 
     let bg = style.background;
+    let background_rect = crate::paint_artifact::box_background_paint_rect(style, rect);
     if bg.a > 0 {
         draw_rounded_rect(
             canvas,
-            rect,
+            background_rect,
             style.border_corner_radii(),
             &color_paint(bg, style.opacity),
         );
     }
     if style.background_image.is_some() {
-        draw_background_image(canvas, rect, style.border_radius, style, style.opacity);
+        draw_background_image(
+            canvas,
+            background_rect,
+            style.border_radius,
+            style,
+            style.opacity,
+        );
     }
     let has_edge_border = style.border_top_width.is_some()
         || style.border_right_width.is_some()
@@ -1312,9 +1319,23 @@ fn draw_text_in_rect(
         );
         let line_height = style.font_size * style.line_height;
         let advance = measure_skia_text_advance(&layout.lines[0], typeface, style);
-        let x = aligned_text_x(content, effective_text_align(style), ink.left, advance);
+        let alignment_ink_left = if style_uses_ahem(style)
+            && layout.lines[0].chars().next().is_some_and(char::is_whitespace)
+        {
+            0.0
+        } else {
+            ink.left
+        };
+        let x = aligned_text_x(
+            content,
+            effective_text_align(style),
+            alignment_ink_left,
+            advance,
+        );
+        let ink_bottom_overflow = (ink.top + ink.height - line_height).max(0.0);
         let top = content.y
-            + text_vertical_offset(style, content.height, line_height);
+            + text_vertical_offset(style, content.height, line_height)
+            - ink_bottom_overflow;
         draw_text_line(
             canvas,
             x,
@@ -1343,7 +1364,19 @@ fn draw_text_in_rect(
             Some(style),
         );
         let advance = measure_skia_text_advance(line, typeface, style);
-        let x = aligned_text_x(content, effective_text_align(style), ink.left, advance);
+        let alignment_ink_left = if style_uses_ahem(style)
+            && line.chars().next().is_some_and(char::is_whitespace)
+        {
+            0.0
+        } else {
+            ink.left
+        };
+        let x = aligned_text_x(
+            content,
+            effective_text_align(style),
+            alignment_ink_left,
+            advance,
+        );
         draw_text_line(
             canvas,
             x,
@@ -2257,6 +2290,46 @@ mod tests {
         assert!(
             !has_ink_after_clip,
             "nowrap glyphs must not paint beyond the text leaf overflow clip"
+        );
+    }
+
+    #[test]
+    fn single_line_descender_stays_within_nominal_line_height() {
+        let mut surface = Surface::new_raster_n32_premul((32, 32)).unwrap();
+        surface.canvas().clear(Color::TRANSPARENT);
+        let typeface = FontMgr::default()
+            .new_from_data(TEST_FONT, None)
+            .expect("Skia test typeface");
+        let metrics_font = test_font();
+        let style = Style {
+            color: w3cos_std::color::Color::BLACK,
+            font_size: 20.0,
+            line_height: 1.2,
+            ..Style::default()
+        };
+
+        draw_text_in_rect(
+            surface.canvas(),
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 32.0,
+                height: 24.0,
+            },
+            "p",
+            &style,
+            &typeface,
+            &metrics_font,
+        );
+
+        let info = ImageInfo::new((32, 32), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 32 * 32 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 32 * 4, (0, 0)));
+        assert!(
+            pixels[24 * 32 * 4..]
+                .chunks_exact(4)
+                .all(|pixel| pixel[3] == 0),
+            "fallback glyph ink must not leak below its nominal line box"
         );
     }
 
