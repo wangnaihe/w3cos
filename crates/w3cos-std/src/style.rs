@@ -152,6 +152,10 @@ pub struct Style {
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
     pub line_height: f32,
+    #[serde(default = "default_text_indent")]
+    pub text_indent: Dimension,
+    #[serde(default)]
+    pub text_transform: TextTransform,
     pub letter_spacing: f32,
     #[serde(default)]
     pub word_spacing: f32,
@@ -289,6 +293,8 @@ impl Default for Style {
             text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
             line_height: 1.2,
+            text_indent: Dimension::Px(0.0),
+            text_transform: TextTransform::None,
             letter_spacing: 0.0,
             word_spacing: 0.0,
             text_decoration: TextDecoration::None,
@@ -410,6 +416,8 @@ impl Style {
             text_align,
             white_space,
             line_height,
+            text_indent,
+            text_transform,
             letter_spacing,
             word_spacing,
             text_decoration,
@@ -513,6 +521,8 @@ impl Style {
             text_align: text_align_b,
             white_space: white_space_b,
             line_height: line_height_b,
+            text_indent: text_indent_b,
+            text_transform: text_transform_b,
             letter_spacing: letter_spacing_b,
             word_spacing: word_spacing_b,
             text_decoration: text_decoration_b,
@@ -614,6 +624,8 @@ impl Style {
             && text_align == text_align_b
             && white_space == white_space_b
             && line_height == line_height_b
+            && text_indent == text_indent_b
+            && text_transform == text_transform_b
             && letter_spacing == letter_spacing_b
             && word_spacing == word_spacing_b
             && text_decoration == text_decoration_b
@@ -651,6 +663,30 @@ impl Style {
 
 const fn default_overflow_anchor() -> bool {
     true
+}
+
+const fn default_text_indent() -> Dimension {
+    Dimension::Px(0.0)
+}
+
+impl Style {
+    /// Resolve `text-indent` against the containing block and viewport.
+    pub fn resolved_text_indent(
+        &self,
+        containing_width: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) -> f32 {
+        match self.text_indent {
+            Dimension::Px(value) => value,
+            Dimension::Percent(value) => containing_width * value / 100.0,
+            Dimension::Rem(value) => value * 16.0,
+            Dimension::Em(value) => value * self.font_size,
+            Dimension::Vw(value) => viewport_width * value / 100.0,
+            Dimension::Vh(value) => viewport_height * value / 100.0,
+            Dimension::Auto => 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1089,6 +1125,100 @@ pub enum TextDecoration {
     Underline,
     LineThrough,
     Overline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TextTransform {
+    #[default]
+    None,
+    Capitalize,
+    Uppercase,
+    Lowercase,
+}
+
+pub fn transformed_text<'a>(
+    text: &'a str,
+    transform: TextTransform,
+    language: Option<&str>,
+    continues_word: bool,
+) -> std::borrow::Cow<'a, str> {
+    let turkic = language.is_some_and(|language| {
+        language == "tr"
+            || language.starts_with("tr-")
+            || language == "az"
+            || language.starts_with("az-")
+    });
+    match transform {
+        TextTransform::None => std::borrow::Cow::Borrowed(text),
+        TextTransform::Uppercase => {
+            let mut output = String::with_capacity(text.len());
+            for character in text.chars() {
+                if turkic && character == 'i' {
+                    output.push('\u{0130}');
+                } else if turkic && character == '\u{0131}' {
+                    output.push('I');
+                } else {
+                    push_css_uppercase(&mut output, character);
+                }
+            }
+            std::borrow::Cow::Owned(output)
+        }
+        TextTransform::Lowercase => {
+            let mut output = String::with_capacity(text.len());
+            for character in text.chars() {
+                if turkic && character == 'I' {
+                    output.push('\u{0131}');
+                } else if turkic && character == '\u{0130}' {
+                    output.push('i');
+                } else {
+                    output.extend(character.to_lowercase());
+                }
+            }
+            std::borrow::Cow::Owned(output)
+        }
+        TextTransform::Capitalize => {
+            let mut output = String::with_capacity(text.len());
+            let mut at_word_start = !continues_word;
+            for character in text.chars() {
+                if character.is_alphanumeric() {
+                    if at_word_start {
+                        push_css_uppercase(&mut output, character);
+                    } else {
+                        output.push(character);
+                    }
+                    at_word_start = false;
+                } else {
+                    output.push(character);
+                    at_word_start = true;
+                }
+            }
+            std::borrow::Cow::Owned(output)
+        }
+    }
+}
+
+fn push_css_uppercase(output: &mut String, character: char) {
+    let codepoint = character as u32;
+    if (0x10d0..=0x10ff).contains(&codepoint) {
+        // CSS 2.1's bicameral mapping baseline treats Georgian Mkhedruli as
+        // unicase; do not apply the newer Unicode Mtavruli case mapping.
+        output.push(character);
+        return;
+    }
+    let simple_greek_uppercase = match codepoint {
+        0x1f80..=0x1f87 | 0x1f90..=0x1f97 | 0x1fa0..=0x1fa7 => {
+            char::from_u32(codepoint + 8)
+        }
+        0x1fb3 => Some('\u{1fbc}'),
+        0x1fc3 => Some('\u{1fcc}'),
+        0x1ff3 => Some('\u{1ffc}'),
+        _ => None,
+    };
+    if let Some(character) = simple_greek_uppercase {
+        output.push(character);
+    } else {
+        output.extend(character.to_uppercase());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]

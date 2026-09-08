@@ -1290,6 +1290,22 @@ impl DocumentByteDecoder {
         }
         let encoding = if let Some(charset) = transport_charset {
             encoding_for_label(&charset)?
+        } else if content_type
+            .split(';')
+            .next()
+            .is_some_and(|media_type| {
+                let media_type = media_type.trim().to_ascii_lowercase();
+                media_type == "application/xml"
+                    || media_type == "application/xhtml+xml"
+                    || media_type == "image/svg+xml"
+                    || media_type.ends_with("+xml")
+            })
+        {
+            // XML entities default to UTF-8 in the absence of a BOM,
+            // transport charset, or XML declaration. Applying HTML's
+            // windows-1252 fallback here corrupts every non-ASCII character
+            // in XHTML served without an explicit charset.
+            encoding_rs::UTF_8
         } else if let Some(charset) = sniff_meta_charset(bytes) {
             html_meta_encoding_for_label(&charset)?
         } else {
@@ -17596,6 +17612,15 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         assert_eq!(bom, 2);
         assert_eq!(utf16.decode(&[0x3d, 0xd8], false).unwrap(), "");
         assert_eq!(utf16.decode(&[0x00, 0xde], true).unwrap(), "\u{1f600}");
+    }
+
+    #[test]
+    fn xhtml_without_an_explicit_charset_defaults_to_utf8() {
+        assert_eq!(
+            decode_document_bytes("<p>X\u{a0}X</p>".as_bytes(), "application/xhtml+xml")
+                .unwrap(),
+            "<p>X\u{a0}X</p>"
+        );
     }
 
     #[test]

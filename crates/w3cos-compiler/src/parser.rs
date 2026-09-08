@@ -171,6 +171,8 @@ pub struct StyleDecl {
     pub text_align: Option<String>,
     pub white_space: Option<String>,
     pub line_height: Option<f32>,
+    pub text_indent: Option<String>,
+    pub text_transform: Option<String>,
     pub letter_spacing: Option<f32>,
     pub text_decoration: Option<String>,
     pub text_overflow: Option<String>,
@@ -1275,6 +1277,10 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                 "flexWrap" | "flex_wrap" => style.flex_wrap = Some(unquote(val)),
                 "minWidth" | "min_width" => style.min_width = Some(unquote(val)),
                 "textAlign" | "text_align" => style.text_align = Some(unquote(val)),
+                "textIndent" | "text_indent" => style.text_indent = Some(unquote(val)),
+                "textTransform" | "text_transform" => {
+                    style.text_transform = Some(unquote(val))
+                }
                 "opacity" => {
                     let v = unquote(val);
                     if let Some(name) = v.strip_prefix('@') {

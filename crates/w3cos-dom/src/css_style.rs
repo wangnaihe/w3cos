@@ -239,7 +239,9 @@ impl CSSStyleDeclaration {
                 if let Some((width, max_width)) = parse_min_percent_and_fixed(value) {
                     self.inner.width = width;
                     self.inner.max_width = max_width;
-                } else if let Some(width) = parse_dimension_checked(value) {
+                } else if let Some(width) =
+                    parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
+                {
                     self.inner.width = width;
                 }
             }
@@ -247,27 +249,37 @@ impl CSSStyleDeclaration {
                 if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
                     self.inner.height = height;
                     self.inner.max_height = max_height;
-                } else if let Some(height) = parse_dimension_checked(value) {
+                } else if let Some(height) =
+                    parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
+                {
                     self.inner.height = height;
                 }
             }
             "min-width" | "minWidth" => {
-                if let Some(value) = parse_dimension_checked(value) {
+                if let Some(value) =
+                    parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
+                {
                     self.inner.min_width = value;
                 }
             }
             "min-height" | "minHeight" => {
-                if let Some(value) = parse_dimension_checked(value) {
+                if let Some(value) =
+                    parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
+                {
                     self.inner.min_height = value;
                 }
             }
             "max-width" | "maxWidth" => {
-                if let Some(value) = parse_dimension_checked(value) {
+                if let Some(value) =
+                    parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
+                {
                     self.inner.max_width = value;
                 }
             }
             "max-height" | "maxHeight" => {
-                if let Some(value) = parse_dimension_checked(value) {
+                if let Some(value) =
+                    parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
+                {
                     self.inner.max_height = value;
                 }
             }
@@ -528,16 +540,55 @@ impl CSSStyleDeclaration {
                 }
             }
             "line-height" | "lineHeight" => {
-                let value = value.trim();
-                if let Some(px) = value.strip_suffix("px").and_then(|v| v.parse::<f32>().ok()) {
-                    self.inner.line_height = (px / self.inner.font_size.max(1.0)).max(0.0);
-                } else if let Ok(v) = value.parse::<f32>() {
-                    self.inner.line_height = v.max(0.0);
+                if let Some(line_height) = parse_font_line_height(value, self.inner.font_size) {
+                    self.inner.line_height = line_height;
+                }
+            }
+            "text-indent" | "textIndent" => {
+                let indent = value
+                    .trim()
+                    .strip_suffix("ex")
+                    .and_then(|number| number.trim().parse::<f32>().ok())
+                    .map(|number| Dimension::Em(number * 0.5))
+                    .or_else(|| parse_dimension_checked(value));
+                if let Some(indent) = indent
+                    && !matches!(indent, Dimension::Auto)
+                {
+                    self.inner.text_indent = indent;
+                }
+            }
+            "text-transform" | "textTransform" => {
+                if let Some(transform) = parse_text_transform(value) {
+                    self.inner.text_transform = transform;
                 }
             }
             "letter-spacing" | "letterSpacing" => {
-                if let Some(v) = parse_px(value) {
-                    self.inner.letter_spacing = v;
+                let value = value.trim();
+                let spacing = if value.eq_ignore_ascii_case("normal") {
+                    Some(0.0)
+                } else if let Some(number) = value.strip_suffix("rem") {
+                    number
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .map(|number| number * 16.0)
+                } else if let Some(number) = value.strip_suffix("em") {
+                    number
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .map(|number| number * self.inner.font_size)
+                } else if let Some(number) = value.strip_suffix("ex") {
+                    number
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .map(|number| number * self.inner.font_size * 0.5)
+                } else {
+                    parse_px(value)
+                };
+                if let Some(spacing) = spacing {
+                    self.inner.letter_spacing = spacing;
                 }
             }
             "word-spacing" | "wordSpacing" => {
@@ -817,6 +868,14 @@ impl CSSStyleDeclaration {
             "min-height" | "minHeight" => dimension_to_css(&self.inner.min_height),
             "max-width" | "maxWidth" => dimension_to_css(&self.inner.max_width),
             "max-height" | "maxHeight" => dimension_to_css(&self.inner.max_height),
+            "text-indent" | "textIndent" => dimension_to_css(&self.inner.text_indent),
+            "text-transform" | "textTransform" => match self.inner.text_transform {
+                w3cos_std::style::TextTransform::None => "none",
+                w3cos_std::style::TextTransform::Capitalize => "capitalize",
+                w3cos_std::style::TextTransform::Uppercase => "uppercase",
+                w3cos_std::style::TextTransform::Lowercase => "lowercase",
+            }
+            .to_string(),
             "flex-grow" | "flexGrow" => format!("{}", self.inner.flex_grow),
             "flex-shrink" | "flexShrink" => format!("{}", self.inner.flex_shrink),
             "flex-direction" | "flexDirection" => {
@@ -1020,6 +1079,14 @@ fn parse_spacing(value: &str) -> Option<Spacing> {
     let value = value.trim();
     if value == "auto" {
         return Some(Spacing::Auto);
+    }
+    if let Some(number) = value.strip_suffix("ex")
+        && let Ok(number) = number.trim().parse::<f32>()
+    {
+        // The portable style currently has no font-metric-relative Ex unit.
+        // Ahem and the deterministic bundled faces use the CSS fallback
+        // x-height of 0.5em, so retain the value as an equivalent Em length.
+        return Some(Spacing::Em(number * 0.5));
     }
     for (suffix, constructor) in [
         ("rem", Spacing::Rem as fn(f32) -> Spacing),
@@ -1300,6 +1367,18 @@ fn parse_dimension_checked(value: &str) -> Option<Dimension> {
         return Some(Dimension::Px(px));
     }
     None
+}
+
+fn dimension_is_non_negative_or_auto(value: &Dimension) -> bool {
+    match *value {
+        Dimension::Auto => true,
+        Dimension::Px(value)
+        | Dimension::Percent(value)
+        | Dimension::Rem(value)
+        | Dimension::Em(value)
+        | Dimension::Vw(value)
+        | Dimension::Vh(value) => value >= 0.0,
+    }
 }
 
 /// Resolve the common responsive `min(100%, <fixed-length>)` shape into the
@@ -1615,6 +1694,17 @@ fn parse_text_decoration(value: &str) -> w3cos_std::style::TextDecoration {
     }
 }
 
+fn parse_text_transform(value: &str) -> Option<w3cos_std::style::TextTransform> {
+    use w3cos_std::style::TextTransform;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(TextTransform::None),
+        "capitalize" => Some(TextTransform::Capitalize),
+        "uppercase" => Some(TextTransform::Uppercase),
+        "lowercase" => Some(TextTransform::Lowercase),
+        _ => None,
+    }
+}
+
 fn parse_text_overflow(value: &str) -> w3cos_std::style::TextOverflow {
     use w3cos_std::style::TextOverflow;
     match value.trim() {
@@ -1714,6 +1804,27 @@ fn parse_font_line_height(value: &str, font_size: f32) -> Option<f32> {
     if value == "normal" {
         return Some(1.2);
     }
+    if let Some(number) = value.strip_suffix("rem") {
+        return number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|number| (number * 16.0 / font_size.max(1.0)).max(0.0));
+    }
+    if let Some(number) = value.strip_suffix("em") {
+        return number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|number| number.max(0.0));
+    }
+    if let Some(number) = value.strip_suffix("ex") {
+        return number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|number| (number * 0.5).max(0.0));
+    }
     if let Some(number) = value.strip_suffix('%') {
         return number
             .trim()
@@ -1795,6 +1906,26 @@ mod font_shorthand_tests {
         let style = declaration.to_style();
         assert_eq!(style.line_height, 1.25);
         assert_eq!(style.font_family.as_deref(), Some("serif"));
+    }
+
+    #[test]
+    fn font_shorthand_resolves_em_line_height_against_its_font_size() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font", "16px/1em Ahem");
+
+        let style = declaration.to_style();
+        assert_eq!(style.font_size, 16.0);
+        assert_eq!(style.line_height, 1.0);
+        assert_eq!(style.font_family.as_deref(), Some("Ahem"));
+    }
+
+    #[test]
+    fn line_height_longhand_resolves_em_against_the_computed_font_size() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "20px");
+        declaration.set_property("line-height", "1em");
+
+        assert_eq!(declaration.to_style().line_height, 1.0);
     }
 }
 
@@ -2466,6 +2597,35 @@ mod tests {
     }
 
     #[test]
+    fn letter_spacing_em_resolves_against_the_computed_font_size() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "20px");
+        declaration.set_property("letter-spacing", "6em");
+        assert_eq!(declaration.to_style().letter_spacing, 120.0);
+    }
+
+    #[test]
+    fn text_indent_preserves_relative_units_and_accepts_signed_absolute_lengths() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "20px");
+        declaration.set_property("text-indent", "+72pt");
+        assert_eq!(declaration.to_style().text_indent, Dimension::Px(96.0));
+        assert_eq!(declaration.get_property("text-indent"), "96px");
+
+        declaration.set_property("text-indent", "200%");
+        let style = declaration.to_style();
+        assert_eq!(style.text_indent, Dimension::Percent(200.0));
+        assert_eq!(style.resolved_text_indent(80.0, 320.0, 240.0), 160.0);
+
+        declaration.set_property("text-indent", "-100em");
+        let style = declaration.to_style();
+        assert_eq!(style.resolved_text_indent(80.0, 320.0, 240.0), -2000.0);
+
+        declaration.set_property("text-indent", "+12ex");
+        assert_eq!(declaration.to_style().text_indent, Dimension::Em(6.0));
+    }
+
+    #[test]
     fn negative_margin_and_character_relative_lengths_remain_valid() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("font-size", "10px");
@@ -2481,6 +2641,15 @@ mod tests {
                 left: Spacing::Em(-1.0),
             }
         );
+    }
+
+    #[test]
+    fn ex_margin_resolves_to_the_fallback_half_em_x_height() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("font-size", "20px");
+        declaration.set_property("margin-left", "12ex");
+        assert_eq!(declaration.inner.margin.left, Spacing::Em(6.0));
+        assert_eq!(declaration.to_style().margin_lengths().left, 120.0);
     }
 
     #[test]
@@ -2612,11 +2781,14 @@ mod tests {
     fn invalid_width_and_background_preserve_prior_declarations() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("width", "10em");
+        declaration.set_property("height", "1in");
         declaration.set_property("background", "green");
         declaration.set_property("width", "\"auto\"");
+        declaration.set_property("height", "-1px");
         declaration.set_property("background", "\"red\"");
 
         assert_eq!(declaration.inner.width, Dimension::Em(10.0));
+        assert_eq!(declaration.inner.height, Dimension::Px(96.0));
         assert_eq!(
             declaration.inner.background,
             Color::from_css("green").unwrap()
@@ -2627,6 +2799,23 @@ mod tests {
             declaration.inner.background,
             Color::from_css("green").unwrap()
         );
+    }
+
+    #[test]
+    fn text_transform_round_trips_supported_keywords() {
+        use w3cos_std::style::TextTransform;
+
+        for (value, expected) in [
+            ("none", TextTransform::None),
+            ("capitalize", TextTransform::Capitalize),
+            ("uppercase", TextTransform::Uppercase),
+            ("lowercase", TextTransform::Lowercase),
+        ] {
+            let mut declaration = CSSStyleDeclaration::new();
+            declaration.set_property("text-transform", value);
+            assert_eq!(declaration.inner.text_transform, expected);
+            assert_eq!(declaration.get_property("text-transform"), value);
+        }
     }
 }
 #[test]

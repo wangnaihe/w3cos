@@ -1225,6 +1225,8 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "text-align" => style.text_align = Some(value.to_string()),
         "white-space" => style.white_space = Some(value.to_string()),
         "line-height" => style.line_height = css_parse_px(value).or_else(|| value.parse().ok()),
+        "text-indent" => style.text_indent = Some(value.to_string()),
+        "text-transform" => style.text_transform = Some(value.to_string()),
         "letter-spacing" => style.letter_spacing = css_parse_px(value),
         "text-decoration" => style.text_decoration = Some(value.to_string()),
         "text-overflow" => style.text_overflow = Some(value.to_string()),
@@ -1589,6 +1591,12 @@ mod tests {
         let style = &sheet.rules[0].style;
         assert_eq!(style.line_height, Some(1.25));
         assert_eq!(style.font_family.as_deref(), Some("serif"));
+    }
+
+    #[test]
+    fn text_indent_is_retained_for_typed_codegen() {
+        let sheet = parse_css("p { text-indent: +72pt; }");
+        assert_eq!(sheet.rules[0].style.text_indent.as_deref(), Some("+72pt"));
     }
 
     #[test]

@@ -470,6 +470,12 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     if let Some(lh) = s.line_height {
         parts.push(format!("line-height:{lh}"));
     }
+    if let Some(indent) = s.text_indent.as_ref() {
+        parts.push(format!("text-indent:{indent}"));
+    }
+    if let Some(transform) = s.text_transform.as_ref() {
+        parts.push(format!("text-transform:{transform}"));
+    }
     if let Some(ws) = s.white_space.as_ref() {
         let v = match ws.as_str() {
             "nowrap" | "noWrap" => "nowrap",

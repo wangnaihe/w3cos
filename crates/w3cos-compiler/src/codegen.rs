@@ -673,6 +673,15 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     if let Some(lh) = s.line_height {
         fields.push(format!("line_height: {lh}_f32"));
     }
+    if let Some(ref indent) = s.text_indent {
+        fields.push(format!("text_indent: {}", gen_dimension(indent)));
+    }
+    if let Some(ref transform) = s.text_transform {
+        fields.push(format!(
+            "text_transform: {}",
+            gen_text_transform(transform)
+        ));
+    }
     if let Some(ref c) = s.color {
         fields.push(format!("color: {}", gen_color_rust(c, "Color::BLACK")));
     }
@@ -1107,6 +1116,15 @@ fn gen_text_decoration(s: &str) -> String {
     }
 }
 
+fn gen_text_transform(s: &str) -> String {
+    match s {
+        "capitalize" => "TextTransform::Capitalize".to_string(),
+        "uppercase" => "TextTransform::Uppercase".to_string(),
+        "lowercase" => "TextTransform::Lowercase".to_string(),
+        _ => "TextTransform::None".to_string(),
+    }
+}
+
 fn gen_text_overflow(s: &str) -> String {
     match s {
         "ellipsis" => "TextOverflow::Ellipsis".to_string(),
@@ -1217,7 +1235,15 @@ fn gen_will_change(s: &str) -> String {
 
 fn gen_dimension(val: &str) -> String {
     let val = val.trim();
+    if let Some(number) = val.strip_suffix("ex")
+        && let Ok(number) = number.trim().parse::<f32>()
+    {
+        return format!("Dimension::Em({}_f32)", number * 0.5);
+    }
     if let Some(px) = css_values::css_parse_calc_px(val) {
+        return format!("Dimension::Px({px}_f32)");
+    }
+    if let Some(px) = w3cos_std::style::parse_absolute_length_px(val) {
         return format!("Dimension::Px({px}_f32)");
     }
     let suffixes: &[(&str, &str)] = &[

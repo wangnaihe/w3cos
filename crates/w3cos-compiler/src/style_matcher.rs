@@ -217,6 +217,8 @@ pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
         text_align,
         white_space,
         line_height,
+        text_indent,
+        text_transform,
         letter_spacing,
         text_decoration,
         text_overflow,

@@ -1272,6 +1272,26 @@ fn draw_text_in_rect(
     _metrics_font: &fontdue::Font,
 ) {
     let content = text_paint_box(rect, style);
+    let image_info = canvas.image_info();
+    let indent = style.resolved_text_indent(
+        content.width,
+        image_info.width() as f32,
+        image_info.height() as f32,
+    );
+    let first_line_content = match style.direction {
+        w3cos_std::style::TextDirection::Ltr => LayoutRect {
+            x: content.x + indent,
+            width: (content.width - indent).max(1.0),
+            ..content
+        },
+        w3cos_std::style::TextDirection::Rtl => LayoutRect {
+            // A negative RTL indent is already represented by the block's
+            // logical-start geometry in the portable line-box lowering.
+            // Only contract the paintable first line for a positive indent.
+            width: (content.width - indent.max(0.0)).max(1.0),
+            ..content
+        },
+    };
     // An overflow clip belongs to the element itself as well as its
     // descendants. The retained prepaint clip chain only carries ancestor
     // clips, so a leaf text node must clip its own glyph paint explicitly.
@@ -1294,9 +1314,10 @@ fn draw_text_in_rect(
         save
     });
     let registry = crate::font_face::FontRegistry::global();
-    let layout = text_layout::retained_text_paint_layout_with_run_width(
+    let layout = text_layout::retained_text_paint_layout_with_run_width_and_first_line(
         text,
         content.width,
+        first_line_content.width,
         style.font_size,
         style.white_space,
         registry.cascade_cache_key(style, text) ^ 0x534b_4941_5445_5801,
@@ -1321,22 +1342,36 @@ fn draw_text_in_rect(
         );
         let line_height = style.font_size * style.line_height;
         let advance = measure_skia_text_advance(&layout.lines[0], typeface, style);
-        let alignment_ink_left = if style_uses_ahem(style)
-            && layout.lines[0].chars().next().is_some_and(char::is_whitespace)
-        {
+        let alignment_ink_left = if style_uses_generic_monospace(style) {
             0.0
+        } else if layout.lines[0]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            measure_skia_text_ink_bounds(
+                layout.lines[0].trim_start_matches(char::is_whitespace),
+                style.font_size,
+                typeface,
+                style.font_weight,
+                Some(style),
+            )
+            .left
         } else {
             ink.left
         };
         let x = aligned_text_x(
-            content,
+            first_line_content,
             effective_text_align(style),
             alignment_ink_left,
             advance,
         );
-        let ink_bottom_overflow = (ink.top + ink.height - line_height).max(0.0);
-        let top = content.y
-            + text_vertical_offset(style, content.height, line_height)
+        let ink_bottom_overflow = if line_height <= 0.0 {
+            0.0
+        } else {
+            (ink.top + ink.height - line_height).max(0.0)
+        };
+        let top = content.y + text_vertical_offset(style, content.height, line_height)
             - ink_bottom_overflow;
         draw_text_line(
             canvas,
@@ -1366,15 +1401,27 @@ fn draw_text_in_rect(
             Some(style),
         );
         let advance = measure_skia_text_advance(line, typeface, style);
-        let alignment_ink_left = if style_uses_ahem(style)
-            && line.chars().next().is_some_and(char::is_whitespace)
-        {
+        let alignment_ink_left = if style_uses_generic_monospace(style) {
             0.0
+        } else if line.chars().next().is_some_and(char::is_whitespace) {
+            measure_skia_text_ink_bounds(
+                line.trim_start_matches(char::is_whitespace),
+                style.font_size,
+                typeface,
+                style.font_weight,
+                Some(style),
+            )
+            .left
         } else {
             ink.left
         };
+        let line_content = if index == 0 {
+            first_line_content
+        } else {
+            content
+        };
         let x = aligned_text_x(
-            content,
+            line_content,
             effective_text_align(style),
             alignment_ink_left,
             advance,
@@ -1397,12 +1444,9 @@ fn draw_text_in_rect(
 }
 
 fn text_vertical_offset(style: &Style, content_height: f32, text_height: f32) -> f32 {
-    let is_extended_inline_fragment = style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|properties| {
-            properties.contains_key("--w3cos-internal-vertical-align-length")
-        });
+    let is_extended_inline_fragment = style.custom_properties.as_ref().is_some_and(|properties| {
+        properties.contains_key("--w3cos-internal-vertical-align-length")
+    });
     if is_extended_inline_fragment
         || (style.display == Display::Block && style.justify_content != JustifyContent::Center)
     {
@@ -1449,7 +1493,9 @@ fn effective_text_align(style: &Style) -> TextAlign {
     // its own margin box. The DOM lowering represents those fragments as
     // Text leaves, so keep their glyphs at the content-box start and let the
     // anonymous line row perform the authored alignment.
-    if style.display == Display::Inline {
+    if style.display == Display::Inline
+        && style.width != w3cos_std::style::Dimension::Percent(100.0)
+    {
         return TextAlign::Left;
     }
     // DOM text content is lowered into the host Text component instead of an
@@ -1493,21 +1539,15 @@ fn draw_text_line(
     if style_uses_ahem(style) {
         let mut cursor_x = x;
         let snapped_top = top.round();
-        let render_text = text_layout::font_render_text(text, style.direction);
-        for character in render_text.chars() {
+        let render_text = text_layout::font_render_text_for_style(text, style);
+        let character_count = render_text.chars().count();
+        for (index, character) in render_text.chars().enumerate() {
             if !character.is_whitespace() {
-                // The CSS Ahem test font's capital E-acute paints an 0.8em
-                // block at the top of its 1em cell. Reftests use the exposed
-                // lower 0.2em to verify inline background and baseline shifts.
-                let glyph_height = if character == '\u{00c9}' {
-                    font_size * 0.8
-                } else {
-                    font_size
-                };
+                let (glyph_top, glyph_height) = ahem_glyph_vertical_bounds(character, font_size);
                 canvas.draw_rect(
                     Rect::from_xywh(
                         cursor_x.round(),
-                        snapped_top,
+                        snapped_top + glyph_top.round(),
                         font_size.round(),
                         glyph_height.round(),
                     ),
@@ -1515,14 +1555,42 @@ fn draw_text_line(
                 );
             }
             cursor_x += font_size;
-            if character.is_whitespace() {
+            if index + 1 < character_count {
+                cursor_x += style.letter_spacing;
+            }
+            if is_word_spacing_character(character) {
+                cursor_x += style.word_spacing;
+            }
+        }
+        return cursor_x - x;
+    }
+    if style_uses_generic_monospace(style) {
+        let mut cursor_x = x;
+        let font = Font::new(typeface, font_size);
+        let monospace_advance = font.measure_str("0", Some(&paint)).0;
+        let render_text = text_layout::font_render_text_for_style(text, style);
+        let character_count = render_text.chars().count();
+        for (index, character) in render_text.chars().enumerate() {
+            if !character.is_whitespace() {
+                canvas.draw_str(
+                    character.to_string(),
+                    (cursor_x.round(), (top + font_size).round()),
+                    &font,
+                    &paint,
+                );
+            }
+            cursor_x += monospace_advance;
+            if index + 1 < character_count {
+                cursor_x += style.letter_spacing;
+            }
+            if is_word_spacing_character(character) {
                 cursor_x += style.word_spacing;
             }
         }
         return cursor_x - x;
     }
     let mut cursor_x = x;
-    let font_text = text_layout::font_render_text(text, style.direction);
+    let font_text = text_layout::font_render_text_for_style(text, style);
     for run in css_font_runs(font_text.as_ref(), typeface, style) {
         let font = Font::new(run.typeface, font_size);
         canvas.draw_str(run.text, (cursor_x, top + font_size), &font, &paint);
@@ -1540,29 +1608,35 @@ fn measure_skia_text_ink_bounds(
 ) -> text_layout::InkBounds {
     if style.is_some_and(style_uses_ahem) {
         let style = style.expect("Ahem style checked above");
-        let render_text = text_layout::font_render_text(
-            text,
-            style.direction,
-        );
+        let render_text = text_layout::font_render_text_for_style(text, style);
+        let character_count = render_text.chars().count();
         let mut cursor = 0.0_f32;
         let mut left = None::<f32>;
         let mut right = 0.0_f32;
-        for character in render_text.chars() {
+        let mut top = f32::MAX;
+        let mut bottom = f32::MIN;
+        for (index, character) in render_text.chars().enumerate() {
             if !character.is_whitespace() {
                 left.get_or_insert(cursor);
                 right = cursor + font_size;
+                let (glyph_top, glyph_height) = ahem_glyph_vertical_bounds(character, font_size);
+                top = top.min(glyph_top);
+                bottom = bottom.max(glyph_top + glyph_height);
             }
             cursor += font_size;
-            if character.is_whitespace() {
+            if index + 1 < character_count {
+                cursor += style.letter_spacing;
+            }
+            if is_word_spacing_character(character) {
                 cursor += style.word_spacing;
             }
         }
         return match left {
             Some(left) => text_layout::InkBounds {
                 left,
-                top: 0.0,
+                top,
                 width: right - left,
-                height: font_size,
+                height: bottom - top,
             },
             _ => text_layout::InkBounds::empty(),
         };
@@ -1574,11 +1648,9 @@ fn measure_skia_text_ink_bounds(
     let mut bottom = f32::MIN;
     let mut saw_ink = false;
 
-    let font_text = text_layout::font_render_text(
-        text,
-        style.map_or(w3cos_std::style::TextDirection::Ltr, |style| {
-            style.direction
-        }),
+    let font_text = style.map_or_else(
+        || text_layout::font_render_text(text, w3cos_std::style::TextDirection::Ltr),
+        |style| text_layout::font_render_text_for_style(text, style),
     );
     let runs = style.map_or_else(
         || fallback_font_runs(font_text.as_ref(), typeface, font_weight),
@@ -1609,15 +1681,39 @@ fn measure_skia_text_ink_bounds(
     }
 }
 
+fn ahem_glyph_vertical_bounds(character: char, font_size: f32) -> (f32, f32) {
+    match character {
+        // The Ahem face exposes an 0.2em descender-only `p`. CSS painting
+        // order tests use it to prove that the glyph covers an underline.
+        'p' => (font_size * 0.8, font_size * 0.2),
+        // Capital E-acute occupies the top 0.8em of its cell. Reftests use
+        // the exposed lower 0.2em for inline background/baseline checks.
+        '\u{00c9}' => (0.0, font_size * 0.8),
+        _ => (0.0, font_size),
+    }
+}
+
 fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> f32 {
-    let render_text = text_layout::font_render_text(text, style.direction);
+    let render_text = text_layout::font_render_text_for_style(text, style);
     let word_spacing = render_text
         .chars()
-        .filter(|character| character.is_whitespace())
+        .filter(|character| is_word_spacing_character(*character))
         .count() as f32
         * style.word_spacing;
     if style_uses_ahem(style) {
-        return render_text.chars().count() as f32 * style.font_size + word_spacing;
+        let character_count = render_text.chars().count();
+        return character_count as f32 * style.font_size
+            + character_count.saturating_sub(1) as f32 * style.letter_spacing
+            + word_spacing;
+    }
+    if style_uses_generic_monospace(style) {
+        let character_count = render_text.chars().count();
+        let monospace_advance = Font::new(typeface, style.font_size)
+            .measure_str("0", None)
+            .0;
+        return character_count as f32 * monospace_advance
+            + character_count.saturating_sub(1) as f32 * style.letter_spacing
+            + word_spacing;
     }
     css_font_runs(render_text.as_ref(), typeface, style)
         .into_iter()
@@ -1630,6 +1726,10 @@ fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> 
         + word_spacing
 }
 
+fn is_word_spacing_character(character: char) -> bool {
+    matches!(character, ' ' | '\u{00a0}')
+}
+
 fn style_uses_ahem(style: &Style) -> bool {
     style.font_family.as_deref().is_some_and(|families| {
         families.split(',').any(|family| {
@@ -1637,6 +1737,17 @@ fn style_uses_ahem(style: &Style) -> bool {
                 .trim()
                 .trim_matches(['"', '\''])
                 .eq_ignore_ascii_case("ahem")
+        })
+    })
+}
+
+fn style_uses_generic_monospace(style: &Style) -> bool {
+    style.font_family.as_deref().is_some_and(|families| {
+        families.split(',').any(|family| {
+            family
+                .trim()
+                .trim_matches(['"', '\''])
+                .eq_ignore_ascii_case("monospace")
         })
     })
 }
@@ -2447,6 +2558,23 @@ mod tests {
             ..style.clone()
         };
         assert_eq!(measure_skia_text_advance("A A", &typeface, &spaced), 90.0);
+        let letter_spaced = Style {
+            letter_spacing: 96.0,
+            ..style.clone()
+        };
+        assert_eq!(
+            measure_skia_text_advance("xx", &typeface, &letter_spaced),
+            136.0
+        );
+        assert_eq!(
+            measure_skia_text_ink_bounds("xx", 20.0, &typeface, 400, Some(&letter_spaced)),
+            text_layout::InkBounds {
+                left: 0.0,
+                top: 0.0,
+                width: 136.0,
+                height: 20.0,
+            }
+        );
         assert_eq!(
             measure_skia_text_advance("\u{202e} A \u{202c}", &typeface, &style),
             60.0,
@@ -2459,6 +2587,15 @@ mod tests {
                 top: 0.0,
                 width: 20.0,
                 height: 20.0,
+            }
+        );
+        assert_eq!(
+            measure_skia_text_ink_bounds("pp", 20.0, &typeface, 400, Some(&style)),
+            text_layout::InkBounds {
+                left: 0.0,
+                top: 16.0,
+                width: 40.0,
+                height: 4.0,
             }
         );
     }

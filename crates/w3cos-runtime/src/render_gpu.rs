@@ -1252,6 +1252,18 @@ fn draw_text_in_rect(
     dpi: Affine,
 ) {
     let content = text_paint_box(rect, style);
+    let indent = style.resolved_text_indent(content.width, content.width, content.height);
+    let first_line_content = match style.direction {
+        w3cos_std::style::TextDirection::Ltr => LayoutRect {
+            x: content.x + indent,
+            width: (content.width - indent).max(1.0),
+            ..content
+        },
+        w3cos_std::style::TextDirection::Rtl => LayoutRect {
+            width: (content.width - indent).max(1.0),
+            ..content
+        },
+    };
     let clips_own_overflow = matches!(
         style.resolved_overflow_x(),
         w3cos_std::style::Overflow::Hidden
@@ -1274,9 +1286,10 @@ fn draw_text_in_rect(
     }
     let line_h = style.font_size * style.line_height;
     let registry = crate::font_face::FontRegistry::global();
-    let layout = crate::text_layout::retained_text_paint_layout_with(
+    let layout = crate::text_layout::retained_text_paint_layout_with_first_line(
         text,
         content.width,
+        first_line_content.width,
         style.font_size,
         style.white_space,
         registry.cascade_cache_key(style, text) ^ 0x4750_5554_4558_5401,
@@ -1293,12 +1306,33 @@ fn draw_text_in_rect(
 
     for (index, line) in lines.iter().enumerate() {
         let ink = layout.ink_bounds[index];
-        let align = single_line_h_align(style, content.width, ink.width);
+        let alignment_ink_left = if line.chars().next().is_some_and(char::is_whitespace) {
+            registry
+                .measure_style_ink_bounds(
+                    style,
+                    line.trim_start_matches(char::is_whitespace),
+                    style.font_size,
+                    font,
+                )
+                .left
+        } else {
+            ink.left
+        };
+        let line_content = if index == 0 {
+            first_line_content
+        } else {
+            content
+        };
+        let align = single_line_h_align(style, line_content.width, ink.width);
         let x = match align {
-            TextAlign::Right => content.x + content.width - ink.width - ink.left,
-            TextAlign::Center => content.x + (content.width - ink.width) * 0.5 - ink.left,
+            TextAlign::Right => {
+                line_content.x + line_content.width - ink.width - alignment_ink_left
+            }
+            TextAlign::Center => {
+                line_content.x + (line_content.width - ink.width) * 0.5 - alignment_ink_left
+            }
             TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
-                content.x - ink.left
+                line_content.x - alignment_ink_left
             }
         };
         let y = if lines.len() == 1 {

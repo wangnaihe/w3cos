@@ -16,6 +16,7 @@ const PARAGRAPH_SEPARATOR: char = '\u{2029}';
 struct TextPaintKey {
     text: String,
     max_width: u32,
+    first_line_width: u32,
     font: u64,
     font_size: u32,
     white_space: u8,
@@ -213,7 +214,12 @@ fn merge_orphan_punctuation_lines(lines: &mut Vec<String>) {
     }
 }
 
-fn wrap_greedy<F>(text: &str, max_width: f32, mut char_width: F) -> Vec<String>
+fn wrap_greedy<F>(
+    text: &str,
+    max_width: f32,
+    first_line_width: f32,
+    mut char_width: F,
+) -> Vec<String>
 where
     F: FnMut(char) -> f32,
 {
@@ -239,7 +245,12 @@ where
             continue;
         }
         let cw = char_width(ch);
-        if !current.is_empty() && current_w + cw > max_width {
+        let available_width = if lines.is_empty() {
+            first_line_width
+        } else {
+            max_width
+        };
+        if !current.is_empty() && current_w + cw > available_width {
             if may_not_start_line(ch) {
                 // Keep closing punctuation with the preceding character
                 // without letting the completed line exceed its paint box.
@@ -282,7 +293,12 @@ where
 /// glyph because the isolated advances were wider. Measure each candidate run
 /// with the paint backend so line breaking and intrinsic sizing share one
 /// metric space.
-fn wrap_greedy_with_run_width<F>(text: &str, max_width: f32, mut run_width: F) -> Vec<String>
+fn wrap_greedy_with_run_width<F>(
+    text: &str,
+    max_width: f32,
+    first_line_width: f32,
+    mut run_width: F,
+) -> Vec<String>
 where
     F: FnMut(&str) -> f32,
 {
@@ -304,30 +320,42 @@ where
             continue;
         }
 
-        let had_content = !current.is_empty();
         current.push(ch);
-        if had_content && run_width(&current) > max_width {
-            current.pop();
-            if ch == ' ' {
-                // A collapsible separator that selects the soft wrap point
-                // is consumed by that break; it must not become indentation
-                // on the following line. NBSP is intentionally excluded.
+        let available_width = if lines.is_empty() {
+            first_line_width
+        } else {
+            max_width
+        };
+        if current.chars().count() > 1 && run_width(&current) > available_width {
+            if let Some(space_index) = current.rfind(' ') {
+                let remainder = current[space_index + 1..]
+                    .trim_start_matches(' ')
+                    .to_string();
+                current.truncate(space_index);
+                while current.ends_with(' ') {
+                    current.pop();
+                }
                 flush(&mut lines, &mut current);
+                current = remainder;
                 continue;
             }
-            if may_not_start_line(ch) {
-                if let Some(last) = current.pop() {
+
+            let mut characters = current.chars();
+            let current_character = characters.next_back().unwrap_or(ch);
+            let previous_character = characters.next_back();
+            let cjk_break = previous_character.is_some_and(is_cjk_line_break_character)
+                || is_cjk_line_break_character(current_character);
+            if cjk_break && !may_not_start_line(current_character) {
+                current.pop();
+                if current.chars().last().is_some_and(may_not_end_line) {
+                    let opening = current.pop().unwrap();
                     flush(&mut lines, &mut current);
-                    current.push(last);
+                    current.push(opening);
+                } else {
+                    flush(&mut lines, &mut current);
                 }
-            } else if current.chars().last().is_some_and(may_not_end_line) {
-                let last = current.pop().unwrap();
-                flush(&mut lines, &mut current);
-                current.push(last);
-            } else {
-                flush(&mut lines, &mut current);
+                current.push(current_character);
             }
-            current.push(ch);
         }
     }
     if !current.is_empty() || text.ends_with('\n') {
@@ -339,6 +367,20 @@ where
     }
     merge_orphan_punctuation_lines(&mut lines);
     lines
+}
+
+fn is_cjk_line_break_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{2e80}'..='\u{2fff}'
+            | '\u{3000}'..='\u{303f}'
+            | '\u{3040}'..='\u{30ff}'
+            | '\u{31c0}'..='\u{31ef}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{ac00}'..='\u{d7af}'
+            | '\u{f900}'..='\u{faff}'
+    )
 }
 
 pub fn estimated_char_width(ch: char, font_size: f32) -> f32 {
@@ -415,6 +457,39 @@ pub(crate) fn font_render_text(
         Cow::Borrowed(text)
     } else {
         Cow::Owned(rendered)
+    }
+}
+
+pub(crate) fn font_render_text_for_style<'a>(
+    text: &'a str,
+    style: &w3cos_std::style::Style,
+) -> Cow<'a, str> {
+    let language = style.custom_properties.as_ref().and_then(|properties| {
+        properties
+            .get("--w3cos-internal-text-language")
+            .map(String::as_str)
+    });
+    let continues_word = style.custom_properties.as_ref().is_some_and(|properties| {
+        properties
+            .get("--w3cos-internal-text-transform-continues-word")
+            .is_some_and(|value| value == "1")
+    });
+    let transformed = w3cos_std::style::transformed_text(
+        text,
+        style.text_transform,
+        language,
+        continues_word,
+    );
+    if style.custom_properties.as_ref().is_some_and(|properties| {
+        properties
+            .get("--w3cos-internal-bidi-visual-order")
+            .is_some_and(|value| value == "1")
+    }) {
+        return transformed;
+    }
+    match transformed {
+        Cow::Borrowed(text) => font_render_text(text, style.direction),
+        Cow::Owned(text) => Cow::Owned(font_render_text(&text, style.direction).into_owned()),
     }
 }
 
@@ -734,7 +809,24 @@ pub fn wrap_text_with_char_width(
             .map(str::to_string)
             .collect();
     }
-    wrap_greedy(&text, max_width, char_width)
+    wrap_greedy(&text, max_width, max_width, char_width)
+}
+
+pub fn wrap_text_with_char_width_and_first_line(
+    text: &str,
+    max_width: f32,
+    first_line_width: f32,
+    white_space: WhiteSpace,
+    char_width: impl FnMut(char) -> f32,
+) -> Vec<String> {
+    let text = prepare_text_for_white_space(text, white_space);
+    if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
+        return text
+            .split(['\n', FORCED_LINE_BREAK])
+            .map(str::to_string)
+            .collect();
+    }
+    wrap_greedy(&text, max_width, first_line_width.max(1.0), char_width)
 }
 
 pub fn wrap_text_with_run_width(
@@ -759,7 +851,24 @@ pub fn wrap_text_with_run_width(
             .map(str::to_string)
             .collect();
     }
-    wrap_greedy_with_run_width(&text, max_width, run_width)
+    wrap_greedy_with_run_width(&text, max_width, max_width, run_width)
+}
+
+pub fn wrap_text_with_run_width_and_first_line(
+    text: &str,
+    max_width: f32,
+    first_line_width: f32,
+    white_space: WhiteSpace,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
+    let text = prepare_text_for_white_space(text, white_space);
+    if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
+        return text
+            .split(['\n', FORCED_LINE_BREAK])
+            .map(str::to_string)
+            .collect();
+    }
+    wrap_greedy_with_run_width(&text, max_width, first_line_width.max(1.0), run_width)
 }
 
 pub fn retained_text_paint_layout(
@@ -794,6 +903,7 @@ pub fn retained_text_paint_layout_with(
     let key = TextPaintKey {
         text: text.to_owned(),
         max_width: max_width.to_bits(),
+        first_line_width: max_width.to_bits(),
         font: font_identity,
         font_size: font_size.to_bits(),
         white_space: white_space_key(white_space),
@@ -803,6 +913,47 @@ pub fn retained_text_paint_layout_with(
     }
 
     let lines = wrap_text_with_char_width(text, max_width, white_space, char_width);
+    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
+    TEXT_PAINT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
+            cache.entries.clear();
+        }
+        cache.entries.insert(key, layout.clone());
+    });
+    layout
+}
+
+pub fn retained_text_paint_layout_with_first_line(
+    text: &str,
+    max_width: f32,
+    first_line_width: f32,
+    font_size: f32,
+    white_space: WhiteSpace,
+    font_identity: u64,
+    char_width: impl FnMut(char) -> f32,
+    mut measure_ink: impl FnMut(&str) -> InkBounds,
+) -> Rc<TextPaintLayout> {
+    let key = TextPaintKey {
+        text: text.to_owned(),
+        max_width: max_width.to_bits(),
+        first_line_width: first_line_width.to_bits(),
+        font: font_identity,
+        font_size: font_size.to_bits(),
+        white_space: white_space_key(white_space),
+    };
+    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
+        return cached;
+    }
+
+    let lines = wrap_text_with_char_width_and_first_line(
+        text,
+        max_width,
+        first_line_width,
+        white_space,
+        char_width,
+    );
     let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
     let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
     TEXT_PAINT_CACHE.with(|cache| {
@@ -827,6 +978,7 @@ pub fn retained_text_paint_layout_with_run_width(
     let key = TextPaintKey {
         text: text.to_owned(),
         max_width: max_width.to_bits(),
+        first_line_width: max_width.to_bits(),
         font: font_identity,
         font_size: font_size.to_bits(),
         white_space: white_space_key(white_space),
@@ -836,6 +988,47 @@ pub fn retained_text_paint_layout_with_run_width(
     }
 
     let lines = wrap_text_with_run_width(text, max_width, white_space, run_width);
+    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
+    TEXT_PAINT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
+            cache.entries.clear();
+        }
+        cache.entries.insert(key, layout.clone());
+    });
+    layout
+}
+
+pub fn retained_text_paint_layout_with_run_width_and_first_line(
+    text: &str,
+    max_width: f32,
+    first_line_width: f32,
+    font_size: f32,
+    white_space: WhiteSpace,
+    font_identity: u64,
+    run_width: impl FnMut(&str) -> f32,
+    mut measure_ink: impl FnMut(&str) -> InkBounds,
+) -> Rc<TextPaintLayout> {
+    let key = TextPaintKey {
+        text: text.to_owned(),
+        max_width: max_width.to_bits(),
+        first_line_width: first_line_width.to_bits(),
+        font: font_identity,
+        font_size: font_size.to_bits(),
+        white_space: white_space_key(white_space),
+    };
+    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
+        return cached;
+    }
+
+    let lines = wrap_text_with_run_width_and_first_line(
+        text,
+        max_width,
+        first_line_width,
+        white_space,
+        run_width,
+    );
     let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
     let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
     TEXT_PAINT_CACHE.with(|cache| {
@@ -919,7 +1112,7 @@ mod tests {
     #[test]
     fn cjk_closing_punctuation_stays_inside_wrap_width() {
         let max_width = 4.0;
-        let lines = wrap_greedy("甲乙丙丁。戊", max_width, |_| 1.0);
+        let lines = wrap_greedy("甲乙丙丁。戊", max_width, max_width, |_| 1.0);
         assert_eq!(lines, vec!["甲乙丙", "丁。戊"]);
         assert!(
             lines
@@ -947,6 +1140,43 @@ mod tests {
                 .sum()
         });
         assert_eq!(lines, vec!["1 2", "3 4"]);
+    }
+
+    #[test]
+    fn normal_white_space_does_not_split_an_overflowing_latin_word() {
+        let lines = wrap_text_with_run_width("XXXXXX XXXXXX", 3.0, WhiteSpace::Normal, |text| {
+            text.chars().count() as f32
+        });
+        assert_eq!(lines, vec!["XXXXXX", "XXXXXX"]);
+    }
+
+    #[test]
+    fn first_line_width_only_changes_the_first_soft_wrap() {
+        let lines = wrap_text_with_run_width_and_first_line(
+            "aa aa aa",
+            5.0,
+            2.0,
+            WhiteSpace::Normal,
+            |text| text.chars().count() as f32,
+        );
+        assert_eq!(lines, vec!["aa", "aa aa"]);
+
+        let negatively_indented = wrap_text_with_run_width_and_first_line(
+            "aa aa aa",
+            5.0,
+            20.0,
+            WhiteSpace::Normal,
+            |text| text.chars().count() as f32,
+        );
+        assert_eq!(negatively_indented, vec!["aa aa aa"]);
+    }
+
+    #[test]
+    fn normal_white_space_still_wraps_cjk_at_character_boundaries() {
+        let lines = wrap_text_with_run_width("甲乙丙丁", 2.0, WhiteSpace::Normal, |text| {
+            text.chars().count() as f32
+        });
+        assert_eq!(lines, vec!["甲乙", "丙丁"]);
     }
 
     #[test]
@@ -1005,16 +1235,20 @@ mod tests {
     }
 
     #[test]
+    fn visual_order_marker_skips_a_second_bidi_reorder() {
+        let mut style = w3cos_std::style::Style::default();
+        style.custom_properties = Some(std::collections::HashMap::from([(
+            "--w3cos-internal-bidi-visual-order".to_string(),
+            "1".to_string(),
+        )]));
+        assert_eq!(font_render_text_for_style("םול🇱🇮", &style), "םול🇱🇮");
+    }
+
+    #[test]
     fn css_paragraph_direction_controls_natural_bidi_and_mirroring() {
         assert_eq!(
-            font_render_text(
-                "c d (א a b)",
-                w3cos_std::style::TextDirection::Rtl,
-            ),
-            font_render_text(
-                "(a b א) c d",
-                w3cos_std::style::TextDirection::Ltr,
-            )
+            font_render_text("c d (א a b)", w3cos_std::style::TextDirection::Rtl,),
+            font_render_text("(a b א) c d", w3cos_std::style::TextDirection::Ltr,)
         );
     }
 
@@ -1084,12 +1318,9 @@ mod tests {
     #[test]
     fn unicode_paragraph_separator_starts_a_new_preformatted_line() {
         assert_eq!(
-            wrap_text_with_run_width(
-                "first\u{2029}second",
-                1000.0,
-                WhiteSpace::Pre,
-                |text| text.len() as f32,
-            ),
+            wrap_text_with_run_width("first\u{2029}second", 1000.0, WhiteSpace::Pre, |text| text
+                .len()
+                as f32,),
             vec!["first", "second"]
         );
     }
@@ -1132,5 +1363,55 @@ mod tests {
         {
             assert_ne!(font.lookup_glyph_index(ch), 0, "missing glyph for {ch}");
         }
+    }
+
+    #[test]
+    fn text_transform_applies_before_font_visual_ordering() {
+        use w3cos_std::style::TextTransform;
+
+        for (transform, expected) in [
+            (TextTransform::Capitalize, "Filler Text FILLER"),
+            (TextTransform::Uppercase, "FILLER TEXT FILLER"),
+            (TextTransform::Lowercase, "filler text filler"),
+        ] {
+            let style = Style {
+                text_transform: transform,
+                ..Style::default()
+            };
+            assert_eq!(
+                font_render_text_for_style("filler text FILLER", &style),
+                expected
+            );
+        }
+
+        let turkish = Style {
+            text_transform: TextTransform::Uppercase,
+            custom_properties: Some(std::collections::HashMap::from([(
+                "--w3cos-internal-text-language".to_string(),
+                "tr".to_string(),
+            )])),
+            ..Style::default()
+        };
+        assert_eq!(font_render_text_for_style("i ı", &turkish), "İ I");
+        assert_eq!(
+            font_render_text_for_style(
+                "I İ",
+                &Style {
+                    text_transform: TextTransform::Lowercase,
+                    ..turkish
+                }
+            ),
+            "ı i"
+        );
+        assert_eq!(
+            font_render_text_for_style(
+                "ᾀᾐᾠᾳῃῳ",
+                &Style {
+                    text_transform: TextTransform::Uppercase,
+                    ..Style::default()
+                }
+            ),
+            "ᾈᾘᾨᾼῌῼ"
+        );
     }
 }

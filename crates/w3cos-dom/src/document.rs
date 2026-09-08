@@ -1255,6 +1255,26 @@ impl Document {
             }
         }
         if let Some(parent) = inherited {
+            if let Some((_, value)) = declared_property_value(&["text-indent", "textIndent"]) {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "inherit" | "unset" => style.text_indent = parent.text_indent,
+                    "initial" | "revert" | "revert-layer" => {
+                        style.text_indent = w3cos_std::style::Dimension::Px(0.0)
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((_, value)) =
+                declared_property_value(&["text-transform", "textTransform"])
+            {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "inherit" | "unset" => style.text_transform = parent.text_transform,
+                    "initial" | "revert" | "revert-layer" => {
+                        style.text_transform = w3cos_std::style::TextTransform::None
+                    }
+                    _ => {}
+                }
+            }
             if declared_property_value(&["direction"])
                 .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
             {
@@ -2556,11 +2576,35 @@ impl Document {
                 && style.font_family == parent_style.font_family
                 && style.font_style == parent_style.font_style
                 && style.line_height == parent_style.line_height
+                && style.text_indent == parent_style.text_indent
                 && style.letter_spacing == parent_style.letter_spacing
                 && style.word_spacing == parent_style.word_spacing
                 && style.text_decoration == parent_style.text_decoration
                 && style.white_space == parent_style.white_space
         };
+        fn append_rendered_text(
+            output: &mut String,
+            content: &str,
+            style: &w3cos_std::style::Style,
+        ) {
+            let language = style.custom_properties.as_ref().and_then(|properties| {
+                properties
+                    .get("--w3cos-internal-text-language")
+                    .map(String::as_str)
+            });
+            let continues_word = output.chars().next_back().is_some_and(char::is_alphanumeric)
+                || style.custom_properties.as_ref().is_some_and(|properties| {
+                    properties
+                        .get("--w3cos-internal-text-transform-continues-word")
+                        .is_some_and(|value| value == "1")
+                });
+            output.push_str(&w3cos_std::style::transformed_text(
+                content,
+                style.text_transform,
+                language,
+                continues_word,
+            ));
+        }
         fn append_text(
             component: &w3cos_std::Component,
             parent_style: &w3cos_std::style::Style,
@@ -2573,6 +2617,7 @@ impl Document {
                 && component.style.font_family == parent_style.font_family
                 && component.style.font_style == parent_style.font_style
                 && component.style.line_height == parent_style.line_height
+                && component.style.text_indent == parent_style.text_indent
                 && component.style.letter_spacing == parent_style.letter_spacing
                 && component.style.word_spacing == parent_style.word_spacing
                 && component.style.text_decoration == parent_style.text_decoration
@@ -2582,7 +2627,7 @@ impl Document {
                     return false;
                 }
                 first_style.get_or_insert_with(|| component.style.clone());
-                output.push_str(content);
+                append_rendered_text(output, content, &component.style);
                 return true;
             }
             if component.children.is_empty() {
@@ -2619,7 +2664,7 @@ impl Document {
                         return None;
                     }
                     text_style.get_or_insert_with(|| component.style.clone());
-                    content.push_str(text);
+                    append_rendered_text(&mut content, text, &component.style);
                 }
                 NodeType::Element => {
                     if child.tag.as_str().eq_ignore_ascii_case("br")
@@ -2643,6 +2688,10 @@ impl Document {
             return None;
         }
         let mut style = text_style?;
+        style.text_transform = w3cos_std::style::TextTransform::None;
+        if let Some(properties) = style.custom_properties.as_mut() {
+            properties.remove("--w3cos-internal-text-transform-continues-word");
+        }
         style.display = if nowrap {
             w3cos_std::style::Display::InlineBlock
         } else {
@@ -2680,6 +2729,8 @@ impl Document {
                 || component.style.font_family != parent_style.font_family
                 || component.style.font_style != parent_style.font_style
                 || component.style.line_height != parent_style.line_height
+                || component.style.text_indent != parent_style.text_indent
+                || component.style.text_transform != parent_style.text_transform
                 || component.style.letter_spacing != parent_style.letter_spacing
                 || component.style.word_spacing != parent_style.word_spacing
                 || component.style.text_decoration != parent_style.text_decoration
@@ -2736,6 +2787,64 @@ impl Document {
         let node = self.get_node(id);
         let mut style = self.computed_style(id, ancestors, inherited);
         let tag = node.tag.as_str();
+        if style.text_transform != w3cos_std::style::TextTransform::None {
+            let mut language_node = Some(id);
+            while let Some(language_id) = language_node {
+                let candidate = self.get_node(language_id);
+                if let Some(language) = candidate
+                    .attributes
+                    .iter()
+                    .find(|(name, _)| {
+                        name.as_str().eq_ignore_ascii_case("lang")
+                            || name.as_str().eq_ignore_ascii_case("xml:lang")
+                    })
+                    .map(|(_, value)| value.trim())
+                    .filter(|value| !value.is_empty())
+                {
+                    style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            "--w3cos-internal-text-language".to_string(),
+                            language.to_ascii_lowercase(),
+                        );
+                    break;
+                }
+                language_node = candidate.parent;
+            }
+            if style.text_transform == w3cos_std::style::TextTransform::Capitalize {
+                let mut previous_sibling = node.prev_sibling;
+                let previous_character = loop {
+                    let Some(previous_id) = previous_sibling else {
+                        break None;
+                    };
+                    let previous = self.get_node(previous_id);
+                    match previous.node_type {
+                        NodeType::Comment
+                        | NodeType::DocumentType
+                        | NodeType::ProcessingInstruction => {
+                            previous_sibling = previous.prev_sibling;
+                        }
+                        NodeType::Text => {
+                            break previous.text_content.as_deref().and_then(|text| text.chars().next_back());
+                        }
+                        NodeType::Element => {
+                            break self.descendant_text_content(previous_id).chars().next_back();
+                        }
+                        _ => break None,
+                    }
+                };
+                if previous_character.is_some_and(char::is_alphanumeric) {
+                    style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            "--w3cos-internal-text-transform-continues-word".to_string(),
+                            "1".to_string(),
+                        );
+                }
+            }
+        }
         self.apply_svg_presentation_style(id, &tag, &mut style);
         if let Some(source) = style
             .custom_properties
@@ -3001,6 +3110,9 @@ impl Document {
                                 && component.style.font_family == generated[0].style.font_family
                                 && component.style.font_style == generated[0].style.font_style
                                 && component.style.line_height == generated[0].style.line_height
+                                && component.style.text_indent == generated[0].style.text_indent
+                                && component.style.text_transform
+                                    == generated[0].style.text_transform
                                 && component.style.letter_spacing
                                     == generated[0].style.letter_spacing
                                 && component.style.word_spacing == generated[0].style.word_spacing
@@ -3024,6 +3136,8 @@ impl Document {
                         style.font_family = generated_style.font_family.clone();
                         style.font_style = generated_style.font_style;
                         style.line_height = generated_style.line_height;
+                        style.text_indent = generated_style.text_indent;
+                        style.text_transform = generated_style.text_transform;
                         style.letter_spacing = generated_style.letter_spacing;
                         style.word_spacing = generated_style.word_spacing;
                         style.text_decoration = generated_style.text_decoration;
@@ -3421,8 +3535,7 @@ impl Document {
                 }
                 if matches!(
                     style.display,
-                    w3cos_std::style::Display::Table
-                        | w3cos_std::style::Display::InlineTable
+                    w3cos_std::style::Display::Table | w3cos_std::style::Display::InlineTable
                 ) {
                     // CSS table fixup has a semantic group order independent
                     // of DOM/pseudo source order: header groups precede row
@@ -3430,7 +3543,10 @@ impl Document {
                     // stable within each group class.
                     children.sort_by_key(|component| match component.style.display {
                         w3cos_std::style::Display::TableCaption
-                            if !component.style.caption_side_bottom => 0,
+                            if !component.style.caption_side_bottom =>
+                        {
+                            0
+                        }
                         w3cos_std::style::Display::TableColumnGroup
                         | w3cos_std::style::Display::TableColumn => 1,
                         w3cos_std::style::Display::TableHeaderGroup => 2,
@@ -3504,6 +3620,7 @@ impl Document {
                             | w3cos_std::style::Display::InlineTable
                     )
                     && (!matches!(style.width, w3cos_std::style::Dimension::Auto)
+                        || style.text_indent != w3cos_std::style::Dimension::Px(0.0)
                         || (style.direction == w3cos_std::style::TextDirection::Rtl
                             && matches!(children[0].kind, w3cos_std::ComponentKind::Text { .. }))
                         || matches!(
@@ -3655,6 +3772,26 @@ impl Document {
                     style.align_self = w3cos_std::style::AlignSelf::FlexEnd;
                 }
 
+                let inline_declares_text_indent = style.display
+                    == w3cos_std::style::Display::Inline
+                    && stylesheet::matching_declarations_for_node(self, id)
+                        .iter()
+                        .any(|(name, _, _)| css_property_eq(name, "text-indent"));
+                if inline_declares_text_indent {
+                    let containing_indent = inherited.map_or(
+                        w3cos_std::style::Dimension::Px(0.0),
+                        |parent| parent.text_indent,
+                    );
+                    style.text_indent = containing_indent;
+                    for child in &mut children {
+                        if child.style.display == w3cos_std::style::Display::Inline
+                            && matches!(child.kind, w3cos_std::ComponentKind::Text { .. })
+                        {
+                            child.style.text_indent = containing_indent;
+                        }
+                    }
+                }
+
                 if let Some(text) = &node.text_content {
                     if children.is_empty() {
                         let component = match tag.as_str() {
@@ -3671,7 +3808,61 @@ impl Document {
                 // lower that visual box as flex-row while retaining the DOM
                 // children and their independently styled paint nodes.
                 if nowrap_inline_formatting_context || anonymous_inline_formatting_context {
-                    if anonymous_inline_formatting_context
+                    if anonymous_inline_formatting_context {
+                        let indent_spacing = match style.text_indent {
+                            w3cos_std::style::Dimension::Px(value) => {
+                                w3cos_std::style::Spacing::Px(value)
+                            }
+                            w3cos_std::style::Dimension::Percent(value) => {
+                                w3cos_std::style::Spacing::Percent(value)
+                            }
+                            w3cos_std::style::Dimension::Rem(value) => {
+                                w3cos_std::style::Spacing::Rem(value)
+                            }
+                            w3cos_std::style::Dimension::Em(value) => {
+                                w3cos_std::style::Spacing::Em(value)
+                            }
+                            w3cos_std::style::Dimension::Vw(value) => {
+                                w3cos_std::style::Spacing::Vw(value)
+                            }
+                            w3cos_std::style::Dimension::Vh(value) => {
+                                w3cos_std::style::Spacing::Vh(value)
+                            }
+                            w3cos_std::style::Dimension::Auto => {
+                                w3cos_std::style::Spacing::Px(0.0)
+                            }
+                        };
+                        if indent_spacing != w3cos_std::style::Spacing::Px(0.0) {
+                            // `text-indent` moves the first in-flow inline box,
+                            // including an atomic inline-level box. Keep the
+                            // box's inherited value: its own first formatted
+                            // line is indented again after entering its inner
+                            // formatting context.
+                            if let Some(first_atomic_inline) = children.iter_mut().find(|child| {
+                                child.style.float == w3cos_std::style::Float::None
+                                    && child.style.position
+                                        == w3cos_std::style::Position::Static
+                                    && !matches!(
+                                        child.kind,
+                                        w3cos_std::ComponentKind::Text { .. }
+                                    )
+                            }) {
+                                let margin = match style.direction {
+                                    w3cos_std::style::TextDirection::Ltr => {
+                                        &mut first_atomic_inline.style.margin.left
+                                    }
+                                    w3cos_std::style::TextDirection::Rtl => {
+                                        &mut first_atomic_inline.style.margin.right
+                                    }
+                                };
+                                if *margin == w3cos_std::style::Spacing::Px(0.0) {
+                                    *margin = indent_spacing;
+                                }
+                            }
+                        }
+                    }
+                    if (anonymous_inline_formatting_context
+                        || matches!(style.text_indent, w3cos_std::style::Dimension::Percent(_)))
                         && children.len() == 1
                         && matches!(children[0].kind, w3cos_std::ComponentKind::Text { .. })
                         && matches!(
@@ -3679,7 +3870,9 @@ impl Document {
                             w3cos_std::style::WhiteSpace::Normal
                                 | w3cos_std::style::WhiteSpace::PreLine
                         )
-                        && !matches!(style.width, w3cos_std::style::Dimension::Auto)
+                        && (!matches!(style.width, w3cos_std::style::Dimension::Auto)
+                            || style.text_indent
+                                != w3cos_std::style::Dimension::Px(0.0))
                     {
                         // A text run in a fixed-width block is not an atomic
                         // flex item: its line box uses the block content width
@@ -5358,6 +5551,12 @@ fn inherit_text_style(
     if !declares("line-height") && !declares("font") {
         style.line_height = parent.line_height;
     }
+    if !declares("text-indent") {
+        style.text_indent = parent.text_indent;
+    }
+    if !declares("text-transform") {
+        style.text_transform = parent.text_transform;
+    }
     if !declares("letter-spacing") {
         style.letter_spacing = parent.letter_spacing;
     }
@@ -5984,7 +6183,7 @@ fn push_xml_escaped(out: &mut String, value: &str, attribute: bool) {
 
 fn passive_generated_inline_declaration(property: &str, value: &str) -> bool {
     let value = value.trim().to_ascii_lowercase();
-    matches!(property, "display" | "quotes")
+    matches!(property, "display" | "quotes" | "text-transform")
         || property.starts_with("counter-")
         || matches!(
             (property, value.as_str()),
@@ -6078,6 +6277,8 @@ fn equivalent_text_paint_style(
         && left.font_style == right.font_style
         && left.white_space == right.white_space
         && left.line_height == right.line_height
+        && left.text_indent == right.text_indent
+        && left.text_transform == right.text_transform
         && left.letter_spacing == right.letter_spacing
         && left.word_spacing == right.word_spacing
         && left.text_decoration == right.text_decoration
@@ -6165,6 +6366,7 @@ fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
             }
             *content = visual_lines.join("\n");
             component.style.direction = w3cos_std::style::TextDirection::Ltr;
+            mark_bidi_visual_order(&mut component.style);
         }
     }
     if let w3cos_std::ComponentKind::Text { content } = &mut component.kind
@@ -6197,6 +6399,7 @@ fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
         // shape as one browser text run.
         component.style.direction = w3cos_std::style::TextDirection::Ltr;
         component.style.unicode_bidi = w3cos_std::style::UnicodeBidi::Normal;
+        mark_bidi_visual_order(&mut component.style);
         return;
     }
     let reordered = reorder_explicit_bidi_children(component);
@@ -6209,6 +6412,16 @@ fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
     if !reordered {
         reorder_explicit_bidi_children(component);
     }
+}
+
+fn mark_bidi_visual_order(style: &mut w3cos_std::style::Style) {
+    style
+        .custom_properties
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            "--w3cos-internal-bidi-visual-order".to_string(),
+            "1".to_string(),
+        );
 }
 
 fn is_bidi_control(character: char) -> bool {
@@ -6229,6 +6442,10 @@ fn is_bidi_control(character: char) -> bool {
     )
 }
 
+fn is_regional_indicator(character: char) -> bool {
+    ('\u{1f1e6}'..='\u{1f1ff}').contains(&character)
+}
+
 fn empty_inline_box_has_no_area(component: &w3cos_std::Component) -> bool {
     use w3cos_std::component::ComponentKind;
     use w3cos_std::style::{Dimension, Display};
@@ -6245,7 +6462,10 @@ fn empty_inline_box_has_no_area(component: &w3cos_std::Component) -> bool {
 
     matches!(component.kind, ComponentKind::Row | ComponentKind::Box)
         && subtree_is_empty(component)
-        && matches!(component.style.display, Display::Inline | Display::InlineFlex)
+        && matches!(
+            component.style.display,
+            Display::Inline | Display::InlineFlex
+        )
         && component.style.width == Dimension::Auto
         && component.style.height == Dimension::Auto
         && component.style.padding == w3cos_std::style::Edges::ZERO
@@ -6284,6 +6504,107 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     component
         .children
         .retain(|child| !empty_inline_box_has_no_area(child));
+    let trailing_isolated_indicators = component.children.last().and_then(|last| {
+        if let ComponentKind::Text { content } = &last.kind {
+            return (!content.is_empty() && content.chars().all(is_regional_indicator))
+                .then(|| last.clone());
+        }
+        if !matches!(last.kind, ComponentKind::Row | ComponentKind::Box) || last.children.len() != 1
+        {
+            return None;
+        }
+        let text = &last.children[0];
+        let ComponentKind::Text { content } = &text.kind else {
+            return None;
+        };
+        (!content.is_empty() && content.chars().all(is_regional_indicator)).then(|| text.clone())
+    });
+    let leading_has_rtl = component.children[..component.children.len().saturating_sub(1)]
+        .iter()
+        .any(|child| match &child.kind {
+            ComponentKind::Text { content } => content.chars().any(|character| {
+                matches!(
+                    unicode_bidi::bidi_class(character),
+                    unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+                )
+            }),
+            _ => false,
+        });
+    if style_bidi_control.is_none()
+        && leading_has_rtl
+        && let Some(mut indicators) = trailing_isolated_indicators
+    {
+        indicators.style.unicode_bidi = UnicodeBidi::Isolate;
+        if let Some(last) = component.children.last_mut() {
+            *last = indicators;
+        }
+        component
+            .style
+            .custom_properties
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(
+                "--w3cos-internal-bidi-font-runs".to_string(),
+                "1".to_string(),
+            );
+        return true;
+    }
+    if component
+        .style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| {
+            properties
+                .get("--w3cos-internal-bidi-font-runs")
+                .is_some_and(|value| value == "1")
+        })
+    {
+        return true;
+    }
+    if style_bidi_control.is_none()
+        && let [child] = component.children.as_slice()
+        && let ComponentKind::Text { content } = &child.kind
+        && let Some(split) = content.find(is_regional_indicator)
+        && content[..split].chars().any(|character| {
+            matches!(
+                unicode_bidi::bidi_class(character),
+                unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+            )
+        })
+        && content[split..].chars().all(is_regional_indicator)
+        && content[split..].chars().count() % 2 == 0
+    {
+        let mut leading = child.clone();
+        leading.kind = ComponentKind::Text {
+            content: content[..split].to_string(),
+        };
+        let mut indicator = child.clone();
+        indicator.kind = ComponentKind::Text {
+            content: content[split..].to_string(),
+        };
+        indicator.style.unicode_bidi = UnicodeBidi::Isolate;
+        component.children = vec![leading, indicator];
+        component
+            .style
+            .custom_properties
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(
+                "--w3cos-internal-bidi-font-runs".to_string(),
+                "1".to_string(),
+            );
+        return true;
+    }
+    if style_bidi_control.is_none() {
+        // Keep a coalescible plain-text run in logical order. The font backend
+        // applies Unicode Bidi to the resulting single run; converting it to
+        // visual order here would make that backend reorder it a second time.
+        let mut logical_run = component.clone();
+        coalesce_passive_inline_text_children(&mut logical_run);
+        if matches!(logical_run.children.as_slice(), [child] if matches!(child.kind, ComponentKind::Text { .. }))
+        {
+            component.children = logical_run.children;
+            return false;
+        }
+    }
     if component.children.len() < 2 && style_bidi_control.is_none() {
         return false;
     }
@@ -6589,6 +6910,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             fragment.kind = ComponentKind::Text { content };
             fragment.style.direction = TextDirection::Ltr;
             fragment.style.unicode_bidi = UnicodeBidi::Normal;
+            mark_bidi_visual_order(&mut fragment.style);
             let has_left_edge = fragment
                 .style
                 .border_left_width
@@ -6623,6 +6945,20 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         })
         .collect::<Vec<_>>();
 
+    // Inline backgrounds belong below the shaped text of the whole bidi run.
+    // A later background fragment must not erase glyph overhang from its
+    // preceding sibling.
+    if visual_fragments
+        .iter()
+        .any(|fragment| fragment.component.style.background.a > 0)
+    {
+        for fragment in &mut visual_fragments {
+            if fragment.component.style.background.a == 0 {
+                fragment.component.style.z_index = fragment.component.style.z_index.max(1);
+            }
+        }
+    }
+
     let anonymous_space = units
         .iter()
         .find(|unit| principal_box_can_merge_generated_inline_text(&unit.component.style))
@@ -6640,6 +6976,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             // boundaries at each embedded inline edge.
             space.style.direction = TextDirection::Ltr;
             space.style.unicode_bidi = UnicodeBidi::Normal;
+            mark_bidi_visual_order(&mut space.style);
             space
         });
     let mut edge_whitespace = Vec::with_capacity(visual_fragments.len());
@@ -6711,17 +7048,12 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         previous_line = Some(fragment.line_index);
     }
     component.children = normalized;
-    component.style.justify_content = match (
-        component.style.text_align,
-        paragraph_direction,
-    ) {
+    component.style.justify_content = match (component.style.text_align, paragraph_direction) {
         (w3cos_std::style::TextAlign::Start, TextDirection::Rtl)
         | (w3cos_std::style::TextAlign::End, TextDirection::Ltr) => {
             w3cos_std::style::JustifyContent::FlexEnd
         }
-        (w3cos_std::style::TextAlign::Center, _) => {
-            w3cos_std::style::JustifyContent::Center
-        }
+        (w3cos_std::style::TextAlign::Center, _) => w3cos_std::style::JustifyContent::Center,
         _ => component.style.justify_content,
     };
     true
@@ -6817,13 +7149,15 @@ fn plain_anonymous_inline_table_text(
             .all(|child| collect(child, content, text_style))
     }
 
-    if !matches!(component.style.display, Display::Table | Display::InlineTable)
-        || component
-            .style
-            .custom_properties
-            .as_ref()
-            .and_then(|properties| properties.get("--w3cos-internal-anonymous-table"))
-            .is_none_or(|value| value != "1")
+    if !matches!(
+        component.style.display,
+        Display::Table | Display::InlineTable
+    ) || component
+        .style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-anonymous-table"))
+        .is_none_or(|value| value != "1")
         || component.children.len() != 1
         || component.children[0].style.display != Display::TableRow
         || component.children[0].children.is_empty()
@@ -6943,7 +7277,7 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
                         | w3cos_std::style::Display::InlineBlock
                         | w3cos_std::style::Display::InlineFlex
                         | w3cos_std::style::Display::InlineTable
-                    )
+                )
             };
             let transparent_text_styles_match =
                 principal_box_can_merge_generated_inline_text(&previous.style)
@@ -7527,8 +7861,7 @@ fn anonymous_table_wrapper(
         }
     }
     grid_children.sort_by_key(|child| match child.style.display {
-        w3cos_std::style::Display::TableColumnGroup
-        | w3cos_std::style::Display::TableColumn => 0,
+        w3cos_std::style::Display::TableColumnGroup | w3cos_std::style::Display::TableColumn => 0,
         w3cos_std::style::Display::TableHeaderGroup => 1,
         w3cos_std::style::Display::TableFooterGroup => 3,
         _ => 2,
@@ -7555,9 +7888,10 @@ fn anonymous_table_wrapper(
         table_style.height = w3cos_std::style::Dimension::Px(table_height);
     }
     if !grid_children.is_empty() {
-        if grid_children.iter().all(|child| {
-            child.style.display == w3cos_std::style::Display::TableCell
-        }) {
+        if grid_children
+            .iter()
+            .all(|child| child.style.display == w3cos_std::style::Display::TableCell)
+        {
             coalesce_plain_anonymous_table_cell_text(&mut grid_children);
             top_captions.push(table_row_from_misparented_children(
                 parent_style,
@@ -7576,8 +7910,7 @@ fn coalesce_plain_anonymous_table_cell_text(cells: &mut [w3cos_std::Component]) 
     use w3cos_std::style::{Dimension, Display, Edges, WhiteSpace};
 
     let direct_text = |cell: &w3cos_std::Component| {
-        cell.children.is_empty()
-            && matches!(cell.kind, w3cos_std::ComponentKind::Text { .. })
+        cell.children.is_empty() && matches!(cell.kind, w3cos_std::ComponentKind::Text { .. })
     };
     let child_text = |cell: &w3cos_std::Component| {
         cell.children.len() == 1
@@ -7590,10 +7923,22 @@ fn coalesce_plain_anonymous_table_cell_text(cells: &mut [w3cos_std::Component]) 
                 || cell.style.background.a != 0
                 || cell.style.background_image.is_some()
                 || cell.style.border_width != 0.0
-                || cell.style.border_top_width.is_some_and(|width| width != 0.0)
-                || cell.style.border_right_width.is_some_and(|width| width != 0.0)
-                || cell.style.border_bottom_width.is_some_and(|width| width != 0.0)
-                || cell.style.border_left_width.is_some_and(|width| width != 0.0)
+                || cell
+                    .style
+                    .border_top_width
+                    .is_some_and(|width| width != 0.0)
+                || cell
+                    .style
+                    .border_right_width
+                    .is_some_and(|width| width != 0.0)
+                || cell
+                    .style
+                    .border_bottom_width
+                    .is_some_and(|width| width != 0.0)
+                || cell
+                    .style
+                    .border_left_width
+                    .is_some_and(|width| width != 0.0)
                 || cell.style.padding != Edges::ZERO
                 || cell.style.margin != Edges::ZERO
                 || cell.style.width != Dimension::Auto
@@ -7628,13 +7973,15 @@ fn coalesce_plain_anonymous_table_cell_text(cells: &mut [w3cos_std::Component]) 
 
     let content = cells
         .iter()
-        .filter_map(|cell| match if direct_text(cell) {
-            &cell.kind
-        } else {
-            &cell.children[0].kind
-        } {
-            w3cos_std::ComponentKind::Text { content } => Some(content.as_str()),
-            _ => None,
+        .filter_map(|cell| {
+            match if direct_text(cell) {
+                &cell.kind
+            } else {
+                &cell.children[0].kind
+            } {
+                w3cos_std::ComponentKind::Text { content } => Some(content.as_str()),
+                _ => None,
+            }
         })
         .collect::<String>();
     if direct_text(&cells[0]) {
@@ -7674,41 +8021,37 @@ fn fixup_css_table_children(
                     .style
                     .custom_properties
                     .as_ref()
-                    .and_then(|properties| {
-                        properties.get("--w3cos-internal-replaced-table-cell")
-                    })
+                    .and_then(|properties| properties.get("--w3cos-internal-replaced-table-cell"))
                     .is_some_and(|value| value == "1")
                     && anonymous_run_started
                     && !anonymous_children.is_empty()
-                    && anonymous_children.iter().all(collapsible_generated_whitespace);
+                    && anonymous_children
+                        .iter()
+                        .all(collapsible_generated_whitespace);
                 if starts_replaced_cell_run {
-                    cells.push(anonymous_table_cell_from_children(
-                        parent_style,
-                        Vec::new(),
-                    ));
+                    cells.push(anonymous_table_cell_from_children(parent_style, Vec::new()));
                     pending_whitespace = None;
                 }
                 if child.style.display == Display::TableCell {
                     if anonymous_run_started {
-                        let follows_replaced_cell_run = anonymous_children.iter().any(|component| {
-                            component
-                                .style
-                                .custom_properties
-                                .as_ref()
-                                .and_then(|properties| {
-                                    properties.get("--w3cos-internal-replaced-table-cell")
-                                })
-                                .is_some_and(|value| value == "1")
-                        });
+                        let follows_replaced_cell_run =
+                            anonymous_children.iter().any(|component| {
+                                component
+                                    .style
+                                    .custom_properties
+                                    .as_ref()
+                                    .and_then(|properties| {
+                                        properties.get("--w3cos-internal-replaced-table-cell")
+                                    })
+                                    .is_some_and(|value| value == "1")
+                            });
                         cells.push(anonymous_table_cell_from_children(
                             parent_style,
                             std::mem::take(&mut anonymous_children),
                         ));
                         if follows_replaced_cell_run {
-                            cells.push(anonymous_table_cell_from_children(
-                                parent_style,
-                                Vec::new(),
-                            ));
+                            cells
+                                .push(anonymous_table_cell_from_children(parent_style, Vec::new()));
                         }
                         anonymous_run_started = false;
                         pending_whitespace = None;
@@ -7726,8 +8069,7 @@ fn fixup_css_table_children(
                 if collapsible_generated_whitespace(&child) {
                     if matches!(
                         parent_style.white_space,
-                        w3cos_std::style::WhiteSpace::Pre
-                            | w3cos_std::style::WhiteSpace::PreWrap
+                        w3cos_std::style::WhiteSpace::Pre | w3cos_std::style::WhiteSpace::PreWrap
                     ) {
                         anonymous_children.push(child);
                         continue;
@@ -7758,16 +8100,16 @@ fn fixup_css_table_children(
             let containing_height = specified_table_cell_height(parent_style);
             let mut fixed = Vec::with_capacity(children.len());
             let mut cells = Vec::new();
-            let flush_cells = |fixed: &mut Vec<w3cos_std::Component>,
-                               cells: &mut Vec<w3cos_std::Component>| {
-                if !cells.is_empty() {
-                    fixed.push(anonymous_table_row(
-                        parent_style,
-                        std::mem::take(cells),
-                        containing_height,
-                    ));
-                }
-            };
+            let flush_cells =
+                |fixed: &mut Vec<w3cos_std::Component>, cells: &mut Vec<w3cos_std::Component>| {
+                    if !cells.is_empty() {
+                        fixed.push(anonymous_table_row(
+                            parent_style,
+                            std::mem::take(cells),
+                            containing_height,
+                        ));
+                    }
+                };
             for child in children {
                 if child.style.display == Display::TableCell {
                     cells.push(child);
@@ -7782,16 +8124,17 @@ fn fixup_css_table_children(
         Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => {
             let mut fixed = Vec::with_capacity(children.len());
             let mut improper = Vec::new();
-            let flush_improper = |fixed: &mut Vec<w3cos_std::Component>,
-                                  improper: &mut Vec<w3cos_std::Component>| {
-                if !improper.is_empty() {
-                    fixed.push(table_row_from_misparented_children(
-                        parent_style,
-                        std::mem::take(improper),
-                        None,
-                    ));
-                }
-            };
+            let flush_improper =
+                |fixed: &mut Vec<w3cos_std::Component>,
+                 improper: &mut Vec<w3cos_std::Component>| {
+                    if !improper.is_empty() {
+                        fixed.push(table_row_from_misparented_children(
+                            parent_style,
+                            std::mem::take(improper),
+                            None,
+                        ));
+                    }
+                };
             for child in children {
                 if child.style.display == Display::TableRow {
                     flush_improper(&mut fixed, &mut improper);
@@ -7820,15 +8163,16 @@ fn fixup_css_table_children(
             };
             let mut fixed = Vec::with_capacity(children.len());
             let mut table_run = Vec::new();
-            let flush_table_run = |fixed: &mut Vec<w3cos_std::Component>,
-                                   table_run: &mut Vec<w3cos_std::Component>| {
-                if !table_run.is_empty() {
-                    fixed.push(anonymous_table_wrapper(
-                        parent_style,
-                        std::mem::take(table_run),
-                    ));
-                }
-            };
+            let flush_table_run =
+                |fixed: &mut Vec<w3cos_std::Component>,
+                 table_run: &mut Vec<w3cos_std::Component>| {
+                    if !table_run.is_empty() {
+                        fixed.push(anonymous_table_wrapper(
+                            parent_style,
+                            std::mem::take(table_run),
+                        ));
+                    }
+                };
             let table_internal = children
                 .iter()
                 .map(|child| is_table_internal(child.style.display))
@@ -8686,10 +9030,7 @@ mod image_component_tests {
             ..w3cos_std::style::Style::default()
         };
 
-        let fixed = fixup_css_table_children(
-            &table_style,
-            vec![cell(), cell(), cell(), row_group],
-        );
+        let fixed = fixup_css_table_children(&table_style, vec![cell(), cell(), cell(), row_group]);
 
         assert_eq!(fixed.len(), 2);
         assert_eq!(fixed[0].style.display, Display::TableRow);
@@ -9131,17 +9472,15 @@ mod image_component_tests {
     fn inline_anonymous_table_run_preserves_collapsed_spaces_at_its_edges() {
         let mut document = Document::new();
         let host = document.create_element("span");
-        let append_span = |document: &mut Document,
-                           host: Element,
-                           content: &str,
-                           display: Option<&str>| {
-            let child = document.create_element("span");
-            if let Some(display) = display {
-                child.style_mut(document).set_property("display", display);
-            }
-            child.set_text_content(document, content);
-            host.append_child(document, child);
-        };
+        let append_span =
+            |document: &mut Document, host: Element, content: &str, display: Option<&str>| {
+                let child = document.create_element("span");
+                if let Some(display) = display {
+                    child.style_mut(document).set_property("display", display);
+                }
+                child.set_text_content(document, content);
+                host.append_child(document, child);
+            };
         append_span(&mut document, host, "a", None);
         let space = document.create_text_node("\n ");
         host.append_child(&mut document, space);
@@ -9220,19 +9559,15 @@ mod image_component_tests {
             "style",
             "display: table-row; white-space: pre",
         );
-        let append = |document: &mut Document,
-                      row: Element,
-                      content: &str,
-                      display: Option<&str>| {
-            let child = document.create_element("span");
-            if let Some(display) = display {
-                child
-                    .style_mut(document)
-                    .set_property("display", display);
-            }
-            child.set_text_content(document, content);
-            row.append_child(document, child);
-        };
+        let append =
+            |document: &mut Document, row: Element, content: &str, display: Option<&str>| {
+                let child = document.create_element("span");
+                if let Some(display) = display {
+                    child.style_mut(document).set_property("display", display);
+                }
+                child.set_text_content(document, content);
+                row.append_child(document, child);
+            };
         append(&mut document, row, "a", Some("table-cell"));
         let leading_space = document.create_text_node(" ");
         row.append_child(&mut document, leading_space);
@@ -9341,7 +9676,9 @@ mod image_component_tests {
     fn replaced_image_cannot_establish_a_table_cell_box() {
         let mut document = Document::new();
         let table = document.create_element("div");
-        table.style_mut(&mut document).set_property("display", "table");
+        table
+            .style_mut(&mut document)
+            .set_property("display", "table");
         let row = document.create_element("div");
         row.style_mut(&mut document)
             .set_property("display", "table-row");
@@ -9597,17 +9934,39 @@ mod image_component_tests {
 
         reorder_explicit_bidi_inline_rows(&mut line);
 
-        let visual = line.children.iter().fold(String::new(), |mut visual, child| {
-            if let ComponentKind::Text { content } = &child.kind {
-                visual.push_str(content);
-            }
-            visual
-        });
-        assert_eq!(visual, "גבא");
+        let logical = line
+            .children
+            .iter()
+            .fold(String::new(), |mut logical, child| {
+                if let ComponentKind::Text { content } = &child.kind {
+                    logical.push_str(content);
+                }
+                logical
+            });
+        assert_eq!(logical, "אבג");
+        assert_eq!(line.children.len(), 1);
         assert!(line.children.iter().all(|child| {
             !matches!(child.kind, ComponentKind::Row | ComponentKind::Box)
                 || !child.children.is_empty()
         }));
+    }
+
+    #[test]
+    fn rtl_text_keeps_a_trailing_flag_in_its_own_font_run() {
+        let mut inline_style = w3cos_std::style::Style::default();
+        inline_style.display = Display::Inline;
+        let mut line = w3cos_std::Component::row(
+            w3cos_std::style::Style::default(),
+            vec![w3cos_std::Component::text("לום🇱🇮", inline_style)],
+        );
+        reorder_explicit_bidi_inline_rows(&mut line);
+        assert_eq!(line.children.len(), 2);
+        assert!(
+            matches!(&line.children[0].kind, ComponentKind::Text { content } if content == "לום")
+        );
+        assert!(
+            matches!(&line.children[1].kind, ComponentKind::Text { content } if content == "🇱🇮")
+        );
     }
 
     #[test]
