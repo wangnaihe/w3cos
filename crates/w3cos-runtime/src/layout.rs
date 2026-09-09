@@ -2842,7 +2842,38 @@ fn project_table_column_background_rects(
     }
     for (rect, index) in layouts.iter_mut() {
         if let Some(projected) = projected.get(index) {
-            *rect = *projected;
+            let mut projected = *projected;
+            let node = &flat[*index];
+            let collapsed_table = nearest_table(*index)
+                .and_then(|table| flat.get(table))
+                .is_some_and(|table| table.style.border_collapse);
+            if collapsed_table {
+                let top = collapsed_layout_edge_width(node.style, 0);
+                let right = collapsed_layout_edge_width(node.style, 1);
+                let bottom = collapsed_layout_edge_width(node.style, 2);
+                let left = collapsed_layout_edge_width(node.style, 3);
+                match node.style.display {
+                    WDisplay::TableRowGroup
+                    | WDisplay::TableHeaderGroup
+                    | WDisplay::TableFooterGroup => {
+                        projected.x -= left;
+                        projected.y -= top;
+                        projected.width += left;
+                        projected.height += top + bottom;
+                    }
+                    WDisplay::TableRow => {
+                        projected.y -= top;
+                        projected.width += right;
+                        projected.height += top + bottom;
+                    }
+                    WDisplay::TableColumnGroup | WDisplay::TableColumn => {
+                        projected.width += right;
+                        projected.height += top + bottom;
+                    }
+                    _ => {}
+                }
+            }
+            *rect = projected;
         }
     }
 }

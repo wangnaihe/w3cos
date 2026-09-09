@@ -1488,6 +1488,29 @@ impl PaintArtifact {
             };
         }
 
+        let collapsed_table_part_border = node.style.border_collapse
+            && node.style.background.a == 0
+            && matches!(
+                node.style.display,
+                Display::TableRowGroup
+                    | Display::TableHeaderGroup
+                    | Display::TableFooterGroup
+                    | Display::TableRow
+                    | Display::TableColumnGroup
+                    | Display::TableColumn
+            )
+            && (node.style.border_width > 0.0
+                || node.style.border_top_width.is_some_and(|width| width > 0.0)
+                || node.style.border_right_width.is_some_and(|width| width > 0.0)
+                || node.style.border_bottom_width.is_some_and(|width| width > 0.0)
+                || node.style.border_left_width.is_some_and(|width| width > 0.0));
+        if collapsed_table_part_border {
+            // Collapsed table borders paint over cell contents. Transparent
+            // table-part backgrounds can therefore use a late display item
+            // without disturbing the table background-layer ordering.
+            return (4, 0, index);
+        }
+
         let mut cursor = Some(index);
         while let Some(current) = cursor {
             let current_node = &self.nodes[current];
