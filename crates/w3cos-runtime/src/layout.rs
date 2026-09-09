@@ -2177,6 +2177,7 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
         tracks: &[f32],
         gap: f32,
         collapsed: bool,
+        rtl: bool,
         layouts: &mut [(LayoutRect, usize)],
         layout_position: &HashMap<usize, usize>,
     ) {
@@ -2187,13 +2188,18 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
             let row_x = layouts[row_position].0.x;
             let mut child_index = component_index + 1;
             let mut column = 0usize;
-            let mut target_x = row_x;
+            let grid_width = tracks.iter().sum::<f32>()
+                + gap * tracks.len().saturating_sub(1) as f32;
+            let mut target_x = if rtl { row_x + grid_width } else { row_x };
             for child in &component.children {
                 let child_count = count_nodes(child);
                 if child.style.display == WDisplay::TableCell {
                     if let Some(track) = tracks.get(column).copied()
                         && let Some(position) = layout_position.get(&child_index).copied()
                     {
+                        if rtl {
+                            target_x -= track;
+                        }
                         let left_half = if collapsed {
                             table_cell_edge_width(child, 3) / 2.0
                         } else {
@@ -2231,14 +2237,17 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                             );
                         }
                         layouts[position].0.width = track + left_half + right_half;
-                        target_x += track + gap;
+                        if rtl {
+                            target_x -= gap;
+                        } else {
+                            target_x += track + gap;
+                        }
                     }
                     column += 1;
                 }
                 child_index += child_count;
             }
-            layouts[row_position].0.width =
-                tracks.iter().sum::<f32>() + gap * tracks.len().saturating_sub(1) as f32;
+            layouts[row_position].0.width = grid_width;
             return;
         }
 
@@ -2257,6 +2266,7 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                     tracks,
                     gap,
                     collapsed,
+                    rtl,
                     layouts,
                     layout_position,
                 );
@@ -2401,6 +2411,7 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                 &tracks,
                 gap,
                 component.style.border_collapse,
+                component.style.direction == w3cos_std::style::TextDirection::Rtl,
                 layouts,
                 layout_position,
             );
@@ -10021,6 +10032,43 @@ mod tests {
         );
 
         assert_eq!(style.flex_direction, FlexDirection::RowReverse);
+    }
+
+    #[test]
+    fn fixed_rtl_table_projects_first_cell_to_rightmost_track() {
+        let cell = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    height: WDim::Px(50.0),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                direction: w3cos_std::style::TextDirection::Rtl,
+                table_layout_fixed: true,
+                width: WDim::Px(100.0),
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::TableRow,
+                    flex_direction: WDir::RowReverse,
+                    ..Style::default()
+                },
+                vec![cell(), cell()],
+            )],
+        );
+
+        let layout = compute(&table, 800.0, 600.0).unwrap();
+        let first = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let second = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!((first.x, first.width), (50.0, 50.0));
+        assert_eq!((second.x, second.width), (0.0, 50.0));
     }
 
     #[test]
