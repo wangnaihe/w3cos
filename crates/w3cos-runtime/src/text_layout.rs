@@ -481,6 +481,12 @@ pub(crate) fn font_render_text_for_style<'a>(
             .get("--w3cos-internal-bidi-visual-order")
             .is_some_and(|value| value == "1")
     }) {
+        if transformed
+            .chars()
+            .any(|character| font_glyph_character(character) != character)
+        {
+            return Cow::Owned(transformed.chars().map(font_glyph_character).collect());
+        }
         return transformed;
     }
     match transformed {
@@ -1238,6 +1244,11 @@ mod tests {
             "1".to_string(),
         )]));
         assert_eq!(font_render_text_for_style("םול🇱🇮", &style), "םול🇱🇮");
+        assert_eq!(
+            font_render_text_for_style("א ÷ × - + \u{00a0}", &style),
+            "א ÷ × - +  ",
+            "visual-order runs must still normalize NBSP to the regular space glyph"
+        );
     }
 
     #[test]
@@ -1259,6 +1270,23 @@ mod tests {
                 "\u{202d}א ÷ × - + \u{00a0}\u{202c}",
                 w3cos_std::style::TextDirection::Ltr,
             )
+        );
+        assert_eq!(
+            font_render_text(
+                "ת + - × ÷ \u{00a0}\u{200f}",
+                w3cos_std::style::TextDirection::Ltr,
+            ),
+            font_render_text(
+                "\u{202d}\u{00a0} ÷ × - + ת\u{202c}",
+                w3cos_std::style::TextDirection::Ltr,
+            )
+        );
+        assert_eq!(
+            font_render_text(
+                "ת + - × ÷ \u{00a0}\u{200f}",
+                w3cos_std::style::TextDirection::Ltr,
+            ),
+            "  ÷ × - + ת"
         );
     }
 

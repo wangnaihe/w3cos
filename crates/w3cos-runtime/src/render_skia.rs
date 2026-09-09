@@ -1342,24 +1342,13 @@ fn draw_text_in_rect(
         );
         let line_height = style.font_size * style.line_height;
         let advance = measure_skia_text_advance(&layout.lines[0], typeface, style);
-        let alignment_ink_left = if style_uses_generic_monospace(style) {
-            0.0
-        } else if layout.lines[0]
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-        {
-            measure_skia_text_ink_bounds(
-                layout.lines[0].trim_start_matches(char::is_whitespace),
-                style.font_size,
-                typeface,
-                style.font_weight,
-                Some(style),
-            )
-            .left
-        } else {
-            ink.left
-        };
+        let alignment_ink_left = alignment_ink_left(
+            &layout.lines[0],
+            ink.left,
+            style.font_size,
+            typeface,
+            style,
+        );
         let x = aligned_text_x(
             first_line_content,
             effective_text_align(style),
@@ -1401,20 +1390,8 @@ fn draw_text_in_rect(
             Some(style),
         );
         let advance = measure_skia_text_advance(line, typeface, style);
-        let alignment_ink_left = if style_uses_generic_monospace(style) {
-            0.0
-        } else if line.chars().next().is_some_and(char::is_whitespace) {
-            measure_skia_text_ink_bounds(
-                line.trim_start_matches(char::is_whitespace),
-                style.font_size,
-                typeface,
-                style.font_weight,
-                Some(style),
-            )
-            .left
-        } else {
-            ink.left
-        };
+        let alignment_ink_left =
+            alignment_ink_left(line, ink.left, style.font_size, typeface, style);
         let line_content = if index == 0 {
             first_line_content
         } else {
@@ -1522,6 +1499,39 @@ fn aligned_text_x(rect: LayoutRect, align: TextAlign, ink_left: f32, advance_wid
             rect.x - ink_left
         }
     }
+}
+
+fn alignment_ink_left(
+    text: &str,
+    ink_left: f32,
+    font_size: f32,
+    typeface: &Typeface,
+    style: &Style,
+) -> f32 {
+    if style_uses_generic_monospace(style) {
+        return 0.0;
+    }
+    let rendered = text_layout::font_render_text_for_style(text, style);
+    if !rendered.chars().next().is_some_and(char::is_whitespace) {
+        return ink_left;
+    }
+    let trimmed = rendered.trim_start_matches(char::is_whitespace);
+    let mut visual_style = style.clone();
+    visual_style
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-bidi-visual-order".to_string(),
+            "1".to_string(),
+        );
+    measure_skia_text_ink_bounds(
+        trimmed,
+        font_size,
+        typeface,
+        style.font_weight,
+        Some(&visual_style),
+    )
+    .left
 }
 
 fn draw_text_line(
