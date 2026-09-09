@@ -7240,11 +7240,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         text.push(control);
         logical.push((control, units.len().saturating_sub(1)));
     }
-    let paragraph_direction = if component.style.direction == TextDirection::Rtl
-        || units
-            .iter()
-            .any(|unit| unit.component.style.direction == TextDirection::Rtl)
-    {
+    let paragraph_direction = if component.style.direction == TextDirection::Rtl {
         TextDirection::Rtl
     } else {
         TextDirection::Ltr
@@ -10593,6 +10589,33 @@ mod image_component_tests {
         assert_eq!(aqua_fragments[0].style.border_left_width, Some(3.0));
         assert_eq!(aqua_fragments[1].style.border_left_width, Some(3.0));
         assert_eq!(aqua_fragments[2].style.border_left_width, Some(0.0));
+    }
+
+    #[test]
+    fn rtl_inline_embed_does_not_replace_the_parent_paragraph_direction() {
+        let text = |content: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            style.display = Display::Inline;
+            w3cos_std::Component::text(content, style)
+        };
+        let mut embedded_style = w3cos_std::style::Style::default();
+        embedded_style.display = Display::Inline;
+        embedded_style.direction = w3cos_std::style::TextDirection::Rtl;
+        embedded_style.unicode_bidi = w3cos_std::style::UnicodeBidi::Embed;
+        let embedded = w3cos_std::Component::row(embedded_style, vec![text("Second")]);
+        let mut line = w3cos_std::Component::row(
+            w3cos_std::style::Style::default(),
+            vec![text("First "), embedded],
+        );
+
+        reorder_explicit_bidi_inline_rows(&mut line);
+        let visual = line.children.iter().fold(String::new(), |mut output, child| {
+            if let ComponentKind::Text { content } = &child.kind {
+                output.push_str(content);
+            }
+            output
+        });
+        assert_eq!(visual, "First Second");
     }
 
     #[test]
