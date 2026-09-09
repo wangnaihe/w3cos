@@ -3703,17 +3703,14 @@ impl Document {
                                 ))
                     })
                     && children.iter().all(|component| {
-                        !matches!(
-                            component.style.position,
-                            w3cos_std::style::Position::Absolute
-                                | w3cos_std::style::Position::Fixed
-                        ) && matches!(
-                            component.style.display,
-                            w3cos_std::style::Display::Inline
-                                | w3cos_std::style::Display::InlineBlock
-                                | w3cos_std::style::Display::InlineFlex
-                                | w3cos_std::style::Display::InlineTable
-                        )
+                        matches!(component.style.position, w3cos_std::style::Position::Static)
+                            && matches!(
+                                component.style.display,
+                                w3cos_std::style::Display::Inline
+                                    | w3cos_std::style::Display::InlineBlock
+                                    | w3cos_std::style::Display::InlineFlex
+                                    | w3cos_std::style::Display::InlineTable
+                            )
                     })
                 {
                     let coalesced = if children.len() == rendered_child_ids.len() {
@@ -3840,6 +3837,18 @@ impl Document {
                 }
 
                 children = fixup_css_table_children(&style, children);
+
+                if block_in_inline && !matches!(style.position, w3cos_std::style::Position::Static)
+                {
+                    // A positioned inline remains the containing block for
+                    // absolutely positioned descendants even when in-flow
+                    // block children fragment its principal inline box. Do
+                    // not flatten this semantic owner into display:contents:
+                    // retaining the inline row lets layout derive the used
+                    // containing width from its first and last fragments.
+                    style.display = w3cos_std::style::Display::Inline;
+                    return self.attach_native_host(id, w3cos_std::Component::row(style, children));
+                }
 
                 if style.display == w3cos_std::style::Display::InlineBlock
                     && children.iter().any(|child| {
@@ -4181,6 +4190,7 @@ impl Document {
                             style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
                         }
                     } else {
+                        let authored_block = style.display == w3cos_std::style::Display::Block;
                         style.display = if matches!(
                             style.display,
                             w3cos_std::style::Display::Inline
@@ -4210,6 +4220,17 @@ impl Document {
                             && style.white_space != w3cos_std::style::WhiteSpace::NoWrap
                         {
                             style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
+                        }
+                        if authored_block
+                            && matches!(style.min_height, w3cos_std::style::Dimension::Auto)
+                        {
+                            // Lowering a block inline-formatting context to a
+                            // flex row must retain the block's initial line
+                            // box strut. A short replaced element otherwise
+                            // collapses an authored tall `line-height`.
+                            style.min_height = w3cos_std::style::Dimension::Px(
+                                style.font_size * style.line_height,
+                            );
                         }
                     }
                     style.justify_content = match (style.text_align, style.direction) {
@@ -6958,6 +6979,9 @@ fn empty_inline_box_has_no_area(component: &w3cos_std::Component) -> bool {
     use w3cos_std::style::{Dimension, Display};
 
     fn subtree_is_empty(component: &w3cos_std::Component) -> bool {
+        if component.style.position != w3cos_std::style::Position::Static {
+            return false;
+        }
         match &component.kind {
             ComponentKind::Text { content } => content.chars().all(is_css_whitespace),
             ComponentKind::Row | ComponentKind::Box => {
@@ -8316,32 +8340,18 @@ fn hoist_floats_into_block_formatting_context(
         if let Some(mut child) = collect(child, false, &mut left, &mut right) {
             let has_prior_in_flow = in_flow.iter().any(contributes_in_flow_content);
             if direct_float == w3cos_std::style::Float::Left && has_prior_in_flow {
-                let preceding_line_height = in_flow
-                    .iter()
-                    .rev()
-                    .find(|component| {
-                        !matches!(
-                            component.style.position,
-                            w3cos_std::style::Position::Absolute
-                                | w3cos_std::style::Position::Fixed
-                        ) && matches!(
-                            component.style.display,
-                            w3cos_std::style::Display::Inline
-                                | w3cos_std::style::Display::InlineBlock
-                                | w3cos_std::style::Display::InlineFlex
-                                | w3cos_std::style::Display::InlineTable
-                        )
-                    })
-                    .map(|component| component.style.font_size * component.style.line_height);
-                if let Some(preceding_line_height) = preceding_line_height {
-                    let preceding_line_height = preceding_line_height.max(
-                        formatting_context_style.font_size * formatting_context_style.line_height,
+                // A later float is shifted to the inline-start edge of the
+                // current line; earlier inline content flows beside it. Keep
+                // its authored top margin so the float's margin edge, rather
+                // than its border edge, is constrained by the prior line.
+                child
+                    .style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-left-float-after-inline".to_string(),
+                        "1".to_string(),
                     );
-                    if let w3cos_std::style::Spacing::Px(margin_top) = child.style.margin.top {
-                        child.style.margin.top =
-                            w3cos_std::style::Spacing::Px(margin_top - preceding_line_height);
-                    }
-                }
                 in_flow.push(child);
             } else if direct_float == w3cos_std::style::Float::Right && has_prior_in_flow {
                 // A right float encountered after in-flow content cannot rise
@@ -8895,6 +8905,35 @@ mod image_component_tests {
     }
 
     #[test]
+    fn lowered_block_inline_context_retains_its_line_height_strut() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#line-box",
+            &[
+                ("display", "block"),
+                ("line-height", "96px"),
+                ("width", "96px"),
+            ],
+        );
+
+        let mut document = Document::new();
+        let container = document.create_element("div");
+        container.set_attribute(&mut document, "id", "line-box");
+        let image = document.create_element("img");
+        image.set_attribute(&mut document, "width", "15");
+        image.set_attribute(&mut document, "height", "15");
+        container.append_child(&mut document, image);
+        document.body().append_child(&mut document, container);
+
+        let tree = document.to_component_tree();
+        let line_box = tree.children.first().expect("line box");
+        assert_eq!(line_box.style.display, Display::Flex);
+        assert_eq!(line_box.style.line_height, 6.0);
+        assert_eq!(line_box.style.min_height, Dimension::Px(96.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn float_fixup_preserves_static_line_and_block_order() {
         let text = |content: &str| {
             let mut style = w3cos_std::style::Style::default();
@@ -8967,7 +9006,17 @@ mod image_component_tests {
         );
         assert_eq!(
             fixed[2].style.margin.top,
-            w3cos_std::style::Spacing::Px(0.0)
+            w3cos_std::style::Spacing::Px(20.0)
+        );
+        assert!(
+            fixed[2]
+                .style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| {
+                    properties.get("--w3cos-internal-left-float-after-inline")
+                })
+                .is_some_and(|value| value == "1")
         );
     }
 

@@ -23142,11 +23142,17 @@ try {
         let inline = element("span");
         let block = element("div");
         let nested_block = element("div");
+        let fixed = element("div");
+        let fixed_style = fixed.get_property("style");
+        fixed_style.set_property("position", Value::string("fixed"));
+        fixed_style.set_property("width", Value::string("100%"));
+        fixed_style.set_property("height", Value::string("100px"));
         let target = element("div");
         let target_style = target.get_property("style");
         target_style.set_property("position", Value::string("absolute"));
         target_style.set_property("width", Value::string("100%"));
         target_style.set_property("height", Value::string("100px"));
+        nested_block.call_method("appendChild", vec![fixed.clone()]);
         nested_block.call_method("appendChild", vec![target.clone()]);
         block.call_method("appendChild", vec![nested_block]);
         inline.call_method("appendChild", vec![block]);
@@ -23159,6 +23165,7 @@ try {
         assert_eq!(before.get_property("offsetWidth").to_number(), 100.0);
         assert_eq!(after.get_property("offsetWidth").to_number(), 100.0);
         assert_eq!(target.get_property("offsetWidth").to_number(), 100.0);
+        assert_eq!(fixed.get_property("offsetWidth").to_number(), 800.0);
     }
 
     #[test]

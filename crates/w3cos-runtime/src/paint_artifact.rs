@@ -239,12 +239,7 @@ fn inline_fragment_clip_rect(
         ) {
             return None;
         }
-        if !matches!(
-            style.display,
-            w3cos_std::style::Display::Inline
-                | w3cos_std::style::Display::InlineBlock
-                | w3cos_std::style::Display::InlineFlex
-        ) {
+        if style.display != w3cos_std::style::Display::Inline {
             return None;
         }
         let alignment = match style.align_self {
@@ -475,40 +470,9 @@ fn annotate_separated_table_background_fragments(
         }
     }
 
-    for source in 0..original_len {
-        if !matches!(
-            nodes[source].style.display,
-            Display::TableRow
-                | Display::TableRowGroup
-                | Display::TableHeaderGroup
-                | Display::TableFooterGroup
-        ) || (nodes[source].style.background.a == 0
-            && nodes[source].style.background_image.is_none())
-        {
-            continue;
-        }
-        let Some(table) = nearest_table(nodes, source) else {
-            continue;
-        };
-        if nodes[table].style.border_collapse {
-            continue;
-        }
-        let fragments = (0..original_len)
-            .filter(|cell| {
-                nodes[*cell].style.display == Display::TableCell
-                    && descendant_of(nodes, *cell, source)
-            })
-            .filter_map(|cell| rect_by_index.get(cell).copied().flatten())
-            .map(|rect| format!("{} {} {} {}", rect.x, rect.y, rect.width, rect.height))
-            .collect::<Vec<_>>();
-        if !fragments.is_empty() {
-            nodes[source]
-                .style
-                .custom_properties
-                .get_or_insert_with(Default::default)
-                .insert(TABLE_BACKGROUND_FRAGMENTS.to_string(), fragments.join(";"));
-        }
-    }
+    // Row and row-group backgrounds paint over their continuous row boxes,
+    // including the separated-border spacing gutters. Only column layers
+    // need per-cell fragments because columns have no principal CSS box.
 }
 
 fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
@@ -1099,6 +1063,17 @@ impl PaintArtifact {
                 // positioned sibling merely because they are inline content.
                 return 0;
             }
+            if current != index
+                && matches!(
+                    node.style.display,
+                    Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+                )
+            {
+                // Atomic inline-level boxes paint their entire subtree in the
+                // inline phase. A block child must not be globally sorted
+                // ahead of its inline-block parent's background.
+                return 2;
+            }
             cursor = node.parent;
         }
         self.nodes.get(index).map_or(0, |node| {
@@ -1255,10 +1230,37 @@ impl PaintArtifact {
 
     fn append_node(&mut self, index: usize) {
         let node = &self.nodes[index];
-        let inherited = node
+        let mut inherited = node
             .parent
             .and_then(|parent| self.node_properties.get(parent).copied())
             .unwrap_or_default();
+        if matches!(node.style.position, Position::Absolute | Position::Fixed) {
+            // Overflow clips between an out-of-flow box and its containing
+            // block do not clip that box. Inherit the clip chain from the
+            // nearest positioned containing-block ancestor, not blindly from
+            // the DOM parent; fixed boxes use the viewport chain.
+            let positioned_ancestor = if matches!(node.style.position, Position::Fixed) {
+                None
+            } else {
+                let mut ancestor = node.parent;
+                let mut owner = None;
+                while let Some(index) = ancestor {
+                    if !matches!(self.nodes[index].style.position, Position::Static) {
+                        owner = Some(index);
+                        break;
+                    }
+                    ancestor = self.nodes[index].parent;
+                }
+                owner
+            };
+            inherited.clip = positioned_ancestor
+                .and_then(|owner| {
+                    self.node_properties
+                        .get(owner)
+                        .map(|properties| properties.clip)
+                })
+                .unwrap_or_default();
+        }
         let inherited_z = node
             .parent
             .and_then(|parent| {
@@ -1447,6 +1449,24 @@ impl PaintArtifact {
             let current_node = &self.nodes[current];
             if current_node.style.float != w3cos_std::style::Float::None {
                 return (2, 0, index);
+            }
+            if current != index
+                && is_positioned(&current_node.style)
+                && !establishes_stacking_context(current_node)
+            {
+                // A positioned z-index:auto subtree participates atomically
+                // at stack level zero even though it does not establish a new
+                // stacking context. Its normal descendants must paint after
+                // the positioned box's own background.
+                return (4, 0, index);
+            }
+            if current != index
+                && matches!(
+                    current_node.style.display,
+                    Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+                )
+            {
+                return (3, 0, index);
             }
             if current != index && establishes_stacking_context(current_node) {
                 break;
@@ -1898,6 +1918,86 @@ mod tests {
     }
 
     #[test]
+    fn separated_row_group_background_is_not_clipped_to_cell_fragments() {
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::Table,
+                    border_collapse: false,
+                    ..Style::default()
+                },
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableRowGroup,
+                    background_image: Some("blue.png".into()),
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableRow,
+                    ..Style::default()
+                },
+                parent: Some(1),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    display: Display::TableCell,
+                    ..Style::default()
+                },
+                parent: Some(2),
+                sticky_counter_signal: None,
+            },
+        ];
+        let row_group = LayoutRect {
+            x: 3.0,
+            y: 3.0,
+            width: 96.0,
+            height: 96.0,
+        };
+        let rects = vec![
+            Some(LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 102.0,
+                height: 102.0,
+            }),
+            Some(row_group),
+            Some(row_group),
+            Some(LayoutRect {
+                x: 3.0,
+                y: 3.0,
+                width: 90.0,
+                height: 96.0,
+            }),
+        ];
+
+        annotate_separated_table_background_fragments(&mut nodes, &rects);
+
+        assert!(
+            nodes[1]
+                .style
+                .custom_properties
+                .as_ref()
+                .is_none_or(|properties| !properties.contains_key(TABLE_BACKGROUND_FRAGMENTS))
+        );
+        assert_eq!(
+            box_background_paint_rects(&nodes[1].style, row_group),
+            vec![row_group]
+        );
+    }
+
+    #[test]
     fn first_line_internal_clip_uses_the_originating_line_height() {
         let mut style = Style::default();
         style.display = w3cos_std::style::Display::Inline;
@@ -1927,6 +2027,22 @@ mod tests {
                 width: 80.0,
                 height: 60.0,
             })
+        );
+    }
+
+    #[test]
+    fn atomic_inline_level_box_is_not_clipped_to_the_parent_line_height() {
+        let style = Style {
+            display: Display::InlineBlock,
+            align_self: w3cos_std::style::AlignSelf::FlexStart,
+            font_size: 16.0,
+            line_height: 1.2,
+            ..Style::default()
+        };
+
+        assert_eq!(
+            inline_fragment_clip_rect(&ComponentKind::Box, &style, rect(0.0)),
+            None
         );
     }
 
@@ -1994,6 +2110,41 @@ mod tests {
             1,
         );
         assert_eq!(artifact.z_order, [i32::MIN, -1, 0]);
+    }
+
+    #[test]
+    fn absolute_box_inherits_clip_chain_from_its_containing_block() {
+        let nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style::default(),
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    overflow: Overflow::Hidden,
+                    ..Style::default()
+                },
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style {
+                    position: Position::Absolute,
+                    ..Style::default()
+                },
+                parent: Some(1),
+                sticky_counter_signal: None,
+            },
+        ];
+        let artifact =
+            PaintArtifact::build(nodes, &[(rect(0.0), 0), (rect(0.0), 1), (rect(80.0), 2)], 1);
+
+        assert_ne!(artifact.node_properties[1].clip, 0);
+        assert_eq!(artifact.node_properties[2].clip, 0);
     }
 
     #[test]
@@ -2362,6 +2513,74 @@ mod tests {
         assert_eq!(artifact.css2_paint_phase(2), 1);
         assert_eq!(artifact.css2_paint_phase(3), 2);
         assert_eq!(artifact.css2_paint_phase(5), 0);
+    }
+
+    #[test]
+    fn inline_block_descendants_remain_in_the_atomic_inline_paint_phase() {
+        let root = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let inline_block = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                display: Display::InlineBlock,
+                ..Style::default()
+            },
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let block_child = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style::default(),
+            parent: Some(1),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            [root, inline_block, block_child],
+            &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2)],
+            1,
+        );
+
+        assert_eq!(artifact.css2_paint_phase(1), 2);
+        assert_eq!(artifact.css2_paint_phase(2), 2);
+        assert!(artifact.paint_order_key(1) < artifact.paint_order_key(2));
+    }
+
+    #[test]
+    fn positioned_auto_descendants_paint_after_the_positioned_background() {
+        let root = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let positioned = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                position: Position::Relative,
+                ..Style::default()
+            },
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let image = PaintNode {
+            kind: ComponentKind::Image {
+                src: "green.png".into(),
+            },
+            style: Style::default(),
+            parent: Some(1),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            [root, positioned, image],
+            &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2)],
+            1,
+        );
+
+        assert!(artifact.paint_order_key(1) < artifact.paint_order_key(2));
     }
 
     #[test]
