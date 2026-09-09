@@ -2190,7 +2190,22 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
             let mut column = 0usize;
             let grid_width = tracks.iter().sum::<f32>()
                 + gap * tracks.len().saturating_sub(1) as f32;
-            let mut target_x = if rtl { row_x + grid_width } else { row_x };
+            let first_cell = component
+                .children
+                .iter()
+                .find(|child| child.style.display == WDisplay::TableCell);
+            let outer_half = if collapsed {
+                first_cell.map_or(0.0, |cell| {
+                    table_cell_edge_width(cell, if rtl { 1 } else { 3 }) / 2.0
+                })
+            } else {
+                0.0
+            };
+            let mut target_x = if rtl {
+                row_x + grid_width - outer_half
+            } else {
+                row_x + outer_half
+            };
             for child in &component.children {
                 let child_count = count_nodes(child);
                 if child.style.display == WDisplay::TableCell {
@@ -2237,6 +2252,10 @@ fn project_fixed_table_cell_rects(layouts: &mut [(LayoutRect, usize)], root: &Co
                             );
                         }
                         layouts[position].0.width = track + left_half + right_half;
+                        if collapsed && !matches!(child.style.height, WDim::Auto) {
+                            layouts[position].0.height += table_cell_edge_width(child, 0)
+                                + table_cell_edge_width(child, 2);
+                        }
                         if rtl {
                             target_x -= gap;
                         } else {
