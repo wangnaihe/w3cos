@@ -93,22 +93,18 @@ impl PropertyMap {
     pub(crate) fn heap_bytes(&self) -> usize {
         match self.inner.as_deref() {
             None => 0,
-            Some(store) => {
-                std::mem::size_of_val(store).saturating_add(match store {
-                    PropertyStore::Inline { .. } => 0,
-                    PropertyStore::Map { map, order } => map
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<(JsString, Value)>())
-                        .saturating_add(
-                            map.len().saturating_mul(std::mem::size_of::<JsString>()),
-                        )
-                        .saturating_add(
-                            order
-                                .capacity()
-                                .saturating_mul(std::mem::size_of::<JsString>()),
-                        ),
-                })
-            }
+            Some(store) => std::mem::size_of_val(store).saturating_add(match store {
+                PropertyStore::Inline { .. } => 0,
+                PropertyStore::Map { map, order } => map
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(JsString, Value)>())
+                    .saturating_add(map.len().saturating_mul(std::mem::size_of::<JsString>()))
+                    .saturating_add(
+                        order
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<JsString>()),
+                    ),
+            }),
         }
     }
 
@@ -223,7 +219,6 @@ impl PropertyMap {
         }
     }
 
-
     pub(crate) fn any_key(&self, mut f: impl FnMut(&JsString) -> bool) -> bool {
         match self.inner.as_deref() {
             None => false,
@@ -269,7 +264,6 @@ impl<'a> Iterator for PropertyMapKeys<'a> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,7 +274,10 @@ mod tests {
         assert!(map.is_empty());
         assert!(map.is_compact());
         assert_eq!(map.heap_bytes(), 0);
-        assert_eq!(std::mem::size_of::<PropertyMap>(), std::mem::size_of::<usize>());
+        assert_eq!(
+            std::mem::size_of::<PropertyMap>(),
+            std::mem::size_of::<usize>()
+        );
     }
 
     #[test]
@@ -288,7 +285,10 @@ mod tests {
         let mut map = PropertyMap::new();
         for i in 0..INLINE_CAP {
             let key = format!("k{i}");
-            assert!(map.insert(JsString::intern(&key), Value::Number(i as f64)).is_none());
+            assert!(
+                map.insert(JsString::intern(&key), Value::Number(i as f64))
+                    .is_none()
+            );
             assert!(map.is_compact(), "still compact at {i}");
             assert_eq!(map.get(&key).map(|v| v.to_number()), Some(i as f64));
         }

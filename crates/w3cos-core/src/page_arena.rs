@@ -24,8 +24,8 @@
 //! padding would not reclaim holes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -80,11 +80,7 @@ impl<T> SizeClassSlab<T> {
         let size = std::mem::size_of::<T>();
         let size = if size == 0 { 1 } else { size };
         let n = Self::CHUNK_BYTES / size;
-        if n < 8 {
-            8
-        } else {
-            n
-        }
+        if n < 8 { 8 } else { n }
     }
 
     fn new() -> Self {

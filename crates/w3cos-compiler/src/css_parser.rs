@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::parser::StyleDecl;
-use w3cos_std::style::Spacing;
+use w3cos_std::style::{Spacing, parse_css_integer_clamped};
 
 #[derive(Debug, Clone)]
 pub struct KeyframeStop {
@@ -575,8 +575,7 @@ fn parse_authored_declarations(block: &str) -> Vec<(String, String)> {
             let (property, value) = declaration.split_once(':')?;
             let property = property.trim().to_ascii_lowercase();
             let value = value.trim().trim_end_matches("!important").trim();
-            (!property.is_empty() && !value.is_empty())
-                .then(|| (property, value.to_string()))
+            (!property.is_empty() && !value.is_empty()).then(|| (property, value.to_string()))
         })
         .collect()
 }
@@ -1208,7 +1207,7 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
         "right" => style.right = Some(value.to_string()),
         "bottom" => style.bottom = Some(value.to_string()),
         "left" => style.left = Some(value.to_string()),
-        "z-index" => style.z_index = value.parse().ok(),
+        "z-index" => style.z_index = parse_css_integer_clamped(value),
         "overflow" => style.overflow = Some(value.to_string()),
         "overflow-x" => style.overflow_x = Some(value.to_string()),
         "overflow-y" => style.overflow_y = Some(value.to_string()),
@@ -1373,7 +1372,10 @@ fn css_parse_padding_spacing(value: &str) -> Option<Spacing> {
         | Spacing::Em(value)
         | Spacing::Vw(value)
         | Spacing::Vh(value)
-            if value < 0.0 => None,
+            if value < 0.0 =>
+        {
+            None
+        }
         Spacing::Auto => None,
         _ => Some(spacing),
     }
@@ -1500,15 +1502,12 @@ fn apply_font_shorthand(style: &mut StyleDecl, value: &str) {
         .find(char::is_whitespace)
         .unwrap_or(after_slash.len());
     let line_height = &after_slash[..line_height_end];
-    style.line_height = line_height
-        .parse::<f32>()
-        .ok()
-        .or_else(|| {
-            line_height
-                .strip_suffix('%')
-                .and_then(|value| value.trim().parse::<f32>().ok())
-                .map(|value| value / 100.0)
-        });
+    style.line_height = line_height.parse::<f32>().ok().or_else(|| {
+        line_height
+            .strip_suffix('%')
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .map(|value| value / 100.0)
+    });
 
     let family = after_slash[line_height_end..].trim();
     if !family.is_empty() {
@@ -1614,6 +1613,15 @@ mod tests {
     fn float_is_retained_in_the_typed_style_declaration() {
         let sheet = parse_css(".target { float: right; }");
         assert_eq!(sheet.rules[0].style.float.as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn z_index_clamps_valid_integers_to_the_supported_range() {
+        let sheet = parse_css(
+            ".low { z-index: -2147483649; } .high { z-index: 999999999999999999999999; }",
+        );
+        assert_eq!(sheet.rules[0].style.z_index, Some(i32::MIN));
+        assert_eq!(sheet.rules[1].style.z_index, Some(i32::MAX));
     }
 
     #[test]

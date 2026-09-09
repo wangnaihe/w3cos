@@ -86,9 +86,7 @@ impl JsString {
     /// True when both handles share the same intern slot or `Rc` allocation.
     pub fn ptr_eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
-            (Repr::Interned(a), Repr::Interned(b)) => {
-                a.handle == b.handle && a.epoch == b.epoch
-            }
+            (Repr::Interned(a), Repr::Interned(b)) => a.handle == b.handle && a.epoch == b.epoch,
             (Repr::Heap(a), Repr::Heap(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }

@@ -474,12 +474,8 @@ pub(crate) fn font_render_text_for_style<'a>(
             .get("--w3cos-internal-text-transform-continues-word")
             .is_some_and(|value| value == "1")
     });
-    let transformed = w3cos_std::style::transformed_text(
-        text,
-        style.text_transform,
-        language,
-        continues_word,
-    );
+    let transformed =
+        w3cos_std::style::transformed_text(text, style.text_transform, language, continues_word);
     if style.custom_properties.as_ref().is_some_and(|properties| {
         properties
             .get("--w3cos-internal-bidi-visual-order")

@@ -112,15 +112,9 @@ mod tests {
         assert_eq!(blue.g, 0);
         assert_eq!(blue.b, 255);
 
-        assert_eq!(
-            Color::from_named("fuchsia"),
-            Some(Color::rgb(255, 0, 255))
-        );
+        assert_eq!(Color::from_named("fuchsia"), Some(Color::rgb(255, 0, 255)));
         assert_eq!(Color::from_named("navy"), Some(Color::rgb(0, 0, 128)));
-        assert_eq!(
-            Color::from_named("silver"),
-            Some(Color::rgb(192, 192, 192))
-        );
+        assert_eq!(Color::from_named("silver"), Some(Color::rgb(192, 192, 192)));
 
         assert!(Color::from_named("unknown").is_none());
     }
@@ -161,10 +155,7 @@ mod tests {
             Color::from_css("rgb(-1, +128, 256)"),
             Some(Color::rgb(0, 128, 255))
         );
-        assert_eq!(
-            Color::from_css("#1000"),
-            Some(Color::rgba(17, 0, 0, 0))
-        );
+        assert_eq!(Color::from_css("#1000"), Some(Color::rgba(17, 0, 0, 0)));
         assert_eq!(Color::from_css("#00000"), None);
         assert_eq!(Color::from_css("#00g"), None);
         assert_eq!(Color::from_css("rgb(100%, 0, 0)"), None);

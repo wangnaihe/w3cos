@@ -3810,7 +3810,11 @@ impl App {
                 })
                 .collect();
         let paint_z = &self.paint_artifact.z_order;
-        render_nodes.sort_by_key(|(idx, _, _, _)| paint_z[*idx]);
+        render_nodes.sort_by(|(left, _, _, _), (right, _, _, _)| {
+            self.paint_artifact
+                .paint_order_key(*left)
+                .cmp(self.paint_artifact.paint_order_key(*right))
+        });
 
         let scroll_info: Vec<Option<(f32, f32, LayoutRect)>> = scroll_info_raw
             .iter()

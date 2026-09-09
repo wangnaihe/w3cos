@@ -1230,7 +1230,8 @@ fn css_url_eof_closure(mut bytes: &[u8]) -> Option<&'static str> {
         }
         if byte == b'\\' {
             escaped = true;
-        } else if matches!(byte, b'\'' | b'"' | b'(' | b'\0'..=b'\x08' | b'\x0b' | b'\x0e'..=b'\x1f' | b'\x7f') {
+        } else if matches!(byte, b'\'' | b'"' | b'(' | b'\0'..=b'\x08' | b'\x0b' | b'\x0e'..=b'\x1f' | b'\x7f')
+        {
             return None;
         }
     }

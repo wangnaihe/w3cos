@@ -4153,13 +4153,39 @@ fn compound_assign_intrinsic(op: AssignOp) -> Option<&'static str> {
 /// as Monaco's `class="` fragment.
 fn wtf8_to_string(atom: &impl std::fmt::Debug) -> String {
     let debug = format!("{:?}", atom);
-    serde_json::from_str(&debug).unwrap_or_else(|_| {
+    let value = serde_json::from_str(&debug).unwrap_or_else(|_| {
         debug
             .strip_prefix('"')
             .and_then(|value| value.strip_suffix('"'))
             .unwrap_or(&debug)
             .to_string()
-    })
+    });
+    decode_wtf8_debug_surrogates(&value)
+}
+
+fn decode_wtf8_debug_surrogates(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("\\u{") {
+        output.push_str(&rest[..start]);
+        let candidate = &rest[start + 3..];
+        let Some(end) = candidate.find('}') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let parsed = u32::from_str_radix(&candidate[..end], 16).ok();
+        if let Some(surrogate @ 0xd800..=0xdfff) = parsed {
+            output.push(
+                char::from_u32(0xe000 + surrogate - 0xd800)
+                    .expect("surrogate sentinel must be a valid scalar value"),
+            );
+        } else {
+            output.push_str(&rest[start..start + 3 + end + 1]);
+        }
+        rest = &candidate[end + 1..];
+    }
+    output.push_str(rest);
+    output
 }
 
 /// Sanitize a JS identifier to be valid Rust: replace `$` with `_d`, leading
@@ -5029,6 +5055,27 @@ fn expr_kind_name(expr: &Expr) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wtf8_debug_surrogates_use_the_internal_single_unit_encoding() {
+        let decoded = decode_wtf8_debug_surrogates("left\\u{D83C}right\\u{DF20}");
+        assert_eq!(
+            w3cos_core::js_string_utf16_units(&decoded),
+            [
+                b'l' as u16,
+                b'e' as u16,
+                b'f' as u16,
+                b't' as u16,
+                0xd83c,
+                b'r' as u16,
+                b'i' as u16,
+                b'g' as u16,
+                b'h' as u16,
+                b't' as u16,
+                0xdf20,
+            ]
+        );
+    }
     use swc_common::{FileName, SourceMap, sync::Lrc};
     use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 

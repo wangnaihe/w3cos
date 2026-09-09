@@ -804,10 +804,7 @@ fn registers(instruction: &Instruction) -> Vec<Register> {
         Instruction::GetProperty { dst, object, key }
         | Instruction::DeleteProperty { dst, object, key } => vec![*dst, *object, *key],
         Instruction::SetProperty {
-            object,
-            key,
-            value,
-            ..
+            object, key, value, ..
         }
         | Instruction::DefineField { object, key, value } => vec![*object, *key, *value],
         Instruction::DefinePrivate {

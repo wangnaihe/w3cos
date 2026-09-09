@@ -26,12 +26,7 @@ pub fn lower_script(source: &str, specifier: &str) -> Result<Module> {
     let parsed = parse(source, specifier)?;
     let strict_mode = module_items_have_use_strict_directive(&parsed.body);
     let annex_b_function_declarations = !strict_mode;
-    let mut builder = Builder::entry(
-        false,
-        annex_b_function_declarations,
-        strict_mode,
-        true,
-    );
+    let mut builder = Builder::entry(false, annex_b_function_declarations, strict_mode, true);
     for item in &parsed.body {
         if let ModuleItem::Stmt(statement) = item {
             builder.predeclare_function_binding(statement)?;
@@ -484,10 +479,45 @@ fn module_export_name(name: &ModuleExportName) -> String {
 
 fn atom_to_string(atom: &impl serde::Serialize) -> String {
     let serialized = serde_json::to_value(atom).expect("SWC string atom must serialize");
-    serialized
+    let value = serialized
         .as_str()
         .expect("SWC string atom must serialize as a JSON string")
-        .to_string()
+        .to_string();
+    decode_serialized_wtf8_surrogates(&value)
+}
+
+fn decode_serialized_wtf8_surrogates(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            output.push(character);
+            continue;
+        }
+        if characters.peek() == Some(&'\\') {
+            characters.next();
+            output.push('\\');
+            continue;
+        }
+        if characters.peek() != Some(&'u') {
+            output.push('\\');
+            continue;
+        }
+        characters.next();
+        let digits = characters.by_ref().take(4).collect::<String>();
+        if digits.len() == 4
+            && let Ok(surrogate @ 0xd800..=0xdfff) = u32::from_str_radix(&digits, 16)
+        {
+            output.push(
+                char::from_u32(0xe000 + surrogate - 0xd800)
+                    .expect("surrogate sentinel must be a valid scalar value"),
+            );
+        } else {
+            output.push_str("\\u");
+            output.push_str(&digits);
+        }
+    }
+    output
 }
 
 fn reexport_binding_name(item: usize, specifier: usize) -> String {
@@ -5345,6 +5375,31 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialized_wtf8_surrogates_keep_single_utf16_units() {
+        let decoded = decode_serialized_wtf8_surrogates("left\\uD83Cright\\uDF20");
+        assert_eq!(
+            w3cos_core::js_string_utf16_units(&decoded),
+            [
+                b'l' as u16,
+                b'e' as u16,
+                b'f' as u16,
+                b't' as u16,
+                0xd83c,
+                b'r' as u16,
+                b'i' as u16,
+                b'g' as u16,
+                b'h' as u16,
+                b't' as u16,
+                0xdf20,
+            ]
+        );
+        assert_eq!(
+            decode_serialized_wtf8_surrogates("literal\\\\uD83C"),
+            "literal\\uD83C"
+        );
+    }
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use w3cos_core::Value;
@@ -10412,10 +10467,9 @@ mod tests {
         let observed = Rc::new(RefCell::new(Vec::new()));
         let report_observed = Rc::clone(&observed);
         let report = Value::function(move |_, arguments| {
-            report_observed.borrow_mut().push((
-                arguments[0].to_js_string(),
-                arguments[1].to_bool(),
-            ));
+            report_observed
+                .borrow_mut()
+                .push((arguments[0].to_js_string(), arguments[1].to_bool()));
             Value::Undefined
         });
 

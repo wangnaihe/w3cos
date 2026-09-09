@@ -2970,10 +2970,7 @@ mod tests {
         style.set_property("white-space", "pre");
         style.set_property("white-space", "pre-lines");
 
-        assert_eq!(
-            style.inner.white_space,
-            w3cos_std::style::WhiteSpace::Pre
-        );
+        assert_eq!(style.inner.white_space, w3cos_std::style::WhiteSpace::Pre);
     }
 
     #[test]

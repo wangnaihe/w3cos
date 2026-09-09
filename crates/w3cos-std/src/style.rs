@@ -26,6 +26,30 @@ pub fn parse_absolute_length_px(value: &str) -> Option<f32> {
     value.parse().ok()
 }
 
+/// Parse a CSS `<integer>` into the runtime's supported range.
+///
+/// CSS integers are not restricted to the host integer width. Keeping an
+/// out-of-range value valid and clamping it preserves its ordering relative
+/// to every representable value instead of dropping the declaration.
+pub fn parse_css_integer_clamped(value: &str) -> Option<i32> {
+    let value = value.trim();
+    if let Ok(parsed) = value.parse::<i128>() {
+        return Some(parsed.clamp(i32::MIN as i128, i32::MAX as i128) as i32);
+    }
+
+    let (negative, digits) = if let Some(digits) = value.strip_prefix('-') {
+        (true, digits)
+    } else if let Some(digits) = value.strip_prefix('+') {
+        (false, digits)
+    } else {
+        (false, value)
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(if negative { i32::MIN } else { i32::MAX })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CssClipRect {
     pub top: Option<Dimension>,
@@ -1222,9 +1246,7 @@ fn push_css_uppercase(output: &mut String, character: char) {
         return;
     }
     let simple_greek_uppercase = match codepoint {
-        0x1f80..=0x1f87 | 0x1f90..=0x1f97 | 0x1fa0..=0x1fa7 => {
-            char::from_u32(codepoint + 8)
-        }
+        0x1f80..=0x1f87 | 0x1f90..=0x1f97 | 0x1fa0..=0x1fa7 => char::from_u32(codepoint + 8),
         0x1fb3 => Some('\u{1fbc}'),
         0x1fc3 => Some('\u{1fcc}'),
         0x1ff3 => Some('\u{1ffc}'),

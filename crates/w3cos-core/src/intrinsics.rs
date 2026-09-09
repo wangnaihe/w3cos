@@ -430,10 +430,7 @@ pub fn construct(constructor: &Value, arguments: Vec<Value>) -> Value {
     crate::class::construct(constructor, arguments)
 }
 
-pub fn construct_completion(
-    constructor: &Value,
-    arguments: Vec<Value>,
-) -> crate::Completion {
+pub fn construct_completion(constructor: &Value, arguments: Vec<Value>) -> crate::Completion {
     crate::catch_js(|| construct(constructor, arguments))
 }
 
@@ -842,7 +839,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod call_completion_tests {
     use super::*;
@@ -858,8 +854,7 @@ mod call_completion_tests {
     #[test]
     fn call_with_arguments_completion_rejects_non_array_without_unwind() {
         let noop = Value::function(|_, _| Value::Undefined);
-        let outcome =
-            call_with_arguments_completion(&noop, Value::Undefined, &Value::Number(1.0));
+        let outcome = call_with_arguments_completion(&noop, Value::Undefined, &Value::Number(1.0));
         let err = outcome.expect_err("non-array args");
         assert_eq!(err.get_property("name").to_js_string(), "TypeError");
     }

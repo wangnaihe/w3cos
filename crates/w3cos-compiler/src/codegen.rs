@@ -677,10 +677,7 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
         fields.push(format!("text_indent: {}", gen_dimension(indent)));
     }
     if let Some(ref transform) = s.text_transform {
-        fields.push(format!(
-            "text_transform: {}",
-            gen_text_transform(transform)
-        ));
+        fields.push(format!("text_transform: {}", gen_text_transform(transform)));
     }
     if let Some(ref c) = s.color {
         fields.push(format!("color: {}", gen_color_rust(c, "Color::BLACK")));

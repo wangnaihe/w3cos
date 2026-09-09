@@ -1278,9 +1278,7 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                 "minWidth" | "min_width" => style.min_width = Some(unquote(val)),
                 "textAlign" | "text_align" => style.text_align = Some(unquote(val)),
                 "textIndent" | "text_indent" => style.text_indent = Some(unquote(val)),
-                "textTransform" | "text_transform" => {
-                    style.text_transform = Some(unquote(val))
-                }
+                "textTransform" | "text_transform" => style.text_transform = Some(unquote(val)),
                 "opacity" => {
                     let v = unquote(val);
                     if let Some(name) = v.strip_prefix('@') {

@@ -235,25 +235,21 @@ pub(crate) fn background_paint_layers_with_overrides(
     positioning_area: Option<LayoutRect>,
     clip_override: Option<LayoutRect>,
 ) -> Vec<BackgroundPaintLayer> {
-    let mut layers = raster_background_layers_with_overrides(
-        style,
-        border_box,
-        positioning_area,
-        clip_override,
-    )
-        .into_iter()
-        .map(BackgroundPaintLayer::Raster)
-        .chain(
-            gradient_background_layers_with_overrides(
-                style,
-                border_box,
-                positioning_area,
-                clip_override,
-            )
+    let mut layers =
+        raster_background_layers_with_overrides(style, border_box, positioning_area, clip_override)
+            .into_iter()
+            .map(BackgroundPaintLayer::Raster)
+            .chain(
+                gradient_background_layers_with_overrides(
+                    style,
+                    border_box,
+                    positioning_area,
+                    clip_override,
+                )
                 .into_iter()
                 .map(BackgroundPaintLayer::Gradient),
-        )
-        .collect::<Vec<_>>();
+            )
+            .collect::<Vec<_>>();
     layers.sort_by_key(BackgroundPaintLayer::layer_index);
     layers
 }

@@ -1311,9 +1311,7 @@ fn draw_text_ink_in_box(
     };
     let x = match align {
         TextAlign::Right => box_rect.x + box_rect.width - ink.width - alignment_ink_left,
-        TextAlign::Center => {
-            box_rect.x + (box_rect.width - ink.width) * 0.5 - alignment_ink_left
-        }
+        TextAlign::Center => box_rect.x + (box_rect.width - ink.width) * 0.5 - alignment_ink_left,
         TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
             box_rect.x - alignment_ink_left
         }

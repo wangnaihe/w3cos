@@ -1870,11 +1870,7 @@ impl Vm {
                         read(*value),
                     );
                 } else {
-                    w3cos_core::intrinsics::set_property(
-                        &read(*object),
-                        &read(*key),
-                        read(*value),
-                    );
+                    w3cos_core::intrinsics::set_property(&read(*object), &read(*key), read(*value));
                 }
             }
             Instruction::DefineField { object, key, value } => {

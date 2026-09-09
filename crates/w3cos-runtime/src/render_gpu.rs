@@ -664,39 +664,45 @@ fn render_node(
         .into_iter()
         .rev()
         {
-        let clip = match &layer {
-            crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.clip,
-            crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.geometry.clip,
-        };
-        let clip_shape = RoundedRect::new(
-            clip.rect.x as f64,
-            clip.rect.y as f64,
-            (clip.rect.x + clip.rect.width) as f64,
-            (clip.rect.y + clip.rect.height) as f64,
-            clip.radius as f64,
-        );
-        scene.push_layer(
-            Fill::NonZero,
-            background_mix(match &layer {
-                crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.blend_mode,
-                crate::background_image::BackgroundPaintLayer::Gradient(layer) => layer.blend_mode,
-            }),
-            1.0,
-            dpi,
-            &clip_shape,
-        );
-        match layer {
-            crate::background_image::BackgroundPaintLayer::Raster(layer) => {
-                for tile in layer.tiles {
-                    draw_image_source(scene, tile, &layer.source);
+            let clip = match &layer {
+                crate::background_image::BackgroundPaintLayer::Raster(layer) => layer.clip,
+                crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
+                    layer.geometry.clip
+                }
+            };
+            let clip_shape = RoundedRect::new(
+                clip.rect.x as f64,
+                clip.rect.y as f64,
+                (clip.rect.x + clip.rect.width) as f64,
+                (clip.rect.y + clip.rect.height) as f64,
+                clip.radius as f64,
+            );
+            scene.push_layer(
+                Fill::NonZero,
+                background_mix(match &layer {
+                    crate::background_image::BackgroundPaintLayer::Raster(layer) => {
+                        layer.blend_mode
+                    }
+                    crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
+                        layer.blend_mode
+                    }
+                }),
+                1.0,
+                dpi,
+                &clip_shape,
+            );
+            match layer {
+                crate::background_image::BackgroundPaintLayer::Raster(layer) => {
+                    for tile in layer.tiles {
+                        draw_image_source(scene, tile, &layer.source);
+                    }
+                }
+                crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
+                    for tile in layer.geometry.tiles {
+                        draw_gradient(scene, tile, &layer.kind, &layer.stops, opacity, dpi);
+                    }
                 }
             }
-            crate::background_image::BackgroundPaintLayer::Gradient(layer) => {
-                for tile in layer.geometry.tiles {
-                    draw_gradient(scene, tile, &layer.kind, &layer.stops, opacity, dpi);
-                }
-            }
-        }
             scene.pop_layer();
         }
     }

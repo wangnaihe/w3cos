@@ -2031,7 +2031,9 @@ fn query_selector_argument(args: &[Value], validation_node: u32) -> String {
         selector.replace(pseudo, ":root")
     });
     let selector_for_validation = selector_for_static_validation(&selector_for_validation);
-    if dom::matches_selector(validation_node, &selector_for_validation).is_err() {
+    if dom::matches_selector(validation_node, &selector_for_validation).is_err()
+        && !w3cos_dom::stylesheet::selector_list_is_valid(&selector_for_validation)
+    {
         dom_exception("Invalid selector", "SyntaxError");
     }
     selector
@@ -3180,7 +3182,52 @@ pub(crate) fn decode_html_entities(input: &str) -> String {
     // not only XML's five predefined entities. Keeping this decoder shared by
     // both parsers prevents XHTML references such as `&times;` and `&divide;`
     // from disappearing at `GeneralRef` boundaries before layout and bidi.
-    html_escape::decode_html_entities(input).into_owned()
+    let decoded = html_escape::decode_html_entities(input);
+    decode_unhandled_numeric_character_references(&decoded)
+}
+
+fn decode_unhandled_numeric_character_references(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("&#") {
+        output.push_str(&rest[..start]);
+        let after_marker = &rest[start + 2..];
+        let (radix, digits_source, prefix_len) = if let Some(hex) = after_marker
+            .strip_prefix('x')
+            .or_else(|| after_marker.strip_prefix('X'))
+        {
+            (16, hex, 1)
+        } else {
+            (10, after_marker, 0)
+        };
+        let digits_len = digits_source
+            .bytes()
+            .take_while(|byte| {
+                if radix == 16 {
+                    byte.is_ascii_hexdigit()
+                } else {
+                    byte.is_ascii_digit()
+                }
+            })
+            .count();
+        if digits_len == 0 {
+            output.push('&');
+            rest = &rest[start + 1..];
+            continue;
+        }
+        let codepoint = u32::from_str_radix(&digits_source[..digits_len], radix).ok();
+        output.push(
+            codepoint
+                .filter(|codepoint| *codepoint != 0)
+                .and_then(char::from_u32)
+                .unwrap_or('\u{fffd}'),
+        );
+        let consumed = 2 + prefix_len + digits_len;
+        let semicolon = usize::from(rest[start + consumed..].starts_with(';'));
+        rest = &rest[start + consumed + semicolon..];
+    }
+    output.push_str(rest);
+    output
 }
 
 pub(crate) fn html_tag_end(input: &str) -> Option<usize> {
@@ -7812,10 +7859,8 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             None => Value::Null,
         },
         "length" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => Value::Number(
-            dom::get_text_content(node)
-                .unwrap_or_default()
-                .encode_utf16()
-                .count() as f64,
+            w3cos_core::js_string_utf16_units(&dom::get_text_content(node).unwrap_or_default())
+                .len() as f64,
         ),
         "substringData" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => func(move |_, args| {
             if args.len() < 2 {
@@ -7824,10 +7869,8 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                     vec![Value::string("substringData requires 2 arguments")],
                 ));
             }
-            let units = dom::get_text_content(node)
-                .unwrap_or_default()
-                .encode_utf16()
-                .collect::<Vec<_>>();
+            let units =
+                w3cos_core::js_string_utf16_units(&dom::get_text_content(node).unwrap_or_default());
             let offset = arg(&args, 0).to_u32() as usize;
             if offset > units.len() {
                 w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
@@ -7838,7 +7881,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             let end = offset
                 .saturating_add(arg(&args, 1).to_u32() as usize)
                 .min(units.len());
-            Value::string(&String::from_utf16_lossy(&units[offset..end]))
+            Value::string(&w3cos_core::js_string_from_utf16_units(&units[offset..end]))
         }),
         "appendData" if matches!(dom::node_type(node), 3 | 4 | 7 | 8) => func(move |_, args| {
             if args.is_empty() {
@@ -7857,10 +7900,9 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         {
             let operation = key.to_string();
             func(move |_, args| {
-                let mut units = dom::get_text_content(node)
-                    .unwrap_or_default()
-                    .encode_utf16()
-                    .collect::<Vec<_>>();
+                let mut units = w3cos_core::js_string_utf16_units(
+                    &dom::get_text_content(node).unwrap_or_default(),
+                );
                 let offset = arg(&args, 0).to_u32() as usize;
                 if offset > units.len() {
                     w3cos_core::throw_value(w3cos_core::web::dom_exception_instance(
@@ -7883,13 +7925,10 @@ fn element_computed_get(node: u32, key: &str) -> Value {
                 let replacement = if operation == "deleteData" {
                     Vec::new()
                 } else {
-                    arg(&args, data_index)
-                        .to_js_string()
-                        .encode_utf16()
-                        .collect()
+                    w3cos_core::js_string_utf16_units(&arg(&args, data_index).to_js_string())
                 };
                 units.splice(offset..end, replacement);
-                dom::set_text_content(node, &String::from_utf16_lossy(&units));
+                dom::set_text_content(node, &w3cos_core::js_string_from_utf16_units(&units));
                 Value::Undefined
             })
         }
@@ -21126,6 +21165,43 @@ mod tests {
             .expect_err("invalid selector syntax must throw");
             assert_eq!(invalid.get_property("name").to_js_string(), "SyntaxError");
         }
+    }
+
+    #[test]
+    fn query_selector_accepts_pseudo_elements_but_never_matches_them() {
+        setup();
+        let document = document_value();
+        let element = create_in_body("div");
+        element.set_property("id", Value::string("pseudo-element"));
+
+        for selector in [
+            "#pseudo-element:first-line",
+            "#pseudo-element::first-letter",
+            "#pseudo-element:before",
+            "#pseudo-element::after",
+        ] {
+            assert!(
+                document
+                    .call_method("querySelector", vec![Value::string(selector)])
+                    .is_null()
+            );
+            assert_eq!(
+                document
+                    .call_method("querySelectorAll", vec![Value::string(selector)])
+                    .get_property("length")
+                    .to_u32(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn html_entities_preserve_numeric_vertical_tab_references() {
+        assert_eq!(
+            decode_html_entities("before&#x000B;after"),
+            "before\u{b}after"
+        );
+        assert_eq!(decode_html_entities("&#11;"), "\u{b}");
     }
 
     #[test]

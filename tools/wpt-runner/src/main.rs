@@ -9,8 +9,8 @@ use clap::{Parser, ValueEnum};
 use discover::discover_suite;
 use manifest::{SuiteManifest, TestKind};
 use runner::{
-    SuiteReport, SuiteRunner, TestReport, build_reftest_report, effective_case_timeout,
-    read_frame, write_frame,
+    SuiteReport, SuiteRunner, TestReport, build_reftest_report, effective_case_timeout, read_frame,
+    write_frame,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -454,11 +454,8 @@ fn spawn_worker(
         let mut bytes = Vec::new();
         stderr.read_to_end(&mut bytes).map(|_| bytes)
     });
-    let case_timeout = effective_case_timeout(
-        &cli.wpt_root,
-        test,
-        Duration::from_millis(cli.timeout_ms),
-    );
+    let case_timeout =
+        effective_case_timeout(&cli.wpt_root, test, Duration::from_millis(cli.timeout_ms));
     let worker_budget = match mode {
         // A harness worker first navigates and then waits for test completion.
         InternalMode::Testharness => case_timeout.saturating_mul(2),
@@ -466,13 +463,20 @@ fn spawn_worker(
     } + Duration::from_secs(2);
     let deadline = Instant::now() + worker_budget;
     let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait().context("failed to poll isolated WPT worker")? {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll isolated WPT worker")?
+        {
             break (status, false);
         }
         if Instant::now() >= deadline {
-            child.kill().context("failed to terminate timed-out WPT worker")?;
+            child
+                .kill()
+                .context("failed to terminate timed-out WPT worker")?;
             break (
-                child.wait().context("failed to reap timed-out WPT worker")?,
+                child
+                    .wait()
+                    .context("failed to reap timed-out WPT worker")?,
                 true,
             );
         }

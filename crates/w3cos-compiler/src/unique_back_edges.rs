@@ -121,10 +121,7 @@ pub fn analyze_unique_back_edges(
                     }
                 }
                 Instruction::SetProperty {
-                    object,
-                    key,
-                    value,
-                    ..
+                    object, key, value, ..
                 }
                 | Instruction::DefineField { object, key, value } => {
                     note_fresh_closure(&origins, &mut fresh_closures, *object, *value);

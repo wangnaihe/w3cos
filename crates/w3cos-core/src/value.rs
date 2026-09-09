@@ -12,6 +12,42 @@ use crate::heap::{HeapAllocation, HeapKind};
 use crate::js_string::JsString;
 use crate::property_map::PropertyMap;
 
+const WTF16_SURROGATE_SENTINEL_START: u32 = 0xe000;
+
+/// Convert the runtime's UTF-8-compatible JS string representation to UTF-16
+/// code units while preserving isolated surrogates.
+pub fn js_string_utf16_units(value: &str) -> Vec<u16> {
+    let mut units = Vec::with_capacity(value.len());
+    for character in value.chars() {
+        let codepoint = character as u32;
+        if (WTF16_SURROGATE_SENTINEL_START..WTF16_SURROGATE_SENTINEL_START + 0x800)
+            .contains(&codepoint)
+        {
+            units.push((0xd800 + codepoint - WTF16_SURROGATE_SENTINEL_START) as u16);
+        } else {
+            units.extend(character.to_string().encode_utf16());
+        }
+    }
+    units
+}
+
+/// Convert UTF-16 code units back to the runtime string representation.
+pub fn js_string_from_utf16_units(units: &[u16]) -> String {
+    let mut output = String::new();
+    for decoded in char::decode_utf16(units.iter().copied()) {
+        match decoded {
+            Ok(character) => output.push(character),
+            Err(error) => output.push(
+                char::from_u32(
+                    WTF16_SURROGATE_SENTINEL_START + u32::from(error.unpaired_surrogate()) - 0xd800,
+                )
+                .expect("surrogate sentinel must be a valid scalar value"),
+            ),
+        }
+    }
+    output
+}
+
 /// JavaScript-compatible dynamic value type.
 ///
 /// Page-local ABI: Undefined / Null / Bool / Number, page-interned strings
@@ -427,7 +463,9 @@ impl Value {
     #[inline]
     pub fn as_function(&self) -> Option<JsFunction> {
         match self {
-            Value::Imm(imm) => imm.function_handle().and_then(crate::page_arena::get_function),
+            Value::Imm(imm) => imm
+                .function_handle()
+                .and_then(crate::page_arena::get_function),
             Value::Function(function) => Some(JsFunction::from_host(Rc::clone(function))),
             _ => None,
         }
@@ -1010,10 +1048,7 @@ pub(crate) fn array_slot_value(value: Value) -> Value {
     }
 }
 
-fn function_heap_bytes(
-    props: &PropertyMap,
-    captures: Option<&AotCaptureMap>,
-) -> usize {
+fn function_heap_bytes(props: &PropertyMap, captures: Option<&AotCaptureMap>) -> usize {
     let mut bytes = std::mem::size_of::<FunctionData>().saturating_add(props.heap_bytes());
     if let Some(captures) = captures {
         // Box<AotCaptureMap> payload (the Box word itself sits in FunctionData).
@@ -1218,8 +1253,10 @@ impl FunctionData {
         // Libraries install methods on constructor prototypes before
         // constructing instances.
         props.insert(JsString::intern("prototype"), Value::object(HashMap::new()));
-        let allocation =
-            HeapAllocation::new(HeapKind::Function, function_heap_bytes(&props, captures_ref));
+        let allocation = HeapAllocation::new(
+            HeapKind::Function,
+            function_heap_bytes(&props, captures_ref),
+        );
         Self {
             body,
             props: RefCell::new(props),
@@ -1812,10 +1849,7 @@ impl Value {
     /// invoked with the object as receiver instead of storing directly.
     pub fn try_set_property(&self, key: &str, value: Value) -> bool {
         if let Some(o) = self.as_object() {
-            let rejects_indexed_set = o
-                .borrow()
-                .get_direct("__w3cosRejectIndexedSet")
-                .to_bool();
+            let rejects_indexed_set = o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool();
             let canonical_index = key
                 .parse::<u32>()
                 .is_ok_and(|index| index.to_string() == key);
@@ -3543,6 +3577,14 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
 mod tests {
     use super::*;
 
+    #[test]
+    fn internal_js_string_round_trips_isolated_and_paired_surrogates() {
+        let units = [0xd83c, 0xdf20, 0xd83c, b'A' as u16, 0xdf20];
+        let encoded = js_string_from_utf16_units(&units);
+        assert_eq!(js_string_utf16_units(&encoded), units);
+        assert!(encoded.starts_with('🌠'));
+    }
+
     fn assert_copy<T: Copy>(value: T) -> T {
         value
     }
@@ -3741,10 +3783,7 @@ mod tests {
 
     #[test]
     fn array_fill_materializes_sparse_slots_and_honors_bounds() {
-        let array = crate::builtins::array_value().call(
-            Value::Undefined,
-            vec![Value::Number(4.0)],
-        );
+        let array = crate::builtins::array_value().call(Value::Undefined, vec![Value::Number(4.0)]);
         assert!(array.call_method("fill", vec![Value::string("x")]) == array);
         assert_eq!(array.to_js_string(), "x,x,x,x");
 
@@ -4784,11 +4823,7 @@ mod tests {
     #[test]
     fn aot_function_calls_factory_with_borrowed_captures_without_dyn_box_path() {
         crate::page_arena::reset();
-        fn factory(
-            this: Value,
-            args: Vec<Value>,
-            captures: &AotCaptureMap,
-        ) -> Value {
+        fn factory(this: Value, args: Vec<Value>, captures: &AotCaptureMap) -> Value {
             assert!(this.is_undefined());
             let capture = captures
                 .get(&7)
@@ -4809,15 +4844,21 @@ mod tests {
         let func = Value::aot_function(factory, captures);
         assert!(func.is_function());
         assert_eq!(
-            func.call(Value::Undefined, vec![Value::Number(3.0)]).to_number(),
+            func.call(Value::Undefined, vec![Value::Number(3.0)])
+                .to_number(),
             13.0
         );
         // Second call must still see the same borrowed captures map.
         assert_eq!(
-            func.call(Value::Undefined, vec![Value::Number(5.0)]).to_number(),
+            func.call(Value::Undefined, vec![Value::Number(5.0)])
+                .to_number(),
             15.0
         );
-        assert!(func.as_function().expect("function").has_own_property("prototype"));
+        assert!(
+            func.as_function()
+                .expect("function")
+                .has_own_property("prototype")
+        );
         // Dyn host function + AOT function + capture-adapter getter.
         assert_eq!(crate::page_arena::live_functions(), 2);
         crate::page_arena::reset();

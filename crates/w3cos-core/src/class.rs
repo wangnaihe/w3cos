@@ -251,10 +251,10 @@ pub fn define_private_field(receiver: &Value, brand: &Value, name: &str, value: 
     let brand_id = require_private_brand(receiver, brand, name);
     if let Some(object) = receiver.as_object() {
         let mut object = object.borrow_mut();
-        object.ensure_rare().private_elements.insert(
-            (brand_id, name.to_string()),
-            PrivateElement::Field(value),
-        );
+        object
+            .ensure_rare()
+            .private_elements
+            .insert((brand_id, name.to_string()), PrivateElement::Field(value));
         object.refresh_heap_accounting();
     }
 }
@@ -264,10 +264,10 @@ pub fn define_private_method(brand: &Value, name: &str, method: Value) {
     let brand_id = require_private_brand(brand, brand, name);
     if let Some(object) = brand.as_object() {
         let mut object = object.borrow_mut();
-        object.ensure_rare().private_elements.insert(
-            (brand_id, name.to_string()),
-            PrivateElement::Method(method),
-        );
+        object
+            .ensure_rare()
+            .private_elements
+            .insert((brand_id, name.to_string()), PrivateElement::Method(method));
         object.refresh_heap_accounting();
     }
 }

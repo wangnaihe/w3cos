@@ -586,7 +586,9 @@ fn translate_javascript_escapes(source: &str) -> String {
             continue;
         }
         if bytes.get(index + 1) == Some(&b'0')
-            && bytes.get(index + 2).is_none_or(|next| !next.is_ascii_digit())
+            && bytes
+                .get(index + 2)
+                .is_none_or(|next| !next.is_ascii_digit())
         {
             output.push_str(r"\x00");
             index += 2;
@@ -767,21 +769,35 @@ mod tests {
             r"^(?:[A-Za-z][^\0\t\n\f\r\u0020/>]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9-.:_\u0080-\u{10FFFF}]*)$",
             "u",
         );
-        assert!(pattern.call_method("test", vec![Value::from("div")]).to_bool());
-        assert!(pattern.call_method("test", vec![Value::from("smallEmoji🆖")]).to_bool());
+        assert!(
+            pattern
+                .call_method("test", vec![Value::from("div")])
+                .to_bool()
+        );
+        assert!(
+            pattern
+                .call_method("test", vec![Value::from("smallEmoji🆖")])
+                .to_bool()
+        );
     }
 
     #[test]
     fn javascript_character_class_and_surrogate_escapes_translate_to_rust_regex() {
         let punctuation = create(r"[-\/\\^$*+?.()|[\]{}]", "g");
-        assert!(punctuation.call_method("test", vec![Value::from("$")]).to_bool());
+        assert!(
+            punctuation
+                .call_method("test", vec![Value::from("$")])
+                .to_bool()
+        );
         let surrogate = create(
             r"([\ud800-\udbff]+)(?![\udc00-\udfff])|(^|[^\ud800-\udbff])([\udc00-\udfff]+)",
             "g",
         );
-        assert!(surrogate
-            .call_method("test", vec![Value::from("�")])
-            .to_bool());
+        assert!(
+            surrogate
+                .call_method("test", vec![Value::from("�")])
+                .to_bool()
+        );
     }
 
     #[test]

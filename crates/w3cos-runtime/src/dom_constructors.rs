@@ -534,9 +534,8 @@ fn build_constructors() -> HashMap<String, Value> {
     });
     replace_child.set_property("length", Value::Number(2.0));
     node.set_property("replaceChild", replace_child);
-    let contains = Value::function(|receiver, args| {
-        crate::jsdom::node_prototype_contains(receiver, args)
-    });
+    let contains =
+        Value::function(|receiver, args| crate::jsdom::node_prototype_contains(receiver, args));
     contains.set_property("length", Value::Number(1.0));
     node.set_property("contains", contains);
     let compare_document_position = Value::function(|receiver, args| {
@@ -549,17 +548,19 @@ fn build_constructors() -> HashMap<String, Value> {
     });
     has_child_nodes.set_property("length", Value::Number(0.0));
     node.set_property("hasChildNodes", has_child_nodes);
-    constructors["Element"].get_property("prototype").set_property(
-        "__w3cos_symbol_unscopables",
-        Value::object(HashMap::from([
-            ("after".to_string(), Value::Bool(true)),
-            ("append".to_string(), Value::Bool(true)),
-            ("before".to_string(), Value::Bool(true)),
-            ("prepend".to_string(), Value::Bool(true)),
-            ("remove".to_string(), Value::Bool(true)),
-            ("replaceWith".to_string(), Value::Bool(true)),
-        ])),
-    );
+    constructors["Element"]
+        .get_property("prototype")
+        .set_property(
+            "__w3cos_symbol_unscopables",
+            Value::object(HashMap::from([
+                ("after".to_string(), Value::Bool(true)),
+                ("append".to_string(), Value::Bool(true)),
+                ("before".to_string(), Value::Bool(true)),
+                ("prepend".to_string(), Value::Bool(true)),
+                ("remove".to_string(), Value::Bool(true)),
+                ("replaceWith".to_string(), Value::Bool(true)),
+            ])),
+        );
     let common_element_events = "onabort onanimationcancel onanimationend \
         onanimationiteration onanimationstart onauxclick onbeforeinput onbeforematch \
         onbeforetoggle onbeforexrselect onblur oncancel oncanplay oncanplaythrough onchange \
@@ -2001,13 +2002,12 @@ fn html_constructor_for_tag(tag: &str) -> &'static str {
         "track" => "HTMLTrackElement",
         "ul" => "HTMLUListElement",
         "canvas" => "HTMLCanvasElement",
-        "abbr" | "acronym" | "address" | "article" | "aside" | "b" | "bdi" | "bdo"
-        | "bgsound" | "big" | "center" | "cite" | "code" | "dd" | "dfn" | "dt"
-        | "em" | "figcaption" | "figure" | "footer" | "header" | "hgroup" | "i"
-        | "isindex" | "kbd" | "main" | "mark" | "nav" | "nobr" | "noembed"
-        | "noframes" | "noscript" | "plaintext" | "rb" | "rp" | "rt" | "rtc" | "ruby"
-        | "s" | "samp" | "search" | "section" | "small" | "spacer" | "strike"
-        | "strong" | "sub" | "summary" | "sup" | "tt" | "u" | "var" | "wbr" => {
+        "abbr" | "acronym" | "address" | "article" | "aside" | "b" | "bdi" | "bdo" | "bgsound"
+        | "big" | "center" | "cite" | "code" | "dd" | "dfn" | "dt" | "em" | "figcaption"
+        | "figure" | "footer" | "header" | "hgroup" | "i" | "isindex" | "kbd" | "main" | "mark"
+        | "nav" | "nobr" | "noembed" | "noframes" | "noscript" | "plaintext" | "rb" | "rp"
+        | "rt" | "rtc" | "ruby" | "s" | "samp" | "search" | "section" | "small" | "spacer"
+        | "strike" | "strong" | "sub" | "summary" | "sup" | "tt" | "u" | "var" | "wbr" => {
             "HTMLElement"
         }
         _ if tag.contains('-') => "HTMLElement",
@@ -2136,10 +2136,7 @@ mod tests {
     #[test]
     fn unknown_html_tags_use_the_unknown_element_prototype() {
         let unknown = Value::object(HashMap::new());
-        w3cos_core::class::set_prototype_of(
-            &unknown,
-            &prototype_for_node(1, "unknown", false),
-        );
+        w3cos_core::class::set_prototype_of(&unknown, &prototype_for_node(1, "unknown", false));
         assert!(w3cos_core::class::instance_of(
             &unknown,
             &constructor("HTMLUnknownElement")

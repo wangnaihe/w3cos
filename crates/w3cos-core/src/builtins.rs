@@ -330,11 +330,7 @@ fn build_array_value() -> Value {
                 if callback
                     .call(
                         this_arg.clone(),
-                        vec![
-                            value.clone(),
-                            Value::Number(index as f64),
-                            this.clone(),
-                        ],
+                        vec![value.clone(), Value::Number(index as f64), this.clone()],
                     )
                     .to_bool()
                 {
@@ -539,8 +535,8 @@ fn array_from(arguments: &[Value]) -> Value {
             Vec::new()
         } else {
             (0..length.floor() as usize)
-            .map(|index| source.get_property(&index.to_string()))
-            .collect()
+                .map(|index| source.get_property(&index.to_string()))
+                .collect()
         }
     };
     if map_function.is_undefined() {
@@ -1795,10 +1791,7 @@ mod tests {
     #[test]
     fn object_set_prototype_of_and_is_prototype_of_share_the_live_chain() {
         let object = object_value();
-        let prototype = object.call_method(
-            "create",
-            vec![object.get_property("prototype")],
-        );
+        let prototype = object.call_method("create", vec![object.get_property("prototype")]);
         let target = Value::object(HashMap::new());
 
         assert!(

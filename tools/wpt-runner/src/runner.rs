@@ -364,10 +364,7 @@ fn reftest_is_waiting() -> bool {
         return false;
     }
     root.get_property("classList")
-        .call_method(
-            "contains",
-            vec![w3cos_core::Value::string("reftest-wait")],
-        )
+        .call_method("contains", vec![w3cos_core::Value::string("reftest-wait")])
         .to_bool()
 }
 

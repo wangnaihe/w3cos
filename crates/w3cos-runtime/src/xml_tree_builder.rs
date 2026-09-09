@@ -536,9 +536,7 @@ mod tests {
             let declarations = rule
                 .declarations
                 .iter()
-                .map(|(property, value): &(String, String)| {
-                    (property.as_str(), value.as_str())
-                })
+                .map(|(property, value): &(String, String)| (property.as_str(), value.as_str()))
                 .collect::<Vec<_>>();
             w3cos_dom::stylesheet::register_rule(&rule.selector, &declarations);
         }
@@ -608,9 +606,7 @@ mod tests {
             let declarations = rule
                 .declarations
                 .iter()
-                .map(|(property, value): &(String, String)| {
-                    (property.as_str(), value.as_str())
-                })
+                .map(|(property, value): &(String, String)| (property.as_str(), value.as_str()))
                 .collect::<Vec<_>>();
             w3cos_dom::stylesheet::register_rule(&rule.selector, &declarations);
         }
@@ -703,9 +699,7 @@ mod tests {
             let declarations = rule
                 .declarations
                 .iter()
-                .map(|(property, value): &(String, String)| {
-                    (property.as_str(), value.as_str())
-                })
+                .map(|(property, value): &(String, String)| (property.as_str(), value.as_str()))
                 .collect::<Vec<_>>();
             w3cos_dom::stylesheet::register_rule(&rule.selector, &declarations);
         }

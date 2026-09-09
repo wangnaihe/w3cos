@@ -104,14 +104,16 @@ impl Color {
             .and_then(|value| value.strip_suffix(')'))
         {
             let channels = arguments.split(',').map(str::trim).collect::<Vec<_>>();
-            return (channels.len() == 4 && rgb_channels_use_one_unit(&channels[..3])).then(|| {
-                Some(Self::rgba(
-                    parse_css_rgb_channel(channels[0])?,
-                    parse_css_rgb_channel(channels[1])?,
-                    parse_css_rgb_channel(channels[2])?,
-                    parse_css_alpha_channel(channels[3])?,
-                ))
-            })?;
+            return (channels.len() == 4 && rgb_channels_use_one_unit(&channels[..3])).then(
+                || {
+                    Some(Self::rgba(
+                        parse_css_rgb_channel(channels[0])?,
+                        parse_css_rgb_channel(channels[1])?,
+                        parse_css_rgb_channel(channels[2])?,
+                        parse_css_alpha_channel(channels[3])?,
+                    ))
+                },
+            )?;
         }
         None
     }
@@ -126,9 +128,11 @@ impl Color {
 }
 
 fn rgb_channels_use_one_unit(channels: &[&str]) -> bool {
-    channels
-        .first()
-        .is_none_or(|first| channels.iter().all(|channel| channel.ends_with('%') == first.ends_with('%')))
+    channels.first().is_none_or(|first| {
+        channels
+            .iter()
+            .all(|channel| channel.ends_with('%') == first.ends_with('%'))
+    })
 }
 
 fn parse_css_rgb_channel(value: &str) -> Option<u8> {

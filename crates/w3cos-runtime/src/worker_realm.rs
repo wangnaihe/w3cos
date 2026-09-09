@@ -13,9 +13,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use w3cos_core::Value;
-use w3cos_vm::{
-    Limits, Vm, binding_cell, external_binding_cell, uninitialized_binding_cell,
-};
+use w3cos_vm::{Limits, Vm, binding_cell, external_binding_cell, uninitialized_binding_cell};
 
 use crate::worker::{WorkerEvent, WorkerScope};
 

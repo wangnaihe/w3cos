@@ -1361,14 +1361,17 @@ impl StreamingDocumentParser {
         if !text.chars().all(char::is_whitespace) {
             self.lock_missing_doctype_mode();
         }
-        if self.fragment_root.is_none()
-            && self.stack.len() == 1
-            && self.section == DocumentInsertionSection::Head
-        {
+        if self.fragment_root.is_none() && self.section == DocumentInsertionSection::Head {
             if text.chars().all(char::is_whitespace) {
                 return;
             }
-            self.enter_body();
+            let at_head_boundary = self
+                .stack
+                .last()
+                .is_some_and(|node| *node == self.html || *node == self.head);
+            if at_head_boundary {
+                self.enter_body();
+            }
         }
         self.reconstruct_active_formatting();
         let decoded = crate::jsdom::decode_html_entities(text);
@@ -1455,6 +1458,28 @@ mod tests {
             DocumentParseProgress::Complete
         );
         (crate::jsdom::document_value(), parser)
+    }
+
+    #[test]
+    fn non_whitespace_text_after_implicit_head_enters_the_body() {
+        let (document, _) = parse_document(
+            "<!doctype html><meta charset=utf-8><title>head</title><link rel=help href=x>One Two",
+        );
+
+        assert_eq!(
+            document
+                .get_property("body")
+                .get_property("textContent")
+                .to_js_string(),
+            "One Two"
+        );
+        assert_eq!(
+            document
+                .get_property("head")
+                .get_property("textContent")
+                .to_js_string(),
+            "head"
+        );
     }
 
     #[test]

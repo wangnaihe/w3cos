@@ -3,7 +3,7 @@ use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
     AlignItems, BoxSizing, Contain, CssClipRect, Dimension, Display, Edges, FlexDirection,
     FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style, TextDirection,
-    UnicodeBidi, WillChange,
+    UnicodeBidi, WillChange, parse_css_integer_clamped,
 };
 
 /// CSSStyleDeclaration — the `element.style` property.
@@ -308,8 +308,20 @@ impl CSSStyleDeclaration {
                 }
             }
             "z-index" | "zIndex" => {
-                if let Ok(v) = value.parse() {
-                    self.inner.z_index = v
+                if value.trim().eq_ignore_ascii_case("auto") {
+                    self.inner.z_index = 0;
+                    if let Some(properties) = self.inner.custom_properties.as_mut() {
+                        properties.remove("--w3cos-internal-z-index-specified");
+                    }
+                } else if let Some(v) = parse_css_integer_clamped(value) {
+                    self.inner.z_index = v;
+                    self.inner
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            "--w3cos-internal-z-index-specified".to_string(),
+                            "true".to_string(),
+                        );
                 }
             }
 
@@ -895,10 +907,9 @@ impl CSSStyleDeclaration {
             "clip" => self.inner.clip.map_or_else(
                 || "auto".to_string(),
                 |clip| {
-                    let side = |value: Option<Dimension>| value.map_or_else(
-                        || "auto".to_string(),
-                        |value| dimension_to_css(&value),
-                    );
+                    let side = |value: Option<Dimension>| {
+                        value.map_or_else(|| "auto".to_string(), |value| dimension_to_css(&value))
+                    };
                     format!(
                         "rect({}, {}, {}, {})",
                         side(clip.top),
@@ -2896,6 +2907,19 @@ mod tests {
             declaration.get_property("clip"),
             "rect(-0px, 96px, auto, 0px)"
         );
+    }
+
+    #[test]
+    fn z_index_clamps_valid_integers_to_the_supported_range() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("z-index", "-2147483649");
+        assert_eq!(declaration.inner.z_index, i32::MIN);
+
+        declaration.set_property("z-index", "999999999999999999999999999999999999999999");
+        assert_eq!(declaration.inner.z_index, i32::MAX);
+
+        declaration.set_property("z-index", "not-an-integer");
+        assert_eq!(declaration.inner.z_index, i32::MAX);
     }
 }
 #[test]

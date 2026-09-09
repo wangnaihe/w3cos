@@ -190,13 +190,7 @@ fn serve_connection(mut stream: TcpStream, root: &Path) -> Result<()> {
             "<!doctype html><meta charset=\"{}\">",
             escape_html_attribute(&label)
         );
-        return write_response(
-            &mut stream,
-            method,
-            200,
-            "text/html",
-            body.as_bytes(),
-        );
+        return write_response(&mut stream, method, 200, "text/html", body.as_bytes());
     }
 
     let file = root.join(&relative);
@@ -251,13 +245,10 @@ fn write_response_with_headers(
             .context("failed to write WPT content type")?;
     }
     for (name, value) in extra_headers {
-        if name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("connection")
-        {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
             continue;
         }
-        write!(stream, "{name}: {value}\r\n")
-            .context("failed to write WPT sidecar header")?;
+        write!(stream, "{name}: {value}\r\n").context("failed to write WPT sidecar header")?;
     }
     write!(
         stream,
@@ -471,9 +462,7 @@ mod tests {
         assert_eq!(response, "<!doctype html><meta charset=\"iso-8859-2\">");
 
         let escaped = http_get(&server.url_for("dom/nodes/encoding.py?label=%22%3E%3Cscript%3E"));
-        assert!(escaped.ends_with(
-            "<!doctype html><meta charset=\"&quot;&gt;&lt;script&gt;\">"
-        ));
+        assert!(escaped.ends_with("<!doctype html><meta charset=\"&quot;&gt;&lt;script&gt;\">"));
     }
 
     fn http_get(url: &str) -> String {

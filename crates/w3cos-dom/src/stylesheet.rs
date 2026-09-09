@@ -436,6 +436,13 @@ fn parse_selector_list(
         .collect()
 }
 
+/// Validate a complete selector list, including terminal pseudo-elements.
+/// DOM query APIs use this to distinguish invalid syntax from a valid
+/// pseudo-element selector, which can never match an Element.
+pub fn selector_list_is_valid(selector: &str) -> bool {
+    parse_selector_list(selector).is_some()
+}
+
 /// Compile one authored selector list into the versioned bytecode consumed by
 /// [`register_compiled_rule`]. Static ESM CSS uses this at W3COS build time;
 /// dynamic stylesheets continue to call [`register_rule`].
@@ -1528,9 +1535,7 @@ fn split_selector_group(selector: &str) -> Vec<String> {
             ']' => bracket -= 1,
             ',' if paren == 0 && bracket == 0 => {
                 let trimmed = trim_css_whitespace(&current);
-                if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
-                }
+                parts.push(trimmed.to_string());
                 current.clear();
                 continue;
             }
@@ -1539,9 +1544,7 @@ fn split_selector_group(selector: &str) -> Vec<String> {
         current.push(ch);
     }
     let trimmed = trim_css_whitespace(&current);
-    if !trimmed.is_empty() {
-        parts.push(trimmed.to_string());
-    }
+    parts.push(trimmed.to_string());
     parts
 }
 

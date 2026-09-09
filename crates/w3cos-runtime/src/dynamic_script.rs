@@ -1290,17 +1290,13 @@ impl DocumentByteDecoder {
         }
         let encoding = if let Some(charset) = transport_charset {
             encoding_for_label(&charset)?
-        } else if content_type
-            .split(';')
-            .next()
-            .is_some_and(|media_type| {
-                let media_type = media_type.trim().to_ascii_lowercase();
-                media_type == "application/xml"
-                    || media_type == "application/xhtml+xml"
-                    || media_type == "image/svg+xml"
-                    || media_type.ends_with("+xml")
-            })
-        {
+        } else if content_type.split(';').next().is_some_and(|media_type| {
+            let media_type = media_type.trim().to_ascii_lowercase();
+            media_type == "application/xml"
+                || media_type == "application/xhtml+xml"
+                || media_type == "image/svg+xml"
+                || media_type.ends_with("+xml")
+        }) {
             // XML entities default to UTF-8 in the absence of a BOM,
             // transport charset, or XML declaration. Applying HTML's
             // windows-1252 fallback here corrupts every non-ASCII character
@@ -4697,8 +4693,7 @@ impl ScriptLoader {
         let integrity = element
             .call_method("getAttribute", vec![Value::string("integrity")])
             .to_js_string();
-        let link_charset = element
-            .call_method("getAttribute", vec![Value::string("charset")]);
+        let link_charset = element.call_method("getAttribute", vec![Value::string("charset")]);
         let fallback_encoding = if link_charset.is_null() || link_charset.is_undefined() {
             document_stylesheet_encoding()
         } else {
@@ -5549,9 +5544,7 @@ impl ScriptLoader {
                 graph.root_href = Some(response.url.clone());
             }
             let parsed = w3cos_compiler::esm_css::parse_css_source(&source, &response.url);
-            if parsed.rules.is_empty()
-                && parsed.imports.is_empty()
-                && parsed.font_faces.is_empty()
+            if parsed.rules.is_empty() && parsed.imports.is_empty() && parsed.font_faces.is_empty()
             {
                 // A stylesheet decoded under a contradictory BOM can become
                 // arbitrary Unicode punctuation. Do not concatenate an
@@ -17617,8 +17610,7 @@ window.__dynamicInlineHandler = dynamicInlineResult;
     #[test]
     fn xhtml_without_an_explicit_charset_defaults_to_utf8() {
         assert_eq!(
-            decode_document_bytes("<p>X\u{a0}X</p>".as_bytes(), "application/xhtml+xml")
-                .unwrap(),
+            decode_document_bytes("<p>X\u{a0}X</p>".as_bytes(), "application/xhtml+xml").unwrap(),
             "<p>X\u{a0}X</p>"
         );
     }

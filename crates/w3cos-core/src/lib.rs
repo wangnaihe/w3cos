@@ -11,9 +11,9 @@ pub mod js_string;
 pub mod json;
 pub mod module_registry;
 mod object;
-mod property_map;
 pub mod page_arena;
 pub mod promise;
+mod property_map;
 mod proxy;
 mod reactive;
 pub mod regexp;
@@ -33,5 +33,5 @@ pub use reactive::{Computed, Effect, Signal, batch, watch};
 pub use value::{
     AotCaptureMap, AotFactory, ArrayStorage, Completion, FunctionData, Immediate, JsArrayRef,
     JsFunction, JsObjectRef, PanicValue, Value, WeakJsObject, catch_js, catch_js_result,
-    throw_value, type_of, unwrap_or_throw,
+    js_string_from_utf16_units, js_string_utf16_units, throw_value, type_of, unwrap_or_throw,
 };

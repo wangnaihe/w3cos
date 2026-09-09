@@ -53,7 +53,6 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
         1,
         body_index,
     );
-
     let mut nodes = layout_cache
         .iter()
         .filter_map(|&(rect, index)| {
@@ -61,7 +60,11 @@ pub fn render_document_rgba(width: u32, height: u32) -> Result<HeadlessFrame> {
             Some((index, rect, &node.kind, &node.style))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
-    nodes.sort_by_key(|(index, _, _, _)| artifact.z_order[*index]);
+    nodes.sort_by(|(left, _, _, _), (right, _, _, _)| {
+        artifact
+            .paint_order_key(*left)
+            .cmp(artifact.paint_order_key(*right))
+    });
 
     let mut rasterizer = SkiaRasterizer::new(include_bytes!("../assets/Inter-Regular.ttf"))
         .ok_or_else(|| anyhow::anyhow!("bundled W3COS font is unavailable to Skia"))?;

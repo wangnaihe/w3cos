@@ -427,7 +427,10 @@ mod tests {
         let completion = cell
             .try_read_named("alpha")
             .expect_err("TDZ try_read must be Err without unwinding");
-        assert_eq!(completion.get_property("name").to_js_string(), "ReferenceError");
+        assert_eq!(
+            completion.get_property("name").to_js_string(),
+            "ReferenceError"
+        );
         assert!(
             completion
                 .get_property("message")

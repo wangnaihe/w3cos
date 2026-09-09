@@ -12,6 +12,7 @@ use crate::layout::LayoutRect;
 
 pub type PropertyNodeId = usize;
 pub type PaintChunkId = usize;
+pub type PaintOrderLevel = (u8, i32, usize);
 
 #[derive(Clone)]
 pub struct PaintNode {
@@ -177,6 +178,7 @@ pub struct PaintArtifact {
     pub properties: PropertyTrees,
     pub node_properties: Vec<PaintProperties>,
     pub z_order: Vec<i32>,
+    pub paint_order: Vec<Vec<PaintOrderLevel>>,
     pub sticky_owner: Vec<Option<usize>>,
     pub rect_by_index: Vec<Option<LayoutRect>>,
     pub generation: u64,
@@ -195,6 +197,7 @@ impl Default for PaintArtifact {
             properties: PropertyTrees::default(),
             node_properties: Vec::new(),
             z_order: Vec::new(),
+            paint_order: Vec::new(),
             sticky_owner: Vec::new(),
             rect_by_index: Vec::new(),
             generation: 0,
@@ -212,7 +215,11 @@ fn background_position_uses_relative_basis(position: &str) -> bool {
     })
 }
 
-fn inline_fragment_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
+fn inline_fragment_clip_rect(
+    kind: &ComponentKind,
+    style: &Style,
+    rect: LayoutRect,
+) -> Option<LayoutRect> {
     let internal_clip = style
         .custom_properties
         .as_ref()
@@ -224,6 +231,14 @@ fn inline_fragment_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRe
             Some((alignment, height))
         });
     let (alignment, height) = internal_clip.or_else(|| {
+        if matches!(
+            kind,
+            ComponentKind::Image { .. }
+                | ComponentKind::Canvas { .. }
+                | ComponentKind::SvgDocument { .. }
+        ) {
+            return None;
+        }
         if !matches!(
             style.display,
             w3cos_std::style::Display::Inline
@@ -349,7 +364,10 @@ fn annotate_separated_table_background_fragments(
     fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
         let mut parent = nodes[index].parent;
         while let Some(parent_index) = parent {
-            if matches!(nodes[parent_index].style.display, Display::Table | Display::InlineTable) {
+            if matches!(
+                nodes[parent_index].style.display,
+                Display::Table | Display::InlineTable
+            ) {
                 return Some(parent_index);
             }
             parent = nodes[parent_index].parent;
@@ -378,9 +396,11 @@ fn annotate_separated_table_background_fragments(
 
     let original_len = nodes.len();
     for source in 0..original_len {
-        if !matches!(nodes[source].style.display, Display::TableColumnGroup | Display::TableColumn)
-            || (nodes[source].style.background.a == 0
-                && nodes[source].style.background_image.is_none())
+        if !matches!(
+            nodes[source].style.display,
+            Display::TableColumnGroup | Display::TableColumn
+        ) || (nodes[source].style.background.a == 0
+            && nodes[source].style.background_image.is_none())
         {
             continue;
         }
@@ -418,10 +438,12 @@ fn annotate_separated_table_background_fragments(
         if covered.is_empty() {
             continue;
         }
-        let rows = (0..original_len).filter(|index| {
-            nodes[*index].style.display == Display::TableRow
-                && nearest_table(nodes, *index) == Some(table)
-        }).collect::<Vec<_>>();
+        let rows = (0..original_len)
+            .filter(|index| {
+                nodes[*index].style.display == Display::TableRow
+                    && nearest_table(nodes, *index) == Some(table)
+            })
+            .collect::<Vec<_>>();
         let mut fragments = Vec::new();
         for row in rows {
             let cells = (0..original_len)
@@ -503,7 +525,10 @@ fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
     fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
         let mut parent = nodes[index].parent;
         while let Some(parent_index) = parent {
-            if matches!(nodes[parent_index].style.display, Display::Table | Display::InlineTable) {
+            if matches!(
+                nodes[parent_index].style.display,
+                Display::Table | Display::InlineTable
+            ) {
                 return Some(parent_index);
             }
             parent = nodes[parent_index].parent;
@@ -571,15 +596,15 @@ fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
         .iter()
         .enumerate()
         .filter(|(_, node)| {
-            node.style.display == Display::TableRow
-                && node.style.visibility == Visibility::Collapse
+            node.style.display == Display::TableRow && node.style.visibility == Visibility::Collapse
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     for row in collapsed_rows {
-        for node in nodes.iter_mut().filter(|node| {
-            node.parent == Some(row) && node.style.display == Display::TableCell
-        }) {
+        for node in nodes
+            .iter_mut()
+            .filter(|node| node.parent == Some(row) && node.style.display == Display::TableCell)
+        {
             node.style.visibility = Visibility::Collapse;
         }
     }
@@ -649,7 +674,9 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| node.parent == Some(row) && node.style.display == Display::TableCell)
+            .filter(|(_, node)| {
+                node.parent == Some(row) && node.style.display == Display::TableCell
+            })
             .map(|(index, _)| index)
             .collect::<Vec<_>>()
     }
@@ -685,7 +712,10 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
     fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
         let mut parent = nodes[index].parent;
         while let Some(parent_index) = parent {
-            if matches!(nodes[parent_index].style.display, Display::Table | Display::InlineTable) {
+            if matches!(
+                nodes[parent_index].style.display,
+                Display::Table | Display::InlineTable
+            ) {
                 return Some(parent_index);
             }
             parent = nodes[parent_index].parent;
@@ -772,12 +802,7 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             let bottom_collapsed = nodes[bottom].style.visibility == Visibility::Collapse;
             if (top_collapsed && !bottom_collapsed) || bottom_edge.0 > top_edge.0 {
                 suppress_edge(&mut nodes[top].style, 2, bottom_edge.0);
-                set_edge(
-                    &mut nodes[bottom].style,
-                    0,
-                    bottom_edge.0,
-                    bottom_edge.1,
-                );
+                set_edge(&mut nodes[bottom].style, 0, bottom_edge.0, bottom_edge.1);
             } else {
                 set_edge(&mut nodes[top].style, 2, top_edge.0, top_edge.1);
                 suppress_edge(&mut nodes[bottom].style, 0, top_edge.0);
@@ -798,7 +823,9 @@ fn extend_collapsed_borders_across_empty_rows(
         nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| node.parent == Some(row) && node.style.display == Display::TableCell)
+            .filter(|(_, node)| {
+                node.parent == Some(row) && node.style.display == Display::TableCell
+            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -1046,6 +1073,42 @@ fn annotate_table_caption_paint_insets(
 }
 
 impl PaintArtifact {
+    pub fn paint_order_key(&self, index: usize) -> &[PaintOrderLevel] {
+        self.paint_order.get(index).map_or(&[], Vec::as_slice)
+    }
+
+    /// CSS2 paint phase within one effective stack level. In-flow block
+    /// backgrounds paint before floats, and inline content paints after
+    /// floats. A float's descendants stay in the float phase as one atomic
+    /// paint group.
+    pub fn css2_paint_phase(&self, index: usize) -> u8 {
+        let mut cursor = Some(index);
+        while let Some(current) = cursor {
+            let Some(node) = self.nodes.get(current) else {
+                break;
+            };
+            if node.style.float != w3cos_std::style::Float::None {
+                return 1;
+            }
+            if matches!(
+                node.style.position,
+                Position::Relative | Position::Absolute | Position::Fixed | Position::Sticky
+            ) {
+                // Positioned subtrees are atomic at their effective stack
+                // level. Do not lift inline descendants above a later
+                // positioned sibling merely because they are inline content.
+                return 0;
+            }
+            cursor = node.parent;
+        }
+        self.nodes.get(index).map_or(0, |node| {
+            u8::from(matches!(
+                node.style.display,
+                Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+            )) * 2
+        })
+    }
+
     pub fn build(
         nodes: impl IntoIterator<Item = PaintNode>,
         layout_cache: &[(LayoutRect, usize)],
@@ -1172,6 +1235,7 @@ impl PaintArtifact {
             rect_by_index,
             node_properties: vec![PaintProperties::default(); nodes.len()],
             z_order: vec![0; nodes.len()],
+            paint_order: vec![Vec::new(); nodes.len()],
             sticky_owner: vec![None; nodes.len()],
             nodes,
             canvas_background,
@@ -1210,9 +1274,39 @@ impl PaintArtifact {
         // positioned descendant with a negative z-index.
         self.z_order[index] = if node.parent.is_none() {
             i32::MIN
+        } else if matches!(node.style.position, Position::Fixed) && node.style.z_index == 0 {
+            // A fixed auto box participates at stack level zero in the root
+            // context. Positioned ancestors with z-index:auto do not create a
+            // context, so their synthetic paint rank must not accumulate.
+            1
         } else {
             effective_z_order(&node.style, inherited_z)
         };
+        // A fixed-positioned box establishes a stacking context even when
+        // z-index is auto. Negative descendants therefore paint above the
+        // fixed box's own background instead of escaping behind it.
+        let fixed_context_floor = node.parent.and_then(|mut ancestor| {
+            loop {
+                let ancestor_node = &self.nodes[ancestor];
+                if matches!(ancestor_node.style.position, Position::Fixed)
+                    && ancestor_node.style.z_index == 0
+                {
+                    break self
+                        .z_order
+                        .get(ancestor)
+                        .copied()
+                        .map(|z| z.saturating_add(1));
+                }
+                match ancestor_node.parent {
+                    Some(parent) => ancestor = parent,
+                    None => break None,
+                }
+            }
+        });
+        if let Some(floor) = fixed_context_floor {
+            self.z_order[index] = self.z_order[index].max(floor);
+        }
+        self.paint_order[index] = self.hierarchical_paint_order(index);
         self.sticky_owner[index] = if matches!(node.style.position, Position::Sticky) {
             Some(index)
         } else {
@@ -1253,7 +1347,7 @@ impl PaintArtifact {
             });
         }
         if let Some(rect) = self.rect_by_index[index]
-            && let Some(fragment_clip) = inline_fragment_clip_rect(&node.style, rect)
+            && let Some(fragment_clip) = inline_fragment_clip_rect(&node.kind, &node.style, rect)
         {
             let parent = properties.clip;
             properties.clip = self.properties.clips.len();
@@ -1304,6 +1398,96 @@ impl PaintArtifact {
             z_order: self.z_order[index],
         });
     }
+
+    fn hierarchical_paint_order(&self, index: usize) -> Vec<PaintOrderLevel> {
+        let node = &self.nodes[index];
+        if node.parent.is_none() {
+            return vec![(0, 0, index)];
+        }
+
+        let mut key = node
+            .parent
+            .and_then(|parent| self.paint_context_prefix(parent))
+            .unwrap_or_default();
+        key.push(self.local_paint_order_level(index));
+        if establishes_stacking_context(node) {
+            // A context's own background is the first item inside that
+            // context. Descendant keys extend the prefix before adding their
+            // local CSS2 paint phase.
+            key.push((0, i32::MIN, index));
+        }
+        key
+    }
+
+    fn paint_context_prefix(&self, index: usize) -> Option<Vec<PaintOrderLevel>> {
+        let node = self.nodes.get(index)?;
+        if node.parent.is_none() || establishes_stacking_context(node) {
+            let mut key = self.paint_order.get(index)?.clone();
+            if establishes_stacking_context(node) {
+                key.pop();
+            }
+            return Some(key);
+        }
+        node.parent
+            .and_then(|parent| self.paint_context_prefix(parent))
+    }
+
+    fn local_paint_order_level(&self, index: usize) -> PaintOrderLevel {
+        let node = &self.nodes[index];
+        if is_positioned(&node.style) {
+            return match node.style.z_index.cmp(&0) {
+                std::cmp::Ordering::Less => (0, node.style.z_index, index),
+                std::cmp::Ordering::Equal => (4, 0, index),
+                std::cmp::Ordering::Greater => (5, node.style.z_index, index),
+            };
+        }
+
+        let mut cursor = Some(index);
+        while let Some(current) = cursor {
+            let current_node = &self.nodes[current];
+            if current_node.style.float != w3cos_std::style::Float::None {
+                return (2, 0, index);
+            }
+            if current != index && establishes_stacking_context(current_node) {
+                break;
+            }
+            cursor = current_node.parent;
+        }
+
+        let phase = if matches!(
+            node.style.display,
+            Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+        ) {
+            3
+        } else {
+            1
+        };
+        (phase, 0, index)
+    }
+}
+
+fn is_positioned(style: &Style) -> bool {
+    matches!(
+        style.position,
+        Position::Relative | Position::Absolute | Position::Fixed | Position::Sticky
+    )
+}
+
+fn establishes_stacking_context(node: &PaintNode) -> bool {
+    let specifies_z_index = node.style.z_index != 0
+        || node
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-z-index-specified")
+            });
+    node.parent.is_none()
+        || (is_positioned(&node.style)
+            && (specifies_z_index
+                || matches!(node.style.position, Position::Fixed | Position::Sticky)))
+        || node.style.opacity < 1.0
+        || !node.style.transform.is_identity()
 }
 
 #[cfg(test)]
@@ -1332,15 +1516,29 @@ mod tests {
             width: 100.0,
             height: 80.0,
         };
+        let text = ComponentKind::Text {
+            content: "fragment".to_string(),
+        };
 
         assert_eq!(
-            inline_fragment_clip_rect(&style, layout),
+            inline_fragment_clip_rect(&text, &style, layout),
             Some(LayoutRect {
                 x: 12.0,
                 y: 100.0,
                 width: 100.0,
                 height: 20.0,
             })
+        );
+        assert_eq!(
+            inline_fragment_clip_rect(
+                &ComponentKind::Image {
+                    src: "100x100.png".to_string(),
+                },
+                &style,
+                layout,
+            ),
+            None,
+            "vertical alignment must not crop a replaced element to the line-height strut"
         );
     }
 
@@ -1667,14 +1865,35 @@ mod tests {
         let artifact = PaintArtifact::build(
             nodes,
             &[
-                (LayoutRect { x: 0.0, y: 0.0, width: 192.0, height: 115.0 }, 0),
-                (LayoutRect { x: 0.0, y: 96.0, width: 192.0, height: 19.0 }, 1),
+                (
+                    LayoutRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 192.0,
+                        height: 115.0,
+                    },
+                    0,
+                ),
+                (
+                    LayoutRect {
+                        x: 0.0,
+                        y: 96.0,
+                        width: 192.0,
+                        height: 19.0,
+                    },
+                    1,
+                ),
             ],
             1,
         );
         assert_eq!(
             table_grid_paint_rect(&artifact.nodes[0].style, artifact.rect_by_index[0].unwrap()),
-            LayoutRect { x: 0.0, y: 0.0, width: 192.0, height: 96.0 }
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 192.0,
+                height: 96.0
+            }
         );
     }
 
@@ -1696,9 +1915,12 @@ mod tests {
             width: 80.0,
             height: 100.0,
         };
+        let text = ComponentKind::Text {
+            content: "fragment".to_string(),
+        };
 
         assert_eq!(
-            inline_fragment_clip_rect(&style, layout),
+            inline_fragment_clip_rect(&text, &style, layout),
             Some(LayoutRect {
                 x: 0.0,
                 y: 10.0,
@@ -1962,6 +2184,184 @@ mod tests {
         );
 
         assert_eq!(artifact.z_order, vec![i32::MIN, i32::MIN + 1, i32::MIN]);
+    }
+
+    #[test]
+    fn nested_stacking_context_orders_background_auto_and_positive_children() {
+        let root = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let wrapper = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style {
+                position: Position::Relative,
+                z_index: 1,
+                ..Style::default()
+            },
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let positive = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style {
+                position: Position::Absolute,
+                z_index: 1,
+                ..Style::default()
+            },
+            parent: Some(1),
+            sticky_counter_signal: None,
+        };
+        let auto = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style {
+                position: Position::Absolute,
+                ..Style::default()
+            },
+            parent: Some(1),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            [root, wrapper, positive, auto],
+            &[
+                (rect(0.0), 0),
+                (rect(0.0), 1),
+                (rect(0.0), 2),
+                (rect(0.0), 3),
+            ],
+            1,
+        );
+
+        assert!(artifact.paint_order_key(1) < artifact.paint_order_key(3));
+        assert!(artifact.paint_order_key(3) < artifact.paint_order_key(2));
+    }
+
+    #[test]
+    fn fixed_auto_stacking_context_contains_negative_descendants() {
+        let root = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let mut relative_style = Style::default();
+        relative_style.position = Position::Relative;
+        let relative = PaintNode {
+            kind: ComponentKind::Column,
+            style: relative_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let mut fixed_style = Style::default();
+        fixed_style.position = Position::Fixed;
+        let fixed = PaintNode {
+            kind: ComponentKind::Column,
+            style: fixed_style,
+            parent: Some(1),
+            sticky_counter_signal: None,
+        };
+        let mut negative_style = Style::default();
+        negative_style.position = Position::Absolute;
+        negative_style.z_index = -1;
+        let negative = PaintNode {
+            kind: ComponentKind::Column,
+            style: negative_style,
+            parent: Some(2),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            [root, relative, fixed, negative],
+            &[
+                (rect(0.0), 0),
+                (rect(0.0), 1),
+                (rect(0.0), 2),
+                (rect(0.0), 3),
+            ],
+            1,
+        );
+
+        assert_eq!(artifact.z_order, vec![i32::MIN, 1, 1, 2]);
+        assert_eq!(artifact.display_items[2].client_index, 2);
+        assert_eq!(artifact.display_items[3].client_index, 3);
+    }
+
+    #[test]
+    fn css2_paint_phases_group_float_descendants_between_blocks_and_inlines() {
+        let root = PaintNode {
+            kind: ComponentKind::Column,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let mut float_style = Style::default();
+        float_style.float = w3cos_std::style::Float::Left;
+        let floating = PaintNode {
+            kind: ComponentKind::Column,
+            style: float_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let float_child = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style::default(),
+            parent: Some(1),
+            sticky_counter_signal: None,
+        };
+        let mut inline_style = Style::default();
+        inline_style.display = Display::Inline;
+        let inline = PaintNode {
+            kind: ComponentKind::Text {
+                content: "inline".to_string(),
+            },
+            style: inline_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let mut relative_style = Style::default();
+        relative_style.position = Position::Relative;
+        let relative = PaintNode {
+            kind: ComponentKind::Column,
+            style: relative_style,
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let mut positioned_inline_style = Style::default();
+        positioned_inline_style.display = Display::Inline;
+        let positioned_inline = PaintNode {
+            kind: ComponentKind::Text {
+                content: "positioned inline".to_string(),
+            },
+            style: positioned_inline_style,
+            parent: Some(4),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            [
+                root,
+                floating,
+                float_child,
+                inline,
+                relative,
+                positioned_inline,
+            ],
+            &[
+                (rect(0.0), 0),
+                (rect(0.0), 1),
+                (rect(0.0), 2),
+                (rect(0.0), 3),
+                (rect(0.0), 4),
+                (rect(0.0), 5),
+            ],
+            1,
+        );
+
+        assert_eq!(artifact.css2_paint_phase(0), 0);
+        assert_eq!(artifact.css2_paint_phase(1), 1);
+        assert_eq!(artifact.css2_paint_phase(2), 1);
+        assert_eq!(artifact.css2_paint_phase(3), 2);
+        assert_eq!(artifact.css2_paint_phase(5), 0);
     }
 
     #[test]
