@@ -1211,6 +1211,19 @@ impl Document {
                 _ => {}
             }
         }
+        if let Some(value) = declared_value(&["clear"]) {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "inherit" => {
+                    style.clear = inherited
+                        .map(|parent| parent.clear)
+                        .unwrap_or(w3cos_std::style::Clear::None);
+                }
+                "initial" | "unset" | "revert" | "revert-layer" => {
+                    style.clear = w3cos_std::style::Clear::None;
+                }
+                _ => {}
+            }
+        }
         if let Some(value) = declared_value(&["display"]) {
             match value.trim().to_ascii_lowercase().as_str() {
                 "inherit" => {
@@ -8257,8 +8270,9 @@ fn hoist_floats_into_block_formatting_context(
         let mut grouped = Vec::with_capacity(components.len());
         let mut left_floats = Vec::new();
         let flush = |left_floats: &mut Vec<w3cos_std::Component>,
-                     grouped: &mut Vec<w3cos_std::Component>| {
-            if left_floats.len() < 2 {
+                     grouped: &mut Vec<w3cos_std::Component>,
+                     force_formatting_context: bool| {
+            if left_floats.len() < 2 && !force_formatting_context {
                 grouped.append(left_floats);
                 return;
             }
@@ -8284,15 +8298,36 @@ fn hoist_floats_into_block_formatting_context(
                 std::mem::take(left_floats),
             ));
         };
+        let mut force_formatting_context = false;
         for component in components {
             if component.style.float == w3cos_std::style::Float::Left {
+                if matches!(
+                    component.style.clear,
+                    w3cos_std::style::Clear::Left | w3cos_std::style::Clear::Both
+                ) {
+                    flush(
+                        &mut left_floats,
+                        &mut grouped,
+                        force_formatting_context,
+                    );
+                    force_formatting_context = true;
+                }
                 left_floats.push(component);
             } else {
-                flush(&mut left_floats, &mut grouped);
+                flush(
+                    &mut left_floats,
+                    &mut grouped,
+                    force_formatting_context,
+                );
+                force_formatting_context = false;
                 grouped.push(component);
             }
         }
-        flush(&mut left_floats, &mut grouped);
+        flush(
+            &mut left_floats,
+            &mut grouped,
+            force_formatting_context,
+        );
         grouped
     }
 
@@ -9072,6 +9107,21 @@ mod image_component_tests {
                 .is_none_or(|properties| {
                     !properties.contains_key("--w3cos-internal-left-float-after-inline")
                 })
+        }));
+
+        let mut first = floating_box(Float::Left);
+        first.style.clear = w3cos_std::style::Clear::Left;
+        let mut cleared = floating_box(Float::Left);
+        cleared.style.clear = w3cos_std::style::Clear::Left;
+        let fixed = hoist_floats_into_block_formatting_context(
+            &context_style,
+            vec![first, cleared],
+        );
+        assert_eq!(fixed.len(), 2);
+        assert!(fixed.iter().all(|component| {
+            component.style.display == Display::Flex
+                && component.style.width == Dimension::Percent(100.0)
+                && matches!(component.children.as_slice(), [child] if child.style.float == Float::Left)
         }));
     }
 

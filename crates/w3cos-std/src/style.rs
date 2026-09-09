@@ -66,6 +66,8 @@ pub struct Style {
     pub position: Position,
     #[serde(default)]
     pub float: Float,
+    #[serde(default)]
+    pub clear: Clear,
 
     // Flexbox
     pub flex_direction: FlexDirection,
@@ -263,6 +265,7 @@ impl Default for Style {
             display: Display::Flex,
             position: Position::Static,
             float: Float::None,
+            clear: Clear::None,
             flex_direction: FlexDirection::Column,
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
@@ -387,6 +390,7 @@ impl Style {
             display: _,
             position,
             float,
+            clear,
             flex_direction,
             justify_content,
             align_items,
@@ -493,6 +497,7 @@ impl Style {
             display: _,
             position: position_b,
             float: float_b,
+            clear: clear_b,
             flex_direction: flex_direction_b,
             justify_content: justify_content_b,
             align_items: align_items_b,
@@ -597,6 +602,7 @@ impl Style {
         } = other;
         position == position_b
             && float == float_b
+            && clear == clear_b
             && flex_direction == flex_direction_b
             && justify_content == justify_content_b
             && align_items == align_items_b
@@ -769,6 +775,15 @@ pub enum Float {
     None,
     Left,
     Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Clear {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]

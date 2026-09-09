@@ -2,7 +2,7 @@ use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
     AlignItems, BoxSizing, Contain, CssClipRect, Dimension, Display, Edges, FlexDirection,
-    FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style, TextDirection,
+    Clear, FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style, TextDirection,
     UnicodeBidi, WillChange, parse_css_integer_clamped,
 };
 
@@ -46,6 +46,7 @@ impl CSSStyleDeclaration {
             "display" => self.inner.display = parse_display(value),
             "position" => self.inner.position = parse_position(value),
             "float" | "cssFloat" => self.inner.float = parse_float(value),
+            "clear" => self.inner.clear = parse_clear(value),
 
             "flex-direction" | "flexDirection" => {
                 self.inner.flex_direction = parse_flex_direction(value)
@@ -807,6 +808,12 @@ impl CSSStyleDeclaration {
                 Float::Left => "left".to_string(),
                 Float::Right => "right".to_string(),
             },
+            "clear" => match self.inner.clear {
+                Clear::None => "none".to_string(),
+                Clear::Left => "left".to_string(),
+                Clear::Right => "right".to_string(),
+                Clear::Both => "both".to_string(),
+            },
             "vertical-align" | "verticalAlign" => match self.inner.align_self {
                 w3cos_std::style::AlignSelf::FlexStart => "top".to_string(),
                 w3cos_std::style::AlignSelf::FlexEnd => "bottom".to_string(),
@@ -1298,6 +1305,15 @@ fn parse_float(value: &str) -> Float {
         "left" => Float::Left,
         "right" => Float::Right,
         _ => Float::None,
+    }
+}
+
+fn parse_clear(value: &str) -> Clear {
+    match value.trim() {
+        "left" => Clear::Left,
+        "right" => Clear::Right,
+        "both" => Clear::Both,
+        _ => Clear::None,
     }
 }
 
@@ -2361,6 +2377,10 @@ mod tests {
         declaration.set_property("cssFloat", "left");
         assert_eq!(declaration.inner.float, Float::Left);
         assert_eq!(declaration.get_property("float"), "left");
+
+        declaration.set_property("clear", "both");
+        assert_eq!(declaration.inner.clear, Clear::Both);
+        assert_eq!(declaration.get_property("clear"), "both");
 
         declaration.set_property("float", "none");
         assert_eq!(declaration.inner.float, Float::None);
