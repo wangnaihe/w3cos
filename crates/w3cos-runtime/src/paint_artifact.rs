@@ -6,7 +6,9 @@
 
 use w3cos_std::color::Color;
 use w3cos_std::component::ComponentKind;
-use w3cos_std::style::{Display, Overflow, Position, Style, Transform2D, Visibility};
+use w3cos_std::style::{
+    Display, Overflow, Position, Style, Transform2D, Visibility, WhiteSpace,
+};
 
 use crate::layout::LayoutRect;
 
@@ -347,6 +349,47 @@ fn suppress_hidden_empty_cell_paint(nodes: &mut [PaintNode]) {
         node.style.border_right_width = None;
         node.style.border_bottom_width = None;
         node.style.border_left_width = None;
+    }
+}
+
+fn trim_collapsible_inline_whitespace_at_line_start(
+    nodes: &mut [PaintNode],
+    rect_by_index: &[Option<LayoutRect>],
+) {
+    for index in 0..nodes.len() {
+        let node = &nodes[index];
+        if node.style.display != Display::Inline
+            || matches!(node.style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap)
+        {
+            continue;
+        }
+        let (Some(parent), Some(rect)) = (
+            node.parent,
+            rect_by_index.get(index).copied().flatten(),
+        ) else {
+            continue;
+        };
+        let Some(parent_rect) = rect_by_index.get(parent).copied().flatten() else {
+            continue;
+        };
+        let Some(parent_style) = nodes.get(parent).map(|parent| &parent.style) else {
+            continue;
+        };
+        let line_start = parent_rect.x
+            + parent_style
+                .border_left_width
+                .unwrap_or(parent_style.border_width)
+            + parent_style.padding_lengths().left;
+        if (rect.x - line_start).abs() > 0.01 {
+            continue;
+        }
+        let ComponentKind::Text { content } = &mut nodes[index].kind else {
+            continue;
+        };
+        let trimmed = content.trim_start_matches([' ', '\t', '\n', '\r', '\u{000c}']);
+        if trimmed.len() != content.len() {
+            *content = trimmed.to_string();
+        }
     }
 }
 
@@ -1200,6 +1243,7 @@ impl PaintArtifact {
                 *slot = Some(rect);
             }
         }
+        trim_collapsible_inline_whitespace_at_line_start(&mut nodes, &rect_by_index);
         suppress_improper_nested_table_part_backgrounds(&mut nodes);
         suppress_hidden_empty_cell_paint(&mut nodes);
         project_collapsed_table_tracks_to_cells(&mut nodes);
@@ -1521,6 +1565,61 @@ mod tests {
             width: 320.0,
             height: 80.0,
         }
+    }
+
+    #[test]
+    fn collapsible_inline_whitespace_is_trimmed_at_a_soft_line_start() {
+        let mut parent_style = Style::default();
+        parent_style.padding.left = w3cos_std::style::Spacing::Px(10.0);
+        parent_style.border_left_width = Some(2.0);
+        let mut inline_style = Style::default();
+        inline_style.display = Display::Inline;
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Row,
+                style: parent_style,
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Text {
+                    content: "  next line".to_string(),
+                },
+                style: inline_style,
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+        ];
+        let rects = vec![
+            Some(LayoutRect {
+                x: 20.0,
+                y: 0.0,
+                width: 200.0,
+                height: 40.0,
+            }),
+            Some(LayoutRect {
+                x: 32.0,
+                y: 20.0,
+                width: 80.0,
+                height: 20.0,
+            }),
+        ];
+
+        trim_collapsible_inline_whitespace_at_line_start(&mut nodes, &rects);
+        assert!(matches!(
+            &nodes[1].kind,
+            ComponentKind::Text { content } if content == "next line"
+        ));
+
+        nodes[1].style.white_space = WhiteSpace::Pre;
+        nodes[1].kind = ComponentKind::Text {
+            content: "  preserved".to_string(),
+        };
+        trim_collapsible_inline_whitespace_at_line_start(&mut nodes, &rects);
+        assert!(matches!(
+            &nodes[1].kind,
+            ComponentKind::Text { content } if content == "  preserved"
+        ));
     }
 
     #[test]

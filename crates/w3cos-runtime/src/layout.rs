@@ -3032,6 +3032,20 @@ fn build_taffy_tree(
     *idx += 1;
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    let passive_inline_text_edges = matches!(comp.kind, ComponentKind::Text { .. })
+        && comp.style.display == WDisplay::Inline
+        && !matches!(comp.style.position, WPos::Absolute | WPos::Fixed);
+    if passive_inline_text_edges {
+        // Vertical padding and borders paint on a non-replaced inline box but
+        // do not participate in line-box height. Taffy's flex item model
+        // otherwise enlarges the line and moves every following line/float.
+        // Preserve horizontal edges for line fitting; restore the painted
+        // vertical border-box extent while collecting layout rectangles.
+        style.padding.top = LengthPercentage::length(0.0);
+        style.padding.bottom = LengthPercentage::length(0.0);
+        style.border.top = LengthPercentage::length(0.0);
+        style.border.bottom = LengthPercentage::length(0.0);
+    }
     let owns_table_layout = matches!(comp.style.display, WDisplay::Table | WDisplay::InlineTable);
     if matches!(
         comp.style.display,
@@ -4433,6 +4447,23 @@ fn collect_layouts_fast(
             }
             let info = &flat[ctx];
 
+            if matches!(info.kind, ComponentKind::Text { .. })
+                && info.style.display == WDisplay::Inline
+                && !matches!(info.style.position, WPos::Absolute | WPos::Fixed)
+            {
+                let padding = info.style.padding_lengths();
+                rect.height += padding.top
+                    + padding.bottom
+                    + info
+                        .style
+                        .border_top_width
+                        .unwrap_or(info.style.border_width)
+                    + info
+                        .style
+                        .border_bottom_width
+                        .unwrap_or(info.style.border_width);
+            }
+
             let effective_scroll_container = if matches!(info.style.position, WPos::Absolute) {
                 let mut ancestor = info.parent;
                 let mut positioned_ancestor = None;
@@ -4845,6 +4876,15 @@ fn compute_absolute_rect(
     viewport_w: f32,
     viewport_h: f32,
 ) -> LayoutRect {
+    let resolve_spacing = |spacing: WSpacing| match spacing {
+        WSpacing::Percent(value) => containing_block.width * value / 100.0,
+        WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
+        WSpacing::Em(value) => value * style.font_size,
+        WSpacing::Vw(value) => value * viewport_w / 100.0,
+        WSpacing::Vh(value) => value * viewport_h / 100.0,
+        WSpacing::Auto => 0.0,
+        other => other.resolve(&w3cos_std::safe_area::current()),
+    };
     let resolve_h = |d: WDim| {
         d.resolve(
             containing_block.width,
@@ -4874,13 +4914,23 @@ fn compute_absolute_rect(
     );
 
     let x = match (resolve_h(style.left), resolve_h(style.right)) {
-        (Some(left), _) => containing_block.x + left,
-        (None, Some(right)) => containing_block.x + containing_block.width - right - width,
+        (Some(left), _) => containing_block.x + left + resolve_spacing(style.margin.left),
+        (None, Some(right)) => {
+            containing_block.x + containing_block.width
+                - right
+                - width
+                - resolve_spacing(style.margin.right)
+        }
         (None, None) => fallback.x,
     };
     let y = match (resolve_v(style.top), resolve_v(style.bottom)) {
-        (Some(top), _) => containing_block.y + top,
-        (None, Some(bottom)) => containing_block.y + containing_block.height - bottom - height,
+        (Some(top), _) => containing_block.y + top + resolve_spacing(style.margin.top),
+        (None, Some(bottom)) => {
+            containing_block.y + containing_block.height
+                - bottom
+                - height
+                - resolve_spacing(style.margin.bottom)
+        }
         (None, None) => fallback.y,
     };
 
@@ -6690,6 +6740,49 @@ mod tests {
                 height: 100.0,
             }
         );
+    }
+
+    #[test]
+    fn absolute_insets_position_the_margin_box() {
+        let containing_block = LayoutRect {
+            x: 10.0,
+            y: 20.0,
+            width: 200.0,
+            height: 160.0,
+        };
+        let fallback = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 40.0,
+            height: 30.0,
+        };
+        let start = Style {
+            position: WPos::Absolute,
+            left: WDim::Px(5.0),
+            top: WDim::Px(7.0),
+            margin: w3cos_std::style::Edges {
+                top: WSpacing::Px(11.0),
+                left: WSpacing::Percent(10.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        };
+        let rect = compute_absolute_rect(&start, containing_block, fallback, 800.0, 600.0);
+        assert_eq!((rect.x, rect.y), (35.0, 38.0));
+
+        let end = Style {
+            position: WPos::Absolute,
+            right: WDim::Px(5.0),
+            bottom: WDim::Px(7.0),
+            margin: w3cos_std::style::Edges {
+                right: WSpacing::Px(13.0),
+                bottom: WSpacing::Percent(10.0),
+                ..w3cos_std::style::Edges::ZERO
+            },
+            ..Style::default()
+        };
+        let rect = compute_absolute_rect(&end, containing_block, fallback, 800.0, 600.0);
+        assert_eq!((rect.x, rect.y), (152.0, 123.0));
     }
 
     #[test]
@@ -10060,6 +10153,37 @@ mod tests {
         assert_eq!(style.margin.bottom, LengthPercentageAuto::length(0.0));
         assert_eq!(style.margin.left, LengthPercentageAuto::length(16.0));
         assert_eq!(style.margin.right, LengthPercentageAuto::length(16.0));
+    }
+
+    #[test]
+    fn non_replaced_inline_paints_vertical_edges_without_enlarging_the_line_box() {
+        let inline = Component::text(
+            "inline",
+            Style {
+                display: WDisp::Inline,
+                font_size: 20.0,
+                line_height: 1.0,
+                padding: w3cos_std::style::Edges::xy(0.0, 5.0),
+                border_width: 2.0,
+                ..Style::default()
+            },
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                font_size: 20.0,
+                line_height: 1.0,
+                ..Style::default()
+            },
+            vec![inline],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let root_rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let inline_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+
+        assert_eq!(root_rect.height, 20.0);
+        assert_eq!(inline_rect.height, 34.0);
     }
 
     #[test]

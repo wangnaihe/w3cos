@@ -7511,6 +7511,20 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             mark_bidi_visual_order(&mut space.style);
             space
         });
+    let freezes_estimated_line_breaks = units.iter().all(|unit| {
+        unit.component
+            .style
+            .font_family
+            .as_deref()
+            .is_some_and(|families| {
+                families.split(',').any(|family| {
+                    family
+                        .trim()
+                        .trim_matches(['"', '\''])
+                        .eq_ignore_ascii_case("ahem")
+                })
+            })
+    });
     let mut edge_whitespace = Vec::with_capacity(visual_fragments.len());
     for fragment in &mut visual_fragments {
         let ComponentKind::Text { content } = &mut fragment.component.kind else {
@@ -7529,6 +7543,29 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     let mut previous_line = None;
     for (index, mut fragment) in visual_fragments.into_iter().enumerate() {
         let starts_new_line = previous_line.is_some_and(|previous| previous != fragment.line_index);
+        if starts_new_line && freezes_estimated_line_breaks {
+            let mut break_style = anonymous_space
+                .as_ref()
+                .map(|space| space.style.clone())
+                .unwrap_or_else(w3cos_std::style::Style::default);
+            break_style.display = Display::Inline;
+            break_style.width = Dimension::Px(0.0);
+            break_style.height = Dimension::Px(break_style.font_size * break_style.line_height);
+            break_style.min_width = Dimension::Auto;
+            break_style.min_height = Dimension::Auto;
+            break_style.max_width = Dimension::Auto;
+            break_style.max_height = Dimension::Auto;
+            break_style.margin = w3cos_std::style::Edges::ZERO;
+            break_style.padding = w3cos_std::style::Edges::ZERO;
+            break_style.border_width = 0.0;
+            break_style.border_top_width = None;
+            break_style.border_right_width = None;
+            break_style.border_bottom_width = None;
+            break_style.border_left_width = None;
+            break_style.background = w3cos_std::Color::TRANSPARENT;
+            break_style.background_image = None;
+            normalized.push(w3cos_std::Component::text("\u{2028}", break_style));
+        }
         if index > 0 && !starts_new_line {
             let boundary_has_space = edge_whitespace[index - 1].1 || edge_whitespace[index].0;
             let left_owns_space = normalized.last().is_some_and(|previous| {
