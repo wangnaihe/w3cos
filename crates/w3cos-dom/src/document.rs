@@ -1425,6 +1425,30 @@ impl Document {
                 style.border_bottom_color = parent.border_bottom_color;
                 style.border_left_color = parent.border_left_color;
             }
+            if declared_property_value(&["border-top"])
+                .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
+            {
+                style.border_top_width = parent.border_top_width;
+                style.border_top_color = parent.border_top_color;
+            }
+            if declared_property_value(&["border-right"])
+                .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
+            {
+                style.border_right_width = parent.border_right_width;
+                style.border_right_color = parent.border_right_color;
+            }
+            if declared_property_value(&["border-bottom"])
+                .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
+            {
+                style.border_bottom_width = parent.border_bottom_width;
+                style.border_bottom_color = parent.border_bottom_color;
+            }
+            if declared_property_value(&["border-left"])
+                .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("inherit"))
+            {
+                style.border_left_width = parent.border_left_width;
+                style.border_left_color = parent.border_left_color;
+            }
         }
         let last_border_declaration = |properties: &[&str]| {
             matched
@@ -11187,6 +11211,28 @@ mod computed_style_cache_tests {
         assert_eq!(child_style.border_width, parent_style.border_width);
         assert_eq!(child_style.border_top_width, parent_style.border_top_width);
         assert_eq!(child_style.border_color, parent_style.border_color);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn border_side_shorthand_inherit_copies_only_the_parent_side() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("border-bottom", "12px solid blue")]);
+        crate::stylesheet::register_rule("#child", &[("border-bottom", "inherit")]);
+
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        let parent_style = document.computed_style_for(parent.id);
+        let child_style = document.computed_style_for(child.id);
+        assert_eq!(child_style.border_bottom_width, parent_style.border_bottom_width);
+        assert_eq!(child_style.border_bottom_color, parent_style.border_bottom_color);
+        assert_ne!(child_style.border_top_width, parent_style.border_bottom_width);
         crate::stylesheet::clear_rules();
     }
 
