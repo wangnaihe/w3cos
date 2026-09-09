@@ -4002,7 +4002,8 @@ impl Document {
                                 | w3cos_std::style::WhiteSpace::PreLine
                         )
                         && (!matches!(style.width, w3cos_std::style::Dimension::Auto)
-                            || style.text_indent != w3cos_std::style::Dimension::Px(0.0))
+                            || style.text_indent != w3cos_std::style::Dimension::Px(0.0)
+                            || style.text_align != w3cos_std::style::TextAlign::Start)
                     {
                         // A text run in a fixed-width block is not an atomic
                         // flex item: its line box uses the block content width
@@ -8338,7 +8339,10 @@ fn hoist_floats_into_block_formatting_context(
         // extract floats nested inside inline descendants here; direct float
         // ordering is handled after blockification.
         if let Some(mut child) = collect(child, false, &mut left, &mut right) {
-            let has_prior_in_flow = in_flow.iter().any(contributes_in_flow_content);
+            let has_prior_in_flow = in_flow.iter().any(|component| {
+                component.style.float == w3cos_std::style::Float::None
+                    && contributes_in_flow_content(component)
+            });
             if direct_float == w3cos_std::style::Float::Left && has_prior_in_flow {
                 // A later float is shifted to the inline-start edge of the
                 // current line; earlier inline content flows beside it. Keep
@@ -9018,6 +9022,20 @@ mod image_component_tests {
                 })
                 .is_some_and(|value| value == "1")
         );
+
+        let fixed = hoist_floats_into_block_formatting_context(
+            &context_style,
+            vec![floating_box(Float::Left), floating_box(Float::Left)],
+        );
+        assert!(fixed.iter().all(|component| {
+            component
+                .style
+                .custom_properties
+                .as_ref()
+                .is_none_or(|properties| {
+                    !properties.contains_key("--w3cos-internal-left-float-after-inline")
+                })
+        }));
     }
 
     #[test]
@@ -9518,6 +9536,25 @@ mod image_component_tests {
             tree.children[0].style.justify_content,
             w3cos_std::style::JustifyContent::FlexEnd
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn justified_single_text_run_uses_the_block_line_width() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[("text-align", "justify")]);
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        let text =
+            document.create_text_node("A long text run must wrap to the anonymous line box width.");
+        block.append_child(&mut document, text);
+        document.body().append_child(&mut document, block);
+
+        let tree = document.to_component_tree();
+        let line = &tree.children[0];
+        assert_eq!(line.style.display, Display::Flex);
+        assert_eq!(line.children[0].style.width, Dimension::Percent(100.0));
+        assert_eq!(line.children[0].style.min_width, Dimension::Px(0.0));
         crate::stylesheet::clear_rules();
     }
 
