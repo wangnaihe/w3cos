@@ -1462,6 +1462,20 @@ impl Document {
                 }
             }
         }
+        for (property, target) in [
+            ("top", &mut style.top),
+            ("right", &mut style.right),
+            ("bottom", &mut style.bottom),
+            ("left", &mut style.left),
+        ] {
+            if let Some(value) = declared_value(&[property])
+                && let Some(number) = value.trim().strip_suffix("ex")
+                && let Ok(number) = number.trim().parse::<f32>()
+                && number.is_finite()
+            {
+                *target = w3cos_std::style::Dimension::Px(number * edge_ex_size);
+            }
+        }
         if let Some(value) = declared_value(&["clip"]) {
             match value.trim().to_ascii_lowercase().as_str() {
                 "inherit" => {
@@ -12329,6 +12343,33 @@ mod computed_style_cache_tests {
         assert_eq!(style.height, w3cos_std::style::Dimension::Px(96.0));
         assert_eq!(style.min_height, w3cos_std::style::Dimension::Px(16.0));
         assert_eq!(style.max_width, w3cos_std::style::Dimension::Px(48.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn ex_position_offsets_use_the_computed_ahem_x_height() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#target",
+            &[
+                ("font", "20px/1 Ahem"),
+                ("top", "2ex"),
+                ("right", "+1ex"),
+                ("bottom", "1ex"),
+                ("left", "-2ex"),
+            ],
+        );
+
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+
+        let style = document.computed_style_for(target.id);
+        assert_eq!(style.top, w3cos_std::style::Dimension::Px(32.0));
+        assert_eq!(style.right, w3cos_std::style::Dimension::Px(16.0));
+        assert_eq!(style.bottom, w3cos_std::style::Dimension::Px(16.0));
+        assert_eq!(style.left, w3cos_std::style::Dimension::Px(-32.0));
         crate::stylesheet::clear_rules();
     }
 
