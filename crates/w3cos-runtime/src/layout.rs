@@ -217,11 +217,23 @@ fn image_intrinsic_size(
         if let Some(value) = max_width {
             used_width = used_width.min(value);
         }
+        if width.is_some()
+            && height.is_none()
+            && let Some(ratio) = ratio.filter(|ratio| *ratio > 0.0)
+        {
+            used_height = used_width / ratio;
+        }
         if let Some(value) = min_height {
             used_height = used_height.max(value);
         }
         if let Some(value) = max_height {
             used_height = used_height.min(value);
+        }
+        if height.is_some()
+            && width.is_none()
+            && let Some(ratio) = ratio.filter(|ratio| *ratio > 0.0)
+        {
+            used_width = used_height * ratio;
         }
     }
     (used_width, used_height)
@@ -5412,11 +5424,45 @@ fn build_taffy_tree(
     }
 
     if comp.children.is_empty() {
-        if let ComponentKind::Image { src } = &comp.kind
+        let constrained_replaced_size = if let ComponentKind::Image { src } = &comp.kind
             && let Some(ratio) = image_intrinsic_ratio(src)
         {
             style.aspect_ratio = Some(ratio);
-        }
+            if !matches!(comp.style.width, WDim::Auto | WDim::Percent(_))
+                && matches!(comp.style.height, WDim::Auto)
+                && let Some(mut used_width) = comp.style.width.resolve(
+                    containing_width,
+                    ROOT_FONT_SIZE,
+                    comp.style.font_size,
+                    viewport_w,
+                    viewport_h,
+                )
+            {
+                if let Some(min_width) = comp.style.min_width.resolve(
+                    containing_width,
+                    ROOT_FONT_SIZE,
+                    comp.style.font_size,
+                    viewport_w,
+                    viewport_h,
+                ) {
+                    used_width = used_width.max(min_width);
+                }
+                if let Some(max_width) = comp.style.max_width.resolve(
+                    containing_width,
+                    ROOT_FONT_SIZE,
+                    comp.style.font_size,
+                    viewport_w,
+                    viewport_h,
+                ) {
+                    used_width = used_width.min(max_width);
+                }
+                Some((used_width.max(0.0), (used_width / ratio).max(0.0)))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let size = leaf_taffy_size(
             &comp.kind,
             &comp.style,
@@ -5617,6 +5663,10 @@ fn build_taffy_tree(
             },
             ..style
         };
+        if let Some((width, height)) = constrained_replaced_size {
+            leaf_style.size.width = Dimension::length(width);
+            leaf_style.size.height = Dimension::length(height);
+        }
         if matches!(comp.kind, ComponentKind::Text { .. })
             && matches!(
                 comp.style.word_break,
@@ -9919,6 +9969,17 @@ mod tests {
             ),
             (20.0, 10.0)
         );
+        assert_eq!(
+            leaf_intrinsic_size(
+                &kind,
+                &Style {
+                    width: WDim::Px(0.0),
+                    min_width: WDim::Px(100.0),
+                    ..Style::default()
+                },
+            ),
+            (100.0, 50.0)
+        );
         let layout = compute(
             &Component::boxed(
                 Style {
@@ -9940,6 +10001,33 @@ mod tests {
         .unwrap();
         let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!((image.width, image.height), (4.0, 2.0));
+        let constrained = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(800.0),
+                    ..Style::default()
+                },
+                vec![Component::image(
+                    source,
+                    Style {
+                        display: WDisp::Inline,
+                        width: WDim::Em(0.0),
+                        min_width: WDim::Em(6.25),
+                        ..Style::default()
+                    },
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        let constrained = constrained
+            .iter()
+            .find(|(_, index)| *index == 1)
+            .unwrap()
+            .0;
+        assert_eq!((constrained.width, constrained.height), (100.0, 50.0));
         crate::image_loader::invalidate(source);
     }
 
