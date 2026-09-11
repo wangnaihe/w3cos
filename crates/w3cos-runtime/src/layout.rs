@@ -1970,6 +1970,71 @@ fn align_table_cell_baselines(layouts: &mut [(LayoutRect, usize)], flat: &[FlatN
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
         .collect::<HashMap<_, _>>();
+    for (cell, node) in flat
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.style.display == WDisplay::TableCell)
+    {
+        let alignment = node.style.align_self;
+        if !matches!(alignment, WAlignSelf::Center | WAlignSelf::FlexEnd) {
+            continue;
+        }
+        let Some(cell_position) = positions.get(&cell).copied() else {
+            continue;
+        };
+        let cell_rect = layouts[cell_position].0;
+        let content_bounds = flat
+            .iter()
+            .enumerate()
+            .filter(|(index, child)| {
+                descendant_of(flat, *index, cell)
+                    && !matches!(child.style.position, WPos::Fixed)
+                    && child.style.display != WDisplay::None
+            })
+            .filter_map(|(index, _)| positions.get(&index).map(|position| layouts[*position].0))
+            .fold(None::<(f32, f32)>, |bounds, rect| {
+                Some(match bounds {
+                    Some((top, bottom)) => (top.min(rect.y), bottom.max(rect.y + rect.height)),
+                    None => (rect.y, rect.y + rect.height),
+                })
+            });
+        let Some((content_top, content_bottom)) = content_bounds else {
+            continue;
+        };
+        let padding = node.style.padding_lengths();
+        let available_top = cell_rect.y
+            + node
+                .style
+                .border_top_width
+                .unwrap_or(node.style.border_width)
+            + padding.top;
+        let available_bottom = cell_rect.y + cell_rect.height
+            - node
+                .style
+                .border_bottom_width
+                .unwrap_or(node.style.border_width)
+            - padding.bottom;
+        let delta = match alignment {
+            WAlignSelf::Center => {
+                available_top + (available_bottom - available_top
+                    - (content_bottom - content_top))
+                    / 2.0
+                    - content_top
+            }
+            WAlignSelf::FlexEnd => available_bottom - content_bottom,
+            _ => 0.0,
+        };
+        if delta.abs() <= f32::EPSILON {
+            continue;
+        }
+        for (rect, index) in layouts.iter_mut() {
+            if descendant_of(flat, *index, cell)
+                && !matches!(flat[*index].style.position, WPos::Absolute | WPos::Fixed)
+            {
+                rect.y += delta;
+            }
+        }
+    }
     for (row, _) in flat
         .iter()
         .enumerate()
@@ -5212,7 +5277,15 @@ fn positioned_descendant_containing_block(
         return rect;
     };
     if !matches!(info.style.display, WDisplay::Inline) {
-        return rect;
+        let Ok(layout) = tree.layout(node) else {
+            return rect;
+        };
+        return LayoutRect {
+            x: rect.x + layout.border.left,
+            y: rect.y + layout.border.top,
+            width: (rect.width - layout.border.left - layout.border.right).max(0.0),
+            height: (rect.height - layout.border.top - layout.border.bottom).max(0.0),
+        };
     }
 
     let Ok(children) = tree.children(node) else {
@@ -7313,6 +7386,39 @@ mod tests {
             },
         );
         assert_eq!((static_position.x, static_position.y), (58.0, 101.2));
+    }
+
+    #[test]
+    fn bordered_positioned_block_uses_its_padding_box_for_absolute_children() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                position: WPos::Relative,
+                width: WDim::Px(150.0),
+                height: WDim::Px(50.0),
+                border_width: 1.0,
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    position: WPos::Absolute,
+                    left: WDim::Px(-15.0),
+                    top: WDim::Px(0.0),
+                    width: WDim::Px(0.0),
+                    height: WDim::Px(50.0),
+                    border_left_width: Some(10.0),
+                    ..Style::default()
+                },
+                Vec::new(),
+            )],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let container = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let absolute = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(absolute.x, container.x + 1.0 - 15.0);
+        assert_eq!(absolute.y, container.y + 1.0);
     }
 
     #[test]

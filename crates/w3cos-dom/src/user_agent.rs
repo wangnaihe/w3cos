@@ -5,7 +5,9 @@
 //! elements directly to native components, but must not define private copies.
 
 use w3cos_std::color::Color;
-use w3cos_std::style::{BoxSizing, Display, Edges, FlexDirection, FontStyle, Spacing, Style};
+use w3cos_std::style::{
+    AlignSelf, BoxSizing, Display, Edges, FlexDirection, FontStyle, Spacing, Style,
+};
 
 /// Apply W3COS's default HTML presentation to an existing style.
 ///
@@ -49,7 +51,10 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
             style.border_spacing_x = 2.0;
             style.border_spacing_y = 2.0;
         }
-        "td" | "th" => style.padding = Edges::all(1.0),
+        "td" | "th" => {
+            style.padding = Edges::all(1.0);
+            style.align_self = AlignSelf::Center;
+        }
         "button" => {
             style.box_sizing = BoxSizing::BorderBox;
             style.background = Color::rgb(239, 239, 239);
@@ -143,6 +148,7 @@ mod tests {
         assert_eq!(html_default_style("tr").display, Display::TableRow);
         assert_eq!(html_default_style("td").display, Display::TableCell);
         assert_eq!(html_default_style("td").padding, Edges::all(1.0));
+        assert_eq!(html_default_style("td").align_self, AlignSelf::Center);
         assert_eq!(html_default_style("th").padding, Edges::all(1.0));
         assert_eq!(html_default_style("script").display, Display::None);
         assert_eq!(html_default_style("style").display, Display::None);
