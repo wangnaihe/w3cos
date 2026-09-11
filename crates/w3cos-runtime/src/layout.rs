@@ -5738,6 +5738,7 @@ fn build_taffy_tree(
         style.align_content = Some(AlignContent::FlexStart);
         if matches!(comp.style.height, WDim::Auto)
             && matches!(comp.style.min_height, WDim::Auto)
+            && matches!(comp.style.max_height, WDim::Auto)
         {
             let line_height = comp.style.font_size * comp.style.line_height;
             let baseline_replaced_height = comp
@@ -6221,7 +6222,9 @@ fn build_taffy_tree(
         } else {
             (Dimension::auto(), size.width)
         };
-        let intrinsic_min_h = if matches!(comp.style.height, WDim::Auto) {
+        let intrinsic_min_h = if matches!(comp.style.height, WDim::Auto)
+            && matches!(comp.style.max_height, WDim::Auto)
+        {
             match &comp.kind {
                 ComponentKind::Text { content } => Dimension::length(
                     text_intrinsic_size_in_parent_for_taffy(content, &comp.style, parent_display).1,
@@ -6816,10 +6819,17 @@ fn update_text_leaf_heights(
                     }
                     let mut taffy_style = tree.style(node)?.clone();
                     let measured_height = Dimension::length(h);
-                    if taffy_style.min_size.height != measured_height
+                    let measured_min_height = if matches!(style.min_height, WDim::Auto)
+                        && matches!(style.max_height, WDim::Auto)
+                    {
+                        measured_height
+                    } else {
+                        taffy_style.min_size.height
+                    };
+                    if taffy_style.min_size.height != measured_min_height
                         || taffy_style.size.height != measured_height
                     {
-                        taffy_style.min_size.height = measured_height;
+                        taffy_style.min_size.height = measured_min_height;
                         taffy_style.size.height = measured_height;
                         tree.set_style(node, taffy_style)?;
                         dirty = true;
@@ -10759,6 +10769,39 @@ mod tests {
         let canvas = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!((parent.width, parent.height), (100.0, 100.0));
         assert_eq!((canvas.width, canvas.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn zero_max_height_clamps_a_block_text_background_box() {
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(800.0),
+                    ..Style::default()
+                },
+                vec![Component::row(
+                    Style {
+                        display: WDisp::Block,
+                        max_height: WDim::Px(0.0),
+                        ..Style::default()
+                    },
+                    vec![Component::text(
+                        "Filler Text",
+                        Style {
+                            display: WDisp::Inline,
+                            ..Style::default()
+                        },
+                    )],
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        let text = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(text.height, 0.0);
     }
 
     #[test]
