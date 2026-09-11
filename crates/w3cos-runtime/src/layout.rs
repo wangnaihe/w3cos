@@ -2876,6 +2876,9 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
 
         let mut active_floats = Vec::<(WFloat, f32)>::new();
         let mut previous = None::<(usize, &Component)>;
+        let mut previous_in_flow = None::<(usize, &Component)>;
+        let mut float_since_in_flow = false;
+        let mut normal_flow_correction = 0.0_f32;
         let mut child_index = component_index + 1;
         for child in &component.children {
             let child_count = count_nodes(child);
@@ -2884,6 +2887,27 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
             {
                 child_index += child_count;
                 continue;
+            }
+            if child.style.float == WFloat::None
+                && child.style.clear == WClear::None
+                && float_since_in_flow
+                && let Some((previous_index, previous_child)) = previous_in_flow
+                && let (Some(previous_position), Some(child_position)) = (
+                    layout_position.get(&previous_index).copied(),
+                    layout_position.get(&child_index).copied(),
+                )
+            {
+                let previous_margin = previous_child.style.margin_lengths();
+                let child_margin = child.style.margin_lengths();
+                let target_y = layouts[previous_position].0.y
+                    + layouts[previous_position].0.height
+                    + collapse([previous_margin.bottom, child_margin.top]);
+                let delta_y = target_y - layouts[child_position].0.y;
+                if delta_y < -f32::EPSILON {
+                    shift_subtree(layouts, layout_position, child_index, child_count, delta_y);
+                    normal_flow_correction = normal_flow_correction.min(delta_y);
+                }
+                float_since_in_flow = false;
             }
             if child.style.float != WFloat::None
                 && let Some((previous_index, previous_child)) = previous
@@ -2941,9 +2965,18 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
                     child.style.float,
                     rect.y + rect.height + child.style.margin_lengths().bottom,
                 ));
+                float_since_in_flow = true;
+            } else {
+                previous_in_flow = Some((child_index, child));
             }
             previous = Some((child_index, child));
             child_index += child_count;
+        }
+        if normal_flow_correction < -f32::EPSILON
+            && matches!(component.style.height, WDim::Auto)
+            && let Some(position) = layout_position.get(&component_index).copied()
+        {
+            layouts[position].0.height += normal_flow_correction;
         }
     }
 
@@ -9109,6 +9142,58 @@ mod tests {
         assert_eq!(collapsed.height, 0.0);
         assert_eq!(floating.y, collapsed.y + 100.0);
         assert_eq!(following.y, 200.0);
+    }
+
+    #[test]
+    fn float_does_not_advance_following_normal_flow_block() {
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                border_width: 3.0,
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(50.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Flex,
+                        float: WFloat::Left,
+                        width: WDim::Px(20.0),
+                        height: WDim::Px(20.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+                Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(50.0),
+                        margin: w3cos_std::style::Edges {
+                            top: WSpacing::Px(50.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let container = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let first = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let floating = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let following = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!(floating.y, first.y + first.height);
+        assert_eq!(following.y, first.y + first.height + 50.0);
+        assert_eq!(container.height, 156.0);
     }
 
     #[test]
