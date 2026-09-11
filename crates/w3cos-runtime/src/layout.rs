@@ -4750,6 +4750,8 @@ fn collect_layouts_fast(
                         info.style,
                         relative_containing_block,
                         relative_containing_block_height_definite,
+                        viewport_w,
+                        viewport_h,
                         rect,
                     );
                 }
@@ -5075,23 +5077,38 @@ fn compute_relative_percentage_rect(
     style: &w3cos_std::style::Style,
     containing_block: LayoutRect,
     containing_block_height_definite: bool,
+    viewport_w: f32,
+    viewport_h: f32,
     mut rect: LayoutRect,
 ) -> LayoutRect {
-    match (style.left, style.right) {
-        (WDim::Percent(value), _) => rect.x += containing_block.width * value / 100.0,
-        (WDim::Auto, WDim::Percent(value)) => {
-            rect.x -= containing_block.width * value / 100.0;
-        }
-        _ => {}
+    let resolve = |dimension: WDim, basis: f32| {
+        dimension.resolve(
+            basis,
+            ROOT_FONT_SIZE,
+            style.font_size,
+            viewport_w,
+            viewport_h,
+        )
+    };
+    match (
+        resolve(style.left, containing_block.width),
+        resolve(style.right, containing_block.width),
+    ) {
+        (Some(left), _) => rect.x += left,
+        (None, Some(right)) => rect.x -= right,
+        (None, None) => {}
     }
-    if containing_block_height_definite {
-        match (style.top, style.bottom) {
-            (WDim::Percent(value), _) => rect.y += containing_block.height * value / 100.0,
-            (WDim::Auto, WDim::Percent(value)) => {
-                rect.y -= containing_block.height * value / 100.0;
-            }
-            _ => {}
-        }
+    match (style.top, style.bottom) {
+        (WDim::Percent(_), _) | (WDim::Auto, WDim::Percent(_))
+            if !containing_block_height_definite => {}
+        _ => match (
+            resolve(style.top, containing_block.height),
+            resolve(style.bottom, containing_block.height),
+        ) {
+            (Some(top), _) => rect.y += top,
+            (None, Some(bottom)) => rect.y -= bottom,
+            (None, None) => {}
+        },
     }
     rect
 }
@@ -7387,6 +7404,36 @@ mod tests {
         );
         let layout = compute(&root, 800.0, 600.0).unwrap();
         assert_eq!((layout[1].0.width, layout[1].0.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn relative_length_insets_offset_the_projected_rect() {
+        let style = Style {
+            position: WPos::Relative,
+            left: WDim::Px(100.0),
+            top: WDim::Px(25.0),
+            ..Style::default()
+        };
+        let rect = compute_relative_percentage_rect(
+            &style,
+            LayoutRect {
+                x: 8.0,
+                y: 0.0,
+                width: 500.0,
+                height: 200.0,
+            },
+            false,
+            800.0,
+            600.0,
+            LayoutRect {
+                x: 8.0,
+                y: 10.0,
+                width: 100.0,
+                height: 50.0,
+            },
+        );
+
+        assert_eq!((rect.x, rect.y), (108.0, 35.0));
     }
 
     #[test]
