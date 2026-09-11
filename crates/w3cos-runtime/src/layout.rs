@@ -2062,7 +2062,9 @@ fn project_rtl_fixed_block_alignment(
         .collect::<HashMap<_, _>>();
     for (index, node) in flat.iter().enumerate() {
         if node.style.display != WDisplay::Block
-            || matches!(node.style.position, WPos::Absolute | WPos::Fixed)
+            || (matches!(node.style.position, WPos::Absolute | WPos::Fixed)
+                && (!matches!(node.style.left, WDim::Auto)
+                    || !matches!(node.style.right, WDim::Auto)))
             || matches!(node.style.width, WDim::Auto)
             || matches!(node.style.margin.left, WSpacing::Auto)
             || matches!(node.style.margin.right, WSpacing::Auto)
@@ -2075,7 +2077,6 @@ fn project_rtl_fixed_block_alignment(
         let parent_node = &flat[parent_index];
         if parent_node.style.direction != w3cos_std::style::TextDirection::Rtl
             || parent_node.style.display != WDisplay::Block
-            || matches!(parent_node.style.width, WDim::Auto)
         {
             continue;
         }
