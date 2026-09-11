@@ -4669,6 +4669,7 @@ impl Document {
 
                 if block_in_inline
                     && !self.events.has_listeners(id)
+                    && children.len() >= 2
                     && children.iter().any(|child| {
                         matches!(
                             child.style.display,
