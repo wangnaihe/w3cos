@@ -4432,6 +4432,20 @@ fn build_taffy_tree(
     if let WSpacing::Percent(value) = comp.style.padding.right {
         style.padding.right = LengthPercentage::length(containing_width * value / 100.0);
     }
+    // Percentage margins use the containing block's content width. Taffy's
+    // block fallback otherwise resolves them against the parent's border box.
+    if let WSpacing::Percent(value) = comp.style.margin.top {
+        style.margin.top = LengthPercentageAuto::length(containing_width * value / 100.0);
+    }
+    if let WSpacing::Percent(value) = comp.style.margin.right {
+        style.margin.right = LengthPercentageAuto::length(containing_width * value / 100.0);
+    }
+    if let WSpacing::Percent(value) = comp.style.margin.bottom {
+        style.margin.bottom = LengthPercentageAuto::length(containing_width * value / 100.0);
+    }
+    if let WSpacing::Percent(value) = comp.style.margin.left {
+        style.margin.left = LengthPercentageAuto::length(containing_width * value / 100.0);
+    }
     let child_containing_width =
         component_content_width(&comp.style, containing_width, viewport_w, viewport_h);
     if comp.style.float != WFloat::None
@@ -9252,6 +9266,40 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!(first.y, 16.0);
         assert_eq!(second.y, 122.0);
+    }
+
+    #[test]
+    fn percentage_margin_uses_the_containing_blocks_content_width() {
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(96.0),
+                    border_left_width: Some(48.0),
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        display: WDisp::Block,
+                        height: WDim::Px(96.0),
+                        margin: w3cos_std::style::Edges {
+                            left: WSpacing::Percent(50.0),
+                            ..w3cos_std::style::Edges::ZERO
+                        },
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        let parent = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let child = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(parent.width, 144.0);
+        assert_eq!(child.x, 96.0);
     }
 
     #[test]
