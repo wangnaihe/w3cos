@@ -3722,17 +3722,62 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
                 continue;
             }
             let target_y = line_top.unwrap_or(parent_rect.y) + line_height;
-            let mut cursor_x = line_start;
-            for (following, following_index) in
-                children[position + 1..]
-                    .iter()
-                    .take_while(|(following, _)| {
-                        !matches!(
-                            &following.kind,
-                            ComponentKind::Text { content } if content == "\u{2028}"
-                        )
-                    })
-            {
+            let following_line = children[position + 1..]
+                .iter()
+                .take_while(|(following, _)| {
+                    !matches!(
+                        &following.kind,
+                        ComponentKind::Text { content } if content == "\u{2028}"
+                    )
+                })
+                .collect::<Vec<_>>();
+            let line_width = following_line
+                .iter()
+                .filter(|(following, _)| {
+                    !matches!(following.style.position, WPos::Absolute | WPos::Fixed)
+                })
+                .filter_map(|(following, following_index)| {
+                    let following_position = layout_position.get(following_index).copied()?;
+                    let margin = following.style.margin_lengths();
+                    let margin_left = match following.style.margin.left {
+                        WSpacing::Percent(value) => parent_rect.width * value / 100.0,
+                        _ => margin.left,
+                    };
+                    let margin_right = match following.style.margin.right {
+                        WSpacing::Percent(value) => parent_rect.width * value / 100.0,
+                        _ => margin.right,
+                    };
+                    Some(margin_left + layouts[following_position].0.width + margin_right)
+                })
+                .sum::<f32>();
+            let content_width = (parent_rect.width
+                - component
+                    .style
+                    .border_left_width
+                    .unwrap_or(component.style.border_width)
+                - component
+                    .style
+                    .border_right_width
+                    .unwrap_or(component.style.border_width)
+                - padding.left
+                - padding.right)
+                .max(0.0);
+            let free_space = (content_width - line_width).max(0.0);
+            let line_offset = match (component.style.text_align, component.style.direction) {
+                (w3cos_std::style::TextAlign::Center, _) => free_space / 2.0,
+                (w3cos_std::style::TextAlign::Right, _)
+                | (
+                    w3cos_std::style::TextAlign::Start,
+                    w3cos_std::style::TextDirection::Rtl,
+                )
+                | (
+                    w3cos_std::style::TextAlign::End,
+                    w3cos_std::style::TextDirection::Ltr,
+                ) => free_space,
+                _ => 0.0,
+            };
+            let mut cursor_x = line_start + line_offset;
+            for (following, following_index) in following_line {
                 if matches!(following.style.position, WPos::Absolute | WPos::Fixed) {
                     // Out-of-flow descendants already receive their CSS static
                     // position from `inline_absolute_static_rect`. Moving them
@@ -3779,7 +3824,10 @@ fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Compon
             .map(|rect| rect.y + rect.height)
             .fold(parent_rect.y, f32::max);
         let line_box_bottom = line_top.map_or(parent_rect.y, |top| top + line_height);
-        layouts[parent_position].0.height = descendant_bottom.max(line_box_bottom) - parent_rect.y;
+        if matches!(component.style.height, WDim::Auto) {
+            layouts[parent_position].0.height =
+                descendant_bottom.max(line_box_bottom) - parent_rect.y;
+        }
     }
 
     visit(root, 0, layouts, &layout_position);
@@ -8575,6 +8623,47 @@ mod tests {
             "projected parent height was {}",
             rect(0).height
         );
+    }
+
+    #[test]
+    fn forced_break_centers_the_following_inline_line() {
+        let inline_box = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::InlineBlock,
+                    width: WDim::Px(100.0),
+                    height: WDim::Px(20.0),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let forced_break = Component::text(
+            "\u{2028}",
+            Style {
+                display: WDisp::Inline,
+                width: WDim::Px(0.0),
+                height: WDim::Px(20.0),
+                ..Style::default()
+            },
+        );
+        let root = Component::boxed(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(200.0),
+                height: WDim::Px(200.0),
+                text_align: w3cos_std::style::TextAlign::Center,
+                justify_content: WJustify::Center,
+                ..Style::default()
+            },
+            vec![inline_box(), forced_break, inline_box()],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        assert_eq!(layout[0].0.height, 200.0);
+        let following = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!(following.x, 50.0);
+        assert_eq!(following.y, 20.0);
     }
 
     #[test]
