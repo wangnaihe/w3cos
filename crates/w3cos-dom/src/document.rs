@@ -4706,10 +4706,24 @@ impl Document {
                     let last_block = children.iter().rposition(is_block).expect("split block");
                     let fragment_style = |retain_left: bool, retain_right: bool| {
                         let mut fragment = style.clone();
-                        fragment.display = w3cos_std::style::Display::InlineFlex;
+                        let passive_fragment = style.padding == w3cos_std::style::Edges::ZERO
+                            && style.border_width == 0.0
+                            && style.border_top_width.unwrap_or(0.0) == 0.0
+                            && style.border_right_width.unwrap_or(0.0) == 0.0
+                            && style.border_bottom_width.unwrap_or(0.0) == 0.0
+                            && style.border_left_width.unwrap_or(0.0) == 0.0;
+                        fragment.display = if passive_fragment {
+                            w3cos_std::style::Display::Flex
+                        } else {
+                            w3cos_std::style::Display::InlineFlex
+                        };
                         fragment.flex_direction = w3cos_std::style::FlexDirection::Row;
                         fragment.align_items = w3cos_std::style::AlignItems::Baseline;
-                        fragment.width = w3cos_std::style::Dimension::Auto;
+                        fragment.width = if passive_fragment {
+                            w3cos_std::style::Dimension::Percent(100.0)
+                        } else {
+                            w3cos_std::style::Dimension::Auto
+                        };
                         fragment.height = w3cos_std::style::Dimension::Auto;
                         fragment.min_width = w3cos_std::style::Dimension::Auto;
                         fragment.min_height = w3cos_std::style::Dimension::Auto;
@@ -4735,6 +4749,23 @@ impl Document {
                         fragment.border_bottom_width = Some(bottom);
                         fragment.border_left_width = Some(if retain_left { left } else { 0.0 });
                         fragment.border_right_width = Some(if retain_right { right } else { 0.0 });
+                        if passive_fragment {
+                            fragment.justify_content = match (style.text_align, style.direction) {
+                                (w3cos_std::style::TextAlign::Right, _)
+                                | (
+                                    w3cos_std::style::TextAlign::Start,
+                                    w3cos_std::style::TextDirection::Rtl,
+                                )
+                                | (
+                                    w3cos_std::style::TextAlign::End,
+                                    w3cos_std::style::TextDirection::Ltr,
+                                ) => w3cos_std::style::JustifyContent::FlexEnd,
+                                (w3cos_std::style::TextAlign::Center, _) => {
+                                    w3cos_std::style::JustifyContent::Center
+                                }
+                                _ => w3cos_std::style::JustifyContent::FlexStart,
+                            };
+                        }
                         fragment
                     };
                     let inline_start_is_left =
