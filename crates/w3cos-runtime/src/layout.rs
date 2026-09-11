@@ -2561,6 +2561,7 @@ fn project_leading_descendant_margin_groups(
             };
             let current_width = layouts[current_position].0.width;
             let mut descendant_margins = Vec::new();
+            let mut crossed_empty_block = false;
             let mut descendant_index = current_index + 1;
             for descendant in &current.children {
                 let descendant_count = count_nodes(descendant);
@@ -2594,6 +2595,7 @@ fn project_leading_descendant_margin_groups(
                         .unwrap_or(descendant.style.border_width)
                         <= 0.0;
                 if empty_collapsible {
+                    crossed_empty_block = true;
                     descendant_margins.push(resolve_margin(
                         descendant.style.margin.bottom,
                         &descendant.style,
@@ -2604,7 +2606,7 @@ fn project_leading_descendant_margin_groups(
                 }
                 break;
             }
-            if descendant_margins.is_empty() {
+            if !crossed_empty_block || !descendant_margins.iter().any(|margin| *margin < 0.0) {
                 continue;
             }
 
@@ -2618,7 +2620,7 @@ fn project_leading_descendant_margin_groups(
             let mut full_group = vec![previous_bottom, current_top];
             full_group.extend(descendant_margins);
             let delta = collapse(&full_group) - collapse(&[previous_bottom, current_top]);
-            if delta.abs() <= f32::EPSILON {
+            if delta >= -f32::EPSILON {
                 continue;
             }
             let parent_end = component_index + count_nodes(component);
