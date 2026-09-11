@@ -1103,6 +1103,12 @@ fn collapsed_empty_row_overlap(
         WDim::Percent(_) => return None,
         WDim::Rem(value) => value * ROOT_FONT_SIZE,
         WDim::Em(value) => value * component.style.font_size,
+        WDim::Ch(value) => {
+            value
+                * layout_font()
+                    .metrics('0', component.style.font_size)
+                    .advance_width
+        }
         WDim::Vw(value) => value * viewport_w / 100.0,
         WDim::Vh(value) => value * viewport_h / 100.0,
     };
@@ -1134,9 +1140,13 @@ fn shrink_to_fit_used_width(component: &Component) -> f32 {
 fn dim_to_px(dim: WDim) -> Option<f32> {
     match dim {
         WDim::Px(v) => Some(v),
-        WDim::Auto | WDim::Percent(_) | WDim::Rem(_) | WDim::Em(_) | WDim::Vw(_) | WDim::Vh(_) => {
-            None
-        }
+        WDim::Auto
+        | WDim::Percent(_)
+        | WDim::Rem(_)
+        | WDim::Em(_)
+        | WDim::Ch(_)
+        | WDim::Vw(_)
+        | WDim::Vh(_) => None,
     }
 }
 
@@ -4115,13 +4125,21 @@ fn component_content_width(
         + resolve_edge(style.padding.right)
         + style.border_left_width.unwrap_or(style.border_width)
         + style.border_right_width.unwrap_or(style.border_width);
-    let specified = style.width.resolve(
-        containing_width,
-        ROOT_FONT_SIZE,
-        style.font_size,
-        viewport_w,
-        viewport_h,
-    );
+    let specified = match style.width {
+        WDim::Ch(value) => Some(
+            value
+                * layout_font()
+                    .metrics('0', style.font_size)
+                    .advance_width,
+        ),
+        _ => style.width.resolve(
+            containing_width,
+            ROOT_FONT_SIZE,
+            style.font_size,
+            viewport_w,
+            viewport_h,
+        ),
+    };
     let mut width = specified.unwrap_or_else(|| {
         containing_width
             - resolve_edge(style.margin.left)
@@ -4371,6 +4389,12 @@ fn build_taffy_tree(
         WDim::Px(value) => Some(value),
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Em(value) => Some(value * comp.style.font_size),
+        WDim::Ch(value) => Some(
+            value
+                * layout_font()
+                    .metrics('0', comp.style.font_size)
+                    .advance_width,
+        ),
         WDim::Vw(value) => Some(value * viewport_w / 100.0),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
         WDim::Auto | WDim::Percent(_) => None,
@@ -5800,7 +5824,12 @@ fn collect_layouts_fast(
                         || relative_containing_block_height_definite)
             }
             WDim::Percent(_) => relative_containing_block_height_definite,
-            WDim::Px(_) | WDim::Rem(_) | WDim::Em(_) | WDim::Vw(_) | WDim::Vh(_) => true,
+            WDim::Px(_)
+            | WDim::Rem(_)
+            | WDim::Em(_)
+            | WDim::Ch(_)
+            | WDim::Vw(_)
+            | WDim::Vh(_) => true,
         });
 
     for &child in tree.children(node).unwrap().iter() {
@@ -6814,6 +6843,11 @@ fn to_taffy_dim(d: WDim, local_font_size: f32, viewport_w: f32, viewport_h: f32)
         WDim::Percent(v) => Dimension::percent(v / 100.0),
         WDim::Rem(v) => Dimension::length(v * 16.0),
         WDim::Em(v) => Dimension::length(v * local_font_size),
+        WDim::Ch(v) => Dimension::length(
+            v * layout_font()
+                .metrics('0', local_font_size)
+                .advance_width,
+        ),
         WDim::Vw(v) => Dimension::length(v * viewport_w / 100.0),
         WDim::Vh(v) => Dimension::length(v * viewport_h / 100.0),
     }
@@ -6831,6 +6865,11 @@ fn to_taffy_auto(
         WDim::Percent(v) => LengthPercentageAuto::percent(v / 100.0),
         WDim::Rem(v) => LengthPercentageAuto::length(v * 16.0),
         WDim::Em(v) => LengthPercentageAuto::length(v * local_font_size),
+        WDim::Ch(v) => LengthPercentageAuto::length(
+            v * layout_font()
+                .metrics('0', local_font_size)
+                .advance_width,
+        ),
         WDim::Vw(v) => LengthPercentageAuto::length(v * viewport_w / 100.0),
         WDim::Vh(v) => LengthPercentageAuto::length(v * viewport_h / 100.0),
     }

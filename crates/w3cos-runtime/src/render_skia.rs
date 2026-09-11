@@ -1351,7 +1351,7 @@ fn draw_text_in_rect(
         );
         let x = aligned_text_x(
             first_line_content,
-            effective_text_align(style),
+            effective_text_align_last(style).unwrap_or_else(|| effective_text_align(style)),
             alignment_ink_left,
             advance,
         );
@@ -1399,7 +1399,11 @@ fn draw_text_in_rect(
         };
         let x = aligned_text_x(
             line_content,
-            effective_text_align(style),
+            if index + 1 == layout.lines.len() {
+                effective_text_align_last(style).unwrap_or_else(|| effective_text_align(style))
+            } else {
+                effective_text_align(style)
+            },
             alignment_ink_left,
             advance,
         );
@@ -1489,6 +1493,22 @@ fn effective_text_align(style: &Style) -> TextAlign {
             (align, _) => align,
         }
     }
+}
+
+fn effective_text_align_last(style: &Style) -> Option<TextAlign> {
+    let value = style
+        .custom_properties
+        .as_ref()?
+        .get("--w3cos-internal-text-align-last")?;
+    Some(match value.as_str() {
+        "left" => TextAlign::Left,
+        "right" => TextAlign::Right,
+        "center" => TextAlign::Center,
+        "start" if style.direction == w3cos_std::style::TextDirection::Rtl => TextAlign::Right,
+        "end" if style.direction == w3cos_std::style::TextDirection::Ltr => TextAlign::Right,
+        "auto" => effective_text_align(style),
+        _ => TextAlign::Left,
+    })
 }
 
 fn aligned_text_x(rect: LayoutRect, align: TextAlign, ink_left: f32, advance_width: f32) -> f32 {
@@ -2205,6 +2225,19 @@ mod tests {
         style.display = Display::Inline;
         style.text_align = TextAlign::Right;
         assert_eq!(effective_text_align(&style), TextAlign::Left);
+    }
+
+    #[test]
+    fn text_align_last_overrides_the_final_inline_line() {
+        let mut style = Style::default();
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-text-align-last".to_string(),
+                "right".to_string(),
+            );
+        assert_eq!(effective_text_align_last(&style), Some(TextAlign::Right));
     }
 
     #[test]

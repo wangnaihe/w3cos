@@ -728,6 +728,7 @@ impl Style {
             Dimension::Percent(value) => containing_width * value / 100.0,
             Dimension::Rem(value) => value * 16.0,
             Dimension::Em(value) => value * self.font_size,
+            Dimension::Ch(value) => value * self.font_size * 0.5,
             Dimension::Vw(value) => viewport_width * value / 100.0,
             Dimension::Vh(value) => viewport_height * value / 100.0,
             Dimension::Auto => 0.0,
@@ -863,6 +864,7 @@ pub enum Dimension {
     Percent(f32),
     Rem(f32),
     Em(f32),
+    Ch(f32),
     Vw(f32),
     Vh(f32),
 }
@@ -1662,6 +1664,7 @@ impl Dimension {
             Dimension::Percent(v) => Some(parent_size * v / 100.0),
             Dimension::Rem(v) => Some(*v * root_font_size),
             Dimension::Em(v) => Some(*v * local_font_size),
+            Dimension::Ch(v) => Some(*v * local_font_size * 0.5),
             Dimension::Vw(v) => Some(*v * viewport_w / 100.0),
             Dimension::Vh(v) => Some(*v * viewport_h / 100.0),
         }

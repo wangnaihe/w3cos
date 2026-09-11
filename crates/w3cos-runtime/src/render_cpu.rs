@@ -1345,6 +1345,22 @@ fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
     }
 }
 
+fn text_align_last(style: &Style) -> Option<TextAlign> {
+    let value = style
+        .custom_properties
+        .as_ref()?
+        .get("--w3cos-internal-text-align-last")?;
+    Some(match value.as_str() {
+        "left" => TextAlign::Left,
+        "right" => TextAlign::Right,
+        "center" => TextAlign::Center,
+        "start" if style.direction == w3cos_std::style::TextDirection::Rtl => TextAlign::Right,
+        "end" if style.direction == w3cos_std::style::TextDirection::Ltr => TextAlign::Right,
+        "auto" => single_line_h_align(style, 0.0, 0.0),
+        _ => TextAlign::Left,
+    })
+}
+
 fn draw_text_in_rect(
     pixmap: &mut Pixmap,
     rect: LayoutRect,
@@ -1403,8 +1419,9 @@ fn draw_text_in_rect(
     let lines = &layout.lines;
 
     if lines.len() == 1 {
-        let align =
-            single_line_h_align(style, first_line_content.width, layout.ink_bounds[0].width);
+        let align = text_align_last(style).unwrap_or_else(|| {
+            single_line_h_align(style, first_line_content.width, layout.ink_bounds[0].width)
+        });
         draw_text_ink_in_box(
             pixmap,
             first_line_content,
@@ -1437,7 +1454,12 @@ fn draw_text_in_rect(
             ink.left
         };
         let line_content = if i == 0 { first_line_content } else { content };
-        let align = single_line_h_align(style, line_content.width, ink.width);
+        let align = if i + 1 == lines.len() {
+            text_align_last(style)
+                .unwrap_or_else(|| single_line_h_align(style, line_content.width, ink.width))
+        } else {
+            single_line_h_align(style, line_content.width, ink.width)
+        };
         let x = match align {
             TextAlign::Right => {
                 line_content.x + line_content.width - ink.width - alignment_ink_left
@@ -1947,6 +1969,19 @@ fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia
 #[cfg(test)]
 mod font_cjk_tests {
     use super::*;
+
+    #[test]
+    fn text_align_last_overrides_the_final_inline_line() {
+        let mut style = Style::default();
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-text-align-last".to_string(),
+                "right".to_string(),
+            );
+        assert_eq!(text_align_last(&style), Some(TextAlign::Right));
+    }
 
     #[test]
     fn cjk_subset_font_loads() {

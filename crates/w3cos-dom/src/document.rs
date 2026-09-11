@@ -1059,7 +1059,10 @@ impl Document {
         let mut custom_properties = inherited
             .and_then(|style| style.custom_properties.clone())
             .unwrap_or_default();
-        custom_properties.retain(|property, _| !property.starts_with("--w3cos-internal-"));
+        custom_properties.retain(|property, _| {
+            !property.starts_with("--w3cos-internal-")
+                || property == "--w3cos-internal-text-align-last"
+        });
 
         // Custom properties participate in the cascade independently of
         // declaration order. Collect them first, then resolve ordinary
@@ -4243,6 +4246,9 @@ impl Document {
                             w3cos_std::style::Dimension::Em(value) => {
                                 w3cos_std::style::Spacing::Em(value)
                             }
+                            w3cos_std::style::Dimension::Ch(value) => {
+                                w3cos_std::style::Spacing::Em(value * 0.5)
+                            }
                             w3cos_std::style::Dimension::Vw(value) => {
                                 w3cos_std::style::Spacing::Vw(value)
                             }
@@ -4287,7 +4293,10 @@ impl Document {
                         )
                         && (!matches!(style.width, w3cos_std::style::Dimension::Auto)
                             || style.text_indent != w3cos_std::style::Dimension::Px(0.0)
-                            || style.text_align != w3cos_std::style::TextAlign::Start)
+                            || style.text_align != w3cos_std::style::TextAlign::Start
+                            || style.custom_properties.as_ref().is_some_and(|properties| {
+                                properties.contains_key("--w3cos-internal-text-align-last")
+                            }))
                     {
                         // A text run in a fixed-width block is not an atomic
                         // flex item: its line box uses the block content width
@@ -4704,14 +4713,14 @@ impl Document {
                     };
                     let first_block = children.iter().position(is_block).expect("split block");
                     let last_block = children.iter().rposition(is_block).expect("split block");
+                    let passive_fragment = style.padding == w3cos_std::style::Edges::ZERO
+                        && style.border_width == 0.0
+                        && style.border_top_width.unwrap_or(0.0) == 0.0
+                        && style.border_right_width.unwrap_or(0.0) == 0.0
+                        && style.border_bottom_width.unwrap_or(0.0) == 0.0
+                        && style.border_left_width.unwrap_or(0.0) == 0.0;
                     let fragment_style = |retain_left: bool, retain_right: bool| {
                         let mut fragment = style.clone();
-                        let passive_fragment = style.padding == w3cos_std::style::Edges::ZERO
-                            && style.border_width == 0.0
-                            && style.border_top_width.unwrap_or(0.0) == 0.0
-                            && style.border_right_width.unwrap_or(0.0) == 0.0
-                            && style.border_bottom_width.unwrap_or(0.0) == 0.0
-                            && style.border_left_width.unwrap_or(0.0) == 0.0;
                         fragment.display = if passive_fragment {
                             w3cos_std::style::Display::Flex
                         } else {
@@ -4771,8 +4780,17 @@ impl Document {
                     let inline_start_is_left =
                         style.direction == w3cos_std::style::TextDirection::Ltr;
                     let mut remaining = children;
-                    let leading = remaining.drain(..first_block).collect::<Vec<_>>();
-                    let trailing = remaining.split_off(last_block - first_block + 1);
+                    let mut leading = remaining.drain(..first_block).collect::<Vec<_>>();
+                    let mut trailing = remaining.split_off(last_block - first_block + 1);
+                    if passive_fragment {
+                        for child in leading.iter_mut().chain(trailing.iter_mut()) {
+                            if matches!(child.kind, w3cos_std::ComponentKind::Text { .. }) {
+                                child.style.width = w3cos_std::style::Dimension::Percent(100.0);
+                                child.style.min_width = w3cos_std::style::Dimension::Px(0.0);
+                                child.style.flex_shrink = 1.0;
+                            }
+                        }
+                    }
                     let mut fragments = vec![w3cos_std::Component::row(
                         fragment_style(inline_start_is_left, !inline_start_is_left),
                         leading,
@@ -9984,6 +10002,29 @@ mod image_component_tests {
         assert_eq!(line.style.display, Display::Flex);
         assert_eq!(line.children[0].style.width, Dimension::Percent(100.0));
         assert_eq!(line.children[0].style.min_width, Dimension::Px(0.0));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn text_align_last_is_inherited_into_line_layout() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("section", &[("text-align-last", "right")]);
+        let mut document = Document::new();
+        let section = document.create_element("section");
+        let block = document.create_element("div");
+        block.set_text_content(&mut document, "first second");
+        section.append_child(&mut document, block);
+        document.body().append_child(&mut document, section);
+
+        assert_eq!(
+            document
+                .computed_style_for(block.id)
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get("--w3cos-internal-text-align-last"))
+                .map(String::as_str),
+            Some("right")
+        );
         crate::stylesheet::clear_rules();
     }
 

@@ -555,6 +555,15 @@ impl CSSStyleDeclaration {
 
             // Text properties
             "text-align" | "textAlign" => self.inner.text_align = parse_text_align(value),
+            "text-align-last" | "textAlignLast" => {
+                self.inner
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-text-align-last".to_string(),
+                        value.trim().to_ascii_lowercase(),
+                    );
+            }
             "white-space" | "whiteSpace" => {
                 if let Some(white_space) = parse_white_space(value) {
                     self.inner.white_space = white_space;
@@ -1221,6 +1230,7 @@ fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
         w3cos_std::style::Dimension::Percent(v) => format!("{v}%"),
         w3cos_std::style::Dimension::Rem(v) => format!("{v}rem"),
         w3cos_std::style::Dimension::Em(v) => format!("{v}em"),
+        w3cos_std::style::Dimension::Ch(v) => format!("{v}ch"),
         w3cos_std::style::Dimension::Vw(v) => format!("{v}vw"),
         w3cos_std::style::Dimension::Vh(v) => format!("{v}vh"),
         w3cos_std::style::Dimension::Auto => "auto".to_string(),
@@ -1436,7 +1446,7 @@ fn parse_dimension_checked(value: &str) -> Option<Dimension> {
     if let Some(n) = v.strip_suffix("ch")
         && let Ok(n) = n.trim().parse()
     {
-        return Some(Dimension::Em(n));
+        return Some(Dimension::Ch(n));
     }
     if let Some(n) = v.strip_suffix("em")
         && let Ok(n) = n.trim().parse()
@@ -1475,6 +1485,7 @@ fn dimension_is_non_negative_or_auto(value: &Dimension) -> bool {
         | Dimension::Percent(value)
         | Dimension::Rem(value)
         | Dimension::Em(value)
+        | Dimension::Ch(value)
         | Dimension::Vw(value)
         | Dimension::Vh(value) => value >= 0.0,
     }
@@ -2964,6 +2975,29 @@ mod tests {
 
         declaration.set_property("z-index", "not-an-integer");
         assert_eq!(declaration.inner.z_index, i32::MAX);
+    }
+
+    #[test]
+    fn text_align_last_is_retained_for_line_layout() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("text-align-last", "right");
+        assert_eq!(
+            declaration
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get("--w3cos-internal-text-align-last"))
+                .map(String::as_str),
+            Some("right")
+        );
+    }
+
+    #[test]
+    fn character_cell_width_retains_the_ch_unit() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("width", "10ch");
+        assert_eq!(declaration.inner.width, Dimension::Ch(10.0));
+        assert_eq!(declaration.get_property("width"), "10ch");
     }
 }
 #[test]

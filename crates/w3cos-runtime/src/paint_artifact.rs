@@ -276,6 +276,7 @@ fn css2_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
         Some(w3cos_std::style::Dimension::Px(value)) => value,
         Some(w3cos_std::style::Dimension::Rem(value)) => value * 16.0,
         Some(w3cos_std::style::Dimension::Em(value)) => value * style.font_size,
+        Some(w3cos_std::style::Dimension::Ch(value)) => value * style.font_size * 0.5,
         Some(w3cos_std::style::Dimension::Vw(value)) => value * rect.width / 100.0,
         Some(w3cos_std::style::Dimension::Vh(value)) => value * rect.height / 100.0,
         Some(w3cos_std::style::Dimension::Percent(value)) => value * auto / 100.0,
