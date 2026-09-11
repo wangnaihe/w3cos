@@ -3662,6 +3662,61 @@ fn project_simple_float_margin_boxes(layouts: &mut [(LayoutRect, usize)], root: 
                     }
                 }
             }
+            if child.style.float == WFloat::None
+                && child.style.clear == WClear::None
+                && matches!(
+                    child.style.display,
+                    WDisplay::Inline
+                        | WDisplay::InlineBlock
+                        | WDisplay::InlineFlex
+                        | WDisplay::InlineTable
+                )
+                && !active_floats.is_empty()
+                && let (Some(parent_position), Some(child_position)) = (
+                    layout_position.get(&component_index).copied(),
+                    layout_position.get(&child_index).copied(),
+                )
+            {
+                let containing = layouts[parent_position].0;
+                let mut current = layouts[child_position].0;
+                loop {
+                    let overlapping = active_floats
+                        .iter()
+                        .filter(|(_, float)| {
+                            current.y < float.y + float.height - f32::EPSILON
+                                && current.y + current.height > float.y + f32::EPSILON
+                        })
+                        .collect::<Vec<_>>();
+                    if overlapping.is_empty() {
+                        break;
+                    }
+                    let left_edge = overlapping
+                        .iter()
+                        .filter(|(side, _)| *side == WFloat::Left)
+                        .map(|(_, float)| float.x + float.width)
+                        .fold(containing.x, f32::max);
+                    let right_edge = overlapping
+                        .iter()
+                        .filter(|(side, _)| *side == WFloat::Right)
+                        .map(|(_, float)| float.x)
+                        .fold(containing.x + containing.width, f32::min);
+                    let margin = child.style.margin_lengths();
+                    let outer_width = current.width + margin.left + margin.right;
+                    if outer_width <= (right_edge - left_edge).max(0.0) + 0.01 {
+                        break;
+                    }
+                    let next_y = overlapping
+                        .iter()
+                        .map(|(_, float)| float.y + float.height)
+                        .fold(current.y, f32::max);
+                    let delta_y = next_y - current.y;
+                    if delta_y <= f32::EPSILON {
+                        break;
+                    }
+                    shift_subtree(layouts, layout_position, child_index, child_count, delta_y);
+                    current.y = next_y;
+                }
+            }
             if child.style.clear != WClear::None {
                 let clearance_bottom = active_floats
                     .iter()
@@ -13946,6 +14001,55 @@ mod tests {
         let float_rect = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
 
         assert_eq!(float_rect.width, 200.0);
+    }
+
+    #[test]
+    fn oversized_inline_replaced_box_wraps_below_a_left_float() {
+        let floating = Component::image(
+            "float.png",
+            Style {
+                display: WDisp::InlineBlock,
+                float: WFloat::Left,
+                width: WDim::Px(100.0),
+                height: WDim::Px(100.0),
+                ..Style::default()
+            },
+        );
+        let whitespace = Component::text(
+            " ",
+            Style {
+                display: WDisp::Inline,
+                ..Style::default()
+            },
+        );
+        let flow = Component::image(
+            "flow.png",
+            Style {
+                display: WDisp::InlineBlock,
+                width: WDim::Percent(100.0),
+                height: WDim::Px(100.0),
+                ..Style::default()
+            },
+        );
+        let root = Component::row(
+            Style {
+                display: WDisp::Flex,
+                width: WDim::Px(600.0),
+                height: WDim::Px(100.0),
+                flex_wrap: WWrap::Wrap,
+                ..Style::default()
+            },
+            vec![floating, whitespace, flow],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let floating = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let flow = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+
+        assert!(
+            flow.y >= floating.y + floating.height - 0.01,
+            "an inline replaced box wider than the float-side band must wrap below the float: float={floating:?}, flow={flow:?}"
+        );
     }
 
     #[test]
