@@ -269,7 +269,10 @@ fn component_max_content_width(component: &Component) -> f32 {
     let establishes_block_formatting_context = matches!(
         component.style.display,
         WDisplay::Block | WDisplay::ListItem | WDisplay::TableCell
-    ) || (component.style.display == WDisplay::InlineBlock
+    ) || (matches!(
+        component.style.display,
+        WDisplay::InlineBlock | WDisplay::InlineTable
+    )
         && component.children.iter().any(|child| {
             matches!(
                 child.style.display,
@@ -5235,7 +5238,12 @@ fn build_taffy_tree(
         && comp.children.iter().any(|child| {
             matches!(
                 child.style.display,
-                WDisplay::TableRow
+                WDisplay::Block
+                    | WDisplay::Flex
+                    | WDisplay::Grid
+                    | WDisplay::ListItem
+                    | WDisplay::Table
+                    | WDisplay::TableRow
                     | WDisplay::TableRowGroup
                     | WDisplay::TableHeaderGroup
                     | WDisplay::TableFooterGroup
@@ -13442,8 +13450,20 @@ mod tests {
                 ..Style::default()
             },
             vec![
-                Component::text("1", Style::default()),
-                Component::text("Before inline-table", Style::default()),
+                Component::text(
+                    "1",
+                    Style {
+                        display: WDisp::Inline,
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    "Before inline-table",
+                    Style {
+                        display: WDisp::Inline,
+                        ..Style::default()
+                    },
+                ),
             ],
         );
         let expected = inline_table
@@ -13455,6 +13475,50 @@ mod tests {
         assert!(
             (shrink_to_fit_used_width(&inline_table) - expected).abs() < 0.01,
             "direct generated inline-table content must aggregate as one row"
+        );
+    }
+
+    #[test]
+    fn inline_table_block_child_starts_a_new_internal_row() {
+        let inline_table = Component::row(
+            Style {
+                display: WDisp::InlineTable,
+                ..Style::default()
+            },
+            vec![
+                Component::text(
+                    "bcd",
+                    Style {
+                        display: WDisp::Inline,
+                        ..Style::default()
+                    },
+                ),
+                Component::text(
+                    "x",
+                    Style {
+                        display: WDisp::Block,
+                        ..Style::default()
+                    },
+                ),
+            ],
+        );
+        let expected = inline_table
+            .children
+            .iter()
+            .map(component_max_content_width)
+            .fold(0.0_f32, f32::max);
+
+        assert!(
+            (shrink_to_fit_used_width(&inline_table) - expected).abs() < 0.01,
+            "block descendants must form separate inline-table rows"
+        );
+
+        let layout = compute(&inline_table, 800.0, 600.0).unwrap();
+        let first = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert!(
+            second.y > first.y,
+            "block descendants must stack below preceding inline content: first={first:?}, second={second:?}"
         );
     }
 
