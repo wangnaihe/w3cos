@@ -6125,6 +6125,7 @@ fn build_taffy_tree(
                     }
                     if mixed_inline_block_flex_fallback
                         && !matches!(c.style.position, WPos::Absolute | WPos::Fixed)
+                        && c.style.float == WFloat::None
                         && matches!(
                             c.style.display,
                             WDisplay::Block
@@ -6631,6 +6632,20 @@ fn collect_layouts_fast(
                         .is_some_and(|value| value == "1")
                 {
                     rect.x = relative_containing_block.x;
+                    if let Some(parent_style) = info.parent.and_then(|parent| flat.get(parent)) {
+                        let line_height =
+                            parent_style.style.font_size * parent_style.style.line_height;
+                        let margin_top = resolve_spacing_for_layout(
+                            info.style.margin.top,
+                            relative_containing_block.width,
+                            info.style.font_size,
+                            viewport_w,
+                            viewport_h,
+                        );
+                        rect.y = rect.y.max(
+                            relative_containing_block.y + line_height.max(0.0) + margin_top,
+                        );
+                    }
                 }
                 out.push((rect, ctx));
             }
@@ -14357,6 +14372,64 @@ mod tests {
             flow.y >= floating.y + floating.height - 0.01,
             "an inline replaced box wider than the float-side band must wrap below the float: float={floating:?}, flow={flow:?}"
         );
+    }
+
+    #[test]
+    fn left_float_after_inline_starts_below_the_established_line_box() {
+        let image = Component::image(
+            "one-pixel.png",
+            Style {
+                display: WDisp::InlineBlock,
+                width: WDim::Px(1.0),
+                height: WDim::Px(1.0),
+                ..Style::default()
+            },
+        );
+        let mut float_style = Style {
+            display: WDisp::Block,
+            float: WFloat::Left,
+            height: WDim::Px(64.0),
+            font_size: 64.0,
+            line_height: 1.0,
+            ..Style::default()
+        };
+        float_style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-left-float-after-inline".to_string(),
+                "1".to_string(),
+            );
+        let root = Component::row(
+            Style {
+                display: WDisp::Block,
+                width: WDim::Px(0.0),
+                font_size: 64.0,
+                line_height: 1.0,
+                ..Style::default()
+            },
+            vec![
+                image,
+                Component::row(
+                    float_style,
+                    vec![Component::text(
+                        "XXXX",
+                        Style {
+                            display: WDisp::Inline,
+                            font_size: 64.0,
+                            line_height: 1.0,
+                            ..Style::default()
+                        },
+                    )],
+                ),
+            ],
+        );
+
+        let layout = compute(&root, 800.0, 600.0).unwrap();
+        let root = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+        let floating = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        assert!(floating.y >= root.y + 64.0 - 0.01);
+        assert!(floating.width > 1.0);
     }
 
     #[test]

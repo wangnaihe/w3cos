@@ -1095,9 +1095,6 @@ impl PaintArtifact {
             let Some(node) = self.nodes.get(current) else {
                 break;
             };
-            if node.style.float != w3cos_std::style::Float::None {
-                return 1;
-            }
             if matches!(
                 node.style.position,
                 Position::Relative | Position::Absolute | Position::Fixed | Position::Sticky
@@ -1106,6 +1103,9 @@ impl PaintArtifact {
                 // level. Do not lift inline descendants above a later
                 // positioned sibling merely because they are inline content.
                 return 0;
+            }
+            if node.style.float != w3cos_std::style::Float::None {
+                return 1;
             }
             if current != index
                 && matches!(
@@ -1512,12 +1512,27 @@ impl PaintArtifact {
             return (4, 0, index);
         }
 
+        // A z-index:auto positioned subtree is one atomic participant in its
+        // containing stacking context. Descendant floats must not escape into
+        // the earlier float phase of that outer context.
+        let mut positioned_ancestor = node.parent;
+        while let Some(current) = positioned_ancestor {
+            let ancestor = &self.nodes[current];
+            if is_positioned(&ancestor.style) {
+                if !establishes_stacking_context(ancestor) {
+                    return (4, 0, index);
+                }
+                break;
+            }
+            if establishes_stacking_context(ancestor) {
+                break;
+            }
+            positioned_ancestor = ancestor.parent;
+        }
+
         let mut cursor = Some(index);
         while let Some(current) = cursor {
             let current_node = &self.nodes[current];
-            if current_node.style.float != w3cos_std::style::Float::None {
-                return (2, 0, index);
-            }
             if current != index
                 && is_positioned(&current_node.style)
                 && !establishes_stacking_context(current_node)
@@ -1527,6 +1542,9 @@ impl PaintArtifact {
                 // stacking context. Its normal descendants must paint after
                 // the positioned box's own background.
                 return (4, 0, index);
+            }
+            if current_node.style.float != w3cos_std::style::Float::None {
+                return (2, 0, index);
             }
             if current != index
                 && matches!(
@@ -2704,6 +2722,69 @@ mod tests {
         );
 
         assert!(artifact.paint_order_key(1) < artifact.paint_order_key(2));
+    }
+
+    #[test]
+    fn float_descendants_do_not_escape_a_positioned_auto_subtree() {
+        let root = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style::default(),
+            parent: None,
+            sticky_counter_signal: None,
+        };
+        let control = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                position: Position::Absolute,
+                ..Style::default()
+            },
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let container = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                position: Position::Absolute,
+                ..Style::default()
+            },
+            parent: Some(0),
+            sticky_counter_signal: None,
+        };
+        let floating = PaintNode {
+            kind: ComponentKind::Box,
+            style: Style {
+                float: w3cos_std::style::Float::Left,
+                ..Style::default()
+            },
+            parent: Some(2),
+            sticky_counter_signal: None,
+        };
+        let float_text = PaintNode {
+            kind: ComponentKind::Text {
+                content: "XXXX".to_string(),
+            },
+            style: Style {
+                display: Display::Inline,
+                ..Style::default()
+            },
+            parent: Some(3),
+            sticky_counter_signal: None,
+        };
+        let artifact = PaintArtifact::build(
+            [root, control, container, floating, float_text],
+            &[
+                (rect(0.0), 0),
+                (rect(0.0), 1),
+                (rect(0.0), 2),
+                (rect(0.0), 3),
+                (rect(0.0), 4),
+            ],
+            1,
+        );
+
+        assert!(artifact.paint_order_key(1) < artifact.paint_order_key(2));
+        assert!(artifact.paint_order_key(2) < artifact.paint_order_key(3));
+        assert!(artifact.paint_order_key(3) < artifact.paint_order_key(4));
     }
 
     #[test]
