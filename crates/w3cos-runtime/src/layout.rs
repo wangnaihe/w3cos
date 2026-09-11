@@ -282,7 +282,7 @@ fn component_max_content_width(component: &Component) -> f32 {
                 let children = component.children.iter().map(child_width).sum::<f32>();
                 children + component.style.gap * component.children.len().saturating_sub(1) as f32
             }
-            WDisplay::Block | WDisplay::ListItem => {
+            WDisplay::Block | WDisplay::ListItem | WDisplay::TableCell => {
                 // A block formatting context contributes the widest generated
                 // line/block row. Consecutive inline-level and floating boxes
                 // can share a row; an in-flow block boundary flushes that row.
@@ -10494,6 +10494,29 @@ mod tests {
             expected,
             "a block boundary splits the anonymous inline rows on both sides"
         );
+    }
+
+    #[test]
+    fn table_cell_max_content_uses_widest_stacked_block_child() {
+        let block_child = |width| {
+            Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(width),
+                    ..Style::default()
+                },
+                Vec::new(),
+            )
+        };
+        let cell = Component::boxed(
+            Style {
+                display: WDisp::TableCell,
+                ..Style::default()
+            },
+            vec![block_child(50.0), block_child(100.0), block_child(75.0)],
+        );
+
+        assert_eq!(component_max_content_width(&cell), 100.0);
     }
 
     #[test]
