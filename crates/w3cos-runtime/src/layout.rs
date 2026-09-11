@@ -2005,6 +2005,7 @@ impl LayoutEngine {
 
         project_rtl_fixed_block_alignment(&mut results, flat, viewport_w, viewport_h);
         project_empty_painted_inline_boxes(&mut results, flat);
+        project_mixed_inline_block_definite_widths(&mut results, flat, viewport_w, viewport_h);
         project_fixed_table_cell_rects(&mut results, root, viewport_w, viewport_h);
         project_forced_break_lines(&mut results, root);
         align_inline_block_last_line_baselines(&mut results, root);
@@ -2143,6 +2144,7 @@ pub fn compute_with_scroll(
 
     project_rtl_fixed_block_alignment(&mut results, &flat, viewport_w, viewport_h);
     project_empty_painted_inline_boxes(&mut results, &flat);
+    project_mixed_inline_block_definite_widths(&mut results, &flat, viewport_w, viewport_h);
     project_fixed_table_cell_rects(&mut results, &layout_root, viewport_w, viewport_h);
     project_forced_break_lines(&mut results, root);
     align_inline_block_last_line_baselines(&mut results, root);
@@ -2224,6 +2226,102 @@ fn project_empty_painted_inline_boxes(
         if painted_height > 0.0 {
             layouts[position].0.y = parent.y;
             layouts[position].0.height = painted_height;
+        }
+    }
+}
+
+fn project_mixed_inline_block_definite_widths(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport_w: f32,
+    viewport_h: f32,
+) {
+    // The flex fallback uses a full-width basis to force the block onto the
+    // line after an anonymous inline run. Restore an authored block width for
+    // painting after that line break has been resolved.
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    for (index, node) in flat.iter().enumerate() {
+        if matches!(node.style.position, WPos::Absolute | WPos::Fixed)
+            || node.style.float != WFloat::None
+            || !matches!(
+                node.style.display,
+                WDisplay::Block
+                    | WDisplay::Flex
+                    | WDisplay::Grid
+                    | WDisplay::ListItem
+                    | WDisplay::Table
+            )
+        {
+            continue;
+        }
+        let Some(parent_index) = node.parent else {
+            continue;
+        };
+        let parent = &flat[parent_index];
+        if parent.style.display != WDisplay::Block
+            || !matches!(parent.kind, ComponentKind::Row)
+        {
+            continue;
+        }
+        let Some(previous_index) = (0..index)
+            .rev()
+            .find(|candidate| flat[*candidate].parent == Some(parent_index))
+        else {
+            continue;
+        };
+        let previous = &flat[previous_index];
+        let previous_has_children = flat
+            .get(previous_index + 1)
+            .is_some_and(|candidate| candidate.parent == Some(previous_index));
+        let padding = previous.style.padding_lengths();
+        let previous_paints_edge = previous.style.border_width > 0.0
+            || previous
+                .style
+                .border_top_width
+                .is_some_and(|width| width > 0.0)
+            || previous
+                .style
+                .border_right_width
+                .is_some_and(|width| width > 0.0)
+            || previous
+                .style
+                .border_bottom_width
+                .is_some_and(|width| width > 0.0)
+            || previous
+                .style
+                .border_left_width
+                .is_some_and(|width| width > 0.0)
+            || padding.top > 0.0
+            || padding.right > 0.0
+            || padding.bottom > 0.0
+            || padding.left > 0.0;
+        if previous.style.display != WDisplay::Inline
+            || previous_has_children
+            || !matches!(previous.kind, ComponentKind::Row | ComponentKind::Box)
+            || !previous_paints_edge
+        {
+            continue;
+        }
+        let (Some(position), Some(parent_position)) = (
+            positions.get(&index).copied(),
+            positions.get(&parent_index).copied(),
+        ) else {
+            continue;
+        };
+        let containing_width = component_content_width(
+            parent.style,
+            layouts[parent_position].0.width,
+            viewport_w,
+            viewport_h,
+        );
+        if let Some(width) =
+            specified_border_box_width_with_basis(node.style, Some(containing_width))
+        {
+            layouts[position].0.width = width;
         }
     }
 }
@@ -5428,6 +5526,36 @@ fn build_taffy_tree(
         // preserving the authored used position exactly.
         style.padding.top = LengthPercentage::length(guard);
     }
+    let empty_inline_establishes_visible_line = |child: &Component| {
+        if child.style.display != WDisplay::Inline
+            || !child.children.is_empty()
+            || !matches!(&child.kind, ComponentKind::Row | ComponentKind::Box)
+        {
+            return false;
+        }
+        let padding = child.style.padding_lengths();
+        child.style.border_width > 0.0
+            || child
+                .style
+                .border_top_width
+                .is_some_and(|width| width > 0.0)
+            || child
+                .style
+                .border_right_width
+                .is_some_and(|width| width > 0.0)
+            || child
+                .style
+                .border_bottom_width
+                .is_some_and(|width| width > 0.0)
+            || child
+                .style
+                .border_left_width
+                .is_some_and(|width| width > 0.0)
+            || padding.top > 0.0
+            || padding.right > 0.0
+            || padding.bottom > 0.0
+            || padding.left > 0.0
+    };
     let establishes_inline_formatting_context = matches!(comp.kind, ComponentKind::Row)
         && comp.style.display == WDisplay::Block
         && normal_flow_children.clone().next().is_some()
@@ -5479,6 +5607,20 @@ fn build_taffy_tree(
                         )
                     };
                     inline_level(left) && inline_level(right)
+                })
+            || normal_flow_children
+                .clone()
+                .zip(normal_flow_children.clone().skip(1))
+                .any(|(left, right)| {
+                    empty_inline_establishes_visible_line(left)
+                        && matches!(
+                            right.style.display,
+                            WDisplay::Block
+                                | WDisplay::Flex
+                                | WDisplay::Grid
+                                | WDisplay::ListItem
+                                | WDisplay::Table
+                        )
                 }));
     if establishes_inline_formatting_context {
         // A block whose normal-flow children are all inline-level establishes
@@ -5839,7 +5981,13 @@ fn build_taffy_tree(
                     // nowrap title to contract and be clipped by its own box.
                     let inline_text_in_block = comp.style.display == WDisplay::Inline
                         && matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid));
-                    let shrink_to_fit = inline_text_in_block
+                    let absolute_auto_shrink_to_fit = matches!(
+                        comp.style.position,
+                        WPos::Absolute | WPos::Fixed
+                    ) && matches!(comp.style.left, WDim::Auto)
+                        && matches!(comp.style.right, WDim::Auto);
+                    let shrink_to_fit = absolute_auto_shrink_to_fit
+                        || inline_text_in_block
                         || matches!(
                             comp.style.display,
                             WDisplay::InlineBlock | WDisplay::InlineFlex
@@ -6246,6 +6394,17 @@ fn build_taffy_tree(
                     }
                     if mixed_inline_block_flex_fallback
                         && !matches!(c.style.position, WPos::Absolute | WPos::Fixed)
+                        && empty_inline_establishes_visible_line(c)
+                    {
+                        let mut child_style = tree.style(node)?.clone();
+                        child_style.min_size.height = Dimension::length(
+                            c.style.font_size * c.style.line_height,
+                        );
+                        child_style.flex_shrink = 0.0;
+                        tree.set_style(node, child_style)?;
+                    }
+                    if mixed_inline_block_flex_fallback
+                        && !matches!(c.style.position, WPos::Absolute | WPos::Fixed)
                         && c.style.float == WFloat::None
                         && matches!(
                             c.style.display,
@@ -6435,22 +6594,30 @@ fn build_taffy_tree(
             let group = tree.new_with_children(group_style, &grouped)?;
             child_nodes.splice(0..2, [group]);
         }
+        let absolute_auto_shrink_to_fit = matches!(
+            comp.style.position,
+            WPos::Absolute | WPos::Fixed
+        ) && matches!(comp.style.left, WDim::Auto)
+            && matches!(comp.style.right, WDim::Auto);
         if matches!(comp.style.width, WDim::Auto)
-            && (comp.style.float != WFloat::None
-                || matches!(
-                    comp.style.display,
-                    WDisplay::Inline
-                        | WDisplay::InlineBlock
-                        | WDisplay::InlineFlex
-                        | WDisplay::InlineTable
-                        | WDisplay::Table
-                ))
-            && (matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid))
-                || (matches!(parent_display, Some(WDisplay::Flex))
-                    && matches!(
+            && (absolute_auto_shrink_to_fit
+                || ((comp.style.float != WFloat::None
+                    || matches!(
                         comp.style.display,
-                        WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
-                    )))
+                        WDisplay::Inline
+                            | WDisplay::InlineBlock
+                            | WDisplay::InlineFlex
+                            | WDisplay::InlineTable
+                            | WDisplay::Table
+                    ))
+                    && (matches!(parent_display, Some(WDisplay::Block | WDisplay::Grid))
+                        || (matches!(parent_display, Some(WDisplay::Flex))
+                            && matches!(
+                                comp.style.display,
+                                WDisplay::InlineBlock
+                                    | WDisplay::InlineFlex
+                                    | WDisplay::InlineTable
+                            )))))
         {
             style.size.width = Dimension::length(shrink_to_fit_used_width_with_available(
                 comp,
@@ -12728,6 +12895,69 @@ mod tests {
             (second.y - (first.y + first.height)).abs() < 0.01,
             "block child should follow the anonymous generated line without a gap: first={first:?}, second={second:?}"
         );
+    }
+
+    #[test]
+    fn empty_decorated_inline_establishes_a_line_before_a_block() {
+        let layout = compute(
+            &Component::row(
+                Style {
+                    display: WDisplay::Block,
+                    width: WDim::Px(800.0),
+                    font_size: 20.0,
+                    line_height: 1.0,
+                    ..Style::default()
+                },
+                vec![
+                    Component::row(
+                        Style {
+                            display: WDisplay::Inline,
+                            border_left_width: Some(20.0),
+                            font_size: 20.0,
+                            line_height: 1.0,
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    ),
+                    Component::text(
+                        "FAIL",
+                        Style {
+                            display: WDisplay::Block,
+                            width: WDim::Px(80.0),
+                            font_size: 20.0,
+                            line_height: 1.0,
+                            ..Style::default()
+                        },
+                    ),
+                    Component::text(
+                        "PASS",
+                        Style {
+                            display: WDisplay::Block,
+                            position: WPos::Absolute,
+                            top: WDim::Px(20.0),
+                            font_size: 20.0,
+                            line_height: 1.0,
+                            ..Style::default()
+                        },
+                    ),
+                ],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        let inline = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let block = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
+        let absolute = layout.iter().find(|(_, index)| *index == 3).unwrap().0;
+        assert_eq!(inline.height, 20.0, "inline={inline:?}, block={block:?}");
+        assert_eq!(block.width, 80.0, "block={block:?}");
+        assert_eq!(
+            block.y,
+            inline.y + inline.height,
+            "inline={inline:?}, block={block:?}"
+        );
+        assert!(absolute.width > 0.0, "absolute={absolute:?}");
     }
 
     #[test]
