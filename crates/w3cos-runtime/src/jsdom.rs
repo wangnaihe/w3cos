@@ -6599,16 +6599,20 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
                 w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok()?,
                 _ => return None,
             };
-            (dom::node_type(node) == 1).then_some((artifact.z_order[index], index, node))
+            (dom::node_type(node) == 1).then_some((index, node))
         })
         .collect::<Vec<_>>();
-    hits.sort_by_key(|(z_order, index, _)| (*z_order, *index));
+    hits.sort_by(|(left, _), (right, _)| {
+        artifact
+            .paint_order_key(*left)
+            .cmp(artifact.paint_order_key(*right))
+    });
 
     let mut seen = HashSet::new();
     let hits = hits
         .into_iter()
         .rev()
-        .filter_map(|(_, _, node)| seen.insert(node).then_some(node))
+        .filter_map(|(_, node)| seen.insert(node).then_some(node))
         .collect::<Vec<_>>();
     let hit_nodes = hits.iter().copied().collect::<HashSet<_>>();
     let mut expanded = Vec::with_capacity(hits.len());
