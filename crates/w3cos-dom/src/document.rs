@@ -1181,6 +1181,83 @@ impl Document {
                 style.font_size = relative_size;
             }
         }
+        let edge_ex_size = css_ex_size(&style);
+        let ex_edge_spacing = |shorthand: &str, longhand: &str, side: usize| {
+            declared_property_value(&[shorthand, longhand]).and_then(|(property, value)| {
+                let value = if css_property_eq(property, shorthand) {
+                    let tokens = split_css_tokens(value);
+                    match tokens.as_slice() {
+                        [all] => Some(all.clone()),
+                        [vertical, horizontal] => {
+                            Some(if side % 2 == 0 { vertical } else { horizontal }.clone())
+                        }
+                        [top, horizontal, bottom] => Some(
+                            match side {
+                                0 => top,
+                                2 => bottom,
+                                _ => horizontal,
+                            }
+                            .clone(),
+                        ),
+                        [top, right, bottom, left] => {
+                            Some([top, right, bottom, left][side].clone())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    Some(value.trim().to_string())
+                }?;
+                value
+                    .strip_suffix("ex")
+                    .and_then(|number| number.trim().parse::<f32>().ok())
+                    .map(|number| w3cos_std::style::Spacing::Px(number * edge_ex_size))
+            })
+        };
+        let mut margin = [
+            style.margin.top,
+            style.margin.right,
+            style.margin.bottom,
+            style.margin.left,
+        ];
+        let mut padding = [
+            style.padding.top,
+            style.padding.right,
+            style.padding.bottom,
+            style.padding.left,
+        ];
+        for (side, longhand) in ["margin-top", "margin-right", "margin-bottom", "margin-left"]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(value) = ex_edge_spacing("margin", longhand, side) {
+                margin[side] = value;
+            }
+        }
+        for (side, longhand) in [
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(value) = ex_edge_spacing("padding", longhand, side) {
+                padding[side] = value;
+            }
+        }
+        style.margin = w3cos_std::style::Edges {
+            top: margin[0],
+            right: margin[1],
+            bottom: margin[2],
+            left: margin[3],
+        };
+        style.padding = w3cos_std::style::Edges {
+            top: padding[0],
+            right: padding[1],
+            bottom: padding[2],
+            left: padding[3],
+        };
         if let Some((_, value)) = declared_property_value(&["vertical-align", "verticalAlign"])
             && let Some(offset) = vertical_align_length_px(value, &style)
         {
@@ -11376,6 +11453,44 @@ mod computed_style_cache_tests {
         assert_eq!(
             document.computed_style_for(child.id).margin,
             document.computed_style_for(parent.id).margin
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn ex_box_edges_use_the_computed_ahem_x_height() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#target",
+            &[
+                ("font", "20px/1 Ahem"),
+                ("margin", "1ex 2ex 3ex 4ex"),
+                ("padding", "4ex 3ex 2ex 1ex"),
+            ],
+        );
+
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "id", "target");
+        document.body().append_child(&mut document, target);
+
+        assert_eq!(
+            document.computed_style_for(target.id).margin,
+            w3cos_std::style::Edges {
+                top: w3cos_std::style::Spacing::Px(16.0),
+                right: w3cos_std::style::Spacing::Px(32.0),
+                bottom: w3cos_std::style::Spacing::Px(48.0),
+                left: w3cos_std::style::Spacing::Px(64.0),
+            }
+        );
+        assert_eq!(
+            document.computed_style_for(target.id).padding,
+            w3cos_std::style::Edges {
+                top: w3cos_std::style::Spacing::Px(64.0),
+                right: w3cos_std::style::Spacing::Px(48.0),
+                bottom: w3cos_std::style::Spacing::Px(32.0),
+                left: w3cos_std::style::Spacing::Px(16.0),
+            }
         );
         crate::stylesheet::clear_rules();
     }
