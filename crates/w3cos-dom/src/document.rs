@@ -4045,26 +4045,36 @@ impl Document {
                         let child = self.get_node(*child_id);
                         child.node_type == NodeType::Text
                             || (child.node_type == NodeType::Element
-                                && !self.events.has_listeners(*child_id)
+                                && {
+                                    let child_display = self
+                                        .computed_style(*child_id, ancestors, Some(&style))
+                                        .display;
+                                    child_display == w3cos_std::style::Display::None
+                                        || (!self.events.has_listeners(*child_id)
+                                            && matches!(
+                                                child_display,
+                                                w3cos_std::style::Display::Inline
+                                                    | w3cos_std::style::Display::InlineBlock
+                                                    | w3cos_std::style::Display::InlineFlex
+                                                    | w3cos_std::style::Display::InlineTable
+                                            ))
+                                })
+                    })
+                    && children
+                        .iter()
+                        .filter(|component| {
+                            component.style.display != w3cos_std::style::Display::None
+                        })
+                        .all(|component| {
+                            matches!(component.style.position, w3cos_std::style::Position::Static)
                                 && matches!(
-                                    self.computed_style(*child_id, ancestors, Some(&style))
-                                        .display,
+                                    component.style.display,
                                     w3cos_std::style::Display::Inline
                                         | w3cos_std::style::Display::InlineBlock
                                         | w3cos_std::style::Display::InlineFlex
                                         | w3cos_std::style::Display::InlineTable
-                                ))
-                    })
-                    && children.iter().all(|component| {
-                        matches!(component.style.position, w3cos_std::style::Position::Static)
-                            && matches!(
-                                component.style.display,
-                                w3cos_std::style::Display::Inline
-                                    | w3cos_std::style::Display::InlineBlock
-                                    | w3cos_std::style::Display::InlineFlex
-                                    | w3cos_std::style::Display::InlineTable
-                            )
-                    })
+                                )
+                        })
                 {
                     let coalesced = if children.len() == rendered_child_ids.len() {
                         self.coalesced_inline_text_run(
@@ -9594,6 +9604,36 @@ mod image_component_tests {
             tree.children[1].children[0].style.height,
             Dimension::Percent(20.0)
         );
+
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn hidden_script_does_not_break_an_inline_formatting_context() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#overlap",
+            &[
+                ("display", "inline-block"),
+                ("margin-left", "-100px"),
+                ("width", "100px"),
+                ("height", "100px"),
+            ],
+        );
+
+        let mut document = Document::new();
+        let canvas = document.create_element("canvas");
+        document.body().append_child(&mut document, canvas);
+        let whitespace = document.create_text_node(" ");
+        document.body().append_child(&mut document, whitespace);
+        let overlap = document.create_element("div");
+        overlap.set_attribute(&mut document, "id", "overlap");
+        document.body().append_child(&mut document, overlap);
+        let script = document.create_element("script");
+        document.body().append_child(&mut document, script);
+
+        let tree = document.to_component_tree();
+        assert_eq!(tree.style.display, Display::Flex);
 
         crate::stylesheet::clear_rules();
     }
