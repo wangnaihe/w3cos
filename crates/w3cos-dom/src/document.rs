@@ -4561,6 +4561,7 @@ impl Document {
                             && style.white_space != w3cos_std::style::WhiteSpace::NoWrap
                         {
                             style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
+                            style.align_content = w3cos_std::style::AlignContent::FlexStart;
                         }
                         if authored_block
                             && matches!(style.min_height, w3cos_std::style::Dimension::Auto)

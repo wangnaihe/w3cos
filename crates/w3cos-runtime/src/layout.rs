@@ -5,11 +5,11 @@ use std::sync::OnceLock;
 use taffy::prelude::*;
 use w3cos_std::component::EventAction;
 use w3cos_std::style::{
-    AlignItems as WAlign, AlignSelf as WAlignSelf, BoxSizing as WBoxSizing, Clear as WClear,
-    Dimension as WDim, Display as WDisplay, EdgeLengths, FlexDirection as WDir, FlexWrap as WWrap,
-    Float as WFloat, JustifyContent as WJustify, Overflow as WOverflow, Position as WPos,
-    Spacing as WSpacing, Visibility as WVisibility, WhiteSpace as WWhiteSpace,
-    WordBreak as WWordBreak,
+    AlignContent as WAlignContent, AlignItems as WAlign, AlignSelf as WAlignSelf,
+    BoxSizing as WBoxSizing, Clear as WClear, Dimension as WDim, Display as WDisplay, EdgeLengths,
+    FlexDirection as WDir, FlexWrap as WWrap, Float as WFloat, JustifyContent as WJustify,
+    Overflow as WOverflow, Position as WPos, Spacing as WSpacing, Visibility as WVisibility,
+    WhiteSpace as WWhiteSpace, WordBreak as WWordBreak,
 };
 use w3cos_std::{Component, ComponentKind};
 
@@ -4735,6 +4735,7 @@ fn build_taffy_tree(
         style.flex_direction = FlexDirection::Row;
         style.flex_wrap = FlexWrap::Wrap;
         style.align_items = Some(AlignItems::FlexStart);
+        style.align_content = Some(AlignContent::FlexStart);
         if matches!(comp.style.min_height, WDim::Auto) {
             let line_height = comp.style.font_size * comp.style.line_height;
             let baseline_replaced_height = comp
@@ -6651,6 +6652,15 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             WAlign::Center => AlignItems::Center,
             WAlign::Stretch => AlignItems::Stretch,
             WAlign::Baseline => AlignItems::Baseline,
+        }),
+        align_content: Some(match s.align_content {
+            WAlignContent::FlexStart => AlignContent::FlexStart,
+            WAlignContent::FlexEnd => AlignContent::FlexEnd,
+            WAlignContent::Center => AlignContent::Center,
+            WAlignContent::SpaceBetween => AlignContent::SpaceBetween,
+            WAlignContent::SpaceAround => AlignContent::SpaceAround,
+            WAlignContent::SpaceEvenly => AlignContent::SpaceEvenly,
+            WAlignContent::Stretch => AlignContent::Stretch,
         }),
         align_self: if s.display == WDisplay::TableCell {
             Some(AlignSelf::Stretch)
@@ -9427,6 +9437,38 @@ mod tests {
         .unwrap();
 
         assert_eq!((layout[1].0.width, layout[1].0.height), (800.0, 50.0));
+    }
+
+    #[test]
+    fn wrapped_inline_lines_stay_at_block_start_in_a_fixed_height_container() {
+        let image = || {
+            Component::image(
+                "blob:w3cos/line-item",
+                Style {
+                    display: WDisp::InlineBlock,
+                    width: WDim::Px(80.0),
+                    height: WDim::Px(20.0),
+                    ..Style::default()
+                },
+            )
+        };
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(100.0),
+                    height: WDim::Px(200.0),
+                    ..Style::default()
+                },
+                vec![image(), image()],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        assert_eq!(layout[1].0.y, 0.0);
+        assert_eq!(layout[2].0.y, 20.0);
     }
 
     #[test]
