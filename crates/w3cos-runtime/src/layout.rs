@@ -1957,6 +1957,7 @@ impl LayoutEngine {
         project_positioned_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
+        project_auto_table_child_heights(&mut results, flat);
         align_table_cell_baselines(&mut results, flat);
         project_table_cell_inline_vertical_padding(&mut results, flat);
         align_empty_inline_table_baselines(&mut results, flat);
@@ -2093,6 +2094,7 @@ pub fn compute_with_scroll(
     project_positioned_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
     project_table_column_background_rects(&mut results, &flat);
     project_collapsed_table_row_rects(&mut results, &flat);
+    project_auto_table_child_heights(&mut results, &flat);
     align_table_cell_baselines(&mut results, &flat);
     project_table_cell_inline_vertical_padding(&mut results, &flat);
     align_empty_inline_table_baselines(&mut results, &flat);
@@ -2629,6 +2631,58 @@ fn project_collapsed_table_row_rects(
             rect.y = top;
             rect.height = (bottom - top).max(0.0);
         }
+    }
+}
+
+fn project_auto_table_child_heights(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    let mut child_bottoms = vec![None::<f32>; flat.len()];
+    for (index, child) in flat.iter().enumerate() {
+        let Some(parent) = child.parent else {
+            continue;
+        };
+        if child.style.display == WDisplay::None
+            || matches!(child.style.position, WPos::Absolute | WPos::Fixed)
+        {
+            continue;
+        }
+        let Some(position) = positions.get(&index).copied() else {
+            continue;
+        };
+        let bottom = layouts[position].0.y + layouts[position].0.height;
+        child_bottoms[parent] =
+            Some(child_bottoms[parent].map_or(bottom, |value| value.max(bottom)));
+    }
+    for (table, node) in flat.iter().enumerate() {
+        if !matches!(node.style.display, WDisplay::Table | WDisplay::InlineTable)
+            || !matches!(node.style.height, WDim::Auto)
+        {
+            continue;
+        }
+        let Some(table_position) = positions.get(&table).copied() else {
+            continue;
+        };
+        let table_y = layouts[table_position].0.y;
+        let Some(child_bottom) = child_bottoms[table] else {
+            continue;
+        };
+        let padding = node.style.padding_lengths();
+        let bottom_edge = padding.bottom
+            + node
+                .style
+                .border_bottom_width
+                .unwrap_or(node.style.border_width);
+        layouts[table_position].0.height = layouts[table_position]
+            .0
+            .height
+            .max(child_bottom - table_y + bottom_edge);
     }
 }
 
@@ -13536,6 +13590,48 @@ mod tests {
         let second = layout.iter().find(|(_, index)| *index == 2).unwrap().0;
         assert_eq!((table.width, table.height), (96.0, 96.0));
         assert_eq!(second.y, first.y + first.height);
+    }
+
+    #[test]
+    fn auto_table_wrapper_contains_its_anonymous_line_child() {
+        let table = Component::row(
+            Style {
+                display: WDisp::Table,
+                ..Style::default()
+            },
+            vec![Component::row(
+                Style {
+                    display: WDisp::Flex,
+                    ..Style::default()
+                },
+                Vec::new(),
+            )],
+        );
+        let flat = pre_flatten(&table);
+        let mut layout = vec![
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 160.0,
+                    height: 19.2,
+                },
+                0,
+            ),
+            (
+                LayoutRect {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 160.0,
+                    height: 40.0,
+                },
+                1,
+            ),
+        ];
+
+        project_auto_table_child_heights(&mut layout, &flat);
+
+        assert_eq!(layout[0].0.height, 40.0);
     }
 
     #[test]
