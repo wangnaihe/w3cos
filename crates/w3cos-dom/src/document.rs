@@ -4780,8 +4780,22 @@ impl Document {
                     let fragment_row =
                         |retain_left: bool,
                          retain_right: bool,
+                         retain_text_indent: bool,
                          mut fragment_children: Vec<w3cos_std::Component>| {
-                            let fragment = fragment_style(retain_left, retain_right);
+                            fn clear_text_indent(component: &mut w3cos_std::Component) {
+                                component.style.text_indent =
+                                    w3cos_std::style::Dimension::Px(0.0);
+                                for child in &mut component.children {
+                                    clear_text_indent(child);
+                                }
+                            }
+                            let mut fragment = fragment_style(retain_left, retain_right);
+                            if !retain_text_indent {
+                                fragment.text_indent = w3cos_std::style::Dimension::Px(0.0);
+                                for child in &mut fragment_children {
+                                    clear_text_indent(child);
+                                }
+                            }
                             if first_block == 0
                                 && fragment_children.len() == 1
                                 && matches!(
@@ -4813,6 +4827,7 @@ impl Document {
                     let mut fragments = vec![fragment_row(
                         inline_start_is_left,
                         !inline_start_is_left,
+                        true,
                         leading,
                     )];
                     let mut middle_inline = Vec::new();
@@ -4820,6 +4835,7 @@ impl Document {
                         if is_block(&child) {
                             if !middle_inline.is_empty() {
                                 fragments.push(fragment_row(
+                                    false,
                                     false,
                                     false,
                                     std::mem::take(&mut middle_inline),
@@ -4841,11 +4857,12 @@ impl Document {
                         }
                     }
                     if !middle_inline.is_empty() {
-                        fragments.push(fragment_row(false, false, middle_inline));
+                        fragments.push(fragment_row(false, false, false, middle_inline));
                     }
                     fragments.push(fragment_row(
                         !inline_start_is_left,
                         inline_start_is_left,
+                        false,
                         trailing,
                     ));
                     let mut contents_style = w3cos_std::style::Style::default();
